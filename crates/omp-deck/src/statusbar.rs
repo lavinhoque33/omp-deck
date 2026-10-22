@@ -25,7 +25,7 @@ use crate::model_picker::{self, ModelsCache, Pending, PickerAction, PickerInput,
 use crate::session_actions::{self, Action, ActionCtx, Availability, CompactMode, Kind};
 use crate::statusfmt::{
     self, Activity, ContextLevel, context_label, context_level, context_percent, fmt_cost,
-    fmt_tokens, short_model_name, thinking_fill, thinking_short,
+    fmt_tokens, thinking_fill, thinking_short,
 };
 use crate::theme::{self, Palette};
 use crate::widgets::{icon_text, menu_item, paint_icon};
@@ -158,7 +158,7 @@ impl BarView {
         let info: Option<&ModelInfo> = selector.as_deref().and_then(|m| catalog.get(m));
         self.model_selector = selector.clone();
         self.model_name = match (info, selector.as_deref()) {
-            (Some(i), _) => short_model_name(&i.name).to_owned(),
+            (Some(i), _) => i.name.clone(),
             (None, Some(sel)) => sel.rsplit('/').next().unwrap_or(sel).to_owned(),
             (None, None) => String::new(),
         };
@@ -704,7 +704,7 @@ fn model_chip(
         });
         let spacing = ui.spacing().item_spacing.x;
         let right_w = CARET_W + effort.map_or(0.0, |_| spacing + PIE_BOX + spacing + label_w);
-        let name_text = statusfmt::short_model_name(&name);
+        let name_text = name.as_str();
         let name_nat = ui
             .painter()
             .layout_no_wrap(name_text.to_owned(), egui::FontId::proportional(15.0), col)
@@ -1252,7 +1252,7 @@ mod tests {
         let mut v = BarView::default();
         let snap = Arc::new(status());
         assert!(v.update(Some(&snap), Path::new("/x"), &catalog()));
-        assert_eq!(v.model_name, "Opus 5.5");
+        assert_eq!(v.model_name, "Claude Opus 5.5");
         assert_eq!(v.current_level(), Some("auto"));
         assert_eq!(v.ctx_label, "17.3%/1M");
         assert_eq!(v.ctx_level, Some(ContextLevel::Warn));
@@ -1300,7 +1300,7 @@ mod tests {
         v.set_defaults(&defaults);
         assert!(v.update(None, Path::new("/work/dir"), &catalog()));
         assert!(v.model_is_default);
-        assert_eq!(v.model_name, "Opus 5.5");
+        assert_eq!(v.model_name, "Claude Opus 5.5");
         assert_eq!(v.current_level(), Some("high"));
         assert!(v.model_tip.contains("Default model"));
         // The session's own model replaces the default.
@@ -1314,7 +1314,7 @@ mod tests {
         assert!(late.model_name.is_empty());
         late.set_defaults(&defaults);
         assert!(late.update(None, Path::new("/w"), &catalog()));
-        assert_eq!(late.model_name, "Opus 5.5");
+        assert_eq!(late.model_name, "Claude Opus 5.5");
     }
 
     #[test]

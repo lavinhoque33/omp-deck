@@ -261,9 +261,7 @@ impl Pending {
     /// Short text for the chip while waiting.
     pub fn describe(&self, catalog: &ModelsCache) -> String {
         match (&self.selector, &self.level) {
-            (Some(s), _) => catalog
-                .get(s)
-                .map_or_else(|| s.clone(), |m| short_model_name(&m.name).to_owned()),
+            (Some(s), _) => catalog.get(s).map_or_else(|| s.clone(), |m| m.name.clone()),
             (None, Some(l)) => format!("thinking {l}"),
             (None, None) => String::new(),
         }
