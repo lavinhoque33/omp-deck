@@ -680,3 +680,69 @@ fn wait_detached_joins_flush_worker() {
         payload.len()
     );
 }
+
+/// With mouse reporting on (as under tmux), Ctrl+click on a plain URL opens it and a right click
+/// only arms the context menu: neither reaches the child as a mouse report.
+#[test]
+fn ctrl_click_opens_plain_url_and_right_click_stays_local() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("cat");
+    let ready = dir.path().join("ready");
+    let script = format!(
+        r"stty raw -echo; printf '\033[?1000hhttps://ex.io/a(b) tail'; : > {r}; cat -v > {o}",
+        r = sh_quote(&ready.display().to_string()),
+        o = sh_quote(&out.display().to_string()),
+    );
+    let mut t = spawn_sh(&script, false);
+    wait_file(&mut t, &ready, "child ready", |_| ready.exists());
+    poll_until(&mut t, "url on screen", |_, t| {
+        t.screen_text().lines[0]
+            .starts_with("https://")
+            .then_some(())
+    });
+    let ctx = egui::Context::default();
+    let size = vec2(640.0, 400.0);
+    let at = pos2(20.0, 12.0);
+    let button = |button, pressed, modifiers| Event::PointerButton {
+        pos: at,
+        button,
+        pressed,
+        modifiers,
+    };
+    let run = |t: &mut deck_term::Terminal, events| {
+        let mut url = None;
+        let output = ctx.run_ui(raw_input(size, events), |ui| {
+            url = TerminalView::new(t).show(ui).open_url;
+        });
+        output.drop_without_applying_deltas();
+        url
+    };
+    run(&mut t, Vec::new());
+    let opened = run(
+        &mut t,
+        vec![
+            Event::PointerMoved(at),
+            button(PointerButton::Primary, true, Modifiers::CTRL),
+            button(PointerButton::Primary, false, Modifiers::CTRL),
+        ],
+    );
+    assert_eq!(opened.as_deref(), Some("https://ex.io/a(b)"));
+    run(
+        &mut t,
+        vec![
+            button(PointerButton::Secondary, true, Modifiers::NONE),
+            button(PointerButton::Secondary, false, Modifiers::NONE),
+        ],
+    );
+    assert_eq!(t.context_link(), Some("https://ex.io/a(b)"));
+    run(
+        &mut t,
+        vec![
+            key(egui::Key::Z, Modifiers::NONE),
+            Event::Text("z".into()),
+            key(egui::Key::Enter, Modifiers::NONE),
+        ],
+    );
+    let data = wait_file(&mut t, &out, "typed input", |d| d.ends_with(b"^M"));
+    assert_eq!(String::from_utf8_lossy(&data), "z^M");
+}

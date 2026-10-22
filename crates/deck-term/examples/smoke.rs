@@ -35,7 +35,9 @@ fn pattern() -> String {
          [\x1b[8mhidden\x1b[0m]\r\n",
     );
     s.push_str("\x1b[31mred \x1b[32mgreen \x1b[33myellow \x1b[34mblue \x1b[35mmagenta \x1b[36mcyan \x1b[91mbright-red \x1b[38;2;255;128;0mtruecolor-orange\x1b[0m\r\n");
-    s.push_str("CJK: 漢字かな한글 | emoji: 🙂🚀 | combining: e\u{301}a\u{308} | ✓ ✗ ★\r\n");
+    s.push_str(
+        "CJK: 漢字かな한글 | emoji: 🙂🚀🐦🔣🗂️ ⠙⠴ | combining: e\u{301}a\u{308} | ✓ ✗ ★\r\n",
+    );
     s.push_str("╭──────╮ ┌──┬──┐ ╔══╦══╗ ┏━━┳━━┓ ┄┄┅┅ ╌╌\r\n");
     s.push_str("│ box  │ ├──┼──┤ ╠══╬══╣ ┣━━╋━━┫ ┆┇ ╎╏\r\n");
     s.push_str("╰──────╯ └──┴──┘ ╚══╩══╝ ┗━━┻━━┛ ╱╲╳ ╴╵╶╷\r\n");

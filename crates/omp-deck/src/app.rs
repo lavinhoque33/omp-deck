@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::icons::{ICON_TERMINAL, ICON_TRIANGLE_ALERT};
+use crate::icons::{
+    ICON_CLIPBOARD_LIST, ICON_COPY, ICON_EXTERNAL_LINK, ICON_TERMINAL, ICON_TRIANGLE_ALERT,
+};
 use deck_core::agents::{AgentsTarget, AgentsWatcher};
 use deck_core::config::{AppConfig, Density, FolderTabs, TabState, Theme, UiStyle, WindowGeometry};
 use deck_core::omp::{
@@ -44,7 +46,7 @@ use crate::statusbar;
 use crate::statusfmt::Activity;
 use crate::tabs::{
     self, Anchor, ClosedTab, CopyPending, ReopenStack, Tab, TabAction, TabBarInput, TabRole,
-    TermTab,
+    TabStatus, TermTab,
 };
 use crate::theme::{self, Palette};
 use crate::titlebar::{self, BarAction, BarInput, OmpBar};
@@ -54,7 +56,7 @@ use crate::ui_fonts;
 use crate::update::UpdateTracker;
 use crate::usage_state::{Usage, UsageEvent};
 use crate::usage_view;
-use crate::widgets::{empty_state, icon_text};
+use crate::widgets::{empty_state, icon_text, menu_item};
 
 mod agents;
 mod bar;
@@ -1250,6 +1252,13 @@ impl App {
             .filter(|t| t.term().is_some_and(|t| !t.term.is_exited()))
             .filter_map(Tab::session_path)
             .collect();
+        // Their rows show the tab's live omp state instead of the running LED.
+        let tab_activity: HashMap<&Path, TabStatus> = self
+            .tabs
+            .iter()
+            .filter_map(|t| Some((t.session_path()?, t.status(false))))
+            .filter(|(_, s)| matches!(s, TabStatus::Busy | TabStatus::Attention))
+            .collect();
         let generation = self.watcher.generation();
         let input = SidebarInput {
             groups: groups_ref,
@@ -1273,6 +1282,10 @@ impl App {
             recent: &self.cfg.recent_folders,
             picker_available: self.picker_available,
             picking: self.picking_scope,
+            tabs: &self.tabs,
+            labels: &self.labels,
+            active_tab: self.active,
+            tab_activity: &tab_activity,
         };
         let panel = egui::Panel::left("sidebar")
             .resizable(true)
@@ -1319,6 +1332,8 @@ impl App {
                 SidebarAction::SetScope(dir) => self.set_scope(dir),
                 SidebarAction::BrowseScope => self.browse_scope(),
                 SidebarAction::TypedScope(text) => self.resolve_scope(text),
+                SidebarAction::ActivateTab(i) => self.apply_tab_action(TabAction::Activate(i)),
+                SidebarAction::CloseTab(i) => self.apply_tab_action(TabAction::Close(i)),
             }
         }
     }
@@ -1388,6 +1403,7 @@ impl App {
 
     fn show_terminal(&mut self, ui: &mut egui::Ui) {
         let mut open_url = None;
+        let mut copy_link = None;
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let Some(Tab::Terminal(tab)) = self.tabs.get_mut(self.active) else {
                 return;
@@ -1412,9 +1428,21 @@ impl App {
             self.terminal_focused = out.response.has_focus();
             tab.bell = false;
             open_url = out.open_url;
+            match terminal_menu(&out.response, &tab.term) {
+                Some(TermMenu::Copy) => {
+                    tab.term.copy_selection();
+                }
+                Some(TermMenu::Paste) => tab.term.paste_clipboard(),
+                Some(TermMenu::OpenLink(url)) => open_url = Some(url),
+                Some(TermMenu::CopyLink(url)) => copy_link = Some(url),
+                None => {}
+            }
         });
         if let Some(url) = open_url {
             self.open_external(url);
+        }
+        if let Some(url) = copy_link {
+            self.copy_text(&url, "link");
         }
     }
 
@@ -2444,6 +2472,71 @@ impl eframe::App for App {
         let cfg = self.snapshot_config();
         self.writer.finish(cfg);
     }
+}
+
+/// Choice from the terminal's right-click menu.
+enum TermMenu {
+    Copy,
+    Paste,
+    OpenLink(String),
+    CopyLink(String),
+}
+
+/// Right-click menu of the terminal: clipboard actions, plus link actions when a link (OSC 8 or
+/// a plain URL) was under the click.
+fn terminal_menu(resp: &egui::Response, term: &deck_term::Terminal) -> Option<TermMenu> {
+    let mut pick = None;
+    theme::context_menu(resp, 220.0, |ui| {
+        let copy_enabled = term.has_selection();
+        if menu_item(
+            ui,
+            ICON_COPY,
+            "Copy",
+            Some("Ctrl+Shift+C"),
+            copy_enabled,
+            false,
+        )
+        .clicked()
+        {
+            pick = Some(TermMenu::Copy);
+            ui.close();
+        }
+        if menu_item(
+            ui,
+            ICON_CLIPBOARD_LIST,
+            "Paste",
+            Some("Ctrl+Shift+V"),
+            true,
+            false,
+        )
+        .clicked()
+        {
+            pick = Some(TermMenu::Paste);
+            ui.close();
+        }
+        if let Some(link) = term.context_link() {
+            ui.separator();
+            let openable = is_openable_url(link);
+            if menu_item(
+                ui,
+                ICON_EXTERNAL_LINK,
+                "Open link",
+                Some("Ctrl+Click"),
+                openable,
+                false,
+            )
+            .clicked()
+            {
+                pick = Some(TermMenu::OpenLink(link.to_owned()));
+                ui.close();
+            }
+            if menu_item(ui, ICON_COPY, "Copy link", None, true, false).clicked() {
+                pick = Some(TermMenu::CopyLink(link.to_owned()));
+                ui.close();
+            }
+        }
+    });
+    pick
 }
 
 /// Only `http`, `https`, `mailto` (scheme matched case-insensitively) may reach xdg-open.

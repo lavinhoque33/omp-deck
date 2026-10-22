@@ -8,11 +8,15 @@ use deck_core::omp::UpdateKind;
 use deck_term::Terminal;
 
 use crate::icons::{
-    ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_SETTINGS, ICON_TERMINAL, ICON_X,
+    ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_SETTINGS, ICON_TERMINAL, ICON_X, Icon,
 };
 use crate::inject::Injector;
 use crate::model_picker::Pending;
-use egui::{Align2, CursorIcon, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use crate::statusfmt::Activity;
+use crate::titlebar::strip_omp_prefix;
+use egui::{
+    Align2, Color32, CursorIcon, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
+};
 
 use crate::theme::{self, Palette};
 use crate::widgets::{menu_item, paint_icon};
@@ -120,17 +124,58 @@ impl Tab {
             Tab::Settings => "Settings",
         }
     }
+
+    /// The title without omp's `π <glyph>` prefix: the status indicator shows that state.
+    pub fn label<'a>(&'a self, labels: &'a HashMap<PathBuf, String>) -> &'a str {
+        match self {
+            // Restored tabs fall back to the stored (raw) title until omp sets one.
+            Tab::Terminal(t) => {
+                strip_omp_prefix(t.pick_title(labels, t.term.title().map(strip_omp_prefix)))
+            }
+            Tab::Settings => "Settings",
+        }
+    }
+
+    /// The leading indicator; the bell only counts on a background tab.
+    pub fn status(&self, active: bool) -> TabStatus {
+        match self.term() {
+            Some(t) => TabStatus::of(
+                t.term.exit_code(),
+                Activity::from_title(t.term.title()),
+                t.bell && !active,
+            ),
+            None => TabStatus::Idle,
+        }
+    }
+
+    /// The idle icon and its accent (`sel` = selection 0..=1, mixing from `weak`).
+    pub fn kind_icon(&self, pal: &Palette, sel: f32) -> (Icon, Color32) {
+        match self {
+            Tab::Settings => (ICON_SETTINGS, theme::mix(pal.weak, pal.accent, sel)),
+            Tab::Terminal(t) if matches!(t.role, TabRole::Update(_)) => (
+                ICON_DOWNLOAD,
+                theme::mix(pal.weak, pal.accent_a, sel.max(0.6)),
+            ),
+            Tab::Terminal(_) => (ICON_TERMINAL, theme::mix(pal.weak, pal.accent_b, sel)),
+        }
+    }
 }
 
 impl TermTab {
     /// OSC title if non-empty, else the session label, else the stored title, else cwd basename.
     pub fn title<'a>(&'a self, labels: &'a HashMap<PathBuf, String>) -> &'a str {
+        self.pick_title(labels, self.term.title())
+    }
+
+    fn pick_title<'a>(
+        &'a self,
+        labels: &'a HashMap<PathBuf, String>,
+        osc: Option<&'a str>,
+    ) -> &'a str {
         if let TabRole::Update(kind) = self.role {
             return crate::update::tab_title(kind);
         }
-        self.term
-            .title()
-            .filter(|t| !t.trim().is_empty() && !is_hostname(t))
+        osc.filter(|t| !t.trim().is_empty() && !is_hostname(t))
             .or_else(|| {
                 self.session_path
                     .as_ref()
@@ -141,6 +186,84 @@ impl TermTab {
             .or_else(|| self.cwd.file_name().and_then(|n| n.to_str()))
             .unwrap_or("omp")
     }
+}
+
+/// What a tab's leading indicator shows, in precedence order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabStatus {
+    /// The process ended (`clean` = exit code 0).
+    Exited { clean: bool },
+    /// omp waits for the user (`π !`).
+    Attention,
+    /// omp is working (spinner frame in the title).
+    Busy,
+    /// A bell rang on a background tab.
+    Bell,
+    /// Nothing to report: the caller's own idle look.
+    Idle,
+}
+
+impl TabStatus {
+    pub fn of(exit_code: Option<i32>, activity: Activity, bell: bool) -> TabStatus {
+        match (exit_code, activity) {
+            (Some(code), _) => TabStatus::Exited { clean: code == 0 },
+            (None, Activity::Attention) => TabStatus::Attention,
+            (None, Activity::Busy) => TabStatus::Busy,
+            _ if bell => TabStatus::Bell,
+            _ => TabStatus::Idle,
+        }
+    }
+
+    /// Tooltip line for the live omp states.
+    pub fn hint(self) -> Option<&'static str> {
+        match self {
+            TabStatus::Attention => Some("omp is waiting for your input"),
+            TabStatus::Busy => Some("omp is working…"),
+            _ => None,
+        }
+    }
+}
+
+/// Paints `status` centred at `c` in an icon slot of `size` px; returns false for
+/// [`TabStatus::Idle`], which the caller paints itself. Shared by the tab strip and the sidebar.
+pub fn paint_status(ui: &Ui, c: Pos2, size: f32, status: TabStatus) -> bool {
+    let pal = Palette::of_ui(ui);
+    let p = ui.painter();
+    match status {
+        TabStatus::Exited { clean } => {
+            let (icon, col) = if clean {
+                (ICON_CIRCLE_CHECK, pal.ok)
+            } else {
+                (ICON_CIRCLE_X, pal.danger)
+            };
+            paint_icon(p, c, Align2::CENTER_CENTER, icon, size, col);
+        }
+        TabStatus::Attention => paint_attention_badge(p, pal, c, size),
+        TabStatus::Busy => crate::widgets::Spin::new(size * 0.8, pal.accent_b).paint_at(ui, c),
+        TabStatus::Bell => theme::glow_dot(p, c, size * 0.22, pal.warn, theme::GLOW_REST),
+        TabStatus::Idle => return false,
+    }
+    true
+}
+
+/// Solid warn disc with a drawn `!` (font independent, legible at a glance).
+fn paint_attention_badge(p: &Painter, pal: &Palette, c: Pos2, size: f32) {
+    let r = size * 0.44;
+    theme::glow_dot(p, c, r, pal.warn, theme::GLOW_REST);
+    let ink = Stroke::new((size * 0.12).max(1.6), pal.bg);
+    p.line_segment([c + vec2(0.0, -r * 0.5), c + vec2(0.0, r * 0.12)], ink);
+    p.circle_filled(c + vec2(0.0, r * 0.5), ink.width * 0.6, pal.bg);
+}
+
+/// Warn wash and outline over a row/pill whose tab waits for the user.
+pub fn paint_attention_pill(p: &Painter, pal: &Palette, rect: Rect, radius: u8) {
+    p.rect(
+        rect,
+        radius,
+        pal.warn.gamma_multiply(0.13),
+        Stroke::new(1.0, pal.warn.gamma_multiply(0.7)),
+        StrokeKind::Inside,
+    );
 }
 
 /// Machine hostname (tmux's default pane title), read once.
@@ -368,11 +491,10 @@ pub fn show_tab_strip(
 
 fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option<TabAction> {
     let pal = Palette::of_ui(ui);
-    let title = tab.title(input.labels);
+    let title = tab.label(input.labels);
     let active = i == input.active;
     let term = tab.term();
-    let exited = term.is_some_and(|t| t.term.is_exited());
-    let bell = term.is_some_and(|t| t.bell) && !active;
+    let status = tab.status(active);
 
     let text_color = if active { pal.text_strong } else { pal.text };
     let mut job = egui::text::LayoutJob::simple_singleline(
@@ -447,29 +569,13 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
                 );
             }
         }
+        if status == TabStatus::Attention {
+            paint_attention_pill(p, pal, pill, radius);
+        }
         // Leading icon / status.
         let ic = pos2(pill.left() + 12.0 + ICON_W / 2.0, pill.center().y);
-        if exited {
-            let clean = term.and_then(|t| t.term.exit_code()) == Some(0);
-            let (icon, col) = if clean {
-                (ICON_CIRCLE_CHECK, pal.ok)
-            } else {
-                (ICON_CIRCLE_X, pal.danger)
-            };
-            paint_icon(p, ic, Align2::CENTER_CENTER, icon, 16.0, col);
-        } else if bell {
-            theme::glow_dot(p, ic, 3.5, pal.warn, theme::GLOW_REST);
-        } else {
-            let (icon, col) = if tab.is_settings() {
-                (ICON_SETTINGS, theme::mix(pal.weak, pal.accent, sel))
-            } else if term.is_some_and(|t| matches!(t.role, TabRole::Update(_))) {
-                (
-                    ICON_DOWNLOAD,
-                    theme::mix(pal.weak, pal.accent_a, sel.max(0.6)),
-                )
-            } else {
-                (ICON_TERMINAL, theme::mix(pal.weak, pal.accent_b, sel))
-            };
+        if !paint_status(ui, ic, ICON_W, status) {
+            let (icon, col) = tab.kind_icon(pal, sel);
             paint_icon(p, ic, Align2::CENTER_CENTER, icon, 16.0, col);
         }
         p.galley(
@@ -504,6 +610,9 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
         .on_hover_cursor(CursorIcon::PointingHand)
         .on_hover_ui(|ui| {
             ui.label(title);
+            if let Some(hint) = status.hint() {
+                ui.weak(hint);
+            }
             if let Some(p) = tab.session_path() {
                 ui.weak(p.display().to_string());
             }
@@ -652,5 +761,24 @@ mod tests {
         assert_eq!(active_after_close(1, 1, 3), 1); // closed active, next slides in
         assert_eq!(active_after_close(2, 2, 3), 1); // closed last active
         assert_eq!(active_after_close(0, 0, 1), 0); // empty: clamped to 0
+    }
+
+    #[test]
+    fn tab_status_precedence() {
+        use Activity::*;
+        let of = TabStatus::of;
+        // Exited wins over everything; the code decides clean/failed.
+        assert_eq!(
+            of(Some(0), Attention, true),
+            TabStatus::Exited { clean: true }
+        );
+        assert_eq!(of(Some(1), Busy, false), TabStatus::Exited { clean: false });
+        // Then attention, busy, the bell, idle.
+        assert_eq!(of(None, Attention, true), TabStatus::Attention);
+        assert_eq!(of(None, Busy, true), TabStatus::Busy);
+        assert_eq!(of(None, Idle, true), TabStatus::Bell);
+        assert_eq!(of(None, Unknown, true), TabStatus::Bell);
+        assert_eq!(of(None, Idle, false), TabStatus::Idle);
+        assert_eq!(of(None, Unknown, false), TabStatus::Idle);
     }
 }

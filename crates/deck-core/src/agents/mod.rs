@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+pub mod markup;
 mod scan;
 mod tail;
 mod transcript;
@@ -106,10 +107,20 @@ pub enum TranscriptItem {
         is_error: bool,
         truncated: bool,
     },
-    /// custom_message display:true, async-result, irc.
+    /// custom_message display:true (async-result, …).
     Notice {
         kind: String,
         text: String,
+    },
+    /// An `<irc>` block from a steering message or an `irc:*` notice; `text` is its markdown body.
+    Irc {
+        /// `from` attribute (`parent`, …).
+        from: Option<String>,
+        /// Sending agent (`agent` attribute, or the notice's "from agent `X`" line).
+        agent: Option<String>,
+        text: String,
+        /// A bracketed line before the block, e.g. "Wait interrupted by message".
+        note: Option<String>,
     },
     Compaction {
         tokens_before: Option<u64>,

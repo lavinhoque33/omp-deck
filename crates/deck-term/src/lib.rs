@@ -6,7 +6,9 @@
 mod clipboard;
 mod core;
 mod fonts;
+mod graphics;
 pub mod input;
+mod links;
 mod pty;
 mod render;
 mod theme;

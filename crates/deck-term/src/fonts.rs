@@ -6,7 +6,9 @@ use std::process::Command;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use egui::epaint::text::Blob;
+use egui::epaint::text::{FallbackRequest, FontInsert, FontProvider};
 use egui::{FontData, FontDefinitions, FontFamily};
+use egui_system_font_provider::SystemFontProvider;
 
 pub(crate) const FAMILY_TERM: &str = "term";
 pub(crate) const FAMILY_BOLD: &str = "term-bold";
@@ -20,43 +22,16 @@ pub struct FontReport {
     pub missing: Vec<String>,
 }
 
-/// Fallback chain after the primary face: (key, path, face index).
-const FALLBACKS: &[(&str, &str, u32)] = &[
-    (
-        "deck-dejavu-mono",
-        "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
-        0,
-    ),
-    (
-        "deck-source-code-pro",
-        "/usr/share/fonts/adobe-source-code-pro-fonts/SourceCodePro-Regular.otf",
-        0,
-    ),
-    (
-        "deck-symbols2",
-        "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
-        0,
-    ),
-    (
-        "deck-symbols-vf",
-        "/usr/share/fonts/google-noto-vf/NotoSansSymbols[wght].ttf",
-        0,
-    ),
-    (
-        "deck-cjk-mono-sc",
-        "/usr/share/fonts/google-noto-sans-mono-cjk-vf-fonts/NotoSansMonoCJK-VF.ttc",
-        2,
-    ),
-    (
-        "deck-emoji-color",
-        "/usr/share/fonts/google-noto-color-emoji-fonts/Noto-COLRv1.ttf",
-        0,
-    ),
-    (
-        "deck-emoji-mono",
-        "/usr/share/fonts/google-noto-emoji-fonts/NotoEmoji-Regular.ttf",
-        0,
-    ),
+/// Fallback chain after the primary face: (key, fontconfig family). Each family is resolved
+/// through fontconfig, so the files may live anywhere on the system.
+const FALLBACKS: &[(&str, &str)] = &[
+    ("deck-dejavu-mono", "DejaVu Sans Mono"),
+    ("deck-source-code-pro", "Source Code Pro"),
+    ("deck-symbols2", "Noto Sans Symbols 2"),
+    ("deck-symbols-vf", "Noto Sans Symbols"),
+    ("deck-cjk-mono-sc", "Noto Sans Mono CJK SC"),
+    ("deck-emoji-color", "Noto Color Emoji"),
+    ("deck-emoji-mono", "Noto Emoji"),
 ];
 
 /// File bytes shared process-wide, so repeated installs (or the same file under two families)
@@ -97,6 +72,49 @@ fn fc_match(pattern: &str) -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// Parses `fc-match -f '%{family}\n%{index}\n%{file}'` output; accepts it only when `family`
+/// is among the matched face's families (fc-match always answers with *something*).
+fn parse_family_match(output: &str, family: &str) -> Option<(PathBuf, u32)> {
+    let mut lines = output.lines();
+    let (fams, index, file) = (lines.next()?, lines.next()?, lines.next()?);
+    if !fams
+        .split(',')
+        .any(|f| f.trim().eq_ignore_ascii_case(family))
+    {
+        return None;
+    }
+    // The high 16 bits select a variable-font named instance; the face index is the low half.
+    let index = index.trim().parse::<u32>().ok()? & 0xffff;
+    let path = PathBuf::from(file.trim());
+    path.is_file().then_some((path, index))
+}
+
+/// File and face index of the installed font whose family really is `family`.
+fn fc_family(family: &str) -> Option<(PathBuf, u32)> {
+    let out = Command::new("fc-match")
+        .args(["-f", "%{family}\n%{index}\n%{file}", family])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_family_match(std::str::from_utf8(&out.stdout).ok()?, family)
+}
+
+/// [`SystemFontProvider`] minus the `term-primary` family, which must stay primary-only:
+/// `GlyphCache::fits_row` classifies glyphs against it and a discovered fallback would hide
+/// which glyphs the primary face lacks.
+struct UiSystemFonts(SystemFontProvider);
+
+impl FontProvider for UiSystemFonts {
+    fn font_for(&self, request: &FallbackRequest<'_>) -> Option<FontInsert> {
+        if request.family == &FontFamily::Name(FAMILY_PRIMARY.into()) {
+            return None;
+        }
+        self.0.font_for(request)
+    }
+}
+
 /// Faces from [`FALLBACKS`] appended (in this order) to egui's `Proportional` and `Monospace`
 /// families after their defaults, so UI text can show emoji, symbols and CJK.
 const UI_FALLBACKS: &[&str] = &[
@@ -120,7 +138,8 @@ fn append_ui_fallbacks(defs: &mut FontDefinitions, family: FontFamily, loaded: &
 
 /// Installs the terminal font families into egui (call once, from the eframe creator).
 /// Starts from `FontDefinitions::default()`; egui's UI families keep their default faces first
-/// and only gain [`UI_FALLBACKS`] at the end (emoji/symbols/CJK in titles). Also disables
+/// and only gain [`UI_FALLBACKS`] at the end (emoji/symbols/CJK in titles). Glyphs the curated
+/// chain lacks come on demand from a system font provider that skips `term-primary`. Also disables
 /// sub-pixel binning (glyphs are placed on whole pixels anyway; binning only blurs).
 pub fn install_fonts(ctx: &egui::Context) -> FontReport {
     let mut defs = FontDefinitions::default();
@@ -174,15 +193,24 @@ pub fn install_fonts(ctx: &egui::Context) -> FontReport {
         _ => primary_key.clone(),
     };
 
+    // One fc-match per family, concurrently: these spawns delay the first frame.
+    let found: Vec<Option<(PathBuf, u32)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = FALLBACKS
+            .iter()
+            .map(|(_, family)| scope.spawn(|| fc_family(family)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect()
+    });
     let mut chain: Vec<String> = Vec::new();
-    for (key, path, index) in FALLBACKS {
-        let path = Path::new(path);
-        if path.is_file() {
-            if add(&mut defs, &mut report, key, path, *index) {
+    for ((key, family), hit) in FALLBACKS.iter().zip(found) {
+        match hit {
+            Some((path, index)) if add(&mut defs, &mut report, key, &path, index) => {
                 chain.push((*key).to_owned());
             }
-        } else {
-            report.missing.push(path.display().to_string());
+            _ => report.missing.push((*family).to_owned()),
         }
     }
     // Last resort: egui's bundled monospace stack (Hack + emoji) so the families always resolve.
@@ -222,6 +250,8 @@ pub fn install_fonts(ctx: &egui::Context) -> FontReport {
     append_ui_fallbacks(&mut defs, FontFamily::Monospace, &chain);
 
     ctx.set_fonts(defs);
+    // Replaces (never appends), so repeated installs keep exactly one provider.
+    ctx.set_font_providers(vec![Arc::new(UiSystemFonts(SystemFontProvider::new()))]);
     ctx.all_styles_mut(|s| s.visuals.text_options.subpixel_binning = false);
     report
 }
@@ -244,6 +274,21 @@ mod tests {
         assert_eq!(
             &after[before.len()..],
             ["deck-symbols2", "deck-emoji-color"]
+        );
+    }
+
+    #[test]
+    fn family_match_requires_the_family_and_masks_instance_bits() {
+        let file = std::env::current_exe().unwrap();
+        let out = |fams: &str, idx: &str| format!("{fams}\n{idx}\n{}", file.display());
+        let hit = parse_family_match(
+            &out("Noto Sans Mono CJK SC,Noto", "65538"),
+            "noto sans mono cjk sc",
+        );
+        assert_eq!(hit, Some((file.clone(), 2)));
+        assert_eq!(
+            parse_family_match(&out("DejaVu Sans", "0"), "Noto Emoji"),
+            None
         );
     }
 }

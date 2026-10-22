@@ -22,6 +22,7 @@ use alacritty_terminal::term::{ClipboardType, Config, Osc52, Term, TermMode};
 use alacritty_terminal::tty::{self, Options, Shell};
 
 use crate::clipboard::Clipboard;
+use crate::graphics::Graphics;
 use crate::input::KeyRules;
 use crate::pty::{TrackedPty, WriteProgress};
 use crate::theme::{self, Palette, TermTheme};
@@ -442,6 +443,8 @@ pub struct Terminal {
     /// User keyboard/paste/IME input is dropped before this instant.
     input_hold: Cell<Option<Instant>>,
     gate: Arc<RepaintGate>,
+    /// Kitty graphics images (fed by the PTY thread, painted by the widget).
+    pub(crate) graphics: Arc<Graphics>,
     /// Per-terminal widget state (selection drag, blink timer, render buffers).
     pub(crate) view: ViewState,
 }
@@ -496,7 +499,8 @@ impl Terminal {
         };
         let pty = tty::new(&tty_opts, window_size, 0)?;
         let modify_other_keys = Arc::new(AtomicU8::new(0));
-        let pty = TrackedPty::new(pty, modify_other_keys.clone(), progress)?;
+        let graphics = Arc::new(Graphics::new(ctx.clone()));
+        let pty = TrackedPty::new(pty, modify_other_keys.clone(), progress, graphics.clone())?;
         let event_loop =
             EventLoop::new(term.clone(), listener, pty, tty_opts.drain_on_exit, false)?;
         let sender = event_loop.channel();
@@ -521,6 +525,7 @@ impl Terminal {
             last_ctrl_c: Cell::new(None),
             input_hold: Cell::new(None),
             gate,
+            graphics,
             view: ViewState::default(),
         })
     }

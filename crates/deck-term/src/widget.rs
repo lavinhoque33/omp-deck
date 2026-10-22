@@ -14,7 +14,8 @@ use egui::{
 
 use crate::core::{Terminal, TerminalEvents};
 use crate::input::{self, Key, KeyAction, KeyInput, Mods, MouseAction, MouseButton};
-use crate::render::{self, Frame, GlyphCache, Metrics, PaintParams, PaintScratch};
+use crate::links;
+use crate::render::{self, Frame, GlyphCache, Metrics, PaintParams, PaintScratch, UrlSpan};
 
 const BLINK_HALF_PERIOD: Duration = Duration::from_millis(500);
 const MULTI_CLICK_SECS: f64 = 0.4;
@@ -40,6 +41,8 @@ pub(crate) struct ViewState {
     pressed: Option<Pressed>,
     /// Ctrl+click opened a link: swallow the matching release.
     link_press: bool,
+    /// Link under the last right click: the context menu's Open/Copy link target.
+    menu_link: Option<String>,
     /// Plain click waiting for a drag before it becomes a selection.
     pending_select: Option<(Point, Side)>,
     selecting: bool,
@@ -75,7 +78,7 @@ pub struct TerminalResponse {
     pub response: egui::Response,
     /// Merged `poll()` result for this frame.
     pub events: TerminalEvents,
-    /// Ctrl+click on an OSC 8 hyperlink; the app opens it.
+    /// Ctrl+click on a hyperlink (OSC 8 target or a plain URL in the text); the app opens it.
     pub open_url: Option<String>,
 }
 
@@ -338,16 +341,29 @@ impl<'a> TerminalView<'a> {
             term.view.frame.capture(&term_guard, &palette);
         }
 
-        // Hyperlink hover (Ctrl held).
+        // Link hover (Ctrl held): an OSC 8 link, else a plain URL in the text.
         let hover = response.hover_pos().filter(|p| rect.contains(*p));
         let ctrl = ui.input(|i| i.modifiers.ctrl);
         let mut hover_link = 0;
+        let mut hover_url = None;
         if let (Some(pos), true) = (hover, ctrl) {
             let (row, col, _) = geo.cell(pos);
             hover_link = term.view.frame.cell(row, col).map_or(0, |c| c.link);
+            if hover_link == 0 {
+                let t = term.term.lock();
+                let offset = t.grid().display_offset();
+                let point = viewport_to_point(offset, Point::new(row, Column(col)));
+                hover_url = links::url_at(&*t, point).map(|hit| {
+                    let vp = |p: Point| (p.line.0 + offset as i32, p.column.0);
+                    UrlSpan {
+                        start: vp(hit.start),
+                        end: vp(hit.end),
+                    }
+                });
+            }
         }
         if response.contains_pointer() {
-            ctx.set_cursor_icon(if hover_link != 0 {
+            ctx.set_cursor_icon(if hover_link != 0 || hover_url.is_some() {
                 CursorIcon::PointingHand
             } else {
                 CursorIcon::Text
@@ -378,6 +394,8 @@ impl<'a> TerminalView<'a> {
             cursor_visible,
             focused,
             hover_link,
+            hover_url,
+            graphics: &term.graphics,
             preedit: &view.preedit,
             banner: banner.as_deref(),
         };
@@ -425,6 +443,52 @@ fn paste(term: &mut Terminal, text: Option<String>, mode: TermMode) {
         term.write(&input::encode_paste(&text, mode));
         after_input(term);
     }
+}
+
+/// Clipboard and link actions behind the app's terminal context menu.
+impl Terminal {
+    /// A local (alacritty) selection exists: Shift+drag, or any drag without mouse reporting.
+    pub fn has_selection(&self) -> bool {
+        self.term
+            .lock()
+            .selection
+            .as_ref()
+            .is_some_and(|s| !s.is_empty())
+    }
+
+    /// Copies the local selection to the clipboard; false when there is nothing to copy.
+    pub fn copy_selection(&self) -> bool {
+        let text = self.term.lock().selection_to_string();
+        match text.filter(|t| !t.is_empty()) {
+            Some(text) => {
+                self.clipboard().set_text(&text);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Pastes the clipboard as input (bracketed when the app enabled bracketed paste).
+    pub fn paste_clipboard(&mut self) {
+        let text = self.clipboard().get_text();
+        let mode = self.mode();
+        paste(self, text, mode);
+    }
+
+    /// Link (OSC 8 target or plain URL) under the last right click.
+    pub fn context_link(&self) -> Option<&str> {
+        self.view.menu_link.as_deref()
+    }
+}
+
+/// Link under viewport cell (`row`, `col`): its OSC 8 target, else a plain URL in the text.
+fn link_at(term: &Terminal, row: usize, col: usize) -> Option<String> {
+    let t = term.term.lock();
+    let point = viewport_to_point(t.grid().display_offset(), Point::new(row, Column(col)));
+    t.grid()[point]
+        .hyperlink()
+        .map(|h| h.uri().to_owned())
+        .or_else(|| links::url_at(&*t, point).map(|hit| hit.uri))
 }
 
 fn handle_keyboard(term: &mut Terminal, events: &[Event], mode: TermMode) {
@@ -478,13 +542,9 @@ fn handle_keyboard(term: &mut Terminal, events: &[Event], mode: TermMode) {
                 if *pressed && (copy || paste_key) {
                     term.view.shortcut_key = Some(*key);
                     if copy {
-                        let sel = term.term.lock().selection_to_string();
-                        if let Some(sel) = sel {
-                            term.clipboard().set_text(&sel);
-                        }
+                        term.copy_selection();
                     } else {
-                        let text = term.clipboard().get_text();
-                        paste(term, text, mode);
+                        term.paste_clipboard();
                     }
                 } else if !*pressed && (copy || paste_key || term.view.shortcut_key == Some(*key)) {
                     if term.view.shortcut_key == Some(*key) {
@@ -582,20 +642,20 @@ fn handle_pointer(
                 let mods = mods_of(*modifiers);
                 let (row, col, side) = geo.cell(*pos);
 
-                if btn == MouseButton::Left && mods.ctrl && !mods.shift {
-                    let uri = {
-                        let t = term.term.lock();
-                        let point = viewport_to_point(
-                            t.grid().display_offset(),
-                            Point::new(row, Column(col)),
-                        );
-                        t.grid()[point].hyperlink().map(|h| h.uri().to_owned())
-                    };
-                    if let Some(uri) = uri {
-                        *open_url = Some(uri);
-                        term.view.link_press = true;
-                        continue;
-                    }
+                if btn == MouseButton::Left
+                    && mods.ctrl
+                    && !mods.shift
+                    && let Some(uri) = link_at(term, row, col)
+                {
+                    *open_url = Some(uri);
+                    term.view.link_press = true;
+                    continue;
+                }
+                // Right click belongs to the app's context menu (egui opens it on release), never
+                // to the PTY: remember the link under it for Open/Copy link.
+                if btn == MouseButton::Right {
+                    term.view.menu_link = link_at(term, row, col);
+                    continue;
                 }
 
                 if mouse_mode && !mods.shift {

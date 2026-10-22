@@ -14,7 +14,7 @@ use deck_core::agents::{AgentStatus, AgentSummary};
 use egui::{Frame, Id, Margin, RichText, Ui};
 use egui_commonmark::{CommonMarkCache, CommonMarkScrollOptions, CommonMarkViewer};
 
-use crate::theme::Palette;
+use crate::theme::{self, Palette};
 use crate::widgets::{Spin, empty_state, icon_text};
 
 /// Output files larger than this are previewed, not rendered whole.
@@ -41,13 +41,17 @@ impl MdPane {
             self.cache.clear_viewer(&id);
             self.sig = Some(sig);
         }
-        CommonMarkViewer::new().show_scrollable(
-            id,
-            ui,
-            &mut self.cache,
-            &CommonMarkScrollOptions::default().viewport_cache(true),
-            text,
-        );
+        let pal = Palette::of_ui(ui);
+        ui.scope(|ui| {
+            theme::markdown_style(ui.style_mut(), pal);
+            CommonMarkViewer::new().show_scrollable(
+                id,
+                ui,
+                &mut self.cache,
+                &CommonMarkScrollOptions::default().viewport_cache(true),
+                text,
+            );
+        });
     }
 }
 

@@ -436,6 +436,46 @@ fn transcript_errors_notices_compaction_and_hidden_entries() {
 }
 
 #[test]
+fn irc_blocks_become_their_own_items() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("t.jsonl");
+    let lines = [
+        r#"{"type":"message","id":"s","message":{"role":"user","content":[{"type":"text","text":"[Wait interrupted by message]\n<irc from=\"parent\" agent=\"Main\">\nFYI: **re-read** `a.rs`.\n</irc>"}],"attribution":"agent","steering":true}}"#,
+        r#"{"type":"message","id":"t","message":{"role":"user","content":[{"type":"text","text":"before\n<irc agent=\"Sib\">\none\n</irc>\n<irc agent=\"Sib\">\ntwo\n</irc>\nafter"}],"attribution":"agent"}}"#,
+        r#"{"type":"custom_message","customType":"irc:incoming","display":true,"content":"<irc>\nIncoming IRC message from agent `Main`:\n\nhello\n</irc>"}"#,
+    ];
+    fs::write(&p, format!("{}\n", lines.join("\n"))).unwrap();
+    let irc =
+        |from: Option<&str>, agent: &str, text: &str, note: Option<&str>| TranscriptItem::Irc {
+            from: from.map(Into::into),
+            agent: Some(agent.into()),
+            text: text.into(),
+            note: note.map(Into::into),
+        };
+    let user = |text: &str| TranscriptItem::User {
+        text: text.into(),
+        from_agent: true,
+        at: None,
+    };
+    assert_eq!(
+        read_all(&p),
+        vec![
+            irc(
+                Some("parent"),
+                "Main",
+                "FYI: **re-read** `a.rs`.",
+                Some("Wait interrupted by message")
+            ),
+            user("before"),
+            irc(None, "Sib", "one", None),
+            irc(None, "Sib", "two", None),
+            user("after"),
+            irc(None, "Main", "hello", None),
+        ]
+    );
+}
+
+#[test]
 fn transcript_reader_tails_partial_lines_and_resets_on_replace() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("t.jsonl");

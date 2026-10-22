@@ -166,7 +166,7 @@ fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: viewport(&cfg),
         clipboard_shortcuts: false,
-        // deck-term classifies glyphs against a primary-only family; a system provider must not add fonts.
+        // deck-term installs its own filtered system provider (it skips `term-primary`, which must stay primary-only).
         system_font_fallback: false,
         ..Default::default()
     };

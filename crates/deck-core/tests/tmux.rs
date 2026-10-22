@@ -279,4 +279,43 @@ fn generated_config_sources_cleanly_twice() {
         keys.contains("Any"),
         "copy-mode table lacks the Any binding: {keys}"
     );
+
+    // omp's image/hyperlink overrides reach the global environment and new panes.
+    let env = Command::new("tmux")
+        .args(["-L", tmux.socket(), "show-environment", "-g"])
+        .output()
+        .unwrap();
+    let env = String::from_utf8_lossy(&env.stdout);
+    for line in [
+        "PI_FORCE_IMAGE_PROTOCOL=kitty",
+        "PI_KITTY_PLACEHOLDERS=1",
+        "PI_FORCE_HYPERLINKS=1",
+    ] {
+        assert!(env.lines().any(|l| l == line), "{line} missing: {env}");
+    }
+    let out_file = dir.path().join("pane-env");
+    let script = format!(
+        "echo \"$PI_FORCE_IMAGE_PROTOCOL $PI_KITTY_PLACEHOLDERS $PI_FORCE_HYPERLINKS\" > '{}'",
+        out_file.display()
+    );
+    let pane = Command::new("tmux")
+        .args([
+            "-L",
+            tmux.socket(),
+            "new-session",
+            "-d",
+            "-s",
+            "e",
+            "--",
+            "sh",
+            "-c",
+        ])
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(pane.status.success());
+    wait_for("the pane to write its env", || {
+        fs::read_to_string(&out_file).is_ok_and(|s| s.ends_with('\n'))
+    });
+    assert_eq!(fs::read_to_string(&out_file).unwrap(), "kitty 1 1\n");
 }

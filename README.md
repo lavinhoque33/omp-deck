@@ -6,17 +6,23 @@ embedded, fully interactive terminal backed by tmux, so closing a tab or the who
 
 ## Features
 
-- **Session sidebar**: every omp session grouped by project (only the active tab's project is expanded;
-  the rest stay collapsed until you open them), newest first, with titles, relative age,
-  a running indicator, a filter box, background auto-refresh, and context menus (open, copy/move to another
+- **Session sidebar**: an "Open tabs" section pinned at the top lists every open tab with its status
+  (click to switch, ✕ or middle-click to close), above every omp session grouped by project (only the active
+  tab's project is expanded; the rest stay collapsed until you open them), newest first, with titles, relative age,
+  a running indicator (sessions open in a tab show the tab's working spinner / needs-input badge instead),
+  a filter box, background auto-refresh, and context menus (open, copy/move to another
   project, copy path/id/resume command, "Restart session" for running sessions, "Stop session process",
   and "Delete session…"). Deleting is permanent: it removes the session file and its subagent transcripts
   and artifacts (stopping a running session first) and cannot be undone.
-- **Tabs**: open, focus, middle-click close, reopen the last closed tab. Closing a tab only detaches;
+- **Tabs**: open, focus, middle-click close, reopen the last closed tab. Each tab shows omp's state: a
+  spinner while the agent works and an amber "!" badge with a tinted tab when it waits for your input,
+  also on background tabs. Closing a tab only detaches;
   the tab context menu's "Kill session process" stops omp, as does "Stop session process" in the sidebar.
   Tabs re-attach to live tmux sessions on the next launch.
 - **Terminal fidelity**: truecolor, wide/emoji cells, mouse reporting, bracketed paste, OSC 52 clipboard,
-  clickable hyperlinks, kitty CSI-u / modifyOtherKeys key encoding.
+  clickable hyperlinks and plain URLs (Ctrl+click), a right-click copy / paste / link menu,
+  kitty CSI-u / modifyOtherKeys key encoding, inline image previews (omp's kitty
+  graphics images, shown through Unicode placeholders).
 - **Session status bar**: model, thinking effort, path, git state, context meter, tokens and cost, plus a
   model picker and actions (handoff, compact, fork, rename, plan, retry, stop, export). Hovering the
   context meter shows omp's `/context` breakdown (system prompt, tools, skills, messages, free space,
@@ -99,7 +105,8 @@ The default session store is `$PI_CODING_AGENT_DIR/sessions` if set, otherwise `
 | Ctrl+Shift+C | Copy terminal selection |
 | Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+drag | Always select locally, even when the app uses mouse reporting |
-| Ctrl+click | Open a hyperlink |
+| Ctrl+click | Open a hyperlink or a plain `http(s)://` / `mailto:` URL |
+| Right click | Terminal menu: copy, paste, open / copy the link under the pointer |
 
 Ctrl+C, Ctrl+X and Ctrl+V go straight to omp (omp uses Ctrl+V for image paste).
 

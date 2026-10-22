@@ -11,7 +11,7 @@ use crate::icons::{
     ICON_CIRCLE_STOP, ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS,
     ICON_FOLDER, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_KEY_ROUND,
     ICON_LIST_TREE, ICON_PLAY, ICON_PLUS, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_SEARCH,
-    ICON_SEARCH_X, ICON_TERMINAL, ICON_TRASH_2,
+    ICON_SEARCH_X, ICON_TERMINAL, ICON_TRASH_2, ICON_X,
 };
 use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot};
 use egui::collapsing_header::CollapsingState;
@@ -24,6 +24,7 @@ use egui::{
 use crate::folder_scope;
 use crate::running::RunningSnapshot;
 use crate::scope_bar::{self, ScopeAction, ScopeInput, ScopeState};
+use crate::tabs::{self, Tab, TabStatus};
 use crate::theme::{self, Palette};
 use crate::transfer::{self, TransferKind};
 use crate::widgets::{empty_state, icon_text, menu_item, paint_icon};
@@ -119,6 +120,10 @@ pub enum SidebarAction {
     BrowseScope,
     /// A path typed into the scope menu.
     TypedScope(String),
+    /// Switch to the tab at this strip index ("Open tabs").
+    ActivateTab(usize),
+    /// Close the tab at this strip index (same path as the tab strip's ✕).
+    CloseTab(usize),
 }
 
 #[derive(Default)]
@@ -158,6 +163,13 @@ pub struct SidebarInput<'a> {
     pub picker_available: bool,
     /// The native folder dialog is open.
     pub picking: bool,
+    /// Every open tab in strip order ("Open tabs" section) with the session labels and the active
+    /// index.
+    pub tabs: &'a [Tab],
+    pub labels: &'a HashMap<PathBuf, String>,
+    pub active_tab: usize,
+    /// Live omp state (`Busy` / `Attention` only) of sessions open in a tab, by session file.
+    pub tab_activity: &'a HashMap<&'a Path, TabStatus>,
 }
 
 /// Which project groups are open. A group is open while filtering, else by its user override,
@@ -341,6 +353,7 @@ pub fn show(
 ) -> SidebarOutput {
     let pal = Palette::of_ui(ui);
     let mut out = SidebarOutput::default();
+    open_tabs_section(ui, input, &mut out);
 
     let scope_actions = scope_bar::chip(
         ui,
@@ -706,16 +719,7 @@ fn group_header(
                 (hov, plus_hov),
             );
         } else {
-            p.rect_filled(rect, 9, pal.raised.gamma_multiply(0.55 * hov));
-            // Chevron, rotated by the open animation (0 = right, 1 = down).
-            let c = pos2(rect.left() + 14.0, rect.center().y);
-            let a = open_t * std::f32::consts::FRAC_PI_2;
-            let rot =
-                |x: f32, y: f32| c + vec2(x * a.cos() - y * a.sin(), x * a.sin() + y * a.cos());
-            p.add(Shape::line(
-                vec![rot(-2.5, -4.0), rot(2.5, 0.0), rot(-2.5, 4.0)],
-                Stroke::new(1.7, theme::mix(pal.weak, pal.text_strong, hov)),
-            ));
+            paint_header_chrome(p, pal, rect, open_t, hov);
             let folder = if open_t > 0.5 {
                 ICON_FOLDER_OPEN
             } else {
@@ -828,21 +832,8 @@ fn paint_header_neutral(
     open_t: f32,
     (hov, plus_hov): (f32, f32),
 ) {
-    p.rect_filled(rect, 6, pal.surface.gamma_multiply(0.7 * hov));
-    let chev = if open_t > 0.5 {
-        ICON_CHEVRON_DOWN
-    } else {
-        ICON_CHEVRON_RIGHT
-    };
+    paint_header_chrome(p, pal, rect, open_t, hov);
     let y = rect.center().y;
-    paint_icon(
-        p,
-        pos2(rect.left() + 12.0, y),
-        Align2::CENTER_CENTER,
-        chev,
-        14.0,
-        theme::mix(pal.weak, pal.text_strong, hov),
-    );
     let folder = if open_t > 0.5 {
         ICON_FOLDER_OPEN
     } else {
@@ -913,6 +904,223 @@ fn paint_header_neutral(
     }
 }
 
+/// Header hover wash and the open/closed chevron at the left (Neon: rotated by `open_t`).
+fn paint_header_chrome(p: &egui::Painter, pal: &Palette, rect: Rect, open_t: f32, hov: f32) {
+    let color = theme::mix(pal.weak, pal.text_strong, hov);
+    if theme::neutral() {
+        p.rect_filled(rect, 6, pal.surface.gamma_multiply(0.7 * hov));
+        let chev = if open_t > 0.5 {
+            ICON_CHEVRON_DOWN
+        } else {
+            ICON_CHEVRON_RIGHT
+        };
+        let c = pos2(rect.left() + 12.0, rect.center().y);
+        paint_icon(p, c, Align2::CENTER_CENTER, chev, 14.0, color);
+        return;
+    }
+    p.rect_filled(rect, 9, pal.raised.gamma_multiply(0.55 * hov));
+    // Rotated by the open animation (0 = right, 1 = down).
+    let c = pos2(rect.left() + 14.0, rect.center().y);
+    let a = open_t * std::f32::consts::FRAC_PI_2;
+    let rot = |x: f32, y: f32| c + vec2(x * a.cos() - y * a.sin(), x * a.sin() + y * a.cos());
+    p.add(Shape::line(
+        vec![rot(-2.5, -4.0), rot(2.5, 0.0), rot(-2.5, 4.0)],
+        Stroke::new(1.7, color),
+    ));
+}
+
+/// Most rows the "Open tabs" list shows before it scrolls.
+const OPEN_TABS_MAX_ROWS: f32 = 6.0;
+/// Icon slot of the status indicators in sidebar rows.
+const STATUS_SIZE: f32 = 14.0;
+
+/// "Open tabs": every tab in strip order with its status indicator; a click activates, the ✕ or a
+/// middle click closes. Pinned above the session list (its own capped scroll area).
+fn open_tabs_section(ui: &mut Ui, input: &SidebarInput<'_>, out: &mut SidebarOutput) {
+    if input.tabs.is_empty() {
+        return;
+    }
+    let pal = Palette::of_ui(ui);
+    let id = ui.make_persistent_id("open-tabs");
+    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let open_t = state.openness(ui.ctx());
+
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), header_h()), Sense::click());
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        paint_header_chrome(p, pal, rect, open_t, hov);
+        let x = rect.left() + if theme::neutral() { 26.0 } else { 28.0 };
+        let y = rect.center().y;
+        let size = if theme::neutral() { 13.0 } else { 14.0 };
+        p.text(
+            pos2(x, y),
+            Align2::LEFT_CENTER,
+            "Open tabs",
+            theme::font(size),
+            pal.text_strong,
+        );
+        // Count, plus how many wait for input (the section may be collapsed).
+        let waiting = input
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| t.status(*i == input.active_tab) == TabStatus::Attention)
+            .count();
+        let mut right = rect.right() - 10.0;
+        let count = p.text(
+            pos2(right, y),
+            Align2::RIGHT_CENTER,
+            input.tabs.len().to_string(),
+            theme::font(size - 2.0),
+            pal.weak,
+        );
+        right = count.left() - 10.0;
+        if waiting > 0 {
+            let c = pos2(right - STATUS_SIZE / 2.0, y);
+            tabs::paint_status(ui, c, STATUS_SIZE, TabStatus::Attention);
+        }
+    }
+    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+        state.toggle(ui);
+        out.interacted = true;
+    }
+    state.store(ui.ctx());
+    state.show_body_unindented(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("open-tabs-list")
+            .max_height((row_h() + 2.0) * OPEN_TABS_MAX_ROWS)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for (i, tab) in input.tabs.iter().enumerate() {
+                    open_tab_row(ui, input, i, tab, out);
+                }
+            });
+    });
+    ui.add_space(theme::dens(6.0, 8.0));
+    let sep = ui.available_rect_before_wrap();
+    ui.painter()
+        .hline(sep.x_range(), sep.top(), Stroke::new(1.0, pal.stroke));
+    ui.add_space(theme::dens(6.0, 8.0));
+}
+
+fn open_tab_row(
+    ui: &mut Ui,
+    input: &SidebarInput<'_>,
+    i: usize,
+    tab: &Tab,
+    out: &mut SidebarOutput,
+) {
+    let pal = Palette::of_ui(ui);
+    let active = i == input.active_tab;
+    let status = tab.status(active);
+    let label = tab.label(input.labels);
+    let folder = tab
+        .term()
+        .and_then(|t| t.cwd.file_name())
+        .and_then(|n| n.to_str());
+    let neutral = theme::neutral();
+
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h()), Sense::click());
+    let close_rect =
+        Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(20.0, 20.0));
+    let close = ui.interact(close_rect, resp.id.with("close"), Sense::click());
+    let ctx = ui.ctx().clone();
+    let hov =
+        ctx.animate_bool_with_time(resp.id.with("hov"), resp.hovered() || close.hovered(), 0.12);
+    let sel = ctx.animate_bool_with_time(resp.id.with("sel"), active, 0.18);
+    if active && sel < 1.0 {
+        // Just activated (from anywhere): keep its row in view.
+        ui.scroll_to_rect(rect, None);
+    }
+    if ui.is_rect_visible(rect) {
+        let pill = rect.shrink2(vec2(2.0, 0.0));
+        let p = ui.painter();
+        paint_row_bg(p, pal, pill, (hov, sel));
+        if status == TabStatus::Attention {
+            tabs::paint_attention_pill(p, pal, pill, if neutral { 6 } else { 10 });
+        }
+        let ic = pos2(
+            pill.left() + if neutral { 15.0 } else { 19.0 },
+            pill.center().y,
+        );
+        if !tabs::paint_status(ui, ic, STATUS_SIZE, status) {
+            let (icon, col) = tab.kind_icon(pal, sel);
+            paint_icon(p, ic, Align2::CENTER_CENTER, icon, STATUS_SIZE, col);
+        }
+        let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.6));
+        let mut job = LayoutJob::default();
+        job.append(
+            label,
+            0.0,
+            TextFormat {
+                font_id: theme::font(if neutral { 13.0 } else { 13.5 }),
+                color,
+                ..Default::default()
+            },
+        );
+        if let Some(folder) = folder {
+            job.append(
+                &format!("  {folder}"),
+                0.0,
+                TextFormat {
+                    font_id: theme::font(11.0),
+                    color: pal.weak,
+                    ..Default::default()
+                },
+            );
+        }
+        let text_x = pill.left() + if neutral { 28.0 } else { 32.0 };
+        job.wrap.max_width = (close_rect.left() - 4.0 - text_x).max(10.0);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = p.layout_job(job);
+        p.galley(
+            pos2(text_x, pill.center().y - galley.size().y / 2.0),
+            galley,
+            color,
+        );
+        if hov > 0.01 {
+            let ch = ctx.animate_bool_with_time(close.id.with("hov"), close.hovered(), 0.1);
+            p.circle_filled(
+                close_rect.center(),
+                10.0,
+                theme::hover_fill(pal).gamma_multiply(ch),
+            );
+            paint_icon(
+                p,
+                close_rect.center(),
+                Align2::CENTER_CENTER,
+                ICON_X,
+                14.0,
+                theme::mix(pal.weak, pal.text_strong, ch).gamma_multiply(hov),
+            );
+        }
+    }
+    let close = close.on_hover_text("Close tab");
+    let resp = resp
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_ui(|ui| {
+            ui.label(label);
+            if let Some(hint) = status.hint() {
+                ui.weak(hint);
+            }
+            if let Some(t) = tab.term() {
+                ui.weak(t.cwd.display().to_string());
+            }
+        });
+    if close.clicked() || resp.middle_clicked() {
+        out.actions.push(SidebarAction::CloseTab(i));
+    } else if resp.clicked() {
+        out.actions.push(SidebarAction::ActivateTab(i));
+        out.interacted = true;
+    }
+}
+
 fn session_row(
     ui: &mut Ui,
     entry: &SessionEntry,
@@ -925,6 +1133,12 @@ fn session_row(
     let pal = Palette::of_ui(ui);
     // A delete/move/copy of this session is in flight on a worker.
     let busy = input.busy.contains(&entry.path);
+    // The live omp state of a tab showing this session (replaces the LED).
+    let live = input
+        .tab_activity
+        .get(entry.path.as_path())
+        .copied()
+        .filter(|_| !busy);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h()), Sense::click());
     let ctx = ui.ctx().clone();
     let hov = ctx.animate_bool_with_time(
@@ -943,40 +1157,15 @@ fn session_row(
                 pill,
                 entry.label(),
                 age_text,
-                (running, busy),
+                (running, busy || live.is_some()),
                 (hov, sel),
             );
         } else {
-            p.rect_filled(
-                pill,
-                10,
-                pal.raised.gamma_multiply(0.75 * hov * (1.0 - sel)),
-            );
-            if sel > 0.01 {
-                p.rect(
-                    pill,
-                    10,
-                    theme::mix(pal.surface, pal.accent, 0.20).gamma_multiply(sel),
-                    Stroke::new(1.0, pal.accent.gamma_multiply(0.5 * sel)),
-                    StrokeKind::Inside,
-                );
-                let bar = Rect::from_center_size(
-                    pos2(pill.left() + 3.0, pill.center().y),
-                    vec2(3.0, 20.0 * sel),
-                );
-                let mut m = egui::epaint::Mesh::default();
-                m.colored_vertex(bar.left_top(), pal.accent_a);
-                m.colored_vertex(bar.right_top(), pal.accent_a);
-                m.colored_vertex(bar.left_bottom(), pal.accent_b);
-                m.colored_vertex(bar.right_bottom(), pal.accent_b);
-                m.add_triangle(0, 1, 2);
-                m.add_triangle(1, 3, 2);
-                p.add(Shape::mesh(m));
-            }
+            paint_row_bg(p, pal, pill, (hov, sel));
             // Status dot.
             let dot = pos2(pill.left() + 19.0, pill.center().y);
-            if busy {
-                // The spinner is placed below, once the painter borrow ends.
+            if busy || live.is_some() {
+                // The spinner / tab status is placed below, once the painter borrow ends.
             } else if running {
                 theme::glow_dot(p, dot, 3.5, pal.ok, theme::GLOW_REST);
             } else {
@@ -1011,17 +1200,17 @@ fn session_row(
             );
         }
     }
+    let dot = pos2(
+        rect.left() + 2.0 + if theme::neutral() { 15.0 } else { 19.0 },
+        rect.center().y,
+    );
     if busy {
         ui.put(
-            Rect::from_center_size(
-                pos2(
-                    rect.left() + 2.0 + if theme::neutral() { 15.0 } else { 19.0 },
-                    rect.center().y,
-                ),
-                vec2(12.0, 12.0),
-            ),
+            Rect::from_center_size(dot, vec2(12.0, 12.0)),
             crate::widgets::Spin::new(12.0, pal.accent_b),
         );
+    } else if let Some(status) = live {
+        tabs::paint_status(ui, dot, STATUS_SIZE, status);
     }
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     if resp.clicked() {
@@ -1130,36 +1319,30 @@ fn session_row(
     });
     resp.on_hover_ui(|ui| {
         ui.label(entry.label());
+        if let Some(hint) = live.and_then(TabStatus::hint) {
+            ui.weak(hint);
+        }
         ui.weak(format!("id: {}", entry.id));
         ui.weak(format!("cwd: {}", entry.cwd.display()));
         ui.weak(format!("file: {}", entry.path.display()));
     });
 }
 
-/// Neutral session row: quiet hover wash, selected = surface fill + strong text + 2 px accent
-/// edge; status dot at the left, age at the right.
+/// Neutral session row: status dot at the left, age at the right (background: [`paint_row_bg`]).
 fn paint_row_neutral(
     p: &egui::Painter,
     pal: &Palette,
     pill: Rect,
     label: &str,
     age_text: &str,
-    (running, busy): (bool, bool),
+    (running, placed): (bool, bool),
     (hov, sel): (f32, f32),
 ) {
-    p.rect_filled(pill, 6, pal.surface.gamma_multiply(0.6 * hov * (1.0 - sel)));
-    if sel > 0.01 {
-        p.rect_filled(pill, 6, pal.surface.gamma_multiply(sel));
-        let bar = Rect::from_center_size(
-            pos2(pill.left() + 1.0, pill.center().y),
-            vec2(2.0, 14.0 * sel),
-        );
-        p.rect_filled(bar, 1, pal.accent);
-    }
+    paint_row_bg(p, pal, pill, (hov, sel));
     let y = pill.center().y;
     let dot = pos2(pill.left() + 15.0, y);
-    if busy {
-        // The spinner is placed by the caller.
+    if placed {
+        // The spinner / tab status is placed by the caller.
     } else if running {
         p.circle_filled(dot, 3.0, pal.ok);
     } else {
@@ -1179,6 +1362,49 @@ fn paint_row_neutral(
         color,
     );
     p.galley(pos2(age_x, y - age.size().y / 2.0), age, pal.weak);
+}
+
+/// List row hover wash and selection. Neutral: surface fill + 2 px accent edge; Neon: accent-tinted
+/// card with a gradient edge.
+fn paint_row_bg(p: &egui::Painter, pal: &Palette, pill: Rect, (hov, sel): (f32, f32)) {
+    if theme::neutral() {
+        p.rect_filled(pill, 6, pal.surface.gamma_multiply(0.6 * hov * (1.0 - sel)));
+        if sel > 0.01 {
+            p.rect_filled(pill, 6, pal.surface.gamma_multiply(sel));
+            let bar = Rect::from_center_size(
+                pos2(pill.left() + 1.0, pill.center().y),
+                vec2(2.0, 14.0 * sel),
+            );
+            p.rect_filled(bar, 1, pal.accent);
+        }
+        return;
+    }
+    p.rect_filled(
+        pill,
+        10,
+        pal.raised.gamma_multiply(0.75 * hov * (1.0 - sel)),
+    );
+    if sel > 0.01 {
+        p.rect(
+            pill,
+            10,
+            theme::mix(pal.surface, pal.accent, 0.20).gamma_multiply(sel),
+            Stroke::new(1.0, pal.accent.gamma_multiply(0.5 * sel)),
+            StrokeKind::Inside,
+        );
+        let bar = Rect::from_center_size(
+            pos2(pill.left() + 3.0, pill.center().y),
+            vec2(3.0, 20.0 * sel),
+        );
+        let mut m = egui::epaint::Mesh::default();
+        m.colored_vertex(bar.left_top(), pal.accent_a);
+        m.colored_vertex(bar.right_top(), pal.accent_a);
+        m.colored_vertex(bar.left_bottom(), pal.accent_b);
+        m.colored_vertex(bar.right_bottom(), pal.accent_b);
+        m.add_triangle(0, 1, 2);
+        m.add_triangle(1, 3, 2);
+        p.add(Shape::mesh(m));
+    }
 }
 
 /// "Copy to project" / "Move to project" submenu: every other project, then "Choose folder…".

@@ -4,7 +4,7 @@ members = ["crates/deck-core", "crates/deck-term", "crates/omp-deck"]
 
 [workspace.package]
 edition = "2024"
-version = "0.3.0"
+version = "0.4.0"
 license = "MIT OR Apache-2.0"
 publish = false
 description = "Desktop wrapper for the omp coding-agent TUI: session sidebar, tabs, embedded terminal backed by tmux"
@@ -19,6 +19,7 @@ deck-term = { path = "crates/deck-term" }
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.37"
 epaint = { version = "0.37", features = ["color_fonts"] }
+egui_system_font_provider = "0.37"
 alacritty_terminal = "0.26"
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 serde = { version = "1", features = ["derive"] }

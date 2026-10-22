@@ -21,6 +21,7 @@ use egui::{FontFamily, FontId, Painter};
 
 use crate::core::Listener;
 use crate::fonts::{FAMILY_BOLD, FAMILY_PRIMARY, FAMILY_TERM};
+use crate::graphics::{self, Graphics, PLACEHOLDER, Placeholder};
 use crate::theme::{self, Palette};
 
 pub(crate) fn c32(c: Rgb) -> Color32 {
@@ -256,6 +257,8 @@ pub(crate) struct Frame {
     pub mode: TermMode,
     pub display_offset: usize,
     pub bg: Color32,
+    /// Kitty graphics placeholder cells (drawn blank, image painted over them).
+    pub placeholders: Vec<Placeholder>,
 }
 
 impl Frame {
@@ -271,6 +274,7 @@ impl Frame {
         self.cells.resize(cols * rows, FCell::default());
         self.zerowidth.clear();
         self.links.clear();
+        self.placeholders.clear();
         self.mode = content.mode;
         self.display_offset = offset;
         self.bg = c32(theme::indexed(
@@ -325,7 +329,16 @@ impl Frame {
             if selection.is_some_and(|s| s.contains(indexed.point)) {
                 out.bg = selection_bg;
             }
-            if cell.extra.is_some() {
+            if cell.c == PLACEHOLDER {
+                // Raw colors carry the image/placement ids; the glyph itself is never drawn.
+                out.c = ' ';
+                let zw = cell.zerowidth().unwrap_or(&[]);
+                let left = self.placeholders.last();
+                let ul = cell.underline_color();
+                if let Some(ph) = graphics::placeholder(row, col, cell.fg, ul, zw, left) {
+                    self.placeholders.push(ph);
+                }
+            } else if cell.extra.is_some() {
                 if let Some(zw) = cell.zerowidth() {
                     out.zw_start = self.zerowidth.len() as u32;
                     out.zw_len = zw.len().min(usize::from(u16::MAX)) as u16;
@@ -368,6 +381,21 @@ impl Frame {
     }
 }
 
+/// Viewport cells of a hovered plain-text URL, (row, col) inclusive; `start` may lie above the
+/// viewport (negative row) when the URL's line is scrolled partly out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UrlSpan {
+    pub start: (i32, usize),
+    pub end: (i32, usize),
+}
+
+impl UrlSpan {
+    fn contains(&self, row: usize, col: usize) -> bool {
+        let p = (row as i32, col);
+        self.start <= p && p <= self.end
+    }
+}
+
 /// Inputs to [`paint`] besides the frame.
 pub(crate) struct PaintParams<'a> {
     /// Pixel-snapped top-left of cell (0, 0).
@@ -378,6 +406,10 @@ pub(crate) struct PaintParams<'a> {
     pub focused: bool,
     /// Hovered hyperlink (Ctrl held) to underline.
     pub hover_link: u16,
+    /// Hovered plain-text URL (Ctrl held) to underline.
+    pub hover_url: Option<UrlSpan>,
+    /// Kitty graphics images shown by placeholder cells.
+    pub graphics: &'a Graphics,
     pub preedit: &'a str,
     pub banner: Option<&'a str>,
 }
@@ -449,6 +481,7 @@ pub(crate) fn paint(
     if !bg_mesh.is_empty() {
         painter.add(Shape::mesh(bg_mesh));
     }
+    paint_images(frame, painter, p.graphics, m, ox_px, oy_px);
 
     // 2. Text rows (+ per-cell special glyphs), 3. decorations into the foreground mesh.
     let mut fg_mesh = Mesh::default();
@@ -487,7 +520,8 @@ pub(crate) fn paint(
                 ppp: m.ppp,
                 color: cell.underline,
             };
-            let hovered = p.hover_link != 0 && cell.link == p.hover_link;
+            let hovered = (p.hover_link != 0 && cell.link == p.hover_link)
+                || p.hover_url.is_some_and(|u| u.contains(row, col));
             draw_underline(&mut cp, cell.flags, hovered, underline_top, line_px);
             if cell.flags.contains(Flags::STRIKEOUT) {
                 cp.color = cell.fg;
@@ -646,6 +680,62 @@ pub(crate) fn paint(
             frame.cursor_color,
         );
         painter.galley(pos2(x_of(0) + m.cell_w, y), galley, Color32::WHITE);
+    }
+}
+
+/// Draws the image part of every placeholder cell: one textured mesh per image.
+fn paint_images(
+    frame: &Frame,
+    painter: &Painter,
+    graphics: &Graphics,
+    m: &Metrics,
+    ox_px: f32,
+    oy_px: f32,
+) {
+    if frame.placeholders.is_empty() {
+        return;
+    }
+    let ctx = painter.ctx();
+    let cell = [m.cell_w_px, m.cell_h_px];
+    let mut meshes: Vec<Mesh> = Vec::new();
+    let mut store = graphics.paint_lock();
+    // Placeholder runs share one image: look it up once per run.
+    let mut last = None;
+    for ph in &frame.placeholders {
+        let target = match last {
+            Some((id, pid, t)) if (id, pid) == (ph.id, ph.pid) => t,
+            _ => {
+                let t = store.target(ctx, ph.id, ph.pid);
+                last = Some((ph.id, ph.pid, t));
+                t
+            }
+        };
+        let Some((texture, size, box_cells)) = target else {
+            continue;
+        };
+        let box_cells = graphics::resolve_box(box_cells, size, cell);
+        let Some((local, uv)) = graphics::cell_quad(box_cells, size, cell, ph.img_row, ph.img_col)
+        else {
+            continue;
+        };
+        let x0 = ox_px + ph.col as f32 * m.cell_w_px;
+        let y0 = oy_px + ph.row as f32 * m.cell_h_px;
+        let rect = Rect::from_min_max(
+            pos2((x0 + local.min.x) / m.ppp, (y0 + local.min.y) / m.ppp),
+            pos2((x0 + local.max.x) / m.ppp, (y0 + local.max.y) / m.ppp),
+        );
+        let i = match meshes.iter().position(|mesh| mesh.texture_id == texture) {
+            Some(i) => i,
+            None => {
+                meshes.push(Mesh::with_texture(texture));
+                meshes.len() - 1
+            }
+        };
+        meshes[i].add_rect_with_uv(rect, uv, Color32::WHITE);
+    }
+    drop(store);
+    for mesh in meshes {
+        painter.add(Shape::mesh(mesh));
     }
 }
 
@@ -1262,6 +1352,8 @@ mod tests {
                 cursor_visible: false,
                 focused: false,
                 hover_link: 0,
+                hover_url: None,
+                graphics: &Graphics::new(ui.ctx().clone()),
                 preedit: "",
                 banner: None,
             };

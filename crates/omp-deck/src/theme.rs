@@ -437,6 +437,26 @@ pub fn section_caption(text: &str, color: Color32) -> RichText {
     }
 }
 
+/// Reading style for egui_commonmark text (apply inside a `ui.scope`): headings a step above the
+/// body rather than the app's title size, drawn in `text_strong` (the viewer paints headings and
+/// **strong** in the "strong" text colour), inline code on `raised` so it stands out on a
+/// `surface` card, monospace a notch below the body, a little air between wrapped rows.
+pub fn markdown_style(style: &mut Style, p: &Palette) {
+    let body = style
+        .text_styles
+        .get(&TextStyle::Body)
+        .map_or(13.0, |f| f.size);
+    if let Some(h) = style.text_styles.get_mut(&TextStyle::Heading) {
+        h.size = body + 5.0;
+    }
+    if let Some(m) = style.text_styles.get_mut(&TextStyle::Monospace) {
+        m.size = body - 1.0;
+    }
+    style.spacing.item_spacing.y = 3.0;
+    style.visuals.code_bg_color = p.raised;
+    style.visuals.widgets.active.fg_stroke.color = p.text_strong;
+}
+
 /// Bar background at horizontal position `t` (0..=1): the Neon violet→cyan wash, flat in Neutral.
 pub fn bar_tint(p: &Palette, t: f32) -> Color32 {
     if neutral() {

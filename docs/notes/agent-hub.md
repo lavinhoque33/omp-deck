@@ -261,6 +261,7 @@ Every non-header line is `{type, id, parentId, timestamp, runtime:{version}, …
    {"type":"message","message":{"role":"user","content":[{"type":"text","text":"Complete assignment thoroughly:\n\n# Target…"}],"attribution":"agent","timestamp":1792592353608}}
    ```
    - `attribution` is `"agent"` for the assignment and `"user"` for chat typed in the Hub (`"/SubTwo"` in the sandbox).
+   - A steer from another agent carries `"steering":true` and text like `[Wait interrupted by message]\n<irc from="parent" agent="Main">\n…markdown…\n</irc>`. OmpDeck splits every `<irc>` block out into its own IRC row (`TranscriptItem::Irc`: `from`, `agent`, body, the bracketed line as a note); text around the blocks stays a user row.
 2. **Assistant**, content blocks `thinking`, `text`, `toolCall`:
    ```json
    {"message":{"role":"assistant","content":[
@@ -303,7 +304,8 @@ Every non-header line is `{type, id, parentId, timestamp, runtime:{version}, …
    ```json
    {"type":"custom_message","customType":"irc:incoming","content":"<irc>\nIncoming IRC message from agent `CoreOmp`:…","display":true,"details":{"id":"…","from":"CoreOmp","message":"…"},"attribution":"agent"}
    ```
-   - `async-result` (section 3) renders as a notice.
+   - `async-result` (section 3) renders as a notice. Its `<system-notice>` / `<task-result …>` / `<output>` wrappers render as captioned subsections (`deck_core::agents::markup`: a wrapper is a lowercase tag alone on its line, closed by `</name>` alone on a later line, outside fenced code).
+   - `irc:*` notices go through the same `<irc>` split as steers; the "Incoming IRC message from agent `X`:" line becomes the agent.
    - The Hub's own renderer handles `display:false` by hiding.
 6. **Message roles `developer` and `custom`:**
    - `{"role":"developer","content":[{"type":"text","text":"<system-reminder reason=\"rule_violation\" rule=\"rs-lazylock\"…"}]}` (rule injections).

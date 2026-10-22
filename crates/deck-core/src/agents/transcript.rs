@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::TranscriptItem;
+use super::markup::{Segment, bracket_note, segments};
 use super::tail::{self, LineTail, cap_bytes, from_epoch_ms, line_type, one_line};
 use crate::status::lock;
 
@@ -143,6 +144,78 @@ fn call_summary(args: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Splits `text` around its `<irc>` blocks: each becomes a [`TranscriptItem::Irc`] (a bracketed
+/// note line just before it rides along as its note), every other stretch goes through `other`.
+fn push_split_irc(
+    text: String,
+    out: &mut Vec<TranscriptItem>,
+    other: impl Fn(String) -> TranscriptItem,
+) {
+    let segs = segments(&text);
+    if !segs
+        .iter()
+        .any(|s| matches!(s, Segment::Tagged(t) if t.name == "irc"))
+    {
+        out.push(other(text));
+        return;
+    }
+    // `note`: a bracketed-note text segment waiting to see whether a block follows it.
+    let mut note: Option<&str> = None;
+    let mut rest = String::new();
+    let flush = |rest: &mut String, out: &mut Vec<TranscriptItem>| {
+        let t = rest.trim();
+        if !t.is_empty() {
+            out.push(other(t.to_owned()));
+        }
+        rest.clear();
+    };
+    for seg in &segs {
+        let irc = match seg {
+            Segment::Tagged(t) if t.name == "irc" => t,
+            seg => {
+                rest.extend(note.take());
+                match seg {
+                    Segment::Text(s) if bracket_note(s).is_some() => note = Some(s),
+                    Segment::Text(s) => rest.push_str(s),
+                    Segment::Tagged(t) => {
+                        rest.push_str(t.raw);
+                        rest.push('\n');
+                    }
+                }
+                continue;
+            }
+        };
+        flush(&mut rest, out);
+        let (agent, body) = match irc.attr("agent") {
+            Some(a) => (Some(a.to_owned()), irc.body),
+            None => incoming_line(irc.body),
+        };
+        out.push(TranscriptItem::Irc {
+            from: irc.attr("from").map(str::to_owned),
+            agent,
+            text: body.trim().to_owned(),
+            note: note.take().and_then(bracket_note).map(str::to_owned),
+        });
+    }
+    rest.extend(note);
+    flush(&mut rest, out);
+}
+
+/// An `irc:incoming` body opens with "Incoming IRC message from agent `X`:"; that line becomes
+/// the agent.
+fn incoming_line(body: &str) -> (Option<String>, &str) {
+    let body = body.trim_start();
+    let (first, rest) = body.split_once('\n').unwrap_or((body, ""));
+    let agent = first
+        .trim()
+        .strip_prefix("Incoming IRC message from agent `")
+        .and_then(|a| a.strip_suffix("`:"));
+    match agent {
+        Some(a) => (Some(a.to_owned()), rest),
+        None => (None, body),
+    }
+}
+
 /// Maps one transcript line to zero or more items; unknown/hidden/malformed lines add nothing.
 fn map_line(line: &[u8], out: &mut Vec<TranscriptItem>) {
     match line_type(line) {
@@ -155,10 +228,15 @@ fn map_line(line: &[u8], out: &mut Vec<TranscriptItem>) {
                 return;
             }
             let text = cap_bytes(text_of(m.content, "\n"), MAX_NOTICE).0;
-            out.push(TranscriptItem::Notice {
-                kind: m.custom_type.unwrap_or_else(|| "message".into()),
-                text,
-            });
+            let kind = m.custom_type.unwrap_or_else(|| "message".into());
+            if kind.starts_with("irc") {
+                push_split_irc(text, out, |text| TranscriptItem::Notice {
+                    kind: kind.clone(),
+                    text,
+                });
+            } else {
+                out.push(TranscriptItem::Notice { kind, text });
+            }
         }
         Some("compaction") => {
             if let Some(c) = parse::<Compaction>(line, "compaction") {
@@ -213,11 +291,18 @@ fn map_message(line: &[u8], out: &mut Vec<TranscriptItem>) {
     let m = entry.message;
     let at = m.timestamp.and_then(from_epoch_ms);
     match role {
-        "user" => out.push(TranscriptItem::User {
-            text: cap_bytes(text_of(m.content, "\n"), MAX_TEXT).0,
-            from_agent: m.attribution.as_deref() == Some("agent"),
-            at,
-        }),
+        "user" => {
+            let from_agent = m.attribution.as_deref() == Some("agent");
+            push_split_irc(
+                cap_bytes(text_of(m.content, "\n"), MAX_TEXT).0,
+                out,
+                |text| TranscriptItem::User {
+                    text,
+                    from_agent,
+                    at,
+                },
+            );
+        }
         "toolResult" => {
             let (text, truncated) = cap_bytes(text_of(m.content, "\n"), MAX_TOOL_RESULT);
             out.push(TranscriptItem::ToolResult {

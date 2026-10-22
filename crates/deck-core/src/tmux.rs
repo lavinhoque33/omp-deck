@@ -346,6 +346,16 @@ pub fn effective_cwd(cwd: &Path) -> PathBuf {
     }
 }
 
+/// Overrides omp honours: inside tmux it would otherwise disable images (OmpDeck renders kitty
+/// Unicode-placeholder images) and never emit OSC 8 hyperlinks.
+const OMP_ENV: [(&str, &str); 3] = [
+    ("PI_FORCE_IMAGE_PROTOCOL", "kitty"),
+    ("PI_KITTY_PLACEHOLDERS", "1"),
+    ("PI_FORCE_HYPERLINKS", "1"),
+];
+
+/// Environment of the PTY child (tmux client or omp itself); a tmux server started by it
+/// inherits the omp overrides, and the generated config sets them for running servers too.
 pub fn terminal_env() -> Vec<(String, String)> {
     [
         ("TERM", "xterm-256color"),
@@ -353,6 +363,7 @@ pub fn terminal_env() -> Vec<(String, String)> {
         ("TERM_PROGRAM", "omp-deck"),
     ]
     .into_iter()
+    .chain(OMP_ENV)
     .map(|(k, v)| (k.to_owned(), v.to_owned()))
     .collect()
 }
@@ -397,9 +408,15 @@ bind -T copy-mode TripleClick1Pane select-pane \; send-keys -X select-line \; ru
 bind -T copy-mode Any if -F '#{!=:#{mouse_x},}' '' { send-keys -X cancel ; send-keys }
 "#;
 
-/// The generated tmux.conf: makes tmux invisible (no status bar, no prefix) and passes
-/// through everything omp needs (extended keys, clipboard, hyperlinks, focus, titles).
-/// Idempotent under repeated `source-file` (`-q` unbinds, indexed terminal-features).
+/// The generated tmux.conf: makes tmux invisible (no status bar, no prefix), passes through
+/// everything omp needs (extended keys, clipboard, hyperlinks, focus, titles) and puts omp's
+/// image/hyperlink overrides into the global environment (new sessions of an already running
+/// server get them). Idempotent under repeated `source-file` (`-q` unbinds, indexed
+/// terminal-features, `set-environment` overwrites).
 pub fn config_text() -> String {
-    CONFIG_TEXT.to_owned()
+    let mut text = CONFIG_TEXT.to_owned();
+    for (k, v) in OMP_ENV {
+        text.push_str(&format!("set-environment -g {k} {v}\n"));
+    }
+    text
 }

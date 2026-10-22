@@ -1,6 +1,7 @@
 //! PTY wrapper that watches the child's output for xterm modifyOtherKeys requests
-//! (`CSI > 4 ; n m`), which alacritty_terminal parses but ignores. Everything else is delegated
-//! to alacritty's [`tty::Pty`].
+//! (`CSI > 4 ; n m`), which alacritty_terminal parses but ignores, and for kitty graphics
+//! commands (APC strings, ignored by alacritty). Everything else is delegated to alacritty's
+//! [`tty::Pty`].
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -11,6 +12,8 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite};
 use polling::{Event, PollMode, Poller};
+
+use crate::graphics::{ApcScanner, Graphics};
 
 /// Byte-level recogniser for `CSI > Pp ; Pv m` and RIS (`ESC c`). Keeps its state between
 /// reads, so sequences split across reads are recognised.
@@ -109,19 +112,24 @@ impl MokScanner {
     }
 }
 
-/// Reader half: a dup of the PTY master fd whose reads are scanned.
+/// Reader half: a dup of the PTY master fd whose reads are scanned (bytes pass unchanged).
 pub(crate) struct ScanReader {
     file: File,
     scanner: MokScanner,
     level: Arc<AtomicU8>,
+    apc: ApcScanner,
+    graphics: Arc<Graphics>,
 }
 
 impl Read for ScanReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.file.read(buf)?;
-        if let Some(level) = self.scanner.feed(&buf[..n]) {
+        let bytes = &buf[..n];
+        if let Some(level) = self.scanner.feed(bytes) {
             self.level.store(level, Ordering::Relaxed);
         }
+        let graphics = &self.graphics;
+        self.apc.feed(bytes, |cmd| graphics.apply(cmd));
         Ok(n)
     }
 }
@@ -202,11 +210,12 @@ pub(crate) struct TrackedPty {
 
 impl TrackedPty {
     /// `level` receives the child's current modifyOtherKeys level (0 = off); `progress` counts
-    /// the input bytes written.
+    /// the input bytes written; kitty graphics commands go to `graphics`.
     pub(crate) fn new(
         pty: tty::Pty,
         level: Arc<AtomicU8>,
         progress: Arc<WriteProgress>,
+        graphics: Arc<Graphics>,
     ) -> io::Result<TrackedPty> {
         let file = pty.file().try_clone()?;
         let writer = CountingWriter {
@@ -218,6 +227,8 @@ impl TrackedPty {
                 file,
                 scanner: MokScanner::default(),
                 level,
+                apc: ApcScanner::default(),
+                graphics,
             },
             writer,
             pty,

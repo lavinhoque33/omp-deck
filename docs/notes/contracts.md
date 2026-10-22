@@ -108,9 +108,11 @@ pub fn new_session_name(now: SystemTime) -> String; // "omp-new-<unix-ms>"
 pub fn direct_launch(cwd: &Path, argv: &[String]) -> LaunchSpec;
 /// cwd if it is an existing dir, else $HOME (else "/").
 pub fn effective_cwd(cwd: &Path) -> PathBuf;
-/// [("TERM","xterm-256color"),("COLORTERM","truecolor"),("TERM_PROGRAM","omp-deck")]
+/// [("TERM","xterm-256color"),("COLORTERM","truecolor"),("TERM_PROGRAM","omp-deck"),
+///  ("PI_FORCE_IMAGE_PROTOCOL","kitty"),("PI_KITTY_PLACEHOLDERS","1"),("PI_FORCE_HYPERLINKS","1")]
 pub fn terminal_env() -> Vec<(String, String)>;
-/// The generated tmux.conf text (see docs/notes/tmux.md).
+/// The generated tmux.conf text (see docs/notes/tmux.md); ends with `set-environment -g` of the
+/// PI_* overrides above.
 pub fn config_text() -> String;
 ```
 
@@ -1015,3 +1017,19 @@ shape, stats.db schema, extension imports, timings).
   savings, top tool schemas (≤ 8 + "N more"), skills count. Without a breakdown (no live control /
   old extension): current numbers + note that the full breakdown needs live control.
 - Both styles (Neutral default, Neon) and Compact/Comfortable density; lucide icons; no per-frame allocation.
+
+## Tab activity indicators, "Open tabs" sidebar section
+
+- `tabs::TabStatus::of(exit_code, Activity::from_title(title), bell && !active)`: precedence
+  Exited > Attention (`π !`) > Busy (spinner glyph) > Bell > Idle. `tabs::paint_status` draws it (check/x,
+  amber `!` badge, `widgets::Spin`, warn dot; Idle → caller's own icon/LED) for the tab strip, the
+  "Open tabs" rows and session rows; `tabs::paint_attention_pill` tints Attention pills/rows. No pulse:
+  idle frames stay free (the spinner repaints at 10 fps only while visible).
+- Tab labels use `Tab::label` (omp's `π <glyph>` prefix stripped, also from stored fallback titles);
+  `Tab::title` stays raw for persistence/kill labels.
+- Background tabs: `Terminal::poll` runs every frame for every tab; title events repaint through the
+  hidden-tab gate (≤ 1 per 250 ms), so indicators update without input.
+- Sidebar: "Open tabs" (collapsible, count + amber badge when any tab waits, ≤ 6 rows then scrolls) pinned
+  above the scope chip; click → `SidebarAction::ActivateTab(i)`, ✕/middle-click → `CloseTab(i)` (app routes
+  both through `apply_tab_action`, i.e. `request_close`). Session rows whose file is open in a tab show
+  that tab's Busy/Attention (`SidebarInput::tab_activity`, built per frame) instead of the running LED.

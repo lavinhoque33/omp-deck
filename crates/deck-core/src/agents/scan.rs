@@ -435,7 +435,7 @@ fn content_text(c: Option<ContentLite>) -> String {
 // Task text
 
 /// Removes omp's assignment preamble (both real wordings).
-pub(crate) fn strip_preamble(task: &str) -> &str {
+pub fn strip_preamble(task: &str) -> &str {
     let t = task.trim_start();
     let rest = if let Some(r) = t.strip_prefix("Complete the assignment below,") {
         r.trim_start().strip_prefix("thoroughly:")
@@ -445,25 +445,28 @@ pub(crate) fn strip_preamble(task: &str) -> &str {
     rest.map_or(t, str::trim_start)
 }
 
+/// The body of the `# Target` section, if there is one.
+pub(crate) fn target_section(body: &str) -> Option<&str> {
+    let mut start = None;
+    let mut off = 0;
+    for line in body.split_inclusive('\n') {
+        let l = line.trim_end_matches(['\n', '\r']);
+        match start {
+            None if l.trim_end() == "# Target" || l.starts_with("# Target ") => {
+                start = Some(off + line.len());
+            }
+            Some(s) if l.starts_with("# ") => return Some(&body[s..off]),
+            _ => {}
+        }
+        off += line.len();
+    }
+    start.map(|s| &body[s..])
+}
+
 /// Preamble stripped; the `# Target` section when one exists; ≤ 1000 chars.
 pub(crate) fn task_gist(task: &str) -> String {
     let body = strip_preamble(task);
-    let mut section: Option<Vec<&str>> = None;
-    for line in body.lines() {
-        match &mut section {
-            None if line.trim_end() == "# Target" || line.starts_with("# Target ") => {
-                section = Some(Vec::new());
-            }
-            None => {}
-            Some(_) if line.starts_with("# ") => break,
-            Some(lines) => lines.push(line),
-        }
-    }
-    let text = match section {
-        Some(lines) => lines.join("\n"),
-        None => body.to_owned(),
-    };
-    let text = text.trim();
+    let text = target_section(body).unwrap_or(body).trim();
     match text.char_indices().nth(MAX_GIST_CHARS) {
         Some((i, _)) => text[..i].trim_end().to_owned(),
         None => text.to_owned(),

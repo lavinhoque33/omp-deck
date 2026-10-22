@@ -11,9 +11,11 @@ use crate::icons::Icon;
 use crate::icons::{
     ICON_ARROW_LEFT_RIGHT, ICON_BELL, ICON_BRAIN, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT,
     ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CLIPBOARD_LIST, ICON_FILE_TEXT, ICON_FOLD_VERTICAL,
-    ICON_NETWORK, ICON_PENCIL, ICON_POWER, ICON_SEARCH, ICON_TERMINAL, ICON_USER, ICON_WRENCH,
+    ICON_MESSAGES_SQUARE, ICON_NETWORK, ICON_PENCIL, ICON_POWER, ICON_SEARCH, ICON_TERMINAL,
+    ICON_USER, ICON_WRENCH,
 };
 use deck_core::agents::TranscriptItem;
+use deck_core::agents::markup::{self, Segment};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align, Align2, Color32, CursorIcon, FontFamily, FontId, Frame, Margin, RichText, ScrollArea,
@@ -30,6 +32,10 @@ const GAP: f32 = 10.0;
 const OVERSCAN: f32 = 400.0;
 const HEADER_H: f32 = 28.0;
 const RESULT_MAX_H: f32 = 280.0;
+/// Collapsed-header preview length (chars).
+const PREVIEW: usize = 160;
+/// Wrapper blocks nest at most this deep before their body is shown verbatim.
+const MAX_TAG_DEPTH: usize = 3;
 
 /// One drawn row: a lone item, or a tool call merged with its result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +86,7 @@ fn default_open(items: &[TranscriptItem], row: Row) -> bool {
         Row::Single(i) => match &items[i] {
             TranscriptItem::User { from_agent, .. } => !from_agent,
             TranscriptItem::Notice { text, .. } => text.len() < 400,
+            TranscriptItem::Irc { .. } => true,
             TranscriptItem::ToolResult { is_error, .. } => *is_error,
             _ => false,
         },
@@ -102,6 +109,7 @@ fn estimate(items: &[TranscriptItem], row: Row, width: f32) -> f32 {
             TranscriptItem::User { .. } | TranscriptItem::Thinking { .. } => HEADER_H + 22.0,
             TranscriptItem::Error { message } => 40.0 + text_height(message),
             TranscriptItem::Notice { text, .. } => 48.0 + text_height(text).min(160.0),
+            TranscriptItem::Irc { text, .. } => HEADER_H + 24.0 + text_height(text),
             _ => 34.0,
         },
     }
@@ -119,7 +127,7 @@ fn tool_icon(name: &str) -> Icon {
     }
 }
 
-/// A single-line, ellipsized layout of coloured parts.
+/// A single-line, ellipsized layout of coloured parts, vertically centred on each other.
 fn line_job(parts: &[(&str, FontId, Color32)], max_width: f32) -> LayoutJob {
     let mut job = LayoutJob::default();
     for (text, font, color) in parts {
@@ -129,6 +137,7 @@ fn line_job(parts: &[(&str, FontId, Color32)], max_width: f32) -> LayoutJob {
             TextFormat {
                 font_id: font.clone(),
                 color: *color,
+                valign: Align::Center,
                 ..TextFormat::default()
             },
         );
@@ -229,7 +238,7 @@ fn header(ui: &mut Ui, h: &Header<'_>) -> bool {
     resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
 }
 
-/// Rounded surface with a coloured bar on the left; fills the available width.
+/// Rounded surface whose left edge is a coloured bar; fills the available width.
 fn bubble<R>(
     ui: &mut Ui,
     fill: Color32,
@@ -238,21 +247,22 @@ fn bubble<R>(
     add: impl FnOnce(&mut Ui) -> R,
 ) -> R {
     let pal = Palette::of_ui(ui);
+    let radius = theme::rad(8, 10);
     let inner = Frame::NONE
         .fill(fill)
         .stroke(Stroke::new(1.0, pal.stroke.gamma_multiply(0.8)))
-        .corner_radius(theme::rad(8, 10))
+        .corner_radius(radius)
         .inner_margin(margin)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)
         });
+    // The bubble's own rounded shape clipped to a 3 px strip, so the bar follows its corners.
     let r = inner.response.rect;
-    let bar_rect = egui::Rect::from_min_max(
-        egui::pos2(r.left() + 1.0, r.top() + 8.0),
-        egui::pos2(r.left() + 4.0, r.bottom() - 8.0),
-    );
-    ui.painter().rect_filled(bar_rect, 2, bar);
+    let strip = egui::Rect::from_min_max(r.left_top(), egui::pos2(r.left() + 3.0, r.bottom()));
+    ui.painter()
+        .with_clip_rect(strip.intersect(ui.clip_rect()))
+        .rect_filled(r, radius, bar);
     inner.inner
 }
 
@@ -283,6 +293,125 @@ fn mono_block(ui: &mut Ui, text: &str, color: Color32, salt: (usize, &'static st
                     );
                 });
         });
+}
+
+/// Markdown in the reading style of [`theme::markdown_style`], its ATX headings drawn as
+/// separate, weighted section titles (level 1–2 underlined by a hairline) so sections stand
+/// apart from their bodies.
+fn markdown(ui: &mut Ui, md: &mut CommonMarkCache, text: &str) {
+    let pal = Palette::of_ui(ui);
+    ui.scope(|ui| {
+        theme::markdown_style(ui.style_mut(), pal);
+        for (n, (heading, body)) in markup::sections(text).into_iter().enumerate() {
+            if let Some(h) = heading {
+                section_heading(ui, h, n == 0);
+            }
+            let body = body.trim_matches('\n');
+            if !body.trim().is_empty() {
+                CommonMarkViewer::new().show(ui, md, body);
+            }
+        }
+    });
+}
+
+/// A section title: weighted, a step above the body; Neon tints levels 1–2 with its cyan accent.
+fn section_heading(ui: &mut Ui, h: markup::Heading<'_>, first: bool) {
+    let pal = Palette::of_ui(ui);
+    let body = ui
+        .style()
+        .text_styles
+        .get(&egui::TextStyle::Body)
+        .map_or(13.0, |f| f.size);
+    let major = if theme::neutral() {
+        pal.text_strong
+    } else {
+        pal.accent_b
+    };
+    let (size, color) = match h.level {
+        1 => (body + 1.0, major),
+        2 => (body, major),
+        _ => (body - 1.0, pal.text_strong),
+    };
+    ui.add_space(if first { 2.0 } else { 12.0 });
+    ui.add(
+        egui::Label::new(
+            theme::strong(markup::preview(h.text, 200))
+                .size(size)
+                .color(color),
+        )
+        .wrap_mode(egui::TextWrapMode::Wrap),
+    );
+    if h.level <= 2 {
+        ui.add_space(3.0);
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().hline(
+            r.x_range(),
+            r.center().y,
+            Stroke::new(1.0, theme::mix(pal.stroke, pal.weak, 0.3)),
+        );
+    }
+    ui.add_space(5.0);
+}
+
+/// `text` as markdown with its wrapper blocks (`<system-notice>`, `<context>`, …) drawn as
+/// captioned subsections instead of literal tags.
+fn rich_text(ui: &mut Ui, md: &mut CommonMarkCache, text: &str, depth: usize) {
+    let pal = Palette::of_ui(ui);
+    for seg in markup::segments(text) {
+        match seg {
+            Segment::Text(t) => markdown(ui, md, t.trim_matches('\n')),
+            Segment::Tagged(t) => {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    caption(ui, &t.name.replace(['-', '_'], " "), pal.weak);
+                    let attrs = t
+                        .attrs
+                        .iter()
+                        .map(|(k, v)| {
+                            if v.is_empty() {
+                                (*k).to_owned()
+                            } else {
+                                format!("{k} {v}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    if !attrs.is_empty() {
+                        ui.add(
+                            egui::Label::new(RichText::new(attrs).size(11.0).color(pal.weak))
+                                .truncate()
+                                .selectable(false),
+                        );
+                    }
+                });
+                let body = t.body.trim_matches('\n');
+                if !body.trim().is_empty() {
+                    ui.add_space(3.0);
+                    Frame::NONE
+                        .fill(theme::mix(pal.bg, pal.surface, 0.5))
+                        .stroke(Stroke::new(1.0, pal.stroke.gamma_multiply(0.6)))
+                        .corner_radius(theme::rad(6, 8))
+                        .inner_margin(Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            if t.name == "output" || depth >= MAX_TAG_DEPTH {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(body)
+                                            .font(FontId::new(12.0, FontFamily::Monospace))
+                                            .color(pal.text),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                );
+                            } else {
+                                rich_text(ui, md, body, depth + 1);
+                            }
+                        });
+                }
+                ui.add_space(6.0);
+            }
+        }
+    }
 }
 
 /// Live state of the transcript tab.
@@ -583,7 +712,7 @@ impl TranscriptView {
                 } else {
                     ("You", ICON_USER)
                 };
-                let preview = crate::agent_model::one_line(text, 160);
+                let preview = markup::preview(text, PREVIEW);
                 let user_c = if theme::neutral() {
                     pal.weak
                 } else {
@@ -620,7 +749,7 @@ impl TranscriptView {
                                 })
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    CommonMarkViewer::new().show(ui, &mut self.md, text);
+                                    rich_text(ui, &mut self.md, markup::strip_preamble(text), 0);
                                 });
                         }
                         c
@@ -657,11 +786,11 @@ impl TranscriptView {
                         }
                     });
                     ui.add_space(2.0);
-                    CommonMarkViewer::new().show(ui, &mut self.md, text);
+                    markdown(ui, &mut self.md, text);
                 });
             }
             TranscriptItem::Thinking { text } => {
-                let preview = crate::agent_model::one_line(text, 160);
+                let preview = markup::preview(text, PREVIEW);
                 let clicked = header(
                     ui,
                     &Header {
@@ -728,7 +857,7 @@ impl TranscriptView {
             }
             TranscriptItem::ToolCall { .. } => {}
             TranscriptItem::Notice { kind, text } => {
-                let preview = crate::agent_model::one_line(text, 160);
+                let preview = markup::preview(text, PREVIEW);
                 let clicked = bubble(
                     ui,
                     theme::mix(pal.surface, pal.warn, 0.06),
@@ -760,12 +889,65 @@ impl TranscriptView {
                                 })
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(text).size(13.0).color(pal.text),
-                                        )
-                                        .wrap_mode(egui::TextWrapMode::Wrap),
-                                    );
+                                    rich_text(ui, &mut self.md, text, 0);
+                                });
+                        }
+                        c
+                    },
+                );
+                if clicked {
+                    self.toggle(i);
+                }
+            }
+            TranscriptItem::Irc {
+                from,
+                agent,
+                text,
+                note,
+            } => {
+                let title = match (agent, from) {
+                    (Some(a), Some(f)) if a != f => format!("IRC · from {a} ({f})"),
+                    (Some(who), _) | (None, Some(who)) => format!("IRC · from {who}"),
+                    (None, None) => "IRC".to_owned(),
+                };
+                let preview = if open {
+                    note.clone().unwrap_or_default()
+                } else {
+                    markup::preview(text, PREVIEW)
+                };
+                let tint = if ui.visuals().dark_mode { 0.12 } else { 0.16 };
+                let clicked = bubble(
+                    ui,
+                    theme::mix(pal.surface, pal.warn, tint),
+                    pal.warn,
+                    Margin::symmetric(8, 2),
+                    |ui| {
+                        let c = header(
+                            ui,
+                            &Header {
+                                open,
+                                icon: ICON_MESSAGES_SQUARE,
+                                icon_color: pal.warn,
+                                title: &title,
+                                title_font: crate::theme::font(13.0),
+                                title_color: pal.text_strong,
+                                headline: &preview,
+                                headline_color: pal.weak,
+                                tail: "",
+                                badge: Badge::None,
+                            },
+                        );
+                        if open {
+                            Frame::NONE
+                                .inner_margin(Margin {
+                                    left: 10,
+                                    right: 8,
+                                    top: 2,
+                                    bottom: 8,
+                                })
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    rich_text(ui, &mut self.md, text, 0);
                                 });
                         }
                         c
@@ -816,7 +998,7 @@ impl TranscriptView {
                         })
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            CommonMarkViewer::new().show(ui, &mut self.md, summary);
+                            markdown(ui, &mut self.md, summary);
                         });
                 }
                 if clicked {
