@@ -13,9 +13,9 @@ use crate::icons::{
     ICON_GIT_FORK, ICON_HANDSHAKE, ICON_LIST_TREE, ICON_MAP, ICON_NETWORK, ICON_PENCIL,
     ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE, ICON_TERMINAL,
 };
-use deck_core::ctl::ContextBreakdown;
+use deck_core::ctl::{ContextBreakdown, LiveModel};
 use deck_core::omp::ModelInfo;
-use deck_core::status::{GitInfo, SessionStatus};
+use deck_core::status::{GitInfo, SessionStats, SessionStatus};
 use egui::{
     Align, Align2, Color32, CursorIcon, Frame, Layout, Margin, Painter, Pos2, Rect, Response,
     RichText, Sense, Shape, Stroke, Ui, UiBuilder, pos2, vec2,
@@ -66,6 +66,8 @@ pub struct GitView {
 #[derive(Default)]
 pub struct BarView {
     defaults: Defaults,
+    /// omp's in-memory model state (live control), used while the file records no model.
+    live_model: Option<LiveModel>,
     snap: Option<Arc<SessionStatus>>,
     catalog_gen: u64,
     built: bool,
@@ -74,8 +76,8 @@ pub struct BarView {
 
     pub model_name: String,
     pub model_selector: Option<String>,
-    /// `model_selector`/`level` come from omp's settings (the session has not recorded a model
-    /// yet): shown dimmed with a tooltip, replaced by the first recorded model.
+    /// `model_selector`/`level` come from omp's settings (neither the session file nor live
+    /// control report a model yet): shown dimmed with a tooltip, replaced by the first real one.
     pub model_is_default: bool,
     /// Effective thinking level (None = the model has none / unknown).
     pub level: Option<String>,
@@ -118,11 +120,44 @@ pub struct Defaults {
     pub level: Option<String>,
 }
 
+/// The session's model and thinking level: the file's once it records a model, else omp's live
+/// in-memory state (omp persists a session only with its first message, so model and thinking
+/// changes before it never reach the file).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModelState<'a> {
+    pub model: Option<&'a str>,
+    pub thinking: Option<&'a str>,
+    pub configured: Option<&'a str>,
+}
+
+pub fn model_state<'a>(stats: &'a SessionStats, live: Option<&'a LiveModel>) -> ModelState<'a> {
+    match live.filter(|_| stats.model.is_none()) {
+        Some(l) => ModelState {
+            model: Some(&l.selector),
+            thinking: Some(&l.thinking),
+            configured: l.thinking_configured.as_deref(),
+        },
+        None => ModelState {
+            model: stats.model.as_deref(),
+            thinking: stats.thinking.as_deref(),
+            configured: stats.thinking_configured.as_deref(),
+        },
+    }
+}
+
 impl BarView {
     /// New defaults invalidate the built view (rebuilt by the next [`BarView::update`]).
     pub fn set_defaults(&mut self, defaults: &Defaults) {
         if self.defaults != *defaults {
             self.defaults = defaults.clone();
+            self.built = false;
+        }
+    }
+
+    /// A changed live model state invalidates the built view, like [`BarView::set_defaults`].
+    pub fn set_live_model(&mut self, live: Option<&LiveModel>) {
+        if self.live_model.as_ref() != live {
+            self.live_model = live.cloned();
             self.built = false;
         }
     }
@@ -203,11 +238,12 @@ impl BarView {
 
     fn build(&mut self, s: &SessionStatus, catalog: &ModelsCache) {
         let st = &s.stats;
-        self.model_is_default = st.model.is_none() && self.defaults.model.is_some();
+        let state = model_state(st, self.live_model.as_ref());
+        self.model_is_default = state.model.is_none() && self.defaults.model.is_some();
         let selector = if self.model_is_default {
             self.defaults.model.clone()
         } else {
-            st.model.clone()
+            state.model.map(str::to_owned)
         };
         let info: Option<&ModelInfo> = selector.as_deref().and_then(|m| catalog.get(m));
         self.model_selector = selector.clone();
@@ -226,8 +262,8 @@ impl BarView {
             self.level = level.clone();
             self.configured = level;
         } else {
-            self.level = st.thinking.clone();
-            self.configured = st.thinking_configured.clone();
+            self.level = state.thinking.map(str::to_owned);
+            self.configured = state.configured.map(str::to_owned);
         }
         self.model_tip = model_tooltip(
             selector.as_deref(),
@@ -775,6 +811,9 @@ fn model_chip(
     let assumed = input
         .assumed
         .filter(|_| v.model_selector.is_none() || v.model_is_default);
+    // An assumed switch overrides only what it changed (a model, a level or both).
+    let assumed_model = assumed.and_then(|a| a.selector.as_deref());
+    let assumed_level = assumed.and_then(|a| a.level.as_deref());
     let resp = chip(ui, "model", Sense::click(), |ui| {
         if let Some(p) = pending {
             ui.add(crate::widgets::Spin::new(16.8, pal.accent));
@@ -785,19 +824,16 @@ fn model_chip(
             ));
             return;
         }
-        let name = match assumed {
-            Some(a) => a.describe(input.catalog),
+        let name = match assumed_model {
+            Some(s) => input
+                .catalog
+                .get(s)
+                .map_or_else(|| s.to_owned(), |m| m.name.clone()),
             None if v.model_name.is_empty() => "model".to_owned(),
             None => v.model_name.clone(),
         };
-        let level = v
-            .level
-            .as_deref()
-            .or(assumed.and_then(|a| a.level.as_deref()));
-        let configured = v
-            .configured
-            .as_deref()
-            .or(assumed.and_then(|a| a.level.as_deref()));
+        let level = assumed_level.or(v.level.as_deref());
+        let configured = assumed_level.or(v.configured.as_deref());
         let col = if (v.model_name.is_empty() || v.model_is_default) && assumed.is_none() {
             pal.weak
         } else {
@@ -872,8 +908,8 @@ fn model_chip(
         picker,
         &PickerInput {
             catalog: input.catalog,
-            current: v.model_selector.as_deref(),
-            level: v.current_level(),
+            current: assumed_model.or(v.model_selector.as_deref()),
+            level: assumed_level.or(v.current_level()),
             favorites: input.favorites,
             provider: input.provider,
         },
@@ -1340,7 +1376,7 @@ fn bar_button(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deck_core::status::{PrInfo, SessionStats};
+    use deck_core::status::PrInfo;
 
     fn catalog() -> ModelsCache {
         let mut c = ModelsCache::default();
@@ -1488,6 +1524,89 @@ mod tests {
         late.set_defaults(&defaults);
         assert!(late.update(None, Path::new("/w"), &catalog()));
         assert_eq!(late.model_name, "Claude Opus 5.5");
+    }
+
+    #[test]
+    fn unpersisted_session_shows_omp_live_model_over_defaults_until_the_file_records_one() {
+        let defaults = Defaults {
+            model: Some("openai/gpt-x".into()),
+            level: Some("medium".into()),
+        };
+        // Picked before the first message: omp has not written the session file yet.
+        let live = LiveModel {
+            selector: "anthropic/claude-opus-5-5".into(),
+            thinking: "low".into(),
+            thinking_configured: Some("low".into()),
+        };
+        let fresh = Arc::new(SessionStatus {
+            fresh: true,
+            ..SessionStatus::default()
+        });
+        let mut v = BarView::default();
+        v.set_defaults(&defaults);
+        v.update(Some(&fresh), Path::new("/w"), &catalog());
+        assert_eq!(v.model_name, "gpt-x");
+        v.set_live_model(Some(&live));
+        assert!(v.update(Some(&fresh), Path::new("/w"), &catalog()));
+        assert!(!v.model_is_default);
+        assert_eq!(
+            v.model_selector.as_deref(),
+            Some("anthropic/claude-opus-5-5")
+        );
+        assert_eq!(v.model_name, "Claude Opus 5.5");
+        assert_eq!(v.level.as_deref(), Some("low"));
+        assert_eq!(v.current_level(), Some("low"));
+        assert_eq!(v.ctx_label, "?%/1M", "the live model's window");
+        // A thinking change is a new state: rebuilt.
+        let high = LiveModel {
+            thinking: "high".into(),
+            thinking_configured: Some("high".into()),
+            ..live.clone()
+        };
+        v.set_live_model(Some(&high));
+        assert!(v.update(Some(&fresh), Path::new("/w"), &catalog()));
+        assert_eq!(v.current_level(), Some("high"));
+        // Once the file records a model (first message on), the file wins.
+        let persisted = Arc::new(status());
+        assert!(v.update(Some(&persisted), Path::new("/w"), &catalog()));
+        assert_eq!(v.level.as_deref(), Some("high"));
+        assert_eq!(v.current_level(), Some("auto"));
+        let mut file_model = status();
+        file_model.stats.model = Some("openai/gpt-x".into());
+        assert!(v.update(Some(&Arc::new(file_model)), Path::new("/w"), &catalog()));
+        assert_eq!(v.model_name, "gpt-x");
+    }
+
+    #[test]
+    fn model_state_prefers_the_file_once_it_records_a_model() {
+        let live = LiveModel {
+            selector: "p/live".into(),
+            thinking: "off".into(),
+            thinking_configured: Some("off".into()),
+        };
+        // A fresh file may carry a thinking_level_change without any model: live wins whole.
+        let fresh = SessionStats {
+            thinking: Some("max".into()),
+            ..SessionStats::default()
+        };
+        assert_eq!(
+            model_state(&fresh, Some(&live)),
+            ModelState {
+                model: Some("p/live"),
+                thinking: Some("off"),
+                configured: Some("off"),
+            }
+        );
+        assert_eq!(model_state(&fresh, None).model, None);
+        let stats = status().stats;
+        assert_eq!(
+            model_state(&stats, Some(&live)),
+            ModelState {
+                model: Some("anthropic/claude-opus-5-5"),
+                thinking: Some("high"),
+                configured: Some("auto"),
+            }
+        );
     }
 
     #[test]

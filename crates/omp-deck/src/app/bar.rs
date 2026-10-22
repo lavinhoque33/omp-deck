@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use deck_core::sessions::{SessionEntry, abbreviate_home};
-use deck_core::status::StatusTarget;
+use deck_core::status::{SessionStats, StatusTarget};
 use egui::{TextEdit, Ui};
 
 use super::{App, AppEvent, PendingConfirm, spawn_opener};
@@ -84,17 +84,16 @@ impl App {
                 self.dirty = true;
             }
 
-            let stats = snap.as_deref().map(|s| &s.stats);
-            let model = stats.and_then(|s| s.model.as_deref());
+            let live_model = live.as_deref().and_then(|l| l.model.as_ref());
+            let no_stats = SessionStats::default();
+            let stats = snap.as_deref().map_or(&no_stats, |s| &s.stats);
+            let state = statusbar::model_state(stats, live_model);
+            let model = state.model;
             if model.is_some() {
                 tab.assumed_switch = None;
             }
             if let Some(p) = &mut tab.pending_switch {
-                let confirmed = p.confirmed_by(
-                    model,
-                    stats.and_then(|s| s.thinking.as_deref()),
-                    stats.and_then(|s| s.thinking_configured.as_deref()),
-                );
+                let confirmed = p.confirmed_by(model, state.thinking, state.configured);
                 let limit = if model.is_none() {
                     FRESH_TIMEOUT
                 } else {
@@ -109,8 +108,16 @@ impl App {
                 } else if p.timed_out(now, limit) {
                     let desc = p.describe(&self.models);
                     if model.is_none() {
-                        // Nothing is persisted yet, so the file cannot show it: assume it worked.
-                        tab.assumed_switch = tab.pending_switch.take();
+                        // Nothing reports the model (no file entry, no live control): assume it
+                        // worked, on top of an earlier assumed switch (`/effort` keeps the model).
+                        let prev = tab.assumed_switch.take();
+                        tab.assumed_switch = tab.pending_switch.take().map(|mut p| {
+                            if let Some(prev) = prev {
+                                p.selector = p.selector.or(prev.selector);
+                                p.level = p.level.or(prev.level);
+                            }
+                            p
+                        });
                     } else {
                         tab.pending_switch = None;
                         toast = Some(format!(
@@ -122,6 +129,7 @@ impl App {
                 }
             }
             self.bar_view.set_defaults(&self.omp_defaults);
+            self.bar_view.set_live_model(live_model);
             self.bar_view
                 .set_context(live.as_deref().and_then(|l| l.context.as_ref()));
             self.bar_view.set_usage(self.usage.summary());
@@ -355,7 +363,7 @@ impl App {
                 self.dirty = true;
             }
             BarAction::Picker(PickerAction::Effort(level)) => {
-                let current = self.bar_view.model_selector.clone();
+                let current = self.current_model();
                 match current {
                     Some(m) => self.queue_change(&m, Some(&level)),
                     None => self
@@ -405,9 +413,22 @@ impl App {
         });
     }
 
+    /// The model the active session runs as far as the deck knows: an assumed switch's model
+    /// while the bar can only show omp's defaults (the same rule as the model chip).
+    fn current_model(&self) -> Option<String> {
+        let v = &self.bar_view;
+        let assumed = match self.tabs.get(self.active) {
+            Some(Tab::Terminal(t)) if v.model_selector.is_none() || v.model_is_default => {
+                t.assumed_switch.as_ref().and_then(|a| a.selector.clone())
+            }
+            _ => None,
+        };
+        assumed.or_else(|| v.model_selector.clone())
+    }
+
     /// Send `/switch` or `/effort` to the active tab and show the optimistic state.
     fn queue_change(&mut self, selector: &str, level: Option<&str>) {
-        let current = self.bar_view.model_selector.clone();
+        let current = self.current_model();
         let Some(change) = model_picker::plan_switch(current.as_deref(), selector, level) else {
             return;
         };

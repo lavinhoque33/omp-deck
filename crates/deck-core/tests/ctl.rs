@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use deck_core::ctl::{CtlClient, CtlCommand, CtlReply, LiveSnapshot, LiveStatus};
+use deck_core::ctl::{CtlClient, CtlCommand, CtlReply, LiveModel, LiveSnapshot, LiveStatus};
 
 const HELLO: &str = r#"{"t":"hello","v":1,"pid":4242}"#;
 
@@ -492,4 +492,58 @@ fn context_breakdown_is_parsed_and_absent_or_malformed_is_none() {
     wait_for("null context", || {
         client.latest().is_some_and(|s| s.context.is_none())
     });
+}
+
+#[test]
+fn main_model_state_is_parsed_and_absent_or_malformed_is_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = fake(tmp.path());
+    let client = CtlClient::spawn(tmp.path().to_path_buf(), || {});
+    let mut s = srv.accept();
+    say(&mut s, HELLO);
+    let with = |m: &str| format!(r#"{{"t":"agents","pid":9,"agents":[],"model":{m}}}"#);
+    let model = || client.latest().and_then(|s| s.model.clone());
+
+    say(
+        &mut s,
+        &with(
+            r#"{"selector":"anthropic/claude-sonnet-5-5","thinkingLevel":"high","configured":"high"}"#,
+        ),
+    );
+    wait_for("model state", || model().is_some());
+    assert_eq!(
+        model(),
+        Some(LiveModel {
+            selector: "anthropic/claude-sonnet-5-5".into(),
+            thinking: "high".into(),
+            thinking_configured: Some("high".into()),
+        })
+    );
+
+    // No effective level is "off", as in the file's `thinking_level_change`.
+    say(
+        &mut s,
+        &with(r#"{"selector":"p/m","thinkingLevel":null,"configured":"auto"}"#),
+    );
+    wait_for("level off", || model().is_some_and(|m| m.selector == "p/m"));
+    let m = model().unwrap();
+    assert_eq!(m.thinking, "off");
+    assert_eq!(m.thinking_configured.as_deref(), Some("auto"));
+
+    // malformed or empty → no model, but the snapshot itself survives
+    say(&mut s, &with(r#"{"thinkingLevel":"high"}"#));
+    wait_for("malformed model", || {
+        client.latest().is_some_and(|s| s.model.is_none())
+    });
+    assert_eq!(client.latest().unwrap().pid, 9);
+    say(&mut s, &with(r#"{"selector":"p/m"}"#));
+    wait_for("model again", || model().is_some());
+    say(&mut s, &with(r#"{"selector":""}"#));
+    wait_for("empty selector", || model().is_none());
+
+    // an older extension sends no field at all
+    say(&mut s, &with(r#"{"selector":"p/m"}"#));
+    wait_for("model again", || model().is_some());
+    say(&mut s, &snapshot_line(9, ""));
+    wait_for("older extension", || model().is_none());
 }

@@ -55,6 +55,21 @@ export default async function ompdeckCtl(api: any) {
       const toolTokenCaches = new WeakMap<object, WeakMap<object, number>>(); // tokenizer -> tool -> tokens
       const mainSession = (): any => { try { return registry.list().find((r: any) => r.kind === "main")?.session; } catch { return undefined; } };
       const modelKey = (): string => { const m = mainSession()?.model; return m ? `${m.provider}/${m.id}` : ""; };
+      // The main session's in-memory model and thinking level: the file records them only once the session is persisted (first message).
+      const mainModel = (): { selector: string; thinkingLevel: string | null; configured: string | null } | null => {
+        try {
+          const sess = mainSession();
+          const key = modelKey();
+          if (!sess || !key) return null;
+          const level = sess.thinkingLevel;
+          const configured = typeof sess.configuredThinkingLevel === "function" ? sess.configuredThinkingLevel() : null;
+          return {
+            selector: key,
+            thinkingLevel: typeof level === "string" ? level : null,
+            configured: typeof configured === "string" ? configured : null,
+          };
+        } catch (e) { log("model state failed: " + e); return null; }
+      };
       const perToolTokens = (sess: any): [string, number][] => {
         const tokenizer = sess.agent?.tokenizer;
         const tools: any[] = sess.agent?.state?.tools ?? [];
@@ -117,7 +132,7 @@ export default async function ompdeckCtl(api: any) {
               model: r.history?.resolvedModel ?? null,
             }));
         } catch (e) { log("snapshot failed: " + e); }
-        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache };
+        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache, model: mainModel() };
       };
       const write = (c: any, l: string) => { try { c.write(l); } catch {} };
       const push = (m: unknown) => {

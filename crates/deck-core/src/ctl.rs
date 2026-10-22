@@ -420,6 +420,20 @@ pub struct LiveSnapshot {
     pub agents: Vec<LiveAgent>,
     /// The main session's `/context` breakdown; `None` from older extensions or on any failure.
     pub context: Option<ContextBreakdown>,
+    /// The main session's in-memory model state; `None` from older extensions or on any failure.
+    pub model: Option<LiveModel>,
+}
+
+/// What the main session runs right now. Unlike the session file (written from the first message
+/// on) this is known for a fresh session too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveModel {
+    /// `provider/id`.
+    pub selector: String,
+    /// Effective level, as the file's `thinking_level_change` (no level → "off").
+    pub thinking: String,
+    /// What the user picked (`auto`, a level), when omp reports it.
+    pub thinking_configured: Option<String>,
 }
 
 /// One row of the `/context` category meter.
@@ -498,7 +512,7 @@ enum WireMsg {
     #[serde(rename = "hello")]
     Hello { v: u32 },
     #[serde(rename = "agents")]
-    Agents(WireSnapshot),
+    Agents(Box<WireSnapshot>),
     #[serde(rename = "reply")]
     Reply {
         rid: u64,
@@ -526,6 +540,18 @@ struct WireSnapshot {
     agents: Vec<Lenient<WireAgent>>,
     #[serde(default)]
     context: Option<Lenient<WireContext>>,
+    #[serde(default)]
+    model: Option<Lenient<WireModel>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireModel {
+    selector: String,
+    #[serde(default)]
+    thinking_level: Option<String>,
+    #[serde(default)]
+    configured: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -670,6 +696,18 @@ impl From<WireSnapshot> for LiveSnapshot {
                     None
                 }
                 None => None,
+            },
+            model: match w.model {
+                Some(Lenient::Ok(m)) if !m.selector.is_empty() => Some(LiveModel {
+                    selector: m.selector,
+                    thinking: m.thinking_level.unwrap_or_else(|| "off".to_owned()),
+                    thinking_configured: m.configured,
+                }),
+                Some(Lenient::Ok(_)) | None => None,
+                Some(Lenient::Bad(_)) => {
+                    log::debug!("ctl: ignored malformed model state");
+                    None
+                }
             },
         }
     }
@@ -976,7 +1014,7 @@ impl Worker {
                 }
             }
             WireMsg::Agents(s) if *hello => {
-                let snap = LiveSnapshot::from(s);
+                let snap = LiveSnapshot::from(*s);
                 let changed = {
                     let mut latest = lock(&self.shared.latest);
                     if latest.as_deref() == Some(&snap) {

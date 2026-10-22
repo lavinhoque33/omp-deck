@@ -122,7 +122,8 @@ Safety:
 
 **Protocol (NDJSON, one request per line):**
 - Server → client, on connect: `{"t":"hello","v":1,"pid":…}` then a snapshot.
-- Snapshot: `{"t":"agents","pid","sessionFile","mainIdle","agents":[{id,name,kind,parent,status,activity,live,streaming,createdAt,lastActivity,sessionFile,model,metrics}]}`.
+- Snapshot: `{"t":"agents","pid","sessionFile","mainIdle","leaf","agents":[{id,name,kind,parent,status,activity,live,streaming,createdAt,lastActivity,sessionFile,model,metrics}],"context","model"}`.
+  - `model`: the main session's in-memory `{selector:"provider/id",thinkingLevel,configured}` (`session.model`, `session.thinkingLevel`, `session.configuredThinkingLevel()`), or `null`. omp writes the session file only from the first message on, and model or thinking changes made before it exist only in memory. For a fresh session `sessionFile` is the announced, not yet existing path.
 - Pushes use the same shape on registry change (50 ms coalesced), on `task:subagent:progress`, and every 1 s while a client is connected.
 - Client → server: `{"rid":N,"t":"list"|"kill"|"revive"|"chat","id":"<AgentId>","text":"…"}`.
 - Replies: `{"t":"reply","rid":N,"ok":true,…}` or `{"ok":false,"error":"…"}`. `list` replies with `snapshot` inside the reply.

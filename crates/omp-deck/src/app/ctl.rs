@@ -77,14 +77,23 @@ impl App {
 
     /// omp's own agent states, while the socket of the active tab is up and reports the session
     /// file the tab shows (a snapshot of another root session — `/new`, `/resume`, a stale
-    /// socket — must not be overlaid).
+    /// socket — must not be overlaid). A session that is not persisted yet (no message sent) has
+    /// no file of its own: then the file omp announced for this tab must match.
     pub(super) fn live_snapshot(&self) -> Option<Arc<LiveSnapshot>> {
-        let root = self.ctl_root()?;
-        self.ctl
+        let snap = self
+            .ctl
             .as_ref()
             .filter(|l| l.client.connected())
-            .and_then(|l| l.client.latest())
-            .filter(|s| s.session_file.as_deref() == Some(root))
+            .and_then(|l| l.client.latest())?;
+        let file = snap.session_file.as_deref()?;
+        let ours = match self.ctl_root() {
+            Some(root) => root == file,
+            None => self
+                .status
+                .latest()
+                .is_some_and(|s| s.fresh && s.session.as_deref() == Some(file)),
+        };
+        ours.then_some(snap)
     }
 
     /// The session file of the active session tab: the root commands are addressed to.
