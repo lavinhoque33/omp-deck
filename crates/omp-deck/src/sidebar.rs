@@ -10,8 +10,8 @@ use crate::icons::{
     ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CHEVRONS_DOWN_UP, ICON_CHEVRONS_UP_DOWN,
     ICON_CIRCLE_STOP, ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS,
     ICON_FOLDER, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_KEY_ROUND,
-    ICON_LIST_TREE, ICON_PLAY, ICON_PLUS, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_SEARCH,
-    ICON_SEARCH_X, ICON_TERMINAL, ICON_TRASH_2, ICON_X,
+    ICON_LIST_TREE, ICON_PLAY, ICON_PLUS, ICON_POWER, ICON_REFRESH_CW, ICON_ROTATE_CCW,
+    ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL, ICON_TRASH_2, ICON_X,
 };
 use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot};
 use egui::collapsing_header::CollapsingState;
@@ -124,6 +124,8 @@ pub enum SidebarAction {
     ActivateTab(usize),
     /// Close the tab at this strip index (same path as the tab strip's ✕).
     CloseTab(usize),
+    /// Kill the process of the tab at this strip index (tabs whose session menu has no "Stop").
+    KillTab(usize),
 }
 
 #[derive(Default)]
@@ -1030,8 +1032,11 @@ fn open_tab_row(
         Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(20.0, 20.0));
     let close = ui.interact(close_rect, resp.id.with("close"), Sense::click());
     let ctx = ui.ctx().clone();
-    let hov =
-        ctx.animate_bool_with_time(resp.id.with("hov"), resp.hovered() || close.hovered(), 0.12);
+    let hov = ctx.animate_bool_with_time(
+        resp.id.with("hov"),
+        resp.hovered() || close.hovered() || resp.context_menu_opened(),
+        0.12,
+    );
     let sel = ctx.animate_bool_with_time(resp.id.with("sel"), active, 0.18);
     if active && sel < 1.0 {
         // Just activated (from anywhere): keep its row in view.
@@ -1119,6 +1124,8 @@ fn open_tab_row(
         out.actions.push(SidebarAction::ActivateTab(i));
         out.interacted = true;
     }
+    let env = input.menu_env();
+    theme::context_menu(&resp, 230.0, |ui| tab_menu(ui, i, tab, &env, out));
 }
 
 fn session_row(
@@ -1217,105 +1224,9 @@ fn session_row(
         out.actions.push(SidebarAction::Open(entry.clone()));
         out.interacted = true;
     }
+    let env = input.menu_env();
     theme::context_menu(&resp, 230.0, |ui| {
-        fn copy(ui: &mut Ui, out: &mut SidebarOutput, text: String, what: &'static str) {
-            out.actions.push(SidebarAction::CopyText { text, what });
-            ui.close();
-        }
-        if menu_item(ui, ICON_PLAY, "Open", None, true, false).clicked() {
-            out.actions.push(SidebarAction::Open(entry.clone()));
-            out.interacted = true;
-            ui.close();
-        }
-        if menu_item(ui, ICON_LIST_TREE, "Session tree…", None, true, false).clicked() {
-            out.actions.push(SidebarAction::Tree(entry.clone()));
-            ui.close();
-        }
-        ui.separator();
-        if menu_item(ui, ICON_FILE_TEXT, "Copy session path", None, true, false).clicked() {
-            copy(
-                ui,
-                out,
-                entry.path.to_string_lossy().into_owned(),
-                "session path",
-            );
-        }
-        if menu_item(ui, ICON_KEY_ROUND, "Copy session id", None, true, false).clicked() {
-            copy(ui, out, entry.id.clone(), "session id");
-        }
-        if menu_item(ui, ICON_TERMINAL, "Copy resume command", None, true, false).clicked() {
-            copy(ui, out, resume_command(&entry.path), "resume command");
-        }
-        ui.separator();
-        if menu_item(
-            ui,
-            ICON_FOLDER_OPEN,
-            "Open project folder",
-            None,
-            true,
-            false,
-        )
-        .clicked()
-        {
-            out.actions
-                .push(SidebarAction::OpenFolder(entry.cwd.clone()));
-            ui.close();
-        }
-        if menu_item(
-            ui,
-            ICON_EXTERNAL_LINK,
-            "Show session file",
-            None,
-            true,
-            false,
-        )
-        .clicked()
-        {
-            let dir = entry
-                .path
-                .parent()
-                .map_or_else(|| entry.path.clone(), Path::to_path_buf);
-            out.actions.push(SidebarAction::OpenFolder(dir));
-            ui.close();
-        }
-        if input.omp_available {
-            ui.separator();
-            let idle = !input.busy.contains(&entry.path);
-            for (kind, icon, label) in [
-                (TransferKind::Copy, ICON_FILES, "Copy to project"),
-                (TransferKind::Move, ICON_FOLDER_OUTPUT, "Move to project"),
-            ] {
-                transfer_menu(ui, entry, (kind, icon, label), idle, input, out);
-            }
-        }
-        if input.omp_available {
-            ui.separator();
-            let idle = !input.busy.contains(&entry.path);
-            if menu_item(ui, ICON_TRASH_2, "Delete session…", None, idle, true).clicked() {
-                out.actions.push(SidebarAction::Delete(entry.clone()));
-                ui.close();
-            }
-        }
-        if running && input.can_stop {
-            ui.separator();
-            if menu_item(ui, ICON_ROTATE_CCW, "Restart session", None, true, false).clicked() {
-                out.actions.push(SidebarAction::Restart(entry.clone()));
-                ui.close();
-            }
-            if menu_item(
-                ui,
-                ICON_CIRCLE_STOP,
-                "Stop session process",
-                None,
-                true,
-                true,
-            )
-            .clicked()
-            {
-                out.actions.push(SidebarAction::Stop(entry.clone()));
-                ui.close();
-            }
-        }
+        session_menu(ui, entry, running, &env, out)
     });
     resp.on_hover_ui(|ui| {
         ui.label(entry.label());
@@ -1407,13 +1318,173 @@ fn paint_row_bg(p: &egui::Painter, pal: &Palette, pill: Rect, (hov, sel): (f32, 
     }
 }
 
+/// What the session and tab context menus need besides the row itself.
+pub struct MenuEnv<'a> {
+    pub groups: &'a [ProjectGroup],
+    /// omp was found: copy/move/delete are offered.
+    pub omp_available: bool,
+    /// Sessions can be stopped and restarted (tmux available).
+    pub can_stop: bool,
+    /// Session files with a move/copy/delete in flight.
+    pub busy: &'a HashSet<PathBuf>,
+}
+
+impl MenuEnv<'_> {
+    fn entry(&self, path: &Path) -> Option<&SessionEntry> {
+        self.groups
+            .iter()
+            .flat_map(|g| &g.sessions)
+            .find(|e| e.path == path)
+    }
+}
+
+impl SidebarInput<'_> {
+    fn menu_env(&self) -> MenuEnv<'_> {
+        MenuEnv {
+            groups: self.groups.unwrap_or(&[]),
+            omp_available: self.omp_available,
+            can_stop: self.can_stop,
+            busy: self.busy,
+        }
+    }
+}
+
+/// A tab's context menu (tab strip and "Open tabs" rows): the tab items, then its session's full
+/// menu once the session file is listed.
+pub fn tab_menu(ui: &mut Ui, i: usize, tab: &Tab, env: &MenuEnv<'_>, out: &mut SidebarOutput) {
+    if menu_item(ui, ICON_X, "Close tab", None, true, false).clicked() {
+        out.actions.push(SidebarAction::CloseTab(i));
+        ui.close();
+    }
+    let Some(t) = tab.term() else {
+        return;
+    };
+    let running = !t.term.is_exited();
+    let entry = t.session_path.as_deref().and_then(|p| env.entry(p));
+    // The session menu's "Stop session process" covers this whenever it is offered.
+    if (entry.is_none() || !env.can_stop)
+        && menu_item(ui, ICON_POWER, "Kill session process", None, running, false).clicked()
+    {
+        out.actions.push(SidebarAction::KillTab(i));
+        ui.close();
+    }
+    if let Some(entry) = entry {
+        ui.separator();
+        session_menu(ui, entry, running, env, out);
+    }
+}
+
+fn session_menu(
+    ui: &mut Ui,
+    entry: &SessionEntry,
+    running: bool,
+    env: &MenuEnv<'_>,
+    out: &mut SidebarOutput,
+) {
+    fn copy(ui: &mut Ui, out: &mut SidebarOutput, text: String, what: &'static str) {
+        out.actions.push(SidebarAction::CopyText { text, what });
+        ui.close();
+    }
+    if menu_item(ui, ICON_PLAY, "Open", None, true, false).clicked() {
+        out.actions.push(SidebarAction::Open(entry.clone()));
+        out.interacted = true;
+        ui.close();
+    }
+    if menu_item(ui, ICON_LIST_TREE, "Session tree…", None, true, false).clicked() {
+        out.actions.push(SidebarAction::Tree(entry.clone()));
+        ui.close();
+    }
+    ui.separator();
+    if menu_item(ui, ICON_FILE_TEXT, "Copy session path", None, true, false).clicked() {
+        copy(
+            ui,
+            out,
+            entry.path.to_string_lossy().into_owned(),
+            "session path",
+        );
+    }
+    if menu_item(ui, ICON_KEY_ROUND, "Copy session id", None, true, false).clicked() {
+        copy(ui, out, entry.id.clone(), "session id");
+    }
+    if menu_item(ui, ICON_TERMINAL, "Copy resume command", None, true, false).clicked() {
+        copy(ui, out, resume_command(&entry.path), "resume command");
+    }
+    ui.separator();
+    if menu_item(
+        ui,
+        ICON_FOLDER_OPEN,
+        "Open project folder",
+        None,
+        true,
+        false,
+    )
+    .clicked()
+    {
+        out.actions
+            .push(SidebarAction::OpenFolder(entry.cwd.clone()));
+        ui.close();
+    }
+    if menu_item(
+        ui,
+        ICON_EXTERNAL_LINK,
+        "Show session file",
+        None,
+        true,
+        false,
+    )
+    .clicked()
+    {
+        let dir = entry
+            .path
+            .parent()
+            .map_or_else(|| entry.path.clone(), Path::to_path_buf);
+        out.actions.push(SidebarAction::OpenFolder(dir));
+        ui.close();
+    }
+    if env.omp_available {
+        ui.separator();
+        let idle = !env.busy.contains(&entry.path);
+        for (kind, icon, label) in [
+            (TransferKind::Copy, ICON_FILES, "Copy to project"),
+            (TransferKind::Move, ICON_FOLDER_OUTPUT, "Move to project"),
+        ] {
+            transfer_menu(ui, entry, (kind, icon, label), idle, env, out);
+        }
+        ui.separator();
+        if menu_item(ui, ICON_TRASH_2, "Delete session…", None, idle, true).clicked() {
+            out.actions.push(SidebarAction::Delete(entry.clone()));
+            ui.close();
+        }
+    }
+    if running && env.can_stop {
+        ui.separator();
+        if menu_item(ui, ICON_ROTATE_CCW, "Restart session", None, true, false).clicked() {
+            out.actions.push(SidebarAction::Restart(entry.clone()));
+            ui.close();
+        }
+        if menu_item(
+            ui,
+            ICON_CIRCLE_STOP,
+            "Stop session process",
+            None,
+            true,
+            true,
+        )
+        .clicked()
+        {
+            out.actions.push(SidebarAction::Stop(entry.clone()));
+            ui.close();
+        }
+    }
+}
+
 /// "Copy to project" / "Move to project" submenu: every other project, then "Choose folder…".
 fn transfer_menu(
     ui: &mut Ui,
     entry: &SessionEntry,
     spec: (TransferKind, Icon, &str),
     enabled: bool,
-    input: &SidebarInput<'_>,
+    env: &MenuEnv<'_>,
     out: &mut SidebarOutput,
 ) {
     let (kind, icon, label) = spec;
@@ -1435,8 +1506,7 @@ fn transfer_menu(
             ),
             |ui| {
                 ui.set_min_width(260.0);
-                let groups = input.groups.unwrap_or(&[]);
-                let targets = transfer::targets(groups, &entry.cwd);
+                let targets = transfer::targets(env.groups, &entry.cwd);
                 if targets.is_empty() {
                     ui.add_enabled(
                         false,

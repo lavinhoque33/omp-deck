@@ -41,7 +41,7 @@ use crate::omp_settings::{config_dir_display, defaults_from_catalog};
 use crate::omp_worker::{self, MovedTab, OmpEvent};
 use crate::running::{RunningMonitor, RunningSnapshot};
 use crate::settings_page::{self, SettingsAction, SettingsInput, SettingsState};
-use crate::sidebar::{self, SidebarAction, SidebarCache, SidebarInput};
+use crate::sidebar::{self, MenuEnv, SidebarAction, SidebarCache, SidebarInput};
 use crate::statusbar;
 use crate::statusfmt::Activity;
 use crate::tabs::{
@@ -757,17 +757,7 @@ impl App {
         match action {
             TabAction::Activate(i) => self.activate(i),
             TabAction::Close(i) => self.request_close(i),
-            TabAction::Kill(i) => self.kill_tab(i),
-            TabAction::CopyPath(i) => {
-                let path = self
-                    .tabs
-                    .get(i)
-                    .and_then(Tab::session_path)
-                    .map(|p| p.to_string_lossy().into_owned());
-                if let Some(p) = path {
-                    self.copy_text(&p, "session path");
-                }
-            }
+            TabAction::Menu(a) => self.apply_sidebar_action(a),
         }
     }
 
@@ -1162,13 +1152,19 @@ impl App {
 
     fn show_bar(&mut self, ui: &mut egui::Ui, maximized: bool) {
         let active = self.tabs.get(self.active);
+        let groups = self.watcher.latest();
         let input = BarInput {
             tabs: TabBarInput {
                 tabs: &self.tabs,
                 labels: &self.labels,
                 active: self.active,
                 scroll_to_active: self.scroll_to_active,
-                can_kill: true,
+                menu: MenuEnv {
+                    groups: groups.as_deref().map_or(&[][..], Vec::as_slice),
+                    omp_available: self.omp.is_some(),
+                    can_stop: self.tmux.is_some(),
+                    busy: &self.moving,
+                },
             },
             csd: !self.cfg.native_decorations,
             maximized,
@@ -1313,28 +1309,33 @@ impl App {
             self.focus_pending = true;
         }
         for action in out.actions {
-            match action {
-                SidebarAction::Open(entry) => self.open_session(&entry),
-                SidebarAction::New(cwd) => self.new_session(cwd),
-                SidebarAction::Refresh => self.refresh_sessions(),
-                SidebarAction::CopyText { text, what } => self.copy_text(&text, what),
-                SidebarAction::OpenFolder(dir) => self.open_folder(dir),
-                SidebarAction::Stop(entry) => self.request_stop(&entry),
-                SidebarAction::Restart(entry) => self.request_restart_session(&entry),
-                SidebarAction::Delete(entry) => self.request_delete(entry),
-                SidebarAction::Tree(entry) => {
-                    let title = entry.label().to_owned();
-                    self.open_tree(entry.path, entry.cwd, title, Some(entry.id));
-                }
-                SidebarAction::Transfer { kind, entry, dest } => {
-                    self.start_transfer(kind, entry, dest);
-                }
-                SidebarAction::SetScope(dir) => self.set_scope(dir),
-                SidebarAction::BrowseScope => self.browse_scope(),
-                SidebarAction::TypedScope(text) => self.resolve_scope(text),
-                SidebarAction::ActivateTab(i) => self.apply_tab_action(TabAction::Activate(i)),
-                SidebarAction::CloseTab(i) => self.apply_tab_action(TabAction::Close(i)),
+            self.apply_sidebar_action(action);
+        }
+    }
+
+    fn apply_sidebar_action(&mut self, action: SidebarAction) {
+        match action {
+            SidebarAction::Open(entry) => self.open_session(&entry),
+            SidebarAction::New(cwd) => self.new_session(cwd),
+            SidebarAction::Refresh => self.refresh_sessions(),
+            SidebarAction::CopyText { text, what } => self.copy_text(&text, what),
+            SidebarAction::OpenFolder(dir) => self.open_folder(dir),
+            SidebarAction::Stop(entry) => self.request_stop(&entry),
+            SidebarAction::Restart(entry) => self.request_restart_session(&entry),
+            SidebarAction::Delete(entry) => self.request_delete(entry),
+            SidebarAction::Tree(entry) => {
+                let title = entry.label().to_owned();
+                self.open_tree(entry.path, entry.cwd, title, Some(entry.id));
             }
+            SidebarAction::Transfer { kind, entry, dest } => {
+                self.start_transfer(kind, entry, dest);
+            }
+            SidebarAction::SetScope(dir) => self.set_scope(dir),
+            SidebarAction::BrowseScope => self.browse_scope(),
+            SidebarAction::TypedScope(text) => self.resolve_scope(text),
+            SidebarAction::ActivateTab(i) => self.activate(i),
+            SidebarAction::CloseTab(i) => self.request_close(i),
+            SidebarAction::KillTab(i) => self.kill_tab(i),
         }
     }
 

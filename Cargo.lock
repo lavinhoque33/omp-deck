@@ -462,7 +462,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "deck-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "dirs",
  "libc",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "deck-term"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "alacritty_terminal",
  "arboard",
@@ -1998,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "omp-deck"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "deck-core",

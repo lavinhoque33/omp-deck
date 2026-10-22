@@ -54,7 +54,7 @@ pub struct OmpBar<'a> {
     pub channel: Channel,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum BarAction {
     Tab(TabAction),
     OpenSettings,

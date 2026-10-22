@@ -16,8 +16,8 @@ embedded, fully interactive terminal backed by tmux, so closing a tab or the who
   and artifacts (stopping a running session first) and cannot be undone.
 - **Tabs**: open, focus, middle-click close, reopen the last closed tab. Each tab shows omp's state: a
   spinner while the agent works and an amber "!" badge with a tinted tab when it waits for your input,
-  also on background tabs. Closing a tab only detaches;
-  the tab context menu's "Kill session process" stops omp, as does "Stop session process" in the sidebar.
+  also on background tabs. Right-clicking a tab (or its "Open tabs" row) shows "Close tab" plus the
+  session's full sidebar menu. Closing a tab only detaches; "Stop session process" stops omp.
   Tabs re-attach to live tmux sessions on the next launch.
 - **Terminal fidelity**: truecolor, wide/emoji cells, mouse reporting, bracketed paste, OSC 52 clipboard,
   clickable hyperlinks and plain URLs (Ctrl+click), a right-click copy / paste / link menu,

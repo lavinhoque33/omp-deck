@@ -18,8 +18,9 @@ use egui::{
     Align2, Color32, CursorIcon, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
 
+use crate::sidebar::{self, MenuEnv, SidebarAction, SidebarOutput};
 use crate::theme::{self, Palette};
-use crate::widgets::{menu_item, paint_icon};
+use crate::widgets::paint_icon;
 
 /// What a terminal tab runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -402,12 +403,12 @@ pub fn active_after_close(active: usize, removed: usize, len_before: usize) -> u
     adjusted.min(len.saturating_sub(1))
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum TabAction {
     Activate(usize),
     Close(usize),
-    Kill(usize),
-    CopyPath(usize),
+    /// Picked from the tab's context menu (the same menu as its "Open tabs" sidebar row).
+    Menu(SidebarAction),
 }
 
 pub struct TabBarInput<'a> {
@@ -415,7 +416,7 @@ pub struct TabBarInput<'a> {
     pub labels: &'a HashMap<PathBuf, String>,
     pub active: usize,
     pub scroll_to_active: bool,
-    pub can_kill: bool,
+    pub menu: MenuEnv<'a>,
 }
 
 /// Height of a tab's hit area (the full bar height); the pill is painted inset.
@@ -627,38 +628,11 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     } else if resp.clicked() && !close.hovered() {
         action = Some(TabAction::Activate(i));
     }
-    theme::context_menu(&resp, 200.0, |ui| {
-        if menu_item(ui, ICON_X, "Close", None, true, false).clicked() {
-            action = Some(TabAction::Close(i));
-            ui.close();
-        }
-        if let Some(t) = term {
-            if menu_item(
-                ui,
-                crate::icons::ICON_POWER,
-                "Kill session process",
-                None,
-                input.can_kill && !t.term.is_exited(),
-                false,
-            )
-            .clicked()
-            {
-                action = Some(TabAction::Kill(i));
-                ui.close();
-            }
-            if menu_item(
-                ui,
-                crate::icons::ICON_COPY,
-                "Copy session path",
-                None,
-                t.session_path.is_some(),
-                false,
-            )
-            .clicked()
-            {
-                action = Some(TabAction::CopyPath(i));
-                ui.close();
-            }
+    theme::context_menu(&resp, 230.0, |ui| {
+        let mut out = SidebarOutput::default();
+        sidebar::tab_menu(ui, i, tab, &input.menu, &mut out);
+        if let Some(a) = out.actions.pop() {
+            action = Some(TabAction::Menu(a));
         }
     });
     action
