@@ -358,6 +358,7 @@ pub fn terminal_env() -> Vec<(String, String)> {
 }
 
 const CONFIG_TEXT: &str = r#"# OmpDeck generated tmux.conf — rewritten at startup; do not edit
+# -q on options newer than tmux 3.2 (extended-keys-format 3.5, allow-passthrough 3.3): older tmux ignores them
 set -g status off
 set -g prefix None
 set -g prefix2 None
@@ -372,9 +373,9 @@ unbind -nq M-MouseDown3Status
 unbind -nq M-MouseDown3StatusLeft
 set -g history-limit 50000
 set -s extended-keys on
-set -s extended-keys-format csi-u
+set -sq extended-keys-format csi-u
 set -s set-clipboard on
-set -g allow-passthrough on
+set -gq allow-passthrough on
 set -g focus-events on
 set -g set-titles on
 set -g set-titles-string '#T'

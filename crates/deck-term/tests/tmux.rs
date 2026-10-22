@@ -31,9 +31,9 @@ unbind -nq M-MouseDown3Status
 unbind -nq M-MouseDown3StatusLeft
 set -g history-limit 50000
 set -s extended-keys on
-set -s extended-keys-format csi-u
+set -sq extended-keys-format csi-u
 set -s set-clipboard on
-set -g allow-passthrough on
+set -gq allow-passthrough on
 set -g focus-events on
 set -g set-titles on
 set -g set-titles-string '#T'
@@ -175,9 +175,13 @@ fn tmux_modify_other_keys_round_trip() {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         t.poll();
-        let mode = server
-            .cmd(&["display-message", "-p", "-t", "t1", "#{pane_key_mode}"])
-            .unwrap_or_default();
+        let mode = server.cmd(&["display-message", "-p", "-t", "t1", "#{pane_key_mode}"]);
+        // Older tmux (e.g. 3.2a) has no `pane_key_mode` format: the query succeeds but expands to nothing.
+        if mode.as_deref().is_some_and(|m| m.trim().is_empty()) {
+            eprintln!("skipping: this tmux has no #{{pane_key_mode}} format");
+            return;
+        }
+        let mode = mode.unwrap_or_default();
         if mode.contains("Ext 2") {
             break;
         }
