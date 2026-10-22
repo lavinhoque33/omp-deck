@@ -14,7 +14,8 @@ bin=target/release/omp-deck
 
 appdir=dist/OmpDeck.AppDir
 rm -rf "$appdir"
-mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/icons/hicolor/scalable/apps"
+mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/doc/omp-deck" \
+    "$appdir/usr/share/icons/hicolor/scalable/apps"
 install -m 0755 "$bin" "$appdir/usr/bin/omp-deck"
 strip "$appdir/usr/bin/omp-deck" 2>/dev/null || true
 install -m 0755 packaging/appimage/AppRun "$appdir/AppRun"
@@ -23,6 +24,10 @@ install -m 0644 packaging/omp-deck.desktop "$appdir/usr/share/applications/omp-d
 install -m 0644 packaging/icons/omp-deck-256.png "$appdir/omp-deck.png"
 cp "$appdir/omp-deck.png" "$appdir/.DirIcon"
 install -m 0644 packaging/icons/omp-deck.svg "$appdir/usr/share/icons/hicolor/scalable/apps/omp-deck.svg"
+# Project and bundled-asset licenses travel with the AppImage.
+install -m 0644 LICENSE-MIT LICENSE-APACHE README.md "$appdir/usr/share/doc/omp-deck/"
+install -m 0644 crates/omp-deck/assets/fonts/Geist-OFL.txt \
+    crates/omp-deck/assets/fonts/lucide-LICENSE.txt "$appdir/usr/share/doc/omp-deck/"
 for s in 16 24 32 48 64 128 256 512; do
     mkdir -p "$appdir/usr/share/icons/hicolor/${s}x${s}/apps"
     install -m 0644 "packaging/icons/omp-deck-$s.png" "$appdir/usr/share/icons/hicolor/${s}x${s}/apps/omp-deck.png"

@@ -38,7 +38,8 @@ pub struct AppConfig {
     pub theme: Theme,
     pub open_tabs: Vec<TabState>,
     pub active_tab: Option<usize>,
-    pub collapsed_groups: Vec<PathBuf>,
+    pub style: UiStyle,
+    pub density: Density,
     /// false → OmpDeck draws its own title bar; true → the window manager's frame.
     pub native_decorations: bool,
     /// Run `omp update --check` at startup and every 6 h.
@@ -64,7 +65,8 @@ impl Default for AppConfig {
             theme: Theme::Dark,
             open_tabs: Vec::new(),
             active_tab: None,
-            collapsed_groups: Vec::new(),
+            style: UiStyle::default(),
+            density: Density::default(),
             native_decorations: false,
             check_updates: true,
             favorite_models: Vec::new(),
@@ -90,6 +92,21 @@ pub enum Theme {
     #[default]
     Dark,
     Light,
+}
+
+/// Visual style axis (second to light/dark `Theme`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum UiStyle {
+    #[default]
+    Neutral,
+    Neon,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Density {
+    #[default]
+    Compact,
+    Comfortable,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -199,7 +216,7 @@ mod tests {
                 title: "T".into(),
             }],
             active_tab: Some(0),
-            collapsed_groups: vec!["/home/u/y".into()],
+            style: UiStyle::Neon,
             native_decorations: true,
             check_updates: false,
             ..AppConfig::default()
@@ -270,6 +287,35 @@ mod tests {
         assert_eq!(cfg.folder_scope, None);
         assert!(cfg.recent_folders.is_empty());
         assert!(cfg.folder_tabs.is_empty());
+    }
+
+    #[test]
+    fn old_state_gets_neutral_compact_and_ignores_collapsed_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.json");
+        fs::write(
+            &p,
+            br#"{"theme": "Light", "collapsed_groups": ["/home/u/y"], "font_size": 15.0}"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load_from(&p);
+        assert_eq!(cfg.style, UiStyle::Neutral);
+        assert_eq!(cfg.density, Density::Compact);
+        assert_eq!(cfg.theme, Theme::Light);
+        assert_eq!(cfg.font_size, 15.0);
+    }
+
+    #[test]
+    fn style_and_density_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.json");
+        let cfg = AppConfig {
+            style: UiStyle::Neon,
+            density: Density::Comfortable,
+            ..AppConfig::default()
+        };
+        cfg.save_to(&p).unwrap();
+        assert_eq!(AppConfig::load_from(&p), cfg);
     }
 
     #[test]

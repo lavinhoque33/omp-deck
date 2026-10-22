@@ -4,13 +4,13 @@
 
 use std::path::{Path, PathBuf};
 
-use egui::{
-    Align2, CursorIcon, FontId, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind, TextEdit,
-    Ui, pos2, vec2,
+use crate::icons::{
+    ICON_CHECK, ICON_CHEVRONS_UP_DOWN, ICON_COPY, ICON_FOLDER, ICON_FOLDER_OPEN, ICON_FOLDER_PLUS,
+    ICON_GLOBE, ICON_PLUS, ICON_X,
 };
-use egui_material_icons::icons::{
-    ICON_ADD, ICON_CHECK, ICON_CLOSE, ICON_CONTENT_COPY, ICON_CREATE_NEW_FOLDER, ICON_FOLDER,
-    ICON_FOLDER_OPEN, ICON_PUBLIC, ICON_UNFOLD_MORE,
+use egui::{
+    Align2, CursorIcon, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui,
+    pos2, vec2,
 };
 
 use crate::folder_scope::{folder_name, parent_display};
@@ -56,14 +56,16 @@ impl ScopeState {
     }
 }
 
-const CHIP_H: f32 = 40.0;
+fn chip_h() -> f32 {
+    theme::dens(32.0, 40.0)
+}
 const MENU_W: f32 = 300.0;
 
 /// The scope chip; its menu opens on click. In folder mode a ✕ on the chip returns to all projects.
 pub fn chip(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState) -> Vec<ScopeAction> {
     let pal = Palette::of_ui(ui);
     let mut actions = Vec::new();
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), CHIP_H), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), chip_h()), Sense::click());
     let clear_rect =
         Rect::from_center_size(pos2(rect.right() - 20.0, rect.center().y), vec2(26.0, 26.0));
     let clear = input
@@ -79,7 +81,12 @@ pub fn chip(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState) -> Vec<
 
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
+        let neutral = theme::neutral();
         let (fill, stroke) = match input.scope {
+            Some(_) if neutral => (
+                theme::mix(pal.surface, pal.raised, hov),
+                pal.accent.gamma_multiply(0.45 + 0.35 * hov),
+            ),
             Some(_) => (
                 theme::mix(pal.surface, pal.accent, 0.14 + 0.06 * hov),
                 pal.accent.gamma_multiply(0.45 + 0.35 * hov),
@@ -89,17 +96,26 @@ pub fn chip(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState) -> Vec<
                 theme::mix(pal.stroke, pal.accent, 0.5 * hov),
             ),
         };
-        p.rect(rect, 11, fill, Stroke::new(1.0, stroke), StrokeKind::Inside);
+        p.rect(
+            rect,
+            if neutral { 8 } else { 11 },
+            fill,
+            Stroke::new(1.0, stroke),
+            StrokeKind::Inside,
+        );
         let (icon, color) = match input.scope {
             Some(_) => (ICON_FOLDER_OPEN, pal.accent),
-            None => (ICON_PUBLIC, pal.weak),
+            None => (ICON_GLOBE, pal.weak),
         };
         paint_icon(
             p,
-            pos2(rect.left() + 20.0, rect.center().y),
+            pos2(
+                rect.left() + if neutral { 16.0 } else { 20.0 },
+                rect.center().y,
+            ),
             Align2::CENTER_CENTER,
             icon,
-            20.0,
+            if neutral { 16.0 } else { 20.0 },
             color,
         );
         let right = if input.scope.is_some() {
@@ -112,22 +128,22 @@ pub fn chip(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState) -> Vec<
             p,
             chevron,
             Align2::CENTER_CENTER,
-            ICON_UNFOLD_MORE,
-            17.0,
+            ICON_CHEVRONS_UP_DOWN,
+            if neutral { 14.0 } else { 17.0 },
             theme::mix(pal.weak, pal.text_strong, hov),
         );
-        let text_x = rect.left() + 38.0;
+        let text_x = rect.left() + if neutral { 32.0 } else { 38.0 };
         let max_w = (chevron.x - 14.0 - text_x).max(10.0);
         match input.scope {
             Some(dir) => {
                 let name = p.layout(
                     folder_name(dir),
-                    FontId::proportional(14.5),
+                    crate::theme::font(if neutral { 13.0 } else { 14.5 }),
                     pal.text_strong,
                     max_w,
                 );
                 let parent = parent_display(dir);
-                let sub = p.layout(parent, FontId::proportional(11.0), pal.weak, max_w);
+                let sub = p.layout(parent, crate::theme::font(11.0), pal.weak, max_w);
                 let total = name.size().y + sub.size().y + 1.0;
                 let top = rect.center().y - total / 2.0;
                 p.galley(pos2(text_x, top), name.clone(), pal.text_strong);
@@ -136,7 +152,7 @@ pub fn chip(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState) -> Vec<
             None => {
                 let g = p.layout(
                     "All projects".to_owned(),
-                    FontId::proportional(14.0),
+                    crate::theme::font(if neutral { 13.0 } else { 14.0 }),
                     pal.text,
                     max_w,
                 );
@@ -161,7 +177,7 @@ pub fn chip(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState) -> Vec<
                 p,
                 clear_rect.center(),
                 Align2::CENTER_CENTER,
-                ICON_CLOSE,
+                ICON_X,
                 16.0,
                 theme::mix(pal.weak, pal.text_strong, ch),
             );
@@ -200,7 +216,7 @@ fn menu(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState, out: &mut V
     let all_icon = if input.scope.is_none() {
         ICON_CHECK
     } else {
-        ICON_PUBLIC
+        ICON_GLOBE
     };
     if menu_item(ui, all_icon, "All projects", None, true, false).clicked() {
         out.push(ScopeAction::Set(None));
@@ -229,16 +245,7 @@ fn menu(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState, out: &mut V
         } else {
             "Open folder…"
         };
-        if menu_item(
-            ui,
-            ICON_CREATE_NEW_FOLDER,
-            label,
-            None,
-            !input.picking,
-            false,
-        )
-        .clicked()
-        {
+        if menu_item(ui, ICON_FOLDER_PLUS, label, None, !input.picking, false).clicked() {
             out.push(ScopeAction::Browse);
             ui.close();
         }
@@ -270,7 +277,7 @@ fn menu(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState, out: &mut V
     }
     if let Some(dir) = input.scope {
         ui.separator();
-        if menu_item(ui, ICON_ADD, "New session here", None, true, false).clicked() {
+        if menu_item(ui, ICON_PLUS, "New session here", None, true, false).clicked() {
             out.push(ScopeAction::NewSession(dir.to_path_buf()));
             ui.close();
         }
@@ -287,7 +294,7 @@ fn menu(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState, out: &mut V
             out.push(ScopeAction::OpenInFileManager(dir.to_path_buf()));
             ui.close();
         }
-        if menu_item(ui, ICON_CONTENT_COPY, "Copy path", None, true, false).clicked() {
+        if menu_item(ui, ICON_COPY, "Copy path", None, true, false).clicked() {
             out.push(ScopeAction::CopyPath(dir.to_path_buf()));
             ui.close();
         }
@@ -313,13 +320,13 @@ pub fn new_session_button(ui: &mut Ui, folder: &Path) -> bool {
         p,
         pos2(rect.left() + 18.0, rect.center().y),
         Align2::CENTER_CENTER,
-        ICON_ADD,
+        ICON_PLUS,
         19.0,
         pal.accent,
     );
     let g = p.layout(
         format!("New session in {}", folder_name(folder)),
-        FontId::proportional(13.5),
+        crate::theme::font(13.5),
         pal.text_strong,
         rect.width() - 46.0,
     );

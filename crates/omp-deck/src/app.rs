@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::icons::{ICON_TERMINAL, ICON_TRIANGLE_ALERT};
 use deck_core::agents::{AgentsTarget, AgentsWatcher};
-use deck_core::config::{AppConfig, FolderTabs, TabState, Theme, WindowGeometry};
+use deck_core::config::{AppConfig, Density, FolderTabs, TabState, Theme, UiStyle, WindowGeometry};
 use deck_core::omp::{
     MoveKind, MoveOutcome, Omp, Setting, UpdateKind, UpdateStatus, fork_argv, update_argv,
 };
@@ -21,7 +22,6 @@ use deck_core::status::{StatusTarget, StatusWatcher};
 use deck_core::tmux::{Tmux, new_session_name, session_name_for};
 use deck_term::{Clipboard, TermTheme, TerminalView};
 use egui::{Frame, Key, Margin, Modifiers, RichText};
-use egui_material_icons::icons::{ICON_TERMINAL, ICON_WARNING};
 use serde_json::Value;
 
 use crate::agent_ctl::Req;
@@ -296,10 +296,12 @@ fn unix_ms() -> u128 {
         .map_or(0, |d| d.as_millis())
 }
 
-fn term_theme(t: Theme) -> TermTheme {
-    match t {
-        Theme::Dark => TermTheme::Dark,
-        Theme::Light => TermTheme::Light,
+fn term_theme(t: Theme, style: UiStyle) -> TermTheme {
+    match (style, t) {
+        (UiStyle::Neutral, Theme::Dark) => TermTheme::NeutralDark,
+        (UiStyle::Neutral, Theme::Light) => TermTheme::NeutralLight,
+        (UiStyle::Neon, Theme::Dark) => TermTheme::Dark,
+        (UiStyle::Neon, Theme::Light) => TermTheme::Light,
     }
 }
 
@@ -326,8 +328,7 @@ impl App {
             cfg.font_size = DEFAULT_FONT;
         }
         cfg.font_size = cfg.font_size.clamp(MIN_FONT, MAX_FONT);
-        theme::install(&ctx);
-        theme::select(&ctx, cfg.theme == Theme::Dark);
+        theme::apply(&ctx, cfg.style, cfg.density, cfg.theme == Theme::Dark);
 
         let root = match &cli.sessions_root {
             Some(p) => SessionsRoot::at(p.clone()),
@@ -843,14 +844,39 @@ impl App {
         }
     }
 
+    /// Re-applies theme × style × density to egui and every open terminal.
+    fn restyle(&mut self) {
+        theme::apply(
+            &self.ctx,
+            self.cfg.style,
+            self.cfg.density,
+            self.cfg.theme == Theme::Dark,
+        );
+        let tt = term_theme(self.cfg.theme, self.cfg.style);
+        for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
+            tab.term.set_theme(tt);
+        }
+        self.dirty = true;
+    }
+
     fn set_theme(&mut self, theme: Theme) {
         if self.cfg.theme != theme {
             self.cfg.theme = theme;
-            theme::select(&self.ctx, theme == Theme::Dark);
-            for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
-                tab.term.set_theme(term_theme(theme));
-            }
-            self.dirty = true;
+            self.restyle();
+        }
+    }
+
+    fn set_style(&mut self, style: UiStyle) {
+        if self.cfg.style != style {
+            self.cfg.style = style;
+            self.restyle();
+        }
+    }
+
+    fn set_density(&mut self, density: Density) {
+        if self.cfg.density != density {
+            self.cfg.density = density;
+            self.restyle();
         }
     }
 
@@ -1179,7 +1205,7 @@ impl App {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
-                        ui.label(icon_text(ICON_WARNING, 18.0, pal.warn));
+                        ui.label(icon_text(ICON_TRIANGLE_ALERT, 18.0, pal.warn));
                         ui.label(RichText::new(NO_TMUX_BANNER).color(pal.text_strong));
                     });
                 });
@@ -1209,6 +1235,11 @@ impl App {
             root: &self.root,
             root_exists: self.root_exists,
             active_path,
+            active_cwd: self
+                .tabs
+                .get(self.active)
+                .and_then(Tab::term)
+                .map(|t| t.cwd.as_path()),
             now: SystemTime::now(),
             refreshing,
             can_stop: self.tmux.is_some(),
@@ -1228,16 +1259,14 @@ impl App {
             .frame(
                 Frame::NONE
                     .fill(pal.panel)
-                    .inner_margin(Margin::symmetric(10, 12)),
+                    .inner_margin(if theme::compact() {
+                        Margin::symmetric(8, 8)
+                    } else {
+                        Margin::symmetric(10, 12)
+                    }),
             )
             .show(ui, |ui| {
-                sidebar::show(
-                    ui,
-                    &input,
-                    &mut self.filter,
-                    &mut self.cfg.collapsed_groups,
-                    &mut self.sidebar_cache,
-                )
+                sidebar::show(ui, &input, &mut self.filter, &mut self.sidebar_cache)
             });
         let width = panel.response.rect.width();
         if (width - self.cfg.sidebar_width).abs() > 1.0 {
@@ -1245,9 +1274,6 @@ impl App {
             self.dirty = true;
         }
         let out = panel.inner;
-        if out.collapsed_changed {
-            self.dirty = true;
-        }
         if out.interacted {
             self.focus_pending = true;
         }
@@ -1299,6 +1325,8 @@ impl App {
                     font_range: (MIN_FONT, MAX_FONT),
                     font_default: DEFAULT_FONT,
                     theme: self.cfg.theme,
+                    style: self.cfg.style,
+                    density: self.cfg.density,
                     native_decorations: self.cfg.native_decorations,
                     omp_found: self.omp.is_some(),
                     omp_version: self.update.version.as_deref(),
@@ -1312,6 +1340,8 @@ impl App {
                     match a {
                         SettingsAction::FontSize(s) => self.set_font_size(s),
                         SettingsAction::Theme(t) => self.set_theme(t),
+                        SettingsAction::Style(v) => self.set_style(v),
+                        SettingsAction::Density(v) => self.set_density(v),
                         SettingsAction::NativeDecorations(v) => self.set_native_decorations(v),
                         SettingsAction::SetCheckUpdates(v) => {
                             self.cfg.check_updates = v;

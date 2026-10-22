@@ -2,6 +2,12 @@
 //! buttons) above the tab row; with native frames only the tab row (logo, tabs, settings, menu).
 //! Also the edge/corner resize zones and outline for the undecorated window.
 
+use crate::icons::{
+    ICON_APP_WINDOW, ICON_ARROW_LEFT_RIGHT, ICON_CIRCLE_ARROW_UP, ICON_COPY, ICON_DOWNLOAD,
+    ICON_HISTORY, ICON_LOG_OUT, ICON_MENU, ICON_MINUS, ICON_MOON, ICON_PLUS, ICON_PUZZLE,
+    ICON_REFRESH_CW, ICON_ROCKET, ICON_ROTATE_CCW, ICON_SETTINGS, ICON_SQUARE, ICON_SUN,
+    ICON_TERMINAL, ICON_X,
+};
 use deck_core::config::Theme;
 use deck_core::omp::UpdateKind;
 use egui::RichText;
@@ -10,19 +16,12 @@ use egui::{
     Align, Context, CursorIcon, Frame, Layout, PointerButton, Sense, Stroke, StrokeKind, UiBuilder,
     ViewportCommand, pos2, vec2,
 };
-use egui_material_icons::icons::{
-    ICON_ADD, ICON_CLOSE, ICON_CROP_SQUARE, ICON_DARK_MODE, ICON_DOWNLOAD, ICON_EXTENSION,
-    ICON_FILTER_NONE, ICON_HISTORY, ICON_LIGHT_MODE, ICON_LOGOUT, ICON_MENU, ICON_MINIMIZE,
-    ICON_REFRESH, ICON_REMOVE, ICON_RESTART_ALT, ICON_ROCKET_LAUNCH, ICON_SETTINGS,
-    ICON_SWAP_HORIZ, ICON_TERMINAL, ICON_UPDATE, ICON_WINDOW,
-};
 
 use crate::tabs::{self, TabAction, TabBarInput};
 use crate::theme::{self, Palette};
 use crate::update::{Channel, UpdateState, status_line};
 use crate::widgets::{icon_button, icon_text, menu_item, paint_icon, win_button};
 
-pub const BAR_H: f32 = tabs::TAB_HIT_H;
 const EDGE: f32 = 6.0;
 const CORNER: f32 = 10.0;
 /// Gap between the window's right edge and the window buttons (outside every resize zone).
@@ -148,7 +147,7 @@ fn strip_galley(
     }
     let mut job = egui::text::LayoutJob::simple_singleline(
         text.to_owned(),
-        egui::FontId::proportional(STRIP_FONT_SIZE),
+        crate::theme::font(STRIP_FONT_SIZE),
         color,
     );
     job.wrap.max_width = max_w;
@@ -180,13 +179,7 @@ fn title_strip(ui: &mut egui::Ui, input: &BarInput<'_>) {
         .frame(Frame::NONE)
         .show(ui, |ui| {
             let rect = ui.max_rect();
-            theme::gradient_rect(
-                ui.painter(),
-                rect,
-                theme::mix(pal.bar, pal.accent_a, 0.10),
-                theme::mix(pal.bar, pal.accent_b, 0.05),
-                true,
-            );
+            theme::paint_bar(ui.painter(), rect, pal);
             let drag = ui.interact(
                 rect,
                 ui.next_auto_id().with("strip-drag"),
@@ -231,18 +224,18 @@ fn title_strip(ui: &mut egui::Ui, input: &BarInput<'_>) {
                     .layout(Layout::right_to_left(Align::Center)),
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    if win_button(ui, ICON_CLOSE, "Close", true).clicked() {
+                    if win_button(ui, ICON_X, "Close", true).clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                     }
                     let (icon, tip) = if input.maximized {
-                        (ICON_FILTER_NONE, "Restore")
+                        (ICON_COPY, "Restore")
                     } else {
-                        (ICON_CROP_SQUARE, "Maximize")
+                        (ICON_SQUARE, "Maximize")
                     };
                     if win_button(ui, icon, tip, false).clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Maximized(!input.maximized));
                     }
-                    if win_button(ui, ICON_MINIMIZE, "Minimize", false).clicked() {
+                    if win_button(ui, ICON_MINUS, "Minimize", false).clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
                     }
                 },
@@ -275,19 +268,13 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
         title_strip(ui, input);
     }
     egui::Panel::top("titlebar")
-        .exact_size(BAR_H)
+        .exact_size(tabs::tab_hit_h())
         .show_separator_line(false)
         .frame(Frame::NONE)
         .show(ui, |ui| {
             let rect = ui.max_rect();
             let p = ui.painter();
-            theme::gradient_rect(
-                p,
-                rect,
-                theme::mix(pal.bar, pal.accent_a, 0.10),
-                theme::mix(pal.bar, pal.accent_b, 0.05),
-                true,
-            );
+            theme::paint_bar(p, rect, pal);
             p.hline(
                 rect.x_range(),
                 rect.bottom() - 0.5,
@@ -351,14 +338,8 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                 pos2(rect.left() + 12.0, rect.top()),
                 pos2(right_rect.left() - 8.0, rect.bottom()),
             );
-            let bar_at = |x: f32| {
-                let t = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                theme::mix(
-                    theme::mix(pal.bar, pal.accent_a, 0.10),
-                    theme::mix(pal.bar, pal.accent_b, 0.05),
-                    t,
-                )
-            };
+            let bar_at =
+                |x: f32| theme::bar_tint(pal, ((x - rect.left()) / rect.width()).clamp(0.0, 1.0));
             let fade = (bar_at(left_rect.left()), bar_at(left_rect.right()));
             ui.scope_builder(
                 UiBuilder::new()
@@ -399,6 +380,29 @@ fn logo(ui: &mut egui::Ui, pal: &Palette, compact: bool) {
     };
     let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
     let p = ui.painter();
+    if theme::neutral() {
+        p.rect(
+            rect,
+            radius as u8 - 1,
+            pal.surface,
+            Stroke::new(1.0, pal.stroke),
+            StrokeKind::Inside,
+        );
+        paint_icon(
+            p,
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            ICON_TERMINAL,
+            glyph - 1.0,
+            pal.accent,
+        );
+        ui.label(
+            theme::strong("OmpDeck")
+                .size(text - 1.0)
+                .color(pal.text_strong),
+        );
+        return;
+    }
     let glow = egui::Shadow {
         offset: [0, 2],
         blur: if compact { 10 } else { 14 },
@@ -439,7 +443,7 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
         {
             pick(ui, &mut action, BarAction::Reopen);
         }
-        if menu_item(ui, ICON_REFRESH, "Refresh sessions", None, true, false).clicked() {
+        if menu_item(ui, ICON_REFRESH_CW, "Refresh sessions", None, true, false).clicked() {
             pick(ui, &mut action, BarAction::Refresh);
         }
         if let Some(o) = &input.omp {
@@ -449,7 +453,7 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
             } else {
                 "Check for updates"
             };
-            if menu_item(ui, ICON_UPDATE, label, None, !checking, false).clicked() {
+            if menu_item(ui, ICON_CIRCLE_ARROW_UP, label, None, !checking, false).clicked() {
                 pick(ui, &mut action, BarAction::CheckUpdates);
             }
             omp_submenu(ui, o, &mut action);
@@ -458,11 +462,7 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.add_space(10.0);
-            ui.label(icon_text(
-                egui_material_icons::icons::ICON_FORMAT_SIZE,
-                17.0,
-                pal.accent,
-            ));
+            ui.label(icon_text(crate::icons::ICON_A_LARGE_SMALL, 17.0, pal.glyph));
             ui.label("Font size");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(4.0);
@@ -470,14 +470,14 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
                     egui::Button::new(icon_text(icon, 16.0, pal.text)).min_size(vec2(26.0, 26.0))
                 };
                 if ui
-                    .add(small(ICON_RESTART_ALT))
+                    .add(small(ICON_ROTATE_CCW))
                     .on_hover_text("Reset (Ctrl+Shift+0)")
                     .clicked()
                 {
                     action = Some(BarAction::FontReset);
                 }
                 if ui
-                    .add(small(ICON_ADD))
+                    .add(small(ICON_PLUS))
                     .on_hover_text("Larger (Ctrl+Shift+=)")
                     .clicked()
                 {
@@ -485,7 +485,7 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
                 }
                 ui.label(theme::strong(format!("{:.0}", input.font_size)).color(pal.text_strong));
                 if ui
-                    .add(small(ICON_REMOVE))
+                    .add(small(ICON_MINUS))
                     .on_hover_text("Smaller (Ctrl+Shift+-)")
                     .clicked()
                 {
@@ -494,8 +494,8 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
             });
         });
         let (icon, label, target) = match input.theme {
-            Theme::Dark => (ICON_LIGHT_MODE, "Light theme", Theme::Light),
-            Theme::Light => (ICON_DARK_MODE, "Dark theme", Theme::Dark),
+            Theme::Dark => (ICON_SUN, "Light theme", Theme::Light),
+            Theme::Light => (ICON_MOON, "Dark theme", Theme::Dark),
         };
         if menu_item(ui, icon, label, None, true, false).clicked() {
             pick(ui, &mut action, BarAction::SetTheme(target));
@@ -507,7 +507,7 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
         };
         if menu_item(
             ui,
-            ICON_WINDOW,
+            ICON_APP_WINDOW,
             "Native title bar",
             Some(state),
             true,
@@ -522,7 +522,7 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
             );
         }
         ui.separator();
-        if menu_item(ui, ICON_LOGOUT, "Quit", None, true, false).clicked() {
+        if menu_item(ui, ICON_LOG_OUT, "Quit", None, true, false).clicked() {
             pick(ui, &mut action, BarAction::Quit);
         }
     });
@@ -533,32 +533,48 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
 fn update_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let galley = badge_galley(ui, label);
-    let (rect, resp) = ui.allocate_exact_size(vec2(badge_width(&galley), 28.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(badge_width(&galley), theme::dens(24.0, 28.0)),
+        Sense::click(),
+    );
     let hov = ui
         .ctx()
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
     let p = ui.painter();
-    let glow = egui::Shadow {
-        offset: [0, 2],
-        blur: 12,
-        spread: 0,
-        color: pal.accent_a.gamma_multiply(0.30 + 0.25 * hov),
+    let (fg, label_fg) = if theme::neutral() {
+        // Flat accent-outlined chip: the one deliberate accent in the bar.
+        p.rect(
+            rect,
+            8,
+            theme::mix(pal.bar, pal.accent, 0.10 + 0.10 * hov),
+            Stroke::new(1.0, pal.accent.gamma_multiply(0.55 + 0.35 * hov)),
+            StrokeKind::Inside,
+        );
+        (pal.accent, pal.accent)
+    } else {
+        let glow = egui::Shadow {
+            offset: [0, 2],
+            blur: 12,
+            spread: 0,
+            color: pal.accent_a.gamma_multiply(0.30 + 0.25 * hov),
+        };
+        p.add(glow.as_shape(rect, egui::CornerRadius::same(14)));
+        theme::gradient_rounded(p, rect, 14.0, pal.accent_a, pal.accent_b);
+        p.rect_stroke(
+            rect,
+            14,
+            Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.18 + 0.25 * hov)),
+            StrokeKind::Inside,
+        );
+        (egui::Color32::WHITE, egui::Color32::WHITE)
     };
-    p.add(glow.as_shape(rect, egui::CornerRadius::same(14)));
-    theme::gradient_rounded(p, rect, 14.0, pal.accent_a, pal.accent_b);
-    p.rect_stroke(
-        rect,
-        14,
-        Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.18 + 0.25 * hov)),
-        StrokeKind::Inside,
-    );
     paint_icon(
         p,
         pos2(rect.left() + 10.0 + 8.0, rect.center().y),
         egui::Align2::CENTER_CENTER,
         ICON_DOWNLOAD,
         16.0,
-        egui::Color32::WHITE,
+        fg,
     );
     p.galley(
         pos2(
@@ -566,7 +582,7 @@ fn update_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
             rect.center().y - galley.size().y / 2.0,
         ),
         galley,
-        egui::Color32::WHITE,
+        label_fg,
     );
     resp.on_hover_text("An omp update is available")
         .on_hover_cursor(CursorIcon::PointingHand)
@@ -575,8 +591,8 @@ fn update_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
 fn badge_galley(ui: &egui::Ui, label: &str) -> std::sync::Arc<egui::Galley> {
     ui.painter().layout_no_wrap(
         label.to_owned(),
-        egui::FontId::proportional(13.0),
-        egui::Color32::WHITE,
+        crate::theme::font(13.0),
+        egui::Color32::PLACEHOLDER,
     )
 }
 
@@ -625,7 +641,7 @@ fn update_actions(ui: &mut egui::Ui, o: &OmpBar<'_>, action: &mut Option<BarActi
     if menu_item(ui, ICON_DOWNLOAD, "Update omp", None, true, false).clicked() {
         pick(ui, action, BarAction::RunUpdate(UpdateKind::Omp));
     }
-    if menu_item(ui, ICON_EXTENSION, "Update plugins", None, true, false).clicked() {
+    if menu_item(ui, ICON_PUZZLE, "Update plugins", None, true, false).clicked() {
         pick(ui, action, BarAction::RunUpdate(UpdateKind::Plugins));
     }
     let kind = o.channel.switch_kind();
@@ -633,7 +649,7 @@ fn update_actions(ui: &mut egui::Ui, o: &OmpBar<'_>, action: &mut Option<BarActi
         Channel::Stable => "Switch to canary channel…",
         Channel::Canary => "Switch to stable channel…",
     };
-    if menu_item(ui, ICON_SWAP_HORIZ, label, None, true, false).clicked() {
+    if menu_item(ui, ICON_ARROW_LEFT_RIGHT, label, None, true, false).clicked() {
         pick(ui, action, BarAction::SwitchChannel(kind));
     }
     ui.separator();
@@ -643,7 +659,7 @@ fn update_actions(ui: &mut egui::Ui, o: &OmpBar<'_>, action: &mut Option<BarActi
     } else {
         "Check again"
     };
-    if menu_item(ui, ICON_REFRESH, check, None, !checking, false).clicked() {
+    if menu_item(ui, ICON_REFRESH_CW, check, None, !checking, false).clicked() {
         pick(ui, action, BarAction::CheckUpdates);
     }
 }
@@ -653,7 +669,7 @@ fn omp_submenu(ui: &mut egui::Ui, o: &OmpBar<'_>, action: &mut Option<BarAction>
     let pal = Palette::of_ui(ui);
     ui.menu_button(
         (
-            icon_text(ICON_ROCKET_LAUNCH, 17.0, pal.accent),
+            icon_text(ICON_ROCKET, 17.0, pal.glyph),
             RichText::new("omp").color(pal.text),
         ),
         |ui| {

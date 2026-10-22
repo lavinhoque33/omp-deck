@@ -6,7 +6,8 @@ embedded, fully interactive terminal backed by tmux, so closing a tab or the who
 
 ## Features
 
-- **Session sidebar**: every omp session grouped by project, newest first, with titles, relative age,
+- **Session sidebar**: every omp session grouped by project (only the active tab's project is expanded;
+  the rest stay collapsed until you open them), newest first, with titles, relative age,
   a running indicator, a filter box, background auto-refresh, and context menus (open, copy/move to another
   project, copy path/id/resume command, "Restart session" for running sessions, "Stop session process",
   and "Delete session…"). Deleting is permanent: it removes the session file and its subagent transcripts
@@ -21,7 +22,9 @@ embedded, fully interactive terminal backed by tmux, so closing a tab or the who
 - **Agent hub and session tree**: browse subagent transcripts and the session tree, fork or navigate from a node.
 - **omp updates and settings**: update check badge, update actions, and a searchable editor for every `omp config` key.
 - **Per-folder mode**: scope the sidebar to a single project folder.
-- Dark and light themes, integrated title bar (or native decorations), persisted window geometry and open tabs.
+- **Appearance**: a flat, neutral default look (Geist font, lucide icons, compact spacing) or the
+  "Midnight neon" style, each in dark and light, plus a Comfortable density option (Settings → OmpDeck).
+  Integrated title bar (or native decorations), persisted window geometry and open tabs.
 
 OmpDeck never writes to the omp session store directly; changes go through omp's own CLI.
 
@@ -128,3 +131,7 @@ Releases are built by GitHub Actions when a `v*` tag is pushed (the tag must mat
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+
+Bundled third-party assets: the [Geist](https://github.com/vercel/geist-font) font (SIL Open Font License
+1.1, `crates/omp-deck/assets/fonts/Geist-OFL.txt`) and [lucide](https://lucide.dev) icons (ISC,
+`crates/omp-deck/assets/fonts/lucide-LICENSE.txt`).

@@ -1,12 +1,21 @@
-//! UI font setup: Adwaita Sans (fallback Cantarell, Noto Sans, then egui's built-ins) as the
-//! Proportional face, plus the Material icon font. Must run after `deck_term::install_fonts`,
-//! which replaces the whole definition set and owns the `term*` families.
+//! UI font setup. Neutral style: bundled Geist (variable, OFL) as the primary face of the
+//! [`NEUTRAL_FAMILY`] family. Neon style: Adwaita Sans (fallback Cantarell, Noto Sans) as the
+//! Proportional family. Both families share the system faces as glyph fallbacks, and the bundled
+//! Lucide icon font backs the `lucide` family (and is a Proportional/neutral fallback so glyphs in
+//! label strings render). Must run after `deck_term::install_fonts`, which replaces the whole
+//! definition set and owns the `term*` families.
 
 use std::path::PathBuf;
 use std::process::Command;
 
 use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
-use egui::{Context, FontData, FontFamily};
+use egui::{Context, FontData, FontDefinitions, FontFamily};
+
+/// Named family of the Neutral style's UI text (Geist first, then the system faces).
+pub const NEUTRAL_FAMILY: &str = "ui-neutral";
+
+static GEIST: &[u8] = include_bytes!("../assets/fonts/Geist-VariableFont.ttf");
+static LUCIDE: &[u8] = include_bytes!("../assets/fonts/lucide.ttf");
 
 /// Candidates in preference order: (fontconfig family, well-known file paths).
 const CANDIDATES: &[(&str, &[&str])] = &[
@@ -26,6 +35,9 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         &["/usr/share/fonts/google-noto/NotoSans-Regular.ttf"],
     ),
 ];
+
+/// egui's built-in emoji/symbol faces, copied into the neutral family so it keeps their glyphs.
+const BUILTIN_FALLBACKS: &[&str] = &["NotoEmoji-Regular", "emoji-icon-font"];
 
 /// `fc-match` hit whose family really is `family` (fc-match always answers with *something*).
 fn fc_lookup(family: &str) -> Option<PathBuf> {
@@ -49,7 +61,7 @@ fn load_one(family: &str, paths: &[&str]) -> Option<Vec<u8>> {
         .and_then(|p| std::fs::read(p).ok())
 }
 
-/// Font bytes of every available UI candidate, in preference order.
+/// Font bytes of every available system UI candidate, in preference order.
 pub struct UiFonts {
     faces: Vec<(&'static str, Vec<u8>)>,
 }
@@ -72,10 +84,21 @@ impl UiFonts {
     }
 }
 
-/// Installs icons and the preloaded UI font chain (no I/O). The first face becomes the primary
-/// Proportional face; the rest are appended as extra glyph fallbacks.
+fn neutral_family() -> FontFamily {
+    FontFamily::Name(NEUTRAL_FAMILY.into())
+}
+
+/// Installs Geist, the icon font and the preloaded system UI faces (no I/O). The first system
+/// face becomes the primary Proportional face; the rest are appended as extra glyph fallbacks.
 pub fn install(ctx: &Context, fonts: UiFonts) {
-    egui_material_icons::initialize(ctx);
+    ctx.add_font(FontInsert::new(
+        "geist",
+        FontData::from_static(GEIST),
+        vec![InsertFontFamily {
+            family: neutral_family(),
+            priority: FontPriority::Highest,
+        }],
+    ));
     for (i, (family, bytes)) in fonts.faces.into_iter().enumerate() {
         let priority = if i == 0 {
             FontPriority::Highest
@@ -86,10 +109,49 @@ pub fn install(ctx: &Context, fonts: UiFonts) {
         ctx.add_font(FontInsert::new(
             &format!("ui-{i}"),
             FontData::from_owned(bytes),
-            vec![InsertFontFamily {
-                family: FontFamily::Proportional,
-                priority,
-            }],
+            vec![
+                InsertFontFamily {
+                    family: FontFamily::Proportional,
+                    priority,
+                },
+                InsertFontFamily {
+                    family: neutral_family(),
+                    priority: FontPriority::Lowest,
+                },
+            ],
         ));
     }
+    let defaults = FontDefinitions::default();
+    for name in BUILTIN_FALLBACKS {
+        if let Some(data) = defaults.font_data.get(*name) {
+            ctx.add_font(FontInsert::new(
+                &format!("ui-neutral-{name}"),
+                data.as_ref().clone(),
+                vec![InsertFontFamily {
+                    family: neutral_family(),
+                    priority: FontPriority::Lowest,
+                }],
+            ));
+        }
+    }
+    let mut lucide = FontData::from_static(LUCIDE);
+    lucide.tweak.y_offset_factor = 0.0;
+    ctx.add_font(FontInsert::new(
+        "lucide",
+        lucide,
+        vec![
+            InsertFontFamily {
+                family: FontFamily::Proportional,
+                priority: FontPriority::Lowest,
+            },
+            InsertFontFamily {
+                family: neutral_family(),
+                priority: FontPriority::Lowest,
+            },
+            InsertFontFamily {
+                family: FontFamily::Name(crate::icons::FONT_FAMILY.into()),
+                priority: FontPriority::Highest,
+            },
+        ],
+    ));
 }

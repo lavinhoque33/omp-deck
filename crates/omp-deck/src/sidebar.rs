@@ -5,20 +5,20 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::icons::Icon;
+use crate::icons::{
+    ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CHEVRONS_DOWN_UP, ICON_CHEVRONS_UP_DOWN,
+    ICON_CIRCLE_STOP, ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS,
+    ICON_FOLDER, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_KEY_ROUND,
+    ICON_LIST_TREE, ICON_PLAY, ICON_PLUS, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_SEARCH,
+    ICON_SEARCH_X, ICON_TERMINAL, ICON_TRASH_2,
+};
 use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot};
 use egui::collapsing_header::CollapsingState;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Align2, CursorIcon, FontId, Frame, Id, Margin, Rect, RichText, Sense, Shape, Stroke,
-    StrokeKind, Ui, pos2, vec2,
-};
-use egui_material_icons::MaterialIcon;
-use egui_material_icons::icons::{
-    ICON_ACCOUNT_TREE, ICON_ADD, ICON_CENTER_FOCUS_STRONG, ICON_CONTENT_COPY, ICON_DELETE,
-    ICON_DESCRIPTION, ICON_DRIVE_FILE_MOVE, ICON_FILE_COPY, ICON_FOLDER, ICON_FOLDER_OFF,
-    ICON_FOLDER_OPEN, ICON_KEY, ICON_OPEN_IN_NEW, ICON_PLAY_ARROW, ICON_REFRESH, ICON_RESTART_ALT,
-    ICON_SEARCH, ICON_SEARCH_OFF, ICON_STOP_CIRCLE, ICON_TERMINAL, ICON_UNFOLD_LESS,
-    ICON_UNFOLD_MORE,
+    Align2, CursorIcon, Frame, Id, Margin, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui,
+    pos2, vec2,
 };
 
 use crate::folder_scope;
@@ -124,7 +124,6 @@ pub enum SidebarAction {
 #[derive(Default)]
 pub struct SidebarOutput {
     pub actions: Vec<SidebarAction>,
-    pub collapsed_changed: bool,
     /// The user clicked something in the sidebar (other than the filter box).
     pub interacted: bool,
 }
@@ -135,6 +134,9 @@ pub struct SidebarInput<'a> {
     pub root: &'a SessionsRoot,
     pub root_exists: bool,
     pub active_path: Option<&'a Path>,
+    /// Working directory of the active terminal tab (its project group when the session file is
+    /// not listed yet).
+    pub active_cwd: Option<&'a Path>,
     pub now: SystemTime,
     /// A manual refresh is in flight (the refresh button spins).
     pub refreshing: bool,
@@ -156,6 +158,98 @@ pub struct SidebarInput<'a> {
     pub picker_available: bool,
     /// The native folder dialog is open.
     pub picking: bool,
+}
+
+/// Which project groups are open. A group is open while filtering, else by its user override,
+/// else when it is the active group. The active group is the group of the most recent tab that
+/// has one (a Settings tab keeps the previous group). Becoming the active group drops a
+/// collapsed (`false`) override so it opens; an open (`true`) override survives. Re-activating
+/// the same group changes nothing. Never persisted.
+#[derive(Default)]
+pub struct Expansion {
+    overrides: HashMap<PathBuf, bool>,
+    active: Option<PathBuf>,
+}
+
+impl Expansion {
+    fn is_open(&self, cwd: &Path, filtering: bool) -> bool {
+        filtering
+            || self
+                .overrides
+                .get(cwd)
+                .copied()
+                .unwrap_or(self.active.as_deref() == Some(cwd))
+    }
+
+    /// Notes the group of the active tab (`None`: the tab has no group, keep the previous one).
+    fn on_activation(&mut self, group: Option<&Path>) {
+        let Some(g) = group else { return };
+        if self.active.as_deref() != Some(g) {
+            if self.overrides.get(g) == Some(&false) {
+                self.overrides.remove(g);
+            }
+            self.active = Some(g.to_path_buf());
+        }
+    }
+
+    fn set(&mut self, cwd: &Path, open: bool) {
+        self.overrides.insert(cwd.to_path_buf(), open);
+    }
+
+    fn set_all(&mut self, groups: &[ProjectGroup], open: bool) {
+        self.overrides.clear();
+        self.overrides
+            .extend(groups.iter().map(|g| (g.cwd.clone(), open)));
+    }
+}
+
+/// The group index holding `active_path`, else the group whose cwd is `active_cwd`.
+fn active_group_of(
+    groups: &[ProjectGroup],
+    active_path: Option<&Path>,
+    active_cwd: Option<&Path>,
+) -> Option<usize> {
+    let by_path = active_path.and_then(|p| {
+        groups
+            .iter()
+            .position(|g| g.sessions.iter().any(|e| e.path == p))
+    });
+    by_path.or_else(|| active_cwd.and_then(|c| groups.iter().position(|g| g.cwd == c)))
+}
+
+/// `(data stamp, active path, active cwd)`.
+type ActiveKey = ((u64, usize), Option<PathBuf>, Option<PathBuf>);
+
+/// The active-group lookup, valid for one [`ActiveKey`].
+#[derive(Default)]
+struct ActiveGroupCache {
+    key: Option<ActiveKey>,
+    group: Option<usize>,
+}
+
+impl ActiveGroupCache {
+    fn get<'a>(
+        &mut self,
+        stamp: (u64, usize),
+        groups: &'a [ProjectGroup],
+        active_path: Option<&Path>,
+        active_cwd: Option<&Path>,
+    ) -> Option<&'a Path> {
+        let fresh = self.key.as_ref().is_some_and(|(s, p, c)| {
+            *s == stamp && p.as_deref() == active_path && c.as_deref() == active_cwd
+        });
+        if !fresh {
+            self.group = active_group_of(groups, active_path, active_cwd);
+            self.key = Some((
+                stamp,
+                active_path.map(Path::to_path_buf),
+                active_cwd.map(Path::to_path_buf),
+            ));
+        }
+        self.group
+            .and_then(|i| groups.get(i))
+            .map(|g| g.cwd.as_path())
+    }
 }
 
 /// Age strings are recomputed at most this often.
@@ -226,17 +320,23 @@ impl AgeCache {
 pub struct SidebarCache {
     filter: FilterCache,
     ages: AgeCache,
+    active_group: ActiveGroupCache,
+    expansion: Expansion,
     pub scope_ui: ScopeState,
 }
 
-const ROW_H: f32 = 36.0;
-const HEADER_H: f32 = 32.0;
+fn row_h() -> f32 {
+    theme::dens(28.0, 36.0)
+}
+
+fn header_h() -> f32 {
+    theme::dens(28.0, 32.0)
+}
 
 pub fn show(
     ui: &mut Ui,
     input: &SidebarInput<'_>,
     filter: &mut String,
-    collapsed: &mut Vec<PathBuf>,
     cache: &mut SidebarCache,
 ) -> SidebarOutput {
     let pal = Palette::of_ui(ui);
@@ -266,10 +366,12 @@ pub fn show(
             },
         });
     }
-    ui.add_space(8.0);
+    ui.add_space(theme::dens(6.0, 8.0));
 
+    let field_h = theme::dens(28.0, 36.0);
+    let neutral = theme::neutral();
     ui.allocate_ui_with_layout(
-        vec2(ui.available_width(), 36.0),
+        vec2(ui.available_width(), field_h),
         egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -282,16 +384,23 @@ pub fn show(
             ui.add(
                 egui::TextEdit::singleline(filter)
                     .id(id)
-                    .prefix(icon_text(ICON_SEARCH, 17.0, pal.weak))
+                    .prefix(icon_text(
+                        ICON_SEARCH,
+                        if neutral { 15.0 } else { 17.0 },
+                        pal.weak,
+                    ))
                     .hint_text("Search sessions…")
                     .align(egui::Align2::LEFT_CENTER)
-                    .min_size(vec2(0.0, 36.0))
+                    .min_size(vec2(0.0, field_h))
                     .desired_width(ui.available_width())
-                    .margin(Margin::symmetric(10, 8))
+                    .margin(Margin::symmetric(
+                        if neutral { 8 } else { 10 },
+                        if neutral { 4 } else { 8 },
+                    ))
                     .frame(
                         Frame::new()
-                            .fill(pal.surface)
-                            .corner_radius(11)
+                            .fill(if neutral { pal.bg } else { pal.surface })
+                            .corner_radius(if neutral { 8 } else { 11 })
                             .stroke(Stroke::new(
                                 1.0,
                                 if focused { pal.accent } else { pal.stroke },
@@ -300,7 +409,7 @@ pub fn show(
             );
         },
     );
-    ui.add_space(8.0);
+    ui.add_space(theme::dens(6.0, 8.0));
     if let Some(dir) = input.scope
         && scope_bar::new_session_button(ui, dir)
     {
@@ -323,7 +432,7 @@ pub fn show(
     if !input.root_exists && input.scope.is_none() {
         empty_state(
             ui,
-            ICON_FOLDER_OFF,
+            ICON_FOLDER_X,
             pal.warn,
             "Sessions directory not found",
             "It will appear here once omp has created sessions.",
@@ -365,9 +474,13 @@ pub fn show(
     let SidebarCache {
         filter: filter_cache,
         ages,
+        active_group: active_cache,
+        expansion,
         ..
     } = cache;
     let stamp = (input.generation, groups.as_ptr() as usize);
+    let active_group = active_cache.get(stamp, groups, input.active_path, input.active_cwd);
+    expansion.on_activation(active_group);
     let visible = filter_cache.sync(stamp, &query, groups);
     let age_key = (
         stamp,
@@ -396,31 +509,24 @@ pub fn show(
                     continue;
                 }
                 any_shown = true;
-                let is_collapsed = !filtering && collapsed.contains(&group.cwd);
+                let open = expansion.is_open(&group.cwd, filtering);
 
                 let pid = ui.make_persistent_id(("project", &group.cwd));
                 let mut state = CollapsingState::load_with_default_open(ui.ctx(), pid, true);
-                state.set_open(!is_collapsed);
+                state.set_open(open);
                 let open_t = state.openness(ui.ctx());
                 let hdr = group_header(ui, group, row_count, open_t, &mut out);
                 let mut menu_collapse = None;
                 crate::theme::context_menu(&hdr.resp, 210.0, |ui| {
-                    if menu_item(ui, ICON_ADD, "New session here", None, true, false).clicked() {
+                    if menu_item(ui, ICON_PLUS, "New session here", None, true, false).clicked() {
                         out.actions.push(SidebarAction::New(group.cwd.clone()));
                         out.interacted = true;
                         ui.close();
                     }
                     let focused = input.scope == Some(group.cwd.as_path());
-                    if menu_item(
-                        ui,
-                        ICON_CENTER_FOCUS_STRONG,
-                        "Focus this folder",
-                        None,
-                        !focused,
-                        false,
-                    )
-                    .on_hover_text("Show only the sessions of this folder")
-                    .clicked()
+                    if menu_item(ui, ICON_FOCUS, "Focus this folder", None, !focused, false)
+                        .on_hover_text("Show only the sessions of this folder")
+                        .clicked()
                     {
                         out.actions
                             .push(SidebarAction::SetScope(Some(group.cwd.clone())));
@@ -432,7 +538,7 @@ pub fn show(
                             .push(SidebarAction::OpenFolder(group.cwd.clone()));
                         ui.close();
                     }
-                    if menu_item(ui, ICON_CONTENT_COPY, "Copy path", None, true, false).clicked() {
+                    if menu_item(ui, ICON_COPY, "Copy path", None, true, false).clicked() {
                         out.actions.push(SidebarAction::CopyText {
                             text: group.cwd.to_string_lossy().into_owned(),
                             what: "project path",
@@ -440,37 +546,27 @@ pub fn show(
                         ui.close();
                     }
                     ui.separator();
-                    if menu_item(ui, ICON_UNFOLD_LESS, "Collapse all", None, true, false).clicked()
+                    if menu_item(ui, ICON_CHEVRONS_DOWN_UP, "Collapse all", None, true, false)
+                        .clicked()
                     {
                         menu_collapse = Some(true);
                         ui.close();
                     }
-                    if menu_item(ui, ICON_UNFOLD_MORE, "Expand all", None, true, false).clicked() {
+                    if menu_item(ui, ICON_CHEVRONS_UP_DOWN, "Expand all", None, true, false)
+                        .clicked()
+                    {
                         menu_collapse = Some(false);
                         ui.close();
                     }
                 });
-                match menu_collapse {
-                    Some(true) => {
-                        collapsed.clear();
-                        collapsed.extend(groups.iter().map(|g| g.cwd.clone()));
-                        out.collapsed_changed = true;
-                    }
-                    Some(false) => {
-                        collapsed.clear();
-                        out.collapsed_changed = true;
-                    }
-                    None => {}
+                if let Some(collapse) = menu_collapse {
+                    expansion.set_all(groups, !collapse);
+                    state.set_open(filtering || !collapse);
                 }
                 if hdr.toggle && !filtering {
-                    if let Some(i) = collapsed.iter().position(|c| *c == group.cwd) {
-                        collapsed.remove(i);
-                    } else {
-                        collapsed.push(group.cwd.clone());
-                    }
-                    out.collapsed_changed = true;
+                    expansion.set(&group.cwd, !open);
                     out.interacted = true;
-                    state.set_open(is_collapsed);
+                    state.set_open(!open);
                 }
                 state.store(ui.ctx());
                 state.show_body_unindented(ui, |ui| {
@@ -497,7 +593,7 @@ pub fn show(
                 if filtering {
                     empty_state(
                         ui,
-                        ICON_SEARCH_OFF,
+                        ICON_SEARCH_X,
                         pal.weak,
                         "No matching sessions",
                         match input.scope {
@@ -536,24 +632,32 @@ fn scope_empty(ui: &mut Ui, dir: &Path) {
 
 fn refresh_button(ui: &mut Ui, spinning: bool) -> egui::Response {
     let pal = Palette::of_ui(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(32.0, 36.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(theme::dens(28.0, 32.0), theme::dens(28.0, 36.0)),
+        Sense::click(),
+    );
     let hov = ui
         .ctx()
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
     let p = ui.painter();
-    p.rect_filled(rect, 10, pal.raised.gamma_multiply(0.85 * hov));
+    let neutral = theme::neutral();
+    p.rect_filled(
+        rect,
+        if neutral { 8 } else { 10 },
+        theme::hover_fill(pal).gamma_multiply(0.85 * hov),
+    );
     if spinning {
         ui.put(
             Rect::from_center_size(rect.center(), vec2(16.0, 16.0)),
-            crate::widgets::Spin::new(16.0, pal.accent_b),
+            crate::widgets::Spin::new(if neutral { 14.0 } else { 16.0 }, pal.accent_b),
         );
     } else {
         paint_icon(
             p,
             rect.center(),
             Align2::CENTER_CENTER,
-            ICON_REFRESH,
-            19.0,
+            ICON_REFRESH_CW,
+            if neutral { 15.0 } else { 19.0 },
             theme::mix(pal.weak, pal.text_strong, hov),
         );
     }
@@ -575,7 +679,8 @@ fn group_header(
     out: &mut SidebarOutput,
 ) -> HeaderResult {
     let pal = Palette::of_ui(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), HEADER_H), Sense::click());
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), header_h()), Sense::click());
     let plus_rect =
         Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(24.0, 24.0));
     let plus = ui.interact(plus_rect, resp.id.with("new"), Sense::click());
@@ -589,88 +694,102 @@ fn group_header(
 
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        p.rect_filled(rect, 9, pal.raised.gamma_multiply(0.55 * hov));
-        // Chevron, rotated by the open animation (0 = right, 1 = down).
-        let c = pos2(rect.left() + 14.0, rect.center().y);
-        let a = open_t * std::f32::consts::FRAC_PI_2;
-        let rot = |x: f32, y: f32| c + vec2(x * a.cos() - y * a.sin(), x * a.sin() + y * a.cos());
-        p.add(Shape::line(
-            vec![rot(-2.5, -4.0), rot(2.5, 0.0), rot(-2.5, 4.0)],
-            Stroke::new(1.7, theme::mix(pal.weak, pal.text_strong, hov)),
-        ));
-        let folder = if open_t > 0.5 {
-            ICON_FOLDER_OPEN
+        if theme::neutral() {
+            paint_header_neutral(
+                p,
+                pal,
+                rect,
+                plus_rect,
+                group,
+                shown,
+                open_t,
+                (hov, plus_hov),
+            );
         } else {
-            ICON_FOLDER
-        };
-        paint_icon(
-            p,
-            pos2(rect.left() + 34.0, rect.center().y),
-            Align2::CENTER_CENTER,
-            folder,
-            18.0,
-            pal.accent,
-        );
+            p.rect_filled(rect, 9, pal.raised.gamma_multiply(0.55 * hov));
+            // Chevron, rotated by the open animation (0 = right, 1 = down).
+            let c = pos2(rect.left() + 14.0, rect.center().y);
+            let a = open_t * std::f32::consts::FRAC_PI_2;
+            let rot =
+                |x: f32, y: f32| c + vec2(x * a.cos() - y * a.sin(), x * a.sin() + y * a.cos());
+            p.add(Shape::line(
+                vec![rot(-2.5, -4.0), rot(2.5, 0.0), rot(-2.5, 4.0)],
+                Stroke::new(1.7, theme::mix(pal.weak, pal.text_strong, hov)),
+            ));
+            let folder = if open_t > 0.5 {
+                ICON_FOLDER_OPEN
+            } else {
+                ICON_FOLDER
+            };
+            paint_icon(
+                p,
+                pos2(rect.left() + 34.0, rect.center().y),
+                Align2::CENTER_CENTER,
+                folder,
+                18.0,
+                pal.accent,
+            );
 
-        let (parent, name) = split_display(&group.display);
-        let mut job = LayoutJob::default();
-        job.append(
-            name,
-            0.0,
-            TextFormat {
-                font_id: FontId::proportional(14.0),
-                color: pal.text_strong,
-                ..Default::default()
-            },
-        );
-        if !parent.is_empty() {
+            let (parent, name) = split_display(&group.display);
+            let mut job = LayoutJob::default();
             job.append(
-                &format!("  {parent}"),
+                name,
                 0.0,
                 TextFormat {
-                    font_id: FontId::proportional(11.5),
-                    color: pal.weak,
+                    font_id: crate::theme::font(14.0),
+                    color: pal.text_strong,
                     ..Default::default()
                 },
             );
-        }
-        job.wrap.max_width = (rect.width() - 46.0 - 40.0).max(10.0);
-        job.wrap.max_rows = 1;
-        job.wrap.break_anywhere = true;
-        let galley = p.layout_job(job);
-        p.galley(
-            pos2(rect.left() + 48.0, rect.center().y - galley.size().y / 2.0),
-            galley,
-            pal.text,
-        );
+            if !parent.is_empty() {
+                job.append(
+                    &format!("  {parent}"),
+                    0.0,
+                    TextFormat {
+                        font_id: crate::theme::font(11.5),
+                        color: pal.weak,
+                        ..Default::default()
+                    },
+                );
+            }
+            job.wrap.max_width = (rect.width() - 46.0 - 40.0).max(10.0);
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            let galley = p.layout_job(job);
+            p.galley(
+                pos2(rect.left() + 48.0, rect.center().y - galley.size().y / 2.0),
+                galley,
+                pal.text,
+            );
 
-        // Count chip crossfades into the "+" button on hover.
-        let count = shown.to_string();
-        let g = p.layout_no_wrap(
-            count,
-            FontId::proportional(11.5),
-            pal.weak.gamma_multiply(1.0 - hov),
-        );
-        let chip = Rect::from_center_size(
-            pos2(rect.right() - 16.0, rect.center().y),
-            vec2((g.size().x + 12.0).max(22.0), 18.0),
-        );
-        p.rect_filled(chip, 9, pal.surface.gamma_multiply(1.0 - hov));
-        p.galley(chip.center() - g.size() / 2.0, g, pal.weak);
-        if hov > 0.01 {
-            p.rect_filled(
-                plus_rect,
-                8,
-                theme::mix(pal.raised, pal.accent, plus_hov * 0.5).gamma_multiply(hov),
+            // Count chip crossfades into the "+" button on hover.
+            let count = shown.to_string();
+            let g = p.layout_no_wrap(
+                count,
+                crate::theme::font(11.5),
+                pal.weak.gamma_multiply(1.0 - hov),
             );
-            paint_icon(
-                p,
-                plus_rect.center(),
-                Align2::CENTER_CENTER,
-                ICON_ADD,
-                17.0,
-                theme::mix(pal.weak, pal.text_strong, plus_hov).gamma_multiply(hov),
+            let chip = Rect::from_center_size(
+                pos2(rect.right() - 16.0, rect.center().y),
+                vec2((g.size().x + 12.0).max(22.0), 18.0),
             );
+            p.rect_filled(chip, 9, pal.surface.gamma_multiply(1.0 - hov));
+            p.galley(chip.center() - g.size() / 2.0, g, pal.weak);
+            if hov > 0.01 {
+                p.rect_filled(
+                    plus_rect,
+                    8,
+                    theme::mix(pal.raised, pal.accent, plus_hov * 0.5).gamma_multiply(hov),
+                );
+                paint_icon(
+                    p,
+                    plus_rect.center(),
+                    Align2::CENTER_CENTER,
+                    ICON_PLUS,
+                    17.0,
+                    theme::mix(pal.weak, pal.text_strong, plus_hov).gamma_multiply(hov),
+                );
+            }
         }
     }
     let resp = resp
@@ -696,6 +815,104 @@ fn group_header(
     HeaderResult { resp, toggle }
 }
 
+/// Neutral header: chevron, folder glyph, medium name + faint parent path, plain count that turns
+/// into the "+" on hover. No fills except the hover wash.
+#[allow(clippy::too_many_arguments)]
+fn paint_header_neutral(
+    p: &egui::Painter,
+    pal: &Palette,
+    rect: Rect,
+    plus_rect: Rect,
+    group: &ProjectGroup,
+    shown: usize,
+    open_t: f32,
+    (hov, plus_hov): (f32, f32),
+) {
+    p.rect_filled(rect, 6, pal.surface.gamma_multiply(0.7 * hov));
+    let chev = if open_t > 0.5 {
+        ICON_CHEVRON_DOWN
+    } else {
+        ICON_CHEVRON_RIGHT
+    };
+    let y = rect.center().y;
+    paint_icon(
+        p,
+        pos2(rect.left() + 12.0, y),
+        Align2::CENTER_CENTER,
+        chev,
+        14.0,
+        theme::mix(pal.weak, pal.text_strong, hov),
+    );
+    let folder = if open_t > 0.5 {
+        ICON_FOLDER_OPEN
+    } else {
+        ICON_FOLDER
+    };
+    paint_icon(
+        p,
+        pos2(rect.left() + 31.0, y),
+        Align2::CENTER_CENTER,
+        folder,
+        15.0,
+        theme::mix(pal.glyph, pal.text_strong, open_t * 0.5),
+    );
+    let (parent, name) = split_display(&group.display);
+    let mut job = LayoutJob::default();
+    job.append(
+        name,
+        0.0,
+        TextFormat {
+            font_id: crate::theme::font(13.0),
+            color: pal.text_strong,
+            ..Default::default()
+        },
+    );
+    if !parent.is_empty() {
+        job.append(
+            &format!("  {parent}"),
+            0.0,
+            TextFormat {
+                font_id: crate::theme::font(11.0),
+                color: pal.weak,
+                ..Default::default()
+            },
+        );
+    }
+    job.wrap.max_width = (rect.width() - 44.0 - 40.0).max(10.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = p.layout_job(job);
+    p.galley(
+        pos2(rect.left() + 46.0, y - galley.size().y / 2.0),
+        galley,
+        pal.text,
+    );
+    let count = p.layout_no_wrap(
+        shown.to_string(),
+        crate::theme::font(11.0),
+        pal.weak.gamma_multiply(1.0 - hov),
+    );
+    p.galley(
+        pos2(
+            rect.right() - 14.0 - count.size().x / 2.0,
+            y - count.size().y / 2.0,
+        ),
+        count,
+        pal.weak,
+    );
+    if hov > 0.01 {
+        p.rect_filled(plus_rect, 6, pal.raised.gamma_multiply(hov * plus_hov));
+        paint_icon(
+            p,
+            plus_rect.center(),
+            Align2::CENTER_CENTER,
+            ICON_PLUS,
+            15.0,
+            theme::mix(pal.weak, pal.text_strong, plus_hov).gamma_multiply(hov),
+        );
+    }
+}
+
 fn session_row(
     ui: &mut Ui,
     entry: &SessionEntry,
@@ -708,7 +925,7 @@ fn session_row(
     let pal = Palette::of_ui(ui);
     // A delete/move/copy of this session is in flight on a worker.
     let busy = input.busy.contains(&entry.path);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h()), Sense::click());
     let ctx = ui.ctx().clone();
     let hov = ctx.animate_bool_with_time(
         resp.id.with("hov"),
@@ -719,73 +936,88 @@ fn session_row(
     if ui.is_rect_visible(rect) {
         let pill = rect.shrink2(vec2(2.0, 0.0));
         let p = ui.painter();
-        p.rect_filled(
-            pill,
-            10,
-            pal.raised.gamma_multiply(0.75 * hov * (1.0 - sel)),
-        );
-        if sel > 0.01 {
-            p.rect(
+        if theme::neutral() {
+            paint_row_neutral(
+                p,
+                pal,
+                pill,
+                entry.label(),
+                age_text,
+                (running, busy),
+                (hov, sel),
+            );
+        } else {
+            p.rect_filled(
                 pill,
                 10,
-                theme::mix(pal.surface, pal.accent, 0.20).gamma_multiply(sel),
-                Stroke::new(1.0, pal.accent.gamma_multiply(0.5 * sel)),
-                StrokeKind::Inside,
+                pal.raised.gamma_multiply(0.75 * hov * (1.0 - sel)),
             );
-            let bar = Rect::from_center_size(
-                pos2(pill.left() + 3.0, pill.center().y),
-                vec2(3.0, 20.0 * sel),
+            if sel > 0.01 {
+                p.rect(
+                    pill,
+                    10,
+                    theme::mix(pal.surface, pal.accent, 0.20).gamma_multiply(sel),
+                    Stroke::new(1.0, pal.accent.gamma_multiply(0.5 * sel)),
+                    StrokeKind::Inside,
+                );
+                let bar = Rect::from_center_size(
+                    pos2(pill.left() + 3.0, pill.center().y),
+                    vec2(3.0, 20.0 * sel),
+                );
+                let mut m = egui::epaint::Mesh::default();
+                m.colored_vertex(bar.left_top(), pal.accent_a);
+                m.colored_vertex(bar.right_top(), pal.accent_a);
+                m.colored_vertex(bar.left_bottom(), pal.accent_b);
+                m.colored_vertex(bar.right_bottom(), pal.accent_b);
+                m.add_triangle(0, 1, 2);
+                m.add_triangle(1, 3, 2);
+                p.add(Shape::mesh(m));
+            }
+            // Status dot.
+            let dot = pos2(pill.left() + 19.0, pill.center().y);
+            if busy {
+                // The spinner is placed below, once the painter borrow ends.
+            } else if running {
+                theme::glow_dot(p, dot, 3.5, pal.ok, theme::GLOW_REST);
+            } else {
+                p.circle_filled(dot, 2.8, pal.weak.gamma_multiply(0.45));
+            }
+            // Age chip.
+            let age = p.layout_no_wrap(age_text.to_owned(), crate::theme::font(11.5), pal.weak);
+            let chip = Rect::from_center_size(
+                pos2(
+                    pill.right() - 10.0 - (age.size().x + 12.0) / 2.0,
+                    pill.center().y,
+                ),
+                vec2(age.size().x + 12.0, 18.0),
             );
-            let mut m = egui::epaint::Mesh::default();
-            m.colored_vertex(bar.left_top(), pal.accent_a);
-            m.colored_vertex(bar.right_top(), pal.accent_a);
-            m.colored_vertex(bar.left_bottom(), pal.accent_b);
-            m.colored_vertex(bar.right_bottom(), pal.accent_b);
-            m.add_triangle(0, 1, 2);
-            m.add_triangle(1, 3, 2);
-            p.add(Shape::mesh(m));
+            p.rect_filled(chip, 9, pal.bg.gamma_multiply(0.55 + 0.45 * sel));
+            p.galley(chip.center() - age.size() / 2.0, age, pal.weak);
+            // Title.
+            let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.5));
+            let mut job = LayoutJob::simple_singleline(
+                entry.label().to_owned(),
+                crate::theme::font(13.5),
+                color,
+            );
+            job.wrap.max_width = (chip.left() - pill.left() - 32.0 - 8.0).max(10.0);
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            let galley = p.layout_job(job);
+            p.galley(
+                pos2(pill.left() + 32.0, pill.center().y - galley.size().y / 2.0),
+                galley,
+                color,
+            );
         }
-        // Status dot.
-        let dot = pos2(pill.left() + 19.0, pill.center().y);
-        if busy {
-            // The spinner is placed below, once the painter borrow ends.
-        } else if running {
-            theme::glow_dot(p, dot, 3.5, pal.ok, theme::GLOW_REST);
-        } else {
-            p.circle_filled(dot, 2.8, pal.weak.gamma_multiply(0.45));
-        }
-        // Age chip.
-        let age = p.layout_no_wrap(age_text.to_owned(), FontId::proportional(11.5), pal.weak);
-        let chip = Rect::from_center_size(
-            pos2(
-                pill.right() - 10.0 - (age.size().x + 12.0) / 2.0,
-                pill.center().y,
-            ),
-            vec2(age.size().x + 12.0, 18.0),
-        );
-        p.rect_filled(chip, 9, pal.bg.gamma_multiply(0.55 + 0.45 * sel));
-        p.galley(chip.center() - age.size() / 2.0, age, pal.weak);
-        // Title.
-        let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.5));
-        let mut job = LayoutJob::simple_singleline(
-            entry.label().to_owned(),
-            FontId::proportional(13.5),
-            color,
-        );
-        job.wrap.max_width = (chip.left() - pill.left() - 32.0 - 8.0).max(10.0);
-        job.wrap.max_rows = 1;
-        job.wrap.break_anywhere = true;
-        let galley = p.layout_job(job);
-        p.galley(
-            pos2(pill.left() + 32.0, pill.center().y - galley.size().y / 2.0),
-            galley,
-            color,
-        );
     }
     if busy {
         ui.put(
             Rect::from_center_size(
-                pos2(rect.left() + 2.0 + 19.0, rect.center().y),
+                pos2(
+                    rect.left() + 2.0 + if theme::neutral() { 15.0 } else { 19.0 },
+                    rect.center().y,
+                ),
                 vec2(12.0, 12.0),
             ),
             crate::widgets::Spin::new(12.0, pal.accent_b),
@@ -801,17 +1033,17 @@ fn session_row(
             out.actions.push(SidebarAction::CopyText { text, what });
             ui.close();
         }
-        if menu_item(ui, ICON_PLAY_ARROW, "Open", None, true, false).clicked() {
+        if menu_item(ui, ICON_PLAY, "Open", None, true, false).clicked() {
             out.actions.push(SidebarAction::Open(entry.clone()));
             out.interacted = true;
             ui.close();
         }
-        if menu_item(ui, ICON_ACCOUNT_TREE, "Session tree…", None, true, false).clicked() {
+        if menu_item(ui, ICON_LIST_TREE, "Session tree…", None, true, false).clicked() {
             out.actions.push(SidebarAction::Tree(entry.clone()));
             ui.close();
         }
         ui.separator();
-        if menu_item(ui, ICON_DESCRIPTION, "Copy session path", None, true, false).clicked() {
+        if menu_item(ui, ICON_FILE_TEXT, "Copy session path", None, true, false).clicked() {
             copy(
                 ui,
                 out,
@@ -819,7 +1051,7 @@ fn session_row(
                 "session path",
             );
         }
-        if menu_item(ui, ICON_KEY, "Copy session id", None, true, false).clicked() {
+        if menu_item(ui, ICON_KEY_ROUND, "Copy session id", None, true, false).clicked() {
             copy(ui, out, entry.id.clone(), "session id");
         }
         if menu_item(ui, ICON_TERMINAL, "Copy resume command", None, true, false).clicked() {
@@ -840,7 +1072,16 @@ fn session_row(
                 .push(SidebarAction::OpenFolder(entry.cwd.clone()));
             ui.close();
         }
-        if menu_item(ui, ICON_OPEN_IN_NEW, "Show session file", None, true, false).clicked() {
+        if menu_item(
+            ui,
+            ICON_EXTERNAL_LINK,
+            "Show session file",
+            None,
+            true,
+            false,
+        )
+        .clicked()
+        {
             let dir = entry
                 .path
                 .parent()
@@ -852,8 +1093,8 @@ fn session_row(
             ui.separator();
             let idle = !input.busy.contains(&entry.path);
             for (kind, icon, label) in [
-                (TransferKind::Copy, ICON_FILE_COPY, "Copy to project"),
-                (TransferKind::Move, ICON_DRIVE_FILE_MOVE, "Move to project"),
+                (TransferKind::Copy, ICON_FILES, "Copy to project"),
+                (TransferKind::Move, ICON_FOLDER_OUTPUT, "Move to project"),
             ] {
                 transfer_menu(ui, entry, (kind, icon, label), idle, input, out);
             }
@@ -861,20 +1102,20 @@ fn session_row(
         if input.omp_available {
             ui.separator();
             let idle = !input.busy.contains(&entry.path);
-            if menu_item(ui, ICON_DELETE, "Delete session…", None, idle, true).clicked() {
+            if menu_item(ui, ICON_TRASH_2, "Delete session…", None, idle, true).clicked() {
                 out.actions.push(SidebarAction::Delete(entry.clone()));
                 ui.close();
             }
         }
         if running && input.can_stop {
             ui.separator();
-            if menu_item(ui, ICON_RESTART_ALT, "Restart session", None, true, false).clicked() {
+            if menu_item(ui, ICON_ROTATE_CCW, "Restart session", None, true, false).clicked() {
                 out.actions.push(SidebarAction::Restart(entry.clone()));
                 ui.close();
             }
             if menu_item(
                 ui,
-                ICON_STOP_CIRCLE,
+                ICON_CIRCLE_STOP,
                 "Stop session process",
                 None,
                 true,
@@ -895,11 +1136,56 @@ fn session_row(
     });
 }
 
+/// Neutral session row: quiet hover wash, selected = surface fill + strong text + 2 px accent
+/// edge; status dot at the left, age at the right.
+fn paint_row_neutral(
+    p: &egui::Painter,
+    pal: &Palette,
+    pill: Rect,
+    label: &str,
+    age_text: &str,
+    (running, busy): (bool, bool),
+    (hov, sel): (f32, f32),
+) {
+    p.rect_filled(pill, 6, pal.surface.gamma_multiply(0.6 * hov * (1.0 - sel)));
+    if sel > 0.01 {
+        p.rect_filled(pill, 6, pal.surface.gamma_multiply(sel));
+        let bar = Rect::from_center_size(
+            pos2(pill.left() + 1.0, pill.center().y),
+            vec2(2.0, 14.0 * sel),
+        );
+        p.rect_filled(bar, 1, pal.accent);
+    }
+    let y = pill.center().y;
+    let dot = pos2(pill.left() + 15.0, y);
+    if busy {
+        // The spinner is placed by the caller.
+    } else if running {
+        p.circle_filled(dot, 3.0, pal.ok);
+    } else {
+        p.circle_filled(dot, 2.5, pal.weak.gamma_multiply(0.4));
+    }
+    let age = p.layout_no_wrap(age_text.to_owned(), crate::theme::font(11.0), pal.weak);
+    let age_x = pill.right() - 10.0 - age.size().x;
+    let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.6));
+    let mut job = LayoutJob::simple_singleline(label.to_owned(), crate::theme::font(13.0), color);
+    job.wrap.max_width = (age_x - pill.left() - 28.0 - 8.0).max(10.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = p.layout_job(job);
+    p.galley(
+        pos2(pill.left() + 28.0, y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    p.galley(pos2(age_x, y - age.size().y / 2.0), age, pal.weak);
+}
+
 /// "Copy to project" / "Move to project" submenu: every other project, then "Choose folder…".
 fn transfer_menu(
     ui: &mut Ui,
     entry: &SessionEntry,
-    spec: (TransferKind, MaterialIcon, &str),
+    spec: (TransferKind, Icon, &str),
     enabled: bool,
     input: &SidebarInput<'_>,
     out: &mut SidebarOutput,
@@ -918,7 +1204,7 @@ fn transfer_menu(
     ui.add_enabled_ui(enabled, |ui| {
         ui.menu_button(
             (
-                icon_text(icon, 17.0, pal.accent),
+                icon_text(icon, 17.0, pal.glyph),
                 RichText::new(label).color(pal.text),
             ),
             |ui| {
@@ -1086,5 +1372,124 @@ mod tests {
         assert_eq!(split_display("~"), ("", "~"));
         assert_eq!(split_display("/"), ("", "/"));
         assert_eq!(split_display("/x"), ("", "x"));
+    }
+
+    fn proj(cwd: &str, ids: &[&str]) -> ProjectGroup {
+        ProjectGroup {
+            cwd: PathBuf::from(cwd),
+            display: cwd.into(),
+            sessions: ids
+                .iter()
+                .map(|id| SessionEntry {
+                    id: (*id).into(),
+                    path: PathBuf::from(format!("{cwd}/{id}.jsonl")),
+                    cwd: PathBuf::from(cwd),
+                    title: None,
+                    first_prompt: None,
+                    modified: SystemTime::UNIX_EPOCH,
+                })
+                .collect(),
+        }
+    }
+
+    fn open_set(ex: &Expansion, groups: &[ProjectGroup]) -> Vec<bool> {
+        groups.iter().map(|g| ex.is_open(&g.cwd, false)).collect()
+    }
+
+    fn group_at<'a>(groups: &'a [ProjectGroup], path: &str) -> Option<&'a Path> {
+        active_group_of(groups, Some(Path::new(path)), None).map(|i| groups[i].cwd.as_path())
+    }
+
+    #[test]
+    fn only_the_active_tabs_group_is_open_at_startup() {
+        let groups = [
+            proj("/a", &["a1"]),
+            proj("/b", &["b1"]),
+            proj("/c", &["c1"]),
+        ];
+        let active = group_at(&groups, "/b/b1.jsonl");
+        assert_eq!(active, Some(Path::new("/b")));
+        let mut ex = Expansion::default();
+        ex.on_activation(active);
+        assert_eq!(open_set(&ex, &groups), [false, true, false]);
+    }
+
+    #[test]
+    fn new_session_tab_opens_its_cwd_group() {
+        let groups = [proj("/a", &["a1"]), proj("/b", &["b1"])];
+        assert_eq!(
+            active_group_of(&groups, None, Some(Path::new("/a"))),
+            Some(0)
+        );
+        assert_eq!(
+            active_group_of(&groups, None, Some(Path::new("/zzz"))),
+            None
+        );
+    }
+
+    #[test]
+    fn manual_open_survives_activating_it_then_another_group() {
+        let groups = [
+            proj("/a", &["a1"]),
+            proj("/b", &["b1"]),
+            proj("/c", &["c1"]),
+        ];
+        let mut ex = Expansion::default();
+        ex.on_activation(group_at(&groups, "/a/a1.jsonl"));
+        ex.set(Path::new("/c"), true); // user opens /c by hand
+        assert_eq!(open_set(&ex, &groups), [true, false, true]);
+        ex.on_activation(group_at(&groups, "/c/c1.jsonl"));
+        ex.on_activation(group_at(&groups, "/b/b1.jsonl"));
+        assert_eq!(open_set(&ex, &groups), [false, true, true]);
+    }
+
+    #[test]
+    fn changing_group_reopens_a_collapsed_group_but_reclicking_does_not() {
+        let groups = [proj("/a", &["a1"]), proj("/b", &["b1"])];
+        let mut ex = Expansion::default();
+        let a = group_at(&groups, "/a/a1.jsonl");
+        ex.on_activation(a);
+        ex.set(Path::new("/a"), false);
+        ex.on_activation(a); // re-click the active tab: stays collapsed
+        assert_eq!(open_set(&ex, &groups), [false, false]);
+        ex.on_activation(group_at(&groups, "/b/b1.jsonl"));
+        ex.set(Path::new("/a"), false);
+        ex.on_activation(a); // group changed back: reopens
+        assert_eq!(open_set(&ex, &groups), [true, false]);
+    }
+
+    #[test]
+    fn a_tab_without_group_keeps_the_previous_group_open() {
+        let groups = [proj("/a", &["a1"]), proj("/b", &["b1"])];
+        let mut ex = Expansion::default();
+        ex.on_activation(group_at(&groups, "/b/b1.jsonl"));
+        ex.on_activation(None); // Settings tab
+        assert_eq!(open_set(&ex, &groups), [false, true]);
+    }
+
+    #[test]
+    fn active_group_lookup_is_cached_per_key() {
+        let groups = [proj("/a", &["a1"]), proj("/b", &["b1"])];
+        let mut cache = ActiveGroupCache::default();
+        let stamp = (1, groups.as_ptr() as usize);
+        let b = Some(Path::new("/b/b1.jsonl"));
+        assert_eq!(cache.get(stamp, &groups, b, None), Some(Path::new("/b")));
+        assert_eq!(cache.group, Some(1));
+        assert_eq!(
+            cache.get(stamp, &groups, Some(Path::new("/a/a1.jsonl")), None),
+            Some(Path::new("/a"))
+        );
+    }
+
+    #[test]
+    fn filtering_shows_everything_and_collapse_expand_all_set_overrides() {
+        let groups = [proj("/a", &["a1"]), proj("/b", &["b1"])];
+        let mut ex = Expansion::default();
+        ex.on_activation(Some(Path::new("/a")));
+        assert!(groups.iter().all(|g| ex.is_open(&g.cwd, true)));
+        ex.set_all(&groups, false);
+        assert_eq!(open_set(&ex, &groups), [false, false]);
+        ex.set_all(&groups, true);
+        assert_eq!(open_set(&ex, &groups), [true, true]);
     }
 }

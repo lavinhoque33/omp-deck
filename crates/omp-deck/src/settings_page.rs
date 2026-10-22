@@ -2,17 +2,18 @@
 //! the left (OmpDeck's own preferences, then omp's settings tabs) and the selected section on the
 //! right, with a search field that filters across every omp tab.
 
-use deck_core::config::Theme;
+use crate::icons::Icon;
+use crate::icons::{
+    ICON_BRAIN, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CLOUD, ICON_CPU, ICON_FOLD_VERTICAL,
+    ICON_FOLDER, ICON_KEYBOARD, ICON_LIST_CHECKS, ICON_LIST_TREE, ICON_MOON, ICON_NEWSPAPER,
+    ICON_PALETTE, ICON_REFRESH_CW, ICON_SEARCH, ICON_SEARCH_X, ICON_SETTINGS_2,
+    ICON_SLIDERS_HORIZONTAL, ICON_SPARKLES, ICON_SQUARE, ICON_SUN, ICON_TERMINAL,
+    ICON_TRIANGLE_ALERT, ICON_WRENCH,
+};
+use deck_core::config::{Density, Theme, UiStyle};
 use deck_core::omp::{Setting, SettingsCatalog};
 use egui::{
-    Align2, CursorIcon, Frame, Margin, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
-};
-use egui_material_icons::MaterialIcon;
-use egui_material_icons::icons::{
-    ICON_ACCOUNT_TREE, ICON_ARTICLE, ICON_BUILD, ICON_CHECKLIST, ICON_CLOUD, ICON_DARK_MODE,
-    ICON_ERROR, ICON_FOLDER, ICON_KEYBOARD, ICON_LIGHT_MODE, ICON_MEMORY, ICON_PALETTE,
-    ICON_PSYCHOLOGY, ICON_REFRESH, ICON_SEARCH, ICON_SEARCH_OFF, ICON_SETTINGS_SUGGEST,
-    ICON_TERMINAL, ICON_TUNE, ICON_WARNING,
+    Align2, Color32, CursorIcon, Frame, Margin, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
 use serde_json::Value;
 
@@ -89,6 +90,8 @@ pub struct SettingsInput<'a> {
     pub font_range: (f32, f32),
     pub font_default: f32,
     pub theme: Theme,
+    pub style: UiStyle,
+    pub density: Density,
     pub native_decorations: bool,
     pub omp_found: bool,
     pub omp_version: Option<&'a str>,
@@ -100,6 +103,8 @@ pub struct SettingsInput<'a> {
 pub enum SettingsAction {
     FontSize(f32),
     Theme(Theme),
+    Style(UiStyle),
+    Density(Density),
     NativeDecorations(bool),
     SetCheckUpdates(bool),
     CheckUpdates,
@@ -117,20 +122,20 @@ pub enum SettingsAction {
     CopyDetails(String),
 }
 
-fn tab_icon(id: &str) -> MaterialIcon {
+fn tab_icon(id: &str) -> Icon {
     match id {
         "appearance" => ICON_PALETTE,
-        "model" => ICON_PSYCHOLOGY,
+        "model" => ICON_BRAIN,
         "interaction" => ICON_KEYBOARD,
-        "context" => ICON_ARTICLE,
-        "memory" => ICON_MEMORY,
+        "context" => ICON_NEWSPAPER,
+        "memory" => ICON_CPU,
         "files" => ICON_FOLDER,
         "shell" => ICON_TERMINAL,
-        "tools" => ICON_BUILD,
-        "tasks" => ICON_CHECKLIST,
+        "tools" => ICON_WRENCH,
+        "tasks" => ICON_LIST_CHECKS,
         "providers" => ICON_CLOUD,
-        "internal" => ICON_SETTINGS_SUGGEST,
-        _ => ICON_ACCOUNT_TREE,
+        "internal" => ICON_SETTINGS_2,
+        _ => ICON_LIST_TREE,
     }
 }
 
@@ -225,7 +230,7 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
     let pal = Palette::of_ui(ui);
     if nav_item(
         ui,
-        ICON_TUNE,
+        ICON_SLIDERS_HORIZONTAL,
         "OmpDeck",
         state.selected == OMPDECK_ENTRY && !searching,
         None,
@@ -271,9 +276,9 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
                 "omp not found"
             };
             let icon = if input.omp_found {
-                ICON_SETTINGS_SUGGEST
+                ICON_SETTINGS_2
             } else {
-                ICON_WARNING
+                ICON_TRIANGLE_ALERT
             };
             if nav_item(ui, icon, label, state.selected >= 1 && !searching, None).clicked() {
                 state.selected = 1;
@@ -285,19 +290,34 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
 
 fn nav_item(
     ui: &mut Ui,
-    icon: MaterialIcon,
+    icon: Icon,
     label: &str,
     selected: bool,
     badge: Option<(&str, bool)>,
 ) -> egui::Response {
     let pal = Palette::of_ui(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+    let neutral = theme::neutral();
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(ui.available_width(), theme::dens(30.0, 36.0)),
+        Sense::click(),
+    );
     let ctx = ui.ctx();
     let hov = ctx.animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
     let sel = ctx.animate_bool_with_time(resp.id.with("sel"), selected, 0.18);
     let p = ui.painter();
-    p.rect_filled(rect, 10, pal.raised.gamma_multiply(0.7 * hov * (1.0 - sel)));
-    if sel > 0.01 {
+    p.rect_filled(
+        rect,
+        if neutral { 6 } else { 10 },
+        theme::hover_fill(pal).gamma_multiply(0.7 * hov * (1.0 - sel)),
+    );
+    if sel > 0.01 && neutral {
+        p.rect_filled(rect, 6, pal.surface.gamma_multiply(sel));
+        let bar = egui::Rect::from_center_size(
+            pos2(rect.left() + 1.0, rect.center().y),
+            vec2(2.0, 14.0 * sel),
+        );
+        p.rect_filled(bar, 1, pal.accent);
+    } else if sel > 0.01 {
         p.rect(
             rect,
             10,
@@ -313,22 +333,32 @@ fn nav_item(
     }
     paint_icon(
         p,
-        pos2(rect.left() + 22.0, rect.center().y),
+        pos2(
+            rect.left() + if neutral { 20.0 } else { 22.0 },
+            rect.center().y,
+        ),
         Align2::CENTER_CENTER,
         icon,
-        19.0,
-        theme::mix(pal.weak, pal.accent, sel.max(hov * 0.6)),
+        if neutral { 16.0 } else { 19.0 },
+        if neutral {
+            theme::mix(pal.glyph, pal.text_strong, sel.max(hov * 0.6))
+        } else {
+            theme::mix(pal.weak, pal.accent, sel.max(hov * 0.6))
+        },
     );
     p.text(
-        pos2(rect.left() + 40.0, rect.center().y),
+        pos2(
+            rect.left() + if neutral { 36.0 } else { 40.0 },
+            rect.center().y,
+        ),
         Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(14.0),
+        crate::theme::font(if neutral { 13.0 } else { 14.0 }),
         theme::mix(pal.text, pal.text_strong, sel),
     );
     if let Some((text, hot)) = badge {
         let color = if hot { pal.accent } else { pal.weak };
-        let g = p.layout_no_wrap(text.to_owned(), egui::FontId::proportional(11.5), color);
+        let g = p.layout_no_wrap(text.to_owned(), crate::theme::font(11.5), color);
         let chip = egui::Rect::from_center_size(
             pos2(
                 rect.right() - 10.0 - (g.size().x + 12.0) / 2.0,
@@ -338,6 +368,8 @@ fn nav_item(
         );
         let fill = if hot {
             pal.accent.gamma_multiply(0.18)
+        } else if neutral {
+            Color32::TRANSPARENT
         } else {
             pal.surface.gamma_multiply(0.8)
         };
@@ -436,7 +468,8 @@ fn omp_view(ui: &mut Ui, pane: &mut OmpPane, view: View, actions: &mut Vec<Setti
             if *loading {
                 ui.add_space(8.0);
                 ui.add(crate::widgets::Spin::new(18.0, pal.accent_b));
-            } else if icon_button(ui, ICON_REFRESH, "Reload settings from omp", false).clicked() {
+            } else if icon_button(ui, ICON_REFRESH_CW, "Reload settings from omp", false).clicked()
+            {
                 *loading = true;
                 actions.push(SettingsAction::LoadCatalog);
             }
@@ -468,7 +501,7 @@ fn omp_view(ui: &mut Ui, pane: &mut OmpPane, view: View, actions: &mut Vec<Setti
             if groups.is_empty() {
                 empty_state(
                     ui,
-                    ICON_SEARCH_OFF,
+                    ICON_SEARCH_X,
                     pal.weak,
                     "No matching settings",
                     "Try other words — every word must match the key, name or description.",
@@ -545,7 +578,7 @@ fn not_found_card(ui: &mut Ui) {
     card(ui, "omp not found", |ui| {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
-            ui.label(icon_text(ICON_WARNING, 26.0, pal.warn));
+            ui.label(icon_text(ICON_TRIANGLE_ALERT, 26.0, pal.warn));
             ui.vertical(|ui| {
                 ui.label(
                     theme::strong("omp not found on PATH")
@@ -578,7 +611,7 @@ fn load_error_card(ui: &mut Ui, err: &str, actions: &mut Vec<SettingsAction>, lo
     card(ui, "Could not load settings", |ui| {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
-            ui.label(icon_text(ICON_ERROR, 26.0, pal.danger));
+            ui.label(icon_text(ICON_CIRCLE_ALERT, 26.0, pal.danger));
             ui.vertical(|ui| {
                 ui.add(
                     egui::Label::new(RichText::new(err).monospace().small().color(pal.text))
@@ -586,12 +619,12 @@ fn load_error_card(ui: &mut Ui, err: &str, actions: &mut Vec<SettingsAction>, lo
                 );
                 ui.add_space(10.0);
                 let retry = egui::Button::new((
-                    icon_text(ICON_REFRESH, 17.0, egui::Color32::WHITE),
-                    RichText::new("Retry").color(egui::Color32::WHITE),
+                    icon_text(ICON_REFRESH_CW, 17.0, theme::on_accent(pal)),
+                    RichText::new("Retry").color(theme::on_accent(pal)),
                 ))
                 .fill(pal.accent)
                 .min_size(vec2(96.0, 32.0))
-                .corner_radius(10);
+                .corner_radius(theme::rad(8, 10));
                 if ui.add(retry).clicked() {
                     *loading = true;
                     actions.push(SettingsAction::LoadCatalog);
@@ -617,12 +650,8 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
             |ui| {
                 if ui
                     .add(
-                        egui::Button::new(icon_text(
-                            egui_material_icons::icons::ICON_RESTART_ALT,
-                            16.0,
-                            pal.text,
-                        ))
-                        .min_size(vec2(30.0, 28.0)),
+                        egui::Button::new(icon_text(crate::icons::ICON_ROTATE_CCW, 16.0, pal.text))
+                            .min_size(vec2(30.0, 28.0)),
                     )
                     .on_hover_text("Reset to default")
                     .clicked()
@@ -644,11 +673,7 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
         ui.add_space(4.0);
         setting_row(ui, "Theme", "Chrome and terminal palette", |ui| {
             let mut idx = usize::from(input.theme == Theme::Light);
-            if segmented(
-                ui,
-                &mut idx,
-                &[(ICON_DARK_MODE, "Dark"), (ICON_LIGHT_MODE, "Light")],
-            ) {
+            if segmented(ui, &mut idx, &[(ICON_MOON, "Dark"), (ICON_SUN, "Light")]) {
                 actions.push(SettingsAction::Theme(if idx == 0 {
                     Theme::Dark
                 } else {
@@ -656,6 +681,49 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
                 }));
             }
         });
+        ui.add_space(4.0);
+        setting_row(
+            ui,
+            "Style",
+            "Neutral is flat and quiet; Midnight neon keeps the violet glow",
+            |ui| {
+                let mut idx = usize::from(input.style == UiStyle::Neon);
+                if segmented(
+                    ui,
+                    &mut idx,
+                    &[(ICON_SQUARE, "Neutral"), (ICON_SPARKLES, "Midnight neon")],
+                ) {
+                    actions.push(SettingsAction::Style(if idx == 0 {
+                        UiStyle::Neutral
+                    } else {
+                        UiStyle::Neon
+                    }));
+                }
+            },
+        );
+        ui.add_space(4.0);
+        setting_row(
+            ui,
+            "Density",
+            "Spacing of the sidebar, tabs, menus and lists",
+            |ui| {
+                let mut idx = usize::from(input.density == Density::Comfortable);
+                if segmented(
+                    ui,
+                    &mut idx,
+                    &[
+                        (ICON_FOLD_VERTICAL, "Compact"),
+                        (ICON_CHEVRONS_UP_DOWN, "Comfortable"),
+                    ],
+                ) {
+                    actions.push(SettingsAction::Density(if idx == 0 {
+                        Density::Compact
+                    } else {
+                        Density::Comfortable
+                    }));
+                }
+            },
+        );
     });
 
     card(ui, "Window", |ui| {
@@ -698,7 +766,7 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
                 .add_enabled(
                     input.omp_found,
                     egui::Button::new((
-                        icon_text(ICON_REFRESH, 16.0, pal.accent),
+                        icon_text(ICON_REFRESH_CW, 16.0, pal.glyph),
                         RichText::new("Check now"),
                     ))
                     .min_size(vec2(0.0, 30.0)),

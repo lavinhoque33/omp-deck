@@ -462,7 +462,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "deck-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "log",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "deck-term"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "arboard",
@@ -742,15 +742,6 @@ dependencies = [
  "log",
  "profiling",
  "winit",
-]
-
-[[package]]
-name = "egui_material_icons"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a49b8d9217d02f0344160bff2f04fdc598f3244f65dc04ea7bf6ab74196d419c"
-dependencies = [
- "egui",
 ]
 
 [[package]]
@@ -1914,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "omp-deck"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "deck-core",
@@ -1923,7 +1914,6 @@ dependencies = [
  "eframe",
  "egui",
  "egui_commonmark",
- "egui_material_icons",
  "env_logger",
  "log",
  "png",

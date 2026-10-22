@@ -332,7 +332,7 @@ impl App {
         };
         let opts = TermOptions {
             scrollback: 10_000,
-            theme: term_theme(self.cfg.theme),
+            theme: term_theme(self.cfg.theme, self.cfg.style),
             clipboard: self.clipboard.clone(),
         };
         let term = match Terminal::spawn(spec, opts, self.ctx.clone()) {

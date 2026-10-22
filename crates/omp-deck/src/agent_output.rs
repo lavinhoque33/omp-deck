@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::icons::{ICON_FILE_TEXT, ICON_INFO};
 use deck_core::agents::{AgentStatus, AgentSummary};
 use egui::{Frame, Id, Margin, RichText, Ui};
 use egui_commonmark::{CommonMarkCache, CommonMarkScrollOptions, CommonMarkViewer};
-use egui_material_icons::icons::{ICON_DESCRIPTION, ICON_INFO};
 
 use crate::theme::Palette;
 use crate::widgets::{Spin, empty_state, icon_text};
@@ -267,7 +267,7 @@ impl OutputPane {
                     "Failed, aborted and killed agents write no output file.",
                 ),
             };
-            empty_state(ui, ICON_DESCRIPTION, pal.weak, why, sub);
+            empty_state(ui, ICON_FILE_TEXT, pal.weak, why, sub);
             return;
         }
         self.sync(ui.ctx(), a);
@@ -275,7 +275,7 @@ impl OutputPane {
             if let Some(message) = &self.error {
                 empty_state(
                     ui,
-                    ICON_DESCRIPTION,
+                    ICON_FILE_TEXT,
                     pal.danger,
                     "Cannot read the output file",
                     message,
@@ -291,13 +291,7 @@ impl OutputPane {
             return;
         };
         if loaded.text.trim().is_empty() {
-            empty_state(
-                ui,
-                ICON_DESCRIPTION,
-                pal.weak,
-                "The output file is empty",
-                "",
-            );
+            empty_state(ui, ICON_FILE_TEXT, pal.weak, "The output file is empty", "");
             return;
         }
         if loaded.truncated {

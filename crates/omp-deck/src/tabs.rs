@@ -7,12 +7,12 @@ use std::time::{Instant, SystemTime};
 use deck_core::omp::UpdateKind;
 use deck_term::Terminal;
 
+use crate::icons::{
+    ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_SETTINGS, ICON_TERMINAL, ICON_X,
+};
 use crate::inject::Injector;
 use crate::model_picker::Pending;
-use egui::{Align2, CursorIcon, FontId, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
-use egui_material_icons::icons::{
-    ICON_CANCEL, ICON_CHECK_CIRCLE, ICON_CLOSE, ICON_DOWNLOAD, ICON_SETTINGS, ICON_TERMINAL,
-};
+use egui::{Align2, CursorIcon, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 
 use crate::theme::{self, Palette};
 use crate::widgets::{menu_item, paint_icon};
@@ -296,8 +296,13 @@ pub struct TabBarInput<'a> {
 }
 
 /// Height of a tab's hit area (the full bar height); the pill is painted inset.
-pub const TAB_HIT_H: f32 = 36.0;
-const PILL_INSET_Y: f32 = 4.0;
+pub fn tab_hit_h() -> f32 {
+    theme::dens(32.0, 36.0)
+}
+
+fn pill_inset_y() -> f32 {
+    if theme::neutral() { 3.0 } else { 4.0 }
+}
 const MAX_TEXT_W: f32 = 170.0;
 const CLOSE_W: f32 = 20.0;
 const ICON_W: f32 = 16.0;
@@ -372,7 +377,7 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     let text_color = if active { pal.text_strong } else { pal.text };
     let mut job = egui::text::LayoutJob::simple_singleline(
         title.to_owned(),
-        FontId::proportional(13.5),
+        crate::theme::font(13.5),
         text_color,
     );
     job.wrap.max_width = MAX_TEXT_W;
@@ -381,11 +386,11 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     let galley = ui.painter().layout_job(job);
 
     let width = 12.0 + ICON_W + 8.0 + galley.size().x + 6.0 + CLOSE_W + 6.0;
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, TAB_HIT_H), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, tab_hit_h()), Sense::click());
     if input.scroll_to_active && active {
         ui.scroll_to_rect(rect.expand2(vec2(12.0, 0.0)), None);
     }
-    let pill = rect.shrink2(vec2(0.0, PILL_INSET_Y));
+    let pill = rect.shrink2(vec2(0.0, pill_inset_y()));
     let close_rect = egui::Rect::from_center_size(
         pos2(pill.right() - 6.0 - CLOSE_W / 2.0, pill.center().y),
         vec2(CLOSE_W, CLOSE_W),
@@ -398,43 +403,58 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         // Hover / active pill.
-        p.rect_filled(pill, 10, pal.raised.gamma_multiply(0.8 * hov * (1.0 - sel)));
+        let neutral = theme::neutral();
+        let radius = if neutral { 6 } else { 10 };
+        p.rect_filled(
+            pill,
+            radius,
+            theme::hover_fill(pal).gamma_multiply(0.8 * hov * (1.0 - sel)),
+        );
         if sel > 0.01 {
             p.rect(
                 pill,
-                10,
+                radius,
                 pal.surface.gamma_multiply(sel),
                 Stroke::new(1.0, pal.stroke.gamma_multiply(sel)),
                 StrokeKind::Inside,
             );
-            // Glowing accent underline.
-            let line = egui::Rect::from_min_max(
-                pos2(pill.left() + 12.0, pill.bottom() - 3.0),
-                pos2(pill.right() - 12.0, pill.bottom() - 1.0),
-            );
-            let glow = egui::Shadow {
-                offset: [0, 0],
-                blur: 12,
-                spread: 0,
-                color: pal.accent_a.gamma_multiply(0.55 * sel),
-            };
-            p.add(glow.as_shape(line, egui::CornerRadius::same(1)));
-            theme::gradient_rounded(
-                p,
-                line,
-                1.0,
-                pal.accent_a.gamma_multiply(sel),
-                pal.accent_b.gamma_multiply(sel),
-            );
+            if neutral {
+                // Flat accent indicator along the pill's bottom edge.
+                let line = egui::Rect::from_min_max(
+                    pos2(pill.left() + 10.0, pill.bottom() - 2.0),
+                    pos2(pill.right() - 10.0, pill.bottom()),
+                );
+                p.rect_filled(line, 1, pal.accent.gamma_multiply(sel));
+            } else {
+                // Glowing accent underline.
+                let line = egui::Rect::from_min_max(
+                    pos2(pill.left() + 12.0, pill.bottom() - 3.0),
+                    pos2(pill.right() - 12.0, pill.bottom() - 1.0),
+                );
+                let glow = egui::Shadow {
+                    offset: [0, 0],
+                    blur: 12,
+                    spread: 0,
+                    color: pal.accent_a.gamma_multiply(0.55 * sel),
+                };
+                p.add(glow.as_shape(line, egui::CornerRadius::same(1)));
+                theme::gradient_rounded(
+                    p,
+                    line,
+                    1.0,
+                    pal.accent_a.gamma_multiply(sel),
+                    pal.accent_b.gamma_multiply(sel),
+                );
+            }
         }
         // Leading icon / status.
         let ic = pos2(pill.left() + 12.0 + ICON_W / 2.0, pill.center().y);
         if exited {
             let clean = term.and_then(|t| t.term.exit_code()) == Some(0);
             let (icon, col) = if clean {
-                (ICON_CHECK_CIRCLE, pal.ok)
+                (ICON_CIRCLE_CHECK, pal.ok)
             } else {
-                (ICON_CANCEL, pal.danger)
+                (ICON_CIRCLE_X, pal.danger)
             };
             paint_icon(p, ic, Align2::CENTER_CENTER, icon, 16.0, col);
         } else if bell {
@@ -467,13 +487,13 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
             p.circle_filled(
                 close_rect.center(),
                 CLOSE_W / 2.0,
-                pal.raised.gamma_multiply(ch),
+                theme::hover_fill(pal).gamma_multiply(ch),
             );
             paint_icon(
                 p,
                 close_rect.center(),
                 Align2::CENTER_CENTER,
-                ICON_CLOSE,
+                ICON_X,
                 14.0,
                 theme::mix(pal.weak, pal.text_strong, ch).gamma_multiply(vis),
             );
@@ -499,14 +519,14 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
         action = Some(TabAction::Activate(i));
     }
     theme::context_menu(&resp, 200.0, |ui| {
-        if menu_item(ui, ICON_CLOSE, "Close", None, true, false).clicked() {
+        if menu_item(ui, ICON_X, "Close", None, true, false).clicked() {
             action = Some(TabAction::Close(i));
             ui.close();
         }
         if let Some(t) = term {
             if menu_item(
                 ui,
-                egui_material_icons::icons::ICON_POWER_SETTINGS_NEW,
+                crate::icons::ICON_POWER,
                 "Kill session process",
                 None,
                 input.can_kill && !t.term.is_exited(),
@@ -519,7 +539,7 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
             }
             if menu_item(
                 ui,
-                egui_material_icons::icons::ICON_CONTENT_COPY,
+                crate::icons::ICON_COPY,
                 "Copy session path",
                 None,
                 t.session_path.is_some(),

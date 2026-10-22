@@ -23,6 +23,10 @@ for png in packaging/icons/omp-deck-*.png; do
 done
 install -m 0755 packaging/install.sh "$stage/install.sh"
 install -m 0644 LICENSE-MIT LICENSE-APACHE README.md "$stage/"
+# Bundled third-party notices sit next to the project licenses.
+mkdir -p "$stage/licenses"
+install -m 0644 crates/omp-deck/assets/fonts/Geist-OFL.txt \
+    crates/omp-deck/assets/fonts/lucide-LICENSE.txt "$stage/licenses/"
 
 tar -C dist --owner=0 --group=0 --sort=name -czf "dist/$name.tar.gz" "$name"
 echo "dist/$name.tar.gz"

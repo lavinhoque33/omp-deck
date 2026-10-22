@@ -5,17 +5,17 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use crate::icons::Icon;
+use crate::icons::{
+    ICON_ARROW_DOWN_TO_LINE, ICON_CHEVRON_DOWN, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT,
+    ICON_CHEVRONS_DOWN, ICON_CLIPBOARD_LIST, ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT,
+    ICON_MESSAGES_SQUARE, ICON_PLAY, ICON_SEND, ICON_SQUARE, ICON_X,
+};
 use deck_core::agents::{AgentStatus, AgentSummary, TranscriptWatcher};
 use deck_core::ctl::LiveStatus;
 use egui::{
-    Align2, Color32, CursorIcon, FontId, Frame, Id, Key, KeyboardShortcut, Margin, Modifiers,
-    Order, RichText, Sense, Sides, Stroke, StrokeKind, TextEdit, Ui, pos2, vec2,
-};
-use egui_material_icons::MaterialIcon;
-use egui_material_icons::icons::{
-    ICON_ASSIGNMENT, ICON_CLOSE, ICON_CONTENT_COPY, ICON_DESCRIPTION, ICON_FORUM,
-    ICON_KEYBOARD_DOUBLE_ARROW_DOWN, ICON_NAVIGATE_BEFORE, ICON_NAVIGATE_NEXT, ICON_OPEN_IN_NEW,
-    ICON_PLAY_ARROW, ICON_SEND, ICON_STOP, ICON_VERTICAL_ALIGN_BOTTOM,
+    Align2, Color32, CursorIcon, Frame, Id, Key, KeyboardShortcut, Margin, Modifiers, Order,
+    RichText, Sense, Sides, Stroke, StrokeKind, TextEdit, Ui, pos2, vec2,
 };
 
 use crate::agent_ctl::{self, CHAT_TIP, CtlView, ReqKind};
@@ -153,11 +153,7 @@ pub fn show(ctx: &egui::Context, st: &mut PopupState, input: &PopupInput<'_>) ->
         .show(ctx, |ui| {
             let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
             let dark = ctx.global_style().visuals.dark_mode;
-            ui.painter().rect_filled(
-                rect,
-                0,
-                Color32::from_black_alpha(if dark { 150 } else { 70 }),
-            );
+            ui.painter().rect_filled(rect, 0, theme::backdrop(dark));
             if resp.clicked() {
                 out.push(PopupAction::Close);
             }
@@ -177,8 +173,8 @@ pub fn show(ctx: &egui::Context, st: &mut PopupState, input: &PopupInput<'_>) ->
     let style = ctx.global_style();
     let frame = Frame::NONE
         .fill(pal.bar)
-        .stroke(Stroke::new(1.0, pal.accent.gamma_multiply(0.45)))
-        .corner_radius(16)
+        .stroke(theme::popup_stroke(pal))
+        .corner_radius(theme::popup_radius())
         .shadow(style.visuals.window_shadow);
     egui::Window::new("agent-popup")
         .id(Id::unique("agent-popup-window"))
@@ -265,7 +261,7 @@ fn popup_body(
                     if st.transcript.is_empty() {
                         empty_state(
                             ui,
-                            ICON_FORUM,
+                            ICON_MESSAGES_SQUARE,
                             pal.accent,
                             if a.status == AgentStatus::Running {
                                 "Waiting for the first entries…"
@@ -281,7 +277,13 @@ fn popup_body(
                 PopupTab::Output => st.output.ui(ui, a),
                 PopupTab::Task => {
                     if a.task.trim().is_empty() {
-                        empty_state(ui, ICON_ASSIGNMENT, pal.weak, "No assignment recorded", "");
+                        empty_state(
+                            ui,
+                            ICON_CLIPBOARD_LIST,
+                            pal.weak,
+                            "No assignment recorded",
+                            "",
+                        );
                     } else {
                         // The task text only changes with the file-inferred snapshot.
                         let generation = view.base_version as usize;
@@ -326,7 +328,7 @@ fn header_rows(
         },
         |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            if nav_button(ui, ICON_CLOSE, "Close (Esc)", true).clicked() {
+            if nav_button(ui, ICON_X, "Close (Esc)", true).clicked() {
                 out.push(PopupAction::Close);
             }
             ui.add_space(6.0);
@@ -344,7 +346,7 @@ fn header_rows(
                 ),
                 (None, None) => (None, None),
             };
-            if nav_button(ui, ICON_NAVIGATE_NEXT, "Next agent", next.is_some()).clicked()
+            if nav_button(ui, ICON_CHEVRON_RIGHT, "Next agent", next.is_some()).clicked()
                 && let Some(i) = next
             {
                 out.push(PopupAction::Open(agents[i].id.clone()));
@@ -357,7 +359,7 @@ fn header_rows(
                         .color(pal.weak),
                 );
             }
-            if nav_button(ui, ICON_NAVIGATE_BEFORE, "Previous agent", prev.is_some()).clicked()
+            if nav_button(ui, ICON_CHEVRON_LEFT, "Previous agent", prev.is_some()).clicked()
                 && let Some(i) = prev
             {
                 out.push(PopupAction::Open(agents[i].id.clone()));
@@ -375,8 +377,12 @@ fn header_rows(
             chip_text(
                 ui,
                 &format!("thinking · {t}"),
-                pal.accent,
-                pal.accent.gamma_multiply(0.14),
+                if theme::neutral() {
+                    pal.text
+                } else {
+                    pal.accent
+                },
+                theme::accent_fill(pal, 0.14),
             );
         }
         lineage(ui, input, a, out);
@@ -449,16 +455,17 @@ fn lineage(ui: &mut Ui, input: &PopupInput<'_>, a: &AgentSummary, out: &mut Vec<
     if !kids.is_empty() {
         ui.label(RichText::new("·").color(pal.weak));
         let r = ui.add(
-            egui::Label::new(
+            egui::Button::new((
                 RichText::new(format!(
-                    "{} child{} ▾",
+                    "{} child{}",
                     kids.len(),
                     if kids.len() == 1 { "" } else { "ren" }
                 ))
                 .size(12.5)
                 .color(pal.accent_b),
-            )
-            .sense(Sense::click()),
+                icon_text(ICON_CHEVRON_DOWN, 14.0, pal.accent_b),
+            ))
+            .frame(false),
         );
         let r = r.on_hover_cursor(CursorIcon::PointingHand);
         theme::dropdown_start_menu(&r, 260.0, |ui| {
@@ -480,7 +487,7 @@ fn status_pill(ui: &mut Ui, sh: &Shown) {
     let (text, color) = (sh.label, sh.color);
     let g = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), FontId::proportional(12.5), color);
+        .layout_no_wrap(text.to_owned(), crate::theme::font(12.5), color);
     let w = g.size().x + 40.0;
     let (rect, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
     ui.painter()
@@ -528,7 +535,7 @@ fn ctl_buttons(ui: &mut Ui, input: &PopupInput<'_>, a: &AgentSummary, out: &mut 
     if agent_ctl::can_kill(ctl.link, live)
         && action_button(
             ui,
-            ICON_STOP,
+            ICON_SQUARE,
             "Kill",
             pal.danger,
             "Abort this agent and release it (it keeps its transcript)",
@@ -540,7 +547,7 @@ fn ctl_buttons(ui: &mut Ui, input: &PopupInput<'_>, a: &AgentSummary, out: &mut 
     if agent_ctl::can_revive(ctl.link, live)
         && action_button(
             ui,
-            ICON_PLAY_ARROW,
+            ICON_PLAY,
             "Revive",
             pal.ok,
             "Bring this parked agent back so it can be messaged",
@@ -553,17 +560,15 @@ fn ctl_buttons(ui: &mut Ui, input: &PopupInput<'_>, a: &AgentSummary, out: &mut 
 
 fn action_button(
     ui: &mut Ui,
-    icon: MaterialIcon,
+    icon: Icon,
     label: &str,
     color: Color32,
     tip: &str,
 ) -> egui::Response {
     let pal = Palette::of_ui(ui);
-    let g = ui.painter().layout_no_wrap(
-        label.to_owned(),
-        FontId::proportional(12.5),
-        pal.text_strong,
-    );
+    let g =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), crate::theme::font(12.5), pal.text_strong);
     let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 40.0, 24.0), Sense::click());
     let p = ui.painter();
     p.rect_filled(
@@ -620,8 +625,8 @@ fn composer_panel(
                 .corner_radius(egui::CornerRadius {
                     nw: 0,
                     ne: 0,
-                    sw: 16,
-                    se: 16,
+                    sw: theme::popup_radius(),
+                    se: theme::popup_radius(),
                 }),
         )
         .show(ui, |ui| {
@@ -680,7 +685,7 @@ fn composer_panel(
                     .frame(
                         Frame::new()
                             .fill(pal.bar)
-                            .corner_radius(10)
+                            .corner_radius(theme::rad(8, 10))
                             .stroke(Stroke::new(
                                 1.0,
                                 if focused && enabled {
@@ -719,7 +724,7 @@ fn composer_panel(
                 } else {
                     pal.raised.gamma_multiply(0.7)
                 };
-                ui.painter().rect_filled(rect, 10, fill);
+                ui.painter().rect_filled(rect, theme::rad(8, 10), fill);
                 if pending {
                     Spin::new(16.0, pal.accent).paint_at(ui, rect.center());
                 } else {
@@ -730,7 +735,7 @@ fn composer_panel(
                         ICON_SEND,
                         18.0,
                         if can_send {
-                            Color32::WHITE
+                            theme::on_accent(pal)
                         } else {
                             pal.weak.gamma_multiply(0.5)
                         },
@@ -754,7 +759,7 @@ fn composer_panel(
 fn badge(ui: &mut Ui, text: &str, color: Color32) {
     let g = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), FontId::proportional(11.5), color);
+        .layout_no_wrap(text.to_owned(), crate::theme::font(11.5), color);
     let (rect, _) = ui.allocate_exact_size(vec2(g.size().x + 16.0, 20.0), Sense::hover());
     ui.painter()
         .rect_filled(rect, 10, color.gamma_multiply(0.16));
@@ -765,7 +770,7 @@ fn badge(ui: &mut Ui, text: &str, color: Color32) {
 fn chip_text(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> egui::Response {
     let g = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), FontId::proportional(12.0), fg);
+        .layout_no_wrap(text.to_owned(), crate::theme::font(12.0), fg);
     let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 18.0, 22.0), Sense::hover());
     ui.painter().rect_filled(rect, 11, bg);
     ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
@@ -776,12 +781,10 @@ fn fact_tile(ui: &mut Ui, label: &str, value: &str) {
     let pal = Palette::of_ui(ui);
     let lg = ui
         .painter()
-        .layout_no_wrap(label.to_uppercase(), FontId::proportional(9.5), pal.weak);
-    let vg = ui.painter().layout_no_wrap(
-        value.to_owned(),
-        FontId::proportional(14.0),
-        pal.text_strong,
-    );
+        .layout_no_wrap(label.to_uppercase(), crate::theme::font(9.5), pal.weak);
+    let vg =
+        ui.painter()
+            .layout_no_wrap(value.to_owned(), crate::theme::font(14.0), pal.text_strong);
     let w = lg.size().x.max(vg.size().x) + 22.0;
     let (rect, _) = ui.allocate_exact_size(vec2(w.max(66.0), 46.0), Sense::hover());
     ui.painter().rect_filled(rect, 10, pal.surface);
@@ -801,10 +804,11 @@ fn fact_tile(ui: &mut Ui, label: &str, value: &str) {
 }
 
 fn note_strip(ui: &mut Ui, color: Color32, label: &str, text: &str) {
+    let pal = Palette::of_ui(ui);
     Frame::NONE
         .fill(color.gamma_multiply(0.11))
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.35)))
-        .corner_radius(9)
+        .stroke(theme::status_stroke(pal, color, 0.35))
+        .corner_radius(theme::rad(8, 9))
         .inner_margin(Margin::symmetric(12, 7))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -818,7 +822,7 @@ fn note_strip(ui: &mut Ui, color: Color32, label: &str, text: &str) {
         });
 }
 
-fn nav_button(ui: &mut Ui, icon: MaterialIcon, tip: &str, enabled: bool) -> egui::Response {
+fn nav_button(ui: &mut Ui, icon: Icon, tip: &str, enabled: bool) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let sense = if enabled {
         Sense::click()
@@ -864,14 +868,19 @@ fn tab_bar(ui: &mut Ui, st: &mut PopupState, a: &AgentSummary, out: &mut Vec<Pop
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     for (tab, icon, label, dim) in [
-                        (PopupTab::Transcript, ICON_FORUM, "Transcript", false),
+                        (
+                            PopupTab::Transcript,
+                            ICON_MESSAGES_SQUARE,
+                            "Transcript",
+                            false,
+                        ),
                         (
                             PopupTab::Output,
-                            ICON_DESCRIPTION,
+                            ICON_FILE_TEXT,
                             "Output",
                             a.output_path.is_none(),
                         ),
-                        (PopupTab::Task, ICON_ASSIGNMENT, "Task", false),
+                        (PopupTab::Task, ICON_CLIPBOARD_LIST, "Task", false),
                     ] {
                         if tab_button(ui, icon, label, current == tab, dim).clicked() {
                             picked = Some(tab);
@@ -884,7 +893,7 @@ fn tab_bar(ui: &mut Ui, st: &mut PopupState, a: &AgentSummary, out: &mut Vec<Pop
                         PopupTab::Transcript => {
                             if action_chip(
                                 ui,
-                                ICON_CONTENT_COPY,
+                                ICON_COPY,
                                 "Transcript path",
                                 "Copy the transcript file path",
                                 false,
@@ -898,7 +907,7 @@ fn tab_bar(ui: &mut Ui, st: &mut PopupState, a: &AgentSummary, out: &mut Vec<Pop
                             }
                             if action_chip(
                                 ui,
-                                ICON_KEYBOARD_DOUBLE_ARROW_DOWN,
+                                ICON_CHEVRONS_DOWN,
                                 "Bottom",
                                 "Jump to the latest entry",
                                 false,
@@ -910,7 +919,7 @@ fn tab_bar(ui: &mut Ui, st: &mut PopupState, a: &AgentSummary, out: &mut Vec<Pop
                             let follow = st.transcript.follow;
                             if action_chip(
                                 ui,
-                                ICON_VERTICAL_ALIGN_BOTTOM,
+                                ICON_ARROW_DOWN_TO_LINE,
                                 "Follow",
                                 "Keep the newest entry in view (scroll up to pause)",
                                 follow,
@@ -928,7 +937,7 @@ fn tab_bar(ui: &mut Ui, st: &mut PopupState, a: &AgentSummary, out: &mut Vec<Pop
                             if let Some(path) = &a.output_path {
                                 if action_chip(
                                     ui,
-                                    ICON_OPEN_IN_NEW,
+                                    ICON_EXTERNAL_LINK,
                                     "Open file",
                                     "Open the output file with the desktop default",
                                     false,
@@ -940,7 +949,7 @@ fn tab_bar(ui: &mut Ui, st: &mut PopupState, a: &AgentSummary, out: &mut Vec<Pop
                                 if st.output.can_copy()
                                     && action_chip(
                                         ui,
-                                        ICON_CONTENT_COPY,
+                                        ICON_COPY,
                                         st.output.copy_label(),
                                         "Copy the whole output text",
                                         false,
@@ -962,14 +971,8 @@ fn tab_bar(ui: &mut Ui, st: &mut PopupState, a: &AgentSummary, out: &mut Vec<Pop
                         }
                         PopupTab::Task => {
                             if !a.task.is_empty()
-                                && action_chip(
-                                    ui,
-                                    ICON_CONTENT_COPY,
-                                    "Copy",
-                                    "Copy the assignment",
-                                    false,
-                                )
-                                .clicked()
+                                && action_chip(ui, ICON_COPY, "Copy", "Copy the assignment", false)
+                                    .clicked()
                             {
                                 out.push(PopupAction::Copy {
                                     text: a.task.clone(),
@@ -986,11 +989,11 @@ fn tab_bar(ui: &mut Ui, st: &mut PopupState, a: &AgentSummary, out: &mut Vec<Pop
     }
 }
 
-fn tab_button(ui: &mut Ui, icon: MaterialIcon, label: &str, on: bool, dim: bool) -> egui::Response {
+fn tab_button(ui: &mut Ui, icon: Icon, label: &str, on: bool, dim: bool) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let g = ui
         .painter()
-        .layout_no_wrap(label.to_owned(), FontId::proportional(13.5), pal.text);
+        .layout_no_wrap(label.to_owned(), crate::theme::font(13.5), pal.text);
     let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 46.0, 36.0), Sense::click());
     let hov = resp.hovered();
     let color = if on {
@@ -1029,22 +1032,16 @@ fn tab_button(ui: &mut Ui, icon: MaterialIcon, label: &str, on: bool, dim: bool)
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-fn action_chip(
-    ui: &mut Ui,
-    icon: MaterialIcon,
-    label: &str,
-    tip: &str,
-    on: bool,
-) -> egui::Response {
+fn action_chip(ui: &mut Ui, icon: Icon, label: &str, tip: &str, on: bool) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let g = ui
         .painter()
-        .layout_no_wrap(label.to_owned(), FontId::proportional(12.0), pal.text);
+        .layout_no_wrap(label.to_owned(), crate::theme::font(12.0), pal.text);
     // Right-to-left layout: allocate, then paint.
     let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 40.0, 26.0), Sense::click());
     let p = ui.painter();
     let fill = if on {
-        pal.accent.gamma_multiply(0.26)
+        theme::accent_fill(pal, 0.26)
     } else if resp.hovered() {
         pal.raised
     } else {

@@ -1,5 +1,6 @@
-//! Terminal color palettes (Breeze-like dark default, Breeze-like light) and color resolution
-//! for alacritty's `Color` values. No egui types: colors are `Rgb`.
+//! Terminal color palettes (Breeze-like dark default and light for the Neon style, zinc-based
+//! Neutral dark and light) and color resolution for alacritty's `Color` values. No egui types:
+//! colors are `Rgb`.
 
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
@@ -10,6 +11,10 @@ pub enum TermTheme {
     #[default]
     Dark,
     Light,
+    /// Zinc near-black; background equals the Neutral chrome `bg`.
+    NeutralDark,
+    /// White paper, zinc text, ANSI tuned for contrast on white.
+    NeutralLight,
 }
 
 const fn rgb(hex: u32) -> Rgb {
@@ -84,6 +89,58 @@ impl Palette {
                     rgb(0xffffff),
                 ],
             },
+            TermTheme::NeutralDark => Palette {
+                foreground: rgb(0xe4e4e7),
+                background: rgb(0x0b0b0d),
+                cursor: rgb(0xfafafa),
+                // Teal-900: the accent hue, dark enough that every ANSI foreground stays legible.
+                selection_bg: rgb(0x134e4a),
+                ansi: [
+                    rgb(0x18181b),
+                    rgb(0xf87171),
+                    rgb(0x4ade80),
+                    rgb(0xfacc15),
+                    rgb(0x60a5fa),
+                    rgb(0xc084fc),
+                    rgb(0x22d3ee),
+                    rgb(0xd4d4d8),
+                    rgb(0x52525b),
+                    rgb(0xfca5a5),
+                    rgb(0x86efac),
+                    rgb(0xfde047),
+                    rgb(0x93c5fd),
+                    rgb(0xd8b4fe),
+                    rgb(0x67e8f9),
+                    rgb(0xfafafa),
+                ],
+            },
+            // Normal colors are tailwind 600/700 (>= 4.5:1 on white where the hue allows);
+            // brights are one step lighter (500/600) so they stay distinct yet readable.
+            TermTheme::NeutralLight => Palette {
+                foreground: rgb(0x18181b),
+                background: rgb(0xffffff),
+                cursor: rgb(0x18181b),
+                // Teal-100: light accent tint under dark text.
+                selection_bg: rgb(0xccfbf1),
+                ansi: [
+                    rgb(0x18181b),
+                    rgb(0xdc2626),
+                    rgb(0x15803d),
+                    rgb(0xa16207),
+                    rgb(0x2563eb),
+                    rgb(0x9333ea),
+                    rgb(0x0e7490),
+                    rgb(0xa1a1aa),
+                    rgb(0x71717a),
+                    rgb(0xef4444),
+                    rgb(0x16a34a),
+                    rgb(0xca8a04),
+                    rgb(0x3b82f6),
+                    rgb(0xa855f7),
+                    rgb(0x0891b2),
+                    rgb(0xd4d4d8),
+                ],
+            },
         }
     }
 
@@ -108,23 +165,25 @@ impl Palette {
             i if i == NamedColor::Background as usize => self.background,
             i if i == NamedColor::Cursor as usize => self.cursor,
             i if i == NamedColor::BrightForeground as usize => self.foreground,
-            i if i == NamedColor::DimForeground as usize => dim(self.foreground),
+            i if i == NamedColor::DimForeground as usize => self.dim(self.foreground),
             // DimBlack..=DimWhite (259..=266).
             i if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&i) => {
-                dim(self.ansi[i - NamedColor::DimBlack as usize])
+                self.dim(self.ansi[i - NamedColor::DimBlack as usize])
             }
             _ => self.foreground,
         }
     }
-}
 
-/// SGR 2 (faint): two thirds intensity.
-pub fn dim(c: Rgb) -> Rgb {
-    let f = |v: u8| ((u16::from(v) * 2) / 3) as u8;
-    Rgb {
-        r: f(c.r),
-        g: f(c.g),
-        b: f(c.b),
+    /// SGR 2 (faint): two thirds of the way from the background to `c`, so faint text fades
+    /// on light palettes instead of turning darker (bolder) than normal text.
+    pub fn dim(&self, c: Rgb) -> Rgb {
+        let bg = self.background;
+        let f = |v: u8, b: u8| ((u16::from(v) * 2 + u16::from(b)) / 3) as u8;
+        Rgb {
+            r: f(c.r, bg.r),
+            g: f(c.g, bg.g),
+            b: f(c.b, bg.b),
+        }
     }
 }
 
@@ -138,14 +197,14 @@ pub fn resolve(color: Color, colors: &Colors, palette: &Palette, dimmed: bool) -
     match color {
         Color::Spec(c) => {
             if dimmed {
-                dim(c)
+                palette.dim(c)
             } else {
                 c
             }
         }
         Color::Indexed(i) => {
             let c = indexed(colors, palette, usize::from(i));
-            if dimmed { dim(c) } else { c }
+            if dimmed { palette.dim(c) } else { c }
         }
         Color::Named(n) => {
             let idx = n as usize;
@@ -155,7 +214,7 @@ pub fn resolve(color: Color, colors: &Colors, palette: &Palette, dimmed: bool) -
                 } else if n == NamedColor::Foreground {
                     indexed(colors, palette, NamedColor::DimForeground as usize)
                 } else {
-                    dim(indexed(colors, palette, idx))
+                    palette.dim(indexed(colors, palette, idx))
                 }
             } else {
                 indexed(colors, palette, idx)
@@ -215,7 +274,45 @@ mod tests {
         );
         assert_eq!(
             resolve(Color::Named(NamedColor::Green), &colors, &p, true),
-            dim(p.ansi[2])
+            p.dim(p.ansi[2])
         );
+    }
+
+    #[test]
+    fn neutral_osc_replies_follow_palette() {
+        // OSC 10/11/12/4 replies resolve through `indexed` with no app overrides.
+        let colors = Colors::default();
+        let dark = Palette::for_theme(TermTheme::NeutralDark);
+        let bg = NamedColor::Background as usize;
+        let fg = NamedColor::Foreground as usize;
+        assert_eq!(indexed(&colors, &dark, bg), rgb(0x0b0b0d));
+        assert_eq!(indexed(&colors, &dark, fg), rgb(0xe4e4e7));
+        assert_eq!(
+            indexed(&colors, &dark, NamedColor::Cursor as usize),
+            rgb(0xfafafa)
+        );
+        assert_eq!(indexed(&colors, &dark, 4), rgb(0x60a5fa));
+        assert_eq!(indexed(&colors, &dark, 15), rgb(0xfafafa));
+        let light = Palette::for_theme(TermTheme::NeutralLight);
+        assert_eq!(indexed(&colors, &light, bg), rgb(0xffffff));
+        assert_eq!(indexed(&colors, &light, fg), rgb(0x18181b));
+        // SGR 2 on a named color goes through the dim slots of the active palette.
+        assert_eq!(
+            resolve(Color::Named(NamedColor::Red), &colors, &light, true),
+            light.dim(rgb(0xdc2626))
+        );
+    }
+
+    #[test]
+    fn faint_fades_toward_background() {
+        let colors = Colors::default();
+        // On white, faint black text gets lighter (not darker) than normal text.
+        let light = Palette::for_theme(TermTheme::NeutralLight);
+        let faint = resolve(Color::Named(NamedColor::Foreground), &colors, &light, true);
+        assert_eq!(faint, rgb(0x656567));
+        // On near-black, faint text gets darker.
+        let dark = Palette::for_theme(TermTheme::NeutralDark);
+        let faint = resolve(Color::Spec(rgb(0xffffff)), &colors, &dark, true);
+        assert_eq!(faint, rgb(0xadadae));
     }
 }

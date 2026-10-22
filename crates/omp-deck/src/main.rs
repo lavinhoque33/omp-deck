@@ -12,6 +12,7 @@ mod composer;
 mod config_writer;
 mod confirm;
 mod folder_scope;
+mod icons;
 mod inject;
 mod model_order;
 mod model_picker;

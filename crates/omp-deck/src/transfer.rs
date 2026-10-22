@@ -3,9 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::icons::{ICON_FOLDER_OPEN, ICON_TRIANGLE_ALERT};
 use deck_core::sessions::{ProjectGroup, SessionEntry};
 use egui::{Id, RichText, TextEdit, Ui, vec2};
-use egui_material_icons::icons::{ICON_FOLDER_OPEN, ICON_WARNING};
 
 use crate::confirm::{Dialog, show_dialog};
 use crate::theme::Palette;
@@ -290,7 +290,7 @@ impl FolderDialog {
                             RichText::new("Browse…")
                         };
                         let btn = egui::Button::new((
-                            icon_text(ICON_FOLDER_OPEN, 17.0, pal.accent),
+                            icon_text(ICON_FOLDER_OPEN, 17.0, pal.glyph),
                             label,
                         ))
                         .min_size(vec2(browse_w, 34.0));
@@ -304,7 +304,7 @@ impl FolderDialog {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.label(icon_text(ICON_WARNING, 16.0, pal.danger));
+                            ui.label(icon_text(ICON_TRIANGLE_ALERT, 16.0, pal.danger));
                             ui.label(RichText::new(msg).small().color(pal.danger));
                         });
                     }

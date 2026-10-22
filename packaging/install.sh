@@ -40,6 +40,7 @@ fi
 bin_dir="$prefix/bin"
 apps_dir="$data_home/applications"
 icon_root="$data_home/icons/hicolor"
+doc_dir="$prefix/share/doc/$APP"
 
 refresh_caches() {
     if command -v update-desktop-database >/dev/null 2>&1; then
@@ -61,6 +62,8 @@ if [ "$uninstall" -eq 1 ]; then
         rmdir "$icon_root/${s}x${s}/apps" "$icon_root/${s}x${s}" 2>/dev/null || true
     done
     rmdir "$icon_root/scalable/apps" "$icon_root/scalable" "$icon_root" 2>/dev/null || true
+    rm -f "$doc_dir/Geist-OFL.txt" "$doc_dir/lucide-LICENSE.txt"
+    rmdir "$doc_dir" "$prefix/share/doc" 2>/dev/null || true
     rmdir "$(dirname "$icon_root")" 2>/dev/null || true
     refresh_caches
     say "OmpDeck uninstalled from $prefix."
@@ -138,6 +141,17 @@ if [ -f "$src/icons/$APP.svg" ]; then
     mkdir -p "$icon_root/scalable/apps"
     install -m 0644 "$src/icons/$APP.svg" "$icon_root/scalable/apps/$APP.svg"
 fi
+
+# Bundled font licenses; older release tarballs predate licenses/ and are skipped.
+for lic in Geist-OFL.txt lucide-LICENSE.txt; do
+    for cand in "$src/licenses/$lic" "$src/$lic"; do
+        if [ -f "$cand" ]; then
+            mkdir -p "$doc_dir"
+            install -m 0644 "$cand" "$doc_dir/$lic"
+            break
+        fi
+    done
+done
 refresh_caches
 
 say "Installed OmpDeck to $bin_dir/$APP"

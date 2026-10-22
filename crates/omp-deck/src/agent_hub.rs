@@ -5,6 +5,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::icons::Icon;
+use crate::icons::{
+    ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_PAUSE,
+    ICON_CIRCLE_STOP, ICON_LIST, ICON_LIST_TREE, ICON_MOON_STAR, ICON_NETWORK, ICON_PLAY,
+    ICON_REFRESH_CW, ICON_SEARCH, ICON_SQUARE, ICON_TRIANGLE_ALERT, ICON_X,
+};
 use deck_core::agents::{AgentStatus, AgentSummary};
 use deck_core::ctl::LiveStatus;
 use egui::Galley;
@@ -12,12 +18,6 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align2, Color32, CursorIcon, FontFamily, FontId, Frame, Id, Margin, Rect, RichText, ScrollArea,
     Sense, Sides, Stroke, StrokeKind, TextEdit, Ui, pos2, vec2,
-};
-use egui_material_icons::MaterialIcon;
-use egui_material_icons::icons::{
-    ICON_ACCOUNT_TREE, ICON_BEDTIME, ICON_CHECK_CIRCLE, ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_ERROR,
-    ICON_EXPAND_MORE, ICON_HUB, ICON_PAUSE_CIRCLE, ICON_PLAY_ARROW, ICON_SEARCH, ICON_STOP,
-    ICON_STOP_CIRCLE, ICON_SYNC, ICON_VIEW_LIST, ICON_WARNING,
 };
 
 use crate::agent_ctl::{self, CtlView, Link, Restart};
@@ -40,14 +40,14 @@ pub fn status_color(pal: &Palette, s: AgentStatus) -> Color32 {
     }
 }
 
-fn bucket_icon(b: Bucket) -> MaterialIcon {
+fn bucket_icon(b: Bucket) -> Icon {
     match b {
         Bucket::Running => status_icon(AgentStatus::Running),
         Bucket::Done => status_icon(AgentStatus::Done),
         Bucket::Failed => status_icon(AgentStatus::Failed),
         Bucket::Aborted => status_icon(AgentStatus::Aborted),
         Bucket::Interrupted => status_icon(AgentStatus::Interrupted),
-        Bucket::Parked => ICON_PAUSE_CIRCLE,
+        Bucket::Parked => ICON_CIRCLE_PAUSE,
     }
 }
 
@@ -63,13 +63,13 @@ fn bucket_color(pal: &Palette, b: Bucket) -> Color32 {
     }
 }
 
-pub fn status_icon(s: AgentStatus) -> MaterialIcon {
+pub fn status_icon(s: AgentStatus) -> Icon {
     match s {
-        AgentStatus::Running => ICON_SYNC,
-        AgentStatus::Done => ICON_CHECK_CIRCLE,
-        AgentStatus::Failed => ICON_ERROR,
-        AgentStatus::Aborted => ICON_STOP_CIRCLE,
-        AgentStatus::Interrupted => ICON_WARNING,
+        AgentStatus::Running => ICON_REFRESH_CW,
+        AgentStatus::Done => ICON_CIRCLE_CHECK,
+        AgentStatus::Failed => ICON_CIRCLE_ALERT,
+        AgentStatus::Aborted => ICON_CIRCLE_STOP,
+        AgentStatus::Interrupted => ICON_TRIANGLE_ALERT,
     }
 }
 
@@ -77,7 +77,7 @@ pub fn status_icon(s: AgentStatus) -> MaterialIcon {
 /// (`parked`, `idle`), else the file-inferred status.
 pub struct Shown {
     pub label: &'static str,
-    pub icon: MaterialIcon,
+    pub icon: Icon,
     pub color: Color32,
     pub spin: bool,
 }
@@ -86,13 +86,13 @@ pub fn shown(pal: &Palette, status: AgentStatus, live: Option<LiveStatus>) -> Sh
     match live {
         Some(LiveStatus::Parked) => Shown {
             label: "parked",
-            icon: ICON_PAUSE_CIRCLE,
+            icon: ICON_CIRCLE_PAUSE,
             color: theme::mix(pal.weak, pal.accent, 0.4),
             spin: false,
         },
         Some(LiveStatus::Idle) if status == AgentStatus::Done => Shown {
             label: "idle",
-            icon: ICON_BEDTIME,
+            icon: ICON_MOON_STAR,
             color: pal.ok,
             spin: false,
         },
@@ -206,7 +206,7 @@ pub fn show(ui: &mut Ui, st: &mut HubState, input: &HubInput<'_>) -> Vec<HubActi
         ui,
         |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(icon_text(ICON_HUB, 20.0, pal.accent));
+            ui.label(icon_text(ICON_NETWORK, 20.0, pal.glyph));
             ui.label(theme::strong("Agents").size(16.0).color(pal.text_strong));
             let total = view.counts.total();
             if total > 0 {
@@ -216,13 +216,13 @@ pub fn show(ui: &mut Ui, st: &mut HubState, input: &HubInput<'_>) -> Vec<HubActi
         },
         |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            if small_button(ui, ICON_CLOSE, "Close the hub (Ctrl+Shift+A)", false).clicked() {
+            if small_button(ui, ICON_X, "Close the hub (Ctrl+Shift+A)", false).clicked() {
                 out.push(HubAction::Close);
             }
             ui.add_space(4.0);
             if small_button(
                 ui,
-                ICON_VIEW_LIST,
+                ICON_LIST,
                 "Flat list: running first, newest activity",
                 !st.filter.tree,
             )
@@ -230,13 +230,7 @@ pub fn show(ui: &mut Ui, st: &mut HubState, input: &HubInput<'_>) -> Vec<HubActi
             {
                 st.filter.tree = false;
             }
-            if small_button(
-                ui,
-                ICON_ACCOUNT_TREE,
-                "Tree: who spawned whom",
-                st.filter.tree,
-            )
-            .clicked()
+            if small_button(ui, ICON_LIST_TREE, "Tree: who spawned whom", st.filter.tree).clicked()
             {
                 st.filter.tree = true;
             }
@@ -247,7 +241,7 @@ pub fn show(ui: &mut Ui, st: &mut HubState, input: &HubInput<'_>) -> Vec<HubActi
     if !input.has_session {
         empty_state(
             ui,
-            ICON_HUB,
+            ICON_NETWORK,
             pal.accent,
             "No session in this tab",
             "Open or start an omp session to see the agents it spawns.",
@@ -290,7 +284,7 @@ pub fn show(ui: &mut Ui, st: &mut HubState, input: &HubInput<'_>) -> Vec<HubActi
         }
         Some(_) if total == 0 => empty_state(
             ui,
-            ICON_HUB,
+            ICON_NETWORK,
             pal.accent,
             "No subagents yet",
             "Agents this session spawns with the task tool show up here, live.",
@@ -332,7 +326,7 @@ fn search_box(ui: &mut Ui, st: &mut HubState) {
             .frame(
                 Frame::new()
                     .fill(pal.surface)
-                    .corner_radius(10)
+                    .corner_radius(theme::rad(8, 10))
                     .stroke(Stroke::new(
                         1.0,
                         if focused { pal.accent } else { pal.stroke },
@@ -344,13 +338,13 @@ fn search_box(ui: &mut Ui, st: &mut HubState) {
 fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
     let g = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), FontId::proportional(11.5), fg);
+        .layout_no_wrap(text.to_owned(), crate::theme::font(11.5), fg);
     let (rect, _) = ui.allocate_exact_size(vec2(g.size().x + 14.0, 18.0), Sense::hover());
     ui.painter().rect_filled(rect, 9, bg);
     ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
 }
 
-fn small_button(ui: &mut Ui, icon: MaterialIcon, tip: &str, on: bool) -> egui::Response {
+fn small_button(ui: &mut Ui, icon: Icon, tip: &str, on: bool) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
     let hov = ui
@@ -359,9 +353,9 @@ fn small_button(ui: &mut Ui, icon: MaterialIcon, tip: &str, on: bool) -> egui::R
     let p = ui.painter();
     p.rect_filled(
         rect,
-        8,
+        theme::rad(6, 8),
         if on {
-            pal.accent.gamma_multiply(0.28)
+            theme::accent_fill(pal, 0.28)
         } else {
             pal.raised.gamma_multiply(0.85 * hov)
         },
@@ -388,7 +382,7 @@ fn status_chip(ui: &mut Ui, b: Bucket, n: usize, on: bool) -> egui::Response {
     let text = format!("{n} {}", b.label());
     let g = ui.painter().layout_no_wrap(
         text,
-        FontId::proportional(12.0),
+        crate::theme::font(12.0),
         if on { pal.text_strong } else { pal.text },
     );
     let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 38.0, 24.0), Sense::click());
@@ -459,7 +453,7 @@ fn gist_wrap_width(width: f32, depth: usize) -> f32 {
 fn layout_gist(ui: &Ui, pal: &Palette, gist: &str, wrap_w: f32) -> Arc<Galley> {
     let mut job = LayoutJob::simple(
         gist.to_owned(),
-        FontId::proportional(12.5),
+        crate::theme::font(12.5),
         pal.text.gamma_multiply(0.92),
         wrap_w,
     );
@@ -639,7 +633,7 @@ fn card(
     }
 
     let tint = match a.status {
-        AgentStatus::Running => theme::mix(pal.surface, pal.accent_b, 0.06),
+        AgentStatus::Running => theme::accent_wash(pal.surface, pal.accent_b, 0.06),
         AgentStatus::Failed => theme::mix(pal.surface, pal.danger, 0.07),
         AgentStatus::Aborted | AgentStatus::Interrupted => theme::mix(pal.surface, pal.warn, 0.05),
         AgentStatus::Done => pal.surface,
@@ -649,15 +643,20 @@ fn card(
     } else {
         tint
     };
-    p.rect_filled(rect, 11, fill);
+    let card_r = theme::rad(8, 11);
+    p.rect_filled(rect, card_r, fill);
     let border = if selected {
         pal.accent
     } else if hovered {
-        pal.accent.gamma_multiply(0.55)
+        if theme::neutral() {
+            theme::mix(pal.stroke, pal.weak, 0.4)
+        } else {
+            pal.accent.gamma_multiply(0.55)
+        }
     } else {
         pal.stroke
     };
-    p.rect_stroke(rect, 11, Stroke::new(1.0, border), StrokeKind::Inside);
+    p.rect_stroke(rect, card_r, Stroke::new(1.0, border), StrokeKind::Inside);
     p.rect_filled(
         Rect::from_min_max(
             pos2(rect.left() + 1.0, rect.top() + 10.0),
@@ -686,11 +685,11 @@ fn card(
         );
     }
     let mut x = left + 24.0;
-    let id_g = p.layout_no_wrap(a.id.clone(), FontId::proportional(13.5), pal.text_strong);
+    let id_g = p.layout_no_wrap(a.id.clone(), crate::theme::font(13.5), pal.text_strong);
     let id_w = id_g.size().x;
     // Model chip on the right (dropped when it would crowd the id).
     let model_g = (!c.short_model.is_empty())
-        .then(|| p.layout_no_wrap(c.short_model.clone(), FontId::proportional(11.0), pal.weak));
+        .then(|| p.layout_no_wrap(c.short_model.clone(), crate::theme::font(11.0), pal.weak));
     let mut limit = right;
     if let Some(g) = &model_g
         && x + id_w + 24.0 + g.size().x + 14.0 < right
@@ -699,7 +698,12 @@ fn card(
             pos2(right - g.size().x - 14.0, mid - 9.0),
             vec2(g.size().x + 14.0, 18.0),
         );
-        p.rect_filled(r, 9, pal.raised.gamma_multiply(0.8));
+        p.rect_filled(
+            r,
+            9,
+            pal.raised
+                .gamma_multiply(if theme::neutral() { 1.0 } else { 0.8 }),
+        );
         p.galley(
             pos2(r.left() + 7.0, mid - g.size().y / 2.0),
             g.clone(),
@@ -710,7 +714,7 @@ fn card(
     let id_galley = if x + id_w > limit {
         // Ellipsize a very long id.
         let mut job =
-            LayoutJob::simple_singleline(a.id.clone(), FontId::proportional(13.5), pal.text_strong);
+            LayoutJob::simple_singleline(a.id.clone(), crate::theme::font(13.5), pal.text_strong);
         job.wrap.max_width = (limit - x).max(30.0);
         job.wrap.max_rows = 1;
         job.wrap.break_anywhere = true;
@@ -730,18 +734,30 @@ fn card(
             (sh.label != status_label(a.status)).then_some(sh.label),
             color,
         ),
-        (a.agent.as_deref(), pal.accent),
+        (
+            a.agent.as_deref(),
+            if theme::neutral() {
+                pal.text
+            } else {
+                pal.accent
+            },
+        ),
         (a.advisor.then_some("advisor"), pal.warn),
     ];
     for (text, col) in badges {
         let Some(text) = text else { continue };
-        let g = p.layout_no_wrap(text.to_owned(), FontId::proportional(10.5), col);
+        let g = p.layout_no_wrap(text.to_owned(), crate::theme::font(10.5), col);
         let w = g.size().x + 12.0;
         if x + w > limit {
             break;
         }
         let r = Rect::from_min_size(pos2(x, mid - 8.0), vec2(w, 16.0));
-        p.rect_filled(r, 8, col.gamma_multiply(0.16));
+        let badge_fill = if theme::neutral() && col == pal.text {
+            pal.raised
+        } else {
+            col.gamma_multiply(0.16)
+        };
+        p.rect_filled(r, 8, badge_fill);
         p.galley(pos2(x + 6.0, mid - g.size().y / 2.0), g, col);
         x += w + 6.0;
     }
@@ -795,7 +811,7 @@ fn card(
             err,
             0.0,
             TextFormat {
-                font_id: FontId::proportional(11.5),
+                font_id: crate::theme::font(11.5),
                 color,
                 ..TextFormat::default()
             },
@@ -809,7 +825,7 @@ fn card(
 
     // Metrics row (bottom-anchored).
     let my = rect.bottom() - CARD_PAD - 8.0;
-    let age_g = p.layout_no_wrap(c.age.clone(), FontId::proportional(11.5), pal.weak);
+    let age_g = p.layout_no_wrap(c.age.clone(), crate::theme::font(11.5), pal.weak);
     let mut rx = right;
     p.galley(
         pos2(rx - age_g.size().x, my - age_g.size().y / 2.0),
@@ -822,8 +838,8 @@ fn card(
         let r = Rect::from_center_size(pos2(rx - 11.0, my), vec2(22.0, 22.0));
         let b = ui.interact(r, id.with("act"), Sense::click());
         let (icon, tip, col) = match act {
-            CardAct::Kill => (ICON_STOP, "Kill this agent…", pal.danger),
-            CardAct::Revive => (ICON_PLAY_ARROW, "Revive this agent", pal.ok),
+            CardAct::Kill => (ICON_SQUARE, "Kill this agent…", pal.danger),
+            CardAct::Revive => (ICON_PLAY, "Revive this agent", pal.ok),
         };
         let strong = b.hovered() || hovered;
         if b.hovered() {
@@ -847,7 +863,7 @@ fn card(
     }
     if tree && c.children > 0 {
         let label = c.children.to_string();
-        let g = p.layout_no_wrap(label, FontId::proportional(11.5), pal.text);
+        let g = p.layout_no_wrap(label, crate::theme::font(11.5), pal.text);
         let w = g.size().x + 30.0;
         let r = Rect::from_min_size(pos2(rx - w, my - 10.0), vec2(w, 20.0));
         let kid = ui.interact(r, id.with("kids"), Sense::click());
@@ -864,7 +880,7 @@ fn card(
             &p,
             pos2(r.left() + 9.0, my),
             Align2::CENTER_CENTER,
-            ICON_EXPAND_MORE,
+            ICON_CHEVRON_DOWN,
             14.0,
             pal.weak,
         );
@@ -879,7 +895,7 @@ fn card(
         rx = r.left() - 10.0;
     }
     let mut job =
-        LayoutJob::simple_singleline(c.metrics.clone(), FontId::proportional(11.5), pal.weak);
+        LayoutJob::simple_singleline(c.metrics.clone(), crate::theme::font(11.5), pal.weak);
     job.wrap.max_width = (rx - left).max(30.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -939,7 +955,7 @@ fn link_badge(ui: &mut Ui, link: Link) {
     };
     let g = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), FontId::proportional(11.5), col);
+        .layout_no_wrap(text.to_owned(), crate::theme::font(11.5), col);
     let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 26.0, 18.0), Sense::hover());
     let p = ui.painter();
     p.rect_filled(rect, 9, col.gamma_multiply(0.16));
@@ -973,7 +989,7 @@ fn link_note(ui: &mut Ui, ctl: &CtlView<'_>, out: &mut Vec<HubAction>) {
     Frame::new()
         .fill(theme::mix(pal.surface, pal.warn, 0.07))
         .stroke(Stroke::new(1.0, pal.warn.gamma_multiply(0.35)))
-        .corner_radius(10)
+        .corner_radius(theme::rad(8, 10))
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());

@@ -1,8 +1,6 @@
 //! Modal dialogs: the shared chrome ([`show_dialog`]) and the yes/no confirmation built on it.
 
-use egui::{
-    Button, Color32, Context, Frame, Id, Key, Margin, Modal, RichText, Shadow, Sides, Ui, vec2,
-};
+use egui::{Button, Context, Frame, Id, Key, Margin, Modal, RichText, Sides, Ui, vec2};
 
 use crate::theme::{self, Palette};
 
@@ -32,18 +30,18 @@ pub fn show_dialog(ctx: &Context, d: &Dialog<'_>, body: impl FnOnce(&mut Ui)) ->
     let pal = Palette::of_ctx(ctx);
     let mut result = None;
     let modal = Modal::new(Id::unique(("omp-deck-dialog", d.id)))
-        .backdrop_color(Color32::from_black_alpha(150))
+        .backdrop_color(theme::backdrop(ctx.global_style().visuals.dark_mode))
         .frame(
             Frame::popup(&ctx.global_style())
-                .fill(pal.raised)
-                .corner_radius(16)
-                .inner_margin(Margin::same(22))
-                .shadow(Shadow {
-                    offset: [0, 20],
-                    blur: 48,
-                    spread: 0,
-                    color: Color32::from_black_alpha(180),
-                }),
+                .fill(if theme::neutral() {
+                    ctx.global_style().visuals.window_fill
+                } else {
+                    pal.raised
+                })
+                .stroke(egui::Stroke::new(1.0, pal.stroke))
+                .corner_radius(theme::popup_radius())
+                .inner_margin(Margin::same(theme::rad(20, 22) as i8))
+                .shadow(theme::modal_shadow(ctx.global_style().visuals.dark_mode)),
         )
         .show(ctx, |ui| {
             ui.set_width(d.width);
@@ -56,16 +54,24 @@ pub fn show_dialog(ctx: &Context, d: &Dialog<'_>, body: impl FnOnce(&mut Ui)) ->
                 |_| {},
                 |ui| {
                     let (fill, fg) = if d.danger {
-                        (pal.danger.gamma_multiply(0.85), Color32::WHITE)
+                        (
+                            pal.danger
+                                .gamma_multiply(if theme::neutral() { 1.0 } else { 0.85 }),
+                            if theme::neutral() {
+                                theme::ink_on(pal.danger)
+                            } else {
+                                egui::Color32::WHITE
+                            },
+                        )
                     } else {
-                        (pal.accent, Color32::WHITE)
+                        (pal.accent, theme::on_accent(pal))
                     };
                     let confirm = ui.add_enabled(
                         d.confirm_enabled,
                         Button::new(RichText::new(d.confirm_label).color(fg))
                             .fill(fill)
                             .min_size(vec2(96.0, 32.0))
-                            .corner_radius(10),
+                            .corner_radius(theme::rad(8, 10)),
                     );
                     if confirm.clicked() {
                         result = Some(true);
@@ -74,7 +80,7 @@ pub fn show_dialog(ctx: &Context, d: &Dialog<'_>, body: impl FnOnce(&mut Ui)) ->
                         .add(
                             Button::new("Cancel")
                                 .min_size(vec2(84.0, 32.0))
-                                .corner_radius(10),
+                                .corner_radius(theme::rad(8, 10)),
                         )
                         .clicked()
                     {

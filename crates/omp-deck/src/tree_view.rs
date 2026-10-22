@@ -6,6 +6,12 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::icons::Icon;
+use crate::icons::{
+    ICON_ALIGN_LEFT, ICON_ARROW_RIGHT, ICON_BOOKMARK, ICON_COPY, ICON_CORNER_DOWN_RIGHT,
+    ICON_CROSSHAIR, ICON_FOLD_VERTICAL, ICON_GIT_FORK, ICON_KEY_ROUND, ICON_LIST_TREE,
+    ICON_SCROLL_TEXT, ICON_SPARKLES, ICON_USER, ICON_WRENCH, ICON_X,
+};
 use deck_core::tree::{NodeKind, SessionTree};
 use egui::Galley;
 use egui::epaint::CubicBezierShape;
@@ -13,12 +19,6 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align, Align2, Color32, CursorIcon, FontId, Frame, Id, Key, Margin, Modifiers, Order, Painter,
     Pos2, Rect, RichText, Sense, Sides, Stroke, StrokeKind, TextEdit, Ui, pos2, vec2,
-};
-use egui_material_icons::MaterialIcon;
-use egui_material_icons::icons::{
-    ICON_ACCOUNT_TREE, ICON_ARROW_FORWARD, ICON_AUTO_AWESOME, ICON_BOOKMARK, ICON_BUILD,
-    ICON_CLOSE, ICON_COMPRESS, ICON_CONTENT_COPY, ICON_FORK_RIGHT, ICON_KEY, ICON_MY_LOCATION,
-    ICON_NOTES, ICON_PERSON, ICON_SUBDIRECTORY_ARROW_RIGHT, ICON_SUMMARIZE,
 };
 
 use crate::theme::{self, Palette};
@@ -226,6 +226,8 @@ pub fn step_row(current: Option<usize>, delta: isize, len: usize) -> Option<usiz
 
 fn class_color(pal: &Palette, class: RowClass) -> Color32 {
     match class {
+        RowClass::User if theme::neutral() => pal.text_strong,
+        RowClass::Assistant if theme::neutral() => pal.text,
         RowClass::User => pal.accent_b,
         RowClass::Assistant => pal.accent,
         RowClass::Tool => pal.weak,
@@ -235,14 +237,14 @@ fn class_color(pal: &Palette, class: RowClass) -> Color32 {
     }
 }
 
-fn class_icon(class: RowClass) -> MaterialIcon {
+fn class_icon(class: RowClass) -> Icon {
     match class {
-        RowClass::User => ICON_PERSON,
-        RowClass::Assistant => ICON_AUTO_AWESOME,
-        RowClass::Tool => ICON_BUILD,
-        RowClass::Compaction => ICON_COMPRESS,
-        RowClass::Summary => ICON_SUMMARIZE,
-        RowClass::Other => ICON_NOTES,
+        RowClass::User => ICON_USER,
+        RowClass::Assistant => ICON_SPARKLES,
+        RowClass::Tool => ICON_WRENCH,
+        RowClass::Compaction => ICON_FOLD_VERTICAL,
+        RowClass::Summary => ICON_SCROLL_TEXT,
+        RowClass::Other => ICON_ALIGN_LEFT,
     }
 }
 
@@ -266,11 +268,7 @@ pub fn show(ctx: &egui::Context, st: &mut TreeState, input: &TreeInput<'_>) -> V
         .show(ctx, |ui| {
             let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
             let dark = ctx.global_style().visuals.dark_mode;
-            ui.painter().rect_filled(
-                rect,
-                0,
-                Color32::from_black_alpha(if dark { 150 } else { 70 }),
-            );
+            ui.painter().rect_filled(rect, 0, theme::backdrop(dark));
             if resp.clicked() {
                 out.push(TreeAction::Close);
             }
@@ -290,8 +288,8 @@ pub fn show(ctx: &egui::Context, st: &mut TreeState, input: &TreeInput<'_>) -> V
     let style = ctx.global_style();
     let frame = Frame::NONE
         .fill(pal.bar)
-        .stroke(Stroke::new(1.0, pal.accent.gamma_multiply(0.45)))
-        .corner_radius(16)
+        .stroke(theme::popup_stroke(pal))
+        .corner_radius(theme::popup_radius())
         .shadow(style.visuals.window_shadow);
     egui::Window::new("tree-window")
         .id(Id::unique("tree-window"))
@@ -604,7 +602,7 @@ fn body(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<Tr
             ),
             _ => ("Nothing to show", "This session has no entries yet."),
         };
-        empty_state(ui, ICON_ACCOUNT_TREE, pal.weak, title, sub);
+        empty_state(ui, ICON_LIST_TREE, pal.weak, title, sub);
         return;
     }
     list(ui, st, tree, input, out);
@@ -613,13 +611,7 @@ fn body(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<Tr
 fn centered_status(ui: &mut Ui, input: &TreeInput<'_>) {
     let pal = Palette::of_ui(ui);
     match input.error {
-        Some(e) => empty_state(
-            ui,
-            ICON_ACCOUNT_TREE,
-            pal.danger,
-            "Cannot read the session",
-            e,
-        ),
+        Some(e) => empty_state(ui, ICON_LIST_TREE, pal.danger, "Cannot read the session", e),
         None => {
             ui.add_space(ui.available_height() * 0.35);
             ui.vertical_centered(|ui| {
@@ -638,15 +630,22 @@ fn header(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<
         |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-            ui.painter()
-                .rect_filled(rect, 10, pal.accent.gamma_multiply(0.18));
+            ui.painter().rect_filled(
+                rect,
+                theme::rad(8, 10),
+                if theme::neutral() {
+                    pal.surface
+                } else {
+                    pal.accent.gamma_multiply(0.18)
+                },
+            );
             paint_icon(
                 ui.painter(),
                 rect.center(),
                 Align2::CENTER_CENTER,
-                ICON_ACCOUNT_TREE,
+                ICON_LIST_TREE,
                 19.0,
-                pal.accent,
+                pal.glyph,
             );
             ui.label(
                 theme::strong("Session tree")
@@ -664,7 +663,7 @@ fn header(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<
             ui.spacing_mut().item_spacing.x = 2.0;
             let close = ui.add_sized(
                 [30.0, 30.0],
-                egui::Button::new(icon(ICON_CLOSE, 20.0, pal.weak)).frame(false),
+                egui::Button::new(icon(ICON_X, 20.0, pal.weak)).frame(false),
             );
             if close.on_hover_text("Close (Esc)").clicked() {
                 out.push(TreeAction::Close);
@@ -733,7 +732,7 @@ fn fmt_count(n: usize) -> String {
     out
 }
 
-fn icon(i: MaterialIcon, size: f32, color: Color32) -> RichText {
+fn icon(i: Icon, size: f32, color: Color32) -> RichText {
     crate::widgets::icon_text(i, size, color)
 }
 
@@ -742,25 +741,35 @@ fn chip(ui: &mut Ui, label: &str, tip: &str, on: bool) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let g = ui
         .painter()
-        .layout_no_wrap(label.to_owned(), FontId::proportional(13.0), pal.text);
+        .layout_no_wrap(label.to_owned(), crate::theme::font(13.0), pal.text);
     let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 26.0, 28.0), Sense::click());
     let hov = ui
         .ctx()
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
     let p = ui.painter();
+    let r = theme::rad(8, 14);
     if on {
-        p.rect_filled(rect, 14, pal.accent.gamma_multiply(0.22));
+        let fill = if theme::neutral() {
+            pal.raised
+        } else {
+            pal.accent.gamma_multiply(0.22)
+        };
+        p.rect_filled(rect, r, fill);
         p.rect_stroke(
             rect,
-            14,
-            Stroke::new(1.0, pal.accent.gamma_multiply(0.7)),
+            r,
+            Stroke::new(
+                1.0,
+                pal.accent
+                    .gamma_multiply(if theme::neutral() { 0.8 } else { 0.7 }),
+            ),
             StrokeKind::Inside,
         );
     } else {
-        p.rect_filled(rect, 14, pal.raised.gamma_multiply(0.7 * hov));
+        p.rect_filled(rect, r, pal.raised.gamma_multiply(0.7 * hov));
         p.rect_stroke(
             rect,
-            14,
+            r,
             Stroke::new(1.0, pal.stroke.gamma_multiply(0.9)),
             StrokeKind::Inside,
         );
@@ -778,7 +787,7 @@ fn chip(ui: &mut Ui, label: &str, tip: &str, on: bool) -> egui::Response {
 fn search_box(ui: &mut Ui, search: &mut String, id: Id, focus: bool) {
     let pal = Palette::of_ui(ui);
     if !search.is_empty() {
-        let clear = ui.add(egui::Button::new(icon(ICON_CLOSE, 16.0, pal.weak)).frame(false));
+        let clear = ui.add(egui::Button::new(icon(ICON_X, 16.0, pal.weak)).frame(false));
         if clear.on_hover_text("Clear search").clicked() {
             search.clear();
         }
@@ -842,7 +851,7 @@ fn keycap(ui: &mut Ui, key: &str, what: &str) {
     let pal = Palette::of_ui(ui);
     let g = ui
         .painter()
-        .layout_no_wrap(key.to_owned(), FontId::proportional(11.5), pal.text);
+        .layout_no_wrap(key.to_owned(), crate::theme::font(11.5), pal.text);
     let (rect, _) = ui.allocate_exact_size(vec2(g.size().x + 14.0, 20.0), Sense::hover());
     ui.painter().rect_filled(rect, 6, pal.surface);
     ui.painter()
@@ -1078,8 +1087,8 @@ fn current_button(ui: &mut Ui, st: &mut TreeState, tree: &SessionTree, list: Rec
     let pal = Palette::of_ui(ui);
     let g = ui.painter().layout_no_wrap(
         "Current".to_owned(),
-        FontId::proportional(12.5),
-        Color32::WHITE,
+        crate::theme::font(12.5),
+        theme::on_accent(pal),
     );
     let size = vec2(g.size().x + 40.0, 30.0);
     let rect = Rect::from_min_size(
@@ -1089,11 +1098,13 @@ fn current_button(ui: &mut Ui, st: &mut TreeState, tree: &SessionTree, list: Rec
     let resp = ui.interact(rect, Id::unique("tree-current"), Sense::click());
     let hov = resp.hovered();
     let p = ui.painter();
-    p.rect_filled(
-        rect.translate(vec2(0.0, 2.0)),
-        15,
-        Color32::from_black_alpha(60),
-    );
+    if !theme::neutral() {
+        p.rect_filled(
+            rect.translate(vec2(0.0, 2.0)),
+            15,
+            Color32::from_black_alpha(60),
+        );
+    }
     theme::gradient_rounded(
         p,
         rect,
@@ -1105,14 +1116,14 @@ fn current_button(ui: &mut Ui, st: &mut TreeState, tree: &SessionTree, list: Rec
         p,
         pos2(rect.left() + 16.0, rect.center().y),
         Align2::CENTER_CENTER,
-        ICON_MY_LOCATION,
+        ICON_CROSSHAIR,
         16.0,
-        Color32::WHITE,
+        theme::on_accent(pal),
     );
     p.galley(
         pos2(rect.left() + 28.0, rect.center().y - g.size().y / 2.0),
         g,
-        Color32::WHITE,
+        theme::on_accent(pal),
     );
     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
         st.want = Want::Leaf;
@@ -1146,7 +1157,7 @@ fn row_menu(
         let fork_off = fork_blocked(tree, layout, input, r);
         let it = menu_item(
             ui,
-            ICON_FORK_RIGHT,
+            ICON_GIT_FORK,
             tree_layout::fork_hint(&n.kind),
             None,
             fork_off.is_none(),
@@ -1163,7 +1174,7 @@ fn row_menu(
         let go_off = go_blocked(tree, layout, input, r);
         let it = menu_item(
             ui,
-            ICON_SUBDIRECTORY_ARROW_RIGHT,
+            ICON_CORNER_DOWN_RIGHT,
             "Go here",
             Some("Enter"),
             go_off.is_none(),
@@ -1178,20 +1189,11 @@ fn row_menu(
             ui.close();
         }
         ui.separator();
-        if menu_item(
-            ui,
-            ICON_CONTENT_COPY,
-            "Copy text",
-            None,
-            !n.text.is_empty(),
-            false,
-        )
-        .clicked()
-        {
+        if menu_item(ui, ICON_COPY, "Copy text", None, !n.text.is_empty(), false).clicked() {
             out.push((r, RowCommand::CopyText(n.text.clone())));
             ui.close();
         }
-        if menu_item(ui, ICON_KEY, "Copy entry id", None, true, false).clicked() {
+        if menu_item(ui, ICON_KEY_ROUND, "Copy entry id", None, true, false).clicked() {
             out.push((r, RowCommand::CopyId(n.id.clone())));
             ui.close();
         }
@@ -1235,17 +1237,28 @@ fn paint_band(
 ) {
     let row = &layout.rows[u.row];
     let inner = u.rect.shrink2(vec2(8.0, 2.0));
+    let r = theme::rad(8, 10);
     if row.is_leaf {
-        p.rect_filled(inner, 10, pal.accent.gamma_multiply(0.11));
+        let fill = if theme::neutral() {
+            pal.surface
+        } else {
+            pal.accent.gamma_multiply(0.11)
+        };
+        p.rect_filled(inner, r, fill);
     }
     if hovered {
-        p.rect_filled(inner, 10, pal.raised.gamma_multiply(0.55));
+        p.rect_filled(inner, r, pal.raised.gamma_multiply(0.55));
     }
     if selected {
-        p.rect_filled(inner, 10, pal.accent.gamma_multiply(0.16));
+        let fill = if theme::neutral() {
+            pal.raised
+        } else {
+            pal.accent.gamma_multiply(0.16)
+        };
+        p.rect_filled(inner, r, fill);
         p.rect_stroke(
             inner,
-            10,
+            r,
             Stroke::new(1.0, pal.accent.gamma_multiply(0.55)),
             StrokeKind::Inside,
         );
@@ -1330,7 +1343,7 @@ fn edge(p: &Painter, a: Pos2, b: Pos2, stroke: Stroke) {
 
 fn paint_node(p: &Painter, pal: &Palette, row: &Row, c: Pos2, fork_point: bool) {
     let base = pal.bar;
-    if row.is_leaf {
+    if row.is_leaf && !theme::neutral() {
         p.circle_filled(c, 15.0, pal.accent.gamma_multiply(0.14));
         p.circle_filled(c, 10.5, pal.accent.gamma_multiply(0.26));
     }
@@ -1411,7 +1424,7 @@ fn paint_content(
             pill_right,
             cy,
             "you are here",
-            Some(ICON_MY_LOCATION),
+            Some(ICON_CROSSHAIR),
             PillStyle::Solid,
         );
         pill_right -= w + 6.0;
@@ -1425,8 +1438,12 @@ fn paint_content(
             pill_right,
             cy,
             &txt,
-            Some(ICON_ACCOUNT_TREE),
-            PillStyle::Soft(pal.accent_b),
+            Some(ICON_LIST_TREE),
+            PillStyle::Soft(if theme::neutral() {
+                pal.text
+            } else {
+                pal.accent_b
+            }),
         );
         pill_right -= w + 6.0;
         pills_w += w + 6.0;
@@ -1448,12 +1465,12 @@ fn paint_content(
     // Text.
     let max_w = (actions_left - 8.0 - pills_w - text_left).max(40.0);
     let (font, color) = match row.class {
-        RowClass::User => (FontId::proportional(14.0), pal.text_strong),
-        RowClass::Assistant => (FontId::proportional(13.5), pal.text),
+        RowClass::User => (crate::theme::font(14.0), pal.text_strong),
+        RowClass::Assistant => (crate::theme::font(13.5), pal.text),
         RowClass::Tool => (FontId::monospace(12.0), pal.weak),
-        RowClass::Compaction => (FontId::proportional(13.0), pal.warn),
-        RowClass::Summary => (FontId::proportional(13.0), pal.ok),
-        RowClass::Other => (FontId::proportional(13.0), pal.weak),
+        RowClass::Compaction => (crate::theme::font(13.0), pal.warn),
+        RowClass::Summary => (crate::theme::font(13.0), pal.ok),
+        RowClass::Other => (crate::theme::font(13.0), pal.weak),
     };
     let color = if row.class == RowClass::Assistant && node.text.starts_with('(') {
         pal.weak
@@ -1485,7 +1502,7 @@ fn paint_content(
             pos2(right, cy),
             Align2::RIGHT_CENTER,
             age,
-            FontId::proportional(12.0),
+            crate::theme::font(12.0),
             pal.weak,
         );
     }
@@ -1550,14 +1567,14 @@ fn pill(
     right: f32,
     cy: f32,
     text: &str,
-    icon: Option<MaterialIcon>,
+    icon: Option<Icon>,
     style: PillStyle,
 ) -> f32 {
     let fg = match style {
-        PillStyle::Solid => Color32::WHITE,
+        PillStyle::Solid => theme::on_accent(pal),
         PillStyle::Soft(c) => c,
     };
-    let g = p.layout_no_wrap(text.to_owned(), FontId::proportional(11.5), fg);
+    let g = p.layout_no_wrap(text.to_owned(), crate::theme::font(11.5), fg);
     let icon_w = if icon.is_some() { 16.0 } else { 0.0 };
     let w = g.size().x + 20.0 + icon_w;
     let rect = Rect::from_min_size(pos2(right - w, cy - 10.0), vec2(w, 20.0));
@@ -1607,7 +1624,7 @@ fn actions(
         p,
         pal,
         (right, cy),
-        ("Go here", ICON_ARROW_FORWARD),
+        ("Go here", ICON_ARROW_RIGHT),
         (go_off, go_tip),
         u,
         "go",
@@ -1619,7 +1636,7 @@ fn actions(
         p,
         pal,
         (right - go_w - 6.0, cy),
-        ("Fork", ICON_FORK_RIGHT),
+        ("Fork", ICON_GIT_FORK),
         (fork_off, tree_layout::fork_hint(&node.kind)),
         u,
         "fork",
@@ -1635,7 +1652,7 @@ fn action_button(
     p: &Painter,
     pal: &Palette,
     (right, cy): (f32, f32),
-    (label, icon): (&str, MaterialIcon),
+    (label, icon): (&str, Icon),
     (off, tip): (Option<&str>, &str),
     u: &RowUi,
     id: &str,
@@ -1643,11 +1660,7 @@ fn action_button(
     on_click: RowCommand,
 ) -> f32 {
     let enabled = off.is_none();
-    let g = p.layout_no_wrap(
-        label.to_owned(),
-        FontId::proportional(12.5),
-        pal.text_strong,
-    );
+    let g = p.layout_no_wrap(label.to_owned(), crate::theme::font(12.5), pal.text_strong);
     let w = g.size().x + 40.0;
     let rect = Rect::from_min_size(pos2(right - w, cy - 13.0), vec2(w, 26.0));
     let resp = ui.interact(
@@ -1668,7 +1681,7 @@ fn action_button(
             rect,
             13,
             if hov {
-                pal.accent.gamma_multiply(0.3)
+                theme::accent_fill(pal, 0.3)
             } else {
                 pal.surface
             },

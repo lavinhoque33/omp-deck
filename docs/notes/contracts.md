@@ -899,3 +899,50 @@ Never touches anything outside what omp's own delete removes. Extension installe
   retry `delete_session` while it reports `Live` for up to ~5 s (lease release after exit). `Live` after
   that → toast "open in another omp process". Success → toast + immediate sidebar rescan; recently-closed
   (Ctrl+Shift+T) and persisted tab lists drop the deleted path.
+
+## Wave 8: "Neutral" modern look (default), Compact density, lucide icons, sidebar auto-expand
+
+User request: their-style modern look (oh-my-pi-gui: neutral near-black, hairline borders, Geist, lucide
+icons, flat, compact) added **and made the default**; lucide icons everywhere; sidebar expands only the
+active tab's folder, the rest collapsed by default.
+
+### deck_core::config
+```rust
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum UiStyle { #[default] Neutral, Neon }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Density { #[default] Compact, Comfortable }
+// AppConfig gains (both #[serde(default)], so existing config files switch to Neutral + Compact):
+pub style: UiStyle,
+pub density: Density,
+// AppConfig loses `collapsed_groups` (expansion is no longer persisted); old files carrying the key
+// still load.
+```
+`Theme { Dark, Light }` unchanged (light/dark axis; style is the second axis).
+
+### deck_term
+`TermTheme` gains `NeutralDark` and `NeutralLight` (existing `Dark`/`Light` = Breeze stay for Neon).
+NeutralDark: background `0x0b0b0d` (must equal the chrome `bg`), foreground `0xe4e4e7`, cursor `0xfafafa`;
+ANSI 0–15: `18181b f87171 4ade80 facc15 60a5fa c084fc 22d3ee d4d4d8 / 52525b fca5a5 86efac fde047 93c5fd
+d8b4fe 67e8f9 fafafa`. NeutralLight: background `0xffffff`, foreground `0x18181b`, cursor `0x18181b`, ANSI
+tuned for contrast on white (zinc/tailwind-600 family). OSC 10/11/4 replies follow the palette.
+
+### omp-deck
+- Neutral palettes (theme.rs): dark bg `0b0b0d`, panel/bar `0f0f11`, surface `17171a`, raised `1f1f23`,
+  stroke `232327`, text `d4d4d8`, text_strong `fafafa`, weak `71717a`, accent teal `2dd4bf` (accent_a =
+  accent_b = accent: no gradients), ok `4ade80`, warn `fbbf24`, danger `f87171`. Light: bg `ffffff`, panel/bar
+  `fafafa`, surface `f4f4f5`, raised/stroke `e4e4e7`, text `3f3f46`, strong `09090b`, weak `71717a`, accent
+  `0d9488`, ok `16a34a`, warn `ca8a04`, danger `dc2626`. Neutral rules: flat (no gradient/glow), 1 px hairline
+  borders, radius 8 (popups 10), hover = subtle surface fill, selection = surface fill + strong text with a
+  thin accent indicator, accent only for focus/active/primary/activity.
+- Fonts: Geist (bundled, OFL; license file shipped) is the UI font in Neutral; Neon keeps Adwaita Sans.
+- Icons: lucide icon font (ISC; license shipped) replaces Material Symbols everywhere (both styles);
+  `egui_material_icons` dependency removed.
+- Density Compact: tighter sidebar rows/headers, tab row, title row, menus, tree/picker rows, paddings.
+  The status bar keeps its user-tuned size (41 px bar, model chip 1.3 × max(path, 213 px)).
+- Settings → Appearance: Theme (Dark/Light), Style (Neutral/Midnight neon), Density (Compact/Comfortable);
+  live switch, persisted.
+- Sidebar expansion: open(group) = filtering || override(group) ?? (group == active tab's project group).
+  User toggles set an in-memory override; activating a tab clears the override of its group (it opens);
+  other groups without an override collapse. Collapse-all / Expand-all set overrides for every group. Not
+  persisted (startup: everything collapsed except the restored active tab's group).

@@ -7,6 +7,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::icons::Icon;
+use crate::icons::{
+    ICON_ARROW_LEFT_RIGHT, ICON_BELL, ICON_BRAIN, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT,
+    ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CLIPBOARD_LIST, ICON_FILE_TEXT, ICON_FOLD_VERTICAL,
+    ICON_NETWORK, ICON_PENCIL, ICON_POWER, ICON_SEARCH, ICON_TERMINAL, ICON_USER, ICON_WRENCH,
+};
 use deck_core::agents::TranscriptItem;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
@@ -14,13 +20,6 @@ use egui::{
     Sense, Stroke, Ui, vec2,
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use egui_material_icons::MaterialIcon;
-use egui_material_icons::icons::{
-    ICON_ASSIGNMENT, ICON_BUILD, ICON_CHECK_CIRCLE, ICON_CHEVRON_RIGHT, ICON_COMPRESS,
-    ICON_DESCRIPTION, ICON_EDIT, ICON_ERROR, ICON_EXPAND_MORE, ICON_HUB, ICON_NOTIFICATIONS,
-    ICON_PERSON, ICON_POWER_SETTINGS_NEW, ICON_PSYCHOLOGY, ICON_SEARCH, ICON_SWAP_HORIZ,
-    ICON_TERMINAL,
-};
 
 use crate::agent_model::short_model;
 use crate::statusfmt::fmt_tokens;
@@ -109,14 +108,14 @@ fn estimate(items: &[TranscriptItem], row: Row, width: f32) -> f32 {
 }
 
 /// Icon for a tool by name.
-fn tool_icon(name: &str) -> MaterialIcon {
+fn tool_icon(name: &str) -> Icon {
     match name {
-        "read" => ICON_DESCRIPTION,
-        "edit" | "write" | "ast_edit" => ICON_EDIT,
+        "read" => ICON_FILE_TEXT,
+        "edit" | "write" | "ast_edit" => ICON_PENCIL,
         "bash" | "eval" | "ssh" => ICON_TERMINAL,
         "grep" | "find" | "web_search" | "ast_grep" | "search" => ICON_SEARCH,
-        "task" | "wait" | "irc" => ICON_HUB,
-        _ => ICON_BUILD,
+        "task" | "wait" | "irc" => ICON_NETWORK,
+        _ => ICON_WRENCH,
     }
 }
 
@@ -144,12 +143,12 @@ fn line_job(parts: &[(&str, FontId, Color32)], max_width: f32) -> LayoutJob {
 enum Badge {
     None,
     Spinner(Color32),
-    Icon(MaterialIcon, Color32),
+    Icon(Icon, Color32),
 }
 
 struct Header<'a> {
     open: bool,
-    icon: MaterialIcon,
+    icon: Icon,
     icon_color: Color32,
     title: &'a str,
     title_font: FontId,
@@ -175,7 +174,7 @@ fn header(ui: &mut Ui, h: &Header<'_>) -> bool {
         egui::pos2(rect.left() + 10.0, mid),
         Align2::CENTER_CENTER,
         if h.open {
-            ICON_EXPAND_MORE
+            ICON_CHEVRON_DOWN
         } else {
             ICON_CHEVRON_RIGHT
         },
@@ -214,8 +213,8 @@ fn header(ui: &mut Ui, h: &Header<'_>) -> bool {
     let job = line_job(
         &[
             (h.title, h.title_font.clone(), h.title_color),
-            ("  ", FontId::proportional(12.5), pal.weak),
-            (h.headline, FontId::proportional(13.0), h.headline_color),
+            ("  ", crate::theme::font(12.5), pal.weak),
+            (h.headline, crate::theme::font(13.0), h.headline_color),
             (
                 if h.tail.is_empty() { "" } else { "  " },
                 mono.clone(),
@@ -242,7 +241,7 @@ fn bubble<R>(
     let inner = Frame::NONE
         .fill(fill)
         .stroke(Stroke::new(1.0, pal.stroke.gamma_multiply(0.8)))
-        .corner_radius(10)
+        .corner_radius(theme::rad(8, 10))
         .inner_margin(margin)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -265,7 +264,7 @@ fn mono_block(ui: &mut Ui, text: &str, color: Color32, salt: (usize, &'static st
     let pal = Palette::of_ui(ui);
     Frame::NONE
         .fill(theme::mix(pal.bg, pal.surface, 0.5))
-        .corner_radius(8)
+        .corner_radius(theme::rad(6, 8))
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -477,14 +476,18 @@ impl TranscriptView {
                 } else {
                     (
                         pal.surface.gamma_multiply(0.9),
-                        pal.accent.gamma_multiply(0.7),
+                        if theme::neutral() {
+                            pal.stroke
+                        } else {
+                            pal.accent.gamma_multiply(0.7)
+                        },
                     )
                 };
                 let badge = match res {
                     None if running => Badge::Spinner(pal.accent_b),
-                    None => Badge::Icon(ICON_NOTIFICATIONS, pal.weak.gamma_multiply(0.5)),
-                    Some((_, true, _)) => Badge::Icon(ICON_ERROR, pal.danger),
-                    Some(_) => Badge::Icon(ICON_CHECK_CIRCLE, pal.ok),
+                    None => Badge::Icon(ICON_BELL, pal.weak.gamma_multiply(0.5)),
+                    Some((_, true, _)) => Badge::Icon(ICON_CIRCLE_ALERT, pal.danger),
+                    Some(_) => Badge::Icon(ICON_CIRCLE_CHECK, pal.ok),
                 };
                 let (headline, tail) = match intent.as_deref().filter(|s| !s.is_empty()) {
                     Some(intent) => (intent, summary.as_str()),
@@ -576,15 +579,20 @@ impl TranscriptView {
                 text, from_agent, ..
             } => {
                 let (title, icon) = if *from_agent {
-                    ("Assignment", ICON_ASSIGNMENT)
+                    ("Assignment", ICON_CLIPBOARD_LIST)
                 } else {
-                    ("You", ICON_PERSON)
+                    ("You", ICON_USER)
                 };
                 let preview = crate::agent_model::one_line(text, 160);
+                let user_c = if theme::neutral() {
+                    pal.weak
+                } else {
+                    pal.accent_a
+                };
                 let clicked = bubble(
                     ui,
-                    theme::mix(pal.surface, pal.accent_a, 0.10),
-                    pal.accent_a,
+                    theme::accent_wash(pal.surface, pal.accent_a, 0.10),
+                    user_c,
                     Margin::symmetric(8, 2),
                     |ui| {
                         let c = header(
@@ -592,9 +600,9 @@ impl TranscriptView {
                             &Header {
                                 open,
                                 icon,
-                                icon_color: pal.accent_a,
+                                icon_color: user_c,
                                 title,
-                                title_font: FontId::proportional(13.0),
+                                title_font: crate::theme::font(13.0),
                                 title_color: pal.text_strong,
                                 headline: if open { "" } else { &preview },
                                 headline_color: pal.weak,
@@ -623,27 +631,34 @@ impl TranscriptView {
                 }
             }
             TranscriptItem::Assistant { text, model, .. } => {
-                bubble(
-                    ui,
-                    pal.surface,
-                    pal.accent_b,
-                    Margin::symmetric(14, 10),
-                    |ui| {
-                        ui.horizontal(|ui| {
-                            caption(ui, "Assistant", pal.accent_b);
-                            if let Some(m) = model {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(short_model(m)).size(11.0).color(pal.weak),
-                                    )
-                                    .selectable(false),
-                                );
-                            }
-                        });
-                        ui.add_space(2.0);
-                        CommonMarkViewer::new().show(ui, &mut self.md, text);
-                    },
-                );
+                let asst_c = if theme::neutral() {
+                    pal.stroke
+                } else {
+                    pal.accent_b
+                };
+                bubble(ui, pal.surface, asst_c, Margin::symmetric(14, 10), |ui| {
+                    ui.horizontal(|ui| {
+                        caption(
+                            ui,
+                            "Assistant",
+                            if theme::neutral() {
+                                pal.weak
+                            } else {
+                                pal.accent_b
+                            },
+                        );
+                        if let Some(m) = model {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(short_model(m)).size(11.0).color(pal.weak),
+                                )
+                                .selectable(false),
+                            );
+                        }
+                    });
+                    ui.add_space(2.0);
+                    CommonMarkViewer::new().show(ui, &mut self.md, text);
+                });
             }
             TranscriptItem::Thinking { text } => {
                 let preview = crate::agent_model::one_line(text, 160);
@@ -651,10 +666,10 @@ impl TranscriptView {
                     ui,
                     &Header {
                         open,
-                        icon: ICON_PSYCHOLOGY,
+                        icon: ICON_BRAIN,
                         icon_color: pal.weak,
                         title: "Thinking",
-                        title_font: FontId::proportional(12.5),
+                        title_font: crate::theme::font(12.5),
                         title_color: pal.weak,
                         headline: if open { "" } else { &preview },
                         headline_color: pal.weak.gamma_multiply(0.8),
@@ -724,10 +739,10 @@ impl TranscriptView {
                             ui,
                             &Header {
                                 open,
-                                icon: ICON_NOTIFICATIONS,
+                                icon: ICON_BELL,
                                 icon_color: pal.warn,
                                 title: kind,
-                                title_font: FontId::proportional(12.5),
+                                title_font: crate::theme::font(12.5),
                                 title_color: pal.text_strong,
                                 headline: if open { "" } else { &preview },
                                 headline_color: pal.weak,
@@ -780,10 +795,10 @@ impl TranscriptView {
                     ui,
                     &Header {
                         open,
-                        icon: ICON_COMPRESS,
+                        icon: ICON_FOLD_VERTICAL,
                         icon_color: pal.accent_b,
                         title: &title,
-                        title_font: FontId::proportional(12.5),
+                        title_font: crate::theme::font(12.5),
                         title_color: pal.text,
                         headline: "",
                         headline_color: pal.weak,
@@ -809,7 +824,12 @@ impl TranscriptView {
                 }
             }
             TranscriptItem::ModelChange { model } => {
-                centered_note(ui, ICON_SWAP_HORIZ, &format!("Model → {model}"), pal.weak);
+                centered_note(
+                    ui,
+                    ICON_ARROW_LEFT_RIGHT,
+                    &format!("Model → {model}"),
+                    pal.weak,
+                );
             }
             TranscriptItem::Error { message } => {
                 bubble(
@@ -820,8 +840,8 @@ impl TranscriptView {
                     |ui| {
                         ui.horizontal_top(|ui| {
                             ui.label(
-                                RichText::new(ICON_ERROR.codepoint)
-                                    .font(FontId::new(17.0, ICON_ERROR.font_family()))
+                                RichText::new(ICON_CIRCLE_ALERT.codepoint)
+                                    .font(FontId::new(17.0, ICON_CIRCLE_ALERT.font_family()))
                                     .color(pal.danger),
                             );
                             ui.add(
@@ -835,7 +855,7 @@ impl TranscriptView {
             TranscriptItem::Exit { reason } => {
                 centered_note(
                     ui,
-                    ICON_POWER_SETTINGS_NEW,
+                    ICON_POWER,
                     &format!("Session ended · {reason}"),
                     pal.weak,
                 );
@@ -844,11 +864,11 @@ impl TranscriptView {
     }
 }
 
-fn centered_note(ui: &mut Ui, icon: MaterialIcon, text: &str, color: Color32) {
+fn centered_note(ui: &mut Ui, icon: Icon, text: &str, color: Color32) {
     let pal = Palette::of_ui(ui);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
     let p = ui.painter();
-    let g = p.layout_no_wrap(text.to_owned(), FontId::proportional(12.0), color);
+    let g = p.layout_no_wrap(text.to_owned(), crate::theme::font(12.0), color);
     let w = g.size().x + 26.0;
     let left = rect.center().x - w / 2.0;
     p.hline(

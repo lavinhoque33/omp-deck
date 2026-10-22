@@ -1,12 +1,12 @@
 //! Widgets of the omp settings editor: one row per setting with its editor, the JSON / secret
 //! modals, the loading skeleton and the info banner.
 
+use crate::icons::{ICON_INFO, ICON_LOCK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_TRASH_2};
 use deck_core::omp::{Setting, SettingKind};
 use egui::{
     Align2, CursorIcon, Frame, Id, Key, Margin, Rect, RichText, Sense, Stroke, TextEdit, Ui, pos2,
     vec2,
 };
-use egui_material_icons::icons::{ICON_DELETE, ICON_EDIT, ICON_INFO, ICON_LOCK, ICON_RESTART_ALT};
 use serde_json::Value;
 
 use crate::confirm::{Dialog, show_dialog};
@@ -87,9 +87,9 @@ pub fn show_row(ui: &mut Ui, row: &mut Row, first: bool) -> Option<RowEvent> {
             if modified && !pending {
                 let tip = if secret { "Clear" } else { "Reset to default" };
                 let icon = if secret {
-                    ICON_DELETE
+                    ICON_TRASH_2
                 } else {
-                    ICON_RESTART_ALT
+                    ICON_ROTATE_CCW
                 };
                 let resp = ui.interact(slot, ui.next_auto_id().with("reset"), Sense::click());
                 let hov = ui
@@ -232,7 +232,7 @@ fn editor(ui: &mut Ui, e: &mut EditCtx<'_>, current: Option<&Value>) -> Option<R
                 if ui
                     .add(
                         egui::Button::new((
-                            icon_text(ICON_EDIT, 16.0, pal.accent),
+                            icon_text(ICON_PENCIL, 16.0, pal.glyph),
                             RichText::new("Edit"),
                         ))
                         .min_size(vec2(0.0, 28.0)),
@@ -259,11 +259,8 @@ fn secret_editor(ui: &mut Ui, is_set: bool) -> Option<RowEvent> {
     let mut ev = None;
     if ui
         .add(
-            egui::Button::new((
-                icon_text(ICON_LOCK, 16.0, pal.accent),
-                RichText::new("Set…"),
-            ))
-            .min_size(vec2(0.0, 28.0)),
+            egui::Button::new((icon_text(ICON_LOCK, 16.0, pal.glyph), RichText::new("Set…")))
+                .min_size(vec2(0.0, 28.0)),
         )
         .clicked()
     {
@@ -560,15 +557,27 @@ pub fn show_secret_modal(ctx: &egui::Context, m: &mut SecretModal) -> ModalOutco
 pub fn note_banner(ui: &mut Ui, text: &str) {
     let pal = Palette::of_ui(ui);
     Frame::NONE
-        .fill(theme::mix(pal.surface, pal.accent_b, 0.07))
-        .stroke(Stroke::new(1.0, pal.accent_b.gamma_multiply(0.28)))
-        .corner_radius(12)
+        .fill(theme::accent_wash(pal.surface, pal.accent_b, 0.07))
+        .stroke(if theme::neutral() {
+            Stroke::new(1.0, pal.stroke)
+        } else {
+            Stroke::new(1.0, pal.accent_b.gamma_multiply(0.28))
+        })
+        .corner_radius(theme::rad(8, 12))
         .inner_margin(Margin::symmetric(14, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                ui.label(icon_text(ICON_INFO, 18.0, pal.accent_b));
+                ui.label(icon_text(
+                    ICON_INFO,
+                    18.0,
+                    if theme::neutral() {
+                        pal.glyph
+                    } else {
+                        pal.accent_b
+                    },
+                ));
                 ui.add(
                     egui::Label::new(RichText::new(text).small().color(pal.text))
                         .wrap_mode(egui::TextWrapMode::Wrap),
@@ -593,10 +602,18 @@ pub fn skeleton(ui: &mut Ui) {
     };
     for _ in 0..3 {
         Frame::NONE
-            .fill(pal.surface.gamma_multiply(0.75))
+            .fill(if theme::neutral() {
+                pal.panel
+            } else {
+                pal.surface.gamma_multiply(0.75)
+            })
             .stroke(Stroke::new(1.0, pal.stroke))
-            .corner_radius(14)
-            .inner_margin(Margin::symmetric(20, 16))
+            .corner_radius(theme::rad(8, 14))
+            .inner_margin(if theme::neutral() {
+                Margin::symmetric(16, 12)
+            } else {
+                Margin::symmetric(20, 16)
+            })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 bar(ui, 90.0, 9.0);

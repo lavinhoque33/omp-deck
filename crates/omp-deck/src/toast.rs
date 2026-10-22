@@ -2,12 +2,12 @@
 
 use std::time::Duration;
 
-use egui::{Align2, Area, Context, Frame, Id, Margin, Order, RichText, Stroke, vec2};
+use egui::{Align2, Area, Context, Frame, Id, Margin, Order, RichText, vec2};
 
+use crate::icons::{ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_INFO, ICON_X};
 use crate::summary::summarize;
 use crate::theme::{self, Palette};
 use crate::widgets::{icon_text, paint_icon};
-use egui_material_icons::icons::{ICON_CHECK_CIRCLE, ICON_CLOSE, ICON_ERROR, ICON_INFO};
 
 const FADE_IN: f32 = 0.18;
 const FADE_OUT: f32 = 0.35;
@@ -134,16 +134,23 @@ impl Toasts {
                             .min(1.0)
                             .min(((life - age) / FADE_OUT).clamp(0.0, 1.0));
                         let (icon, color) = match t.kind {
-                            ToastKind::Info => (ICON_INFO, pal.accent_b),
-                            ToastKind::Success => (ICON_CHECK_CIRCLE, pal.ok),
-                            ToastKind::Error => (ICON_ERROR, pal.danger),
+                            ToastKind::Info => (
+                                ICON_INFO,
+                                if theme::neutral() { pal.glyph } else { pal.accent_b },
+                            ),
+                            ToastKind::Success => (ICON_CIRCLE_CHECK, pal.ok),
+                            ToastKind::Error => (ICON_CIRCLE_ALERT, pal.danger),
                         };
                         ui.scope(|ui| {
                             ui.set_opacity(a);
                             Frame::popup(ui.style())
-                                .fill(theme::mix(pal.raised, color, 0.06))
-                                .stroke(Stroke::new(1.0, color.gamma_multiply(0.45)))
-                                .corner_radius(12)
+                                .fill(if theme::neutral() {
+                                    ui.style().visuals.window_fill
+                                } else {
+                                    theme::mix(pal.raised, color, 0.06)
+                                })
+                                .stroke(theme::status_stroke(pal, color, 0.45))
+                                .corner_radius(theme::rad(8, 12))
                                 .inner_margin(Margin::symmetric(14, 11))
                                 .show(ui, |ui| {
                                     ui.set_width(WIDTH);
@@ -193,7 +200,7 @@ impl Toasts {
                                                 ui.painter(),
                                                 r.center(),
                                                 Align2::CENTER_CENTER,
-                                                ICON_CLOSE,
+                                                ICON_X,
                                                 15.0,
                                                 col,
                                             );
@@ -207,10 +214,13 @@ impl Toasts {
                                                             theme::strong(&act.label)
                                                                 .color(pal.text_strong),
                                                         )
-                                                        .fill(color.gamma_multiply(0.25))
-                                                        .stroke(Stroke::new(
-                                                            1.0,
-                                                            color.gamma_multiply(0.7),
+                                                        .fill(if theme::neutral() {
+                                                            pal.surface
+                                                        } else {
+                                                            color.gamma_multiply(0.25)
+                                                        })
+                                                        .stroke(theme::status_stroke(
+                                                            pal, color, 0.7,
                                                         ))
                                                         .corner_radius(8),
                                                     )

@@ -6,15 +6,15 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::icons::Icon;
+use crate::icons::{
+    ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_UP, ICON_CIRCLE_ALERT, ICON_REFRESH_CW,
+    ICON_SEARCH, ICON_STAR,
+};
 use deck_core::omp::ModelInfo;
 use egui::{
     Align2, Color32, CursorIcon, FontId, Margin, Response, RichText, Sense, Stroke, StrokeKind,
     TextEdit, Ui, pos2, vec2,
-};
-use egui_material_icons::MaterialIcon;
-use egui_material_icons::icons::{
-    ICON_CHECK, ICON_ERROR, ICON_EXPAND_LESS, ICON_EXPAND_MORE, ICON_REFRESH, ICON_SEARCH,
-    ICON_STAR,
 };
 
 use crate::statusfmt::{fmt_price, fmt_tokens, short_model_name, thinking_short};
@@ -412,12 +412,14 @@ fn provider_dropdown(ui: &mut Ui, state: &mut PickerState, input: &PickerInput<'
     let p = ui.painter();
     p.rect(
         rect,
-        9,
+        theme::rad(8, 9),
         theme::mix(pal.surface, pal.raised, hov),
         Stroke::new(
             1.0,
             if state.provider_open {
                 pal.accent
+            } else if theme::neutral() {
+                theme::mix(pal.stroke, pal.weak, 0.4 * hov)
             } else {
                 theme::mix(pal.stroke, pal.accent, 0.5 * hov)
             },
@@ -428,7 +430,7 @@ fn provider_dropdown(ui: &mut Ui, state: &mut PickerState, input: &PickerInput<'
         pos2(rect.left() + 12.0, rect.center().y),
         Align2::LEFT_CENTER,
         label(selected),
-        FontId::proportional(13.5),
+        crate::theme::font(13.5),
         if selected.is_some() {
             pal.text_strong
         } else {
@@ -440,9 +442,9 @@ fn provider_dropdown(ui: &mut Ui, state: &mut PickerState, input: &PickerInput<'
         pos2(rect.right() - 18.0, rect.center().y),
         Align2::CENTER_CENTER,
         if state.provider_open {
-            ICON_EXPAND_LESS
+            ICON_CHEVRON_UP
         } else {
-            ICON_EXPAND_MORE
+            ICON_CHEVRON_DOWN
         },
         20.0,
         theme::mix(pal.weak, pal.text_strong, hov),
@@ -483,7 +485,7 @@ fn provider_options(
     egui::Frame::new()
         .fill(pal.bg)
         .stroke(Stroke::new(1.0, pal.stroke))
-        .corner_radius(9)
+        .corner_radius(theme::rad(8, 9))
         .inner_margin(Margin::same(4))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
@@ -521,7 +523,15 @@ fn option_row(ui: &mut Ui, text: &str, selected: bool) -> bool {
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.08);
     let p = ui.painter();
     if selected {
-        p.rect_filled(rect, 7, pal.accent.gamma_multiply(0.16));
+        p.rect_filled(
+            rect,
+            theme::rad(6, 7),
+            if theme::neutral() {
+                pal.raised
+            } else {
+                pal.accent.gamma_multiply(0.16)
+            },
+        );
         paint_icon(
             p,
             pos2(rect.left() + 14.0, rect.center().y),
@@ -531,13 +541,13 @@ fn option_row(ui: &mut Ui, text: &str, selected: bool) -> bool {
             pal.accent,
         );
     } else if hov > 0.0 {
-        p.rect_filled(rect, 7, pal.surface.gamma_multiply(hov));
+        p.rect_filled(rect, theme::rad(6, 7), pal.surface.gamma_multiply(hov));
     }
     p.text(
         pos2(rect.left() + 30.0, rect.center().y),
         Align2::LEFT_CENTER,
         text,
-        FontId::proportional(13.0),
+        crate::theme::font(13.0),
         if selected { pal.text_strong } else { pal.text },
     );
     resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
@@ -589,8 +599,13 @@ pub fn show(
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .frame(
             egui::Frame::popup(&ctx.global_style())
-                .fill(Palette::of_ctx(&ctx).raised)
-                .corner_radius(14)
+                .fill(if theme::neutral() {
+                    ctx.global_style().visuals.window_fill
+                } else {
+                    Palette::of_ctx(&ctx).raised
+                })
+                .stroke(Stroke::new(1.0, Palette::of_ctx(&ctx).stroke))
+                .corner_radius(theme::rad(10, 14))
                 .inner_margin(egui::Margin::same(12)),
         )
         .show(|ui| {
@@ -642,7 +657,7 @@ fn body(
             ui.painter(),
             rect.center(),
             Align2::CENTER_CENTER,
-            ICON_REFRESH,
+            ICON_REFRESH_CW,
             18.0,
             color,
         );
@@ -706,7 +721,7 @@ fn body(
         }
         LoadState::Failed(e) => {
             ui.horizontal_wrapped(|ui| {
-                ui.label(icon_text(ICON_ERROR, 16.0, pal.danger));
+                ui.label(icon_text(ICON_CIRCLE_ALERT, 16.0, pal.danger));
                 ui.label(RichText::new(format!("Could not list models: {e}")).color(pal.danger));
             });
             return;
@@ -772,7 +787,7 @@ fn body(
         });
 }
 
-fn header_row(ui: &mut Ui, label: &str, icon: Option<MaterialIcon>) {
+fn header_row(ui: &mut Ui, label: &str, icon: Option<Icon>) {
     let pal = Palette::of_ui(ui);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
     let mut x = rect.left() + 6.0;
@@ -783,7 +798,11 @@ fn header_row(ui: &mut Ui, label: &str, icon: Option<MaterialIcon>) {
             Align2::LEFT_BOTTOM,
             icon,
             14.0,
-            pal.accent,
+            if theme::neutral() {
+                pal.warn
+            } else {
+                pal.accent
+            },
         );
         x += 19.0;
     }
@@ -791,7 +810,7 @@ fn header_row(ui: &mut Ui, label: &str, icon: Option<MaterialIcon>) {
         pos2(x, rect.bottom() - 7.0),
         Align2::LEFT_BOTTOM,
         label.to_uppercase(),
-        FontId::proportional(11.0),
+        crate::theme::font(11.0),
         pal.weak,
     );
 }
@@ -860,7 +879,12 @@ fn model_row(
     let p = ui.painter();
     let inner = rect.shrink2(vec2(0.0, 1.0));
     if current {
-        p.rect_filled(inner, 8, pal.accent.gamma_multiply(0.16));
+        let fill = if theme::neutral() {
+            pal.raised
+        } else {
+            pal.accent.gamma_multiply(0.16)
+        };
+        p.rect_filled(inner, if theme::neutral() { 6 } else { 8 }, fill);
     } else if hov > 0.0 {
         p.rect_filled(inner, 8, pal.surface.gamma_multiply(hov));
     }
@@ -885,19 +909,19 @@ fn model_row(
             pos2(x, mid),
             Align2::RIGHT_CENTER,
             price,
-            FontId::proportional(11.0),
+            crate::theme::font(11.0),
             pal.weak,
         );
         x = g.left() - 10.0;
     }
     if let Some(w) = m.context_window {
         let label = fmt_tokens(w);
-        let g = p.layout_no_wrap(label.clone(), FontId::proportional(11.0), pal.text);
+        let g = p.layout_no_wrap(label.clone(), crate::theme::font(11.0), pal.text);
         let pill = egui::Rect::from_min_size(
             pos2(x - g.size().x - 12.0, mid - 9.0),
             vec2(g.size().x + 12.0, 18.0),
         );
-        p.rect_filled(pill, 9, pal.surface);
+        p.rect_filled(pill, theme::rad(6, 9), pal.surface);
         p.galley(pill.center() - g.size() / 2.0, g, pal.text);
         x = pill.left() - 10.0;
     }
@@ -905,7 +929,7 @@ fn model_row(
     let g = fitted(
         p,
         short_model_name(&m.name),
-        FontId::proportional(13.5),
+        crate::theme::font(13.5),
         if current { pal.text_strong } else { pal.text },
         limit - name_x,
     );
@@ -920,13 +944,25 @@ fn model_row(
         let g = fitted(
             p,
             &m.provider,
-            FontId::proportional(10.0),
-            pal.accent,
+            crate::theme::font(10.0),
+            if theme::neutral() {
+                pal.text
+            } else {
+                pal.accent
+            },
             (limit - name_x - 10.0).min(120.0),
         );
         let tag =
             egui::Rect::from_min_size(pos2(name_x, mid + 8.0 - 7.0), vec2(g.size().x + 10.0, 14.0));
-        p.rect_filled(tag, 7, pal.accent.gamma_multiply(0.16));
+        p.rect_filled(
+            tag,
+            theme::rad(5, 7),
+            if theme::neutral() {
+                pal.raised
+            } else {
+                pal.accent.gamma_multiply(0.16)
+            },
+        );
         p.galley(
             pos2(tag.left() + 5.0, tag.center().y - g.size().y / 2.0),
             g,
@@ -934,7 +970,7 @@ fn model_row(
         );
         id_x = tag.right() + 6.0;
     }
-    let g = fitted(p, &m.id, FontId::proportional(10.5), pal.weak, limit - id_x);
+    let g = fitted(p, &m.id, crate::theme::font(10.5), pal.weak, limit - id_x);
     p.galley(
         pos2(id_x, mid + 8.0 - g.size().y / 2.0),
         g,
@@ -952,10 +988,22 @@ fn model_row(
             Align2::CENTER_CENTER,
             ICON_STAR,
             19.0 + 2.0 * sh,
-            pal.accent,
+            if theme::neutral() {
+                pal.warn
+            } else {
+                pal.accent
+            },
         );
     } else {
-        let color = theme::mix(pal.weak.gamma_multiply(0.7), pal.accent, sh);
+        let color = theme::mix(
+            pal.weak.gamma_multiply(0.7),
+            if theme::neutral() {
+                pal.warn
+            } else {
+                pal.accent
+            },
+            sh,
+        );
         p.add(egui::Shape::closed_line(
             star_points(center, 8.0 + 1.5 * sh),
             Stroke::new(1.4, color),
@@ -989,7 +1037,7 @@ fn pills(ui: &mut Ui, options: &[String], selected: Option<&str>) -> Option<Stri
         for opt in options {
             let on = selected == Some(opt.as_str());
             let label = thinking_short(opt);
-            let font = FontId::proportional(12.0);
+            let font = crate::theme::font(12.0);
             let g = ui
                 .painter()
                 .layout_no_wrap(label.to_owned(), font, pal.text);
@@ -1000,7 +1048,15 @@ fn pills(ui: &mut Ui, options: &[String], selected: Option<&str>) -> Option<Stri
                 .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.08);
             let p = ui.painter();
             let (fill, fg, stroke) = if on {
-                (pal.accent.gamma_multiply(0.30), pal.text_strong, pal.accent)
+                (
+                    if theme::neutral() {
+                        pal.raised
+                    } else {
+                        pal.accent.gamma_multiply(0.30)
+                    },
+                    pal.text_strong,
+                    pal.accent,
+                )
             } else {
                 (
                     theme::mix(pal.surface, pal.raised, hov),
@@ -1008,8 +1064,14 @@ fn pills(ui: &mut Ui, options: &[String], selected: Option<&str>) -> Option<Stri
                     pal.stroke,
                 )
             };
-            p.rect(rect, 12, fill, Stroke::new(1.0, stroke), StrokeKind::Inside);
-            let g = p.layout_no_wrap(label.to_owned(), FontId::proportional(12.0), fg);
+            p.rect(
+                rect,
+                theme::rad(8, 12),
+                fill,
+                Stroke::new(1.0, stroke),
+                StrokeKind::Inside,
+            );
+            let g = p.layout_no_wrap(label.to_owned(), crate::theme::font(12.0), fg);
             p.galley(rect.center() - g.size() / 2.0, g, fg);
             if resp
                 .on_hover_text(format!("/effort {opt}"))

@@ -6,17 +6,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::icons::{
+    ICON_CHART_PIE, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_STOP,
+    ICON_COPY, ICON_DOWNLOAD, ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_GIT_BRANCH,
+    ICON_GIT_FORK, ICON_HANDSHAKE, ICON_LIST_TREE, ICON_MAP, ICON_NETWORK, ICON_PENCIL,
+    ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE, ICON_TERMINAL,
+};
 use deck_core::omp::ModelInfo;
 use deck_core::status::{GitInfo, SessionStatus};
 use egui::{
     Align, Align2, Color32, CursorIcon, Frame, Layout, Margin, Painter, Pos2, Rect, Response,
     RichText, Sense, Shape, Stroke, Ui, UiBuilder, pos2, vec2,
-};
-use egui_material_icons::icons::{
-    ICON_ACCOUNT_TREE, ICON_ALT_ROUTE, ICON_AUTO_AWESOME, ICON_CHECK_CIRCLE, ICON_COMPRESS,
-    ICON_CONTENT_COPY, ICON_DONUT_LARGE, ICON_DOWNLOAD, ICON_EDIT, ICON_ERROR, ICON_FOLDER,
-    ICON_FORK_RIGHT, ICON_HANDSHAKE, ICON_HUB, ICON_MAP, ICON_MORE_HORIZ, ICON_REPLAY, ICON_STOP,
-    ICON_STOP_CIRCLE, ICON_TERMINAL, ICON_UNFOLD_MORE,
 };
 
 use crate::agent_model::Counts;
@@ -582,6 +582,10 @@ fn text(s: &str, size: f32, color: Color32) -> egui::Label {
     egui::Label::new(RichText::new(s).size(size).color(color)).selectable(false)
 }
 
+fn chip_radius() -> u8 {
+    if theme::neutral() { 6 } else { 10 }
+}
+
 /// A rounded segment with a hover plate; `add` lays out its contents on one line. The response
 /// is registered after the contents, so it wins hit-testing and labels never swallow clicks.
 fn chip(ui: &mut Ui, id: &'static str, sense: Sense, add: impl FnOnce(&mut Ui)) -> Response {
@@ -605,7 +609,11 @@ fn chip(ui: &mut Ui, id: &'static str, sense: Sense, add: impl FnOnce(&mut Ui)) 
     if sense != Sense::hover() && r.hovered() {
         ui.painter().set(
             bg,
-            Shape::rect_filled(r.rect, 10, pal.raised.gamma_multiply(0.85)),
+            Shape::rect_filled(
+                r.rect,
+                chip_radius(),
+                theme::hover_fill(pal).gamma_multiply(0.85),
+            ),
         );
     }
     r
@@ -696,7 +704,7 @@ fn model_chip(
             ui.painter()
                 .layout_no_wrap(
                     thinking_short(l).to_owned(),
-                    egui::FontId::proportional(14.4),
+                    crate::theme::font(14.4),
                     pal.accent,
                 )
                 .size()
@@ -707,7 +715,7 @@ fn model_chip(
         let name_text = name.as_str();
         let name_nat = ui
             .painter()
-            .layout_no_wrap(name_text.to_owned(), egui::FontId::proportional(15.0), col)
+            .layout_no_wrap(name_text.to_owned(), crate::theme::font(15.0), col)
             .size()
             .x
             + 8.0;
@@ -745,7 +753,7 @@ fn model_chip(
             );
             ui.add(text(thinking_short(l), 14.4, pal.accent));
         }
-        ui.label(icon_text(ICON_UNFOLD_MORE, 16.8, pal.weak));
+        ui.label(icon_text(ICON_CHEVRONS_UP_DOWN, 16.8, pal.weak));
     });
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     let resp = if egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp)) {
@@ -798,7 +806,7 @@ fn git_chip(ui: &mut Ui, g: &GitView, out: &mut Vec<BarAction>) {
     let pal = Palette::of_ui(ui);
     let r = chip(ui, "git", Sense::hover(), |ui| {
         ui.label(icon_text(
-            ICON_ALT_ROUTE,
+            ICON_GIT_BRANCH,
             18.0,
             if g.dirty { pal.warn } else { pal.ok },
         ));
@@ -868,7 +876,7 @@ fn context_meter(ui: &mut Ui, v: &BarView) {
 /// The glyph of one count in the Agents chip.
 enum Glyph {
     Spinner,
-    Icon(egui_material_icons::MaterialIcon),
+    Icon(crate::icons::Icon),
 }
 
 /// `⟳ 2 · ✓ 5 · ✕ 1` — live counts of the active session's subagents; click toggles the hub.
@@ -912,21 +920,21 @@ fn agents_chip(ui: &mut Ui, v: &AgentsChip, out: &mut Vec<BarAction>) {
             seg(
                 ui,
                 c.aborted + c.interrupted,
-                Glyph::Icon(ICON_STOP_CIRCLE),
+                Glyph::Icon(ICON_CIRCLE_STOP),
                 pal.warn,
             );
-            seg(ui, c.failed, Glyph::Icon(ICON_ERROR), pal.danger);
-            seg(ui, c.done, Glyph::Icon(ICON_CHECK_CIRCLE), pal.ok);
+            seg(ui, c.failed, Glyph::Icon(ICON_CIRCLE_ALERT), pal.danger);
+            seg(ui, c.done, Glyph::Icon(ICON_CIRCLE_CHECK), pal.ok);
             seg(ui, c.running, Glyph::Spinner, pal.accent_b);
         }
-        ui.label(icon_text(ICON_HUB, 19.2, icon_color));
+        ui.label(icon_text(ICON_NETWORK, 19.2, icon_color));
     });
     if v.open {
         let p = ui.painter();
-        p.rect_filled(r.rect, 10, pal.accent.gamma_multiply(0.14));
+        p.rect_filled(r.rect, chip_radius(), pal.accent.gamma_multiply(0.14));
         p.rect_stroke(
             r.rect,
-            10,
+            chip_radius(),
             Stroke::new(1.0, pal.accent.gamma_multiply(0.55)),
             egui::StrokeKind::Inside,
         );
@@ -969,13 +977,13 @@ fn actions_row(ui: &mut Ui, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
     ui.add_space(6.0);
 
     // Added right → left, so this reads: Stop/Retry · Plan · Handoff · Compact ▾ · Fork · Tree · ⋯
-    let more = bar_button(ui, ICON_MORE_HORIZ, "More actions", true, None, false);
+    let more = bar_button(ui, ICON_ELLIPSIS, "More actions", true, None, false);
     theme::dropup_menu(&more, 220.0, |ui| overflow_menu(ui, c, out));
 
     let tree = Kind::Tree;
     if bar_button(
         ui,
-        ICON_ACCOUNT_TREE,
+        ICON_LIST_TREE,
         "Session tree (Ctrl+Shift+B)",
         session_actions::availability(tree, c).is_enabled(),
         reason(tree, c),
@@ -989,7 +997,7 @@ fn actions_row(ui: &mut Ui, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
     let fork = Kind::Fork;
     if bar_button(
         ui,
-        ICON_FORK_RIGHT,
+        ICON_GIT_FORK,
         "Fork into a new tab",
         session_actions::availability(fork, c).is_enabled(),
         reason(fork, c),
@@ -1002,7 +1010,7 @@ fn actions_row(ui: &mut Ui, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
 
     let compact = bar_button(
         ui,
-        ICON_COMPRESS,
+        ICON_FOLD_VERTICAL,
         "Compact context…",
         session_actions::availability(Kind::Compact, c).is_enabled(),
         reason(Kind::Compact, c),
@@ -1010,17 +1018,17 @@ fn actions_row(ui: &mut Ui, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
     );
     if session_actions::availability(Kind::Compact, c).is_enabled() {
         theme::dropup_menu(&compact, 210.0, |ui| {
-            if menu_item(ui, ICON_COMPRESS, "Compact", None, true, false).clicked() {
+            if menu_item(ui, ICON_FOLD_VERTICAL, "Compact", None, true, false).clicked() {
                 out.push(BarAction::Run(Action::Compact(CompactMode::Default)));
             }
-            if menu_item(ui, ICON_COMPRESS, "Compact (soft)", None, true, false).clicked() {
+            if menu_item(ui, ICON_FOLD_VERTICAL, "Compact (soft)", None, true, false).clicked() {
                 out.push(BarAction::Run(Action::Compact(CompactMode::Soft)));
             }
-            if menu_item(ui, ICON_COMPRESS, "Snapcompact", None, true, false).clicked() {
+            if menu_item(ui, ICON_FOLD_VERTICAL, "Snapcompact", None, true, false).clicked() {
                 out.push(BarAction::Run(Action::Compact(CompactMode::Snapcompact)));
             }
             ui.separator();
-            if menu_item(ui, ICON_EDIT, "Compact with focus…", None, true, false).clicked() {
+            if menu_item(ui, ICON_PENCIL, "Compact with focus…", None, true, false).clicked() {
                 out.push(BarAction::AskCompactFocus);
             }
         });
@@ -1054,7 +1062,7 @@ fn actions_row(ui: &mut Ui, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
     if session_actions::visible(Kind::Retry, c)
         && bar_button(
             ui,
-            ICON_REPLAY,
+            ICON_ROTATE_CCW,
             "Retry the failed turn",
             session_actions::availability(Kind::Retry, c).is_enabled(),
             reason(Kind::Retry, c),
@@ -1067,7 +1075,7 @@ fn actions_row(ui: &mut Ui, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
     if session_actions::visible(Kind::Stop, c)
         && bar_button(
             ui,
-            ICON_STOP,
+            ICON_SQUARE,
             "Stop the current turn (Esc)",
             true,
             None,
@@ -1100,7 +1108,7 @@ fn overflow_menu(ui: &mut Ui, c: &ActionCtx, out: &mut Vec<BarAction>) {
     };
     item(
         ui,
-        ICON_ACCOUNT_TREE,
+        ICON_LIST_TREE,
         "Session tree",
         Kind::Tree,
         BarAction::OpenTree,
@@ -1114,16 +1122,22 @@ fn overflow_menu(ui: &mut Ui, c: &ActionCtx, out: &mut Vec<BarAction>) {
     );
     item(
         ui,
-        ICON_DONUT_LARGE,
+        ICON_CHART_PIE,
         "Context usage",
         Kind::Context,
         BarAction::Run(Action::Context),
     );
     ui.separator();
-    item(ui, ICON_EDIT, "Rename…", Kind::Rename, BarAction::AskRename);
     item(
         ui,
-        ICON_AUTO_AWESOME,
+        ICON_PENCIL,
+        "Rename…",
+        Kind::Rename,
+        BarAction::AskRename,
+    );
+    item(
+        ui,
+        ICON_SPARKLES,
         "Auto-name",
         Kind::AutoName,
         BarAction::Run(Action::AutoName),
@@ -1131,7 +1145,7 @@ fn overflow_menu(ui: &mut Ui, c: &ActionCtx, out: &mut Vec<BarAction>) {
     ui.separator();
     item(
         ui,
-        ICON_CONTENT_COPY,
+        ICON_COPY,
         "Copy last response",
         Kind::CopyLast,
         BarAction::Run(Action::CopyLast),
@@ -1148,7 +1162,7 @@ fn overflow_menu(ui: &mut Ui, c: &ActionCtx, out: &mut Vec<BarAction>) {
 /// Compact icon button; disabled ones dim and explain why in the tooltip. `emphasis` tints it.
 fn bar_button(
     ui: &mut Ui,
-    icon: egui_material_icons::MaterialIcon,
+    icon: crate::icons::Icon,
     tooltip: &str,
     enabled: bool,
     disabled_reason: Option<&str>,
@@ -1174,7 +1188,11 @@ fn bar_button(
         (pal.weak.gamma_multiply(0.4), pal.weak.gamma_multiply(0.4))
     };
     let p = ui.painter();
-    p.rect_filled(rect, 10, pal.raised.gamma_multiply(0.9 * hov));
+    p.rect_filled(
+        rect,
+        chip_radius(),
+        theme::hover_fill(pal).gamma_multiply(0.9 * hov),
+    );
     paint_icon(
         p,
         rect.center(),
