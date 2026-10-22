@@ -34,8 +34,12 @@ pub const BAR_H: f32 = 41.0;
 const CHIP_H: f32 = 29.0;
 const PATH_CHARS: usize = 44;
 const CHIP_PAD: f32 = 7.0;
-/// The model chip is at least this wide even when the path chip is short.
-const MODEL_CHIP_FLOOR_W: f32 = 221.0;
+/// Horizontal space a chip adds around its content: both pads plus the one item gap measured
+/// on screen (so a chip asked to be N px wide really is N px wide).
+const CHIP_CHROME_W: f32 = 2.0 * CHIP_PAD + 6.0;
+/// The model chip is 1.3x the wider of the measured path chip and this baseline width.
+const MODEL_CHIP_BASE_W: f32 = 213.0;
+const MODEL_CHIP_SCALE: f32 = 1.3;
 const PIE_BOX: f32 = 18.0;
 const CARET_W: f32 = 16.8;
 
@@ -481,9 +485,8 @@ fn info_row(
     // The model chip is as wide as the (measured) path chip, but never takes over the bar.
     let widths = seg_widths(ui, v);
     let gap = ui.spacing().item_spacing.x;
-    let path_chip_w = (widths[2] - gap - 1.0).max(MODEL_CHIP_FLOOR_W);
-    let cap = (ui.available_width() * 0.52).max(195.0);
-    model_chip(ui, v, picker, input, (path_chip_w.min(cap), cap), out);
+    let (chip_w, cap) = model_chip_width(widths[2] - gap - 1.0, ui.available_width());
+    model_chip(ui, v, picker, input, (chip_w, cap), out);
 
     // Priority-based fit on measured widths: drop the least important segments first.
     let present = SEGS.map(|s| match s {
@@ -499,6 +502,14 @@ fn info_row(
             segment(ui, v, s, out);
         }
     }
+}
+
+/// Model chip `(width, cap)`: 1.3x the wider of the path chip and the baseline, capped at 52% of
+/// the bar so it never takes over a narrow bar.
+fn model_chip_width(path_chip_w: f32, bar_w: f32) -> (f32, f32) {
+    let cap = (bar_w * 0.52).max(195.0);
+    let want = path_chip_w.max(MODEL_CHIP_BASE_W) * MODEL_CHIP_SCALE;
+    (want.min(cap), cap)
 }
 
 /// Which segments fit `budget`, in priority order: the first present one that does not fit ends
@@ -700,8 +711,8 @@ fn model_chip(
             .size()
             .x
             + 8.0;
-        let inner_w = (min_w - 2.0 * CHIP_PAD)
-            .max((name_nat + spacing + right_w).min(max_w - 2.0 * CHIP_PAD))
+        let inner_w = (min_w - CHIP_CHROME_W)
+            .max((name_nat + spacing + right_w).min(max_w - CHIP_CHROME_W))
             .min(ui.available_width())
             .max(0.0);
         let name_w = (inner_w - right_w - spacing).max(0.0);
@@ -1347,6 +1358,26 @@ mod tests {
             }
             prev = now;
             w -= 5.0;
+        }
+    }
+
+    #[test]
+    fn model_chip_is_wide_but_capped_and_segments_still_fit_monotonically() {
+        assert!((model_chip_width(100.0, 1400.0).0 - 276.9).abs() < 0.1);
+        assert!((model_chip_width(300.0, 1400.0).0 - 390.0).abs() < 0.1);
+        assert_eq!(model_chip_width(300.0, 400.0).0, 208.0);
+        let widths = [60.0, 90.0, 300.0, 70.0, 80.0];
+        let all = [true; 5];
+        let mut prev = [true; 5];
+        let mut bar = 1400.0;
+        while bar >= 0.0 {
+            let (chip, _) = model_chip_width(widths[2], bar);
+            let now = fit_segments(&widths, &all, bar - chip - 6.0, 6.0);
+            for i in 0..5 {
+                assert!(prev[i] || !now[i], "segment {i} came back at {bar}px");
+            }
+            prev = now;
+            bar -= 5.0;
         }
     }
 
