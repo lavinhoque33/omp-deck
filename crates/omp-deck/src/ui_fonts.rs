@@ -1,7 +1,8 @@
 //! UI font setup. Neutral style: bundled Geist (variable, OFL) as the primary face of the
 //! [`NEUTRAL_FAMILY`] family. Neon style: Adwaita Sans (fallback Cantarell, Noto Sans) as the
-//! Proportional family. Both families share the system faces as glyph fallbacks, and the bundled
-//! Lucide icon font backs the `lucide` family (and is a Proportional/neutral fallback so glyphs in
+//! Proportional family. The Neutral family is rebuilt by [`finalize`] as Geist followed by the
+//! whole Proportional chain, so its glyph coverage is a superset of Neon's. The bundled
+//! Lucide icon font backs the `lucide` family (and is a Proportional fallback so glyphs in
 //! label strings render). Must run after `deck_term::install_fonts`, which replaces the whole
 //! definition set and owns the `term*` families.
 
@@ -35,9 +36,6 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         &["/usr/share/fonts/google-noto/NotoSans-Regular.ttf"],
     ),
 ];
-
-/// egui's built-in emoji/symbol faces, copied into the neutral family so it keeps their glyphs.
-const BUILTIN_FALLBACKS: &[&str] = &["NotoEmoji-Regular", "emoji-icon-font"];
 
 /// `fc-match` hit whose family really is `family` (fc-match always answers with *something*).
 fn fc_lookup(family: &str) -> Option<PathBuf> {
@@ -109,30 +107,11 @@ pub fn install(ctx: &Context, fonts: UiFonts) {
         ctx.add_font(FontInsert::new(
             &format!("ui-{i}"),
             FontData::from_owned(bytes),
-            vec![
-                InsertFontFamily {
-                    family: FontFamily::Proportional,
-                    priority,
-                },
-                InsertFontFamily {
-                    family: neutral_family(),
-                    priority: FontPriority::Lowest,
-                },
-            ],
+            vec![InsertFontFamily {
+                family: FontFamily::Proportional,
+                priority,
+            }],
         ));
-    }
-    let defaults = FontDefinitions::default();
-    for name in BUILTIN_FALLBACKS {
-        if let Some(data) = defaults.font_data.get(*name) {
-            ctx.add_font(FontInsert::new(
-                &format!("ui-neutral-{name}"),
-                data.as_ref().clone(),
-                vec![InsertFontFamily {
-                    family: neutral_family(),
-                    priority: FontPriority::Lowest,
-                }],
-            ));
-        }
     }
     let mut lucide = FontData::from_static(LUCIDE);
     lucide.tweak.y_offset_factor = 0.0;
@@ -145,13 +124,26 @@ pub fn install(ctx: &Context, fonts: UiFonts) {
                 priority: FontPriority::Lowest,
             },
             InsertFontFamily {
-                family: neutral_family(),
-                priority: FontPriority::Lowest,
-            },
-            InsertFontFamily {
                 family: FontFamily::Name(crate::icons::FONT_FAMILY.into()),
                 priority: FontPriority::Highest,
             },
         ],
     ));
+}
+
+/// Makes the Neutral family's coverage a superset of Proportional's: Geist first, then every
+/// Proportional face in order (system UI faces, egui's emoji faces, deck-term's symbol / CJK /
+/// color-emoji fallbacks, Lucide). Call once from the first frame, when the final definitions
+/// (after every queued `add_font`) are readable.
+pub fn finalize(ctx: &Context) {
+    let mut defs: FontDefinitions = ctx.fonts(|f| f.definitions().clone());
+    let mut chain = vec!["geist".to_owned()];
+    if let Some(prop) = defs.families.get(&FontFamily::Proportional) {
+        chain.extend(prop.iter().filter(|k| *k != "geist").cloned());
+    }
+    if defs.families.get(&neutral_family()) == Some(&chain) {
+        return;
+    }
+    defs.families.insert(neutral_family(), chain);
+    ctx.set_fonts(defs);
 }

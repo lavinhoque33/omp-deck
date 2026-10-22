@@ -242,6 +242,8 @@ pub struct App {
     /// Opens (sidebar, reopen) requested before the first tmux snapshot: attaching a canonical name
     /// blindly could land in a tmux session that now runs another file. Processed on arrival.
     deferred_opens: Vec<ClosedTab>,
+    /// The Neutral font family was rebuilt from the final definitions (first frame).
+    fonts_finalized: bool,
     /// Frames drawn since `frame_mark` (debug log `omp_deck::frames`, RUST_LOG=omp_deck::frames=debug).
     frame_count: u32,
     frame_mark: Instant,
@@ -462,6 +464,7 @@ impl App {
             popup: None,
             tree: None,
             tree_busy: None,
+            fonts_finalized: false,
             frame_count: 0,
             frame_mark: Instant::now(),
             repaint_causes: HashMap::new(),
@@ -2336,6 +2339,10 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if !self.fonts_finalized {
+            self.fonts_finalized = true;
+            ui_fonts::finalize(&ctx);
+        }
         self.count_frame(&ctx);
         self.handle_shortcuts(&ctx);
         self.drain_events(&ctx);
