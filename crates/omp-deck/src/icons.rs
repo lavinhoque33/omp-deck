@@ -34,6 +34,7 @@ impl Icon {
 }
 
 pub const ICON_A_LARGE_SMALL: Icon = Icon::new("\u{e587}");
+pub const ICON_ACTIVITY: Icon = Icon::new("\u{e038}");
 pub const ICON_ALIGN_LEFT: Icon = Icon::new("\u{e185}");
 pub const ICON_APP_WINDOW: Icon = Icon::new("\u{e426}");
 pub const ICON_ARROW_DOWN_TO_LINE: Icon = Icon::new("\u{e455}");
@@ -75,6 +76,7 @@ pub const ICON_FOLDER_OPEN: Icon = Icon::new("\u{e247}");
 pub const ICON_FOLDER_OUTPUT: Icon = Icon::new("\u{e337}");
 pub const ICON_FOLDER_PLUS: Icon = Icon::new("\u{e0d9}");
 pub const ICON_FOLDER_X: Icon = Icon::new("\u{e33e}");
+pub const ICON_GAUGE: Icon = Icon::new("\u{e1bf}");
 pub const ICON_GIT_BRANCH: Icon = Icon::new("\u{e0e2}");
 pub const ICON_GIT_FORK: Icon = Icon::new("\u{e28d}");
 pub const ICON_GLOBE: Icon = Icon::new("\u{e0e8}");

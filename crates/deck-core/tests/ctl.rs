@@ -383,3 +383,113 @@ fn drop_is_prompt_connected_or_not() {
     drop(client);
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
 }
+
+#[test]
+fn context_breakdown_is_parsed_and_absent_or_malformed_is_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = fake(tmp.path());
+    let client = CtlClient::spawn(tmp.path().to_path_buf(), || {});
+    let mut s = srv.accept();
+    say(&mut s, HELLO);
+    let with = |ctx: &str| {
+        let ctx = ctx.replace('\n', "");
+        format!(r#"{{"t":"agents","pid":9,"agents":[],"context":{ctx}}}"#)
+    };
+
+    say(
+        &mut s,
+        &with(
+            r#"{"model":"Fake One","contextWindow":50000,"usedTokens":1234,"anchored":true,
+                "categories":[{"id":"systemPrompt","label":"System prompt","tokens":2901},
+                              {"id":"messages","tokens":0},{"label":"no id","tokens":1}],
+                "autoCompactBuffer":16384,"freeTokens":32382,"thresholdTokens":33616,
+                "snapcompactSaved":null,
+                "tools":[{"name":"task","tokens":881},{"name":"eval","tokens":653},{"oops":1}],
+                "skills":3,"computedAt":1790000000000,"futureField":{"x":1}}"#,
+        ),
+    );
+    wait_for("context snapshot", || {
+        client.latest().is_some_and(|s| s.context.is_some())
+    });
+    let ctx = client.latest().unwrap().context.clone().unwrap();
+    assert_eq!(ctx.model.as_deref(), Some("Fake One"));
+    assert_eq!(
+        (ctx.context_window, ctx.used_tokens, ctx.anchored),
+        (50000, 1234, true)
+    );
+    let cats: Vec<_> = ctx
+        .categories
+        .iter()
+        .map(|c| (c.id.as_str(), c.label.as_str(), c.tokens))
+        .collect();
+    assert_eq!(
+        cats,
+        [
+            ("systemPrompt", "System prompt", 2901),
+            ("messages", "messages", 0)
+        ],
+        "label defaults to the id; a category without an id is skipped"
+    );
+    assert_eq!(
+        (
+            ctx.auto_compact_buffer,
+            ctx.free_tokens,
+            ctx.threshold_tokens,
+            ctx.snapcompact_saved
+        ),
+        (16384, 32382, Some(33616), None)
+    );
+    assert_eq!(
+        ctx.tools,
+        [("task".to_string(), 881), ("eval".to_string(), 653)]
+    );
+    assert_eq!((ctx.skills, ctx.computed_at_ms), (3, 1_790_000_000_000));
+
+    // threshold null (auto-compaction off) stays None
+    say(
+        &mut s,
+        &with(r#"{"contextWindow":1000,"usedTokens":10,"thresholdTokens":null}"#),
+    );
+    wait_for("minimal context", || {
+        client
+            .latest()
+            .and_then(|s| s.context.as_ref().map(|c| c.context_window))
+            == Some(1000)
+    });
+    assert_eq!(
+        client
+            .latest()
+            .unwrap()
+            .context
+            .as_ref()
+            .unwrap()
+            .threshold_tokens,
+        None
+    );
+
+    // missing required numbers → no context, but the snapshot itself survives
+    say(&mut s, &with(r#"{"model":"x"}"#));
+    wait_for("malformed context", || {
+        client.latest().is_some_and(|s| s.context.is_none())
+    });
+    assert_eq!(client.latest().unwrap().pid, 9);
+
+    // an older extension sends no field at all; `null` means unavailable
+    say(&mut s, &with(r#"{"contextWindow":5,"usedTokens":1}"#));
+    wait_for("context again", || {
+        client.latest().is_some_and(|s| s.context.is_some())
+    });
+    say(&mut s, &snapshot_line(9, ""));
+    wait_for("older extension", || {
+        client.latest().is_some_and(|s| s.context.is_none())
+    });
+    say(&mut s, &with("null"));
+    say(&mut s, &with(r#"{"contextWindow":5,"usedTokens":1}"#));
+    wait_for("context after null", || {
+        client.latest().is_some_and(|s| s.context.is_some())
+    });
+    say(&mut s, &with("null"));
+    wait_for("null context", || {
+        client.latest().is_some_and(|s| s.context.is_none())
+    });
+}

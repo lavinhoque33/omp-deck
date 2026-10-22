@@ -946,3 +946,72 @@ tuned for contrast on white (zinc/tailwind-600 family). OSC 10/11/4 replies foll
   User toggles set an in-memory override; activating a tab clears the override of its group (it opens);
   other groups without an override collapse. Collapse-all / Expand-all set overrides for every group. Not
   persisted (startup: everything collapsed except the restored active tab's group).
+
+## Wave 9: native Usage view, detailed context tooltip
+
+Facts: `docs/notes/omp-usage-context.md` (omp 18.12.6 `/usage` + `/context` internals, `omp usage --json`
+shape, stats.db schema, extension imports, timings).
+
+### deck-core
+
+- `deck_core::usage` (new module; workspace dep `rusqlite` 0.40 `bundled`, read-only opens only):
+  - Serde mirror of `omp usage --json` (`raw` ignored, unknown fields ignored, every optional field
+    `Option`/default): `UsageSnapshot { generated_at_ms: i64, reports: Vec<UsageReport>,
+    accounts_without_usage: Vec<UnavailableAccount>, disabled_credentials: Vec<UnavailableAccount> }`,
+    `UsageReport { provider, fetched_at_ms, limits: Vec<UsageLimit>, reset_credits: Option<ResetCredits>,
+    notes: Vec<String>, metadata: UsageMetadata { email, account_id, org_name, plan_type, tier, project_id } }`,
+    `UsageLimit { id, label, scope: UsageScope { account_id, model_id, tier, window_id, shared }, window:
+    Option<UsageWindow { id, label, duration_ms, resets_at_ms, reset_label }>, amount: UsageAmount { used,
+    limit, remaining, used_fraction, remaining_fraction, unit: String }, status: LimitStatus
+    { Ok, Warning, Exhausted, Unknown }, notes }`, `ResetCredits { available_count, redeemable_count,
+    cooldown_until, credits: Vec<ResetCredit { title, remaining_count, usable, expires_at }> }`,
+    `UnavailableAccount { provider, label: Option<String>, reason: Option<String> }`.
+  - `fetch_usage(omp: &OmpCli-or-program, invalidate: bool, timeout: Duration) -> Result<UsageSnapshot, UsageError>`:
+    runs `omp usage --json --no-extensions` (preceded by `omp usage invalidate` when `invalidate`), kills
+    on timeout (default 30 s), typed errors (spawn / timeout / exit status + stderr tail / parse).
+    Never runs `usage reset`.
+  - `provider_cards(&UsageSnapshot, now_ms) -> Vec<ProviderCard>` — pure port of omp's
+    `buildProviderCards`: group windows by `label|window.id`, mean fraction across accounts,
+    `resets_in_ms` from the fullest window, window tag (`5h`/`7d`/`mo`…) only when labels collide,
+    effective status (explicit, else used ≥1 exhausted / ≥0.9 warning / ok), `idle` when every window
+    < 0.5 % used and no credits/notes, sort active by max fraction desc then name, display names
+    (`anthropic` → `Anthropic`, `openai-codex` → `Codex`, …), accounts count + unavailable account labels,
+    reset-credit summary text. `tightest(&[ProviderCard]) -> Option<(provider name, window label, used_fraction, status)>`.
+  - `stats_db_path() -> PathBuf` (`~/$PI_CONFIG_DIR/stats.db`, `PI_CONFIG_DIR` default `.omp`).
+  - `activity(db, days) -> Result<Activity, UsageError>`: read-only open (`SQLITE_OPEN_READ_ONLY`, WAL
+    tolerated, busy timeout); per local day `cost, requests, tokens` (omp's query) and per model
+    `{provider, model, cost, requests, tokens}` for the last 30 days. Missing db → empty `Activity`.
+  - `Heatmap::build(&Activity, today, weeks = 53)`: 7×weeks cells `Option<u8>` 0–4 (`ceil(sqrt(v/max)·4)`,
+    value = cost if any cost else requests), month labels, totals (past year cost/requests/tokens),
+    last-30-days totals + daily series, busiest day, active days, longest streak.
+- `deck_core::ctl`: `LiveSnapshot.context: Option<ContextBreakdown>` (absent from older extensions →
+  `None`). `ContextBreakdown { model: Option<String> /* display name */, context_window: u64,
+  used_tokens: u64, anchored: bool, categories: Vec<ContextCategory { id, label, tokens }>,
+  auto_compact_buffer: u64, free_tokens: u64, threshold_tokens: Option<u64>, snapcompact_saved: Option<u64>,
+  tools: Vec<(String, u64)> /* per-tool schema tokens, desc */, skills: u32, computed_at_ms: i64 }`.
+  Extension (`ompdeck-ctl.ts`) computes it with `computeSessionContextBreakdown(session,
+  {snapcompactSavings:true})` (+ per-tool schema tokens) on `session_start`, `session_switch`,
+  `agent_end`, `turn_end`, model change, and caches it; snapshots carry the cached value (no model blob).
+  Any failure → field omitted.
+
+### omp-deck
+
+- Usage state owned by the app: background worker runs `fetch_usage` ~3 s after startup, every 5 min,
+  when the Usage view opens and data is > 60 s old, and on manual refresh (`invalidate = true`); and
+  `activity` when the view opens (≥ 10 min apart). UI thread never blocks.
+- Status bar **usage chip** (gauge icon + tightest `NN% left`, coloured by status; dropped first when
+  narrow; hidden when there are no reports). Hover: compact per-provider cards (bars = remaining,
+  `resets in …`). Click, ⋯ menu "Usage…", app menu, Ctrl+Shift+U → **Usage view**.
+- **Usage view** (modal like the session tree): header "Usage" + "Updated Xs ago" + refresh;
+  tabs **Overview** (stats strip: Tightest quota, Past year, Last 30 days + sparkline, Busiest day;
+  provider cards with remaining bars, `NN% left`, `resets in`, resets banked, unavailable accounts,
+  "untouched: …" footnote; activity heatmap 53×7 with month labels + "N active days · longest streak M
+  days") and **Details** (per provider table Limit | Account | Left | Resets; top models last 30 days).
+  Empty states: no accounts (hint `omp /login`), fetch error inline with Retry, omp missing.
+- **Context tooltip**: rich hover on the status-bar context chip: model + window header,
+  `used / window (pct)` (+ "estimated" when not anchored), stacked category meter with the
+  auto-compact threshold mark, legend rows (swatch, label, tokens, % of window) for categories, free
+  space, autocompact buffer, "N left before auto-compaction at P %" / "past auto-compaction", snapcompact
+  savings, top tool schemas (≤ 8 + "N more"), skills count. Without a breakdown (no live control /
+  old extension): current numbers + note that the full breakdown needs live control.
+- Both styles (Neutral default, Neon) and Compact/Comfortable density; lucide icons; no per-frame allocation.

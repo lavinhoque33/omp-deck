@@ -641,7 +641,7 @@ impl Omp {
         &self.program
     }
 
-    fn command(&self, args: &[&std::ffi::OsStr]) -> Command {
+    pub(crate) fn command(&self, args: &[&std::ffi::OsStr]) -> Command {
         let mut c = Command::new(&self.program);
         c.args(args)
             .current_dir("/")

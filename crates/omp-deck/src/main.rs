@@ -11,6 +11,7 @@ mod clipboard_bridge;
 mod composer;
 mod config_writer;
 mod confirm;
+mod ctx_tip;
 mod folder_scope;
 mod icons;
 mod inject;
@@ -37,6 +38,9 @@ mod tree_layout;
 mod tree_view;
 mod ui_fonts;
 mod update;
+mod usage_fmt;
+mod usage_state;
+mod usage_view;
 mod widgets;
 
 use anyhow::anyhow;

@@ -60,6 +60,7 @@ pub enum BarAction {
     OpenSettings,
     Reopen,
     Refresh,
+    OpenUsage,
     FontLarger,
     FontSmaller,
     FontReset,
@@ -445,6 +446,18 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
         }
         if menu_item(ui, ICON_REFRESH_CW, "Refresh sessions", None, true, false).clicked() {
             pick(ui, &mut action, BarAction::Refresh);
+        }
+        if menu_item(
+            ui,
+            crate::icons::ICON_GAUGE,
+            "Usage…",
+            Some("Ctrl+Shift+U"),
+            true,
+            false,
+        )
+        .clicked()
+        {
+            pick(ui, &mut action, BarAction::OpenUsage);
         }
         if let Some(o) = &input.omp {
             let checking = *o.state == UpdateState::Checking;

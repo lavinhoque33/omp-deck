@@ -18,7 +18,11 @@ embedded, fully interactive terminal backed by tmux, so closing a tab or the who
 - **Terminal fidelity**: truecolor, wide/emoji cells, mouse reporting, bracketed paste, OSC 52 clipboard,
   clickable hyperlinks, kitty CSI-u / modifyOtherKeys key encoding.
 - **Session status bar**: model, thinking effort, path, git state, context meter, tokens and cost, plus a
-  model picker and actions (handoff, compact, fork, rename, plan, retry, stop, export).
+  model picker and actions (handoff, compact, fork, rename, plan, retry, stop, export). Hovering the
+  context meter shows omp's `/context` breakdown (system prompt, tools, skills, messages, free space,
+  auto-compact buffer, per-tool schema sizes) for tabs running with live control.
+- **Usage**: omp's `/usage` as a native view (Ctrl+Shift+U or the status-bar usage chip): remaining quota
+  per provider and window with reset times, a year of activity as a heatmap, and top models by cost.
 - **Agent hub and session tree**: browse subagent transcripts and the session tree, fork or navigate from a node.
 - **omp updates and settings**: update check badge, update actions, and a searchable editor for every `omp config` key.
 - **Per-folder mode**: scope the sidebar to a single project folder.

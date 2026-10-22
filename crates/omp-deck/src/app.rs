@@ -52,6 +52,8 @@ use crate::toast::{ToastAction, ToastClick, ToastKind, Toasts};
 use crate::transfer::{self, FolderDialog, FolderOutcome, TransferKind};
 use crate::ui_fonts;
 use crate::update::UpdateTracker;
+use crate::usage_state::{Usage, UsageEvent};
+use crate::usage_view;
 use crate::widgets::{empty_state, icon_text};
 
 mod agents;
@@ -59,6 +61,7 @@ mod bar;
 mod ctl;
 mod spawn;
 mod tree;
+mod usage;
 
 use spawn::{Focus, Post, SpawnReq};
 
@@ -122,6 +125,8 @@ enum AppEvent {
     SpawnPrepared(spawn::Prepared),
     /// A headless fork from the session tree finished: the new session file.
     TreeForked(Result<PathBuf, String>),
+    /// A usage fetch / `stats.db` read finished.
+    Usage(UsageEvent),
 }
 
 /// A modal question awaiting the user's answer, with what to do on "yes".
@@ -258,6 +263,10 @@ pub struct App {
     popup: Option<PopupState>,
     // Wave 6: session tree.
     tree: Option<tree::TreeUi>,
+    // Wave 9: Usage view.
+    usage: Usage,
+    usage_open: bool,
+    usage_ui: usage_view::ViewState,
     tree_busy: Option<tree::TreeBusy>,
     // Wave 5: live subagent control.
     /// The installed control extension every omp launch loads.
@@ -393,6 +402,7 @@ impl App {
             });
         }
 
+        let usage = Usage::new(omp.is_some(), Instant::now());
         let mut app = App {
             ctx,
             root_exists: root.exists(),
@@ -463,6 +473,9 @@ impl App {
             hub: HubState::default(),
             popup: None,
             tree: None,
+            usage,
+            usage_open: false,
+            usage_ui: usage_view::ViewState::default(),
             tree_busy: None,
             fonts_finalized: false,
             frame_count: 0,
@@ -1077,6 +1090,7 @@ impl App {
         let hub_available = self.active_session_tab();
         // Most specific first (egui ignores extra Shift/Alt when matching).
         let tree_key = (hub_available || self.tree.is_some()) && self.tree_shortcut(ctx);
+        let usage_key = self.usage_shortcut(ctx);
         let (reopen, prev, next, bigger, smaller, reset, hub) = ctx.input_mut(|i| {
             (
                 i.consume_key(ctrl_shift, Key::T),
@@ -1096,6 +1110,9 @@ impl App {
         }
         if tree_key {
             self.toggle_tree();
+        }
+        if usage_key {
+            self.toggle_usage();
         }
         if reopen {
             self.reopen_closed();
@@ -1134,6 +1151,7 @@ impl App {
                 }
                 AppEvent::SpawnPrepared(p) => self.on_spawn_prepared(p),
                 AppEvent::TreeForked(r) => self.on_tree_forked(r),
+                AppEvent::Usage(u) => self.on_usage_event(u),
             }
         }
     }
@@ -1184,6 +1202,7 @@ impl App {
             BarAction::Refresh => self.refresh_sessions(),
             BarAction::FontLarger => self.set_font_size(self.cfg.font_size + 1.0),
             BarAction::FontSmaller => self.set_font_size(self.cfg.font_size - 1.0),
+            BarAction::OpenUsage => self.open_usage(),
             BarAction::FontReset => self.set_font_size(DEFAULT_FONT),
             BarAction::SetTheme(t) => self.set_theme(t),
             BarAction::SetNativeDecorations(v) => self.set_native_decorations(v),
@@ -2379,6 +2398,7 @@ impl eframe::App for App {
             && self.dialog.is_none()
             && self.popup.is_none()
             && self.tree.is_none()
+            && !self.usage_open
             && !egui::Popup::is_any_open(&ctx)
             && ctx.memory(|m| m.focused()).is_none()
         {
@@ -2389,6 +2409,7 @@ impl eframe::App for App {
         self.show_bar(ui, maximized);
         self.show_banners(ui);
         self.drive_status(&ctx);
+        self.drive_usage(&ctx);
         self.drive_agents();
         self.show_status_bar(ui);
         self.show_sidebar(ui, &snap);
@@ -2396,6 +2417,7 @@ impl eframe::App for App {
         self.show_central(ui);
         self.show_agent_popup(&ctx);
         self.show_tree(&ctx);
+        self.show_usage(&ctx);
         self.show_confirm(&ctx);
         self.show_action_dialog(&ctx);
         self.show_folder_dialog(&ctx);

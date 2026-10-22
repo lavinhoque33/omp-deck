@@ -13,3 +13,5 @@ thiserror.workspace = true
 log.workspace = true
 tempfile.workspace = true
 memchr = "2"
+libc = "0.2"
+rusqlite.workspace = true

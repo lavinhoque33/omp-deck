@@ -6,12 +6,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::icons::ICON_GAUGE;
 use crate::icons::{
     ICON_CHART_PIE, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_STOP,
     ICON_COPY, ICON_DOWNLOAD, ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_GIT_BRANCH,
     ICON_GIT_FORK, ICON_HANDSHAKE, ICON_LIST_TREE, ICON_MAP, ICON_NETWORK, ICON_PENCIL,
     ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE, ICON_TERMINAL,
 };
+use deck_core::ctl::ContextBreakdown;
 use deck_core::omp::ModelInfo;
 use deck_core::status::{GitInfo, SessionStatus};
 use egui::{
@@ -20,6 +22,9 @@ use egui::{
 };
 
 use crate::agent_model::Counts;
+use crate::ctx_tip::{self, CtxTip};
+use crate::usage_state::Summary;
+use crate::usage_view;
 
 use crate::model_picker::{self, ModelsCache, Pending, PickerAction, PickerInput, PickerState};
 use crate::session_actions::{self, Action, ActionCtx, Availability, CompactMode, Kind};
@@ -86,6 +91,13 @@ pub struct BarView {
     pub ctx_frac: Option<f32>,
     pub ctx_level: Option<ContextLevel>,
     pub ctx_tip: String,
+    /// The live `/context` breakdown (keyed by what it was computed from), formatted once.
+    ctx_detail: Option<((i64, u64, u64), Arc<CtxTip>)>,
+    /// The jsonl view of the context (last reply's prompt tokens, model window): the chip falls
+    /// back to it when no live breakdown exists.
+    ctx_jsonl: (Option<u64>, Option<u64>),
+    /// Quota summary behind the usage chip; `None` hides the chip.
+    usage: Option<Arc<Summary>>,
 
     pub tokens_in: String,
     pub tokens_out: String,
@@ -113,6 +125,48 @@ impl BarView {
             self.defaults = defaults.clone();
             self.built = false;
         }
+    }
+
+    /// The usage chip's data; a new summary changes the chip's width, so it bumps `rev`.
+    pub fn set_usage(&mut self, summary: Option<&Arc<Summary>>) {
+        let same = match (&self.usage, summary) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.usage = summary.cloned();
+            self.rev += 1;
+        }
+    }
+
+    /// The live context breakdown behind the context tooltip (`None`: no live control, or an
+    /// older extension that does not send one).
+    pub fn set_context(&mut self, breakdown: Option<&ContextBreakdown>) {
+        let Some(b) = breakdown else {
+            if self.ctx_detail.take().is_some() {
+                self.apply_ctx();
+            }
+            return;
+        };
+        let key = (b.computed_at_ms, b.used_tokens, b.context_window);
+        if self.ctx_detail.as_ref().is_none_or(|(k, _)| *k != key) {
+            self.ctx_detail = Some((key, Arc::new(CtxTip::build(b))));
+            self.apply_ctx();
+        }
+    }
+
+    /// Chip label/fraction/level: the live breakdown's numbers when present (so chip and tooltip
+    /// agree), else the jsonl ones.
+    fn apply_ctx(&mut self) {
+        let (tokens, window) =
+            chip_numbers(self.ctx_detail.as_ref().map(|(k, _)| *k), self.ctx_jsonl);
+        self.ctx_label = context_label(tokens, window);
+        let pct = context_percent(tokens, window);
+        self.ctx_frac = pct.map(|p| (p / 100.0).clamp(0.0, 1.0) as f32);
+        self.ctx_level = pct.zip(window).map(|(p, w)| context_level(p, w));
+        self.ctx_tip = context_tooltip(tokens, window, pct);
+        self.rev += 1;
     }
 
     /// Rebuild when the snapshot (by identity) or the catalog changed; true when it did.
@@ -189,11 +243,8 @@ impl BarView {
         self.git = s.git.as_ref().map(git_view);
 
         let window = info.and_then(|i| i.context_window);
-        self.ctx_label = context_label(st.context_tokens, window);
-        let pct = context_percent(st.context_tokens, window);
-        self.ctx_frac = pct.map(|p| (p / 100.0).clamp(0.0, 1.0) as f32);
-        self.ctx_level = pct.zip(window).map(|(p, w)| context_level(p, w));
-        self.ctx_tip = context_tooltip(st.context_tokens, window, pct);
+        self.ctx_jsonl = (st.context_tokens, window);
+        self.apply_ctx();
 
         self.tokens_in = fmt_tokens(st.input_tokens);
         self.tokens_out = fmt_tokens(st.output_tokens);
@@ -309,6 +360,18 @@ fn model_tooltip(
     t
 }
 
+/// What the chip shows: the live breakdown's `(computed_at, used_tokens, context_window)` when
+/// it has a window, else the jsonl numbers.
+fn chip_numbers(
+    live: Option<(i64, u64, u64)>,
+    jsonl: (Option<u64>, Option<u64>),
+) -> (Option<u64>, Option<u64>) {
+    match live {
+        Some((_, used, window)) if window > 0 => (Some(used), Some(window)),
+        _ => jsonl,
+    }
+}
+
 fn context_tooltip(tokens: Option<u64>, window: Option<u64>, pct: Option<f64>) -> String {
     match (tokens, window, pct) {
         (Some(t), Some(w), Some(p)) => format!(
@@ -348,6 +411,7 @@ pub enum BarAction {
     OpenUrl(String),
     ToggleAgentHub,
     OpenTree,
+    OpenUsage,
 }
 
 pub struct BarInput<'a> {
@@ -428,16 +492,24 @@ enum Seg {
     Path,
     Cost,
     Tokens,
+    Usage,
 }
 
-const SEGS: [Seg; 5] = [Seg::Ctx, Seg::Git, Seg::Path, Seg::Cost, Seg::Tokens];
+const SEGS: [Seg; 6] = [
+    Seg::Ctx,
+    Seg::Git,
+    Seg::Path,
+    Seg::Cost,
+    Seg::Tokens,
+    Seg::Usage,
+];
 
 /// Real widths (divider + chip, without the spacing before them) of every segment for one view
 /// revision and pixel density.
 #[derive(Clone, Copy)]
 struct SegWidths {
     key: (u64, u32),
-    w: [f32; 5],
+    w: [f32; 6],
 }
 
 /// Lays `f` out once in an invisible child and returns the width it took.
@@ -454,7 +526,7 @@ fn measure(ui: &mut Ui, f: impl FnOnce(&mut Ui)) -> f32 {
     child.min_rect().width()
 }
 
-fn seg_widths(ui: &mut Ui, v: &BarView) -> [f32; 5] {
+fn seg_widths(ui: &mut Ui, v: &BarView) -> [f32; 6] {
     let key = (v.rev, ui.ctx().pixels_per_point().to_bits());
     let id = ui.scope_id().with("seg-widths");
     if let Some(c) = ui.data(|d| d.get_temp::<SegWidths>(id))
@@ -462,7 +534,7 @@ fn seg_widths(ui: &mut Ui, v: &BarView) -> [f32; 5] {
     {
         return c.w;
     }
-    let mut w = [0.0; 5];
+    let mut w = [0.0; 6];
     let mut sink = Vec::new();
     for (i, s) in SEGS.into_iter().enumerate() {
         w[i] = measure(ui, |ui| segment(ui, v, s, &mut sink));
@@ -493,11 +565,19 @@ fn info_row(
         Seg::Git => v.git.is_some(),
         Seg::Cost => v.show_cost,
         Seg::Tokens => v.show_tokens,
+        Seg::Usage => v.usage.as_ref().is_some_and(|u| u.chip.is_some()),
         Seg::Ctx | Seg::Path => true,
     });
     let shown = fit_segments(&widths, &present, ui.available_width() - gap, gap);
-    // Drawn in reading order: path, git, ctx, tokens, cost.
-    for s in [Seg::Path, Seg::Git, Seg::Ctx, Seg::Tokens, Seg::Cost] {
+    // Drawn in reading order: path, git, ctx, tokens, cost, usage.
+    for s in [
+        Seg::Path,
+        Seg::Git,
+        Seg::Ctx,
+        Seg::Tokens,
+        Seg::Cost,
+        Seg::Usage,
+    ] {
         if shown[SEGS.iter().position(|x| *x == s).unwrap_or(0)] {
             segment(ui, v, s, out);
         }
@@ -514,9 +594,14 @@ fn model_chip_width(path_chip_w: f32, bar_w: f32) -> (f32, f32) {
 
 /// Which segments fit `budget`, in priority order: the first present one that does not fit ends
 /// the list, so a narrower bar never shows a segment a wider one dropped.
-fn fit_segments(widths: &[f32; 5], present: &[bool; 5], mut budget: f32, gap: f32) -> [bool; 5] {
-    let mut shown = [false; 5];
-    for i in 0..SEGS.len() {
+fn fit_segments<const N: usize>(
+    widths: &[f32; N],
+    present: &[bool; N],
+    mut budget: f32,
+    gap: f32,
+) -> [bool; N] {
+    let mut shown = [false; N];
+    for i in 0..N {
         if !present[i] {
             continue;
         }
@@ -574,6 +659,27 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
                 ui.label(RichText::new(&v.cost).size(14.4).color(pal.ok));
             })
             .on_hover_text(&v.cost_tip);
+        }
+        Seg::Usage => {
+            if let Some(u) = &v.usage
+                && let Some(c) = &u.chip
+            {
+                divider(ui);
+                let color = match c.status {
+                    deck_core::usage::LimitStatus::Ok => pal.text,
+                    s => usage_view::status_color(pal, s),
+                };
+                let r = chip(ui, "usage", Sense::click(), |ui| {
+                    ui.label(icon_text(ICON_GAUGE, 15.6, pal.weak));
+                    ui.add(text(&c.text, 14.4, color));
+                });
+                let r = r
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_ui(|ui| usage_view::hover_ui(ui, u));
+                if r.clicked() {
+                    out.push(BarAction::OpenUsage);
+                }
+            }
         }
     }
 }
@@ -845,14 +951,19 @@ fn git_chip(ui: &mut Ui, g: &GitView, out: &mut Vec<BarAction>) {
     }
 }
 
-fn context_meter(ui: &mut Ui, v: &BarView) {
-    let pal = Palette::of_ui(ui);
-    let color = match v.ctx_level {
+/// Colour of the context meter / label at an escalation level.
+pub(crate) fn level_color(pal: &Palette, level: Option<ContextLevel>) -> Color32 {
+    match level {
         None | Some(ContextLevel::Normal) => pal.accent,
         Some(ContextLevel::Warn) => pal.warn,
         Some(ContextLevel::High) => theme::mix(pal.warn, pal.danger, 0.5),
         Some(ContextLevel::Critical) => pal.danger,
-    };
+    }
+}
+
+fn context_meter(ui: &mut Ui, v: &BarView) {
+    let pal = Palette::of_ui(ui);
+    let color = level_color(pal, v.ctx_level);
     chip(ui, "ctx", Sense::hover(), |ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(81.0, 16.8), Sense::hover());
         let bar = Rect::from_center_size(rect.center(), vec2(65.0, 5.0));
@@ -870,7 +981,15 @@ fn context_meter(ui: &mut Ui, v: &BarView) {
         };
         ui.add(text(&v.ctx_label, 14.4, label_color));
     })
-    .on_hover_text(&v.ctx_tip);
+    .on_hover_ui(|ui| match &v.ctx_detail {
+        Some((_, tip)) => ctx_tip::show(ui, tip),
+        None => {
+            ui.set_max_width(320.0);
+            ui.label(&v.ctx_tip);
+            ui.add_space(2.0);
+            ui.label(RichText::new(ctx_tip::NEEDS_LIVE).small().color(pal.weak));
+        }
+    });
 }
 
 /// The glyph of one count in the Agents chip.
@@ -1157,6 +1276,10 @@ fn overflow_menu(ui: &mut Ui, c: &ActionCtx, out: &mut Vec<BarAction>) {
         Kind::Export,
         BarAction::Run(Action::ExportHtml),
     );
+    ui.separator();
+    if menu_item(ui, ICON_GAUGE, "Usage…", Some("Ctrl+Shift+U"), true, false).clicked() {
+        out.push(BarAction::OpenUsage);
+    }
 }
 
 /// Compact icon button; disabled ones dim and explain why in the tooltip. `emphasis` tints it.
@@ -1290,6 +1413,38 @@ mod tests {
         );
         assert!(g.dirty);
         assert!(v.path_full.ends_with("proj"));
+    }
+
+    #[test]
+    fn chip_follows_the_live_breakdown_and_falls_back_to_jsonl() {
+        use deck_core::ctl::ContextBreakdown;
+        let live = ContextBreakdown {
+            model: None,
+            context_window: 50_000,
+            used_tokens: 1_900,
+            anchored: false,
+            categories: Vec::new(),
+            auto_compact_buffer: 0,
+            free_tokens: 0,
+            threshold_tokens: None,
+            snapcompact_saved: None,
+            tools: Vec::new(),
+            skills: 0,
+            computed_at_ms: 1,
+        };
+        let mut v = BarView::default();
+        let snap = Arc::new(status());
+        v.update(Some(&snap), Path::new("/x"), &catalog());
+        assert_eq!(v.ctx_label, "17.3%/1M");
+        v.set_context(Some(&live));
+        assert_eq!(v.ctx_label, "3.8%/50K");
+        assert_eq!(v.ctx_level, Some(ContextLevel::Normal));
+        // A rebuild keeps following the live numbers.
+        let newer = Arc::new(status());
+        v.update(Some(&newer), Path::new("/x"), &catalog());
+        assert_eq!(v.ctx_label, "3.8%/50K");
+        v.set_context(None);
+        assert_eq!(v.ctx_label, "17.3%/1M");
     }
 
     #[test]

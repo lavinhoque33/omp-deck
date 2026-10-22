@@ -418,6 +418,39 @@ pub struct LiveSnapshot {
     /// The main session's in-memory leaf entry id (`sessionManager.getLeafId()`).
     pub leaf: Option<String>,
     pub agents: Vec<LiveAgent>,
+    /// The main session's `/context` breakdown; `None` from older extensions or on any failure.
+    pub context: Option<ContextBreakdown>,
+}
+
+/// One row of the `/context` category meter.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextCategory {
+    /// omp's id: `systemPrompt`, `systemTools`, `systemContext`, `skills`, `messages`.
+    pub id: String,
+    pub label: String,
+    pub tokens: u64,
+}
+
+/// omp's `computeSessionContextBreakdown` (what `/context` shows) plus per-tool schema tokens.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextBreakdown {
+    /// Model display name.
+    pub model: Option<String>,
+    pub context_window: u64,
+    /// Provider-anchored total; not the sum of the categories.
+    pub used_tokens: u64,
+    /// True when `used_tokens` comes from the last assistant message's reported usage.
+    pub anchored: bool,
+    pub categories: Vec<ContextCategory>,
+    pub auto_compact_buffer: u64,
+    pub free_tokens: u64,
+    /// Absolute token count at which auto-compaction triggers; `None` when it is off.
+    pub threshold_tokens: Option<u64>,
+    pub snapcompact_saved: Option<u64>,
+    /// Per-tool schema tokens, descending.
+    pub tools: Vec<(String, u64)>,
+    pub skills: u32,
+    pub computed_at_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -491,6 +524,86 @@ struct WireSnapshot {
     leaf: Option<String>,
     #[serde(default)]
     agents: Vec<Lenient<WireAgent>>,
+    #[serde(default)]
+    context: Option<Lenient<WireContext>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireContext {
+    #[serde(default)]
+    model: Option<String>,
+    context_window: u64,
+    used_tokens: u64,
+    #[serde(default)]
+    anchored: bool,
+    #[serde(default)]
+    categories: Vec<Lenient<WireCategory>>,
+    #[serde(default)]
+    auto_compact_buffer: u64,
+    #[serde(default)]
+    free_tokens: u64,
+    #[serde(default)]
+    threshold_tokens: Option<u64>,
+    #[serde(default)]
+    snapcompact_saved: Option<u64>,
+    #[serde(default)]
+    tools: Vec<Lenient<WireTool>>,
+    #[serde(default)]
+    skills: u32,
+    #[serde(default)]
+    computed_at: i64,
+}
+
+#[derive(Deserialize)]
+struct WireCategory {
+    id: String,
+    #[serde(default)]
+    label: Option<String>,
+    tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct WireTool {
+    name: String,
+    tokens: u64,
+}
+
+impl From<WireContext> for ContextBreakdown {
+    fn from(w: WireContext) -> Self {
+        ContextBreakdown {
+            model: w.model,
+            context_window: w.context_window,
+            used_tokens: w.used_tokens,
+            anchored: w.anchored,
+            categories: w
+                .categories
+                .into_iter()
+                .filter_map(|c| match c {
+                    Lenient::Ok(c) => Some(ContextCategory {
+                        label: c.label.unwrap_or_else(|| c.id.clone()),
+                        id: c.id,
+                        tokens: c.tokens,
+                    }),
+                    Lenient::Bad(_) => None,
+                })
+                .collect(),
+            auto_compact_buffer: w.auto_compact_buffer,
+            free_tokens: w.free_tokens,
+            threshold_tokens: w.threshold_tokens,
+            snapcompact_saved: w.snapcompact_saved,
+            tools: w
+                .tools
+                .into_iter()
+                .filter_map(|t| match t {
+                    Lenient::Ok(t) => Some((t.name, t.tokens)),
+                    Lenient::Bad(_) => None,
+                })
+                .collect(),
+            skills: w.skills,
+            computed_at_ms: w.computed_at,
+        }
+    }
 }
 
 /// An element that failed to parse is skipped instead of failing the whole snapshot.
@@ -550,6 +663,14 @@ impl From<WireSnapshot> for LiveSnapshot {
             main_idle: w.main_idle,
             leaf: w.leaf,
             agents,
+            context: match w.context {
+                Some(Lenient::Ok(c)) => Some(c.into()),
+                Some(Lenient::Bad(_)) => {
+                    log::debug!("ctl: ignored malformed context breakdown");
+                    None
+                }
+                None => None,
+            },
         }
     }
 }

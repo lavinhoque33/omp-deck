@@ -67,6 +67,7 @@ impl App {
         }
 
         let snap = self.status.latest();
+        let live = self.live_snapshot();
         let now = Instant::now();
         let mut toast = None;
         if let Some(Tab::Terminal(tab)) = self.tabs.get_mut(self.active)
@@ -121,6 +122,9 @@ impl App {
                 }
             }
             self.bar_view.set_defaults(&self.omp_defaults);
+            self.bar_view
+                .set_context(live.as_deref().and_then(|l| l.context.as_ref()));
+            self.bar_view.set_usage(self.usage.summary());
             self.bar_view.update(snap.as_ref(), &tab.cwd, &self.models);
         }
         if let Some(t) = toast {
@@ -140,6 +144,7 @@ impl App {
             || self.dialog.is_some()
             || self.popup.is_some()
             || self.tree.is_some()
+            || self.usage_open
             || egui::Popup::is_any_open(ctx))
             && let Some(t) = self.tabs.get(self.active).and_then(Tab::term)
         {
@@ -381,6 +386,7 @@ impl App {
             BarAction::OpenUrl(u) => self.open_external(u),
             BarAction::ToggleAgentHub => self.toggle_agent_hub(),
             BarAction::OpenTree => self.open_tree_active(),
+            BarAction::OpenUsage => self.open_usage(),
         }
     }
 

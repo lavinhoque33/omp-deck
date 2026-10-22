@@ -24,15 +24,23 @@ export default async function ompdeckCtl(api: any) {
     } catch (e) { log("internal import failed: " + e); return; }
     // Optional: only fork_at needs it; without it that op answers with an error.
     try { ({ SessionManager } = await import("@oh-my-pi/pi-coding-agent/session/session-manager")); } catch (e) { log("session-manager import failed: " + e); }
+    // Optional: the /context breakdown. Literal specifiers; a missing module just omits `context` from snapshots.
+    let contextRuntime: any, contextUsage: any;
+    try { contextRuntime = await import("@oh-my-pi/pi-coding-agent/session/context-usage-runtime"); } catch (e) { log("context-usage-runtime import failed: " + e); }
+    try { contextUsage = await import("@oh-my-pi/pi-tui/status-line/context-usage"); } catch (e) { log("context-usage import failed: " + e); }
     if (!AgentLifecycleManager || !AgentRegistry || typeof sessionFileBelongsToRoot !== "function") { log("internal API missing"); return; }
 
     const isMain = (ctx: any) => ctx?.agent?.kind === "main";
     api.on("session_start", (_ev: any, ctx: any) => { try { if (isMain(ctx)) start(ctx); } catch (e) { log("start failed: " + e); } });
-    api.on("session_switch", (ev: any, ctx: any) => { try { if (isMain(ctx)) { log(`session_switch ${ev?.reason}`); G.__ompdeckCtl?.setCtx(ctx); } } catch (e) { log("switch failed: " + e); } });
+    api.on("session_switch", (ev: any, ctx: any) => { try { if (isMain(ctx)) { log(`session_switch ${ev?.reason}`); G.__ompdeckCtl?.setCtx(ctx); G.__ompdeckCtl?.recompute(); } } catch (e) { log("switch failed: " + e); } });
+    // Context numbers move on these; `recompute` is cheap (cached per message) and never throws.
+    for (const name of ["agent_end", "turn_end", "model_select", "session_compact"]) {
+      try { api.on(name, (_ev: any, ctx: any) => { try { if (isMain(ctx)) G.__ompdeckCtl?.recompute(); } catch (e) { log(name + " failed: " + e); } }); } catch (e) { log("on " + name + " failed: " + e); }
+    }
     api.on("session_shutdown", (_ev: any, ctx: any) => { try { if (isMain(ctx)) stop(); } catch (e) { log("stop failed: " + e); } });
 
     function start(ctx: any) {
-      if (G.__ompdeckCtl) { G.__ompdeckCtl.setCtx(ctx); return; }
+      if (G.__ompdeckCtl) { G.__ompdeckCtl.setCtx(ctx); G.__ompdeckCtl.recompute(); return; }
       const registry = AgentRegistry.global();
       const clients = new Set<any>();
       let mainCtx = ctx;
@@ -40,6 +48,60 @@ export default async function ompdeckCtl(api: any) {
       const rootFile = (): string | null => { try { return mainCtx.sessionManager.getSessionFile?.() ?? null; } catch { return null; } };
       const mainIdle = (): boolean | null => { try { return typeof mainCtx.isIdle === "function" ? !!mainCtx.isIdle() : null; } catch { return null; } };
       const mainLeaf = (): string | null => { try { return mainCtx.sessionManager.getLeafId?.() ?? null; } catch { return null; } };
+
+      // ---- /context breakdown (omp's computeSessionContextBreakdown + per-tool schema tokens), cached ----
+      let contextCache: any = null;
+      let contextKey = "";
+      const toolTokenCaches = new WeakMap<object, WeakMap<object, number>>(); // tokenizer -> tool -> tokens
+      const mainSession = (): any => { try { return registry.list().find((r: any) => r.kind === "main")?.session; } catch { return undefined; } };
+      const modelKey = (): string => { const m = mainSession()?.model; return m ? `${m.provider}/${m.id}` : ""; };
+      const perToolTokens = (sess: any): [string, number][] => {
+        const tokenizer = sess.agent?.tokenizer;
+        const tools: any[] = sess.agent?.state?.tools ?? [];
+        if (!tokenizer || typeof tokenizer.countTokens !== "function" || sess.model?.toolSchemasInContext === false) return [];
+        let toolTokens = toolTokenCaches.get(tokenizer);
+        if (!toolTokens) { toolTokens = new WeakMap(); toolTokenCaches.set(tokenizer, toolTokens); }
+        const est = contextUsage?.estimateToolSchemaTokens;
+        const out: [string, number][] = [];
+        for (const t of tools) {
+          if (typeof t?.name !== "string") continue;
+          let n = toolTokens.get(t);
+          if (n === undefined) {
+            try {
+              n = typeof est === "function"
+                ? est([t], tokenizer, sess.settings?.revision ?? 0)
+                : tokenizer.countTokens([t.name, t.description ?? "", JSON.stringify(t.parameters ?? {})]);
+            } catch { n = undefined; }
+            if (typeof n === "number" && Number.isFinite(n)) toolTokens.set(t, n);
+          }
+          if (typeof n === "number" && Number.isFinite(n)) out.push([t.name, Math.max(0, Math.round(n))]);
+        }
+        return out.sort((a, b) => b[1] - a[1]);
+      };
+      const recompute = () => {
+        try {
+          const sess = mainSession();
+          contextKey = modelKey();
+          if (!sess || typeof contextRuntime?.computeSessionContextBreakdown !== "function") { contextCache = null; return; }
+          const b = contextRuntime.computeSessionContextBreakdown(sess, { snapcompactSavings: true });
+          if (!b || !(b.contextWindow > 0)) { contextCache = null; return; }
+          let anchored = false;
+          try { anchored = !!sess.getContextBreakdown?.()?.anchored; } catch {}
+          const saved = b.snapcompact?.savedTokens;
+          contextCache = {
+            model: b.model?.name ?? b.model?.id ?? null,
+            contextWindow: b.contextWindow, usedTokens: b.usedTokens, anchored,
+            categories: (b.categories ?? []).map((c: any) => ({ id: c.id, label: c.label, tokens: c.tokens })),
+            autoCompactBuffer: b.autoCompactBufferTokens ?? 0, freeTokens: b.freeTokens ?? 0,
+            thresholdTokens: b.thresholdTokens ?? null,
+            snapcompactSaved: typeof saved === "number" && saved > 0 ? saved : null,
+            tools: perToolTokens(sess).map(([name, tokens]) => ({ name, tokens })),
+            skills: Array.isArray(sess.skills) ? sess.skills.length : 0,
+            computedAt: Date.now(),
+          };
+        } catch (e) { log("context compute failed: " + e); contextCache = null; }
+        schedule();
+      };
 
       const snapshot = () => {
         const root = rootFile();
@@ -55,7 +117,7 @@ export default async function ompdeckCtl(api: any) {
               model: r.history?.resolvedModel ?? null,
             }));
         } catch (e) { log("snapshot failed: " + e); }
-        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents };
+        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache };
       };
       const write = (c: any, l: string) => { try { c.write(l); } catch {} };
       const push = (m: unknown) => {
@@ -247,14 +309,16 @@ export default async function ompdeckCtl(api: any) {
       };
       try {
         offRegistry = registry.onChange(schedule); // registered/status_changed/metadata_changed(activity)/removed
-        tick = setInterval(() => { if (clients.size) push(snapshot()); }, 1000); // safety net for isStreaming/mainIdle
+        tick = setInterval(() => { if (!clients.size) return; if (modelKey() !== contextKey) recompute(); push(snapshot()); }, 1000); // safety net for isStreaming/mainIdle
         try { offProgress = api.events.on("task:subagent:progress", schedule); } catch (e) { log("progress listener failed: " + e); }
         G.__ompdeckCtl = {
           setCtx(c: any) { mainCtx = c; schedule(); },
+          recompute,
           close,
         };
       } catch (e) { log("setup failed: " + e); close(); return; }
       log("listening " + sockPath);
+      recompute();
     }
     function stop() { const c = G.__ompdeckCtl; G.__ompdeckCtl = undefined; c?.close(); }
   } catch (e) { log("factory failed: " + e); }
