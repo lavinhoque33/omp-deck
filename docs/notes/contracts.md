@@ -356,6 +356,13 @@ pub fn fork_argv(src: &Path, dest_cwd: &Path) -> Vec<String>;
 /// Canary → ["omp","update","--canary"], Stable → ["omp","update","--stable"].
 pub fn update_argv(kind: UpdateKind) -> Vec<String>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum UpdateKind { Omp, Plugins, Canary, Stable }
+/// argv for the "Install omp" tab (TabRole::InstallOmp, direct, never persisted), offered while
+/// `Omp::detect()` is None: `sh -c` fetching `INSTALL_URL` (https://omp.sh/install) with curl, else
+/// wget, into a variable (a failed download fails the tab), then `sh -s -- --binary` (prebuilt binary
+/// → `$PI_INSTALL_DIR` or `~/.local/bin`, no bun/root). Exit 0 → re-run `Omp::detect()` and adopt it
+/// (version, models, usage) without a restart. All omp tab argv (sessions, resume, restart, fork,
+/// update) use the detected binary as argv[0], since `~/.local/bin` may not be on PATH yet.
+pub fn install_argv() -> Vec<String>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateStatus { pub current: String, pub latest: Option<String> } // latest None = up to date

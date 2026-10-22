@@ -3,6 +3,7 @@
 pub mod agents;
 pub mod config;
 pub mod ctl;
+pub mod gdrive;
 pub mod omp;
 pub mod sessions;
 pub mod status;

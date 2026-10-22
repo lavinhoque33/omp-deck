@@ -120,6 +120,10 @@ impl App {
                         }
                     }
                 }
+                UsageAction::InstallOmp => {
+                    self.close_usage();
+                    self.open_install_tab();
+                }
             }
         }
     }

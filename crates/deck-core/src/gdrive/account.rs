@@ -1,0 +1,113 @@
+//! The signed-in Google account: `config_dir()/google-drive.json`, mode 0600.
+
+use std::fmt;
+use std::fs;
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use super::{Error, Result, io_err};
+use crate::config::config_dir;
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Account {
+    pub refresh_token: String,
+    /// From the id_token of the sign-in (`None` when Google sent none).
+    pub email: Option<String>,
+    /// The last upload from this machine.
+    pub last_backup: Option<LastBackup>,
+    /// Content fingerprint of the synced set known to be on Drive (uploaded or restored here);
+    /// auto backup uploads only when the local content differs from it.
+    pub synced_fingerprint: Option<String>,
+}
+
+// Hand-written so the refresh token never ends up in a log.
+impl fmt::Debug for Account {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Account")
+            .field("email", &self.email)
+            .field("last_backup", &self.last_backup)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LastBackup {
+    /// Drive file name.
+    pub name: String,
+    /// Upload time, unix seconds.
+    pub unix: i64,
+    pub host: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AccountStore {
+    path: PathBuf,
+}
+
+impl AccountStore {
+    pub fn default_location() -> AccountStore {
+        AccountStore::at(config_dir().join("google-drive.json"))
+    }
+
+    pub fn at(path: PathBuf) -> AccountStore {
+        AccountStore { path }
+    }
+
+    /// `None` = signed out. A corrupt file counts as signed out (logged).
+    pub fn load(&self) -> Result<Option<Account>> {
+        let bytes = match fs::read(&self.path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err("cannot read", &self.path)(e)),
+        };
+        match serde_json::from_slice::<Account>(&bytes) {
+            Ok(a) if !a.refresh_token.is_empty() => Ok(Some(a)),
+            Ok(_) => Ok(None),
+            Err(e) => {
+                log::warn!(
+                    "corrupt {}: {e}; treating as signed out",
+                    self.path.display()
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Atomic (temp file + rename); the file is created 0600 because it holds the refresh token.
+    pub fn save(&self, account: &Account) -> Result<()> {
+        let json = serde_json::to_vec_pretty(account).map_err(|e| Error::Io(e.to_string()))?;
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        fs::create_dir_all(dir).map_err(io_err("cannot create", dir))?;
+        let mut tmp = self.path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let write = || -> io::Result<()> {
+            let _ = fs::remove_file(&tmp);
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(&json)?;
+            f.sync_all()?;
+            fs::rename(&tmp, &self.path)
+        };
+        write().map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            io_err("cannot write", &self.path)(e)
+        })
+    }
+
+    pub fn delete(&self) -> Result<()> {
+        match fs::remove_file(&self.path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                Err(io_err("cannot delete", &self.path)(e))
+            }
+            _ => Ok(()),
+        }
+    }
+}

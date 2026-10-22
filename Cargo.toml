@@ -4,7 +4,7 @@ members = ["crates/deck-core", "crates/deck-term", "crates/omp-deck"]
 
 [workspace.package]
 edition = "2024"
-version = "0.4.2"
+version = "0.4.3"
 license = "MIT OR Apache-2.0"
 publish = false
 description = "Desktop wrapper for the omp coding-agent TUI: session sidebar, tabs, embedded terminal backed by tmux"
@@ -30,8 +30,14 @@ thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
 tempfile = "3"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.4"
 
 [profile.dev.package."*"]
 opt-level = 2

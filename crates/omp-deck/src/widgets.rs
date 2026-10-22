@@ -1,7 +1,7 @@
 //! Reusable chrome widgets: icon buttons, window buttons, toggle, segmented control, cards,
 //! setting rows, empty states and menu items. Everything is themed through [`Palette`].
 
-use crate::icons::Icon;
+use crate::icons::{ICON_DOWNLOAD, Icon};
 use egui::{
     Align2, Button, Color32, CornerRadius, CursorIcon, FontId, Frame, Margin, Response, RichText,
     Sense, Stroke, StrokeKind, Ui, pos2, vec2,
@@ -356,6 +356,23 @@ pub fn empty_state(ui: &mut Ui, icon: Icon, color: Color32, title: &str, sub: &s
                 .wrap_mode(egui::TextWrapMode::Wrap),
         );
     });
+}
+
+/// "Install omp" button shown wherever omp was not found.
+pub fn install_omp_button(ui: &mut Ui) -> bool {
+    let pal = Palette::of_ui(ui);
+    ui.add(
+        Button::new((
+            icon_text(ICON_DOWNLOAD, 16.0, pal.glyph),
+            RichText::new("Install omp"),
+        ))
+        .min_size(vec2(0.0, 30.0)),
+    )
+    .on_hover_text(format!(
+        "Run omp's official installer ({}) in a new tab; it installs to ~/.local/bin, no root needed",
+        deck_core::omp::INSTALL_URL
+    ))
+    .clicked()
 }
 
 /// Menu entry with icon, optional shortcut hint and danger styling.

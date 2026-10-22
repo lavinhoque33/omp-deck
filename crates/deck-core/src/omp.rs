@@ -297,6 +297,24 @@ pub fn update_argv(kind: UpdateKind) -> Vec<String> {
     v
 }
 
+/// omp's official installer script.
+pub const INSTALL_URL: &str = "https://omp.sh/install";
+
+/// argv for an "Install omp" tab: fetch [`INSTALL_URL`] with curl (else wget) and run it with
+/// `--binary`, which installs a prebuilt omp to `~/.local/bin` without bun or root.
+/// A failed download fails the whole command instead of running an empty script.
+pub fn install_argv() -> Vec<String> {
+    let script = format!(
+        "set -e\n\
+         if command -v curl >/dev/null 2>&1; then s=$(curl -fsSL {INSTALL_URL})\n\
+         elif command -v wget >/dev/null 2>&1; then s=$(wget -qO- {INSTALL_URL})\n\
+         else echo 'Installing omp needs curl or wget.' >&2; exit 1\n\
+         fi\n\
+         printf '%s\\n' \"$s\" | sh -s -- --binary\n"
+    );
+    vec!["sh".into(), "-c".into(), script]
+}
+
 fn failed(message: impl Into<String>) -> OmpError {
     OmpError::Failed {
         code: None,
@@ -1289,6 +1307,41 @@ mod tests {
             update_argv(UpdateKind::Stable),
             ["omp", "update", "--stable"]
         );
+    }
+
+    /// Runs `install_argv()` with a fake `curl` (body `curl_body`) first on PATH.
+    fn run_installer(curl_body: &str) -> (bool, Option<String>) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let curl = dir.path().join("curl");
+        std::fs::write(&curl, format!("#!/bin/sh\n{curl_body}\n")).unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = dir.path().join("ran");
+        let argv = install_argv();
+        let ok = Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+            .env("OUT", &out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        (ok, std::fs::read_to_string(&out).ok())
+    }
+
+    #[test]
+    fn installer_runs_the_downloaded_script_with_binary_flag() {
+        let (ok, ran) = run_installer(r#"echo 'echo "args:$*" > "$OUT"'"#);
+        assert!(ok);
+        assert_eq!(ran.as_deref(), Some("args:--binary\n"));
+    }
+
+    #[test]
+    fn installer_fails_without_running_anything_when_the_download_fails() {
+        let (ok, ran) = run_installer("echo 'echo partial > \"$OUT\"'; exit 22");
+        assert!(!ok);
+        assert_eq!(ran, None);
     }
 }
 

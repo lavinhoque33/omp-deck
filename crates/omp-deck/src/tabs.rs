@@ -29,6 +29,8 @@ pub enum TabRole {
     Session,
     /// `omp update …` running directly (never tmux, never persisted).
     Update(UpdateKind),
+    /// omp's official installer, offered while omp is not found (direct, never persisted).
+    InstallOmp,
 }
 
 /// A terminal tab: an omp process (usually inside tmux) rendered by deck-term.
@@ -153,7 +155,7 @@ impl Tab {
     pub fn kind_icon(&self, pal: &Palette, sel: f32) -> (Icon, Color32) {
         match self {
             Tab::Settings => (ICON_SETTINGS, theme::mix(pal.weak, pal.accent, sel)),
-            Tab::Terminal(t) if matches!(t.role, TabRole::Update(_)) => (
+            Tab::Terminal(t) if matches!(t.role, TabRole::Update(_) | TabRole::InstallOmp) => (
                 ICON_DOWNLOAD,
                 theme::mix(pal.weak, pal.accent_a, sel.max(0.6)),
             ),
@@ -173,8 +175,10 @@ impl TermTab {
         labels: &'a HashMap<PathBuf, String>,
         osc: Option<&'a str>,
     ) -> &'a str {
-        if let TabRole::Update(kind) = self.role {
-            return crate::update::tab_title(kind);
+        match self.role {
+            TabRole::Update(kind) => return crate::update::tab_title(kind),
+            TabRole::InstallOmp => return "Install omp",
+            TabRole::Session => {}
         }
         osc.filter(|t| !t.trim().is_empty() && !is_hostname(t))
             .or_else(|| {

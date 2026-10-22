@@ -12,6 +12,7 @@ mod composer;
 mod config_writer;
 mod confirm;
 mod ctx_tip;
+mod drive_view;
 mod folder_scope;
 mod icons;
 mod inject;

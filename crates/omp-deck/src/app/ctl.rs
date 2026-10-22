@@ -490,7 +490,7 @@ impl App {
             self.toasts
                 .error(&self.ctx, format!("Could not restart: {e}"));
         }
-        let argv = crate::tabs::omp_argv(tab.session_path.as_deref());
+        let argv = self.with_omp_program(crate::tabs::omp_argv(tab.session_path.as_deref()));
         self.spawn_tab_post(SpawnReq {
             tmux_name: tab.tmux_name,
             cwd: tab.cwd,

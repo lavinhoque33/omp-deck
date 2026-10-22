@@ -1,22 +1,25 @@
 #!/bin/sh
-# OmpDeck installer (per-user, no root).
+# OmpDeck installer (per-user, no root). Also installs omp (prebuilt, to ~/.local/bin) if missing.
 #
 #   curl -fsSL https://raw.githubusercontent.com/lavinhoque33/omp-deck/main/packaging/install.sh | sh
 #   ./install.sh              from an extracted release tarball: install that build
-#   ./install.sh --uninstall  remove everything this script installed
+#   ./install.sh --uninstall  remove everything this script installed (omp stays)
 #
 # Options: --version <x.y.z>  install a specific release instead of the latest
 #          --prefix <dir>     install under <dir> instead of ~/.local
+#          --no-omp           do not install omp when it is missing
 #          --uninstall        remove the installed files
 set -eu
 
 REPO="lavinhoque33/omp-deck"
 APP="omp-deck"
 SIZES="16 24 32 48 64 128 256 512"
+OMP_INSTALL_URL="https://omp.sh/install"
 
 prefix="${HOME}/.local"
 version=""
 uninstall=0
+with_omp=1
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -25,9 +28,10 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --uninstall) uninstall=1 ;;
+        --no-omp) with_omp=0 ;;
         --version) [ $# -ge 2 ] || die "--version needs a value"; version=${2#v}; shift ;;
         --prefix) [ $# -ge 2 ] || die "--prefix needs a value"; prefix=$2; shift ;;
-        -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
     shift
@@ -155,7 +159,26 @@ done
 refresh_caches
 
 say "Installed OmpDeck to $bin_dir/$APP"
-command -v omp >/dev/null 2>&1 || warn "'omp' was not found on PATH; OmpDeck needs it (https://github.com/can1357/oh-my-pi)"
+
+# omp: OmpDeck finds it on PATH or in ~/.local/bin (where omp's --binary installer puts it).
+if command -v omp >/dev/null 2>&1 || [ -x "$HOME/.local/bin/omp" ]; then
+    :
+elif [ "$with_omp" -eq 0 ]; then
+    warn "'omp' was not found; OmpDeck needs it. Use OmpDeck's 'Install omp' button or run: curl -fsSL $OMP_INSTALL_URL | sh"
+else
+    say "omp was not found; installing it with its official installer ($OMP_INSTALL_URL)..."
+    omp_script=""
+    if command -v curl >/dev/null 2>&1; then
+        omp_script=$(curl -fsSL "$OMP_INSTALL_URL") || omp_script=""
+    elif command -v wget >/dev/null 2>&1; then
+        omp_script=$(wget -qO- "$OMP_INSTALL_URL") || omp_script=""
+    fi
+    if [ -n "$omp_script" ] && printf '%s\n' "$omp_script" | sh -s -- --binary; then
+        :
+    else
+        warn "installing omp failed; OmpDeck offers an 'Install omp' button to retry"
+    fi
+fi
 command -v tmux >/dev/null 2>&1 || warn "'tmux' was not found; OmpDeck still works but sessions will not persist after closing a tab. Install tmux for persistence."
 case ":$PATH:" in
     *":$bin_dir:"*) ;;

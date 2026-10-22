@@ -566,6 +566,11 @@ impl Usage {
         }
     }
 
+    /// omp was installed while OmpDeck runs: quotas can be fetched from now on.
+    pub fn omp_found(&mut self) {
+        self.omp_found = true;
+    }
+
     pub fn summary(&self) -> Option<&Arc<Summary>> {
         self.summary.as_ref()
     }

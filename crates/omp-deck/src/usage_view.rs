@@ -56,6 +56,8 @@ pub struct ViewInput<'a> {
 pub enum UsageAction {
     Close,
     Refresh,
+    /// Run omp's official installer (omp was not found).
+    InstallOmp,
 }
 
 /// Colour of a limit status; `Ok` is the accent (teal in Neutral).
@@ -419,8 +421,15 @@ fn quotas(ui: &mut Ui, input: &ViewInput<'_>, out: &mut Vec<UsageAction>) {
                 ICON_TERMINAL,
                 pal.warn,
                 "omp was not found",
-                "OmpDeck reads quotas with `omp usage`. Install omp or put it on PATH, then restart OmpDeck.",
+                "OmpDeck reads quotas with `omp usage`. Install omp, or put it on PATH and restart OmpDeck.",
             );
+            ui.add_space(12.0);
+            if ui
+                .vertical_centered(crate::widgets::install_omp_button)
+                .inner
+            {
+                out.push(UsageAction::InstallOmp);
+            }
             return;
         }
         Load::Loading => {

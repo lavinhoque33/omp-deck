@@ -41,6 +41,11 @@ jobs:
         run: cargo test --workspace --release
 
       - name: Build
+        # Baked into the binary for Google Drive backup (see docs/google-drive-setup.md); without
+        # them the feature shows as "not available in this build".
+        env:
+          OMP_DECK_GOOGLE_CLIENT_ID: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_ID }}
+          OMP_DECK_GOOGLE_CLIENT_SECRET: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_SECRET }}
         run: cargo build --release -p omp-deck --locked
 
       - name: Validate desktop file

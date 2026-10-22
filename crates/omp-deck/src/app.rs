@@ -15,7 +15,8 @@ use crate::icons::{
 use deck_core::agents::{AgentsTarget, AgentsWatcher};
 use deck_core::config::{AppConfig, Density, FolderTabs, TabState, Theme, UiStyle, WindowGeometry};
 use deck_core::omp::{
-    MoveKind, MoveOutcome, Omp, Setting, UpdateKind, UpdateStatus, fork_argv, update_argv,
+    MoveKind, MoveOutcome, Omp, Setting, UpdateKind, UpdateStatus, fork_argv, install_argv,
+    update_argv,
 };
 use deck_core::sessions::{
     ProjectGroup, SessionEntry, SessionWatcher, SessionsRoot, abbreviate_home, find_fork,
@@ -61,6 +62,7 @@ use crate::widgets::{empty_state, icon_text, menu_item};
 mod agents;
 mod bar;
 mod ctl;
+mod drive;
 mod spawn;
 mod tree;
 mod usage;
@@ -129,6 +131,8 @@ enum AppEvent {
     TreeForked(Result<PathBuf, String>),
     /// A usage fetch / `stats.db` read finished.
     Usage(UsageEvent),
+    /// A Google Drive backup job finished.
+    Drive(drive::DriveEvent),
 }
 
 /// A modal question awaiting the user's answer, with what to do on "yes".
@@ -165,6 +169,8 @@ enum PendingConfirm {
     RestartSession(RestartTarget),
     /// Delete a session file (and its artifacts) through omp.
     DeleteSession(SessionEntry),
+    /// Restore a downloaded Google Drive backup over the local omp config.
+    RestoreBackup(Box<deck_core::gdrive::PreparedRestore>),
 }
 
 /// What a sidebar restart was asked about.
@@ -298,6 +304,8 @@ pub struct App {
 
     started: Instant,
     shot: Option<ShotPlan>,
+    /// Google Drive backup of the omp config.
+    drive: drive::DriveUi,
 }
 
 /// Minimum time between two window-title updates.
@@ -405,6 +413,7 @@ impl App {
         }
 
         let usage = Usage::new(omp.is_some(), Instant::now());
+        let drive = drive::DriveUi::new(root.agent_dir());
         let mut app = App {
             ctx,
             root_exists: root.exists(),
@@ -491,6 +500,7 @@ impl App {
                 .unwrap_or_else(Instant::now),
             started: Instant::now(),
             shot,
+            drive,
         };
         if let Some(e) = startup_error {
             app.toasts.error(&app.ctx, format!("Folder ignored: {e}"));
@@ -546,7 +556,7 @@ impl App {
         title: String,
         focus: Focus,
     ) {
-        let argv = tabs::omp_argv(session_path.as_deref());
+        let argv = self.with_omp_program(tabs::omp_argv(session_path.as_deref()));
         self.spawn_tab_post(SpawnReq {
             tmux_name,
             cwd,
@@ -655,6 +665,44 @@ impl App {
         let cwd = self.home.clone().unwrap_or_else(|| PathBuf::from("/"));
         let argv = self.with_omp_program(update_argv(kind));
         self.spawn_tab_with(None, cwd, None, String::new(), argv, TabRole::Update(kind));
+    }
+
+    /// Run omp's official installer in a direct tab; one at a time (re-focus a running one).
+    fn open_install_tab(&mut self) {
+        let running = self.tabs.iter().position(|t| {
+            matches!(t, Tab::Terminal(t) if t.role == TabRole::InstallOmp && !t.term.is_exited())
+        });
+        if let Some(i) = running {
+            self.activate(i);
+            return;
+        }
+        let cwd = self.home.clone().unwrap_or_else(|| PathBuf::from("/"));
+        let argv = install_argv();
+        self.spawn_tab_with(None, cwd, None, String::new(), argv, TabRole::InstallOmp);
+    }
+
+    /// The installer finished: pick up the new omp without a restart.
+    fn finish_omp_install(&mut self, code: Option<i32>) {
+        if code != Some(0) {
+            let code = code.map_or("signal".to_owned(), |c| c.to_string());
+            self.toasts.error(
+                &self.ctx,
+                format!("Installing omp failed (exit {code}) — see the tab for details"),
+            );
+            return;
+        }
+        let Some(omp) = Omp::detect() else {
+            self.toasts.error(
+                &self.ctx,
+                "The installer finished, but omp is not on PATH or in ~/.local/bin",
+            );
+            return;
+        };
+        self.omp = Some(omp);
+        self.usage.omp_found();
+        self.spawn_omp(|omp| OmpEvent::Version(omp.version().map_err(|e| e.to_string())));
+        self.reload_models();
+        self.toasts.success(&self.ctx, "omp installed");
     }
 
     /// Use the detected omp binary as argv[0] (it may live outside PATH, e.g. `~/.local/bin`).
@@ -787,7 +835,7 @@ impl App {
                     unix_ms(),
                 )
                 .into_name();
-            let argv = tabs::omp_argv(path.as_deref());
+            let argv = self.with_omp_program(tabs::omp_argv(path.as_deref()));
             self.spawn_tab_post(SpawnReq {
                 tmux_name: Some(name),
                 cwd: st.cwd.clone(),
@@ -1144,6 +1192,7 @@ impl App {
                 AppEvent::SpawnPrepared(p) => self.on_spawn_prepared(p),
                 AppEvent::TreeForked(r) => self.on_tree_forked(r),
                 AppEvent::Usage(u) => self.on_usage_event(u),
+                AppEvent::Drive(ev) => self.on_drive_event(ev),
             }
         }
     }
@@ -1344,17 +1393,35 @@ impl App {
         match self.tabs.get(self.active) {
             None => {
                 self.terminal_focused = false;
-                egui::CentralPanel::no_frame().show(ui, |ui| {
-                    ui.painter().rect_filled(ui.max_rect(), 0, pal.bg);
-                    ui.add_space((ui.available_height() / 2.0 - 90.0).max(20.0));
-                    empty_state(
-                        ui,
-                        ICON_TERMINAL,
-                        pal.accent,
-                        "No session open",
-                        "Pick a session from the sidebar, or press + next to a project to start a new one.",
-                    );
-                });
+                let omp_missing = self.omp.is_none();
+                let install = egui::CentralPanel::no_frame()
+                    .show(ui, |ui| {
+                        ui.painter().rect_filled(ui.max_rect(), 0, pal.bg);
+                        ui.add_space((ui.available_height() / 2.0 - 90.0).max(20.0));
+                        if !omp_missing {
+                            empty_state(
+                                ui,
+                                ICON_TERMINAL,
+                                pal.accent,
+                                "No session open",
+                                "Pick a session from the sidebar, or press + next to a project to start a new one.",
+                            );
+                            return false;
+                        }
+                        empty_state(
+                            ui,
+                            ICON_TERMINAL,
+                            pal.warn,
+                            "omp is not installed",
+                            "OmpDeck runs the omp coding agent, which was not found on PATH or in ~/.local/bin.",
+                        );
+                        ui.add_space(12.0);
+                        ui.vertical_centered(crate::widgets::install_omp_button).inner
+                    })
+                    .inner;
+                if install {
+                    self.open_install_tab();
+                }
             }
             Some(Tab::Settings) => {
                 self.terminal_focused = false;
@@ -1370,6 +1437,7 @@ impl App {
                     omp_version: self.update.version.as_deref(),
                     check_updates: self.cfg.check_updates,
                     update: &self.update.state,
+                    drive: self.drive.card(self.cfg.drive_auto_backup),
                 };
                 let actions = egui::CentralPanel::no_frame()
                     .show(ui, |ui| settings_page::show(ui, &mut self.settings, &input))
@@ -1395,6 +1463,8 @@ impl App {
                         SettingsAction::CopyDetails(text) => {
                             self.copy_text(&text, "error details");
                         }
+                        SettingsAction::InstallOmp => self.open_install_tab(),
+                        SettingsAction::Drive(a) => self.apply_drive_action(a),
                     }
                 }
             }
@@ -1449,7 +1519,10 @@ impl App {
 
     /// A confirmation or form dialog is open.
     fn modal_open(&self) -> bool {
-        self.confirm.is_some() || self.dialog.is_some() || self.folder_dialog.is_some()
+        self.confirm.is_some()
+            || self.dialog.is_some()
+            || self.folder_dialog.is_some()
+            || self.drive.modal_open()
     }
 
     fn show_confirm(&mut self, ctx: &egui::Context) {
@@ -1467,6 +1540,10 @@ impl App {
             self.answer_draft(uid, answer);
             return;
         }
+        if let PendingConfirm::RestoreBackup(prepared) = pending {
+            self.answer_restore(prepared, answer);
+            return;
+        }
         if !answer {
             return;
         }
@@ -1476,7 +1553,6 @@ impl App {
             }
             PendingConfirm::SwitchChannel(kind) => self.open_update_tab(kind),
             PendingConfirm::MoveSession { entry, dest } => self.execute_move(entry, dest),
-            PendingConfirm::ClearDraft { .. } => {}
             PendingConfirm::KillAgent {
                 id,
                 uid,
@@ -1488,6 +1564,7 @@ impl App {
             }
             PendingConfirm::RestartSession(target) => self.execute_restart_session(target),
             PendingConfirm::DeleteSession(entry) => self.execute_delete(entry),
+            PendingConfirm::ClearDraft { .. } | PendingConfirm::RestoreBackup(_) => {}
         }
     }
 
@@ -1694,19 +1771,23 @@ impl App {
         ));
     }
 
-    /// When an update tab's process has exited: re-check, and report success or failure.
+    /// When an update or install tab's process has exited: re-check, and report the outcome.
     fn check_update_tabs(&mut self) {
         let mut finished = Vec::new();
         for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
-            if let TabRole::Update(kind) = tab.role
+            if matches!(tab.role, TabRole::Update(_) | TabRole::InstallOmp)
                 && !tab.exit_handled
                 && tab.term.is_exited()
             {
                 tab.exit_handled = true;
-                finished.push((kind, tab.term.exit_code()));
+                finished.push((tab.role, tab.term.exit_code()));
             }
         }
-        for (kind, code) in finished {
+        for (role, code) in finished {
+            let TabRole::Update(kind) = role else {
+                self.finish_omp_install(code);
+                continue;
+            };
             match code {
                 Some(0) => self.update.recheck.push_back(Some(kind)),
                 other => {
@@ -2280,7 +2361,7 @@ impl App {
             refocus,
         }) = tab.map(|b| *b)
         {
-            let argv = tabs::omp_argv(t.session_path.as_deref());
+            let argv = self.with_omp_program(tabs::omp_argv(t.session_path.as_deref()));
             self.spawn_tab_post(SpawnReq {
                 tmux_name: t.tmux_name,
                 cwd: t.cwd,
@@ -2439,6 +2520,7 @@ impl eframe::App for App {
         self.show_banners(ui);
         self.drive_status(&ctx);
         self.drive_usage(&ctx);
+        self.drive_tick(&ctx);
         self.drive_agents();
         self.show_status_bar(ui);
         self.show_sidebar(ui, &snap);
@@ -2447,6 +2529,7 @@ impl eframe::App for App {
         self.show_agent_popup(&ctx);
         self.show_tree(&ctx);
         self.show_usage(&ctx);
+        self.show_drive_picker(&ctx);
         self.show_confirm(&ctx);
         self.show_action_dialog(&ctx);
         self.show_folder_dialog(&ctx);

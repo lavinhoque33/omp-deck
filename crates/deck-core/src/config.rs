@@ -54,6 +54,8 @@ pub struct AppConfig {
     pub recent_folders: Vec<PathBuf>,
     /// Per-folder open tabs (folder mode launch/restore).
     pub folder_tabs: BTreeMap<PathBuf, FolderTabs>,
+    /// Back up the omp config to Google Drive automatically when it changed (while signed in).
+    pub drive_auto_backup: bool,
 }
 
 impl Default for AppConfig {
@@ -74,6 +76,7 @@ impl Default for AppConfig {
             folder_scope: None,
             recent_folders: Vec::new(),
             folder_tabs: BTreeMap::new(),
+            drive_auto_backup: true,
         }
     }
 }

@@ -17,6 +17,7 @@ use egui::{
 };
 use serde_json::Value;
 
+use crate::drive_view::{self, DriveAction, DriveCard};
 use crate::omp_rows::{
     JsonModal, ModalOutcome, RowEvent, SecretModal, note_banner, show_json_modal, show_row,
     show_secret_modal, skeleton,
@@ -97,6 +98,7 @@ pub struct SettingsInput<'a> {
     pub omp_version: Option<&'a str>,
     pub check_updates: bool,
     pub update: &'a UpdateState,
+    pub drive: DriveCard,
 }
 
 #[derive(Debug, PartialEq)]
@@ -120,6 +122,10 @@ pub enum SettingsAction {
     CopyKey(String),
     /// Copy an omp error message to the clipboard.
     CopyDetails(String),
+    /// Run omp's official installer in a tab (omp was not found).
+    InstallOmp,
+    /// The Google Drive backup card.
+    Drive(DriveAction),
 }
 
 fn tab_icon(id: &str) -> Icon {
@@ -204,7 +210,7 @@ pub fn show(
                     } else if state.selected == OMPDECK_ENTRY {
                         ompdeck_section(ui, input, &mut actions);
                     } else if !input.omp_found {
-                        not_found_card(ui);
+                        not_found_card(ui, &mut actions);
                     } else {
                         let tab = state.selected - 1;
                         omp_view(ui, &mut state.omp, View::Tab(tab), &mut actions);
@@ -567,7 +573,7 @@ fn show_modals(ctx: &egui::Context, pane: &mut OmpPane, actions: &mut Vec<Settin
     }
 }
 
-fn not_found_card(ui: &mut Ui) {
+fn not_found_card(ui: &mut Ui, actions: &mut Vec<SettingsAction>) {
     let pal = Palette::of_ui(ui);
     ui.label(
         theme::strong("omp settings")
@@ -589,12 +595,16 @@ fn not_found_card(ui: &mut Ui) {
                 ui.add(
                     egui::Label::new(
                         RichText::new(
-                            "OmpDeck edits omp's settings through the `omp` command, but could not find it on your PATH or in ~/.local/bin. Install omp or add it to PATH, then restart OmpDeck.",
+                            "OmpDeck edits omp's settings through the `omp` command, but could not find it on your PATH or in ~/.local/bin. Install it with omp's official installer, or add it to PATH and restart OmpDeck.",
                         )
                         .color(pal.weak),
                     )
                     .wrap_mode(egui::TextWrapMode::Wrap),
                 );
+                ui.add_space(10.0);
+                if crate::widgets::install_omp_button(ui) {
+                    actions.push(SettingsAction::InstallOmp);
+                }
             });
         });
     });
@@ -639,7 +649,10 @@ fn load_error_card(ui: &mut Ui, err: &str, actions: &mut Vec<SettingsAction>, lo
 fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<SettingsAction>) {
     let pal = Palette::of_ui(ui);
     ui.label(theme::strong("OmpDeck").size(22.0).color(pal.text_strong));
-    ui.label(RichText::new("Appearance, window behaviour and updates of this app").color(pal.weak));
+    ui.label(
+        RichText::new("Appearance, window behaviour, updates and backups of this app")
+            .color(pal.weak),
+    );
     ui.add_space(16.0);
 
     card(ui, "Appearance", |ui| {
@@ -776,5 +789,13 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
                 actions.push(SettingsAction::CheckUpdates);
             }
         });
+    });
+
+    card(ui, "Google Drive backup", |ui| {
+        actions.extend(
+            drive_view::card(ui, &input.drive)
+                .into_iter()
+                .map(SettingsAction::Drive),
+        );
     });
 }
