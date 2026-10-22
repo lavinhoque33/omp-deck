@@ -1,0 +1,86 @@
+[package]
+name = "omp-deck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Desktop wrapper for the omp coding-agent TUI (session sidebar, tabs, tmux)"
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+
+[dependencies]
+deck-core.workspace = true
+deck-term.workspace = true
+eframe.workspace = true
+egui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+egui_material_icons.workspace = true
+egui_commonmark.workspace = true
+# Hidden `--screenshot` flag encodes the egui screenshot; png 0.18 is already in the lockfile via eframe.
+png = "0.18"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[package.metadata.deb]
+name = "omp-deck"
+maintainer = "lavinhoque33 <caspianprince33@yahoo.com>"
+section = "devel"
+priority = "optional"
+extended-description = """\
+OmpDeck lists every persisted omp session in a sidebar and opens each one in a tab \
+running the omp TUI in an embedded terminal backed by tmux. Requires the omp binary \
+on PATH."""
+depends = "$auto, fontconfig"
+recommends = "tmux"
+license-file = ["../../LICENSE-MIT", "0"]
+assets = [
+    ["target/release/omp-deck", "usr/bin/omp-deck", "755"],
+    ["../../packaging/omp-deck.desktop", "usr/share/applications/omp-deck.desktop", "644"],
+    ["../../packaging/icons/omp-deck.svg", "usr/share/icons/hicolor/scalable/apps/omp-deck.svg", "644"],
+    ["../../packaging/icons/omp-deck-16.png", "usr/share/icons/hicolor/16x16/apps/omp-deck.png", "644"],
+    ["../../packaging/icons/omp-deck-24.png", "usr/share/icons/hicolor/24x24/apps/omp-deck.png", "644"],
+    ["../../packaging/icons/omp-deck-32.png", "usr/share/icons/hicolor/32x32/apps/omp-deck.png", "644"],
+    ["../../packaging/icons/omp-deck-48.png", "usr/share/icons/hicolor/48x48/apps/omp-deck.png", "644"],
+    ["../../packaging/icons/omp-deck-64.png", "usr/share/icons/hicolor/64x64/apps/omp-deck.png", "644"],
+    ["../../packaging/icons/omp-deck-128.png", "usr/share/icons/hicolor/128x128/apps/omp-deck.png", "644"],
+    ["../../packaging/icons/omp-deck-256.png", "usr/share/icons/hicolor/256x256/apps/omp-deck.png", "644"],
+    ["../../packaging/icons/omp-deck-512.png", "usr/share/icons/hicolor/512x512/apps/omp-deck.png", "644"],
+    ["../../README.md", "usr/share/doc/omp-deck/README.md", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/omp-deck/LICENSE-MIT", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/omp-deck/LICENSE-APACHE", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "omp-deck"
+summary = "Desktop wrapper for the omp coding-agent TUI"
+url = "https://github.com/lavinhoque33/omp-deck"
+assets = [
+    { source = "../../target/release/omp-deck", dest = "/usr/bin/omp-deck", mode = "755" },
+    { source = "../../packaging/omp-deck.desktop", dest = "/usr/share/applications/omp-deck.desktop", mode = "644" },
+    { source = "../../packaging/icons/omp-deck.svg", dest = "/usr/share/icons/hicolor/scalable/apps/omp-deck.svg", mode = "644" },
+    { source = "../../packaging/icons/omp-deck-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/omp-deck.png", mode = "644" },
+    { source = "../../packaging/icons/omp-deck-24.png", dest = "/usr/share/icons/hicolor/24x24/apps/omp-deck.png", mode = "644" },
+    { source = "../../packaging/icons/omp-deck-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/omp-deck.png", mode = "644" },
+    { source = "../../packaging/icons/omp-deck-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/omp-deck.png", mode = "644" },
+    { source = "../../packaging/icons/omp-deck-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/omp-deck.png", mode = "644" },
+    { source = "../../packaging/icons/omp-deck-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/omp-deck.png", mode = "644" },
+    { source = "../../packaging/icons/omp-deck-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/omp-deck.png", mode = "644" },
+    { source = "../../packaging/icons/omp-deck-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/omp-deck.png", mode = "644" },
+    { source = "../../README.md", dest = "/usr/share/doc/omp-deck/README.md", mode = "644", doc = true },
+    { source = "../../LICENSE-MIT", dest = "/usr/share/doc/omp-deck/LICENSE-MIT", mode = "644", doc = true },
+    { source = "../../LICENSE-APACHE", dest = "/usr/share/doc/omp-deck/LICENSE-APACHE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+fontconfig = "*"
+
+[package.metadata.generate-rpm.recommends]
+tmux = "*"

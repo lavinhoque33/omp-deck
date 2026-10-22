@@ -1,0 +1,3 @@
+{"type":"session","version":3,"id":"01a00001-sub","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/home/u/alpha"}
+{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"subagent prompt"}],"timestamp":1}}
+{"type":"title","v":1,"title":"sub","source":"auto","updatedAt":"2026-01-01T00:00:00Z","pad":""}

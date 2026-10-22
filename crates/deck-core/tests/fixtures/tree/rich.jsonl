@@ -1,0 +1,35 @@
+{"type":"title","v":1,"title":"Tree fixture","source":"user","updatedAt":"2026-03-01T10:00:00.000Z","pad":"            "}
+{"type":"session","version":3,"id":"sess-rich","timestamp":"2026-03-01T10:00:00.000Z","cwd":"/work/proj"}
+{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-03-01T10:00:00.000Z","model":"anthropic/claude-x"}
+{"type":"thinking_level_change","id":"t1","parentId":"m1","timestamp":"2026-03-01T10:00:01.000Z","thinkingLevel":"high"}
+{"type":"message","id":"u1","parentId":"t1","timestamp":"2026-03-01T10:00:02.000Z","message":{"role":"user","content":[{"type":"text","text":"Hello\nworld\tfoo"}]}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-03-01T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Sure, reading"},{"type":"toolCall","id":"tc1","name":"read","arguments":{"path":"/tmp/x.rs","offset":10,"limit":5}},{"type":"toolCall","id":"tc2","name":"bash","arguments":{"command":"ls -la"}}],"stopReason":"toolUse"}}
+{"type":"message","id":"r1","parentId":"a1","timestamp":"2026-03-01T10:00:04.000Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"read","content":[{"type":"text","text":"line1\nline2"}]}}
+{"type":"message","id":"r2","parentId":"r1","timestamp":"2026-03-01T10:00:05.000Z","message":{"role":"toolResult","toolCallId":"tc2","toolName":"bash","content":[{"type":"text","text":"total 0"}]}}
+{"type":"message","id":"a2","parentId":"r2","timestamp":"2026-03-01T10:00:06.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"stopReason":"stop"}}
+{"type":"message","id":"u3","parentId":"a2","timestamp":"2026-03-01T10:00:20.000Z","message":{"role":"user","content":[{"type":"text","text":"branch B prompt"}]}}
+{"type":"message","id":"u2","parentId":"a2","timestamp":"2026-03-01T10:00:10.000Z","message":{"role":"user","content":"second question as string"}}
+{"type":"message","id":"a3","parentId":"u2","timestamp":"2026-03-01T10:00:11.000Z","message":{"role":"assistant","content":[{"type":"text","text":"  "}],"stopReason":"stop"}}
+{"type":"message","id":"a4","parentId":"u3","timestamp":"2026-03-01T10:00:21.000Z","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"rate limited"}}
+{"type":"compaction","id":"c1","parentId":"a4","timestamp":"2026-03-01T10:00:22.000Z","summary":"## Goal\nstuff","firstKeptEntryId":"u3","tokensBefore":12345,"method":"handoff"}
+{"type":"branch_summary","id":"bs1","parentId":"c1","timestamp":"2026-03-01T10:00:23.000Z","fromId":"a2","summary":"Explored\nX","fromExtension":false}
+{"type":"label","id":"l1","parentId":"bs1","timestamp":"2026-03-01T10:00:24.000Z","targetId":"a2","label":"milestone"}
+{"type":"label","id":"l2","parentId":"l1","timestamp":"2026-03-01T10:00:25.000Z","targetId":"a2","label":"final"}
+{"type":"label","id":"l3","parentId":"l2","timestamp":"2026-03-01T10:00:26.000Z","targetId":"u1","label":"first"}
+{"type":"label","id":"l4","parentId":"l3","timestamp":"2026-03-01T10:00:27.000Z","targetId":"u1","label":null}
+{"type":"custom_message","id":"cm1","parentId":"l4","timestamp":"2026-03-01T10:00:28.000Z","customType":"async-result","content":"<system-notice>\nJob done\n</system-notice>","display":true,"attribution":"agent"}
+{"type":"custom_message","id":"cm2","parentId":"cm1","timestamp":"2026-03-01T10:00:28.000Z","customType":"advisor","content":"<advisory>x</advisory>","details":{"notes":[{"note":"check bounds","advisor":"sec","severity":"blocker"}]},"display":true}
+{"type":"custom","customType":"tool_execution_start","data":{"toolCallId":"tc9","toolName":"wait"},"id":"ct1","parentId":"cm2","timestamp":"2026-03-01T10:00:29.000Z"}
+{"type":"message","id":"a5","parentId":"ct1","timestamp":"2026-03-01T10:00:30.000Z","message":{"role":"assistant","content":[],"stopReason":"aborted"}}
+{"type":"message","id":"bx","parentId":"a5","timestamp":"2026-03-01T10:00:31.000Z","message":{"role":"bashExecution","command":"git status\n--short","output":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}
+{"type":"message","id":"dv","parentId":"bx","timestamp":"2026-03-01T10:00:32.000Z","message":{"role":"developer","content":"be careful"}}
+{"type":"message","id":"ot","parentId":"dv","timestamp":"2026-03-01T10:00:33.000Z","message":{"role":"custom","content":"whatever"}}
+{"type":"service_tier_change","id":"st1","parentId":"ot","timestamp":"2026-03-01T10:00:34.000Z","serviceTier":{"openai":"priority"}}
+{"type":"title_change","id":"tc","parentId":"st1","timestamp":"2026-03-01T10:00:35.000Z","title":"New\ntitle","source":"auto"}
+{"type":"mode_change","id":"mc","parentId":"tc","timestamp":"2026-03-01T10:00:36.000Z","mode":"plan"}
+{"type":"credential_pin","id":"cp","parentId":"mc","timestamp":"2026-03-01T10:00:37.000Z","provider":"anthropic","hash":"abc"}
+{"type":"session_init","id":"si","parentId":"cp","timestamp":"2026-03-01T10:00:38.000Z","systemPrompt":["x"],"task":"t","tools":[]}
+{"type":"ttsr_injection","id":"ti","parentId":"si","timestamp":"2026-03-01T10:00:39.000Z","injectedRules":["r"]}
+{"type":"reset_boundary","id":"rb","parentId":"ti","timestamp":"2026-03-01T10:00:40.000Z"}
+{"type":"model_usage","id":"mu1","parentId":"rb","timestamp":"2026-03-01T10:00:41.000Z","purpose":"title","role":"smol","provider":"p","model":"m","usage":{},"stopReason":"stop","activeLeafId":"a5"}
+{"type":"message","id":"zz","parentId":"a5","timesta

@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    # ubuntu-22.04 keeps the glibc requirement (2.35) low for the prebuilt binaries.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches the crate version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            tmux pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
+            desktop-file-utils dpkg-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Build
+        run: cargo build --release -p omp-deck --locked
+
+      - name: Validate desktop file
+        run: desktop-file-validate packaging/omp-deck.desktop
+
+      - name: Tarball
+        run: packaging/build-tarball.sh "$VERSION"
+
+      - name: AppImage
+        run: |
+          curl -fsSL -o /tmp/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.0/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool
+          APPIMAGETOOL=/tmp/appimagetool packaging/appimage/build-appimage.sh "$VERSION"
+
+      - name: Install cargo-deb and cargo-generate-rpm
+        run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
+
+      - name: .deb
+        run: cargo deb -p omp-deck --no-build --output "dist/omp-deck_${VERSION}_amd64.deb"
+
+      - name: .rpm
+        run: cargo generate-rpm -p crates/omp-deck --output "dist/omp-deck-${VERSION}-1.x86_64.rpm"
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          for f in omp-deck-*.tar.gz omp-deck-*.AppImage omp-deck_*.deb omp-deck-*.rpm; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          cat ./*.sha256 > SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/omp-deck-*.tar.gz
+            dist/omp-deck-*.tar.gz.sha256
+            dist/omp-deck-*.AppImage
+            dist/omp-deck-*.AppImage.sha256
+            dist/omp-deck_*.deb
+            dist/omp-deck_*.deb.sha256
+            dist/omp-deck-*.rpm
+            dist/omp-deck-*.rpm.sha256
+            dist/SHA256SUMS
+          generate_release_notes: true

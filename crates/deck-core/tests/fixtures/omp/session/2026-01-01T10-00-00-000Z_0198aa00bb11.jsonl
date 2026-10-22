@@ -1,0 +1,2 @@
+{"type":"session","version":3,"id":"0198aa00bb11","timestamp":"2026-01-01T10:00:00.000Z","cwd":"/nonexistent/deck-fixture-src"}
+{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello fixture"}],"timestamp":1767261601000}}

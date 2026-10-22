@@ -1,0 +1,8 @@
+{"type":"session","version":3,"id":"s-roots","timestamp":"2026-03-02T10:00:00.000Z","cwd":"/w"}
+{"type":"message","id":"ra","parentId":null,"timestamp":"2026-03-02T10:00:01.000Z","message":{"role":"user","content":"root a"}}
+{"type":"message","id":"rb","parentId":"missing-parent","timestamp":"2026-03-02T10:00:02.000Z","message":{"role":"user","content":"orphan b"}}
+{"type":"message","id":"rc","parentId":"rc","timestamp":"2026-03-02T10:00:03.000Z","message":{"role":"user","content":"self c"}}
+{"type":"message","id":"aa","parentId":"ra","timestamp":"2026-03-02T10:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"stopReason":"stop"}}
+{"type":"message","id":"ra","parentId":null,"timestamp":"2026-03-02T10:00:05.000Z","message":{"role":"user","content":"duplicate id ignored"}}
+not json at all
+{"type":"message","id":"ub","parentId":"rb","timestamp":"2026-03-02T10:00:06.000Z","message":{"role":"user","content":"under orphan"}}

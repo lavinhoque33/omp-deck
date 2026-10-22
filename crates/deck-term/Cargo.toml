@@ -1,0 +1,20 @@
+[package]
+name = "deck-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+egui.workspace = true
+epaint.workspace = true
+alacritty_terminal.workspace = true
+arboard.workspace = true
+thiserror.workspace = true
+log.workspace = true
+# Same version alacritty_terminal 0.26 uses: its EventedReadWrite trait takes polling types.
+polling = "3.11"
+
+[dev-dependencies]
+tempfile.workspace = true
+eframe.workspace = true

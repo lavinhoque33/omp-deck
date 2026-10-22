@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=OmpDeck
+GenericName=omp Session Manager
+Comment=Desktop wrapper for the omp coding-agent TUI
+Exec=omp-deck %f
+TryExec=omp-deck
+Icon=omp-deck
+Terminal=false
+Categories=Development;
+Keywords=omp;oh-my-pi;agent;terminal;tmux;ai;
+StartupWMClass=omp-deck
+StartupNotify=true

@@ -1,0 +1,2 @@
+{"type":"session","version":3,"id":"01b00002-0000-0000-0000-000000000002","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/srv/one"}
+{"type":"message","id":"m1","message":{"role":"user","content":"second dir same cwd","timestamp":1}}

@@ -1,0 +1,841 @@
+//! The top bars. With client-side decorations: a title row (icon + name, active title, window
+//! buttons) above the tab row; with native frames only the tab row (logo, tabs, settings, menu).
+//! Also the edge/corner resize zones and outline for the undecorated window.
+
+use deck_core::config::Theme;
+use deck_core::omp::UpdateKind;
+use egui::RichText;
+use egui::viewport::ResizeDirection;
+use egui::{
+    Align, Context, CursorIcon, Frame, Layout, PointerButton, Sense, Stroke, StrokeKind, UiBuilder,
+    ViewportCommand, pos2, vec2,
+};
+use egui_material_icons::icons::{
+    ICON_ADD, ICON_CLOSE, ICON_CROP_SQUARE, ICON_DARK_MODE, ICON_DOWNLOAD, ICON_EXTENSION,
+    ICON_FILTER_NONE, ICON_HISTORY, ICON_LIGHT_MODE, ICON_LOGOUT, ICON_MENU, ICON_MINIMIZE,
+    ICON_REFRESH, ICON_REMOVE, ICON_RESTART_ALT, ICON_ROCKET_LAUNCH, ICON_SETTINGS,
+    ICON_SWAP_HORIZ, ICON_TERMINAL, ICON_UPDATE, ICON_WINDOW,
+};
+
+use crate::tabs::{self, TabAction, TabBarInput};
+use crate::theme::{self, Palette};
+use crate::update::{Channel, UpdateState, status_line};
+use crate::widgets::{icon_button, icon_text, menu_item, paint_icon, win_button};
+
+pub const BAR_H: f32 = tabs::TAB_HIT_H;
+const EDGE: f32 = 6.0;
+const CORNER: f32 = 10.0;
+/// Gap between the window's right edge and the window buttons (outside every resize zone).
+const CONTROL_INSET: f32 = 12.0;
+/// Width of the minimize / maximize / close cluster measured from the right window edge (three
+/// 40 px buttons, two 2 px gaps, [`CONTROL_INSET`]). The north resize edge stops short of it: the
+/// buttons are 30 px tall in the 32 px strip, so they reach into the top `EDGE` pixels.
+const CONTROL_W: f32 = CONTROL_INSET + 3.0 * 40.0 + 2.0 * 2.0;
+
+pub struct BarInput<'a> {
+    pub tabs: TabBarInput<'a>,
+    /// Draw window buttons and handle drag/resize (no native frame).
+    pub csd: bool,
+    pub maximized: bool,
+    pub settings_active: bool,
+    pub can_reopen: bool,
+    pub font_size: f32,
+    pub theme: Theme,
+    pub native_decorations: bool,
+    pub strip: StripInput<'a>,
+    pub omp: Option<OmpBar<'a>>,
+}
+
+/// omp CLI state shown in the bar; absent when omp was not found.
+pub struct OmpBar<'a> {
+    pub version: Option<&'a str>,
+    pub state: &'a UpdateState,
+    /// `(current, latest)` while an update is known.
+    pub available: Option<(&'a str, &'a str)>,
+    pub channel: Channel,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum BarAction {
+    Tab(TabAction),
+    OpenSettings,
+    Reopen,
+    Refresh,
+    FontLarger,
+    FontSmaller,
+    FontReset,
+    SetTheme(Theme),
+    SetNativeDecorations(bool),
+    /// Open an update tab (Omp or Plugins).
+    RunUpdate(UpdateKind),
+    /// Ask before switching channel (Canary / Stable).
+    SwitchChannel(UpdateKind),
+    CheckUpdates,
+    Quit,
+}
+
+/// Height of the title row (app name, active title, window buttons; client-side decorations only).
+pub const STRIP_H: f32 = 32.0;
+/// Width reserved at each end of the title row for the icon/name and the window buttons.
+const STRIP_SIDE_W: f32 = 160.0;
+
+/// The title strip's content: what the active tab is called, and where it lives.
+pub struct StripInput<'a> {
+    /// Already stripped of omp's `π <glyph> ` prefix; empty shows "OmpDeck".
+    pub title: &'a str,
+    pub cwd: Option<&'a std::path::Path>,
+    pub session: Option<&'a std::path::Path>,
+}
+
+/// omp's terminal title is `π <glyph> <label>` (glyph = state marker or spinner frame); returns
+/// the label, or the input unchanged when it does not carry that prefix.
+pub fn strip_omp_prefix(title: &str) -> &str {
+    let t = title.trim();
+    let Some(rest) = t.strip_prefix('π') else {
+        return t;
+    };
+    // `π` must be followed by whitespace, else it is part of the label.
+    if !rest.starts_with(char::is_whitespace) {
+        return t;
+    }
+    match rest.trim_start().split_once(char::is_whitespace) {
+        Some((_glyph, label)) => label.trim(),
+        None => "",
+    }
+}
+
+/// Native window title: `<tab> — OmpDeck`, plus ` — <folder>` in folder mode.
+pub fn window_title(tab: Option<&str>, folder: Option<&str>) -> String {
+    let mut s = match tab.filter(|t| !t.is_empty()) {
+        Some(t) => format!("{t} — OmpDeck"),
+        None => "OmpDeck".to_owned(),
+    };
+    if let Some(f) = folder {
+        s.push_str(" — ");
+        s.push_str(f);
+    }
+    s
+}
+
+/// The laid-out title, reused while nothing it depends on changes (the strip repaints often, the
+/// title rarely).
+#[derive(Clone)]
+struct StripGalley {
+    title: String,
+    max_w: f32,
+    ppp: f32,
+    color: egui::Color32,
+    galley: std::sync::Arc<egui::Galley>,
+}
+
+const STRIP_FONT_SIZE: f32 = 13.5;
+
+fn strip_galley(
+    ui: &egui::Ui,
+    text: &str,
+    max_w: f32,
+    color: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let id = egui::Id::unique("titlestrip-galley");
+    let ppp = ui.ctx().pixels_per_point();
+    if let Some(c) = ui.data(|d| d.get_temp::<StripGalley>(id))
+        && c.title == text
+        && c.max_w == max_w
+        && c.ppp == ppp
+        && c.color == color
+    {
+        return c.galley;
+    }
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        text.to_owned(),
+        egui::FontId::proportional(STRIP_FONT_SIZE),
+        color,
+    );
+    job.wrap.max_width = max_w;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = ui.painter().layout_job(job);
+    ui.data_mut(|d| {
+        d.insert_temp(
+            id,
+            StripGalley {
+                title: text.to_owned(),
+                max_w,
+                ppp,
+                color,
+                galley: galley.clone(),
+            },
+        );
+    });
+    galley
+}
+
+/// The CSD title strip: centered, ellipsized active-tab title; drags / maximizes the window.
+fn title_strip(ui: &mut egui::Ui, input: &BarInput<'_>) {
+    let ctx = ui.ctx().clone();
+    let pal = Palette::of_ui(ui);
+    egui::Panel::top("titlestrip")
+        .exact_size(STRIP_H)
+        .show_separator_line(false)
+        .frame(Frame::NONE)
+        .show(ui, |ui| {
+            let rect = ui.max_rect();
+            theme::gradient_rect(
+                ui.painter(),
+                rect,
+                theme::mix(pal.bar, pal.accent_a, 0.10),
+                theme::mix(pal.bar, pal.accent_b, 0.05),
+                true,
+            );
+            let drag = ui.interact(
+                rect,
+                ui.next_auto_id().with("strip-drag"),
+                Sense::click_and_drag(),
+            );
+            if drag.drag_started_by(PointerButton::Primary) {
+                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+            if drag.double_clicked() {
+                ctx.send_viewport_cmd(ViewportCommand::Maximized(!input.maximized));
+            }
+            let strip = &input.strip;
+            let text = if strip.title.is_empty() {
+                "OmpDeck"
+            } else {
+                strip.title
+            };
+
+            // Left: icon + name.
+            let left_rect = egui::Rect::from_min_max(
+                pos2(rect.left() + 12.0, rect.top()),
+                pos2(rect.left() + STRIP_SIDE_W, rect.bottom()),
+            );
+            ui.scope_builder(
+                UiBuilder::new()
+                    .max_rect(left_rect)
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    logo(ui, pal, true);
+                },
+            );
+
+            // Right: minimize / maximize-restore / close.
+            let right_rect = egui::Rect::from_min_max(
+                pos2(rect.right() - STRIP_SIDE_W, rect.top()),
+                pos2(rect.right() - CONTROL_INSET, rect.bottom()),
+            );
+            ui.scope_builder(
+                UiBuilder::new()
+                    .max_rect(right_rect)
+                    .layout(Layout::right_to_left(Align::Center)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    if win_button(ui, ICON_CLOSE, "Close", true).clicked() {
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                    let (icon, tip) = if input.maximized {
+                        (ICON_FILTER_NONE, "Restore")
+                    } else {
+                        (ICON_CROP_SQUARE, "Maximize")
+                    };
+                    if win_button(ui, icon, tip, false).clicked() {
+                        ctx.send_viewport_cmd(ViewportCommand::Maximized(!input.maximized));
+                    }
+                    if win_button(ui, ICON_MINIMIZE, "Minimize", false).clicked() {
+                        ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                    }
+                },
+            );
+
+            // Center: the active tab's title, centered on the window and clear of both groups.
+            let max_w = (rect.width() - 2.0 * (STRIP_SIDE_W + 8.0)).max(40.0);
+            let galley = strip_galley(ui, text, max_w, pal.text_strong);
+            let pos = rect.center() - galley.size() / 2.0;
+            ui.painter().galley(pos, galley, pal.text_strong);
+            if strip.cwd.is_some() || strip.session.is_some() {
+                drag.on_hover_ui(|ui| {
+                    if let Some(c) = strip.cwd {
+                        ui.label(format!("cwd: {}", c.display()));
+                    }
+                    if let Some(s) = strip.session {
+                        ui.label(format!("session: {}", s.display()));
+                    }
+                });
+            }
+        });
+}
+
+/// Draws the bar; returns the action requested this frame.
+pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
+    let ctx = ui.ctx().clone();
+    let pal = Palette::of_ui(ui);
+    let mut action = None;
+    if input.csd {
+        title_strip(ui, input);
+    }
+    egui::Panel::top("titlebar")
+        .exact_size(BAR_H)
+        .show_separator_line(false)
+        .frame(Frame::NONE)
+        .show(ui, |ui| {
+            let rect = ui.max_rect();
+            let p = ui.painter();
+            theme::gradient_rect(
+                p,
+                rect,
+                theme::mix(pal.bar, pal.accent_a, 0.10),
+                theme::mix(pal.bar, pal.accent_b, 0.05),
+                true,
+            );
+            p.hline(
+                rect.x_range(),
+                rect.bottom() - 0.5,
+                Stroke::new(1.0, pal.stroke),
+            );
+
+            // The window drags from empty bar space only (tabs and buttons win hit-testing).
+            if input.csd {
+                let drag = ui.interact(
+                    rect,
+                    ui.next_auto_id().with("bar-drag"),
+                    Sense::click_and_drag(),
+                );
+                if drag.drag_started_by(PointerButton::Primary) {
+                    ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                }
+                if drag.double_clicked() {
+                    ctx.send_viewport_cmd(ViewportCommand::Maximized(!input.maximized));
+                }
+            }
+
+            let badge_w = input
+                .omp
+                .as_ref()
+                .and_then(|o| o.available)
+                .map_or(0.0, |(_, latest)| {
+                    4.0 + badge_width(&badge_galley(ui, &format!("Update {latest}")))
+                });
+            let right_w = 68.0 + badge_w + 12.0;
+            let right_rect = egui::Rect::from_min_max(
+                pos2(rect.right() - right_w, rect.top()),
+                pos2(rect.right(), rect.bottom()),
+            );
+            ui.scope_builder(
+                UiBuilder::new()
+                    .max_rect(right_rect)
+                    .layout(Layout::right_to_left(Align::Center)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.add_space(8.0);
+                    let menu = icon_button(ui, ICON_MENU, "Menu", false);
+                    if let Some(a) = app_menu(&menu, input) {
+                        action = Some(a);
+                    }
+                    if icon_button(ui, ICON_SETTINGS, "Settings", input.settings_active).clicked() {
+                        action = Some(BarAction::OpenSettings);
+                    }
+                    if let Some(o) = &input.omp
+                        && let Some((_, latest)) = o.available
+                    {
+                        ui.add_space(4.0);
+                        let badge = update_badge(ui, &format!("Update {latest}"));
+                        if let Some(a) = update_popover(&badge, o) {
+                            action = Some(a);
+                        }
+                    }
+                },
+            );
+
+            let left_rect = egui::Rect::from_min_max(
+                pos2(rect.left() + 12.0, rect.top()),
+                pos2(right_rect.left() - 8.0, rect.bottom()),
+            );
+            let bar_at = |x: f32| {
+                let t = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                theme::mix(
+                    theme::mix(pal.bar, pal.accent_a, 0.10),
+                    theme::mix(pal.bar, pal.accent_b, 0.05),
+                    t,
+                )
+            };
+            let fade = (bar_at(left_rect.left()), bar_at(left_rect.right()));
+            ui.scope_builder(
+                UiBuilder::new()
+                    .max_rect(left_rect)
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| {
+                    // Whatever does not fit is clipped, never drawn over the right-hand buttons.
+                    let clip = ui.clip_rect().intersect(left_rect);
+                    ui.set_clip_rect(clip);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if input.csd {
+                        // Icon, name and window buttons live in the title row above.
+                        ui.add_space(2.0);
+                    } else {
+                        logo(ui, pal, false);
+                        ui.add_space(4.0);
+                        let (r, _) = ui.allocate_exact_size(vec2(1.0, 20.0), Sense::hover());
+                        ui.painter().rect_filled(r, 0, pal.stroke);
+                        ui.add_space(2.0);
+                    }
+                    if let Some(a) = tabs::show_tab_strip(ui, &input.tabs, fade)
+                        && action.is_none()
+                    {
+                        action = Some(BarAction::Tab(a));
+                    }
+                },
+            );
+        });
+    action
+}
+
+/// App icon plus the "OmpDeck" wordmark; `compact` is the slim title-row variant.
+fn logo(ui: &mut egui::Ui, pal: &Palette, compact: bool) {
+    let (side, radius, glyph, text) = if compact {
+        (22.0, 6.0, 14.0, 14.0)
+    } else {
+        (28.0, 8.0, 17.0, 15.0)
+    };
+    let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
+    let p = ui.painter();
+    let glow = egui::Shadow {
+        offset: [0, 2],
+        blur: if compact { 10 } else { 14 },
+        spread: 0,
+        color: pal.accent_a.gamma_multiply(0.45),
+    };
+    p.add(glow.as_shape(rect, egui::CornerRadius::same(radius as u8)));
+    theme::gradient_rounded(p, rect, radius, pal.accent_a, pal.accent_b);
+    paint_icon(
+        p,
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        ICON_TERMINAL,
+        glyph,
+        egui::Color32::WHITE,
+    );
+    ui.label(theme::strong("OmpDeck").size(text).color(pal.text_strong));
+}
+
+fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> {
+    let mut action = None;
+    theme::dropdown_menu(button, 250.0, |ui| {
+        ui.set_min_width(250.0);
+        let pal = Palette::of_ui(ui);
+        fn pick(ui: &mut egui::Ui, slot: &mut Option<BarAction>, a: BarAction) {
+            *slot = Some(a);
+            ui.close();
+        }
+        if menu_item(
+            ui,
+            ICON_HISTORY,
+            "Reopen closed tab",
+            Some("Ctrl+Shift+T"),
+            input.can_reopen,
+            false,
+        )
+        .clicked()
+        {
+            pick(ui, &mut action, BarAction::Reopen);
+        }
+        if menu_item(ui, ICON_REFRESH, "Refresh sessions", None, true, false).clicked() {
+            pick(ui, &mut action, BarAction::Refresh);
+        }
+        if let Some(o) = &input.omp {
+            let checking = *o.state == UpdateState::Checking;
+            let label = if checking {
+                "Checking for updates…"
+            } else {
+                "Check for updates"
+            };
+            if menu_item(ui, ICON_UPDATE, label, None, !checking, false).clicked() {
+                pick(ui, &mut action, BarAction::CheckUpdates);
+            }
+            omp_submenu(ui, o, &mut action);
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.add_space(10.0);
+            ui.label(icon_text(
+                egui_material_icons::icons::ICON_FORMAT_SIZE,
+                17.0,
+                pal.accent,
+            ));
+            ui.label("Font size");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(4.0);
+                let small = |icon| {
+                    egui::Button::new(icon_text(icon, 16.0, pal.text)).min_size(vec2(26.0, 26.0))
+                };
+                if ui
+                    .add(small(ICON_RESTART_ALT))
+                    .on_hover_text("Reset (Ctrl+Shift+0)")
+                    .clicked()
+                {
+                    action = Some(BarAction::FontReset);
+                }
+                if ui
+                    .add(small(ICON_ADD))
+                    .on_hover_text("Larger (Ctrl+Shift+=)")
+                    .clicked()
+                {
+                    action = Some(BarAction::FontLarger);
+                }
+                ui.label(theme::strong(format!("{:.0}", input.font_size)).color(pal.text_strong));
+                if ui
+                    .add(small(ICON_REMOVE))
+                    .on_hover_text("Smaller (Ctrl+Shift+-)")
+                    .clicked()
+                {
+                    action = Some(BarAction::FontSmaller);
+                }
+            });
+        });
+        let (icon, label, target) = match input.theme {
+            Theme::Dark => (ICON_LIGHT_MODE, "Light theme", Theme::Light),
+            Theme::Light => (ICON_DARK_MODE, "Dark theme", Theme::Dark),
+        };
+        if menu_item(ui, icon, label, None, true, false).clicked() {
+            pick(ui, &mut action, BarAction::SetTheme(target));
+        }
+        let state = if input.native_decorations {
+            "On"
+        } else {
+            "Off"
+        };
+        if menu_item(
+            ui,
+            ICON_WINDOW,
+            "Native title bar",
+            Some(state),
+            true,
+            false,
+        )
+        .clicked()
+        {
+            pick(
+                ui,
+                &mut action,
+                BarAction::SetNativeDecorations(!input.native_decorations),
+            );
+        }
+        ui.separator();
+        if menu_item(ui, ICON_LOGOUT, "Quit", None, true, false).clicked() {
+            pick(ui, &mut action, BarAction::Quit);
+        }
+    });
+    action
+}
+
+/// Pill-shaped accent-gradient badge announcing an available update.
+fn update_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let pal = Palette::of_ui(ui);
+    let galley = badge_galley(ui, label);
+    let (rect, resp) = ui.allocate_exact_size(vec2(badge_width(&galley), 28.0), Sense::click());
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+    let p = ui.painter();
+    let glow = egui::Shadow {
+        offset: [0, 2],
+        blur: 12,
+        spread: 0,
+        color: pal.accent_a.gamma_multiply(0.30 + 0.25 * hov),
+    };
+    p.add(glow.as_shape(rect, egui::CornerRadius::same(14)));
+    theme::gradient_rounded(p, rect, 14.0, pal.accent_a, pal.accent_b);
+    p.rect_stroke(
+        rect,
+        14,
+        Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.18 + 0.25 * hov)),
+        StrokeKind::Inside,
+    );
+    paint_icon(
+        p,
+        pos2(rect.left() + 10.0 + 8.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        ICON_DOWNLOAD,
+        16.0,
+        egui::Color32::WHITE,
+    );
+    p.galley(
+        pos2(
+            rect.left() + 10.0 + 16.0 + 6.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        egui::Color32::WHITE,
+    );
+    resp.on_hover_text("An omp update is available")
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn badge_galley(ui: &egui::Ui, label: &str) -> std::sync::Arc<egui::Galley> {
+    ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::proportional(13.0),
+        egui::Color32::WHITE,
+    )
+}
+
+fn badge_width(galley: &egui::Galley) -> f32 {
+    10.0 + 16.0 + 6.0 + galley.size().x + 14.0
+}
+
+/// The popover under the update badge.
+fn update_popover(badge: &egui::Response, o: &OmpBar<'_>) -> Option<BarAction> {
+    let mut action = None;
+    theme::dropdown_menu(badge, 280.0, |ui| {
+        ui.set_min_width(280.0);
+        let pal = Palette::of_ui(ui);
+        if let Some((current, latest)) = o.available {
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        let title = |t: String| theme::strong(t).size(14.5).color(pal.text_strong);
+                        ui.label(title("omp".to_owned()));
+                        ui.label(title(latest.to_owned()));
+                        ui.label(title("is available".to_owned()));
+                    });
+                    ui.label(
+                        RichText::new(format!("Installed: {current}"))
+                            .small()
+                            .color(pal.weak),
+                    );
+                });
+            });
+            ui.add_space(2.0);
+            ui.separator();
+        }
+        update_actions(ui, o, &mut action);
+    });
+    action
+}
+
+/// Update / channel / check items shared by the badge popover and the app menu's omp submenu.
+fn update_actions(ui: &mut egui::Ui, o: &OmpBar<'_>, action: &mut Option<BarAction>) {
+    fn pick(ui: &mut egui::Ui, slot: &mut Option<BarAction>, a: BarAction) {
+        *slot = Some(a);
+        ui.close();
+    }
+    if menu_item(ui, ICON_DOWNLOAD, "Update omp", None, true, false).clicked() {
+        pick(ui, action, BarAction::RunUpdate(UpdateKind::Omp));
+    }
+    if menu_item(ui, ICON_EXTENSION, "Update plugins", None, true, false).clicked() {
+        pick(ui, action, BarAction::RunUpdate(UpdateKind::Plugins));
+    }
+    let kind = o.channel.switch_kind();
+    let label = match o.channel {
+        Channel::Stable => "Switch to canary channel…",
+        Channel::Canary => "Switch to stable channel…",
+    };
+    if menu_item(ui, ICON_SWAP_HORIZ, label, None, true, false).clicked() {
+        pick(ui, action, BarAction::SwitchChannel(kind));
+    }
+    ui.separator();
+    let checking = *o.state == UpdateState::Checking;
+    let check = if checking {
+        "Checking…"
+    } else {
+        "Check again"
+    };
+    if menu_item(ui, ICON_REFRESH, check, None, !checking, false).clicked() {
+        pick(ui, action, BarAction::CheckUpdates);
+    }
+}
+
+/// "omp" submenu of the app menu: version, status and the update actions.
+fn omp_submenu(ui: &mut egui::Ui, o: &OmpBar<'_>, action: &mut Option<BarAction>) {
+    let pal = Palette::of_ui(ui);
+    ui.menu_button(
+        (
+            icon_text(ICON_ROCKET_LAUNCH, 17.0, pal.accent),
+            RichText::new("omp").color(pal.text),
+        ),
+        |ui| {
+            ui.set_min_width(250.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    let version = o
+                        .version
+                        .map_or_else(|| "omp".to_owned(), |v| format!("omp {v}"));
+                    ui.label(theme::strong(version).color(pal.text_strong));
+                    ui.label(RichText::new(status_line(o.state)).small().color(pal.weak));
+                });
+            });
+            ui.add_space(2.0);
+            ui.separator();
+            update_actions(ui, o, action);
+        },
+    );
+}
+
+/// Window outline plus edge/corner resize zones (undecorated window, not maximized).
+///
+/// Each zone is its own foreground widget that only starts a resize when it owns the press, so
+/// the window controls (inset by [`CONTROL_INSET`]) and any popup above it are never shadowed.
+pub fn window_chrome(ctx: &Context, maximized: bool) {
+    let screen = ctx.content_rect();
+    if maximized {
+        return;
+    }
+    let pal = Palette::of_ctx(ctx);
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("window-outline"),
+    ));
+    painter.rect_stroke(screen, 0, Stroke::new(1.0, pal.stroke), StrokeKind::Inside);
+    for (i, (rect, dir, cursor)) in resize_zones(screen).into_iter().enumerate() {
+        egui::Area::new(egui::Id::unique(("window-resize-zone", i)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .constrain(false)
+            .show(ctx, |ui| {
+                let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(cursor);
+                    if ui.input(|i| i.pointer.button_pressed(PointerButton::Primary)) {
+                        ui.ctx()
+                            .send_viewport_cmd(ViewportCommand::BeginResize(dir));
+                    }
+                }
+            });
+    }
+}
+
+/// The 8 resize zones of a window occupying `screen`: four corners (`CORNER`²) and the four edges
+/// between them (`EDGE` thick; the north one ends left of the window controls). They never
+/// overlap each other.
+fn resize_zones(screen: egui::Rect) -> [(egui::Rect, ResizeDirection, CursorIcon); 8] {
+    use ResizeDirection as D;
+    let (l, r, t, b) = (screen.left(), screen.right(), screen.top(), screen.bottom());
+    let rect =
+        |x0: f32, y0: f32, x1: f32, y1: f32| egui::Rect::from_min_max(pos2(x0, y0), pos2(x1, y1));
+    [
+        (
+            rect(l, t, l + CORNER, t + CORNER),
+            D::NorthWest,
+            CursorIcon::ResizeNorthWest,
+        ),
+        (
+            rect(r - CORNER, t, r, t + CORNER),
+            D::NorthEast,
+            CursorIcon::ResizeNorthEast,
+        ),
+        (
+            rect(l, b - CORNER, l + CORNER, b),
+            D::SouthWest,
+            CursorIcon::ResizeSouthWest,
+        ),
+        (
+            rect(r - CORNER, b - CORNER, r, b),
+            D::SouthEast,
+            CursorIcon::ResizeSouthEast,
+        ),
+        (
+            rect(l + CORNER, t, r - CONTROL_W, t + EDGE),
+            D::North,
+            CursorIcon::ResizeNorth,
+        ),
+        (
+            rect(l + CORNER, b - EDGE, r - CORNER, b),
+            D::South,
+            CursorIcon::ResizeSouth,
+        ),
+        (
+            rect(l, t + CORNER, l + EDGE, b - CORNER),
+            D::West,
+            CursorIcon::ResizeWest,
+        ),
+        (
+            rect(r - EDGE, t + CORNER, r, b - CORNER),
+            D::East,
+            CursorIcon::ResizeEast,
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen() -> egui::Rect {
+        egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0))
+    }
+
+    /// Positive-area intersection (rectangles that merely touch do not overlap).
+    fn overlap(a: egui::Rect, b: egui::Rect) -> bool {
+        let i = a.intersect(b);
+        i.width() > 0.0 && i.height() > 0.0
+    }
+
+    #[test]
+    fn zones_do_not_overlap_each_other() {
+        let zones = resize_zones(screen());
+        for (i, a) in zones.iter().enumerate() {
+            for b in &zones[i + 1..] {
+                assert!(!overlap(a.0, b.0), "{:?} overlaps {:?}", a.1, b.1);
+            }
+        }
+    }
+
+    #[test]
+    fn zones_leave_the_window_controls_alone() {
+        // The control cluster: three 40x30 buttons centered in the strip, inset from the edge.
+        let controls = egui::Rect::from_min_max(
+            pos2(
+                screen().right() - CONTROL_W,
+                screen().top() + (STRIP_H - 30.0) / 2.0,
+            ),
+            pos2(
+                screen().right() - CONTROL_INSET,
+                screen().top() + (STRIP_H + 30.0) / 2.0,
+            ),
+        );
+        for (rect, dir, _) in resize_zones(screen()) {
+            assert!(!overlap(rect, controls), "{dir:?} covers the controls");
+        }
+    }
+
+    #[test]
+    fn zone_directions_match_their_position() {
+        let s = screen();
+        let dir_at = |p: egui::Pos2| {
+            resize_zones(s)
+                .into_iter()
+                .find(|z| z.0.contains(p))
+                .map(|z| z.1)
+        };
+        assert_eq!(dir_at(pos2(1.0, 1.0)), Some(ResizeDirection::NorthWest));
+        assert_eq!(dir_at(pos2(999.0, 699.0)), Some(ResizeDirection::SouthEast));
+        assert_eq!(dir_at(pos2(999.0, 300.0)), Some(ResizeDirection::East));
+        assert_eq!(dir_at(pos2(500.0, 699.0)), Some(ResizeDirection::South));
+        assert_eq!(dir_at(pos2(500.0, 300.0)), None);
+    }
+
+    #[test]
+    fn omp_prefix_is_stripped_from_titles() {
+        assert_eq!(strip_omp_prefix("π > my project"), "my project");
+        assert_eq!(strip_omp_prefix("π ⠦ fix the bug"), "fix the bug");
+        assert_eq!(strip_omp_prefix("π ! "), "");
+        assert_eq!(strip_omp_prefix("π"), "π");
+        assert_eq!(strip_omp_prefix("Settings"), "Settings");
+        assert_eq!(strip_omp_prefix("πrate ship"), "πrate ship");
+    }
+
+    #[test]
+    fn window_title_names_tab_app_and_folder() {
+        assert_eq!(window_title(Some("proj"), None), "proj — OmpDeck");
+        assert_eq!(
+            window_title(Some("proj"), Some("work")),
+            "proj — OmpDeck — work"
+        );
+        assert_eq!(window_title(None, None), "OmpDeck");
+        assert_eq!(window_title(Some(""), Some("work")), "OmpDeck — work");
+    }
+}

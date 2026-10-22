@@ -1,0 +1,261 @@
+// ompdeck-ctl.ts — OmpDeck control extension (protocol v:1).
+// Load with: omp -e <path>; env OMPDECK_CTL_DIR selects the socket dir. Inert when unset.
+// Any failure (version drift of omp internals, I/O) degrades to "no socket" or an error reply; it never throws into omp.
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+const DIR = process.env.OMPDECK_CTL_DIR;
+const LOG = process.env.OMPDECK_CTL_LOG; // debug only
+const log = (s: string) => {
+  if (!LOG) return;
+  try { fs.appendFileSync(LOG, `${new Date().toISOString()} ${s}\n`); } catch {}
+};
+const G = globalThis as any; // process-wide: the factory runs for the main session and for every subagent session
+
+export default async function ompdeckCtl(api: any) {
+  if (!DIR) return; // not launched by OmpDeck -> inert
+  try {
+    // Internal modules are bundled in the omp binary; literal specifiers only (non-literal dynamic import fails).
+    let AgentLifecycleManager: any, AgentRegistry: any, sessionFileBelongsToRoot: any, SessionManager: any;
+    try {
+      ({ AgentLifecycleManager } = await import("@oh-my-pi/pi-coding-agent/registry/agent-lifecycle"));
+      ({ AgentRegistry } = await import("@oh-my-pi/pi-coding-agent/registry/agent-registry"));
+      ({ sessionFileBelongsToRoot } = await import("@oh-my-pi/pi-coding-agent/registry/persisted-agents"));
+    } catch (e) { log("internal import failed: " + e); return; }
+    // Optional: only fork_at needs it; without it that op answers with an error.
+    try { ({ SessionManager } = await import("@oh-my-pi/pi-coding-agent/session/session-manager")); } catch (e) { log("session-manager import failed: " + e); }
+    if (!AgentLifecycleManager || !AgentRegistry || typeof sessionFileBelongsToRoot !== "function") { log("internal API missing"); return; }
+
+    const isMain = (ctx: any) => ctx?.agent?.kind === "main";
+    api.on("session_start", (_ev: any, ctx: any) => { try { if (isMain(ctx)) start(ctx); } catch (e) { log("start failed: " + e); } });
+    api.on("session_switch", (ev: any, ctx: any) => { try { if (isMain(ctx)) { log(`session_switch ${ev?.reason}`); G.__ompdeckCtl?.setCtx(ctx); } } catch (e) { log("switch failed: " + e); } });
+    api.on("session_shutdown", (_ev: any, ctx: any) => { try { if (isMain(ctx)) stop(); } catch (e) { log("stop failed: " + e); } });
+
+    function start(ctx: any) {
+      if (G.__ompdeckCtl) { G.__ompdeckCtl.setCtx(ctx); return; }
+      const registry = AgentRegistry.global();
+      const clients = new Set<any>();
+      let mainCtx = ctx;
+      let pending: any;
+      const rootFile = (): string | null => { try { return mainCtx.sessionManager.getSessionFile?.() ?? null; } catch { return null; } };
+      const mainIdle = (): boolean | null => { try { return typeof mainCtx.isIdle === "function" ? !!mainCtx.isIdle() : null; } catch { return null; } };
+      const mainLeaf = (): string | null => { try { return mainCtx.sessionManager.getLeafId?.() ?? null; } catch { return null; } };
+
+      const snapshot = () => {
+        const root = rootFile();
+        let agents: any[] = [];
+        try {
+          // The registry is process-global and keeps agents of earlier sessions (/new, /resume): scope to the current root like the Hub.
+          agents = registry.list()
+            .filter((r: any) => r.kind !== "main" && r.sessionFile && root && sessionFileBelongsToRoot(r.sessionFile, root))
+            .map((r: any) => ({
+              id: r.id, name: r.displayName, kind: r.kind, parent: r.parentId ?? null, status: r.status, // running|idle|parked|aborted
+              activity: r.activity ?? null, live: !!r.session, streaming: r.session?.isStreaming ?? null,
+              createdAt: r.createdAt, lastActivity: r.lastActivity, sessionFile: r.sessionFile,
+              model: r.history?.resolvedModel ?? null,
+            }));
+        } catch (e) { log("snapshot failed: " + e); }
+        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents };
+      };
+      const write = (c: any, l: string) => { try { c.write(l); } catch {} };
+      const push = (m: unknown) => {
+        if (!clients.size) return;
+        let l: string; try { l = JSON.stringify(m) + "\n"; } catch { return; }
+        for (const c of clients) write(c, l);
+      };
+      const schedule = () => { if (pending) return; pending = setTimeout(() => { pending = undefined; push(snapshot()); }, 50); };
+
+      // fork_at: omp's AgentSession.#zr: a cut at a tool-calling assistant (or inside its batch) extends over the matching toolResults so no call is left unpaired.
+      function forkCut(sm: any, id: string): string {
+        const answered = new Set<string>();
+        let assistant: any;
+        const branch: any[] = sm.getBranch(id);
+        for (let i = branch.length - 1; i >= 0; i--) {
+          const e = branch[i];
+          if (e.type !== "message") continue;
+          if (e.message.role === "toolResult") { answered.add(e.message.toolCallId); continue; }
+          if (e.message.role === "assistant") assistant = e.message;
+          break;
+        }
+        const pending = new Set<string>();
+        for (const b of assistant?.content ?? []) if (b.type === "toolCall" && !answered.has(b.id)) pending.add(b.id);
+        let cut = id, cur = id;
+        while (pending.size > 0) {
+          const kids: any[] = sm.getChildren(cur);
+          const hit = kids.findLast((k: any) => k.type === "message" && k.message.role === "toolResult" && pending.has(k.message.toolCallId));
+          if (hit) { pending.delete(hit.message.toolCallId); cut = cur = hit.id; continue; }
+          if (kids.length !== 1 || kids[0].type === "message") break;
+          cur = kids[0].id;
+        }
+        return cut;
+      }
+
+      async function handle(cmd: any): Promise<any> {
+        if (cmd.t === "list") return { ok: true, snapshot: snapshot() };
+        if (cmd.t === "fork_at" || cmd.t === "navigate") {
+          const want = rootFile();
+          if (typeof cmd.root !== "string" || !want || cmd.root !== want) return { ok: false, error: "session changed" };
+          const sm = mainCtx.sessionManager;
+          const id = String(cmd.entryId ?? "");
+          const entry = sm.getEntry?.(id);
+          if (!entry) return { ok: false, error: "no such entry" };
+          if (cmd.t === "navigate") {
+            // navigateTree has no streaming guard of its own: idle only.
+            if (mainIdle() !== true) return { ok: false, error: "busy" };
+            const cc = registry.get("Main")?.session?.extensionRunner?.createCommandContext?.();
+            if (typeof cc?.navigateTree !== "function") return { ok: false, error: "navigation unavailable" };
+            const r = await cc.navigateTree(id, { summarize: false });
+            schedule();
+            if (r?.cancelled) return { ok: false, error: "navigation cancelled" };
+            return { ok: true, leaf: mainLeaf() };
+          }
+          if (entry.type !== "message") return { ok: false, error: "only message entries can be forked" };
+          if (!SessionManager) return { ok: false, error: "fork unavailable" };
+          // Second manager on the same file: the live tab keeps its session, leaf and screen.
+          await sm.flush?.();
+          const file = sm.getSessionFile?.();
+          if (!file) return { ok: false, error: "session has no file" };
+          const m2 = await SessionManager.open(file, undefined, undefined, { suppressBreadcrumb: true });
+          try {
+            const newFile = m2.createBranchedSession(forkCut(m2, id), { copyArtifacts: true });
+            await m2.flush?.();
+            if (!newFile) return { ok: false, error: "fork produced no file" };
+            return { ok: true, newFile };
+          } finally { try { await m2.close?.(); } catch {} }
+        }
+        if (cmd.t !== "kill" && cmd.t !== "revive" && cmd.t !== "chat") return { ok: false, error: "unknown cmd" };
+        // The tab may have moved to another root session (/new, /resume) since the command was composed.
+        const want = rootFile();
+        if (typeof cmd.root !== "string" || !want || cmd.root !== want) return { ok: false, error: "session changed" };
+        const lifecycle = AgentLifecycleManager.global();
+        const ref = registry.get(String(cmd.id));
+        if (!ref || ref.kind !== "sub") return { ok: false, error: "no such subagent" };
+        // The registry keeps agents of earlier sessions (/new, /fork, /resume): only the current root's agents are controllable.
+        const root = rootFile();
+        let owned = false;
+        try { owned = !!(root && ref.sessionFile && sessionFileBelongsToRoot(ref.sessionFile, root)); } catch {}
+        if (!owned) return { ok: false, error: "no such subagent" };
+        switch (cmd.t) {
+          case "kill": // == Hub `x`
+            if (ref.status === "running" && ref.session) await ref.session.abort({ reason: "OmpDeck kill" });
+            return { ok: true, released: await lifecycle.release(ref.id, ref, { tombstone: true }) };
+          case "revive": // == Hub `r`
+            await lifecycle.ensureLive(ref.id); return { ok: true, status: registry.get(ref.id)?.status };
+          default: { // chat == transcript-viewer input: revives parked, steers running, prompts idle
+            const s = await lifecycle.ensureLive(ref.id);
+            // prompt() resolves when the whole turn ends: reply once it has been accepted (it did not reject
+            // within the grace window) and only log a later failure.
+            const turn = Promise.resolve(s.prompt(String(cmd.text ?? ""), { streamingBehavior: "steer" }));
+            const early = await Promise.race([
+              turn.then(() => undefined, (e: any) => ({ error: String(e?.message ?? e) })),
+              new Promise<undefined>(r => setTimeout(r, 300)),
+            ]);
+            turn.catch((e: any) => log("chat turn failed: " + e));
+            return early ? { ok: false, error: early.error } : { ok: true };
+          }
+        }
+      }
+      const reply = (s: any, rid: any, r: any) => { let l: string; try { l = JSON.stringify({ t: "reply", rid, ...r }) + "\n"; } catch { l = JSON.stringify({ t: "reply", rid, ok: false, error: "unserializable reply" }) + "\n"; } write(s, l); };
+
+      // ---- endpoint ownership ----
+      // The dir must be a private real directory of ours (created 0700 if missing); never chmod/follow anything.
+      const me = process.getuid?.();
+      const sockPath = path.join(DIR!, "ctl.sock");
+      if (Buffer.byteLength(sockPath) >= 108) { log("socket path too long"); return; }
+      try { fs.mkdirSync(DIR!, { recursive: true, mode: 0o700 }); } catch (e) { log("mkdir failed: " + e); return; }
+      try {
+        const st = fs.lstatSync(DIR!);
+        if (!st.isDirectory() || (me !== undefined && st.uid !== me) || (st.mode & 0o077) !== 0) { log("ctl dir not private"); return; }
+      } catch (e) { log("ctl dir stat failed: " + e); return; }
+      // Exclusive ownership via an O_EXCL pid file; a lock whose pid is dead is reclaimed, a live one means another omp serves this dir.
+      const lockPath = path.join(DIR!, "ctl.lock");
+      // Lock content: "<pid> <starttime>" (/proc/<pid>/stat field 22, parsed after the last ')'). Stale = pid dead or start time differs (pid reuse).
+      const startTime = (pid: number): string | null => {
+        try { const st = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); return st.slice(st.lastIndexOf(")") + 1).trim().split(/\s+/)[19] ?? null; } catch { return null; }
+      };
+      const myStart = startTime(process.pid);
+      const myLock = `${process.pid} ${myStart ?? ""}`.trim();
+      const parseLock = (t: string): { pid: number; start: string | null } => { const [p, s] = t.trim().split(/\s+/); return { pid: parseInt(p, 10), start: s ?? null }; };
+      const ownerLive = (t: string): boolean => {
+        const { pid, start } = parseLock(t);
+        if (!Number.isFinite(pid) || pid <= 0) return false;
+        const now = startTime(pid);
+        if (now === null) return false;
+        return start === null ? true : start === now;
+      };
+      const tryLock = (): boolean => {
+        try { const fd = fs.openSync(lockPath, "wx", 0o600); try { fs.writeSync(fd, myLock); } finally { fs.closeSync(fd); } return true; }
+        catch (e: any) { if (e?.code !== "EEXIST") { log("lock failed: " + e); } return false; }
+      };
+      let locked = tryLock();
+      if (!locked) {
+        let holder = ""; try { holder = fs.readFileSync(lockPath, "utf8"); } catch {}
+        if (holder !== myLock && ownerLive(holder)) { log(`dir owned by live lock ${holder}`); return; }
+        // Stale (dead pid, or unreadable/garbage): move it aside atomically, confirm it is the one we judged stale, retry once.
+        const aside = `${lockPath}.stale.${process.pid}`;
+        try {
+          fs.renameSync(lockPath, aside);
+          let got = ""; try { got = fs.readFileSync(aside, "utf8"); } catch {}
+          if (got === holder) { fs.unlinkSync(aside); locked = tryLock(); }
+          else { try { fs.linkSync(aside, lockPath); } catch {} try { fs.unlinkSync(aside); } catch {} log("lost lock reclaim race"); return; }
+        } catch (e) { log("stale lock reclaim failed: " + e); return; }
+        if (!locked) return;
+      }
+      const unlock = () => { try { if (fs.readFileSync(lockPath, "utf8") === myLock) fs.unlinkSync(lockPath); } catch {} };
+      // We hold the lock, so any socket here is a leftover of a dead process; still only unlink an actual socket of ours.
+      try {
+        const st = fs.lstatSync(sockPath);
+        if (!st.isSocket() || (me !== undefined && st.uid !== me)) { log("refusing to replace non-socket at ctl.sock"); unlock(); return; }
+        fs.unlinkSync(sockPath);
+      } catch (e: any) { if (e?.code !== "ENOENT") { log("sock stat failed: " + e); unlock(); return; } }
+      let server: any;
+      try {
+        server = Bun.listen<{ buf: string }>({
+          unix: sockPath,
+          socket: {
+            open(s) {
+              s.data = { buf: "" }; clients.add(s);
+              write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid }) + "\n" + JSON.stringify(snapshot()) + "\n");
+            },
+            close(s) { clients.delete(s); },
+            error(s) { clients.delete(s); },
+            data(s, chunk) {
+              s.data.buf += chunk.toString();
+              if (s.data.buf.length > 8 * 1024 * 1024) { s.data.buf = ""; return; } // runaway client without newlines
+              for (let i; (i = s.data.buf.indexOf("\n")) >= 0;) {
+                const line = s.data.buf.slice(0, i); s.data.buf = s.data.buf.slice(i + 1);
+                let cmd: any; try { cmd = JSON.parse(line); } catch { continue; }
+                if (!cmd || typeof cmd !== "object") continue;
+                let p: Promise<any>; try { p = handle(cmd); } catch (e: any) { p = Promise.reject(e); }
+                p.then(r => reply(s, cmd.rid, r), e => reply(s, cmd.rid, { ok: false, error: String(e?.message ?? e) }));
+              }
+            },
+          },
+        });
+      } catch (e) { log("listen failed: " + e); unlock(); return; }
+      let ino: number | undefined; try { ino = fs.lstatSync(sockPath).ino; } catch {}
+      let offRegistry: any, tick: any, offProgress: any;
+      const close = () => {
+        try { if (typeof offRegistry === "function") offRegistry(); } catch {}
+        try { if (typeof offProgress === "function") offProgress(); } catch {}
+        try { clearInterval(tick); clearTimeout(pending); } catch {}
+        try { server.stop(true); } catch {}
+        // Unlink only an endpoint that is still ours (same inode), then the lock, then the dir if that left it empty.
+        try { if (ino !== undefined && fs.lstatSync(sockPath).ino === ino) fs.unlinkSync(sockPath); } catch {}
+        unlock();
+        try { fs.rmdirSync(DIR!); } catch {}
+      };
+      try {
+        offRegistry = registry.onChange(schedule); // registered/status_changed/metadata_changed(activity)/removed
+        tick = setInterval(() => { if (clients.size) push(snapshot()); }, 1000); // safety net for isStreaming/mainIdle
+        try { offProgress = api.events.on("task:subagent:progress", schedule); } catch (e) { log("progress listener failed: " + e); }
+        G.__ompdeckCtl = {
+          setCtx(c: any) { mainCtx = c; schedule(); },
+          close,
+        };
+      } catch (e) { log("setup failed: " + e); close(); return; }
+      log("listening " + sockPath);
+    }
+    function stop() { const c = G.__ompdeckCtl; G.__ompdeckCtl = undefined; c?.close(); }
+  } catch (e) { log("factory failed: " + e); }
+}

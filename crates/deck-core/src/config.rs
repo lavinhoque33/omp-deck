@@ -1,0 +1,325 @@
+//! Persistent app configuration (`$XDG_CONFIG_HOME/omp-deck/state.json`).
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("config I/O error at {path}: {source}")]
+    Io { path: PathBuf, source: io::Error },
+    #[error("config serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+const MAX_RECENT_FOLDERS: usize = 10;
+
+/// `$XDG_CONFIG_HOME/omp-deck` (via `dirs::config_dir()`), fallback `~/.config/omp-deck`.
+pub fn config_dir() -> PathBuf {
+    dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("omp-deck")
+}
+
+fn state_path() -> PathBuf {
+    config_dir().join("state.json")
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AppConfig {
+    pub window: Option<WindowGeometry>,
+    pub sidebar_width: f32,
+    pub font_size: f32,
+    pub theme: Theme,
+    pub open_tabs: Vec<TabState>,
+    pub active_tab: Option<usize>,
+    pub collapsed_groups: Vec<PathBuf>,
+    /// false → OmpDeck draws its own title bar; true → the window manager's frame.
+    pub native_decorations: bool,
+    /// Run `omp update --check` at startup and every 6 h.
+    pub check_updates: bool,
+    /// `ModelInfo.selector`s, insertion order.
+    pub favorite_models: Vec<String>,
+    /// `None` = "All providers".
+    pub model_provider_filter: Option<String>,
+    /// Last sidebar scope (`None` = global view).
+    pub folder_scope: Option<PathBuf>,
+    /// Most-recent first, deduped, at most 10.
+    pub recent_folders: Vec<PathBuf>,
+    /// Per-folder open tabs (folder mode launch/restore).
+    pub folder_tabs: BTreeMap<PathBuf, FolderTabs>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        AppConfig {
+            window: None,
+            sidebar_width: 300.0,
+            font_size: 14.0,
+            theme: Theme::Dark,
+            open_tabs: Vec::new(),
+            active_tab: None,
+            collapsed_groups: Vec::new(),
+            native_decorations: false,
+            check_updates: true,
+            favorite_models: Vec::new(),
+            model_provider_filter: None,
+            folder_scope: None,
+            recent_folders: Vec::new(),
+            folder_tabs: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WindowGeometry {
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TabState {
+    pub tmux_name: String,
+    pub cwd: PathBuf,
+    pub session_path: Option<PathBuf>,
+    pub title: String,
+}
+
+/// Open tabs remembered per folder (folder-mode launch/restore).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FolderTabs {
+    pub open_tabs: Vec<TabState>,
+    pub active_tab: Option<usize>,
+}
+
+impl AppConfig {
+    pub fn load() -> AppConfig {
+        Self::load_from(&state_path())
+    }
+
+    /// Missing file → default silently; unreadable or corrupt → default, logged.
+    pub fn load_from(path: &Path) -> AppConfig {
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                if e.kind() != io::ErrorKind::NotFound {
+                    log::warn!("cannot read config {}: {e}", path.display());
+                }
+                return AppConfig::default();
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                log::warn!("corrupt config {}: {e}; using defaults", path.display());
+                AppConfig::default()
+            }
+        }
+    }
+
+    pub fn save(&self) -> Result<(), ConfigError> {
+        self.save_to(&state_path())
+    }
+
+    /// Atomic: write a sibling temp file, then rename over the target.
+    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
+        let io_err = |source| ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        let json = serde_json::to_vec_pretty(self)?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            fs::create_dir_all(dir).map_err(io_err)?;
+        }
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        fs::write(&tmp, json).map_err(io_err)?;
+        fs::rename(&tmp, path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            io_err(e)
+        })
+    }
+
+    /// Toggles `selector` in `favorite_models`; returns the new state (true = favorite).
+    pub fn toggle_favorite(&mut self, selector: &str) -> bool {
+        if let Some(i) = self.favorite_models.iter().position(|s| s == selector) {
+            self.favorite_models.remove(i);
+            false
+        } else {
+            self.favorite_models.push(selector.to_owned());
+            true
+        }
+    }
+
+    /// Moves `dir` to the front of `recent_folders`, deduped, capped at 10.
+    pub fn push_recent_folder(&mut self, dir: PathBuf) {
+        self.recent_folders.retain(|p| *p != dir);
+        self.recent_folders.insert(0, dir);
+        self.recent_folders.truncate(MAX_RECENT_FOLDERS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> AppConfig {
+        AppConfig {
+            window: Some(WindowGeometry {
+                x: Some(10.0),
+                y: None,
+                width: 1200.0,
+                height: 800.0,
+                maximized: true,
+            }),
+            sidebar_width: 321.0,
+            font_size: 16.5,
+            theme: Theme::Light,
+            open_tabs: vec![TabState {
+                tmux_name: "omp-abc".into(),
+                cwd: "/home/u/x".into(),
+                session_path: Some("/s/a.jsonl".into()),
+                title: "T".into(),
+            }],
+            active_tab: Some(0),
+            collapsed_groups: vec!["/home/u/y".into()],
+            native_decorations: true,
+            check_updates: false,
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn old_state_without_wave2_keys_gets_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, r#"{"sidebar_width": 250.0, "font_size": 12.0}"#).unwrap();
+        let cfg = AppConfig::load_from(&path);
+        assert_eq!(cfg.sidebar_width, 250.0);
+        assert!(!cfg.native_decorations);
+        assert!(cfg.check_updates);
+    }
+
+    #[test]
+    fn roundtrip_creates_dirs_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/deeper/state.json");
+        sample().save_to(&path).unwrap();
+        assert_eq!(AppConfig::load_from(&path), sample());
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("state.json")]);
+    }
+
+    #[test]
+    fn missing_or_corrupt_gives_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            AppConfig::load_from(&dir.path().join("nope.json")),
+            AppConfig::default()
+        );
+        let bad = dir.path().join("bad.json");
+        fs::write(&bad, b"{ not json").unwrap();
+        assert_eq!(AppConfig::load_from(&bad), AppConfig::default());
+    }
+
+    #[test]
+    fn partial_json_fills_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.json");
+        fs::write(
+            &p,
+            br#"{"font_size": 20.0, "theme": "Light", "future_field": 1}"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load_from(&p);
+        assert_eq!(cfg.font_size, 20.0);
+        assert_eq!(cfg.theme, Theme::Light);
+        assert_eq!(cfg.sidebar_width, 300.0);
+        assert!(cfg.open_tabs.is_empty());
+    }
+
+    #[test]
+    fn old_state_without_wave4_keys_gets_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.json");
+        fs::write(&p, br#"{"open_tabs": [], "check_updates": false}"#).unwrap();
+        let cfg = AppConfig::load_from(&p);
+        assert!(!cfg.check_updates);
+        assert!(cfg.favorite_models.is_empty());
+        assert_eq!(cfg.model_provider_filter, None);
+        assert_eq!(cfg.folder_scope, None);
+        assert!(cfg.recent_folders.is_empty());
+        assert!(cfg.folder_tabs.is_empty());
+    }
+
+    #[test]
+    fn toggle_favorite_twice_restores() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.toggle_favorite("a/x"));
+        assert!(cfg.toggle_favorite("b/y"));
+        assert_eq!(cfg.favorite_models, vec!["a/x", "b/y"]);
+        assert!(!cfg.toggle_favorite("a/x"));
+        assert_eq!(cfg.favorite_models, vec!["b/y"]);
+        assert!(cfg.toggle_favorite("a/x"));
+        assert_eq!(cfg.favorite_models, vec!["b/y", "a/x"]);
+    }
+
+    #[test]
+    fn recent_folders_dedupe_front_cap() {
+        let mut cfg = AppConfig::default();
+        for i in 0..12 {
+            cfg.push_recent_folder(PathBuf::from(format!("/d/{i}")));
+        }
+        assert_eq!(cfg.recent_folders.len(), 10);
+        assert_eq!(cfg.recent_folders[0], PathBuf::from("/d/11"));
+        assert_eq!(cfg.recent_folders[9], PathBuf::from("/d/2"));
+        cfg.push_recent_folder(PathBuf::from("/d/5"));
+        assert_eq!(cfg.recent_folders.len(), 10);
+        assert_eq!(cfg.recent_folders[0], PathBuf::from("/d/5"));
+        assert_eq!(
+            cfg.recent_folders
+                .iter()
+                .filter(|p| p.as_path() == Path::new("/d/5"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn folder_tabs_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cfg = sample();
+        cfg.folder_tabs.insert(
+            "/home/u/x".into(),
+            FolderTabs {
+                open_tabs: cfg.open_tabs.clone(),
+                active_tab: Some(0),
+            },
+        );
+        cfg.folder_scope = Some("/home/u/x".into());
+        cfg.model_provider_filter = Some("openai".into());
+        cfg.save_to(&path).unwrap();
+        assert_eq!(AppConfig::load_from(&path), cfg);
+    }
+}
