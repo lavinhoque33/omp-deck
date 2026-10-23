@@ -149,6 +149,7 @@ fn start(
         status: Mutex::new(Status {
             exited: None,
             reader_done: false,
+            child_exited: false,
             busy: 0,
             first_attach_done: false,
             shutting_down: false,
@@ -190,6 +191,7 @@ fn start(
     spawn_thread("child-waiter", move || {
         let code = s.child.wait();
         log::info!("child exited: {code:?}");
+        s.update_status(|st| st.child_exited = true);
         // Windows: closing the pseudoconsole ends its output pipe; the reader keeps draining.
         s.child.close_console();
         s.wait_status(DRAIN_TIMEOUT, |st| st.reader_done);
@@ -357,6 +359,9 @@ struct Status {
     /// `Some(code)` once the session ended.
     exited: Option<Option<i32>>,
     reader_done: bool,
+    /// The child process is gone; its remaining output may still be draining (`exited` is
+    /// recorded once that finished).
+    child_exited: bool,
     /// Threads that must deliver something before the process exits.
     busy: usize,
     /// A client received the final screen and `Exited` (or killed the session) after the
@@ -414,6 +419,17 @@ impl Shared {
         drop(core);
         if !self.input.try_push(replies) {
             log::warn!("PTY input queue full; dropping terminal query replies");
+        }
+    }
+
+    /// If the child already exited, waits until its remaining output (e.g. ConPTY's teardown
+    /// sequence) is in the terminal and the exit is recorded, so snapshots show the final
+    /// screen and an attach is answered by the exit path.
+    fn settle_exit(&self) {
+        if self.status().child_exited {
+            self.wait_status(DRAIN_TIMEOUT + Duration::from_secs(1), |st| {
+                st.exited.is_some()
+            });
         }
     }
 
@@ -724,6 +740,7 @@ fn conn_loop(conn: &mut Conn<'_>) -> Result<()> {
             }
             Kind::Peek => {
                 let params: PeekParams = protocol::parse(&conn.payload)?;
+                shared.settle_exit();
                 let mut core = shared.core();
                 let snapshot = core.snapshot(params.history_lines);
                 shared.send_replies(core);
@@ -780,6 +797,7 @@ fn attach(conn: &mut Conn<'_>, params: &AttachParams) -> Result<()> {
         })?;
         return conn.reply(Kind::Exited, &payload);
     }
+    shared.settle_exit();
     let mut core = shared.core();
     // Checked under the core lock: the child waiter reads `ever_attached` (also under it)
     // after recording the exit, so either it sees this attach or this sees the exit.

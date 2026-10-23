@@ -125,7 +125,12 @@ fn display_is_home_abbreviated() {
 fn abbreviate_home_cases() {
     let Some(home) = dirs::home_dir() else { return };
     assert_eq!(abbreviate_home(&home), "~");
-    assert_eq!(abbreviate_home(&home.join("x/y")), "~/x/y");
+    let sep = std::path::MAIN_SEPARATOR;
+    assert_eq!(abbreviate_home(&home.join("x/y")), format!("~{sep}x{sep}y"));
+    assert_eq!(
+        abbreviate_home(&home.join("x").join("y")),
+        format!("~{sep}x{sep}y")
+    );
     assert_eq!(abbreviate_home(Path::new("/srv/one")), "/srv/one");
     // A sibling sharing the textual prefix is not inside HOME.
     let mut lookalike = home.clone().into_os_string();

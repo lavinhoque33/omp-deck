@@ -436,19 +436,25 @@ mod tests {
         let mut dlg = FolderDialog::new(TransferKind::Move, entry);
         let home = Some(Path::new("/home/u"));
 
-        dlg.set_text("/a".into(), home);
+        // Absolute on every OS: a bare `/a` has no drive on Windows.
+        let (a, ab) = if cfg!(windows) {
+            (r"C:\a".to_owned(), r"C:\ab".to_owned())
+        } else {
+            ("/a".to_owned(), "/ab".to_owned())
+        };
+        dlg.set_text(a.clone(), home);
         let first = dlg
             .take_request()
             .expect("lexically fine → fs check queued");
-        dlg.set_text("/ab".into(), home);
+        dlg.set_text(ab.clone(), home);
         let second = dlg.take_request().expect("queued");
         assert_ne!(first.generation, second.generation);
         assert!(dlg.take_request().is_none(), "one request per change");
 
         // The older answer arrives late and must not unlock the dialog.
-        dlg.apply_check(first.generation, Ok(PathBuf::from("/a")));
+        dlg.apply_check(first.generation, Ok(PathBuf::from(&a)));
         assert!(matches!(dlg.checked, Checked::Pending));
-        dlg.apply_check(second.generation, Ok(PathBuf::from("/ab")));
+        dlg.apply_check(second.generation, Ok(PathBuf::from(&ab)));
         assert!(matches!(dlg.checked, Checked::Valid(_)));
 
         // Lexical failures never reach a worker.

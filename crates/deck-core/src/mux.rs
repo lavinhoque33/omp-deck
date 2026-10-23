@@ -119,6 +119,29 @@ impl HostMux {
     }
 }
 
+/// `value` when it is a test name, `omp-deck-test-` plus `[A-Za-z0-9_-]+`; otherwise (unset,
+/// empty or anything else, with a warning for the latter) `default`. A stray environment variable
+/// can therefore never point the app at another tmux server or host namespace.
+fn checked_override(value: Option<&str>, default: &str, var: &str) -> String {
+    match value {
+        None | Some("") => default.to_owned(),
+        Some(v)
+            if v.strip_prefix("omp-deck-test-").is_some_and(|rest| {
+                !rest.is_empty()
+                    && rest
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            }) =>
+        {
+            v.to_owned()
+        }
+        Some(v) => {
+            log::warn!("ignoring {var}={v:?}: only omp-deck-test-<name> is accepted");
+            default.to_owned()
+        }
+    }
+}
+
 impl Mux {
     /// The backend for `choice`. Windows always uses the host. Elsewhere `Auto` is tmux when
     /// installed, else the host when its daemon exists; `Tmux` / `Host` demand that backend.
@@ -130,19 +153,11 @@ impl Mux {
         } else {
             choice
         };
-        let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let tmux = || {
-            Tmux::detect_on(
-                non_empty(TMUX_SOCKET_ENV)
-                    .as_deref()
-                    .unwrap_or(tmux::APP_SOCKET),
-            )
-            .map(Mux::Tmux)
+        let from_env = |var: &str, default: &str| {
+            checked_override(std::env::var(var).ok().as_deref(), default, var)
         };
-        let host = || {
-            HostMux::detect(non_empty(HOST_NS_ENV).as_deref().unwrap_or(HOST_NAMESPACE))
-                .map(Mux::Host)
-        };
+        let tmux = || Tmux::detect_on(&from_env(TMUX_SOCKET_ENV, tmux::APP_SOCKET)).map(Mux::Tmux);
+        let host = || HostMux::detect(&from_env(HOST_NS_ENV, HOST_NAMESPACE)).map(Mux::Host);
         match choice {
             BackendChoice::Tmux => tmux(),
             BackendChoice::Host => host(),
@@ -590,6 +605,29 @@ mod tests {
             ["env", "OMPDECK_CTL_DIR=/run/d", "A=b c", "omp", "--resume"]
         );
         assert_eq!(spec.args[spec.args.len() - 6], "--");
+    }
+
+    #[test]
+    fn env_overrides_only_accept_test_names() {
+        let check = |v: Option<&str>| checked_override(v, "omp-deck", "X");
+        assert_eq!(
+            check(Some("omp-deck-test-123_a-b")),
+            "omp-deck-test-123_a-b"
+        );
+        for bad in [
+            "",
+            "default",
+            "omp-deck",
+            "omp-deck-test-",
+            "omp-deck-test-a b",
+            "omp-deck-test-a/b",
+            "omp-deck-test-é",
+            "x-omp-deck-test-1",
+            "OMP-DECK-TEST-1",
+        ] {
+            assert_eq!(check(Some(bad)), "omp-deck", "{bad:?}");
+        }
+        assert_eq!(check(None), "omp-deck");
     }
 
     #[test]

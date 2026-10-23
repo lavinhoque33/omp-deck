@@ -105,8 +105,53 @@ fn viewport(cfg: &AppConfig) -> egui::ViewportBuilder {
     vb
 }
 
-fn main() -> anyhow::Result<()> {
+/// Logging. A Windows release build is a GUI-subsystem process without a console, so it logs to
+/// `<cache>/omp-deck/omp-deck.log`; everything else logs to stderr.
+fn init_logging() {
+    #[cfg(all(windows, not(debug_assertions)))]
+    if let Some(file) = log_file() {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .target(env_logger::Target::Pipe(Box::new(file)))
+            .init();
+        return;
+    }
     env_logger::init();
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn log_file() -> Option<std::fs::File> {
+    let dir = dirs::cache_dir()?.join("omp-deck");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("omp-deck.log"))
+        .ok()
+}
+
+/// A failure before or while opening the window: stderr, the log, and (Windows release, no
+/// console) a message box.
+fn report_fatal(err: &anyhow::Error) {
+    eprintln!("omp-deck: {err:#}");
+    log::error!("fatal: {err:#}");
+    #[cfg(all(windows, not(debug_assertions)))]
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("OmpDeck")
+        .set_description(format!("{err:#}"))
+        .show();
+}
+
+fn main() -> anyhow::Result<()> {
+    init_logging();
+    if let Err(e) = run() {
+        report_fatal(&e);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run() -> anyhow::Result<()> {
     let cli = match cli::parse(std::env::args().skip(1)) {
         Ok(Parsed::Run(cli)) => cli,
         Ok(Parsed::Help) => {
@@ -140,11 +185,14 @@ fn main() -> anyhow::Result<()> {
     }
     log::debug!("config dir: {}", config_dir().display());
 
-    let options = eframe::NativeOptions {
-        viewport: viewport(&cfg),
+    // One option set per renderer; `viewport` is rebuilt because the builder is consumed.
+    let cfg_for_window = cfg.clone();
+    let options = move |renderer| eframe::NativeOptions {
+        viewport: viewport(&cfg_for_window),
         clipboard_shortcuts: false,
         // deck-term installs its own filtered system provider (it skips `term-primary`, which must stay primary-only).
         system_font_fallback: false,
+        renderer,
         ..Default::default()
     };
     // Blocking filesystem checks are fine here: the window does not exist yet.
@@ -165,12 +213,48 @@ fn main() -> anyhow::Result<()> {
         start_dir,
         ctl_ext: install_ctl_extension(),
     };
-    let result = eframe::run_native(
-        "OmpDeck",
-        options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, init)))),
-    );
+    let init = std::sync::Arc::new(std::sync::Mutex::new(Some(init)));
+    let result = run_window(options, init);
     // Terminal drops hand tmux detaches to background threads; let them finish before exiting.
     deck_term::wait_detached(std::time::Duration::from_secs(2));
-    result.map_err(|e| anyhow!("eframe: {e}"))
+    result
+}
+
+/// Opens the window and runs the app. Windows: wgpu first (DX12; a software adapter when there
+/// is no GPU, as on VMs, RDP sessions and CI runners where OpenGL is only GDI 1.1), glow when
+/// wgpu cannot start. Elsewhere: glow only. `init` is taken by whichever attempt reaches the
+/// app-creation step, so a renderer that fails earlier leaves it for the next one.
+fn run_window(
+    options: impl Fn(eframe::Renderer) -> eframe::NativeOptions,
+    init: std::sync::Arc<std::sync::Mutex<Option<AppInit>>>,
+) -> anyhow::Result<()> {
+    let attempt = |renderer: eframe::Renderer| {
+        let init = init.clone();
+        eframe::run_native(
+            "OmpDeck",
+            options(renderer),
+            Box::new(move |cc| {
+                let init = init
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                    .ok_or("the app was already created")?;
+                Ok(Box::new(App::new(cc, init)))
+            }),
+        )
+    };
+    #[cfg(windows)]
+    {
+        match attempt(eframe::Renderer::Wgpu) {
+            Ok(()) => Ok(()),
+            Err(wgpu_err) => {
+                log::error!("wgpu renderer failed: {wgpu_err}; trying OpenGL");
+                attempt(eframe::Renderer::Glow).map_err(|glow_err| {
+                    anyhow!("no usable renderer: wgpu: {wgpu_err}; OpenGL: {glow_err}")
+                })
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    attempt(eframe::Renderer::Glow).map_err(|e| anyhow!("eframe: {e}"))
 }

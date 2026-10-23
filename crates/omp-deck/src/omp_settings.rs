@@ -219,14 +219,15 @@ pub fn section_title(section: &str) -> String {
 
 /// Config directory shown in the banner: `PI_CODING_AGENT_DIR` or `~/.omp/agent`, `~`-abbreviated.
 pub fn config_dir_display(env: Option<&str>, home: Option<&Path>) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
     let dir = match (env.filter(|e| !e.is_empty()), home) {
         (Some(e), _) => Path::new(e).to_path_buf(),
         (None, Some(h)) => h.join(".omp").join("agent"),
-        (None, None) => return "~/.omp/agent".to_owned(),
+        (None, None) => return format!("~{sep}.omp{sep}agent"),
     };
     match home.and_then(|h| dir.strip_prefix(h).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Some(rest) => format!("~/{}", rest.display()),
+        Some(rest) => format!("~{sep}{}", rest.display()),
         None => dir.display().to_string(),
     }
 }
@@ -549,18 +550,24 @@ mod tests {
 
     #[test]
     fn config_dir_banner_path() {
-        let home = Path::new("/home/u");
-        assert_eq!(config_dir_display(None, Some(home)), "~/.omp/agent");
-        assert_eq!(
-            config_dir_display(Some("/home/u/x/agent"), Some(home)),
-            "~/x/agent"
-        );
-        assert_eq!(
-            config_dir_display(Some("/tmp/agent"), Some(home)),
-            "/tmp/agent"
-        );
-        assert_eq!(config_dir_display(Some(""), Some(home)), "~/.omp/agent");
-        assert_eq!(config_dir_display(None, None), "~/.omp/agent");
+        let sep = std::path::MAIN_SEPARATOR;
+        let default = format!("~{sep}.omp{sep}agent");
+        let (home, inside, outside, nested) = if cfg!(windows) {
+            (
+                r"C:\Users\u",
+                r"C:\Users\u\x\agent",
+                r"D:\tmp\agent",
+                r"~\x\agent",
+            )
+        } else {
+            ("/home/u", "/home/u/x/agent", "/tmp/agent", "~/x/agent")
+        };
+        let home = Path::new(home);
+        assert_eq!(config_dir_display(None, Some(home)), default);
+        assert_eq!(config_dir_display(Some(inside), Some(home)), nested);
+        assert_eq!(config_dir_display(Some(outside), Some(home)), outside);
+        assert_eq!(config_dir_display(Some(""), Some(home)), default);
+        assert_eq!(config_dir_display(None, None), default);
     }
 
     #[test]

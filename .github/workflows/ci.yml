@@ -92,41 +92,65 @@ jobs:
           Write-Host $ls
           if ($ls -match '(?m)\be2e\b') { throw "e2e still listed after kill" }
 
-      - name: GUI screenshot
+      - name: GUI screenshot (restored omp tab through the host)
         if: ${{ !cancelled() }}
-        # Hosted runners have no GPU; the software-rendered window may fail on some images, so this step
-        # reports but does not gate the job. The screenshot artifact shows what happened.
-        continue-on-error: true
         run: |
           $ErrorActionPreference = 'Stop'
-          $empty = Join-Path $env:RUNNER_TEMP 'empty-sessions'
-          New-Item -ItemType Directory -Force -Path $empty | Out-Null
+          $env:PATH = (Join-Path $env:LOCALAPPDATA 'omp') + ';' + $env:PATH
+          $env:RUST_LOG = 'info'
+          # A one-message omp session plus a persisted open tab for it, so the app restores the tab on launch
+          # and starts `omp --resume <file>` in omp-deck-host.
+          $proj = Join-Path $env:RUNNER_TEMP 'proj'
+          $root = Join-Path $env:RUNNER_TEMP 'sessions'
+          $id = '01c00003-0000-4000-8000-000000000003'
+          $dir = Join-Path $root 'ci-proj'
+          New-Item -ItemType Directory -Force -Path $proj, $dir | Out-Null
+          $file = Join-Path $dir "2026-01-01T10-00-00-000Z_$id.jsonl"
+          $header = @{ type = 'session'; version = 3; id = $id; timestamp = '2026-01-01T10:00:00.000Z'; cwd = $proj } | ConvertTo-Json -Compress
+          $msg = @{ type = 'message'; id = 'm1'; message = @{ role = 'user'; content = 'hello from CI'; timestamp = 1 } } | ConvertTo-Json -Compress -Depth 4
+          [IO.File]::WriteAllText($file, "$header`n$msg`n")
+          $cfgDir = Join-Path $env:APPDATA 'omp-deck'
+          New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+          $state = @{
+            open_tabs = @(@{ tmux_name = "omp-$id"; cwd = $proj; session_path = $file; title = 'CI session' })
+            active_tab = 0
+            check_updates = $false
+          } | ConvertTo-Json -Depth 5
+          [IO.File]::WriteAllText((Join-Path $cfgDir 'state.json'), $state)
+
           $shot = Join-Path $PWD 'shot.png'
           Remove-Item -Force -ErrorAction SilentlyContinue $shot
+          New-Item -ItemType Directory -Force -Path app-logs | Out-Null
           $p = Start-Process -FilePath (Resolve-Path 'target/debug/omp-deck.exe').Path `
-            -ArgumentList @('--sessions-root', $empty, '--screenshot', $shot, '--screenshot-after', '6') `
-            -PassThru
-          if (-not $p.WaitForExit(90000)) {
-            $p.Kill($true)
-            throw "omp-deck did not exit within 90 s"
-          }
+            -ArgumentList @('--sessions-root', $root, '--screenshot', $shot, '--screenshot-after', '20') `
+            -RedirectStandardOutput app-logs/stdout.txt -RedirectStandardError app-logs/stderr.txt -PassThru
+          $exited = $p.WaitForExit(120000)
+          if (-not $exited) { $p.Kill($true) }
+          Write-Host "---- omp-deck stderr ----"; Get-Content app-logs/stderr.txt -ErrorAction SilentlyContinue | Select-Object -Last 80
+          Write-Host "---- omp-deck-host ls ----"; & target/debug/omp-deck-host.exe ls
+          if (-not $exited) { throw "omp-deck did not exit within 120 s" }
           Write-Host "omp-deck exited with $($p.ExitCode)"
           if (-not (Test-Path $shot)) { throw "screenshot was not written" }
           Write-Host ("shot.png: {0} bytes" -f (Get-Item $shot).Length)
+          # The restored tab's session must still be alive in the host after the app exited (detach, not kill).
+          $ls = (& target/debug/omp-deck-host.exe ls | Out-String)
+          if ($ls -notmatch "omp-$id") { throw "restored tab's host session is not running after the app exited" }
+          & target/debug/omp-deck-host.exe kill "omp-$id"
 
       - name: Stop leftover host sessions
         if: always()
         run: |
           $exe = 'target/debug/omp-deck-host.exe'
-          if (Test-Path $exe) { & $exe kill e2e 2>&1 | Out-Null }
+          if (Test-Path $exe) { & $exe ls 2>$null | ForEach-Object { & $exe kill $_.Trim() 2>&1 | Out-Null } }
           $global:LASTEXITCODE = 0
 
-      - name: Collect host logs
+      - name: Collect host and app logs
         if: always()
         run: |
           New-Item -ItemType Directory -Force -Path host-logs | Out-Null
           $src = Join-Path $env:LOCALAPPDATA 'omp-deck\host'
           if (Test-Path $src) { Copy-Item -Recurse -Force "$src\*" host-logs }
+          if (Test-Path app-logs) { Copy-Item -Recurse -Force app-logs host-logs }
           New-Item -ItemType File -Force -Path host-logs\.keep | Out-Null
 
       - name: Upload screenshot

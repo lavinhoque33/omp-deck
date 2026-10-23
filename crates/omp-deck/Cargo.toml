@@ -29,6 +29,9 @@ png = "0.18"
 [target.'cfg(windows)'.dependencies]
 # Native folder dialog (the Unix builds shell out to kdialog / zenity); no async runtime needed.
 rfd = { version = "0.16", default-features = false }
+# wgpu (DX12, with the WARP software adapter) is the Windows renderer: GPU-less machines (VMs,
+# RDP, CI runners) only expose GDI OpenGL 1.1, which glow cannot use. Glow stays as the fallback.
+eframe = { workspace = true, features = ["wgpu"] }
 
 [build-dependencies]
 # Windows: the app icon and version resource of the .exe (a no-op on other targets).

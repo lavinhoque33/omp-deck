@@ -218,12 +218,16 @@ fn child_exiting_at_launch_is_still_served_with_final_screen_and_code() {
         24,
     )
     .unwrap();
-    wait_until("output rendered", || {
-        deck_host::peek(&ns.0, "quick", 0)
-            .is_ok_and(|(_, snap)| String::from_utf8_lossy(&snap).contains("launch-error"))
-    });
+    // Attach only after the child is gone: the daemon then finishes draining ConPTY's
+    // teardown output into the terminal first, so the first attach gets exactly the final
+    // screen followed by the exit code (no `Output` frames).
+    let child = ns.0.info("quick").unwrap().child_pid;
+    wait_until("child exited", || !pid_alive(child));
+    let (_, final_screen) = deck_host::peek(&ns.0, "quick", 0).unwrap();
+    assert!(String::from_utf8_lossy(&final_screen).contains("launch-error"));
     let mut c = Client::attach(&ns, "quick", 80, 24);
     assert!(c.screen().contains("launch-error"), "{}", c.screen());
     assert_eq!(c.next(), HostEvent::Exited(Some(5)));
+    assert_eq!(c.next(), HostEvent::Closed);
     wait_until("endpoint gone", || !ns.0.has("quick"));
 }

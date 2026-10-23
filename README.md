@@ -1,8 +1,9 @@
 # OmpDeck
 
-A native Linux desktop wrapper for [`omp`](https://github.com/can1357/oh-my-pi) (oh-my-pi), the coding-agent TUI.
-A sidebar lists every persisted omp session; clicking one opens a tab running that session in an
-embedded, fully interactive terminal backed by tmux, so closing a tab or the whole app leaves omp running.
+A native desktop wrapper for Linux and Windows around [`omp`](https://github.com/can1357/oh-my-pi) (oh-my-pi),
+the coding-agent TUI. A sidebar lists every persisted omp session; clicking one opens a tab running that session
+in an embedded, fully interactive terminal. The session runs outside the app (in tmux, or in OmpDeck's own session
+host), so closing a tab or the whole app leaves omp running.
 
 ## Features
 
@@ -18,7 +19,7 @@ embedded, fully interactive terminal backed by tmux, so closing a tab or the who
   spinner while the agent works and an amber "!" badge with a tinted tab when it waits for your input,
   also on background tabs. Right-clicking a tab (or its "Open tabs" row) shows "Close tab" plus the
   session's full sidebar menu. Closing a tab only detaches; "Stop session process" stops omp.
-  Tabs re-attach to live tmux sessions on the next launch.
+  Tabs re-attach to their live sessions on the next launch.
 - **Terminal fidelity**: truecolor, wide/emoji cells, mouse reporting, bracketed paste, OSC 52 clipboard,
   clickable hyperlinks and plain URLs (Ctrl+click), a right-click copy / paste / link menu,
   kitty CSI-u / modifyOtherKeys key encoding, inline image previews (omp's kitty
@@ -48,14 +49,31 @@ OmpDeck never writes to the omp session store directly; changes go through omp's
 
 ## Requirements
 
-- Linux x86_64, Wayland or X11, with fontconfig.
-- [`omp`](https://github.com/can1357/oh-my-pi) on `PATH` or in `~/.local/bin` (required). If it is missing,
-  `install.sh` installs it, and OmpDeck shows an "Install omp" button (on the start screen, in Settings and in
-  Usage) that runs omp's official installer (`https://omp.sh/install`, prebuilt binary into `~/.local/bin`,
-  no root) in a tab and picks omp up when it finishes, without a restart.
-- `tmux` (optional but recommended): without it, omp runs directly in the terminal tab, a banner is shown,
-  and sessions do not survive closing the tab. OmpDeck uses its own tmux server (`tmux -L omp-deck`) and
-  never touches your default one.
+- **Linux** x86_64, Wayland or X11, with fontconfig; or **Windows** 10 (1809 or newer) / 11, x64
+  (arm64 builds are published when they build).
+- [`omp`](https://github.com/can1357/oh-my-pi) (required): on `PATH`, in `~/.local/bin` (Linux), or in
+  `%LOCALAPPDATA%\omp` / `%USERPROFILE%\.bun\bin` (Windows). If it is missing, the installers install it, and
+  OmpDeck shows an "Install omp" button (on the start screen, in Settings and in Usage) that runs omp's official
+  installer (prebuilt binary, no admin rights) in a tab and picks omp up when it finishes, without a restart.
+- Linux: `tmux` (optional). OmpDeck uses its own tmux server (`tmux -L omp-deck`) and never touches your
+  default one. Without tmux it uses its own session host instead (see [Session backends](#session-backends)).
+
+### Session backends
+
+Each omp tab runs in a session that lives outside the app, so it survives closing the tab or OmpDeck:
+
+- **tmux** (Linux default when installed): a dedicated, invisible tmux server `-L omp-deck`.
+- **OmpDeck host** (always on Windows; on Linux when tmux is missing or when chosen): `omp-deck-host`, a small
+  per-session daemon shipped next to `omp-deck`. It owns the session's pseudo-terminal (a ConPTY on Windows),
+  keeps the screen and 50 000 lines of scrollback, answers terminal queries while no tab is attached, and
+  restores the screen when a tab re-attaches. Sessions are reachable only by your user (a private socket
+  directory on Linux; named pipes restricted to your account on Windows).
+
+On Linux, Settings → OmpDeck → **Session backend** chooses Auto (tmux if installed, else the host), tmux or
+OmpDeck host for new tabs; running sessions keep their backend. If neither is available, omp runs directly in
+the tab, a banner says so, and sessions end with the tab.
+
+`omp-deck-host ls|info <name>|dump <name>|kill <name>` inspect and stop host sessions from a shell.
 
 ## Install
 
@@ -80,17 +98,29 @@ Make sure `~/.local/bin` is on your `PATH`.
 
 **Fedora / openSUSE**: `sudo dnf install ./omp-deck-<version>-1.x86_64.rpm`
 
-Release assets come with `.sha256` files and a combined `SHA256SUMS`. Prebuilt binaries are built on
+**Windows** (PowerShell, no admin rights; installs into `%LOCALAPPDATA%\Programs\OmpDeck` with a Start menu
+entry, and installs omp when it is not found):
+
+```powershell
+irm https://raw.githubusercontent.com/lavinhoque33/omp-deck/main/packaging/install.ps1 | iex
+```
+
+Options: `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lavinhoque33/omp-deck/main/packaging/install.ps1))) -Version x.y.z -NoOmp`
+(or `-Uninstall`). Alternatively download `omp-deck-<version>-x86_64-windows.zip`, extract it anywhere and run
+`omp-deck.exe`; keep `omp-deck-host.exe`, `conpty.dll` and `OpenConsole.exe` next to it.
+
+Release assets come with `.sha256` files and a combined `SHA256SUMS`. Linux binaries are built on
 Ubuntu 22.04 (glibc 2.35 or newer).
 
 **From source** (Rust stable, 2024 edition; on Debian/Ubuntu you need
 `pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev`):
 
 ```sh
-cargo install --git https://github.com/lavinhoque33/omp-deck omp-deck --locked
+cargo install --git https://github.com/lavinhoque33/omp-deck omp-deck deck-host --locked
 ```
 
-This installs only the binary. For the menu entry and icon, use one of the packages above.
+This installs only the binaries (`omp-deck` and `omp-deck-host`). For the menu entry and icon, use one of the
+packages above.
 
 ## Usage
 
@@ -104,7 +134,7 @@ omp-deck [OPTIONS] [FOLDER]
 ```
 
 The default session store is `$PI_CODING_AGENT_DIR/sessions` if set, otherwise `~/.omp/agent/sessions`
-(`$PI_CONFIG_DIR` replaces `.omp`).
+(Windows: `%USERPROFILE%\.omp\agent\sessions`; `$PI_CONFIG_DIR` replaces `.omp`).
 
 ### Shortcuts
 
@@ -127,11 +157,13 @@ Ctrl+C, Ctrl+X and Ctrl+V go straight to omp (omp uses Ctrl+V for image paste).
 
 | Path | Contents |
 | --- | --- |
-| `$XDG_CONFIG_HOME/omp-deck/` (default `~/.config/omp-deck/`) | `state.json` (window, tabs, settings, Sync folders), generated `tmux.conf`, `google-drive.json` (Google sign-in, mode 0600), `project-sync.json` (last project backups, mode 0600) |
-| `$XDG_DATA_HOME/omp-deck/` (default `~/.local/share/omp-deck/`) | live-control extension loaded into omp tabs, `restore-safety/` (copies kept before a Drive restore; `project-*` for project restores) |
-| `$XDG_CACHE_HOME/omp-deck/project-sync/` (default `~/.cache/omp-deck/…`) | temporary archives while a project backup or restore runs (removed afterwards) |
+| `$XDG_CONFIG_HOME/omp-deck/` (default `~/.config/omp-deck/`; Windows `%APPDATA%\omp-deck\`) | `state.json` (window, tabs, settings, Sync folders), generated `tmux.conf`, `google-drive.json` (Google sign-in, mode 0600), `project-sync.json` (last project backups, mode 0600), `ctl.key` (Windows: secret for the live-control pipes) |
+| `$XDG_DATA_HOME/omp-deck/` (default `~/.local/share/omp-deck/`; Windows `%APPDATA%\omp-deck\`) | live-control extension loaded into omp tabs, `restore-safety/` (copies kept before a Drive restore; `project-*` for project restores) |
+| `$XDG_CACHE_HOME/omp-deck/` (default `~/.cache/omp-deck/`; Windows `%LOCALAPPDATA%\omp-deck\`) | `project-sync/` temporary archives while a project backup or restore runs (removed afterwards), `host/` session-host logs |
 
-Environment: `OMP_DECK_TMUX_SOCKET` selects a different tmux socket (name must match `omp-deck-test-[A-Za-z0-9_-]+`);
+Environment: `OMP_DECK_TMUX_SOCKET` / `OMP_DECK_HOST_NS` select a different tmux socket / host namespace
+(name must match `omp-deck-test-[A-Za-z0-9_-]+`); `OMP_DECK_HOST_EXE` points at another `omp-deck-host`;
+`OMP_DECK_CONPTY_FLAGS` overrides the ConPTY creation flags (Windows, troubleshooting);
 `OMP_DECK_GOOGLE_CLIENT_ID` / `OMP_DECK_GOOGLE_CLIENT_SECRET` supply or override the Google OAuth
 client for Drive backup; `RUST_LOG` enables logging.
 
@@ -218,19 +250,25 @@ recovered.
 - Installed with `install.sh`: `curl -fsSL https://raw.githubusercontent.com/lavinhoque33/omp-deck/main/packaging/install.sh | sh -s -- --uninstall`
   (or `./install.sh --uninstall` from the extracted tarball).
 - `.deb`: `sudo apt remove omp-deck`; `.rpm`: `sudo dnf remove omp-deck`; AppImage: delete the file.
-- Settings and data stay in the directories above; delete them for a full clean-up. Running omp sessions
-  live in the `omp-deck` tmux server: `tmux -L omp-deck kill-server` stops them.
+- Windows: `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lavinhoque33/omp-deck/main/packaging/install.ps1))) -Uninstall`
+  (removes the program and its Start menu entry; omp stays).
+- Settings and data stay in the directories above; delete them for a full clean-up. Running omp sessions keep
+  running: stop them from the sidebar, with `tmux -L omp-deck kill-server` (tmux backend) or
+  `omp-deck-host kill <name>` (host backend; `omp-deck-host ls` lists them).
 
 ## Development
 
 ```sh
 cargo build --workspace
-cargo test --workspace            # needs tmux; tests use throwaway tmux sockets
+cargo test --workspace            # Linux tests use throwaway tmux sockets and host namespaces
 cargo clippy --workspace --all-targets -- -D warnings
+# Windows compile check from Linux (cargo install cargo-xwin; rustup target add x86_64-pc-windows-msvc):
+cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 ```
 
-Packaging scripts live in `packaging/`: `build-tarball.sh`, `appimage/build-appimage.sh`, `install.sh`.
-Releases are built by GitHub Actions when a `v*` tag is pushed (the tag must match the version in `Cargo.toml`).
+Packaging scripts live in `packaging/`: `build-tarball.sh`, `appimage/build-appimage.sh`, `install.sh`,
+`install.ps1`, `windows/fetch-conpty.ps1`. CI runs on Linux and Windows; releases are built by GitHub Actions
+when a `v*` tag is pushed (the tag must match the version in `Cargo.toml`).
 
 ## License
 
@@ -238,4 +276,5 @@ Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](L
 
 Bundled third-party assets: the [Geist](https://github.com/vercel/geist-font) font (SIL Open Font License
 1.1, `crates/omp-deck/assets/fonts/Geist-OFL.txt`) and [lucide](https://lucide.dev) icons (ISC,
-`crates/omp-deck/assets/fonts/lucide-LICENSE.txt`).
+`crates/omp-deck/assets/fonts/lucide-LICENSE.txt`). The Windows build ships Microsoft's ConPTY
+(`conpty.dll`, `OpenConsole.exe` from the `Microsoft.Windows.Console.ConPTY` package, MIT).

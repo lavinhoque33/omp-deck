@@ -164,7 +164,7 @@ pub struct ProjectGroup {
     pub sessions: Vec<SessionEntry>,
 }
 
-/// `/home/u/x` → `~/x`; `$HOME` itself → `~`; anything else unchanged.
+/// `/home/u/x` → `~/x` (`~\x` on Windows); `$HOME` itself → `~`; anything else unchanged.
 pub fn abbreviate_home(path: &Path) -> String {
     if let Some(home) = dirs::home_dir()
         && let Ok(rest) = path.strip_prefix(&home)
@@ -172,7 +172,13 @@ pub fn abbreviate_home(path: &Path) -> String {
         return if rest.as_os_str().is_empty() {
             "~".to_string()
         } else {
-            format!("~/{}", rest.display())
+            // Native separators throughout: `~/x/y`, `~\x\y` on Windows.
+            let tail: Vec<_> = rest.iter().map(|c| c.to_string_lossy()).collect();
+            format!(
+                "~{sep}{}",
+                tail.join(std::path::MAIN_SEPARATOR_STR),
+                sep = std::path::MAIN_SEPARATOR
+            )
         };
     }
     path.display().to_string()
