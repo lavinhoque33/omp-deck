@@ -42,6 +42,39 @@ fn host_exe() -> Option<PathBuf> {
     exe.is_file().then_some(exe)
 }
 
+/// A VT replay as plain text: escape sequences dropped, one line per screen row.
+fn plain_text(vt: &[u8]) -> String {
+    let text = String::from_utf8_lossy(vt);
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                // CSI: parameters, then a final byte in 0x40..=0x7e.
+                Some('[') => {
+                    for n in chars.by_ref() {
+                        if ('@'..='~').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC / APC: up to BEL or ST.
+                Some(']' | '_') => {
+                    while let Some(n) = chars.next() {
+                        if n == '\x07' || (n == '\x1b' && chars.next() == Some('\\')) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn kv(k: &str, v: impl AsRef<Path>) -> (String, String) {
     (k.to_owned(), v.as_ref().to_string_lossy().into_owned())
 }
@@ -70,19 +103,21 @@ fn live_omp_serves_a_snapshot_of_its_session_through_the_host() {
     for d in [&agent, &project, &data, &home.join(".config")] {
         fs::create_dir_all(d).unwrap();
     }
-    #[cfg(target_os = "linux")]
-    if let Some(real) = dirs::home_dir()
-        .map(|h| h.join(".omp/natives"))
-        .filter(|n| n.exists())
-    {
-        std::os::unix::fs::symlink(real, home.join(".omp/natives")).unwrap();
-    }
     let mut env = vec![
         kv("HOME", &home),
         kv("USERPROFILE", &home),
         kv("PI_CODING_AGENT_DIR", &agent),
-        kv("PI_CONFIG_DIR", home.join(".omp")),
+        // Relative to HOME (omp joins it onto the home dir; an absolute path would be nested).
+        ("PI_CONFIG_DIR".to_owned(), ".omp".to_owned()),
     ];
+    // omp's extracted native addons: reuse the real cache (read-only use) instead of extracting
+    // them again into the sandbox.
+    if let Some(natives) = dirs::home_dir()
+        .map(|h| h.join(".omp").join("natives"))
+        .filter(|n| n.is_dir())
+    {
+        env.push(kv("PI_NATIVES_DIR", natives));
+    }
     if cfg!(unix) {
         env.push(kv("XDG_CONFIG_HOME", home.join(".config")));
         env.push(kv("XDG_DATA_HOME", home.join(".local/share")));
@@ -133,29 +168,55 @@ fn live_omp_serves_a_snapshot_of_its_session_through_the_host() {
     deck_host::start(host.namespace(), &spec, 120, 40).unwrap();
     assert!(mux.has_session(name));
 
-    // The real client finds the extension's endpoint once omp has started.
-    let client = CtlClient::spawn(dir, || {});
-    let end = Instant::now() + Duration::from_secs(30);
-    while client.latest().is_none() && Instant::now() < end {
+    // The real client finds the extension's endpoint once omp has started. While waiting, keep
+    // the last screen of the session: omp's own error shows there if it exits early (the host
+    // lingers 10 s after an unseen exit).
+    let client = CtlClient::spawn(dir.clone(), || {});
+    let start = Instant::now();
+    let mut screen = String::new();
+    let mut last_peek = Instant::now();
+    while client.latest().is_none() && start.elapsed() < Duration::from_secs(30) {
         std::thread::sleep(Duration::from_millis(100));
+        if last_peek.elapsed() >= Duration::from_millis(500) {
+            last_peek = Instant::now();
+            if let Ok((_, vt)) = deck_host::peek(host.namespace(), name, 200) {
+                screen = plain_text(&vt);
+            }
+        }
     }
-    let snap = client.latest().unwrap_or_else(|| {
+    let diagnostics = || {
         let log = host
             .namespace()
             .log_path(name)
             .and_then(|p| fs::read_to_string(p).ok());
-        panic!("no snapshot within 30 s; host log: {log:?}");
-    });
+        let final_screen = deck_host::peek(host.namespace(), name, 200)
+            .map(|(_, vt)| plain_text(&vt))
+            .unwrap_or(screen.clone());
+        format!(
+            "launch: {} {:?}\nenv set: {:?}\nenv removed: {:?}\nsession file: {}\nextension: {}\nctl endpoint: {}\nhost log: {log:?}\nomp screen:\n{final_screen}",
+            spec.program.display(),
+            spec.args,
+            spec.env_set,
+            spec.env_remove,
+            session.display(),
+            ext.display(),
+            dir.display(),
+        )
+    };
+    let Some(snap) = client.latest() else {
+        panic!("no snapshot within 30 s\n{}", diagnostics());
+    };
     assert!(client.connected());
     assert!(snap.pid > 0);
     let file = snap
         .session_file
         .as_deref()
-        .expect("snapshot names a session file");
+        .unwrap_or_else(|| panic!("snapshot names no session file\n{}", diagnostics()));
     assert_eq!(
         file.file_name(),
         session.file_name(),
-        "snapshot names {file:?}, expected {session:?}"
+        "snapshot names {file:?}, expected {session:?}\n{}",
+        diagnostics()
     );
     // A fresh resumed session with no subagents.
     assert!(snap.agents.is_empty(), "{:?}", snap.agents);

@@ -9,13 +9,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_LOG: u64 = 1 << 20;
 
+/// `OMP_DECK_HOST_LOG=debug` (inherited from the launching client) also logs per-connection
+/// events, for diagnosing transport problems.
+const LEVEL_ENV: &str = "OMP_DECK_HOST_LOG";
+
 struct FileLogger {
     file: Mutex<(File, u64)>,
+    level: log::LevelFilter,
 }
 
 impl log::Log for FileLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= self.level
     }
 
     fn log(&self, record: &log::Record) {
@@ -80,10 +85,15 @@ pub(crate) fn init(path: Option<&Path>) {
             len = 0;
         }
     }
+    let level = match std::env::var(LEVEL_ENV).as_deref() {
+        Ok("debug") => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Info,
+    };
     static LOGGER: OnceLock<FileLogger> = OnceLock::new();
     if LOGGER
         .set(FileLogger {
             file: Mutex::new((file, len)),
+            level,
         })
         .is_err()
     {
@@ -92,7 +102,7 @@ pub(crate) fn init(path: Option<&Path>) {
     if let Some(logger) = LOGGER.get()
         && log::set_logger(logger).is_ok()
     {
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(level);
     }
 }
 

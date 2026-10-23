@@ -180,8 +180,9 @@ jobs:
           Get-Content "$zip.sha256"
 
       - name: Smoke the packaged zip
-        # The release exes use the GUI subsystem: Start-Process -Wait with redirected output exercises the
-        # CLI's console handling, and the host must sideload the bundled conpty.dll.
+        # The release exes use the GUI subsystem: Start-Process with redirected output exercises the CLI's console
+        # handling, and the host must sideload the bundled conpty.dll. Never `Start-Process -Wait` here: pwsh 7
+        # waits for the whole process tree, i.e. for the detached session daemon too.
         run: |
           $ErrorActionPreference = 'Stop'
           $dir = Join-Path $env:RUNNER_TEMP 'zip-smoke'
@@ -191,8 +192,10 @@ jobs:
           $ns = 'omp-deck-test-release'
           function Invoke-Host([string]$HostArgs) {
             $out = Join-Path $env:RUNNER_TEMP 'host-out.txt'
-            $p = Start-Process -FilePath $host_exe -ArgumentList $HostArgs -Wait -PassThru -NoNewWindow `
+            $p = Start-Process -FilePath $host_exe -ArgumentList $HostArgs -PassThru -NoNewWindow `
               -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+            $null = $p.Handle   # keeps ExitCode available after the process exits
+            $p.WaitForExit()
             $text = (Get-Content -Raw $out -ErrorAction SilentlyContinue) + (Get-Content -Raw "$out.err" -ErrorAction SilentlyContinue)
             if ($p.ExitCode -ne 0) { throw "omp-deck-host $HostArgs failed ($($p.ExitCode)): $text" }
             return $text
@@ -243,7 +246,9 @@ jobs:
           function Invoke-InstalledHost([string]$HostArgs) {
             $out = Join-Path $env:RUNNER_TEMP 'inst-host-out.txt'
             $p = Start-Process -FilePath (Join-Path $installDir 'omp-deck-host.exe') -ArgumentList $HostArgs `
-              -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+              -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+            $null = $p.Handle   # keeps ExitCode available after the process exits
+            $p.WaitForExit()
             $text = (Get-Content -Raw $out -ErrorAction SilentlyContinue) + (Get-Content -Raw "$out.err" -ErrorAction SilentlyContinue)
             if ($p.ExitCode -ne 0) { throw "omp-deck-host $HostArgs failed ($($p.ExitCode)): $text" }
           }

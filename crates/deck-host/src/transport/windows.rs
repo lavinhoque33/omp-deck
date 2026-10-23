@@ -20,7 +20,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_DATA,
     ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED,
     GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -315,6 +315,13 @@ impl Listener {
             }
         };
         let connected = wait_connect(&pipe);
+        if let Err(e) = &connected {
+            // This instance is finished either way (its client left, or the wait failed):
+            // reset it so the handle closes cleanly; a fresh instance replaces it below.
+            log::info!("pipe client left before it was accepted: {e}");
+            // SAFETY: valid pipe handle; no I/O pending on it any more.
+            unsafe { DisconnectNamedPipe(raw(&pipe)) };
+        }
         // The next instance is created while this one still exists, so the pipe name never
         // disappears (clients would read that as "not running"); in the gap they see
         // ERROR_PIPE_BUSY and wait. After `remove` no new instance is created.
@@ -480,12 +487,12 @@ impl Stream {
             }
             // SAFETY: valid event handle.
             let waited = unsafe { WaitForSingleObject(raw(event), timeout_ms) };
-            if waited == WAIT_TIMEOUT {
-                // SAFETY: cancels exactly this operation; then wait for it to settle so `ov`
-                // and the buffer are no longer referenced.
+            if waited != WAIT_OBJECT_0 {
+                // Timed out (or the wait itself failed): cancel exactly this operation, then
+                // let GetOverlappedResult below wait for it to settle so `ov` and the buffer
+                // are no longer referenced when this returns.
+                // SAFETY: valid handle and the pending operation's OVERLAPPED.
                 unsafe { CancelIoEx(h, &ov) };
-            } else if waited != WAIT_OBJECT_0 {
-                return Err(io::Error::last_os_error());
             }
         }
         let mut n = 0u32;

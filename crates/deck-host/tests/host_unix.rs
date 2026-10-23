@@ -464,3 +464,24 @@ fn input_to_a_child_that_never_reads_is_bounded() {
     ns.0.kill("full").unwrap();
     assert!(!ns.0.has("full"));
 }
+
+#[test]
+fn clients_that_drop_immediately_do_not_break_the_endpoint() {
+    use std::io::Write;
+    let ns = TestNs::new();
+    deck_host::start(&ns.0, &shell("drop"), 80, 24).unwrap();
+    let socket = ns.dir().join("drop.sock");
+    for i in 0..30 {
+        let mut s = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        if i % 2 == 1 {
+            // A partial frame, then gone before reading the Hello reply.
+            let _ = s.write_all(&[5, 0]);
+        }
+        drop(s);
+    }
+    assert_eq!(ns.0.list(), ["drop"]);
+    assert!(ns.0.info("drop").is_ok());
+    let mut c = Client::attach(&ns, "drop", 80, 24);
+    c.type_line("echo still-served");
+    c.wait_output("still-served\r\n");
+}

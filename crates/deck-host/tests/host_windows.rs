@@ -231,3 +231,54 @@ fn child_exiting_at_launch_is_still_served_with_final_screen_and_code() {
     assert_eq!(c.next(), HostEvent::Closed);
     wait_until("endpoint gone", || !ns.0.has("quick"));
 }
+
+#[test]
+fn clients_that_drop_immediately_do_not_break_the_endpoint() {
+    use std::io::Write;
+    let ns = TestNs::new();
+    deck_host::start(&ns.0, &cmd("drop"), 80, 24).unwrap();
+    let suffix = format!(".{}.drop", ns.0.as_str());
+    let pipe = std::fs::read_dir(r"\\.\pipe\")
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("omp-deck-host.") && n.ends_with(&suffix))
+        .expect("session pipe listed");
+    let path = format!(r"\\.\pipe\{pipe}");
+    // Several threads connecting and dropping at once also hit the window between a new
+    // instance and the daemon's next ConnectNamedPipe (client gone first: ERROR_NO_DATA).
+    let workers: Vec<_> = (0..4)
+        .map(|t| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut connected = 0;
+                for i in 0..50 {
+                    // Busy instances are expected while the daemon recycles; count real
+                    // connects.
+                    let Ok(mut f) = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&path)
+                    else {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    };
+                    connected += 1;
+                    if (i + t) % 2 == 1 {
+                        // A partial frame, then gone before reading the Hello reply.
+                        let _ = f.write_all(&[5, 0]);
+                    }
+                    drop(f);
+                }
+                connected
+            })
+        })
+        .collect();
+    let connected: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
+    assert!(connected >= 10, "only {connected} raw connects succeeded");
+    assert_eq!(ns.0.list(), ["drop"]);
+    assert!(ns.0.info("drop").is_ok());
+    let mut c = Client::attach(&ns, "drop", 80, 24);
+    c.type_line("echo still-served");
+    c.wait_output("still-served");
+}

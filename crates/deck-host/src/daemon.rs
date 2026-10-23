@@ -632,6 +632,7 @@ fn accept_loop(shared: &Arc<Shared>, listener: &Listener) -> ! {
     loop {
         match listener.accept() {
             Ok(stream) => {
+                log::debug!("connection accepted");
                 let s = Arc::clone(shared);
                 if let Err(e) = spawn_thread("conn", move || {
                     if let Err(e) = serve_conn(&s, stream) {
