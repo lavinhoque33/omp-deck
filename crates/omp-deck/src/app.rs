@@ -1436,7 +1436,7 @@ impl App {
             }
             Some(Tab::Settings) => {
                 self.terminal_focused = false;
-                let account = self.drive.card(self.cfg.drive_auto_backup);
+                let account = self.drive.card(self.cfg.drive_backup_interval);
                 let rows = self.sync_rows();
                 let input = SettingsInput {
                     font_size: self.cfg.font_size,
@@ -2714,7 +2714,7 @@ const DELETE_ATTEMPTS: u32 = 5;
 const DELETE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// `1536` → `1.5 KB` (binary steps, one decimal above bytes).
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
     if bytes < 1024 {
         return format!("{bytes} B");

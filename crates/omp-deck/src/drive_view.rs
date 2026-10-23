@@ -1,12 +1,13 @@
 //! The "Google Drive backup" settings card and the restore picker (pure UI: state in, actions out;
 //! the logic lives in `app/drive.rs` and `deck_core::gdrive`).
 
+use deck_core::config::SyncInterval;
 use egui::{Button, Context, RichText, ScrollArea, Ui, vec2};
 
 use crate::confirm::{Dialog, show_dialog};
 use crate::icons::{ICON_ARCHIVE_RESTORE, ICON_CLOUD_UPLOAD, ICON_LOG_IN, ICON_LOG_OUT, ICON_X};
 use crate::theme::Palette;
-use crate::widgets::{Spin, icon_text, setting_row, toggle};
+use crate::widgets::{Spin, icon_text, setting_row};
 
 /// What the card shows.
 #[derive(Clone, Debug, PartialEq)]
@@ -20,7 +21,7 @@ pub enum DriveCard {
         email: Option<String>,
         /// "2026-10-22 13:52:01 UTC from host", `None` = no backup from this computer yet.
         last: Option<String>,
-        auto: bool,
+        interval: SyncInterval,
         busy: Option<Busy>,
     },
 }
@@ -39,7 +40,7 @@ pub enum Busy {
 pub enum DriveAction {
     SignIn,
     CancelSignIn,
-    SetAuto(bool),
+    SetInterval(SyncInterval),
     BackupNow,
     OpenRestore,
     SignOut,
@@ -112,7 +113,7 @@ pub fn card(ui: &mut Ui, state: &DriveCard) -> Vec<DriveAction> {
         DriveCard::SignedIn {
             email,
             last,
-            auto,
+            interval,
             busy,
         } => {
             let idle = busy.is_none();
@@ -135,12 +136,19 @@ pub fn card(ui: &mut Ui, state: &DriveCard) -> Vec<DriveAction> {
             setting_row(
                 ui,
                 "Back up automatically",
-                "Checks every 10 minutes and uploads when the backed-up files changed",
+                "Checks on this schedule and uploads when the backed-up files changed",
                 |ui| {
-                    let mut on = *auto;
-                    if toggle(ui, &mut on).changed() {
-                        actions.push(DriveAction::SetAuto(on));
-                    }
+                    egui::ComboBox::from_id_salt("drive-backup-interval")
+                        .selected_text(interval.label())
+                        .show_ui(ui, |ui| {
+                            for v in SyncInterval::ALL {
+                                if ui.selectable_label(*interval == v, v.label()).clicked()
+                                    && *interval != v
+                                {
+                                    actions.push(DriveAction::SetInterval(v));
+                                }
+                            }
+                        });
                 },
             );
             ui.add_space(4.0);

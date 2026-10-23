@@ -5,11 +5,12 @@
 use deck_core::config::SyncInterval;
 use egui::{Button, Context, Frame, Id, Margin, RichText, ScrollArea, Stroke, Ui, vec2};
 
-use crate::confirm::{Dialog, show_dialog};
+use crate::confirm::{Dialog, show_dialog, show_dialog_labeled};
 use crate::drive_view::{DriveAction, DriveCard};
 use crate::icons::{
     ICON_ARCHIVE_RESTORE, ICON_CLOUD_UPLOAD, ICON_FOLDER, ICON_FOLDER_OPEN, ICON_FOLDER_PLUS,
-    ICON_LOG_IN, ICON_PENCIL, ICON_TRASH_2, ICON_TRIANGLE_ALERT, ICON_X,
+    ICON_LIST_CHECKS, ICON_LOG_IN, ICON_PENCIL, ICON_REFRESH_CW, ICON_TRASH_2, ICON_TRIANGLE_ALERT,
+    ICON_X,
 };
 use crate::theme::{self, Palette};
 use crate::widgets::{Spin, card, icon_text, setting_row, toggle};
@@ -43,6 +44,8 @@ pub enum SessionsCell {
     /// `0` sessions = nothing to back up.
     Ready {
         count: u64,
+        /// Sessions not opted out (`count` minus the exclusions).
+        included: u64,
         text: String,
     },
     Failed(String),
@@ -59,7 +62,13 @@ impl Cells {
         matches!(self.omp, OmpCell::Present(_))
     }
 
+    /// At least one session is left to back up.
     pub fn sessions_usable(&self) -> bool {
+        matches!(self.sessions, SessionsCell::Ready { included, .. } if included > 0)
+    }
+
+    /// The folder has sessions to choose from.
+    pub fn sessions_choosable(&self) -> bool {
         matches!(self.sessions, SessionsCell::Ready { count, .. } if count > 0)
     }
 
@@ -96,6 +105,12 @@ impl Cells {
             SessionsCell::Ready { count: 0, .. } => (
                 "no sessions".into(),
                 Some("omp has no sessions for this folder"),
+            ),
+            SessionsCell::Ready {
+                included: 0, text, ..
+            } => (
+                text.clone(),
+                Some("Every session is opted out; use Choose… to include some"),
             ),
             SessionsCell::Ready { text, .. } => (text.clone(), None),
             SessionsCell::Failed(e) => (
@@ -195,6 +210,8 @@ pub enum SyncAction {
     BackUp(usize),
     SetInterval(SyncInterval),
     OpenRestore,
+    ChooseSessions(usize),
+    OpenManager,
 }
 
 fn account_strip(ui: &mut Ui, account: &DriveCard, actions: &mut Vec<SyncAction>) {
@@ -319,6 +336,11 @@ pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
                     actions.push(SyncAction::OpenRestore);
                 }
                 resp.on_disabled_hover_text(why_not);
+                let resp = button(ui, idle, ICON_LIST_CHECKS, "Manage cloud backups…");
+                if resp.clicked() {
+                    actions.push(SyncAction::OpenManager);
+                }
+                resp.on_disabled_hover_text(why_not);
             },
         );
         weak_note(ui, NOTE);
@@ -373,11 +395,17 @@ fn project_row(
                             ui.add(Spin::new(16.0, pal.accent_b));
                         }
                         None => {
-                            let resp = button(ui, idle, ICON_CLOUD_UPLOAD, "Back up now");
+                            let any = (row.omp_on && row.cells.omp_usable())
+                                || (row.sessions_on && row.cells.sessions_usable());
+                            let resp = button(ui, idle && any, ICON_CLOUD_UPLOAD, "Back up now");
                             if resp.clicked() {
                                 actions.push(SyncAction::BackUp(i));
                             }
-                            resp.on_disabled_hover_text(why_not);
+                            resp.on_disabled_hover_text(if idle {
+                                "Turn on .omp or Sessions first"
+                            } else {
+                                why_not
+                            });
                         }
                     }
                     if button(ui, row.busy.is_none(), ICON_PENCIL, "Change…").clicked() {
@@ -413,6 +441,16 @@ fn project_row(
                         actions.push(SyncAction::SetSessions(i, on));
                     },
                 );
+                if ui
+                    .add_enabled(
+                        row.cells.sessions_choosable() && row.busy.is_none(),
+                        Button::new(RichText::new("Choose…").small()),
+                    )
+                    .on_hover_text("Pick which sessions are backed up (new ones are included)")
+                    .clicked()
+                {
+                    actions.push(SyncAction::ChooseSessions(i));
+                }
             });
             ui.add_space(2.0);
             match &row.last {
@@ -468,7 +506,8 @@ fn icon_label(icon: crate::icons::Icon, color: egui::Color32) -> egui::Label {
     egui::Label::new(icon_text(icon, 16.0, color))
 }
 
-/// `[switch] label  size` where the switch is disabled (and shown off) when `usable` is false.
+/// `[switch] label  size`; the switch keeps showing the stored state but is disabled when `usable`
+/// is false (nothing to back up), with `why` as its tooltip.
 fn part_switch(
     ui: &mut Ui,
     label: &str,
@@ -479,7 +518,7 @@ fn part_switch(
     mut changed: impl FnMut(bool),
 ) {
     let pal = Palette::of_ui(ui);
-    let mut shown = on && usable;
+    let mut shown = on;
     let resp = ui.add_enabled_ui(usable, |ui| toggle(ui, &mut shown)).inner;
     if resp.changed() {
         changed(shown);
@@ -540,7 +579,10 @@ pub fn path_dialog(ctx: &Context, p: &mut PathPrompt) -> PathAnswer {
             id: "sync-path",
             title,
             width: 460.0,
-            confirm_label: "Add",
+            confirm_label: match p.purpose {
+                PathPurpose::Add => "Add",
+                PathPurpose::Change(_) => "Change",
+            },
             confirm_enabled: ok,
             danger: false,
             enter_confirms: true,
@@ -593,6 +635,8 @@ pub struct BackupDialog {
     pub omp: bool,
     pub sessions: bool,
     pub keep: bool,
+    /// Sessions the row for this folder leaves out (0 when the folder is not in the Sync table).
+    pub excluded: usize,
 }
 
 pub enum BackupAnswer {
@@ -656,6 +700,17 @@ pub fn backup_dialog(
                     },
                 );
             });
+            if d.excluded > 0 {
+                ui.add_space(4.0);
+                weak_note(
+                    ui,
+                    &format!(
+                        "{} session{} excluded on the Sync page",
+                        d.excluded,
+                        if d.excluded == 1 { "" } else { "s" }
+                    ),
+                );
+            }
             ui.add_space(10.0);
             ui.checkbox(&mut d.keep, "Keep this folder in Sync")
                 .on_hover_text("Adds the folder to the Sync page so it is backed up automatically");
@@ -686,6 +741,8 @@ pub struct VersionRow {
     pub when: String,
     /// ".omp 24 KiB · 3 sessions 1.2 MB".
     pub summary: String,
+    /// The uploaded file's size.
+    pub bytes: u64,
     pub has_omp: bool,
     pub has_sessions: bool,
 }
@@ -824,6 +881,8 @@ pub enum RestoreAction {
     /// The target text was edited.
     TargetEdited,
     Select(usize, usize),
+    /// Delete the version (project, version) from Drive (asks first).
+    Delete(usize, usize),
     Continue,
     Confirm,
     Close,
@@ -857,7 +916,7 @@ pub fn restore_dialog(
             enter_confirms: false,
         },
         |ui| match &d.step {
-            Step::Pick => pick_body(ui, d, &mut act),
+            Step::Pick => pick_body(ui, d, lane_busy, &mut act),
             Step::Preparing => {
                 progress_or_wait(ui, progress, "Downloading and checking the backup…");
             }
@@ -937,7 +996,7 @@ fn progress_or_wait(ui: &mut Ui, p: Option<&ProgView>, fallback: &str) {
     }
 }
 
-fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, act: &mut Option<RestoreAction>) {
+fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Option<RestoreAction>) {
     let pal = Palette::of_ui(ui);
     if let Some(e) = &d.error {
         ui.horizontal(|ui| {
@@ -1014,17 +1073,31 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, act: &mut Option<RestoreAction>
                         let text = RichText::new(format!("{}   {}", v.when, v.summary))
                             .small()
                             .color(pal.text);
-                        if ui
-                            .add(
-                                Button::selectable(sel, text)
-                                    .truncate()
-                                    .min_size(vec2(ui.available_width(), 24.0)),
-                            )
-                            .clicked()
-                            && !sel
-                        {
-                            *act = Some(RestoreAction::Select(pi, vi));
-                        }
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let del = ui
+                                .add_enabled(
+                                    !lane_busy,
+                                    Button::new(icon_text(ICON_TRASH_2, 14.0, pal.danger))
+                                        .min_size(vec2(26.0, 24.0)),
+                                )
+                                .on_hover_text("Delete this backup from Google Drive")
+                                .on_disabled_hover_text("Another project job is running");
+                            if del.clicked() {
+                                *act = Some(RestoreAction::Delete(pi, vi));
+                            }
+                            if ui
+                                .add(
+                                    Button::selectable(sel, text)
+                                        .truncate()
+                                        .min_size(vec2(ui.available_width(), 24.0)),
+                                )
+                                .clicked()
+                                && !sel
+                            {
+                                *act = Some(RestoreAction::Select(pi, vi));
+                            }
+                        });
                     }
                 });
             }
@@ -1236,6 +1309,484 @@ fn warn_list(ui: &mut Ui, title: &str, items: &[String]) {
     }
 }
 
+// ------------------------------------------------------------------ sessions to back up
+
+/// One session in the "Sessions to back up" list.
+pub struct SessionItem {
+    pub id: String,
+    pub title: String,
+    /// Lower-cased title and id, for the filter box.
+    pub haystack: String,
+    pub age: String,
+    pub size: String,
+    pub bytes: u64,
+    /// Checked = backed up.
+    pub on: bool,
+}
+
+pub struct SessionsDialog {
+    pub path: std::path::PathBuf,
+    pub display: String,
+    pub items: Vec<SessionItem>,
+    filter: String,
+    focus_filter: bool,
+}
+
+pub enum SessionsAnswer {
+    Open,
+    Cancel,
+    Save,
+}
+
+impl SessionsDialog {
+    pub fn new(path: std::path::PathBuf, display: String, items: Vec<SessionItem>) -> Self {
+        SessionsDialog {
+            path,
+            display,
+            items,
+            filter: String::new(),
+            focus_filter: true,
+        }
+    }
+
+    /// Ids of the unchecked sessions: what the row stores.
+    pub fn excluded_ids(&self) -> std::collections::BTreeSet<String> {
+        self.items
+            .iter()
+            .filter(|s| !s.on)
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// (checked sessions, their bytes).
+    pub fn selected(&self) -> (usize, u64) {
+        self.items
+            .iter()
+            .filter(|s| s.on)
+            .fold((0, 0), |(n, b), s| (n + 1, b + s.bytes))
+    }
+
+    /// All / None apply to the sessions the filter shows.
+    pub fn set_visible(&mut self, on: bool) {
+        let needle = self.filter.trim().to_lowercase();
+        for s in &mut self.items {
+            if needle.is_empty() || s.haystack.contains(&needle) {
+                s.on = on;
+            }
+        }
+    }
+}
+
+/// "Sessions to back up": checkbox list, checked = backed up.
+pub fn sessions_dialog(ctx: &Context, d: &mut SessionsDialog) -> SessionsAnswer {
+    let pal = Palette::of_ctx(ctx);
+    let answer = show_dialog(
+        ctx,
+        &Dialog {
+            id: "sync-sessions",
+            title: "Sessions to back up",
+            width: 560.0,
+            confirm_label: "Save",
+            confirm_enabled: true,
+            danger: false,
+            enter_confirms: false,
+        },
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.add(icon_label(ICON_FOLDER, pal.glyph));
+                ui.add(
+                    egui::Label::new(RichText::new(&d.display).color(pal.text_strong)).truncate(),
+                );
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut d.filter)
+                        .id(Id::unique("omp-deck-sync-sessions-filter"))
+                        .hint_text("Filter sessions")
+                        .desired_width(ui.available_width() - 120.0)
+                        .margin(Margin::symmetric(10, 6)),
+                );
+                if d.focus_filter {
+                    resp.request_focus();
+                    d.focus_filter = false;
+                }
+                if ui.button("All").clicked() {
+                    d.set_visible(true);
+                }
+                if ui.button("None").clicked() {
+                    d.set_visible(false);
+                }
+            });
+            ui.add_space(6.0);
+            let needle = d.filter.trim().to_lowercase();
+            let mut shown = 0usize;
+            ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for it in &mut d.items {
+                    if !(needle.is_empty() || it.haystack.contains(&needle)) {
+                        continue;
+                    }
+                    shown += 1;
+                    egui::Sides::new().shrink_left().show(
+                        ui,
+                        |ui| {
+                            ui.add(egui::Checkbox::new(
+                                &mut it.on,
+                                RichText::new(&it.title).color(pal.text),
+                            ))
+                            .on_hover_text(&it.id);
+                        },
+                        |ui| {
+                            ui.label(RichText::new(&it.size).small().color(pal.weak));
+                            ui.label(RichText::new(&it.age).small().color(pal.weak));
+                        },
+                    );
+                }
+                if shown == 0 {
+                    ui.label(RichText::new("No session matches the filter.").color(pal.weak));
+                }
+            });
+            ui.add_space(8.0);
+            let (n, bytes) = d.selected();
+            ui.label(
+                RichText::new(format!(
+                    "{n} of {} selected · {}",
+                    d.items.len(),
+                    crate::app::human_size(bytes)
+                ))
+                .color(pal.text),
+            );
+            weak_note(ui, "New sessions are backed up automatically.");
+        },
+    );
+    match answer {
+        Some(true) => SessionsAnswer::Save,
+        Some(false) => SessionsAnswer::Cancel,
+        None => SessionsAnswer::Open,
+    }
+}
+
+// ------------------------------------------------------------------ cloud backup manager
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagerStep {
+    Browse,
+    /// "Delete permanently?" with the totals.
+    Confirm,
+    Deleting,
+}
+
+pub struct ManagerDialog {
+    pub step: ManagerStep,
+    pub list: ListState,
+    /// Checked versions, by index into the app's backup list.
+    pub checked: std::collections::HashSet<usize>,
+    /// The user pressed Cancel while deleting.
+    pub cancelling: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ManagerAction {
+    /// Close (browse), stop deleting (deleting).
+    Cancel,
+    Refresh,
+    Toggle(usize, bool),
+    ToggleGroup(usize, bool),
+    /// Go to the confirmation.
+    AskDelete,
+    /// Back from the confirmation to the list.
+    Back,
+    Delete,
+}
+
+impl ManagerDialog {
+    pub fn new() -> ManagerDialog {
+        ManagerDialog {
+            step: ManagerStep::Browse,
+            list: ListState::Loading,
+            checked: std::collections::HashSet::new(),
+            cancelling: false,
+        }
+    }
+
+    /// (checked versions, their total size).
+    pub fn totals(&self) -> (usize, u64) {
+        let ListState::Ready(groups) = &self.list else {
+            return (0, 0);
+        };
+        groups
+            .iter()
+            .flat_map(|g| &g.versions)
+            .filter(|v| self.checked.contains(&v.backup))
+            .fold((0, 0), |(n, b), v| (n + 1, b + v.bytes))
+    }
+
+    pub fn set_version(&mut self, backup: usize, on: bool) {
+        if on {
+            self.checked.insert(backup);
+        } else {
+            self.checked.remove(&backup);
+        }
+    }
+
+    pub fn set_group(&mut self, group: usize, on: bool) {
+        let ListState::Ready(groups) = &self.list else {
+            return;
+        };
+        let Some(g) = groups.get(group) else {
+            return;
+        };
+        for v in &g.versions {
+            if on {
+                self.checked.insert(v.backup);
+            } else {
+                self.checked.remove(&v.backup);
+            }
+        }
+    }
+
+    /// Replaces the list. Selections are indices into the app's list, which a refresh renumbers,
+    /// so they are dropped.
+    pub fn set_list(&mut self, list: ListState) {
+        self.checked.clear();
+        self.list = list;
+    }
+}
+
+impl Default for ManagerDialog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// "Manage cloud backups": every project backup, project → PC → versions, with checkboxes.
+pub fn manager_dialog(
+    ctx: &Context,
+    d: &mut ManagerDialog,
+    progress: Option<&ProgView>,
+    lane_busy: bool,
+) -> Option<ManagerAction> {
+    let pal = Palette::of_ctx(ctx);
+    let mut act = None;
+    let (selected, bytes) = d.totals();
+    let (label, enabled, danger) = match d.step {
+        ManagerStep::Browse => (
+            "Delete permanently…",
+            selected > 0 && !lane_busy && matches!(d.list, ListState::Ready(_)),
+            false,
+        ),
+        ManagerStep::Confirm => ("Delete permanently", true, true),
+        ManagerStep::Deleting => ("Delete permanently", false, true),
+    };
+    let cancel_label = match (&d.step, &d.list) {
+        (ManagerStep::Browse, ListState::Failed(_)) => "Close",
+        (ManagerStep::Browse, ListState::Ready(g)) if g.is_empty() => "Close",
+        _ => "Cancel",
+    };
+    let answer = show_dialog_labeled(
+        ctx,
+        &Dialog {
+            id: "sync-manager",
+            title: "Manage cloud backups",
+            width: 600.0,
+            confirm_label: label,
+            confirm_enabled: enabled,
+            danger,
+            enter_confirms: false,
+        },
+        cancel_label,
+        |ui| match d.step {
+            ManagerStep::Browse => manager_body(ui, d, selected, bytes, lane_busy, &mut act),
+            ManagerStep::Confirm => {
+                let wrap = |ui: &mut Ui, t: RichText| {
+                    ui.add(egui::Label::new(t).wrap_mode(egui::TextWrapMode::Wrap));
+                };
+                wrap(
+                    ui,
+                    RichText::new(format!(
+                        "Permanently delete {selected} backup{} ({}) from Google Drive?",
+                        if selected == 1 { "" } else { "s" },
+                        crate::app::human_size(bytes)
+                    ))
+                    .color(pal.text_strong),
+                );
+                ui.add_space(4.0);
+                wrap(
+                    ui,
+                    RichText::new("This can't be undone. The files do not go to the trash.")
+                        .color(pal.danger),
+                );
+                if let ListState::Ready(groups) = &d.list {
+                    ui.add_space(8.0);
+                    ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                        for g in groups {
+                            let host = if g.this_pc {
+                                "this PC"
+                            } else {
+                                g.host.as_str()
+                            };
+                            for v in g.versions.iter().filter(|v| d.checked.contains(&v.backup)) {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "• {} · {host} · {}",
+                                            g.name, v.when
+                                        ))
+                                        .small()
+                                        .color(pal.text),
+                                    )
+                                    .truncate(),
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+            ManagerStep::Deleting => {
+                progress_or_wait(
+                    ui,
+                    progress,
+                    if d.cancelling {
+                        "Stopping after the current backup…"
+                    } else {
+                        "Deleting…"
+                    },
+                );
+            }
+        },
+    );
+    if act.is_some() {
+        return act;
+    }
+    match (answer, d.step) {
+        (Some(true), ManagerStep::Browse) => Some(ManagerAction::AskDelete),
+        (Some(true), ManagerStep::Confirm) => Some(ManagerAction::Delete),
+        (Some(false), ManagerStep::Confirm) => Some(ManagerAction::Back),
+        (Some(false), _) => Some(ManagerAction::Cancel),
+        _ => None,
+    }
+}
+
+fn manager_body(
+    ui: &mut Ui,
+    d: &ManagerDialog,
+    selected: usize,
+    bytes: u64,
+    lane_busy: bool,
+    act: &mut Option<ManagerAction>,
+) {
+    let pal = Palette::of_ui(ui);
+    let groups = match &d.list {
+        ListState::Loading => {
+            ui.horizontal(|ui| {
+                ui.add(Spin::new(18.0, pal.accent_b));
+                ui.label(RichText::new("Loading project backups…").color(pal.weak));
+            });
+            return;
+        }
+        ListState::Failed(e) => {
+            ui.add(
+                egui::Label::new(RichText::new(e).color(pal.danger))
+                    .wrap_mode(egui::TextWrapMode::Wrap),
+            );
+            ui.add_space(8.0);
+            if ui.button("Retry").clicked() {
+                *act = Some(ManagerAction::Refresh);
+            }
+            return;
+        }
+        ListState::Ready(g) => g,
+    };
+    if groups.is_empty() {
+        ui.label(RichText::new("No project backups on Google Drive.").color(pal.weak));
+        ui.add_space(8.0);
+        if ui.button("Refresh").clicked() {
+            *act = Some(ManagerAction::Refresh);
+        }
+        return;
+    }
+    ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let mut last: Option<(&str, &str)> = None;
+        for (gi, g) in groups.iter().enumerate() {
+            if last != Some((g.name.as_str(), g.path.as_str())) {
+                last = Some((g.name.as_str(), g.path.as_str()));
+                if gi > 0 {
+                    ui.add_space(6.0);
+                }
+                ui.horizontal(|ui| {
+                    ui.add(icon_label(ICON_FOLDER, pal.glyph));
+                    ui.label(theme::strong(&g.name).color(pal.text_strong));
+                    ui.add(
+                        egui::Label::new(RichText::new(&g.path).small().color(pal.weak)).truncate(),
+                    );
+                });
+            }
+            ui.indent(("mgr-pc", gi), |ui| {
+                let mut on = g.versions.iter().all(|v| d.checked.contains(&v.backup));
+                let host = if g.this_pc {
+                    "this PC"
+                } else {
+                    g.host.as_str()
+                };
+                if ui
+                    .checkbox(&mut on, RichText::new(host).color(pal.text))
+                    .on_hover_text("Select every version from this computer")
+                    .changed()
+                {
+                    *act = Some(ManagerAction::ToggleGroup(gi, on));
+                }
+                ui.indent(("mgr-versions", gi), |ui| {
+                    for v in &g.versions {
+                        let mut on = d.checked.contains(&v.backup);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .checkbox(&mut on, RichText::new(&v.when).small().color(pal.text))
+                                .changed()
+                            {
+                                *act = Some(ManagerAction::Toggle(v.backup, on));
+                            }
+                            ui.label(
+                                RichText::new(crate::app::human_size(v.bytes))
+                                    .small()
+                                    .color(pal.text),
+                            );
+                            ui.label(RichText::new(&v.summary).small().color(pal.weak));
+                        });
+                    }
+                });
+            });
+        }
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                !lane_busy,
+                Button::new((
+                    icon_text(ICON_REFRESH_CW, 14.0, pal.glyph),
+                    RichText::new("Refresh"),
+                )),
+            )
+            .clicked()
+        {
+            *act = Some(ManagerAction::Refresh);
+        }
+        ui.label(
+            RichText::new(format!(
+                "{selected} selected · {}",
+                crate::app::human_size(bytes)
+            ))
+            .color(pal.text),
+        );
+    });
+    if lane_busy {
+        weak_note(ui, "Another project job is running; wait for it to finish.");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1266,6 +1817,84 @@ mod tests {
         assert!(!plan(false, 0).danger());
     }
 
+    fn item(id: &str, title: &str, bytes: u64, on: bool) -> SessionItem {
+        SessionItem {
+            id: id.into(),
+            title: title.into(),
+            haystack: format!("{title} {id}").to_lowercase(),
+            age: String::new(),
+            size: String::new(),
+            bytes,
+            on,
+        }
+    }
+
+    #[test]
+    fn sessions_dialog_stores_the_unchecked_and_all_none_follow_the_filter() {
+        let mut d = SessionsDialog::new(
+            "/w/app".into(),
+            "~/app".into(),
+            vec![
+                item("a", "Fix parser", 10, true),
+                item("b", "Write docs", 20, false),
+                item("c", "Fix lexer", 30, true),
+            ],
+        );
+        assert_eq!(d.excluded_ids().into_iter().collect::<Vec<_>>(), ["b"]);
+        assert_eq!(d.selected(), (2, 40));
+        d.filter = " FIX ".into();
+        d.set_visible(false);
+        assert_eq!(d.excluded_ids().len(), 3, "only the shown rows changed");
+        d.set_visible(true);
+        assert_eq!(d.excluded_ids().into_iter().collect::<Vec<_>>(), ["b"]);
+        d.filter.clear();
+        d.set_visible(true);
+        assert!(d.excluded_ids().is_empty());
+    }
+
+    fn version(backup: usize, bytes: u64) -> VersionRow {
+        VersionRow {
+            backup,
+            when: "t".into(),
+            summary: String::new(),
+            bytes,
+            has_omp: true,
+            has_sessions: false,
+        }
+    }
+
+    #[test]
+    fn manager_selection_totals_groups_and_resets_on_refresh() {
+        let mut d = ManagerDialog::new();
+        d.set_list(ListState::Ready(vec![
+            CloudProject {
+                name: "app".into(),
+                path: "/w/app".into(),
+                host: "h".into(),
+                this_pc: true,
+                versions: vec![version(3, 100), version(1, 50)],
+            },
+            CloudProject {
+                name: "app".into(),
+                path: "/w/app".into(),
+                host: "other".into(),
+                this_pc: false,
+                versions: vec![version(0, 7)],
+            },
+        ]));
+        assert_eq!(d.totals(), (0, 0));
+        d.set_group(0, true);
+        assert_eq!(d.totals(), (2, 150));
+        d.set_version(0, true);
+        assert_eq!(d.totals(), (3, 157));
+        d.set_version(3, false);
+        assert_eq!(d.totals(), (2, 57));
+        d.set_group(0, false);
+        assert_eq!(d.totals(), (1, 7));
+        d.set_list(ListState::Loading);
+        assert_eq!(d.totals(), (0, 0), "indices are renumbered by a refresh");
+    }
+
     #[test]
     fn continue_needs_a_version_a_part_and_a_target() {
         let mut d = RestoreDialog::new(false, "/tmp/x".into(), true, false);
@@ -1279,6 +1908,7 @@ mod tests {
                 backup: 0,
                 when: "now".into(),
                 summary: String::new(),
+                bytes: 0,
                 has_omp: true,
                 has_sessions: false,
             }],
@@ -1320,6 +1950,7 @@ mod render_tests {
             omp: OmpCell::Present("1 KB · 1 file".into()),
             sessions: SessionsCell::Ready {
                 count: 2,
+                included: 2,
                 text: "2 sessions · 3 KB".into(),
             },
         }
@@ -1342,7 +1973,7 @@ mod render_tests {
         let account = DriveCard::SignedIn {
             email: Some("a@b.c".into()),
             last: None,
-            auto: false,
+            interval: SyncInterval::Every10Minutes,
             busy: None,
         };
         let page_state = SyncPage {
@@ -1370,6 +2001,7 @@ mod render_tests {
                 backup: 0,
                 when: "2026-10-22".into(),
                 summary: ".omp 1 KB".into(),
+                bytes: 1024,
                 has_omp: true,
                 has_sessions: true,
             }],
@@ -1417,6 +2049,7 @@ mod render_tests {
             omp: true,
             sessions: true,
             keep: true,
+            excluded: 2,
         };
         let mut p = PathPrompt::new(PathPurpose::Add);
         frames(|_, ctx| {

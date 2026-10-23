@@ -1202,3 +1202,49 @@ impl Service {
 - Transfers: initiation, chunks and downloads retry network/429/5xx with bounded backoff; a 308 that does not
   advance, or a download that does not pass its high-water mark, counts as a failure. The access token is
   fetched before packing (offline fails at once). `Service.cache_root` (pub) = `$XDG_CACHE_HOME/omp-deck/project-sync`.
+
+## Wave 11: cloud backup management, deliberate add, session opt-out, config backup interval
+
+### deck-core
+- `config::SyncInterval` gains `Every10Minutes` ("Every 10 minutes") and `Every30Minutes` ("Every 30 minutes");
+  `ALL` = `[Off, Every10Minutes, Every30Minutes, Hourly, Every6Hours, Daily]`. Existing serialized names unchanged.
+  `#[default]` stays `Every6Hours` (project sync).
+- `AppConfig.drive_auto_backup: bool` is replaced by `AppConfig.drive_backup_interval: SyncInterval`
+  (config backup lane; default `Every10Minutes`). Migration on load: a stored `"drive_auto_backup": false` with no
+  `drive_backup_interval` key → `Off`; `true`/absent → `Every10Minutes`. The old key is never written again.
+- `config::SyncRow` gains `#[serde(default)] excluded_sessions: BTreeSet<String>` (session ids opted out; every
+  other session, including ones created later, is backed up).
+- `gdrive::ProjectSizes` (now `Clone`, not `Copy`) gains `session_list: Vec<SessionSize>`, newest first, for every
+  session of the project (exclusions not applied; `sessions`/`session_bytes` stay totals over all of them).
+  `SessionSize { id: String, title: String /* title, else first-prompt snippet, else "(untitled)" */,
+  modified: SystemTime, bytes: u64 /* jsonl + artifacts */ }`.
+- `Service::backup_project(root, project, parts, excluded: &BTreeSet<String>, force, cancel, progress)`: sessions
+  whose id is in `excluded` are left out silently (not in `skipped`); the fingerprint covers the excluded set, so
+  changing it counts as a change. Selected parts with nothing left (all sessions excluded, no `.omp`) →
+  `Error::NothingToBackUp`.
+- `Service::delete_project_backup(&self, backup: &ProjectBackup) -> Result<()>`: Drive `files.delete` (permanent,
+  bypasses trash; appDataFolder files cannot be trashed anyway); 404 = already gone = `Ok`. Refuses (typed error)
+  a file whose appProperties `kind` is not `project`. If the deleted file's name equals the `last.name` of a
+  `ProjectSyncState` entry, that entry is removed (state saved) so the next pass uploads that project again.
+
+### omp-deck
+- Add folder / Change folder only adds/changes the row: new rows start with `.omp` and Sessions **off** and no
+  exclusions; nothing is packed or uploaded until the user clicks Back up now (or the row is later due in an
+  automatic pass with something selected). Adding a row never makes a pass due immediately (if `next_auto` is in
+  the past, push it to now + period). Sizes are still measured on a worker.
+- Sessions cell: count/size of the **included** sessions (`9 of 11 sessions · 80 MB` when some are excluded,
+  computed on measure/exclusion change, never per frame) + a "Choose…" button → dialog "Sessions to back up":
+  filter box, All / None, checkbox list (checked = backed up; title, age, size), note "New sessions are backed
+  up automatically", Save / Cancel. Save stores the unchecked ids (only ids in the current list).
+- Every backup of a row (manual, automatic, sidebar dialog for a folder in the table) passes the row's
+  exclusions; the sidebar backup dialog shows "N sessions excluded on the Sync page" when nonzero.
+- Delete cloud backups (project lane, one job at a time, never while another project job runs):
+  - Restore dialog: each version has a trash button → confirm "Delete permanently" (project, PC, date, size,
+    "This can't be undone"), then the list refreshes.
+  - Sync page: "Manage cloud backups…" next to Restore… → dialog listing every project backup grouped by project
+    → PC ("this PC" for ours) → versions (date, size, parts), version checkboxes + group select-all, Refresh,
+    footer "N selected · size", "Delete permanently…" → confirm (count, total size, can't be undone) → worker
+    deletes sequentially with progress "Deleting i of n", stops on cancel, reports deleted/failed, refreshes.
+- Settings → OmpDeck → Google Drive backup: the "Back up automatically" switch becomes a dropdown over
+  `SyncInterval::ALL` ("Off" disables; others = period between checks; unchanged config is still skipped). The
+  first automatic check after startup/sign-in/turning it on stays 45 s.

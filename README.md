@@ -153,9 +153,10 @@ consistent SQLite snapshot.
 **What is not backed up:** logins and API credentials (`agent.db`), `secrets.yml`, sessions, logs,
 caches, the model catalog (`models.db`) and other runtime state.
 
-**Backups**: each backup is one `omp-backup-<UTC time>-<host>.tar.gz` with a manifest. With
-**Back up automatically** on (the default), OmpDeck checks every 10 minutes and uploads only when
-the backed-up content changed. **Back up now** uploads at once. Drive keeps the newest 30 backups.
+**Backups**: each backup is one `omp-backup-<UTC time>-<host>.tar.gz` with a manifest. **Back up
+automatically** sets how often OmpDeck checks (Off, every 10 minutes (default), 30 minutes, hour, 6 hours,
+day); it uploads only when the backed-up content changed. **Back up now** uploads at once. Drive keeps the
+newest 30 backups.
 
 **Restore…** lists the backups, newest first, with date, machine and size. After you pick one,
 OmpDeck downloads and verifies it, then shows exactly which files will be replaced, added or
@@ -174,7 +175,8 @@ Google OAuth credentials show the card as "not available in this build". Maintai
 
 Settings → **Sync** is a separate workflow from the config backup above and uses the same Google
 sign-in. Each row of the **Projects** table is a folder (**Add folder…**, **Change…**) with two
-switches, each showing how much it would upload:
+switches, each showing how much it would upload. A newly added folder starts with both switches off and
+nothing is uploaded until you pick what to keep and click **Back up now**:
 
 - **.omp folder**: the project's `<folder>/.omp` (project `AGENTS.md`, rules, skills, commands, agents,
   `config.yml`, `mcp.json`, plans, …). `node_modules/`, `.git/`, symlinks and special files are skipped
@@ -182,10 +184,12 @@ switches, each showing how much it would upload:
   Not offered for your home folder, whose `.omp` is omp's global directory.
 - **Sessions**: every omp session whose project is this folder, with its attachments, subagent
   transcripts and referenced images. Sessions that are being written are saved up to their last complete
-  line.
+  line. **Choose…** opens the session list: untick the sessions to leave out. Sessions created later are
+  backed up automatically.
 
-**Back up now** uploads one row at once. **Back up listed projects automatically** (Off, Every hour,
-Every 6 hours (default), Every day) uploads only rows whose files changed since their last backup. Each backup is one
+**Back up now** uploads one row at once. **Back up listed projects automatically** (Off, every 10 or 30
+minutes, every hour, every 6 hours (default), every day) uploads only rows whose files or session choices
+changed since their last backup. Each backup is one
 `omp-project-<UTC time>-<host>-<folder>.tar.gz`; Drive keeps the newest 3 per project and machine.
 Backups count toward your Drive storage. Right-click a project (or a session, under **Google Drive**) in the
 sidebar → **Back up to Google Drive…** for a one-off backup, optionally adding the folder to the table.
@@ -203,6 +207,11 @@ versions selectable. Pick the folder to restore into (it is created if missing) 
   new folder and tells the agent where it now lives. Existing sessions are never replaced or removed; a
   session that already exists on this machine is added as a copy with a new id. Restoring sessions needs
   omp installed.
+
+**Delete backups**: **Manage cloud backups…** lists every project backup by project, machine and version;
+tick the ones to remove and **Delete permanently…**. The restore dialog also has a delete button per
+version. Deleted backups are removed from Drive at once (they do not go to the Drive trash) and cannot be
+recovered.
 
 ## Uninstall
 

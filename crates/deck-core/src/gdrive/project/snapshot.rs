@@ -1,16 +1,16 @@
 //! What a project consists of, found with metadata only: the `.omp` files, the sessions of the
 //! folder with their artifacts, and the fingerprint over their (path, length, mtime).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use super::{OmpDir, Parts, ProjectSizes, same_path};
+use super::{OmpDir, Parts, ProjectSizes, SessionSize, same_path};
 use crate::gdrive::archive::hex;
 use crate::sessions::{self, SessionsRoot};
 
@@ -36,6 +36,7 @@ pub(super) struct SessionSnap {
     pub file_name: String,
     pub title: String,
     pub modified_unix: i64,
+    pub modified: SystemTime,
     pub jsonl: FileRef,
     pub artifacts: Vec<FileRef>,
 }
@@ -51,16 +52,20 @@ pub(super) struct Snapshot {
     pub skipped: Vec<String>,
     /// Session artifacts left out (`session “<title>”: <reason>`).
     pub session_notes: Vec<String>,
+    /// Excluded ids that are sessions of this project (stale ids do not count as a change).
+    excluded: BTreeSet<String>,
     fingerprint: String,
 }
 
 impl Snapshot {
     /// Looks at the project without reading any file content. `home` is `$HOME`: a project
     /// that is the home folder has no project `.omp` (it is omp's global directory).
+    /// Sessions whose id is in `excluded` are left out silently.
     pub(super) fn take(
         root: &SessionsRoot,
         project: &Path,
         parts: Parts,
+        excluded: &BTreeSet<String>,
         home: Option<&Path>,
     ) -> io::Result<Snapshot> {
         let mut omp_files = Vec::new();
@@ -89,8 +94,9 @@ impl Snapshot {
             }
         };
         let mut session_notes = Vec::new();
+        let mut matched = BTreeSet::new();
         let sessions = if parts.sessions {
-            project_sessions(root, project, &mut session_notes)
+            project_sessions(root, project, excluded, &mut matched, &mut session_notes)
         } else {
             Vec::new()
         };
@@ -102,6 +108,7 @@ impl Snapshot {
             blob_dir: root.agent_dir().join("blobs"),
             skipped,
             session_notes,
+            excluded: matched,
             fingerprint: String::new(),
         };
         snap.fingerprint = snap.compute_fingerprint();
@@ -125,15 +132,25 @@ impl Snapshot {
         !self.omp_included() && !self.sessions_included()
     }
 
+    /// Totals over the sessions in the snapshot (take it with no exclusions to measure a
+    /// project) and the per-session list, newest first.
     pub(super) fn sizes(&self) -> ProjectSizes {
+        let mut session_list: Vec<SessionSize> = self
+            .sessions
+            .iter()
+            .map(|s| SessionSize {
+                id: s.id.clone(),
+                title: s.title.clone(),
+                modified: s.modified,
+                bytes: s.jsonl.len + s.artifacts.iter().map(|a| a.len).sum::<u64>(),
+            })
+            .collect();
+        session_list.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
         ProjectSizes {
             omp: self.omp,
-            sessions: self.sessions.len() as u64,
-            session_bytes: self
-                .sessions
-                .iter()
-                .map(|s| s.jsonl.len + s.artifacts.iter().map(|a| a.len).sum::<u64>())
-                .sum(),
+            sessions: session_list.len() as u64,
+            session_bytes: session_list.iter().map(|s| s.bytes).sum(),
+            session_list,
         }
     }
 
@@ -152,6 +169,11 @@ impl Snapshot {
             &u8::from(self.parts.omp).to_string(),
             &u8::from(self.parts.sessions).to_string(),
         ]);
+        if self.parts.sessions {
+            for id in &self.excluded {
+                line(&["excluded", id]);
+            }
+        }
         if self.parts.omp {
             for f in &self.omp_files {
                 line(&["omp", &f.rel, &f.len.to_string(), &f.mtime_ns.to_string()]);
@@ -184,6 +206,8 @@ impl Snapshot {
 fn project_sessions(
     root: &SessionsRoot,
     project: &Path,
+    excluded: &BTreeSet<String>,
+    matched: &mut BTreeSet<String>,
     notes: &mut Vec<String>,
 ) -> Vec<SessionSnap> {
     let mut out = Vec::new();
@@ -193,6 +217,10 @@ fn project_sessions(
             continue;
         }
         for e in group.sessions {
+            if excluded.contains(&e.id) {
+                matched.insert(e.id);
+                continue;
+            }
             if !valid_id(&e.id) {
                 log::warn!("skipping session {}: unusable id", e.path.display());
                 continue;
@@ -244,6 +272,7 @@ fn project_sessions(
                 id: e.id,
                 file_name: file_name.to_owned(),
                 title,
+                modified: e.modified,
                 modified_unix: e
                     .modified
                     .duration_since(UNIX_EPOCH)
@@ -420,7 +449,7 @@ mod tests {
         write(&nested(15), "x");
         write(&nested(16).with_file_name("deep.txt"), "x");
 
-        let snap = Snapshot::take(&root, &proj, BOTH, None).unwrap();
+        let snap = Snapshot::take(&root, &proj, BOTH, &BTreeSet::new(), None).unwrap();
         let rels: Vec<&str> = snap.omp_files.iter().map(|f| f.rel.as_str()).collect();
         assert_eq!(rels.len(), 3, "{rels:?}");
         assert_eq!(
@@ -452,7 +481,7 @@ mod tests {
         session(&agent, "s2", &proj);
         session(&agent, "s3", &other);
 
-        let snap = Snapshot::take(&root, &proj, BOTH, None).unwrap();
+        let snap = Snapshot::take(&root, &proj, BOTH, &BTreeSet::new(), None).unwrap();
         assert_eq!(snap.omp, OmpDir::Missing);
         let sizes = snap.sizes();
         assert_eq!(sizes.sessions, 2);
@@ -474,17 +503,19 @@ mod tests {
         // A `.omp` that is a file is not a project directory.
         write(&proj.join(".omp"), "not a dir");
         assert_eq!(
-            Snapshot::take(&root, &proj, BOTH, None).unwrap().omp,
+            Snapshot::take(&root, &proj, BOTH, &BTreeSet::new(), None)
+                .unwrap()
+                .omp,
             OmpDir::Missing
         );
         fs::remove_file(proj.join(".omp")).unwrap();
 
         // The home folder's `.omp` is omp's global directory: never offered.
         write(&proj.join(".omp/AGENTS.md"), "x");
-        let global = Snapshot::take(&root, &proj, BOTH, Some(&proj)).unwrap();
+        let global = Snapshot::take(&root, &proj, BOTH, &BTreeSet::new(), Some(&proj)).unwrap();
         assert_eq!(global.omp, OmpDir::Global);
         assert!(global.omp_files.is_empty() && !global.omp_included());
-        let elsewhere = Snapshot::take(&root, &proj, BOTH, Some(&other)).unwrap();
+        let elsewhere = Snapshot::take(&root, &proj, BOTH, &BTreeSet::new(), Some(&other)).unwrap();
         assert!(matches!(elsewhere.omp, OmpDir::Present { files: 1, .. }));
     }
 
@@ -495,7 +526,7 @@ mod tests {
         let root = SessionsRoot::at(tmp.path().join("agent/sessions"));
         write(&proj.join(".omp/AGENTS.md"), "one");
         let fp = |parts| {
-            Snapshot::take(&root, &proj, parts, None)
+            Snapshot::take(&root, &proj, parts, &BTreeSet::new(), None)
                 .unwrap()
                 .fingerprint()
                 .to_owned()

@@ -248,15 +248,13 @@ fn fork_at_creates_a_new_file_ending_at_the_entry_and_keeps_the_source() {
 #[cfg(unix)]
 #[test]
 fn fork_at_speaks_the_rpc_protocol_and_surfaces_failures() {
-    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("proj");
     fs::create_dir_all(&cwd).unwrap();
     let src = write_session(&tmp.path().join("agent"), &cwd);
     let script = |name: &str, body: &str| {
         let p = tmp.path().join(name);
-        fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        install_exec(&p, &format!("#!/bin/sh\n{body}\n"));
         Omp::at(p)
     };
 
@@ -317,16 +315,15 @@ cat >/dev/null"#,
 #[test]
 fn unpack_session_runs_detached_from_the_terminal_and_reports_the_mode() {
     use deck_core::omp::MoveKind;
-    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("proj");
     fs::create_dir_all(&cwd).unwrap();
     let seen = tmp.path().join("seen");
     let script = tmp.path().join("omp.sh");
     // Records argv and the terminal variables, closes nothing: stdin must already be null.
-    fs::write(
+    install_exec(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\n{{ echo \"$@\"; for v in TMUX TMUX_PANE ZELLIJ_PANE_ID CMUX_SURFACE_ID \
              KITTY_WINDOW_ID WEZTERM_PANE TERM_SESSION_ID WT_SESSION KEEP; do eval \"echo $v=\\${{$v-unset}}\"; done; \
              if [ -t 0 ]; then echo tty-stdin; fi; }} > {}\n\
@@ -334,9 +331,7 @@ fn unpack_session_runs_detached_from_the_terminal_and_reports_the_mode() {
              echo 'Unpacked session (abc).' >&2\n",
             seen.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let mut omp = Omp::at(&script);
     for v in [
         "TMUX",
@@ -352,18 +347,7 @@ fn unpack_session_runs_detached_from_the_terminal_and_reports_the_mode() {
     }
     let omp = omp.with_env("KEEP", "yes");
     let tar = tmp.path().join("s.tar");
-    // A sibling test forking while the script's write handle was open can make the first exec
-    // fail with "Text file busy"; that is the harness, not the code under test.
-    let out = (0..20)
-        .find_map(|_| match omp.unpack_session(&tar, &cwd) {
-            Err(e) if e.to_string().contains("busy") => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                None
-            }
-            r => Some(r),
-        })
-        .expect("exec stayed busy")
-        .unwrap();
+    let out = omp.unpack_session(&tar, &cwd).unwrap();
     assert_eq!(out.kind, MoveKind::Created);
     assert_eq!(
         out.new_path,
@@ -392,12 +376,28 @@ fn unpack_session_runs_detached_from_the_terminal_and_reports_the_mode() {
     );
 
     let failing = tmp.path().join("fail.sh");
-    fs::write(
+    install_exec(
         &failing,
         "#!/bin/sh\necho 'error: Bad session archive' >&2\nexit 1\n",
-    )
-    .unwrap();
-    fs::set_permissions(&failing, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let err = Omp::at(&failing).unpack_session(&tar, &cwd).unwrap_err();
     assert!(err.to_string().contains("Bad session archive"), "{err}");
+}
+
+#[cfg(unix)]
+/// Creates executable `dest` with `content` without ever holding a write fd to the executed
+/// inode: a concurrent fork in a sibling test thread would otherwise leak it and exec would fail
+/// with ETXTBSY. The bytes go to a staging file; `install` (external process) makes the copy.
+fn install_exec(dest: &Path, content: &str) {
+    let mut stage = dest.as_os_str().to_owned();
+    stage.push(".src");
+    let stage = std::path::PathBuf::from(stage);
+    fs::write(&stage, content).unwrap();
+    let status = std::process::Command::new("install")
+        .args(["-m", "755"])
+        .arg(&stage)
+        .arg(dest)
+        .status()
+        .unwrap();
+    assert!(status.success());
 }

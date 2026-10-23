@@ -1,6 +1,6 @@
 //! Persistent app configuration (`$XDG_CONFIG_HOME/omp-deck/state.json`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,21 @@ fn state_path() -> PathBuf {
     config_dir().join("state.json")
 }
 
+/// Parses the stored JSON, migrating the retired `drive_auto_backup` bool: `false` without a
+/// `drive_backup_interval` becomes `Off`; `true` or absent keeps the default. The old key is dropped.
+fn parse_config(bytes: &[u8]) -> Result<AppConfig, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+    if let Some(map) = value.as_object_mut() {
+        let legacy = map.remove("drive_auto_backup");
+        if legacy == Some(serde_json::Value::Bool(false))
+            && !map.contains_key("drive_backup_interval")
+        {
+            map.insert("drive_backup_interval".into(), "Off".into());
+        }
+    }
+    serde_json::from_value(value)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
@@ -56,7 +71,7 @@ pub struct AppConfig {
     /// Per-folder open tabs (folder mode launch/restore).
     pub folder_tabs: BTreeMap<PathBuf, FolderTabs>,
     /// Back up the omp config to Google Drive automatically when it changed (while signed in).
-    pub drive_auto_backup: bool,
+    pub drive_backup_interval: SyncInterval,
     /// Project folders backed up to Google Drive (Settings → Sync), in table order.
     pub project_sync: Vec<SyncRow>,
     /// How often the rows are backed up automatically.
@@ -81,7 +96,7 @@ impl Default for AppConfig {
             folder_scope: None,
             recent_folders: Vec::new(),
             folder_tabs: BTreeMap::new(),
-            drive_auto_backup: true,
+            drive_backup_interval: SyncInterval::Every10Minutes,
             project_sync: Vec::new(),
             project_sync_interval: SyncInterval::default(),
         }
@@ -96,12 +111,18 @@ pub struct SyncRow {
     pub omp: bool,
     /// The project's omp sessions.
     pub sessions: bool,
+    /// Session ids opted out of the backup; every other session (including ones created later) is
+    /// backed up.
+    #[serde(default)]
+    pub excluded_sessions: BTreeSet<String>,
 }
 
 /// How often the Sync rows are backed up automatically.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncInterval {
     Off,
+    Every10Minutes,
+    Every30Minutes,
     Hourly,
     #[default]
     Every6Hours,
@@ -109,8 +130,10 @@ pub enum SyncInterval {
 }
 
 impl SyncInterval {
-    pub const ALL: [SyncInterval; 4] = [
+    pub const ALL: [SyncInterval; 6] = [
         SyncInterval::Off,
+        SyncInterval::Every10Minutes,
+        SyncInterval::Every30Minutes,
         SyncInterval::Hourly,
         SyncInterval::Every6Hours,
         SyncInterval::Daily,
@@ -118,18 +141,22 @@ impl SyncInterval {
 
     /// `None` = automatic backup is off.
     pub fn period(self) -> Option<Duration> {
-        let hours = match self {
+        let minutes = match self {
             SyncInterval::Off => return None,
-            SyncInterval::Hourly => 1,
-            SyncInterval::Every6Hours => 6,
-            SyncInterval::Daily => 24,
+            SyncInterval::Every10Minutes => 10,
+            SyncInterval::Every30Minutes => 30,
+            SyncInterval::Hourly => 60,
+            SyncInterval::Every6Hours => 6 * 60,
+            SyncInterval::Daily => 24 * 60,
         };
-        Some(Duration::from_secs(hours * 3600))
+        Some(Duration::from_secs(minutes * 60))
     }
 
     pub fn label(self) -> &'static str {
         match self {
             SyncInterval::Off => "Off",
+            SyncInterval::Every10Minutes => "Every 10 minutes",
+            SyncInterval::Every30Minutes => "Every 30 minutes",
             SyncInterval::Hourly => "Every hour",
             SyncInterval::Every6Hours => "Every 6 hours",
             SyncInterval::Daily => "Every day",
@@ -200,7 +227,7 @@ impl AppConfig {
                 return AppConfig::default();
             }
         };
-        match serde_json::from_slice(&bytes) {
+        match parse_config(&bytes) {
             Ok(cfg) => cfg,
             Err(e) => {
                 log::warn!("corrupt config {}: {e}; using defaults", path.display());
@@ -432,21 +459,70 @@ mod tests {
     fn old_state_without_sync_keys_gets_defaults_and_sync_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("state.json");
-        fs::write(&p, br#"{"drive_auto_backup": false, "open_tabs": []}"#).unwrap();
+        fs::write(&p, br#"{"open_tabs": []}"#).unwrap();
         let cfg = AppConfig::load_from(&p);
         assert!(cfg.project_sync.is_empty());
         assert_eq!(cfg.project_sync_interval, SyncInterval::Every6Hours);
-        assert!(!cfg.drive_auto_backup);
 
         let mut cfg = sample();
         cfg.project_sync = vec![SyncRow {
             path: "/home/u/x".into(),
             omp: true,
             sessions: false,
+            excluded_sessions: ["a".to_owned(), "b".to_owned()].into(),
         }];
         cfg.project_sync_interval = SyncInterval::Daily;
         cfg.save_to(&p).unwrap();
         assert_eq!(AppConfig::load_from(&p), cfg);
+    }
+
+    #[test]
+    fn sync_row_without_exclusions_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        fs::write(
+            &p,
+            br#"{"project_sync": [{"path": "/x", "omp": true, "sessions": true}]}"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load_from(&p);
+        assert!(cfg.project_sync[0].excluded_sessions.is_empty());
+    }
+
+    #[test]
+    fn legacy_drive_auto_backup_migrates_and_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        let load = |json: &str| {
+            fs::write(&p, json).unwrap();
+            AppConfig::load_from(&p)
+        };
+        assert_eq!(
+            load(r#"{"drive_auto_backup": false}"#).drive_backup_interval,
+            SyncInterval::Off
+        );
+        assert_eq!(
+            load(r#"{"drive_auto_backup": true}"#).drive_backup_interval,
+            SyncInterval::Every10Minutes
+        );
+        assert_eq!(
+            load("{}").drive_backup_interval,
+            SyncInterval::Every10Minutes
+        );
+        // An explicit new key wins over the legacy one.
+        assert_eq!(
+            load(r#"{"drive_auto_backup": false, "drive_backup_interval": "Hourly"}"#)
+                .drive_backup_interval,
+            SyncInterval::Hourly
+        );
+        let cfg = load(r#"{"drive_auto_backup": false}"#);
+        cfg.save_to(&p).unwrap();
+        let written = fs::read_to_string(&p).unwrap();
+        assert!(!written.contains("drive_auto_backup"));
+        assert_eq!(
+            AppConfig::load_from(&p).drive_backup_interval,
+            SyncInterval::Off
+        );
     }
 
     #[test]
@@ -456,6 +532,8 @@ mod tests {
             periods,
             [
                 None,
+                Some(Duration::from_secs(600)),
+                Some(Duration::from_secs(1800)),
                 Some(Duration::from_secs(3600)),
                 Some(Duration::from_secs(6 * 3600)),
                 Some(Duration::from_secs(24 * 3600)),
@@ -463,6 +541,6 @@ mod tests {
         );
         let labels: std::collections::BTreeSet<_> =
             SyncInterval::ALL.iter().map(|i| i.label()).collect();
-        assert_eq!(labels.len(), 4);
+        assert_eq!(labels.len(), 6);
     }
 }

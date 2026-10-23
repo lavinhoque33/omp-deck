@@ -27,6 +27,16 @@ pub struct Dialog<'a> {
 
 /// Shows the modal; `Some(true)` = confirmed, `Some(false)` = cancelled / dismissed.
 pub fn show_dialog(ctx: &Context, d: &Dialog<'_>, body: impl FnOnce(&mut Ui)) -> Option<bool> {
+    show_dialog_labeled(ctx, d, "Cancel", body)
+}
+
+/// [`show_dialog`] with a custom dismiss-button label (e.g. "Close" when nothing can be confirmed).
+pub fn show_dialog_labeled(
+    ctx: &Context,
+    d: &Dialog<'_>,
+    cancel_label: &str,
+    body: impl FnOnce(&mut Ui),
+) -> Option<bool> {
     let pal = Palette::of_ctx(ctx);
     let mut result = None;
     let modal = Modal::new(Id::unique(("omp-deck-dialog", d.id)))
@@ -78,7 +88,7 @@ pub fn show_dialog(ctx: &Context, d: &Dialog<'_>, body: impl FnOnce(&mut Ui)) ->
                     }
                     if ui
                         .add(
-                            Button::new("Cancel")
+                            Button::new(cancel_label)
                                 .min_size(vec2(84.0, 32.0))
                                 .corner_radius(theme::rad(8, 10)),
                         )

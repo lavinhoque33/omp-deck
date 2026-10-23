@@ -12,7 +12,7 @@ mod pack;
 mod restore;
 mod snapshot;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
@@ -78,13 +78,26 @@ pub enum OmpDir {
     Symlink,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One session of a project as the Sync page lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSize {
+    pub id: String,
+    /// Title, else first-prompt snippet, else "(untitled)".
+    pub title: String,
+    pub modified: SystemTime,
+    /// The jsonl file plus its artifacts.
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectSizes {
     pub omp: OmpDir,
     /// Sessions whose header `cwd` is the project.
     pub sessions: u64,
     /// Their jsonl files plus artifacts.
     pub session_bytes: u64,
+    /// Every one of those sessions, newest first.
+    pub session_list: Vec<SessionSize>,
 }
 
 /// Blocking (worker). Sessions = the `sessions::scan(root)` group whose `cwd` equals `project`.
@@ -93,7 +106,13 @@ pub fn measure(root: &SessionsRoot, project: &Path) -> io::Result<ProjectSizes> 
         omp: true,
         sessions: true,
     };
-    let snap = Snapshot::take(root, project, both, dirs::home_dir().as_deref())?;
+    let snap = Snapshot::take(
+        root,
+        project,
+        both,
+        &BTreeSet::new(),
+        dirs::home_dir().as_deref(),
+    )?;
     Ok(snap.sizes())
 }
 
@@ -612,14 +631,17 @@ impl Service {
         write_private(&self.store.sibling(STATE_FILE), &json)
     }
 
-    /// Backs up the chosen `parts` of `project`. `Ok(None)` = unchanged since the last backup
-    /// of this path with these parts (skipped unless `force`). Nothing selected or nothing
-    /// present is [`Error::NothingToBackUp`].
+    /// Backs up the chosen `parts` of `project`; sessions whose id is in `excluded` are left out
+    /// (silently, and the set is part of the change detection). `Ok(None)` = unchanged since the
+    /// last backup of this path with these parts (skipped unless `force`). Nothing selected or
+    /// nothing left to back up is [`Error::NothingToBackUp`].
+    #[allow(clippy::too_many_arguments)] // the contract's signature
     pub fn backup_project(
         &self,
         root: &SessionsRoot,
         project: &Path,
         parts: Parts,
+        excluded: &BTreeSet<String>,
         force: bool,
         cancel: &AtomicBool,
         progress: &(dyn Fn(Progress) + Sync),
@@ -634,7 +656,7 @@ impl Service {
             done: 0,
             total: 0,
         });
-        let snap = Snapshot::take(root, project, parts, dirs::home_dir().as_deref())
+        let snap = Snapshot::take(root, project, parts, excluded, dirs::home_dir().as_deref())
             .map_err(io_err("cannot read", project))?;
         if snap.is_empty() {
             return Err(nothing());
@@ -773,6 +795,30 @@ impl Service {
             pruned,
             skipped,
         }))
+    }
+
+    /// Permanently deletes `backup` from Drive (`files.delete` bypasses the trash); a file that is
+    /// already gone counts as deleted. Only project backups are accepted. When it is the last
+    /// backup recorded for a project, that project's local state is dropped so the next pass
+    /// uploads it again.
+    pub fn delete_project_backup(&self, backup: &ProjectBackup) -> Result<()> {
+        if backup.file.props.get("kind").map(String::as_str) != Some(PROJECT_KIND) {
+            return Err(invalid(format!(
+                "{} is not a project backup; refusing to delete it",
+                backup.file.name
+            )));
+        }
+        let account = self.signed_in()?;
+        self.drive(&account).delete_permanently(&backup.file.id)?;
+        let mut state = self.project_state();
+        let before = state.projects.len();
+        state
+            .projects
+            .retain(|_, synced| synced.last.name != backup.file.name);
+        if state.projects.len() != before {
+            self.save_project_state(&state)?;
+        }
+        Ok(())
     }
 
     /// All project backups, newest first.

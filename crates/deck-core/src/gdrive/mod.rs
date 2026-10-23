@@ -26,7 +26,7 @@ pub use oauth::{LOGIN_TIMEOUT, LoginFlow, SCOPES};
 pub use project::{
     KEEP_PROJECT_BACKUPS, OmpDir, PROJECT_PREFIX, Parts, PreparedProjectRestore, Progress,
     ProjectBackup, ProjectBackupOutcome, ProjectRestorePlan, ProjectRestoreReport, ProjectSizes,
-    ProjectSyncState, ProjectSynced, SessionPlan, Stage, measure, path_id,
+    ProjectSyncState, ProjectSynced, SessionPlan, SessionSize, Stage, measure, path_id,
 };
 
 use crate::usage::Date;

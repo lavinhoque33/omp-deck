@@ -1885,11 +1885,25 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Executable `dest` created by an external process so this process never holds a write fd to
+    /// the executed inode (a sibling thread's fork would leak it and exec would fail with ETXTBSY).
+    fn install_exec(dest: &std::path::Path, content: &str) {
+        let mut stage = dest.as_os_str().to_owned();
+        stage.push(".src");
+        std::fs::write(&stage, content).unwrap();
+        let status = std::process::Command::new("install")
+            .args(["-m", "755"])
+            .arg(&stage)
+            .arg(dest)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
     fn fake_omp(dir: &Path, script: &str) -> Omp {
-        use std::os::unix::fs::PermissionsExt;
         let p = dir.join("omp");
-        std::fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        install_exec(&p, &format!("#!/bin/sh\n{script}\n"));
         Omp::at(p)
     }
 

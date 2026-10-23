@@ -1355,13 +1355,26 @@ mod tests {
         );
     }
 
+    /// Executable `dest` created by an external process so this process never holds a write fd to
+    /// the executed inode (a sibling thread's fork would leak it and exec would fail with ETXTBSY).
+    fn install_exec(dest: &std::path::Path, content: &str) {
+        let mut stage = dest.as_os_str().to_owned();
+        stage.push(".src");
+        std::fs::write(&stage, content).unwrap();
+        let status = std::process::Command::new("install")
+            .args(["-m", "755"])
+            .arg(&stage)
+            .arg(dest)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     /// Runs `install_argv()` with a fake `curl` (body `curl_body`) first on PATH.
     fn run_installer(curl_body: &str) -> (bool, Option<String>) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let curl = dir.path().join("curl");
-        std::fs::write(&curl, format!("#!/bin/sh\n{curl_body}\n")).unwrap();
-        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        install_exec(&curl, &format!("#!/bin/sh\n{curl_body}\n"));
         let out = dir.path().join("ran");
         let argv = install_argv();
         let ok = Command::new(&argv[0])

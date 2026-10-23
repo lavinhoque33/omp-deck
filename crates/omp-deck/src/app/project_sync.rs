@@ -5,9 +5,9 @@
 //! `drive.rs`). Network, packing and measuring all run on workers; the UI only reads shared
 //! progress and channel results.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -20,13 +20,15 @@ use deck_core::gdrive::{
 use deck_core::sessions::abbreviate_home;
 
 use super::{App, AppEvent, human_size};
+use crate::confirm::{self, Confirm};
 use crate::drive_view::DriveCard;
 use crate::omp_worker;
 use crate::sidebar::{DriveMenu, format_age};
 use crate::sync_view::{
-    self, BackupAnswer, BackupDialog, Cells, CloudProject, LastView, ListState, OmpCell,
-    PathAnswer, PathPrompt, PathPurpose, PlanView, ProgView, ReportView, RestoreAction,
-    RestoreDialog, RowView, SessionsCell, Step, SyncAction, SyncPage, TargetStatus, VersionRow,
+    self, BackupAnswer, BackupDialog, Cells, CloudProject, LastView, ListState, ManagerAction,
+    ManagerDialog, ManagerStep, OmpCell, PathAnswer, PathPrompt, PathPurpose, PlanView, ProgView,
+    ReportView, RestoreAction, RestoreDialog, RowView, SessionItem, SessionsAnswer, SessionsCell,
+    SessionsDialog, Step, SyncAction, SyncPage, TargetStatus, VersionRow,
 };
 use crate::transfer;
 use crate::tree_layout::clock;
@@ -40,10 +42,16 @@ const PLAN_LIST: usize = 8;
 
 /// What the lane is doing.
 enum Kind {
-    Backup { path: PathBuf },
+    Backup {
+        path: PathBuf,
+    },
     Listing,
     Preparing,
     Restoring,
+    Deleting {
+        done: Arc<AtomicUsize>,
+        total: usize,
+    },
 }
 
 /// Latest progress of the running job, written by the worker, read each frame.
@@ -128,6 +136,13 @@ pub(super) enum SyncEvent {
     Listed(Result<Vec<ProjectBackup>, Error>),
     Prepared(Result<Box<PreparedProjectRestore>, Error>),
     Restored(Result<ProjectRestoreReport, Error>),
+    /// Permanent deletion of cloud backups finished (or was cancelled part-way).
+    Deleted {
+        deleted: usize,
+        failed: Vec<(String, Error)>,
+        cancelled: bool,
+        state: ProjectSyncState,
+    },
     Picked {
         pick: Pick,
         path: Option<PathBuf>,
@@ -158,6 +173,14 @@ struct Restore {
     probe_generation: u64,
     /// The user typed or browsed a target: the preset must not overwrite it.
     target_touched: bool,
+    /// A version's "delete permanently" confirmation is open (index into `backups`, prepared text).
+    pending_delete: Option<(usize, Confirm)>,
+}
+
+/// The "Manage cloud backups" dialog and the backups behind its checkboxes.
+struct Manager {
+    dlg: ManagerDialog,
+    backups: Vec<ProjectBackup>,
 }
 
 pub(super) struct SyncUi {
@@ -183,6 +206,10 @@ pub(super) struct SyncUi {
     picking: bool,
     backup: Option<BackupDialog>,
     restore: Option<Restore>,
+    manager: Option<Manager>,
+    sessions: Option<SessionsDialog>,
+    /// Size cells by folder, rebuilt when sizes arrive or exclusions change.
+    cells: HashMap<PathBuf, Cells>,
 }
 
 impl SyncUi {
@@ -205,55 +232,102 @@ impl SyncUi {
             picking: false,
             backup: None,
             restore: None,
+            manager: None,
+            sessions: None,
+            cells: HashMap::new(),
         }
     }
 
     /// A dialog of this feature is open.
     pub(super) fn modal_open(&self) -> bool {
-        self.prompt.is_some() || self.backup.is_some() || self.restore.is_some()
+        self.prompt.is_some()
+            || self.backup.is_some()
+            || self.restore.is_some()
+            || self.manager.is_some()
+            || self.sessions.is_some()
     }
 }
 
-/// Sizes for the UI: `Loading` until the first measurement lands.
-fn cells_of(sizes: Option<&Result<ProjectSizes, String>>) -> Cells {
+/// Sessions of `sizes` that are not opted out, with their bytes.
+fn included_sessions(sizes: &ProjectSizes, excluded: &BTreeSet<String>) -> (u64, u64) {
+    let (mut gone, mut gone_bytes) = (0u64, 0u64);
+    if !excluded.is_empty() {
+        for s in sizes
+            .session_list
+            .iter()
+            .filter(|s| excluded.contains(&s.id))
+        {
+            gone += 1;
+            gone_bytes += s.bytes;
+        }
+    }
+    (
+        sizes.sessions.saturating_sub(gone),
+        sizes.session_bytes.saturating_sub(gone_bytes),
+    )
+}
+
+fn loading_cells() -> Cells {
+    Cells {
+        omp: OmpCell::Loading,
+        sessions: SessionsCell::Loading,
+    }
+}
+
+/// Sizes for the UI: `Loading` until the first measurement lands. Built when sizes arrive or the
+/// exclusions change, never per frame.
+fn cells_of(sizes: Option<&Result<ProjectSizes, String>>, excluded: &BTreeSet<String>) -> Cells {
     match sizes {
-        None => Cells {
-            omp: OmpCell::Loading,
-            sessions: SessionsCell::Loading,
-        },
+        None => loading_cells(),
         Some(Err(e)) => Cells {
             omp: OmpCell::Failed(e.clone()),
             sessions: SessionsCell::Failed(e.clone()),
         },
-        Some(Ok(s)) => Cells {
-            omp: match &s.omp {
-                OmpDir::Missing => OmpCell::Missing,
-                OmpDir::Global => OmpCell::Global,
-                OmpDir::Symlink => OmpCell::Symlink,
-                OmpDir::Present { files, bytes } => OmpCell::Present(format!(
-                    "{} · {files} file{}",
-                    human_size(*bytes),
-                    if *files == 1 { "" } else { "s" }
-                )),
-            },
-            sessions: SessionsCell::Ready {
-                count: s.sessions,
-                text: format!(
-                    "{} session{} · {}",
-                    s.sessions,
-                    if s.sessions == 1 { "" } else { "s" },
-                    human_size(s.session_bytes)
-                ),
-            },
-        },
+        Some(Ok(s)) => {
+            let (included, bytes) = included_sessions(s, excluded);
+            let plural = |n: u64| if n == 1 { "" } else { "s" };
+            Cells {
+                omp: match &s.omp {
+                    OmpDir::Missing => OmpCell::Missing,
+                    OmpDir::Global => OmpCell::Global,
+                    OmpDir::Symlink => OmpCell::Symlink,
+                    OmpDir::Present { files, bytes } => OmpCell::Present(format!(
+                        "{} · {files} file{}",
+                        human_size(*bytes),
+                        if *files == 1 { "" } else { "s" }
+                    )),
+                },
+                sessions: SessionsCell::Ready {
+                    count: s.sessions,
+                    included,
+                    text: if included == s.sessions {
+                        format!(
+                            "{} session{} · {}",
+                            s.sessions,
+                            plural(s.sessions),
+                            human_size(bytes)
+                        )
+                    } else {
+                        format!(
+                            "{included} of {} sessions · {}",
+                            s.sessions,
+                            human_size(bytes)
+                        )
+                    },
+                },
+            }
+        }
     }
 }
 
-/// What a backup of `path` can include right now, given the user's switches.
-fn usable_parts(want: Parts, sizes: &ProjectSizes) -> Parts {
+/// No opted-out sessions (a folder that is not in the Sync table).
+static NO_IDS: BTreeSet<String> = BTreeSet::new();
+
+/// What a backup of `path` can include right now, given the user's switches and exclusions.
+fn usable_parts(want: Parts, sizes: &ProjectSizes, excluded: &BTreeSet<String>) -> Parts {
     Parts {
         omp: want.omp && matches!(sizes.omp, OmpDir::Present { .. }),
-        sessions: want.sessions && sizes.sessions > 0,
+        sessions: want.sessions && included_sessions(sizes, excluded).0 > 0,
     }
 }
 
@@ -328,9 +402,16 @@ impl App {
             })
     }
 
-    /// Measures, then backs up `path` with whichever of `want` exists.
+    /// Measures, then backs up `path` with whichever of `want` exists, leaving out the sessions
+    /// the Sync row opted out (a folder that is not in the table has none).
     fn start_project_backup(&mut self, path: PathBuf, want: Parts, auto: bool) -> bool {
         let root = self.root.clone();
+        let excluded = self
+            .cfg
+            .project_sync
+            .iter()
+            .find(|r| r.path == path)
+            .map_or_else(BTreeSet::new, |r| r.excluded_sessions.clone());
         let kind = Kind::Backup { path: path.clone() };
         self.lane_job(kind, move |service, cancel, report| {
             let result = measure(&root, &path)
@@ -340,7 +421,8 @@ impl App {
                         .backup_project(
                             &root,
                             &path,
-                            usable_parts(want, &sizes),
+                            usable_parts(want, &sizes, &excluded),
+                            &excluded,
                             !auto,
                             cancel,
                             report,
@@ -404,12 +486,23 @@ impl App {
             self.sync.pass.clear();
             return;
         }
-        if self.sync.job.is_some() || self.sync.restore.is_some() || self.sync.backup.is_some() {
+        if self.sync.job.is_some()
+            || self.sync.restore.is_some()
+            || self.sync.backup.is_some()
+            || self.sync.manager.is_some()
+        {
             return;
         }
         if let Some(path) = self.sync.pass.pop_front() {
-            if self.cfg.project_sync.iter().any(|r| r.path == path) {
-                let want = self.row_parts(&path);
+            let want = self.row_parts(&path);
+            let row = self.cfg.project_sync.iter().find(|r| r.path == path);
+            // Measured and nothing usable (no .omp, every session opted out): skip quietly.
+            let usable = match (row, self.sync.sizes.get(&path)) {
+                (Some(r), Some(Ok(s))) => usable_parts(want, s, &r.excluded_sessions).any(),
+                (Some(_), _) => true,
+                (None, _) => false,
+            };
+            if want.any() && usable {
                 self.start_project_backup(path, want, true);
             }
             ctx.request_repaint();
@@ -428,6 +521,7 @@ impl App {
                 .cfg
                 .project_sync
                 .iter()
+                .filter(|r| r.omp || r.sessions)
                 .map(|r| r.path.clone())
                 .collect();
             self.sync.pass_failure_shown = false;
@@ -481,7 +575,12 @@ impl App {
                     full: r.path.display().to_string(),
                     omp_on: r.omp,
                     sessions_on: r.sessions,
-                    cells: cells_of(self.sync.sizes.get(&r.path)),
+                    cells: self
+                        .sync
+                        .cells
+                        .get(&r.path)
+                        .cloned()
+                        .unwrap_or_else(loading_cells),
                     last,
                     busy,
                 }
@@ -519,6 +618,7 @@ impl App {
                 if i < self.cfg.project_sync.len() {
                     let row = self.cfg.project_sync.remove(i);
                     self.sync.sizes.remove(&row.path);
+                    self.sync.cells.remove(&row.path);
                     self.sync.errors.remove(&row.path);
                     self.dirty = true;
                 }
@@ -553,13 +653,17 @@ impl App {
                 }
             }
             SyncAction::SetInterval(v) => {
+                let was_off = self.cfg.project_sync_interval == SyncInterval::Off;
                 self.cfg.project_sync_interval = v;
                 self.dirty = true;
-                if v != SyncInterval::Off {
-                    self.sync.next_auto = Instant::now() + AUTO_FIRST;
+                if let Some(period) = v.period() {
+                    self.sync.next_auto =
+                        Instant::now() + if was_off { AUTO_FIRST } else { period };
                 }
             }
             SyncAction::OpenRestore => self.open_restore(None),
+            SyncAction::ChooseSessions(i) => self.open_sessions_dialog(i),
+            SyncAction::OpenManager => self.open_manager(),
         }
     }
 
@@ -604,8 +708,9 @@ impl App {
         match purpose {
             PathPurpose::Add => self.cfg.project_sync.push(SyncRow {
                 path: path.clone(),
-                omp: true,
-                sessions: true,
+                omp: false,
+                sessions: false,
+                excluded_sessions: BTreeSet::new(),
             }),
             PathPurpose::Change(i) => {
                 let row = self
@@ -614,11 +719,23 @@ impl App {
                     .get_mut(i)
                     .ok_or_else(|| "That row is gone".to_owned())?;
                 let old = std::mem::replace(&mut row.path, path.clone());
+                // The ids belong to the old folder's sessions.
+                row.excluded_sessions.clear();
                 self.sync.sizes.remove(&old);
+                self.sync.cells.remove(&old);
                 self.sync.errors.remove(&old);
             }
         }
         self.dirty = true;
+        if purpose == PathPurpose::Add {
+            // Adding never makes the automatic pass due right now.
+            let now = Instant::now();
+            if self.sync.next_auto <= now {
+                let period = self.cfg.project_sync_interval.period();
+                self.sync.next_auto = now + period.unwrap_or(AUTO_FIRST);
+            }
+            self.refresh_cells(&path);
+        }
         self.measure_path(&path);
         Ok(())
     }
@@ -630,7 +747,8 @@ impl App {
             SyncEvent::State(s) => self.sync.state = s,
             SyncEvent::Sizes { path, result } => {
                 self.sync.measuring.remove(&path);
-                self.sync.sizes.insert(path, result);
+                self.sync.sizes.insert(path.clone(), result);
+                self.refresh_cells(&path);
             }
             SyncEvent::BackedUp {
                 path,
@@ -653,6 +771,16 @@ impl App {
             SyncEvent::Restored(result) => {
                 self.sync.job = None;
                 self.on_restored(result);
+            }
+            SyncEvent::Deleted {
+                deleted,
+                failed,
+                cancelled,
+                state,
+            } => {
+                self.sync.job = None;
+                self.sync.state = state;
+                self.on_deleted(deleted, failed, cancelled);
             }
             SyncEvent::Picked { pick, path } => {
                 self.sync.picking = false;
@@ -785,18 +913,25 @@ impl App {
                 if signed_out {
                     self.sync.pass.clear();
                 }
-                self.sync.errors.insert(path, msg.clone());
-                if !auto {
+                if auto && nothing {
+                    // Nothing selected is usable (e.g. every session opted out): not a failure.
+                    self.sync.errors.remove(&path);
+                    log::info!("automatic project backup of {name}: nothing to back up");
+                } else if !auto {
+                    self.sync.errors.insert(path, msg.clone());
                     self.toasts
                         .error(&self.ctx, format!("Backup of {name} failed: {msg}"));
-                } else if !nothing && !self.sync.pass_failure_shown {
-                    self.sync.pass_failure_shown = true;
-                    self.toasts.error(
-                        &self.ctx,
-                        format!("Automatic backup of {name} failed: {msg}"),
-                    );
                 } else {
-                    log::warn!("automatic project backup of {name} failed: {msg}");
+                    self.sync.errors.insert(path, msg.clone());
+                    if !self.sync.pass_failure_shown {
+                        self.sync.pass_failure_shown = true;
+                        self.toasts.error(
+                            &self.ctx,
+                            format!("Automatic backup of {name} failed: {msg}"),
+                        );
+                    } else {
+                        log::warn!("automatic project backup of {name} failed: {msg}");
+                    }
                 }
             }
         }
@@ -814,6 +949,7 @@ impl App {
             omp: row.is_none_or(|r| r.omp),
             sessions: row.is_none_or(|r| r.sessions),
             keep: true,
+            excluded: 0,
             path: path.clone(),
         });
         self.measure_path(&path);
@@ -824,7 +960,19 @@ impl App {
         let Some(d) = &mut self.sync.backup else {
             return;
         };
-        let cells = cells_of(self.sync.sizes.get(&d.path));
+        let excluded = self
+            .cfg
+            .project_sync
+            .iter()
+            .find(|r| r.path == d.path)
+            .map_or(&NO_IDS, |r| &r.excluded_sessions);
+        let cells = cells_of(self.sync.sizes.get(&d.path), excluded);
+        d.excluded = match cells.sessions {
+            SessionsCell::Ready {
+                count, included, ..
+            } => usize::try_from(count.saturating_sub(included)).unwrap_or(0),
+            _ => 0,
+        };
         match sync_view::backup_dialog(ctx, d, &cells, busy) {
             BackupAnswer::Open => {}
             BackupAnswer::Cancel => {
@@ -846,11 +994,15 @@ impl App {
                             r.omp = d.omp;
                             r.sessions = d.sessions;
                         }
-                        None => self.cfg.project_sync.push(SyncRow {
-                            path: d.path.clone(),
-                            omp: d.omp,
-                            sessions: d.sessions,
-                        }),
+                        None => {
+                            self.cfg.project_sync.push(SyncRow {
+                                path: d.path.clone(),
+                                omp: d.omp,
+                                sessions: d.sessions,
+                                excluded_sessions: BTreeSet::new(),
+                            });
+                            self.refresh_cells(&d.path);
+                        }
                     }
                     self.dirty = true;
                 }
@@ -892,34 +1044,59 @@ impl App {
             only,
             probe_generation: 0,
             target_touched: false,
+            pending_delete: None,
         });
         self.probe_target();
         self.start_project_listing();
     }
 
+    /// (Re)loads the project backup list for whichever of the restore / manager dialogs is open.
     fn start_project_listing(&mut self) {
         if let Some(r) = &mut self.sync.restore {
             r.dlg.list = ListState::Loading;
             r.dlg.sel = None;
         }
+        if let Some(m) = &mut self.sync.manager {
+            m.dlg.set_list(ListState::Loading);
+        }
         let started = self.lane_job(Kind::Listing, |service, _, _| {
             SyncEvent::Listed(service.list_projects())
         });
-        if !started && let Some(r) = &mut self.sync.restore {
-            r.dlg.list = ListState::Failed("Another project job is running; try again.".to_owned());
+        if !started {
+            let busy = "Another project job is running; try again.";
+            if let Some(r) = &mut self.sync.restore {
+                r.dlg.list = ListState::Failed(busy.to_owned());
+            }
+            if let Some(m) = &mut self.sync.manager {
+                m.dlg.set_list(ListState::Failed(busy.to_owned()));
+            }
         }
     }
 
     fn on_listed(&mut self, result: Result<Vec<ProjectBackup>, Error>) {
         let result = result.map_err(|e| self.drive_error(e));
-        let Some(r) = &mut self.sync.restore else {
-            return;
-        };
+        let me = hostname();
         match result {
-            Err(msg) => r.dlg.list = ListState::Failed(msg),
+            Err(msg) => {
+                if let Some(r) = &mut self.sync.restore {
+                    r.dlg.list = ListState::Failed(msg.clone());
+                }
+                if let Some(m) = &mut self.sync.manager {
+                    m.dlg.set_list(ListState::Failed(msg));
+                }
+            }
             Ok(backups) => {
+                if let Some(m) = &mut self.sync.manager {
+                    let mut groups = group_backups(&backups, &me, None);
+                    sort_for_manager(&mut groups);
+                    m.dlg.set_list(ListState::Ready(groups));
+                    m.backups = backups.clone();
+                }
+                let Some(r) = &mut self.sync.restore else {
+                    return;
+                };
                 let only_id = r.only.as_deref().map(path_id);
-                let groups = group_backups(&backups, &hostname(), only_id.as_deref());
+                let groups = group_backups(&backups, &me, only_id.as_deref());
                 r.backups = backups;
                 let first = (!groups.is_empty()).then_some((0, 0));
                 r.dlg.list = ListState::Ready(groups);
@@ -1005,6 +1182,7 @@ impl App {
         };
         let Some(action) = sync_view::restore_dialog(ctx, &mut r.dlg, progress.as_ref(), busy)
         else {
+            self.show_delete_confirm(ctx);
             return;
         };
         match action {
@@ -1015,6 +1193,7 @@ impl App {
                 self.probe_target();
             }
             RestoreAction::Select(p, v) => self.select_version(p, v),
+            RestoreAction::Delete(p, v) => self.ask_delete_version(p, v),
             RestoreAction::Continue => self.restore_prepare(),
             RestoreAction::Confirm => self.restore_apply(),
             RestoreAction::Cancel => match r.dlg.step {
@@ -1239,6 +1418,8 @@ impl App {
     pub(super) fn show_sync_dialogs(&mut self, ctx: &egui::Context) {
         self.show_backup_dialog(ctx);
         self.show_restore_dialog(ctx);
+        self.show_manager_dialog(ctx);
+        self.show_sessions_dialog(ctx);
         self.show_path_prompt(ctx);
     }
 
@@ -1273,6 +1454,341 @@ impl App {
             }
         }
     }
+    // ---------------------------------------------------------------- sessions to back up
+
+    /// Rebuilds the cached cells of `path` (sizes arrived, exclusions changed).
+    fn refresh_cells(&mut self, path: &Path) {
+        let Some(row) = self.cfg.project_sync.iter().find(|r| r.path == path) else {
+            return;
+        };
+        let cells = cells_of(self.sync.sizes.get(path), &row.excluded_sessions);
+        self.sync.cells.insert(path.to_path_buf(), cells);
+    }
+
+    fn open_sessions_dialog(&mut self, i: usize) {
+        let Some(row) = self.cfg.project_sync.get(i) else {
+            return;
+        };
+        let Some(Ok(sizes)) = self.sync.sizes.get(&row.path) else {
+            return;
+        };
+        let now = SystemTime::now();
+        let items = sizes
+            .session_list
+            .iter()
+            .map(|s| {
+                let age = format_age(now, s.modified);
+                SessionItem {
+                    id: s.id.clone(),
+                    title: clip(&s.title, 80),
+                    haystack: format!("{} {}", s.title, s.id).to_lowercase(),
+                    age: if age == "now" {
+                        "just now".to_owned()
+                    } else {
+                        format!("{age} ago")
+                    },
+                    size: human_size(s.bytes),
+                    bytes: s.bytes,
+                    on: !row.excluded_sessions.contains(&s.id),
+                }
+            })
+            .collect();
+        self.sync.sessions = Some(SessionsDialog::new(
+            row.path.clone(),
+            abbreviate_home(&row.path),
+            items,
+        ));
+    }
+
+    fn show_sessions_dialog(&mut self, ctx: &egui::Context) {
+        let Some(d) = &mut self.sync.sessions else {
+            return;
+        };
+        match sync_view::sessions_dialog(ctx, d) {
+            SessionsAnswer::Open => {}
+            SessionsAnswer::Cancel => {
+                self.sync.sessions = None;
+                self.focus_pending = true;
+            }
+            SessionsAnswer::Save => {
+                let Some(d) = self.sync.sessions.take() else {
+                    return;
+                };
+                self.focus_pending = true;
+                let excluded = d.excluded_ids();
+                if let Some(row) = self.cfg.project_sync.iter_mut().find(|r| r.path == d.path)
+                    && row.excluded_sessions != excluded
+                {
+                    row.excluded_sessions = excluded;
+                    self.dirty = true;
+                }
+                self.refresh_cells(&d.path);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- deleting cloud backups
+
+    /// Deletes `backups` permanently, one after the other, on the project lane.
+    fn start_delete(&mut self, backups: Vec<ProjectBackup>) -> bool {
+        let total = backups.len();
+        let done = Arc::new(AtomicUsize::new(0));
+        let (counter, ctx) = (done.clone(), self.ctx.clone());
+        self.lane_job(Kind::Deleting { done, total }, move |service, cancel, _| {
+            let mut deleted = 0;
+            let mut failed = Vec::new();
+            let mut cancelled = false;
+            for b in &backups {
+                if cancel.load(Ordering::Relaxed) {
+                    cancelled = true;
+                    break;
+                }
+                match service.delete_project_backup(b) {
+                    Ok(()) => deleted += 1,
+                    Err(e) => {
+                        let when = b
+                            .file
+                            .created_unix()
+                            .map_or_else(|| b.file.created.clone(), clock);
+                        failed.push((format!("{} ({when})", b.name), e));
+                    }
+                }
+                counter.fetch_add(1, Ordering::Relaxed);
+                ctx.request_repaint();
+            }
+            SyncEvent::Deleted {
+                deleted,
+                failed,
+                cancelled,
+                state: service.project_state(),
+            }
+        })
+    }
+
+    fn delete_progress(&self) -> Option<ProgView> {
+        let j = self.sync.job.as_ref()?;
+        let Kind::Deleting { done, total } = &j.kind else {
+            return None;
+        };
+        let done = done.load(Ordering::Relaxed);
+        Some(ProgView {
+            label: format!("Deleting {} of {total}", (done + 1).min(*total)),
+            fraction: Some(done as f32 / (*total).max(1) as f32),
+        })
+    }
+
+    fn on_deleted(&mut self, deleted: usize, failed: Vec<(String, Error)>, cancelled: bool) {
+        let s = |n: usize| if n == 1 { "" } else { "s" };
+        let failures: Vec<String> = failed
+            .into_iter()
+            .map(|(name, e)| format!("{name}: {}", self.drive_error(e)))
+            .collect();
+        let stopped = if cancelled { " (stopped early)" } else { "" };
+        if let Some(first) = failures.first() {
+            for f in &failures {
+                log::warn!("deleting a cloud backup failed: {f}");
+            }
+            self.toasts.error(
+                &self.ctx,
+                format!(
+                    "Deleted {deleted} backup{}, {} failed{stopped}: {first}",
+                    s(deleted),
+                    failures.len()
+                ),
+            );
+        } else if deleted > 0 {
+            self.toasts.success(
+                &self.ctx,
+                format!(
+                    "Permanently deleted {deleted} cloud backup{}{stopped}",
+                    s(deleted)
+                ),
+            );
+        } else if cancelled {
+            self.toasts.info(&self.ctx, "Deletion cancelled");
+        }
+        if let Some(m) = &mut self.sync.manager {
+            m.dlg.step = ManagerStep::Browse;
+            m.dlg.cancelling = false;
+        }
+        if self.sync.restore.is_some() || self.sync.manager.is_some() {
+            self.start_project_listing();
+        }
+    }
+
+    /// "Manage cloud backups…" on the Sync page.
+    pub(super) fn open_manager(&mut self) {
+        if self.sync.job.is_some() || !self.sync_signed_in() {
+            self.toasts.info(
+                &self.ctx,
+                "Sign in and wait for the running project job first.",
+            );
+            return;
+        }
+        self.sync.manager = Some(Manager {
+            dlg: ManagerDialog::new(),
+            backups: Vec::new(),
+        });
+        self.start_project_listing();
+    }
+
+    fn show_manager_dialog(&mut self, ctx: &egui::Context) {
+        let progress = self.delete_progress();
+        let busy = self.sync.job.is_some();
+        let Some(m) = &mut self.sync.manager else {
+            return;
+        };
+        let Some(action) = sync_view::manager_dialog(ctx, &mut m.dlg, progress.as_ref(), busy)
+        else {
+            return;
+        };
+        match action {
+            ManagerAction::Refresh => self.start_project_listing(),
+            ManagerAction::Toggle(b, on) => m.dlg.set_version(b, on),
+            ManagerAction::ToggleGroup(g, on) => m.dlg.set_group(g, on),
+            ManagerAction::AskDelete => {
+                if m.dlg.totals().0 > 0 {
+                    m.dlg.step = ManagerStep::Confirm;
+                }
+            }
+            ManagerAction::Back => m.dlg.step = ManagerStep::Browse,
+            ManagerAction::Cancel => {
+                if let Some(j) = &self.sync.job {
+                    j.cancel.store(true, Ordering::Relaxed);
+                }
+                if m.dlg.step == ManagerStep::Deleting {
+                    m.dlg.cancelling = true;
+                } else {
+                    self.sync.manager = None;
+                    self.focus_pending = true;
+                }
+            }
+            ManagerAction::Delete => {
+                let mut picked: Vec<usize> = m.dlg.checked.iter().copied().collect();
+                picked.sort_unstable();
+                let list: Vec<ProjectBackup> = picked
+                    .iter()
+                    .filter_map(|i| m.backups.get(*i).cloned())
+                    .collect();
+                if list.is_empty() {
+                    return;
+                }
+                if self.start_delete(list) {
+                    if let Some(m) = &mut self.sync.manager {
+                        m.dlg.step = ManagerStep::Deleting;
+                        m.dlg.cancelling = false;
+                    }
+                } else {
+                    self.toasts.info(
+                        &self.ctx,
+                        "Another project job is running; try again in a moment.",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The restore dialog's "delete this version" confirmation.
+    fn show_delete_confirm(&mut self, ctx: &egui::Context) {
+        let Some(r) = &mut self.sync.restore else {
+            return;
+        };
+        let Some((index, confirm)) = &r.pending_delete else {
+            return;
+        };
+        let backup_index = *index;
+        let Some(backup) = r.backups.get(backup_index).cloned() else {
+            r.pending_delete = None;
+            return;
+        };
+        match confirm::show(ctx, "sync-delete-backup", confirm) {
+            None => {}
+            Some(false) => r.pending_delete = None,
+            Some(true) => {
+                r.pending_delete = None;
+                let was_selected = r.dlg.version().is_some_and(|v| backup_index == v.backup);
+                if self.start_delete(vec![backup]) {
+                    if let Some(r) = &mut self.sync.restore {
+                        r.dlg.list = ListState::Loading;
+                        r.dlg.sel = None;
+                        if was_selected {
+                            // Back to the state of a freshly opened dialog with nothing picked.
+                            r.dlg.omp = false;
+                            r.dlg.sessions = false;
+                            r.dlg.error = None;
+                            if !r.dlg.target_fixed && !r.target_touched {
+                                r.dlg.target.clear();
+                                r.dlg.target_status = TargetStatus::Unknown;
+                                r.probe_generation += 1;
+                            }
+                        }
+                    }
+                } else {
+                    self.toasts.info(
+                        &self.ctx,
+                        "Another project job is running; try again in a moment.",
+                    );
+                }
+            }
+        }
+    }
+
+    fn ask_delete_version(&mut self, p: usize, v: usize) {
+        let Some(r) = &mut self.sync.restore else {
+            return;
+        };
+        let ListState::Ready(groups) = &r.dlg.list else {
+            return;
+        };
+        if let Some(version) = groups.get(p).and_then(|g| g.versions.get(v))
+            && let Some(b) = r.backups.get(version.backup)
+        {
+            let when = b
+                .file
+                .created_unix()
+                .map_or_else(|| b.file.created.clone(), clock);
+            let host = if b.host == hostname() {
+                "this PC"
+            } else {
+                b.host.as_str()
+            };
+            let confirm = Confirm {
+                title: "Delete this backup permanently?".to_owned(),
+                body: format!(
+                    "{} from {host}, {when} ({}).\n\nThis can't be undone: the file is removed \
+                     from Google Drive, not moved to the trash.",
+                    b.name,
+                    human_size(b.file.size)
+                ),
+                confirm_label: "Delete permanently".to_owned(),
+                danger: true,
+            };
+            r.pending_delete = Some((version.backup, confirm));
+        }
+    }
+}
+
+/// A single-line title of at most `max` characters.
+fn clip(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("");
+    if line.chars().count() <= max {
+        return line.to_owned();
+    }
+    let mut out: String = line.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Project → PC → versions: groups of one project (name, path) are adjacent, this PC first.
+fn sort_for_manager(groups: &mut [CloudProject]) {
+    groups.sort_by(|a, b| {
+        (a.name.to_lowercase(), &a.path, !a.this_pc, &a.host).cmp(&(
+            b.name.to_lowercase(),
+            &b.path,
+            !b.this_pc,
+            &b.host,
+        ))
+    });
 }
 
 /// Groups `backups` (newest first) by (host, path id); groups appear in order of their newest
@@ -1325,6 +1841,7 @@ fn version_row(index: usize, b: &ProjectBackup) -> VersionRow {
             .created_unix()
             .map_or_else(|| b.file.created.clone(), clock),
         summary: parts.join(" · "),
+        bytes: b.file.size,
         has_omp: b.omp_bytes.is_some(),
         has_sessions: b.sessions.is_some(),
     }
@@ -1334,7 +1851,7 @@ fn version_row(index: usize, b: &ProjectBackup) -> VersionRow {
 mod tests {
     use std::collections::BTreeMap;
 
-    use deck_core::gdrive::BackupFile;
+    use deck_core::gdrive::{BackupFile, SessionSize};
 
     use super::*;
 
@@ -1368,6 +1885,14 @@ mod tests {
             omp,
             sessions,
             session_bytes: 4096,
+            session_list: (0..sessions)
+                .map(|i| SessionSize {
+                    id: format!("s{i}"),
+                    title: format!("session {i}"),
+                    modified: SystemTime::UNIX_EPOCH,
+                    bytes: 4096 / sessions,
+                })
+                .collect(),
         }
     }
 
@@ -1416,9 +1941,14 @@ mod tests {
             omp: true,
             sessions: true,
         };
-        let both = usable_parts(want, &sizes(OmpDir::Present { files: 3, bytes: 9 }, 2));
+        let none = BTreeSet::new();
+        let both = usable_parts(
+            want,
+            &sizes(OmpDir::Present { files: 3, bytes: 9 }, 2),
+            &none,
+        );
         assert_eq!(both, want);
-        let no_omp = usable_parts(want, &sizes(OmpDir::Missing, 2));
+        let no_omp = usable_parts(want, &sizes(OmpDir::Missing, 2), &none);
         assert_eq!(
             no_omp,
             Parts {
@@ -1426,7 +1956,7 @@ mod tests {
                 sessions: true
             }
         );
-        let global = usable_parts(want, &sizes(OmpDir::Global, 0));
+        let global = usable_parts(want, &sizes(OmpDir::Global, 0), &none);
         assert!(!global.any());
         let switched_off = usable_parts(
             Parts {
@@ -1434,6 +1964,7 @@ mod tests {
                 sessions: true,
             },
             &sizes(OmpDir::Present { files: 1, bytes: 1 }, 1),
+            &none,
         );
         assert_eq!(
             switched_off,
@@ -1446,7 +1977,7 @@ mod tests {
 
     #[test]
     fn size_cells_describe_what_was_measured() {
-        assert_eq!(cells_of(None).omp, OmpCell::Loading);
+        assert_eq!(cells_of(None, &BTreeSet::new()).omp, OmpCell::Loading);
         let ok = Ok(sizes(
             OmpDir::Present {
                 files: 1,
@@ -1454,22 +1985,23 @@ mod tests {
             },
             1,
         ));
-        let c = cells_of(Some(&ok));
+        let c = cells_of(Some(&ok), &BTreeSet::new());
         assert_eq!(c.omp, OmpCell::Present("1.0 KB · 1 file".into()));
         assert_eq!(
             c.sessions,
             SessionsCell::Ready {
                 count: 1,
+                included: 1,
                 text: "1 session · 4.0 KB".into()
             }
         );
         assert!(c.omp_usable() && c.sessions_usable());
         let none = Ok(sizes(OmpDir::Global, 0));
-        let c = cells_of(Some(&none));
+        let c = cells_of(Some(&none), &BTreeSet::new());
         assert!(!c.omp_usable() && !c.sessions_usable());
         let failed: Result<ProjectSizes, String> = Err("denied".into());
         assert_eq!(
-            cells_of(Some(&failed)).omp,
+            cells_of(Some(&failed), &BTreeSet::new()).omp,
             OmpCell::Failed("denied".into())
         );
     }
@@ -1477,7 +2009,7 @@ mod tests {
     #[test]
     fn symlinked_omp_is_never_offered() {
         let r = Ok(sizes(OmpDir::Symlink, 1));
-        let c = cells_of(Some(&r));
+        let c = cells_of(Some(&r), &BTreeSet::new());
         assert_eq!(c.omp, OmpCell::Symlink);
         assert!(!c.omp_usable());
         let want = Parts {
@@ -1485,11 +2017,50 @@ mod tests {
             sessions: true,
         };
         assert_eq!(
-            usable_parts(want, &sizes(OmpDir::Symlink, 1)),
+            usable_parts(want, &sizes(OmpDir::Symlink, 1), &BTreeSet::new()),
             Parts {
                 omp: false,
                 sessions: true
             }
         );
+    }
+
+    #[test]
+    fn excluded_sessions_shrink_the_cell_and_the_parts() {
+        let ok = Ok(sizes(OmpDir::Missing, 4));
+        let some: BTreeSet<String> = ["s0".to_owned(), "s1".to_owned(), "gone".to_owned()].into();
+        let c = cells_of(Some(&ok), &some);
+        assert_eq!(
+            c.sessions,
+            SessionsCell::Ready {
+                count: 4,
+                included: 2,
+                text: "2 of 4 sessions · 2.0 KB".into()
+            }
+        );
+        // Everything opted out: nothing is usable, but the list can still be opened.
+        let all: BTreeSet<String> = (0..4).map(|i| format!("s{i}")).collect();
+        let c = cells_of(Some(&ok), &all);
+        assert!(!c.sessions_usable() && c.sessions_choosable());
+        let want = Parts {
+            omp: false,
+            sessions: true,
+        };
+        let s = sizes(OmpDir::Missing, 4);
+        assert!(usable_parts(want, &s, &some).sessions);
+        assert!(!usable_parts(want, &s, &all).sessions);
+    }
+
+    #[test]
+    fn manager_groups_by_project_then_pc_with_this_pc_first() {
+        let list = [
+            backup("zed", "p1", "2026-10-22T10:00:00Z", Some(1), None),
+            backup("me", "p2", "2026-10-21T10:00:00Z", Some(1), None),
+            backup("me", "p1", "2026-10-20T10:00:00Z", Some(1), None),
+        ];
+        let mut g = group_backups(&list, "me", None);
+        sort_for_manager(&mut g);
+        let order: Vec<(&str, bool)> = g.iter().map(|g| (g.name.as_str(), g.this_pc)).collect();
+        assert_eq!(order, [("p1", true), ("p1", false), ("p2", true)]);
     }
 }

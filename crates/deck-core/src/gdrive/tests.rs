@@ -1048,6 +1048,7 @@ mod project_sync {
                 &self.root,
                 project,
                 parts,
+                &BTreeSet::new(),
                 force,
                 &AtomicBool::new(false),
                 &quiet,
@@ -1453,6 +1454,258 @@ mod project_sync {
         assert_eq!(sessions::scan(&w.root).len(), 2);
     }
 
+    // ------------------------------------------------------------ exclusions and deletion
+
+    fn ids(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn backup_without(
+        w: &World,
+        project: &Path,
+        parts: Parts,
+        excluded: &BTreeSet<String>,
+        force: bool,
+    ) -> Result<Option<ProjectBackupOutcome>> {
+        w.service.backup_project(
+            &w.root,
+            project,
+            parts,
+            excluded,
+            force,
+            &AtomicBool::new(false),
+            &quiet,
+        )
+    }
+
+    fn session_dirs(archive: &[u8]) -> BTreeSet<String> {
+        members(archive)
+            .into_iter()
+            .filter_map(|m| {
+                m.0.strip_prefix("sessions/")
+                    .and_then(|r| r.split('/').next())
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn excluded_sessions_stay_out_while_later_ones_are_included() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        session(&w.agent, "keep", &proj, "");
+        session(&w.agent, "skip", &proj, "");
+        let skip = ids(&["skip"]);
+
+        let first = backup_without(&w, &proj, SESSIONS, &skip, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.backup.sessions, Some(1));
+        assert!(first.skipped.is_empty(), "{:?}", first.skipped);
+        assert_eq!(session_dirs(&only_archive(&w)), ids(&["keep"]));
+        assert!(
+            backup_without(&w, &proj, SESSIONS, &skip, false)
+                .unwrap()
+                .is_none(),
+            "same exclusions, nothing changed"
+        );
+
+        // A session created afterwards is not excluded: it is picked up automatically.
+        session(&w.agent, "later", &proj, "");
+        let second = backup_without(&w, &proj, SESSIONS, &skip, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.backup.sessions, Some(2));
+        let archive = {
+            let m = w.mock.lock().unwrap();
+            m.files["new2"].1.clone()
+        };
+        assert_eq!(session_dirs(&archive), ids(&["keep", "later"]));
+    }
+
+    #[test]
+    fn changing_the_exclusions_counts_as_a_change() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        session(&w.agent, "a", &proj, "");
+        session(&w.agent, "b", &proj, "");
+        let none = BTreeSet::new();
+        let first = backup_without(&w, &proj, SESSIONS, &none, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.backup.sessions, Some(2));
+        assert!(
+            backup_without(&w, &proj, SESSIONS, &none, false)
+                .unwrap()
+                .is_none()
+        );
+        let narrowed = backup_without(&w, &proj, SESSIONS, &ids(&["a"]), false)
+            .unwrap()
+            .expect("a new exclusion is a change");
+        assert_eq!(narrowed.backup.sessions, Some(1));
+        assert_ne!(narrowed.synced.fingerprint, first.synced.fingerprint);
+        let widened = backup_without(&w, &proj, SESSIONS, &none, false)
+            .unwrap()
+            .expect("lifting the exclusion is a change");
+        assert_eq!(widened.backup.sessions, Some(2));
+        assert_eq!(widened.synced.fingerprint, first.synced.fingerprint);
+    }
+
+    #[test]
+    fn nothing_left_after_excluding_every_session_is_nothing_to_back_up() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        session(&w.agent, "a", &proj, "");
+        let all = ids(&["a"]);
+        let err = backup_without(&w, &proj, SESSIONS, &all, true).unwrap_err();
+        assert!(matches!(err, Error::NothingToBackUp(_)), "{err}");
+        assert!(w.mock.lock().unwrap().files.is_empty());
+
+        // `.omp` still counts as something to back up.
+        write(&proj.join(".omp/AGENTS.md"), "rules");
+        let both = Parts {
+            omp: true,
+            sessions: true,
+        };
+        let out = backup_without(&w, &proj, both, &all, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.backup.sessions, None);
+        assert!(out.backup.omp_bytes.is_some());
+    }
+
+    #[test]
+    fn excluding_an_id_that_is_not_a_session_of_the_project_is_no_change() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        session(&w.agent, "a", &proj, "");
+        let first = backup_without(&w, &proj, SESSIONS, &BTreeSet::new(), false)
+            .unwrap()
+            .unwrap();
+        let stale = ids(&["deleted-long-ago"]);
+        assert!(
+            backup_without(&w, &proj, SESSIONS, &stale, false)
+                .unwrap()
+                .is_none(),
+            "a stale exclusion changes nothing"
+        );
+        assert_eq!(
+            w.service.project_state().projects[&proj].fingerprint,
+            first.synced.fingerprint
+        );
+    }
+
+    #[test]
+    fn measure_lists_every_session_newest_first_with_title_and_size() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let old = session(&w.agent, "old", &proj, "");
+        let new = session(&w.agent, "new", &proj, "");
+        let t = |secs| std::time::UNIX_EPOCH + Duration::from_secs(secs);
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(t(1_000_000))
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&new)
+            .unwrap()
+            .set_modified(t(2_000_000))
+            .unwrap();
+        write(&new.with_extension("").join("a.txt"), "12345");
+
+        let sizes = measure(&w.root, &proj).unwrap();
+        let listed: Vec<&str> = sizes.session_list.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(listed, ["new", "old"]);
+        assert_eq!(sizes.sessions, 2);
+        assert_eq!(
+            sizes.session_bytes,
+            sizes.session_list.iter().map(|s| s.bytes).sum::<u64>()
+        );
+        assert_eq!(
+            sizes.session_list[0].bytes,
+            fs::metadata(&new).unwrap().len() + 5
+        );
+        assert_eq!(sizes.session_list[0].title, "t");
+        assert_eq!(sizes.session_list[0].modified, t(2_000_000));
+    }
+
+    #[test]
+    fn deleting_a_backup_removes_it_from_drive_and_forgets_the_recorded_one() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        session(&w.agent, "s1", &proj, "");
+        let out = w.backup(&proj, SESSIONS, false).unwrap().unwrap();
+        assert!(w.service.project_state().projects.contains_key(&proj));
+
+        let listed = w.service.list_projects().unwrap();
+        assert_eq!(listed.len(), 1);
+        w.service.delete_project_backup(&listed[0]).unwrap();
+        assert!(w.mock.lock().unwrap().files.is_empty());
+        assert!(w.service.list_projects().unwrap().is_empty());
+        assert!(
+            !w.service.project_state().projects.contains_key(&proj),
+            "the state of the deleted last backup is dropped"
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+        let again = w.backup(&proj, SESSIONS, false).unwrap();
+        assert!(again.is_some(), "an unchanged project is uploaded again");
+
+        // Already gone: success, and the newer backup's state is left alone.
+        w.service.delete_project_backup(&out.backup).unwrap();
+        assert!(w.service.project_state().projects.contains_key(&proj));
+        assert_eq!(w.service.list_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleting_an_older_backup_keeps_the_recorded_state() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        session(&w.agent, "s1", &proj, "");
+        w.backup(&proj, SESSIONS, false).unwrap().unwrap();
+        let older = w.service.list_projects().unwrap().remove(0);
+        // Backup names carry the time in seconds; the state is matched by name.
+        std::thread::sleep(Duration::from_millis(1100));
+        session(&w.agent, "s2", &proj, "");
+        w.backup(&proj, SESSIONS, false).unwrap().unwrap();
+
+        w.service.delete_project_backup(&older).unwrap();
+        assert_eq!(w.service.list_projects().unwrap().len(), 1);
+        assert!(
+            w.backup(&proj, SESSIONS, false).unwrap().is_none(),
+            "the latest backup is still there, so nothing is due"
+        );
+    }
+
+    #[test]
+    fn only_project_backups_can_be_deleted() {
+        let w = world();
+        let mut f = file("cfg", "2030-01-01T00:00:00.000Z");
+        f.props = BTreeMap::from([
+            ("kind".into(), "config".into()),
+            ("host".into(), "h".into()),
+            ("pid".into(), "p".into()),
+        ]);
+        w.mock
+            .lock()
+            .unwrap()
+            .files
+            .insert(f.id.clone(), (f.clone(), vec![1]));
+        let backup = ProjectBackup::from_file(f).unwrap();
+        let err = w.service.delete_project_backup(&backup).unwrap_err();
+        assert!(matches!(err, Error::InvalidBackup(_)), "{err}");
+        assert_eq!(w.mock.lock().unwrap().files.len(), 1);
+    }
+
     // ------------------------------------------------------------ rejected archives
 
     fn manifest_for(files: &[(&str, &[u8])]) -> serde_json::Value {
@@ -1647,7 +1900,15 @@ mod project_sync {
         write(&proj.join(".omp/AGENTS.md"), "x\n");
         let err = w
             .service
-            .backup_project(&w.root, &proj, OMP, true, &AtomicBool::new(true), &quiet)
+            .backup_project(
+                &w.root,
+                &proj,
+                OMP,
+                &BTreeSet::new(),
+                true,
+                &AtomicBool::new(true),
+                &quiet,
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Cancelled), "{err}");
         assert!(w.mock.lock().unwrap().files.is_empty());
@@ -2420,7 +2681,15 @@ mod project_sync {
         let events = Mutex::new(Vec::new());
         let record = |p: Progress| events.lock().unwrap().push(p);
         w.service
-            .backup_project(&w.root, &proj, OMP, true, &AtomicBool::new(false), &record)
+            .backup_project(
+                &w.root,
+                &proj,
+                OMP,
+                &BTreeSet::new(),
+                true,
+                &AtomicBool::new(false),
+                &record,
+            )
             .unwrap()
             .unwrap();
         let of = |stage| -> Vec<Progress> {
@@ -2458,8 +2727,17 @@ mod project_sync {
 
     fn fake_omp(dir: &Path, name: &str, body: &str) -> Omp {
         let path = dir.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut stage = path.as_os_str().to_owned();
+        stage.push(".src");
+        fs::write(&stage, format!("#!/bin/sh\n{body}\n")).unwrap();
+        // External copy: no write fd to the executed inode lives here (ETXTBSY with sibling forks).
+        let status = std::process::Command::new("install")
+            .args(["-m", "755"])
+            .arg(&stage)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
         Omp::at(path)
     }
 

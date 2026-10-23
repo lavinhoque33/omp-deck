@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use deck_core::config::SyncInterval;
 use deck_core::gdrive::{
     Account, BackupFile, BackupOutcome, Credentials, Error, HISTORY_DB, LOGIN_TIMEOUT,
     PreparedRestore, RestoreReport, Service,
@@ -19,9 +20,8 @@ use crate::drive_view::{self, Busy, DriveAction, DriveCard, RestoreList, Restore
 use crate::omp_worker;
 use crate::tree_layout::clock;
 
-/// First automatic check after startup, and after signing in / turning auto backup on.
+/// First automatic check after startup, and after signing in / changing the interval.
 const AUTO_FIRST: Duration = Duration::from_secs(45);
-const AUTO_EVERY: Duration = Duration::from_secs(10 * 60);
 /// Restore-confirmation lists show at most this many paths per line.
 const LIST_MAX: usize = 6;
 
@@ -86,7 +86,7 @@ impl DriveUi {
     }
 
     /// The settings card's state.
-    pub(super) fn card(&self, auto: bool) -> DriveCard {
+    pub(super) fn card(&self, interval: SyncInterval) -> DriveCard {
         if self.service.is_none() {
             return DriveCard::Unavailable;
         }
@@ -102,7 +102,7 @@ impl DriveUi {
                 .last_backup
                 .as_ref()
                 .map(|l| format!("{} from {}", clock(l.unix), l.host)),
-            auto,
+            interval,
             busy: match self.phase {
                 Phase::Busy(b) => Some(b),
                 _ => None,
@@ -135,11 +135,13 @@ impl App {
                     cancel.store(true, Ordering::Relaxed);
                 }
             }
-            DriveAction::SetAuto(on) => {
-                self.cfg.drive_auto_backup = on;
+            DriveAction::SetInterval(v) => {
+                let was_off = self.cfg.drive_backup_interval == SyncInterval::Off;
+                self.cfg.drive_backup_interval = v;
                 self.dirty = true;
-                if on {
-                    self.drive.next_auto = Instant::now() + AUTO_FIRST;
+                if let Some(period) = v.period() {
+                    self.drive.next_auto =
+                        Instant::now() + if was_off { AUTO_FIRST } else { period };
                 }
             }
             DriveAction::BackupNow => self.start_backup(true),
@@ -248,9 +250,11 @@ impl App {
     /// Per frame: start the automatic backup when it is due.
     pub(super) fn drive_tick(&mut self, ctx: &egui::Context) {
         let d = &self.drive;
+        let Some(period) = self.cfg.drive_backup_interval.period() else {
+            return;
+        };
         // Not while a restore is being picked or confirmed either.
         if d.account.is_none()
-            || !self.cfg.drive_auto_backup
             || d.picker.is_some()
             || matches!(self.confirm, Some((_, PendingConfirm::RestoreBackup(_))))
             || !matches!(d.phase, Phase::Idle)
@@ -259,7 +263,7 @@ impl App {
         }
         let now = Instant::now();
         if now >= d.next_auto {
-            self.drive.next_auto = now + AUTO_EVERY;
+            self.drive.next_auto = now + period;
             self.start_backup(false);
         } else {
             ctx.request_repaint_after(d.next_auto - now);

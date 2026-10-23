@@ -24,8 +24,9 @@ to your Google Drive; they are not sent anywhere else, and nobody other than you
 
 The sign-in token is stored only on your computer, in `~/.config/omp-deck/google-drive.json`
 (readable only by your user). "Sign out" revokes it at Google and deletes the file. You can also
-remove OmpDeck's access at any time at <https://myaccount.google.com/permissions>; to delete the
-backups themselves, open Google Drive → Settings → Manage apps → OmpDeck → Delete hidden app data.
+remove OmpDeck's access at any time at <https://myaccount.google.com/permissions>. Project backups can be
+deleted permanently in OmpDeck (Settings → Sync → Manage cloud backups…); to delete all backups, open
+Google Drive → Settings → Manage apps → OmpDeck → Delete hidden app data.
 
 OmpDeck's use of information received from Google APIs adheres to the
 [Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy),

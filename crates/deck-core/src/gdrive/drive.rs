@@ -285,6 +285,42 @@ impl<'a> Drive<'a> {
         .map(drop)
     }
 
+    /// Permanent `files.delete` (bypasses the trash). A file that is already gone (404) counts as
+    /// deleted. Network errors and 429/5xx answers are retried ([`MAX_ATTEMPTS`] in a row, backing
+    /// off).
+    pub(super) fn delete_permanently(&mut self, id: &str) -> Result<()> {
+        const WHAT: &str = "Deleting the backup";
+        let url = self.file_url(id)?;
+        let never = AtomicBool::new(false);
+        let mut failures = 0u32;
+        loop {
+            let resp = self.raw(Lane::Api, |http, auth| {
+                http.delete(&url).header("Authorization", auth).call()
+            });
+            let reason = match resp {
+                Err(Error::Network(m)) => m,
+                Err(e) => return Err(e),
+                Ok(mut resp) => {
+                    let status = resp.status().as_u16();
+                    if (200..300).contains(&status) || status == 404 {
+                        return Ok(());
+                    }
+                    if !matches!(status, 429 | 500..=599) {
+                        let body = resp.body_mut().read_to_string().unwrap_or_default();
+                        return Err(google_error(WHAT, status, &body));
+                    }
+                    format!("Google answered HTTP {status}")
+                }
+            };
+            failures += 1;
+            if failures >= MAX_ATTEMPTS {
+                return Err(Error::Network(reason));
+            }
+            log::warn!("{WHAT}: {reason}; retrying (attempt {failures})");
+            backoff(failures, &never)?;
+        }
+    }
+
     /// Drive ids are URL-safe tokens; anything else is refused rather than escaped.
     fn file_url(&self, id: &str) -> Result<String> {
         if id.is_empty()
