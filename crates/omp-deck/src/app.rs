@@ -1,9 +1,8 @@
-//! The eframe application: wires sessions, tmux, tabs, persistence and the terminal widget.
+//! The eframe application: wires sessions, session backends, tabs, persistence and the terminal widget.
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -14,15 +13,17 @@ use crate::icons::{
 };
 use deck_core::agents::{AgentsTarget, AgentsWatcher};
 use deck_core::config::{AppConfig, Density, FolderTabs, TabState, Theme, UiStyle, WindowGeometry};
+use deck_core::mux::{BackendChoice, MuxKind};
 use deck_core::omp::{
     MoveKind, MoveOutcome, Omp, Setting, UpdateKind, UpdateStatus, fork_argv, install_argv,
     update_argv,
 };
+use deck_core::platform;
 use deck_core::sessions::{
     ProjectGroup, SessionEntry, SessionWatcher, SessionsRoot, abbreviate_home, find_fork,
 };
 use deck_core::status::{StatusTarget, StatusWatcher};
-use deck_core::tmux::{Tmux, new_session_name, session_name_for};
+use deck_core::tmux::{new_session_name, session_name_for};
 use deck_term::{Clipboard, TermTheme, TerminalView};
 use egui::{Frame, Key, Margin, Modifiers, RichText};
 use serde_json::Value;
@@ -31,6 +32,7 @@ use crate::agent_ctl::Req;
 use crate::agent_hub::HubState;
 use crate::agent_model::AgentsView;
 use crate::agent_popup::PopupState;
+use crate::backend::Backends;
 use crate::cli::Cli;
 use crate::clipboard_bridge;
 use crate::config_writer::ConfigWriter;
@@ -76,7 +78,6 @@ const REFRESH_SPIN: Duration = Duration::from_millis(800);
 const MIN_FONT: f32 = 8.0;
 const MAX_FONT: f32 = 40.0;
 const DEFAULT_FONT: f32 = 14.0;
-const NO_TMUX_BANNER: &str = "tmux not found — sessions are not persistent; closing a tab ends omp";
 /// Toast action id: quit the app (after changing the title-bar style).
 const TOAST_QUIT: u64 = 1;
 /// How often the sidebar's age chips are refreshed (they only change by minutes).
@@ -88,7 +89,7 @@ const COPY_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct AppInit {
     pub cli: Cli,
     pub cfg: AppConfig,
-    pub tmux: Option<Tmux>,
+    pub backends: Backends,
     /// UI font bytes, read before the window opens.
     pub ui_fonts: ui_fonts::UiFonts,
     /// The command-line folder, already resolved (`None` = none given).
@@ -119,7 +120,7 @@ enum AppEvent {
         copy_id: u64,
         path: Option<PathBuf>,
     },
-    /// The old tmux session of a restart-with-control is gone (or refused to go): relaunch.
+    /// The old session of a restart-with-control is gone (or refused to go): relaunch.
     RestartReady {
         /// Where the restarted tab goes in the strip.
         anchor: Option<Anchor>,
@@ -141,7 +142,7 @@ enum AppEvent {
 /// A modal question awaiting the user's answer, with what to do on "yes".
 enum PendingConfirm {
     StopSession {
-        tmux_name: String,
+        mux_name: String,
         label: String,
     },
     SwitchChannel(UpdateKind),
@@ -178,9 +179,9 @@ enum PendingConfirm {
 
 /// What a sidebar restart was asked about.
 pub(super) struct RestartTarget {
-    /// The tab showing the session when asked (`None`: only tmux is running it).
+    /// The tab showing the session when asked (`None`: only a backend is running it).
     pub uid: Option<u64>,
-    pub tmux_name: String,
+    pub mux_name: String,
     pub session: PathBuf,
     pub cwd: PathBuf,
     pub title: String,
@@ -189,7 +190,9 @@ pub(super) struct RestartTarget {
 pub struct App {
     ctx: egui::Context,
     cfg: AppConfig,
-    tmux: Option<Tmux>,
+    backends: Backends,
+    /// Warning shown above the panels (no backend, or the chosen one is unavailable).
+    backend_banner: Option<String>,
     root: SessionsRoot,
     root_exists: bool,
     watcher: SessionWatcher,
@@ -255,8 +258,8 @@ pub struct App {
     next_tab_uid: u64,
     /// Tabs (uid) whose close waits for their injector to reach a job boundary and its last byte to settle.
     closing: Vec<u64>,
-    /// Opens (sidebar, reopen) requested before the first tmux snapshot: attaching a canonical name
-    /// blindly could land in a tmux session that now runs another file. Processed on arrival.
+    /// Opens (sidebar, reopen) requested before the first snapshot of the backends: attaching a
+    /// canonical name blindly could land in a session that now runs another file. Processed on arrival.
     deferred_opens: Vec<ClosedTab>,
     /// The Neutral font family was rebuilt from the final definitions (first frame).
     fonts_finalized: bool,
@@ -293,11 +296,11 @@ pub struct App {
     /// Bumped whenever the active tab changes by the user's hand; a queued launch may take focus
     /// only while this still equals its own claim.
     activation_seq: u64,
-    /// Namespace of this instance's control dirs: the tmux socket name, or `direct`.
+    /// Namespace of this instance's control dirs: the first backend's, or `direct`.
     ctl_ns: String,
     /// The restored tab that was active (focused once all restored tabs exist).
     restore_focus: Option<u64>,
-    /// Counter for the control keys of tabs without tmux.
+    /// Counter for the control keys of tabs without a backend.
     direct_seq: u64,
 
     dirty: bool,
@@ -340,13 +343,14 @@ impl App {
         let AppInit {
             cli,
             mut cfg,
-            tmux,
+            backends,
             ui_fonts,
             folder,
             start_dir,
             ctl_ext,
         } = init;
-        let ctl_ns = tmux.as_ref().map_or("direct", |t| t.socket()).to_owned();
+        let ctl_ns = backends.ctl_namespace();
+        let backend_banner = backends.banner();
         ui_fonts::install(&ctx, ui_fonts);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
@@ -365,8 +369,13 @@ impl App {
             move || ctx.request_repaint()
         };
         let watcher = SessionWatcher::spawn(root.clone(), POLL_INTERVAL, repaint.clone());
-        let running =
-            RunningMonitor::spawn(tmux.clone(), root.path.clone(), POLL_INTERVAL, repaint);
+        let running = RunningMonitor::spawn(
+            backends.all().to_vec(),
+            ctl_ns.clone(),
+            root.path.clone(),
+            POLL_INTERVAL,
+            repaint,
+        );
 
         let mut startup_error = None;
         let launch_folder = match folder {
@@ -382,7 +391,7 @@ impl App {
         if let Some(dir) = &launch_folder {
             cfg.push_recent_folder(dir.clone());
         }
-        // Tabs are only restored under tmux (without it nothing outlives the app). A folder
+        // Tabs are only restored with a backend (without one nothing outlives the app). A folder
         // launch restores that folder's own tabs, a plain launch the global ones.
         let (restore_tabs, restore_active) = match &launch_folder {
             Some(dir) => cfg
@@ -391,8 +400,8 @@ impl App {
                 .map_or((Vec::new(), None), |f| (f.open_tabs.clone(), f.active_tab)),
             None => (cfg.open_tabs.clone(), cfg.active_tab),
         };
-        let pending_restore =
-            (tmux.is_some() && !restore_tabs.is_empty()).then_some((restore_tabs, restore_active));
+        let pending_restore = (!backends.is_empty() && !restore_tabs.is_empty())
+            .then_some((restore_tabs, restore_active));
         let shot = cli.screenshot.map(|path| ShotPlan {
             path,
             after: Duration::from_secs_f64(cli.screenshot_after),
@@ -423,7 +432,8 @@ impl App {
             ctx,
             root_exists: root.exists(),
             cfg,
-            tmux,
+            backends,
+            backend_banner,
             root,
             watcher,
             running,
@@ -467,7 +477,7 @@ impl App {
             sidebar_cache: SidebarCache::default(),
             folder_dialog: None,
             home: dirs::home_dir(),
-            picker_available: transfer::on_path("kdialog") || transfer::on_path("zenity"),
+            picker_available: transfer::picker_available(),
             status,
             status_uid: None,
             status_target: None,
@@ -543,20 +553,20 @@ impl App {
         }
     }
 
-    /// Queue a session tab. `tmux_name` is ignored in degraded mode.
+    /// Queue a session tab. `mux_name` is ignored in degraded mode.
     fn spawn_tab(
         &mut self,
-        tmux_name: Option<String>,
+        mux_name: Option<String>,
         cwd: PathBuf,
         session_path: Option<PathBuf>,
         title: String,
     ) {
-        self.spawn_tab_focus(tmux_name, cwd, session_path, title, Focus::Claim);
+        self.spawn_tab_focus(mux_name, cwd, session_path, title, Focus::Claim);
     }
 
     fn spawn_tab_focus(
         &mut self,
-        tmux_name: Option<String>,
+        mux_name: Option<String>,
         cwd: PathBuf,
         session_path: Option<PathBuf>,
         title: String,
@@ -564,7 +574,7 @@ impl App {
     ) {
         let argv = self.with_omp_program(tabs::omp_argv(session_path.as_deref()));
         self.spawn_tab_post(SpawnReq {
-            tmux_name,
+            mux_name,
             cwd,
             session_path,
             title,
@@ -575,11 +585,11 @@ impl App {
         });
     }
 
-    /// Queue a terminal tab running `argv` (in tmux when `tmux_name` is given and tmux exists).
+    /// Queue a terminal tab running `argv` (in tmux when `mux_name` is given and tmux exists).
     /// Session tabs first get their control directory prepared on a worker (see `spawn.rs`).
     fn spawn_tab_with(
         &mut self,
-        tmux_name: Option<String>,
+        mux_name: Option<String>,
         cwd: PathBuf,
         session_path: Option<PathBuf>,
         title: String,
@@ -587,7 +597,7 @@ impl App {
         role: TabRole,
     ) {
         self.spawn_tab_post(SpawnReq {
-            tmux_name,
+            mux_name,
             cwd,
             session_path,
             title,
@@ -600,7 +610,7 @@ impl App {
 
     fn open_session(&mut self, entry: &SessionEntry) {
         self.open_resolved(ClosedTab {
-            tmux_name: Some(session_name_for(&entry.id)),
+            mux_name: Some(session_name_for(&entry.id)),
             cwd: entry.cwd.clone(),
             session_path: Some(entry.path.clone()),
             title: entry.label().to_owned(),
@@ -628,7 +638,7 @@ impl App {
         let existing = path.and_then(|p| {
             self.tabs
                 .iter()
-                .position(|t| t.session_path() == Some(p) || t.tmux_name().is_some_and(holds))
+                .position(|t| t.session_path() == Some(p) || t.mux_name().is_some_and(holds))
         });
         if let Some(i) = existing {
             if let Some(t) = self.tabs[i].term_mut()
@@ -642,18 +652,18 @@ impl App {
         if self.spawn_queued_for(req.session_path.as_deref(), None) {
             return; // already on its way
         }
-        let name = match (&self.tmux, req.tmux_name) {
-            (Some(_), Some(preferred)) => Some(
+        let name = req
+            .mux_name
+            .filter(|_| !self.backends.is_empty())
+            .map(|preferred| {
                 snap.resolve_for(
                     self.running.is_blind(),
                     &preferred,
                     req.session_path.as_deref(),
                     unix_ms(),
                 )
-                .into_name(),
-            ),
-            _ => None,
-        };
+                .into_name()
+            });
         self.spawn_tab_focus(name, req.cwd, req.session_path, req.title, focus);
     }
 
@@ -666,9 +676,9 @@ impl App {
         }
     }
 
-    /// Open an `omp update …` tab: runs directly (no tmux, not persisted) in $HOME.
+    /// Open an `omp update …` tab: runs outside the session backends (not persisted) in $HOME.
     fn open_update_tab(&mut self, kind: UpdateKind) {
-        let cwd = self.home.clone().unwrap_or_else(|| PathBuf::from("/"));
+        let cwd = self.home.clone().unwrap_or_else(platform::home_or_root);
         let argv = self.with_omp_program(update_argv(kind));
         self.spawn_tab_with(None, cwd, None, String::new(), argv, TabRole::Update(kind));
     }
@@ -682,7 +692,7 @@ impl App {
             self.activate(i);
             return;
         }
-        let cwd = self.home.clone().unwrap_or_else(|| PathBuf::from("/"));
+        let cwd = self.home.clone().unwrap_or_else(platform::home_or_root);
         let argv = install_argv();
         self.spawn_tab_with(None, cwd, None, String::new(), argv, TabRole::InstallOmp);
     }
@@ -700,7 +710,10 @@ impl App {
         let Some(omp) = Omp::detect() else {
             self.toasts.error(
                 &self.ctx,
-                "The installer finished, but omp is not on PATH or in ~/.local/bin",
+                format!(
+                    "The installer finished, but omp is not in {}",
+                    crate::update::OMP_LOOKUP
+                ),
             );
             return;
         };
@@ -721,7 +734,8 @@ impl App {
 
     fn new_session(&mut self, cwd: PathBuf) {
         let name = self
-            .tmux
+            .backends
+            .primary()
             .is_some()
             .then(|| new_session_name(SystemTime::now()));
         self.spawn_tab(name, cwd, None, String::new());
@@ -749,7 +763,7 @@ impl App {
             && t.role == TabRole::Session
         {
             self.closed.push(ClosedTab {
-                tmux_name: t.tmux_name.clone(),
+                mux_name: t.mux_name.clone(),
                 cwd: t.cwd.clone(),
                 session_path: t.session_path.clone(),
                 title: t.title(&self.labels).to_owned(),
@@ -774,17 +788,18 @@ impl App {
         self.open_resolved(closed);
     }
 
-    /// Kill a tmux session on a worker thread; the outcome arrives as a toast.
-    fn kill_tmux_session(&self, name: String, label: String) {
-        let Some(tmux) = self.tmux.clone() else {
+    /// Kill a session (in whichever backend holds it) on a worker thread; the outcome arrives
+    /// as a toast.
+    fn kill_session(&self, name: String, label: String) {
+        if self.backends.is_empty() {
             return;
-        };
+        }
+        let backends = self.backends.clone();
         let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            let event = match tmux.kill(&name) {
+            let event = match backends.kill(&name) {
                 Ok(()) => AppEvent::Toast(ToastKind::Success, format!("Stopped “{label}”")),
                 Err(e) => {
-                    log::warn!("kill {name}: {e}");
                     AppEvent::Toast(ToastKind::Error, format!("Could not stop “{label}”: {e}"))
                 }
             };
@@ -798,10 +813,10 @@ impl App {
         let Some(Tab::Terminal(tab)) = self.tabs.get_mut(i) else {
             return;
         };
-        match tab.tmux_name.clone() {
-            Some(name) if self.tmux.is_some() => {
+        match tab.mux_name.clone() {
+            Some(name) if tab.mux.is_some() => {
                 let label = tab.title(&self.labels).to_owned();
-                self.kill_tmux_session(name, label);
+                self.kill_session(name, label);
             }
             _ => tab.term.kill(),
         }
@@ -825,7 +840,7 @@ impl App {
             if self
                 .tabs
                 .iter()
-                .any(|t| t.tmux_name() == Some(st.tmux_name.as_str()))
+                .any(|t| t.mux_name() == Some(st.tmux_name.as_str()))
             {
                 continue;
             }
@@ -843,7 +858,7 @@ impl App {
                 .into_name();
             let argv = self.with_omp_program(tabs::omp_argv(path.as_deref()));
             self.spawn_tab_post(SpawnReq {
-                tmux_name: Some(name),
+                mux_name: Some(name),
                 cwd: st.cwd.clone(),
                 session_path: path,
                 title: st.title.clone(),
@@ -867,7 +882,7 @@ impl App {
             if tab.copy.is_some() {
                 continue;
             }
-            let Some(name) = &tab.tmux_name else {
+            let Some(name) = &tab.mux_name else {
                 continue;
             };
             if let Some(path) =
@@ -935,6 +950,18 @@ impl App {
         }
     }
 
+    /// Where new sessions go. Running sessions stay where they are: every backend is still
+    /// polled, listed and stoppable.
+    fn set_session_backend(&mut self, choice: BackendChoice) {
+        if self.cfg.session_backend == choice {
+            return;
+        }
+        self.cfg.session_backend = choice;
+        self.backends.set_choice(choice);
+        self.backend_banner = self.backends.banner();
+        self.dirty = true;
+    }
+
     fn set_density(&mut self, density: Density) {
         if self.cfg.density != density {
             self.cfg.density = density;
@@ -984,11 +1011,10 @@ impl App {
             .scope
             .clone()
             .or_else(|| self.home.clone())
-            .unwrap_or_else(|| PathBuf::from("/"));
+            .unwrap_or_else(deck_core::platform::home_or_root);
         let (home, base) = (self.home.clone(), start.clone());
         omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            let picked = transfer::picker_command(&start, transfer::on_path)
-                .and_then(|p| transfer::run_picker(&p));
+            let picked = transfer::pick_folder(&start);
             AppEvent::Omp(OmpEvent::ScopeChosen {
                 generation,
                 typed: false,
@@ -1052,7 +1078,8 @@ impl App {
         self.toasts.success(&self.ctx, format!("Copied {what}"));
     }
 
-    /// Open a link with xdg-open off the UI thread; a failure arrives as an error toast.
+    /// Open a link with the desktop's handler off the UI thread; a failure arrives as an error
+    /// toast.
     fn open_external(&self, url: String) {
         if !is_openable_url(&url) {
             log::warn!("refusing to open url with disallowed scheme: {url}");
@@ -1060,25 +1087,26 @@ impl App {
         }
         let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            if let Err(e) = spawn_opener(url.as_ref()) {
-                log::warn!("xdg-open {url}: {e}");
+            if let Err(e) = platform::open_path(url.as_ref()) {
+                log::warn!("open {url}: {e}");
                 let _ = tx.send(AppEvent::Toast(
                     ToastKind::Error,
-                    format!("xdg-open failed: {e}"),
+                    format!("Could not open the link: {e}"),
                 ));
                 ctx.request_repaint();
             }
         });
     }
 
-    /// Open `dir` in the desktop file manager (xdg-open), entirely off the UI thread.
+    /// Open `dir` in the desktop file manager, entirely off the UI thread.
     fn open_folder(&self, dir: PathBuf) {
         let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
             let outcome = if !dir.is_absolute() || !dir.is_dir() {
                 Err(format!("Folder not found: {}", dir.display()))
             } else {
-                spawn_opener(dir.as_os_str()).map_err(|e| format!("xdg-open failed: {e}"))
+                platform::open_path(dir.as_os_str())
+                    .map_err(|e| format!("Could not open the folder: {e}"))
             };
             if let Err(msg) = outcome {
                 let _ = tx.send(AppEvent::Toast(ToastKind::Error, msg));
@@ -1089,7 +1117,7 @@ impl App {
 
     /// tmux session currently running `entry`: the holder of its file, a live tab on it, else the
     /// canonical name.
-    fn running_tmux_name(&self, entry: &SessionEntry) -> Option<String> {
+    fn running_session_name(&self, entry: &SessionEntry) -> Option<String> {
         let snap = self.running.latest();
         let holder = snap
             .as_ref()
@@ -1098,7 +1126,7 @@ impl App {
             self.tabs.iter().find_map(|t| {
                 let t = t.term()?;
                 (t.session_path.as_deref() == Some(entry.path.as_path()) && !t.term.is_exited())
-                    .then(|| t.tmux_name.clone())
+                    .then(|| t.mux_name.clone())
                     .flatten()
             })
         };
@@ -1112,7 +1140,7 @@ impl App {
 
     /// Ask before stopping the tmux session that runs `entry`.
     fn request_stop(&mut self, entry: &SessionEntry) {
-        let Some(tmux_name) = self.running_tmux_name(entry) else {
+        let Some(mux_name) = self.running_session_name(entry) else {
             self.toasts
                 .info(&self.ctx, "That session is not running anymore.");
             return;
@@ -1127,7 +1155,7 @@ impl App {
                 confirm_label: "Stop session".to_owned(),
                 danger: true,
             },
-            PendingConfirm::StopSession { tmux_name, label },
+            PendingConfirm::StopSession { mux_name, label },
         ));
     }
 
@@ -1218,7 +1246,7 @@ impl App {
                 menu: MenuEnv {
                     groups: groups.as_deref().map_or(&[][..], Vec::as_slice),
                     omp_available: self.omp.is_some(),
-                    can_stop: self.tmux.is_some(),
+                    can_stop: !self.backends.is_empty(),
                     busy: &self.moving,
                     drive: self.drive_menu(),
                 },
@@ -1269,9 +1297,9 @@ impl App {
     }
 
     fn show_banners(&mut self, ui: &mut egui::Ui) {
-        if self.tmux.is_none() {
+        if let Some(text) = &self.backend_banner {
             let pal = Palette::of_ui(ui);
-            egui::Panel::top("no-tmux-banner")
+            egui::Panel::top("backend-banner")
                 .show_separator_line(false)
                 .frame(
                     Frame::NONE
@@ -1283,7 +1311,7 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
                         ui.label(icon_text(ICON_TRIANGLE_ALERT, 18.0, pal.warn));
-                        ui.label(RichText::new(NO_TMUX_BANNER).color(pal.text_strong));
+                        ui.label(RichText::new(text.as_str()).color(pal.text_strong));
                     });
                 });
         }
@@ -1326,7 +1354,7 @@ impl App {
                 .map(|t| t.cwd.as_path()),
             now: SystemTime::now(),
             refreshing,
-            can_stop: self.tmux.is_some(),
+            can_stop: !self.backends.is_empty(),
             omp_available: self.omp.is_some(),
             busy: &self.moving,
             generation,
@@ -1424,7 +1452,7 @@ impl App {
                             ICON_TERMINAL,
                             pal.warn,
                             "omp is not installed",
-                            "OmpDeck runs the omp coding agent, which was not found on PATH or in ~/.local/bin.",
+                            &format!("OmpDeck runs the omp coding agent, which was not found in {}.", crate::update::OMP_LOOKUP),
                         );
                         ui.add_space(12.0);
                         ui.vertical_centered(crate::widgets::install_omp_button).inner
@@ -1450,6 +1478,11 @@ impl App {
                     omp_version: self.update.version.as_deref(),
                     check_updates: self.cfg.check_updates,
                     update: &self.update.state,
+                    backend: settings_page::BackendCard {
+                        choice: self.cfg.session_backend,
+                        tmux: self.backends.has(MuxKind::Tmux),
+                        host: self.backends.has(MuxKind::Host),
+                    },
                     drive: account.clone(),
                     sync: self.sync_page(&account, &rows),
                 };
@@ -1462,6 +1495,7 @@ impl App {
                         SettingsAction::Theme(t) => self.set_theme(t),
                         SettingsAction::Style(v) => self.set_style(v),
                         SettingsAction::Density(v) => self.set_density(v),
+                        SettingsAction::SessionBackend(v) => self.set_session_backend(v),
                         SettingsAction::NativeDecorations(v) => self.set_native_decorations(v),
                         SettingsAction::SetCheckUpdates(v) => {
                             self.cfg.check_updates = v;
@@ -1564,8 +1598,8 @@ impl App {
             return;
         }
         match pending {
-            PendingConfirm::StopSession { tmux_name, label } => {
-                self.kill_tmux_session(tmux_name, label);
+            PendingConfirm::StopSession { mux_name, label } => {
+                self.kill_session(mux_name, label);
             }
             PendingConfirm::SwitchChannel(kind) => self.open_update_tab(kind),
             PendingConfirm::MoveSession { entry, dest } => self.execute_move(entry, dest),
@@ -1605,8 +1639,8 @@ impl App {
 
     fn snapshot_config(&self) -> AppConfig {
         let mut cfg = self.cfg.clone();
-        // Before restore ran (or without tmux) the stored tab list is left untouched.
-        if self.tmux.is_some() && self.pending_restore.is_none() {
+        // Before restore ran (or without a backend) the stored tab list is left untouched.
+        if !self.backends.is_empty() && self.pending_restore.is_none() {
             // The settings page is never persisted; `active_tab` indexes the persisted list.
             let mut active_tab = None;
             let mut open_tabs = Vec::new();
@@ -1614,14 +1648,18 @@ impl App {
                 let Tab::Terminal(t) = tab else {
                     continue;
                 };
-                let Some(tmux_name) = t.tmux_name.clone() else {
+                // Update/installer tabs are one-off processes, never restored.
+                if t.role != TabRole::Session {
+                    continue;
+                }
+                let Some(mux_name) = t.mux_name.clone() else {
                     continue;
                 };
                 if i == self.active {
                     active_tab = Some(open_tabs.len());
                 }
                 open_tabs.push(TabState {
-                    tmux_name,
+                    tmux_name: mux_name,
                     cwd: t.cwd.clone(),
                     session_path: t.session_path.clone(),
                     title: t.title(&self.labels).to_owned(),
@@ -1985,12 +2023,13 @@ impl App {
     fn copy_session(&mut self, entry: &SessionEntry, dest: &Path) {
         let argv = self.with_omp_program(fork_argv(&entry.path, dest));
         let name = self
-            .tmux
+            .backends
+            .primary()
             .is_some()
             .then(|| new_session_name(SystemTime::now()));
         let started_at = SystemTime::now();
         self.spawn_tab_post(SpawnReq {
-            tmux_name: name,
+            mux_name: name,
             cwd: dest.to_path_buf(),
             session_path: None,
             title: entry.label().to_owned(),
@@ -2085,7 +2124,7 @@ impl App {
     }
 
     fn request_move(&mut self, entry: SessionEntry, dest: PathBuf) {
-        let running = self.running_tmux_name(&entry).is_some()
+        let running = self.running_session_name(&entry).is_some()
             || self.tabs.iter().any(|t| {
                 t.term().is_some_and(|t| {
                     t.session_path.as_deref() == Some(entry.path.as_path()) && !t.term.is_exited()
@@ -2119,7 +2158,7 @@ impl App {
         if self.omp.is_none() || !self.moving.insert(entry.path.clone()) {
             return;
         }
-        let holder = self.running_tmux_name(&entry);
+        let holder = self.running_session_name(&entry);
         // The monitor snapshot can lag behind a tab that was just opened: kill the tmux session
         // each matching tab recorded as well, not only the snapshot's holder.
         let mut kill_names: Vec<String> = holder.iter().cloned().collect();
@@ -2128,13 +2167,13 @@ impl App {
         for i in (0..self.tabs.len()).rev() {
             let hit = self.tabs[i].term().is_some_and(|t| {
                 t.session_path.as_deref() == Some(entry.path.as_path())
-                    || (holder.is_some() && t.tmux_name == holder)
+                    || (holder.is_some() && t.mux_name == holder)
             });
             if !hit {
                 continue;
             }
             if let Some(t) = self.tabs[i].term_mut() {
-                match &t.tmux_name {
+                match &t.mux_name {
                     Some(name) => {
                         if !kill_names.contains(name) {
                             kill_names.push(name.clone());
@@ -2145,7 +2184,7 @@ impl App {
                 if tab_state.is_none() {
                     slot = i;
                     tab_state = Some(ClosedTab {
-                        tmux_name: t.tmux_name.clone(),
+                        mux_name: t.mux_name.clone(),
                         cwd: t.cwd.clone(),
                         session_path: Some(entry.path.clone()),
                         title: entry.label().to_owned(),
@@ -2166,14 +2205,13 @@ impl App {
             &self.ctx,
             format!("Moving “{title}” to {}…", abbreviate_home(&dest)),
         );
-        let tmux = self.tmux.clone();
+        let backends = self.backends.clone();
+        let persistent = !backends.is_empty();
         let (src, id) = (entry.path, entry.id);
         self.spawn_omp(move |omp| {
-            if let Some(tmux) = &tmux {
-                for name in &kill_names {
-                    if let Err(e) = tmux.kill(name) {
-                        log::warn!("kill {name} before move: {e}");
-                    }
+            for name in &kill_names {
+                if let Err(e) = backends.kill(name) {
+                    log::warn!("kill {name} before move: {e}");
                 }
             }
             let result = omp_worker::retry_while_live(
@@ -2188,18 +2226,15 @@ impl App {
                             MoveKind::Forked { new_id } => new_id,
                             _ => &id,
                         };
-                        tab.tmux_name = tmux.is_some().then(|| session_name_for(new_id));
+                        tab.mux_name = persistent.then(|| session_name_for(new_id));
                         tab.cwd = dest.clone();
                         tab.session_path = Some(outcome.new_path.clone());
                     }
                     Err(_) => {
                         // Re-attach a tmux session that survived; else resume the original file
                         // under its canonical name.
-                        let alive = tmux
-                            .as_ref()
-                            .and_then(|t| kill_names.iter().find(|n| t.has_session(n)).cloned());
-                        tab.tmux_name =
-                            alive.or_else(|| tmux.is_some().then(|| session_name_for(&id)));
+                        let alive = kill_names.iter().find(|n| backends.has_session(n)).cloned();
+                        tab.mux_name = alive.or_else(|| persistent.then(|| session_name_for(&id)));
                     }
                 }
                 Box::new(MovedTab {
@@ -2224,7 +2259,7 @@ impl App {
             return;
         }
         let label = entry.label().to_owned();
-        let running = self.running_tmux_name(&entry).is_some();
+        let running = self.running_session_name(&entry).is_some();
         let busy = self.tabs.iter().any(|t| match t {
             Tab::Terminal(t) => {
                 !t.term.is_exited()
@@ -2266,18 +2301,18 @@ impl App {
         if self.omp.is_none() || !self.moving.insert(entry.path.clone()) {
             return;
         }
-        let holder = self.running_tmux_name(&entry);
+        let holder = self.running_session_name(&entry);
         let mut kill_names: Vec<String> = holder.iter().cloned().collect();
         for i in (0..self.tabs.len()).rev() {
             let hit = self.tabs[i].term().is_some_and(|t| {
                 t.session_path.as_deref() == Some(entry.path.as_path())
-                    || (holder.is_some() && t.tmux_name == holder)
+                    || (holder.is_some() && t.mux_name == holder)
             });
             if !hit {
                 continue;
             }
             if let Some(t) = self.tabs[i].term_mut() {
-                match &t.tmux_name {
+                match &t.mux_name {
                     Some(name) => {
                         if !kill_names.contains(name) {
                             kill_names.push(name.clone());
@@ -2292,13 +2327,11 @@ impl App {
         self.closed
             .retain(|c| c.session_path.as_deref() != Some(path.as_path()));
         let title = entry.label().to_owned();
-        let tmux = self.tmux.clone();
+        let backends = self.backends.clone();
         self.spawn_omp(move |omp| {
-            if let Some(tmux) = &tmux {
-                for name in &kill_names {
-                    if let Err(e) = tmux.kill(name) {
-                        log::warn!("kill {name} before delete: {e}");
-                    }
+            for name in &kill_names {
+                if let Err(e) = backends.kill(name) {
+                    log::warn!("kill {name} before delete: {e}");
                 }
             }
             // Each attempt spawns a headless omp (~0.8 s): few attempts, short delay (~5 s total).
@@ -2379,7 +2412,7 @@ impl App {
         {
             let argv = self.with_omp_program(tabs::omp_argv(t.session_path.as_deref()));
             self.spawn_tab_post(SpawnReq {
-                tmux_name: t.tmux_name,
+                mux_name: t.mux_name,
                 cwd: t.cwd,
                 session_path: t.session_path,
                 title: t.title,
@@ -2415,10 +2448,7 @@ impl App {
                 dlg.browsing = true;
                 let start = dlg.start_dir(self.home.as_deref());
                 omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-                    AppEvent::Omp(OmpEvent::FolderPicked(
-                        transfer::picker_command(&start, transfer::on_path)
-                            .and_then(|p| transfer::run_picker(&p)),
-                    ))
+                    AppEvent::Omp(OmpEvent::FolderPicked(transfer::pick_folder(&start)))
                 });
             }
         }
@@ -2642,7 +2672,8 @@ fn terminal_menu(resp: &egui::Response, term: &deck_term::Terminal) -> Option<Te
     pick
 }
 
-/// Only `http`, `https`, `mailto` (scheme matched case-insensitively) may reach xdg-open.
+/// Only `http`, `https`, `mailto` (scheme matched case-insensitively) may reach the desktop's
+/// opener.
 fn is_openable_url(url: &str) -> bool {
     let Some((scheme, rest)) = url.split_once(':') else {
         return false;
@@ -2651,23 +2682,6 @@ fn is_openable_url(url: &str) -> bool {
         && ["http", "https", "mailto"]
             .iter()
             .any(|s| scheme.eq_ignore_ascii_case(s))
-}
-
-/// Start `xdg-open <arg>` and reap it; blocks until the opener exits, so call off the UI thread.
-/// A non-zero exit status is an error (xdg-open found no handler, the handler failed, …).
-fn spawn_opener(arg: &std::ffi::OsStr) -> std::io::Result<()> {
-    let mut child = Command::new("xdg-open")
-        .arg(arg)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!("exited with {status}")))
-    }
 }
 
 fn write_png(path: &Path, img: &egui::ColorImage) -> anyhow::Result<()> {

@@ -2,11 +2,12 @@
 //! the byte-level helpers used to prefilter lines before any JSON parsing.
 
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use memchr::{memchr, memchr_iter, memmem};
+
+use crate::platform::{self, FileId};
 
 /// Bytes read per [`LineTail::poll`] call.
 const MAX_READ: u64 = 8 * 1024 * 1024;
@@ -15,7 +16,7 @@ const MAX_LINE: usize = 48 * 1024 * 1024;
 
 /// What one [`LineTail::poll`] produced.
 pub(crate) struct Chunk {
-    /// The file was replaced (different `(dev, ino)`) or shrank: the consumer must discard
+    /// The file was replaced (different file identity) or shrank: the consumer must discard
     /// everything derived from earlier chunks before applying `data`.
     pub reset: bool,
     /// Zero or more complete lines (each terminated by `\n`).
@@ -24,10 +25,10 @@ pub(crate) struct Chunk {
     pub more: bool,
 }
 
-/// Follows an append-only file: `(dev, ino)` + offset + the unterminated last line.
+/// Follows an append-only file: file identity + offset + the unterminated last line.
 pub(crate) struct LineTail {
     path: PathBuf,
-    id: Option<(u64, u64)>,
+    id: Option<FileId>,
     /// Bytes consumed from the file (including those still held in `pending`).
     offset: u64,
     pending: Vec<u8>,
@@ -47,25 +48,10 @@ impl LineTail {
     }
 
     pub fn poll(&mut self) -> io::Result<Chunk> {
-        // Regular files only: a FIFO must never be opened, a symlink never followed. O_NONBLOCK
-        // (0o4000 on Linux, all archs) keeps a swapped-in FIFO from blocking; the opened fd must
-        // be the lstat'd file.
-        let lmd = std::fs::symlink_metadata(&self.path)?;
-        if !lmd.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "not a regular file",
-            ));
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(0o4000)
-            .open(&self.path)?;
+        // Regular files only: a FIFO is never opened, a link never followed (`platform`).
+        let mut file = platform::open_regular_file(&self.path)?;
         let md = file.metadata()?;
-        if (md.dev(), md.ino()) != (lmd.dev(), lmd.ino()) || !md.file_type().is_file() {
-            return Err(io::Error::other("file changed while opening"));
-        }
-        let id = (md.dev(), md.ino());
+        let id = platform::file_identity(&file)?;
         let len = md.len();
         let mut reset = false;
         if self.id != Some(id) || len < self.offset {

@@ -8,6 +8,8 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Map, Value};
 
+use crate::platform;
+
 #[derive(Debug, thiserror::Error)]
 pub enum OmpError {
     #[error("failed to run omp: {0}")]
@@ -297,13 +299,21 @@ pub fn update_argv(kind: UpdateKind) -> Vec<String> {
     v
 }
 
-/// omp's official installer script.
-pub const INSTALL_URL: &str = "https://omp.sh/install";
+/// omp's official installer script (the PowerShell one on Windows).
+pub const INSTALL_URL: &str = if cfg!(windows) {
+    "https://omp.sh/install.ps1"
+} else {
+    "https://omp.sh/install"
+};
 
-/// argv for an "Install omp" tab: fetch [`INSTALL_URL`] with curl (else wget) and run it with
-/// `--binary`, which installs a prebuilt omp to `~/.local/bin` without bun or root.
-/// A failed download fails the whole command instead of running an empty script.
+/// argv for an "Install omp" tab. Unix: fetch [`INSTALL_URL`] with curl (else wget) and run it with
+/// `--binary`, which installs a prebuilt omp to `~/.local/bin` without bun or root; a failed
+/// download fails the whole command instead of running an empty script. Windows: the same
+/// installer through PowerShell, installing `%LOCALAPPDATA%\omp\omp.exe`.
 pub fn install_argv() -> Vec<String> {
+    if cfg!(windows) {
+        return powershell_install_argv();
+    }
     let script = format!(
         "set -e\n\
          if command -v curl >/dev/null 2>&1; then s=$(curl -fsSL {INSTALL_URL})\n\
@@ -313,6 +323,22 @@ pub fn install_argv() -> Vec<String> {
          printf '%s\\n' \"$s\" | sh -s -- --binary\n"
     );
     vec!["sh".into(), "-c".into(), script]
+}
+
+/// PowerShell argv that runs the `install.ps1` installer in binary mode.
+fn powershell_install_argv() -> Vec<String> {
+    let command = format!("& ([scriptblock]::Create((irm {INSTALL_URL}))) -Binary");
+    [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain([command])
+    .collect()
 }
 
 fn failed(message: impl Into<String>) -> OmpError {
@@ -618,24 +644,59 @@ pub fn parse_settings(
     Ok(SettingsCatalog { tabs })
 }
 
+/// Where omp's installers put the binary when PATH does not list it. Unix: `~/.local/bin/omp`.
+/// Windows: `%LOCALAPPDATA%\omp\omp.exe` (install.ps1 -Binary), `~\.bun\bin\omp.exe` (bun's shim).
+fn install_locations(
+    home: Option<PathBuf>,
+    local_data: Option<PathBuf>,
+    windows: bool,
+) -> Vec<PathBuf> {
+    if !windows {
+        return home.map(|h| h.join(".local/bin/omp")).into_iter().collect();
+    }
+    local_data
+        .map(|d| d.join("omp").join("omp.exe"))
+        .into_iter()
+        .chain(home.map(|h| h.join(".bun").join("bin").join("omp.exe")))
+        .collect()
+}
+
+/// What omp keys its terminal breadcrumb on (`docs/notes/project-sync.md`): helper runs drop them
+/// so a headless omp never writes (or overwrites) the breadcrumb of the terminal the GUI was
+/// started from.
+const TERMINAL_VARS: [&str; 8] = [
+    "TMUX",
+    "TMUX_PANE",
+    "ZELLIJ_PANE_ID",
+    "CMUX_SURFACE_ID",
+    "KITTY_WINDOW_ID",
+    "WEZTERM_PANE",
+    "TERM_SESSION_ID",
+    "WT_SESSION",
+];
+
+/// Removes [`TERMINAL_VARS`] from `cmd`'s environment and hides its console window.
+fn headless(cmd: &mut Command) -> &mut Command {
+    for var in TERMINAL_VARS {
+        cmd.env_remove(var);
+    }
+    platform::no_window(cmd)
+}
+
 struct Captured {
     stdout: String,
     stderr: String,
 }
 
 impl Omp {
-    /// First executable `omp` on PATH, else `~/.local/bin/omp`.
+    /// First executable `omp` on PATH (`PATHEXT` on Windows), else the installers' default
+    /// locations ([`install_locations`]).
     pub fn detect() -> Option<Omp> {
-        let on_path = std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|d| d.join("omp"))
-                .find(|p| is_executable(p))
-        });
-        on_path
+        platform::find_on_path("omp")
             .or_else(|| {
-                dirs::home_dir()
-                    .map(|h| h.join(".local/bin/omp"))
-                    .filter(|p| is_executable(p))
+                install_locations(dirs::home_dir(), dirs::data_local_dir(), cfg!(windows))
+                    .into_iter()
+                    .find(|p| platform::is_executable(p))
             })
             .map(Omp::at)
     }
@@ -662,7 +723,7 @@ impl Omp {
     pub(crate) fn command(&self, args: &[&std::ffi::OsStr]) -> Command {
         let mut c = Command::new(&self.program);
         c.args(args)
-            .current_dir("/")
+            .current_dir(platform::root_dir())
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -670,6 +731,7 @@ impl Omp {
         for (k, v) in &self.env {
             c.env(k, v);
         }
+        headless(&mut c);
         c
     }
 
@@ -736,6 +798,7 @@ impl Omp {
                         c.env_remove(k);
                     }
                 }
+                headless(&mut c);
                 self.finish(c, None)
             });
             (text.join(), json.join(), defaults.join())
@@ -798,7 +861,7 @@ impl Omp {
         let cwd = crate::sessions::header_cwd(&file)
             .filter(|d| d.is_dir())
             .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("/"));
+            .unwrap_or_else(platform::root_dir);
         let mut cmd = Command::new(&self.program);
         cmd.args(["--mode", "rpc", "--resume"])
             .arg(&file)
@@ -810,12 +873,11 @@ impl Omp {
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
-        let mut child = Reaper(cmd.spawn()?);
-        let (Some(mut stdin), Some(stdout), Some(mut stderr)) = (
-            child.0.stdin.take(),
-            child.0.stdout.take(),
-            child.0.stderr.take(),
-        ) else {
+        headless(&mut cmd);
+        let mut child = platform::spawn_killable(cmd)?;
+        let (Some(mut stdin), Some(stdout), Some(mut stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
             return Err(failed("omp rpc pipes unavailable"));
         };
         let (tx, rx) = channel::<String>();
@@ -851,7 +913,7 @@ impl Omp {
                 Err(RecvTimeoutError::Disconnected) => {
                     // omp exited before answering: its stderr says why.
                     drop(stdin);
-                    let status = child.0.wait()?;
+                    let status = child.wait()?;
                     let err = err_reader.join().unwrap_or_default();
                     return Err(failure(status.code(), "", &err));
                 }
@@ -889,7 +951,7 @@ impl Omp {
         // Closing stdin ends rpc mode; omp flushes and exits. A stuck process is killed.
         drop(stdin);
         let end = Instant::now() + Duration::from_secs(5);
-        while child.0.try_wait()?.is_none() && Instant::now() < end {
+        while child.try_wait()?.is_none() && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(20));
         }
         drop(child);
@@ -917,7 +979,7 @@ impl Omp {
         let ext = crate::ctl::install_delete_extension(work.path())?;
         let out = work.path().join("result");
         let err_path = work.path().join("stderr");
-        let cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let cwd = platform::home_or_root();
         let mut cmd = Command::new(&self.program);
         cmd.args(["--mode", "rpc", "--no-session", "--no-extensions", "-e"])
             .arg(&ext)
@@ -931,9 +993,10 @@ impl Omp {
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
-        let mut child = Reaper(cmd.spawn()?);
+        headless(&mut cmd);
+        let mut child = platform::spawn_killable(cmd)?;
         let deadline = Instant::now() + TIMEOUT;
-        while child.0.try_wait()?.is_none() {
+        while child.try_wait()?.is_none() {
             if Instant::now() >= deadline {
                 return Err(DeleteError::Timeout);
             }
@@ -969,7 +1032,7 @@ impl Omp {
     /// --cwd <dest>`; the tar is always removed. omp deletes the original when it is a prefix of
     /// the archive (`Replaced`). Fails with nothing changed while a live omp writes the session.
     pub fn move_session(&self, src: &Path, dest_cwd: &Path) -> Result<MoveOutcome, OmpError> {
-        // Commands run with cwd "/", so relative paths must be made absolute first.
+        // Commands run in the filesystem root, so relative paths must be made absolute first.
         let src = std::path::absolute(src)?;
         let dest = std::path::absolute(dest_cwd)?;
         let tmp = tempfile::tempdir()?;
@@ -999,29 +1062,15 @@ impl Omp {
     pub fn unpack_session(&self, tar: &Path, cwd: &Path) -> Result<MoveOutcome, OmpError> {
         use crate::usage::{UsageError, run_bounded};
         const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-        /// What omp keys its terminal breadcrumb on (`docs/notes/project-sync.md`).
-        const TERMINAL_VARS: [&str; 8] = [
-            "TMUX",
-            "TMUX_PANE",
-            "ZELLIJ_PANE_ID",
-            "CMUX_SURFACE_ID",
-            "KITTY_WINDOW_ID",
-            "WEZTERM_PANE",
-            "TERM_SESSION_ID",
-            "WT_SESSION",
-        ];
         let tar = std::path::absolute(tar)?;
         let cwd = std::path::absolute(cwd)?;
-        let mut cmd = self.command(&[
+        let cmd = self.command(&[
             "session".as_ref(),
             "unpack".as_ref(),
             tar.as_os_str(),
             "--cwd".as_ref(),
             cwd.as_os_str(),
         ]);
-        for var in TERMINAL_VARS {
-            cmd.env_remove(var);
-        }
         let (code, stdout, stderr) = run_bounded(cmd, TIMEOUT).map_err(|e| match e {
             UsageError::Spawn(e) => OmpError::Spawn(e),
             _ => OmpError::Failed {
@@ -1037,21 +1086,6 @@ impl Omp {
         }
         parse_unpack(&stdout, &stderr)
     }
-}
-
-/// Kills and reaps the child on every exit path.
-struct Reaper(std::process::Child);
-
-impl Drop for Reaper {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(test)]
@@ -1355,8 +1389,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn powershell_install_runs_the_ps1_installer_in_binary_mode() {
+        let argv = powershell_install_argv();
+        assert_eq!(
+            &argv[..5],
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command"
+            ]
+        );
+        assert_eq!(
+            argv[5],
+            format!("& ([scriptblock]::Create((irm {INSTALL_URL}))) -Binary")
+        );
+        assert_eq!(argv.len(), 6);
+    }
+
+    #[test]
+    fn install_locations_per_os() {
+        let home = || Some(PathBuf::from("/h"));
+        let local = || Some(PathBuf::from("/h/AppData/Local"));
+        assert_eq!(
+            install_locations(home(), local(), false),
+            [PathBuf::from("/h/.local/bin/omp")]
+        );
+        assert_eq!(
+            install_locations(home(), local(), true),
+            [
+                PathBuf::from("/h/AppData/Local/omp/omp.exe"),
+                PathBuf::from("/h/.bun/bin/omp.exe")
+            ]
+        );
+        assert!(install_locations(None, None, true).is_empty());
+    }
+
     /// Executable `dest` created by an external process so this process never holds a write fd to
     /// the executed inode (a sibling thread's fork would leak it and exec would fail with ETXTBSY).
+    #[cfg(unix)]
     fn install_exec(dest: &std::path::Path, content: &str) {
         let mut stage = dest.as_os_str().to_owned();
         stage.push(".src");
@@ -1371,6 +1444,7 @@ mod tests {
     }
 
     /// Runs `install_argv()` with a fake `curl` (body `curl_body`) first on PATH.
+    #[cfg(unix)]
     fn run_installer(curl_body: &str) -> (bool, Option<String>) {
         let dir = tempfile::tempdir().unwrap();
         let curl = dir.path().join("curl");
@@ -1389,6 +1463,7 @@ mod tests {
         (ok, std::fs::read_to_string(&out).ok())
     }
 
+    #[cfg(unix)]
     #[test]
     fn installer_runs_the_downloaded_script_with_binary_flag() {
         let (ok, ran) = run_installer(r#"echo 'echo "args:$*" > "$OUT"'"#);
@@ -1396,6 +1471,7 @@ mod tests {
         assert_eq!(ran.as_deref(), Some("args:--binary\n"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn installer_fails_without_running_anything_when_the_download_fails() {
         let (ok, ran) = run_installer("echo 'echo partial > \"$OUT\"'; exit 22");

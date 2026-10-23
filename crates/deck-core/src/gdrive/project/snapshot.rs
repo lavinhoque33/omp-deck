@@ -4,7 +4,6 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 use super::{OmpDir, Parts, ProjectSizes, SessionSize, same_path};
 use crate::gdrive::archive::hex;
+use crate::platform;
 use crate::sessions::{self, SessionsRoot};
 
 /// Deepest nesting (path components below `.omp` / the artifacts directory) that is followed.
@@ -89,7 +89,7 @@ impl Snapshot {
                 }
                 Ok(_) => OmpDir::Missing,
                 Err(e) if matches!(e.kind(), io::ErrorKind::NotFound) => OmpDir::Missing,
-                Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => OmpDir::Missing,
+                Err(e) if e.kind() == io::ErrorKind::NotADirectory => OmpDir::Missing,
                 Err(e) => return Err(e),
             }
         };
@@ -315,7 +315,7 @@ fn file_ref(path: &Path, rel: String) -> Option<FileRef> {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .and_then(|d| i128::try_from(d.as_nanos()).ok())
             .unwrap_or(0),
-        mode: meta.permissions().mode() & 0o777,
+        mode: platform::file_mode(path, &meta),
     })
 }
 
@@ -400,6 +400,7 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     const BOTH: Parts = Parts {
@@ -436,8 +437,11 @@ mod tests {
         write(&proj.join(".omp/rules/r.md"), "ab");
         write(&proj.join(".omp/node_modules/x/y.js"), "dep");
         write(&proj.join(".omp/skills/.git/HEAD"), "ref");
-        symlink(proj.join(".omp/AGENTS.md"), proj.join(".omp/link.md")).unwrap();
-        symlink(&proj, proj.join(".omp/dirlink")).unwrap();
+        #[cfg(unix)]
+        {
+            symlink(proj.join(".omp/AGENTS.md"), proj.join(".omp/link.md")).unwrap();
+            symlink(&proj, proj.join(".omp/dirlink")).unwrap();
+        }
         // 15 directories + the file = 16 components (kept); one more is too deep.
         let nested = |n: usize| {
             let mut p = proj.join(".omp");

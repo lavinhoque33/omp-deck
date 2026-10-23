@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::mux::BackendChoice;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("config I/O error at {path}: {source}")]
@@ -18,12 +20,10 @@ pub enum ConfigError {
 
 const MAX_RECENT_FOLDERS: usize = 10;
 
-/// `$XDG_CONFIG_HOME/omp-deck` (via `dirs::config_dir()`), fallback `~/.config/omp-deck`.
+/// `omp-deck` under the platform config directory (`dirs::config_dir()`: `$XDG_CONFIG_HOME` or
+/// `~/.config`, `%APPDATA%`). Without any config directory the path is relative to the cwd.
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("omp-deck")
+    dirs::config_dir().unwrap_or_default().join("omp-deck")
 }
 
 fn state_path() -> PathBuf {
@@ -76,6 +76,8 @@ pub struct AppConfig {
     pub project_sync: Vec<SyncRow>,
     /// How often the rows are backed up automatically.
     pub project_sync_interval: SyncInterval,
+    /// Which session backend new tabs use (live sessions keep theirs until closed).
+    pub session_backend: BackendChoice,
 }
 
 impl Default for AppConfig {
@@ -99,6 +101,7 @@ impl Default for AppConfig {
             drive_backup_interval: SyncInterval::Every10Minutes,
             project_sync: Vec::new(),
             project_sync_interval: SyncInterval::default(),
+            session_backend: BackendChoice::default(),
         }
     }
 }
@@ -522,6 +525,34 @@ mod tests {
         assert_eq!(
             AppConfig::load_from(&p).drive_backup_interval,
             SyncInterval::Off
+        );
+    }
+
+    #[test]
+    fn session_backend_defaults_for_old_state_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        fs::write(&p, r#"{"sidebar_width": 250.0}"#).unwrap();
+        assert_eq!(
+            AppConfig::load_from(&p).session_backend,
+            BackendChoice::Auto
+        );
+        for choice in [
+            BackendChoice::Auto,
+            BackendChoice::Tmux,
+            BackendChoice::Host,
+        ] {
+            let cfg = AppConfig {
+                session_backend: choice,
+                ..AppConfig::default()
+            };
+            cfg.save_to(&p).unwrap();
+            assert_eq!(AppConfig::load_from(&p).session_backend, choice);
+        }
+        fs::write(&p, r#"{"session_backend": "Host"}"#).unwrap();
+        assert_eq!(
+            AppConfig::load_from(&p).session_backend,
+            BackendChoice::Host
         );
     }
 

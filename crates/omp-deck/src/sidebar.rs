@@ -83,7 +83,7 @@ pub fn resume_command(path: &Path) -> String {
 
 /// `("~/dev", "proj")` for `"~/dev/proj"`; a display without a usable last segment is all name.
 fn split_display(display: &str) -> (&str, &str) {
-    match display.rsplit_once('/') {
+    match display.rsplit_once(['/', '\\']) {
         Some((parent, name)) if !name.is_empty() => (parent, name),
         _ => ("", display),
     }

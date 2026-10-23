@@ -1,4 +1,5 @@
 //! OmpDeck: desktop wrapper for the omp coding-agent TUI.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod agent_ctl;
 mod agent_hub;
@@ -6,6 +7,7 @@ mod agent_model;
 mod agent_output;
 mod agent_popup;
 mod app;
+mod backend;
 mod cli;
 mod clipboard_bridge;
 mod composer;
@@ -14,6 +16,7 @@ mod confirm;
 mod ctx_tip;
 mod drive_view;
 mod folder_scope;
+mod host_remote;
 mod icons;
 mod inject;
 mod model_order;
@@ -47,40 +50,12 @@ mod widgets;
 
 use anyhow::anyhow;
 use deck_core::config::{AppConfig, config_dir};
-use deck_core::tmux::Tmux;
 
 use crate::app::{App, AppInit};
+use crate::backend::Backends;
 use crate::cli::Parsed;
 
 const MIN_SIZE: [f32; 2] = [640.0, 400.0];
-
-/// `^omp-deck-test-[A-Za-z0-9_-]+$`: never the user's default server, never a path.
-fn valid_test_socket(name: &str) -> bool {
-    name.strip_prefix("omp-deck-test-").is_some_and(|rest| {
-        !rest.is_empty()
-            && rest
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    })
-}
-
-/// tmux on PATH; `OMP_DECK_TMUX_SOCKET` swaps in a different socket (tests/smoke runs).
-fn detect_tmux() -> Option<Tmux> {
-    let tmux = Tmux::detect()?;
-    match std::env::var("OMP_DECK_TMUX_SOCKET") {
-        Ok(sock) if valid_test_socket(&sock) => {
-            let conf = std::env::temp_dir().join(format!("{sock}.conf"));
-            Some(Tmux::with_socket("tmux", sock, conf))
-        }
-        Ok(sock) if !sock.is_empty() => {
-            log::warn!(
-                "ignoring OMP_DECK_TMUX_SOCKET={sock:?}: must match omp-deck-test-[A-Za-z0-9_-]+"
-            );
-            Some(tmux)
-        }
-        _ => Some(tmux),
-    }
-}
 
 /// Writes the control extension into `$XDG_DATA_HOME/omp-deck/` (a small file write before the
 /// window opens). Failure only costs live control: the hub stays read-only.
@@ -144,26 +119,26 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let tmux = detect_tmux();
-    match &tmux {
-        Some(t) => {
-            if let Err(e) = t.ensure_config() {
-                log::error!("writing tmux config failed: {e}");
-            }
-        }
-        None => log::warn!("tmux not found: running omp directly (no persistence)"),
+    let cfg = AppConfig::load();
+    let backends = Backends::detect(cfg.session_backend);
+    backends.prepare();
+    if backends.is_empty() {
+        log::warn!("no session backend (tmux / omp-deck-host): running omp directly");
     }
-    // Control sockets of sessions that no longer exist. Before any tab launches, so a fresh
-    // launch can't be pruned; needs tmux's session list as the set of keys still alive.
+    // Control endpoints of sessions that no longer exist. Before any tab launches, so a fresh
+    // launch can't be pruned; the alive sessions of every backend are the keys still in use.
     // An empty answer may be a failed query: never prune on it (same rule as the poller).
-    if let Some(t) = &tmux {
-        let alive = t.alive_sessions();
+    if !backends.is_empty() {
+        let alive: std::collections::HashSet<String> = backends
+            .all()
+            .iter()
+            .flat_map(|m| m.alive_sessions())
+            .collect();
         if !alive.is_empty() {
-            deck_core::ctl::prune_ctl_dirs(t.socket(), &alive);
+            deck_core::ctl::prune_ctl_dirs(&backends.ctl_namespace(), &alive);
         }
     }
     log::debug!("config dir: {}", config_dir().display());
-    let cfg = AppConfig::load();
 
     let options = eframe::NativeOptions {
         viewport: viewport(&cfg),
@@ -184,7 +159,7 @@ fn main() -> anyhow::Result<()> {
     let init = AppInit {
         cli,
         cfg,
-        tmux,
+        backends,
         ui_fonts: ui_fonts::UiFonts::load(),
         folder,
         start_dir,
@@ -198,28 +173,4 @@ fn main() -> anyhow::Result<()> {
     // Terminal drops hand tmux detaches to background threads; let them finish before exiting.
     deck_term::wait_detached(std::time::Duration::from_secs(2));
     result.map_err(|e| anyhow!("eframe: {e}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::valid_test_socket;
-
-    #[test]
-    fn socket_override_validation() {
-        assert!(valid_test_socket("omp-deck-test-123"));
-        assert!(valid_test_socket("omp-deck-test-a_B-9"));
-        for bad in [
-            "",
-            "default",
-            "omp-deck",
-            "omp-deck-test-",
-            "omp-deck-test-a/b",
-            "omp-deck-test-..",
-            "omp-deck-test-a\n",
-            "/tmp/x",
-            "omp-deck-test-é",
-        ] {
-            assert!(!valid_test_socket(bad), "{bad:?}");
-        }
-    }
 }

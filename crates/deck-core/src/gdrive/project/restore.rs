@@ -7,9 +7,8 @@
 //! sessions are written by `omp session unpack`, never by us.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
+use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -24,6 +23,7 @@ use super::{
 use crate::gdrive::archive::{ManifestFile, PROJECT_SAFETY_PREFIX, hex, prune_safety};
 use crate::gdrive::{Error, KEEP_SAFETY_COPIES, Result, compact_stamp, io_err, unix_now};
 use crate::omp::{MoveKind, Omp};
+use crate::platform;
 
 /// Unpacked-size cap while reading an archive (a guard against decompression bombs).
 const MAX_UNPACKED: u64 = 64 << 30;
@@ -95,11 +95,7 @@ pub(super) fn extract(
         .map_err(io_err("cannot read", archive))?
         .len();
     let mut pump = Pump::new(cancel, progress, Stage::Verifying, total);
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(into)
-        .map_err(io_err("cannot create", into))?;
+    platform::create_private_dir_all(into).map_err(io_err("cannot create", into))?;
     let bad = |e: io::Error| match job_io(cancel, "cannot unpack")(e) {
         Error::Io(m) => invalid(m),
         other => other,
@@ -146,19 +142,17 @@ pub(super) fn extract(
             return Err(invalid(format!("{rel} appears twice")));
         }
         let dest = into.join(&rel);
-        if let Some(dir) = dest.parent() {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .map_err(io_err("cannot create", dir))?;
-        }
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&dest)
-            .map_err(io_err("cannot create", &dest))?;
+        // A `.omp` file whose name Windows cannot store is verified but not staged: the restore
+        // skips it (see `check_dest`) and never reads the staged copy.
+        let staged = !(cfg!(windows) && member == Member::Omp && unstorable_on_windows(&rel));
+        let mut out = if staged {
+            if let Some(dir) = dest.parent() {
+                platform::create_private_dir_all(dir).map_err(io_err("cannot create", dir))?;
+            }
+            Some(platform::open_private_file(&dest).map_err(io_err("cannot create", &dest))?)
+        } else {
+            None
+        };
         let mut hasher = Sha256::new();
         let mut size = 0u64;
         loop {
@@ -168,8 +162,10 @@ pub(super) fn extract(
             }
             hasher.update(&buf[..n]);
             size += n as u64;
-            out.write_all(&buf[..n])
-                .map_err(io_err("cannot write", &dest))?;
+            if let Some(out) = &mut out {
+                out.write_all(&buf[..n])
+                    .map_err(io_err("cannot write", &dest))?;
+            }
         }
         seen.insert(rel, (size, hex(&hasher.finalize())));
     }
@@ -439,10 +435,7 @@ pub(super) fn apply(
         // Things may have changed since the plan was made.
         omp_root_exists(target)?;
     }
-    DirBuilder::new()
-        .recursive(true)
-        .create(target)
-        .map_err(io_err("cannot create", target))?;
+    fs::create_dir_all(target).map_err(io_err("cannot create", target))?;
     let mut report = ProjectRestoreReport::default();
     if let Some(files) = omp_files {
         match restore_omp(
@@ -493,11 +486,7 @@ fn restore_omp(
         .collect();
     if !existing.is_empty() {
         let safety = safety_dir(safety_root, unix_now());
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&safety)
-            .map_err(io_err("cannot create", &safety))?;
+        platform::create_private_dir_all(&safety).map_err(io_err("cannot create", &safety))?;
         for f in &existing {
             // Regular files only (checked above), so `copy` cannot follow a link.
             let (from, to) = (omp_dir.join(&f.path), safety.join(&f.path));
@@ -561,10 +550,43 @@ enum Dest {
     Blocked(String),
 }
 
-/// Walks `rel` below `omp_dir` without following links: a symlink anywhere on the way (or as
-/// the file), a file where a folder is needed, or a folder where the file goes blocks it.
+/// Why Windows cannot store a file or folder called `name`: a character from `<>:"|?*` or a
+/// control character, a trailing dot or space, or a reserved device name (`CON`, `PRN`, `AUX`,
+/// `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, with or without an extension).
+fn windows_name_problem(name: &str) -> Option<&'static str> {
+    if name
+        .chars()
+        .any(|c| c.is_control() || "<>:\"|?*".contains(c))
+    {
+        return Some("the name has a character Windows does not allow");
+    }
+    if name.ends_with(['.', ' ']) {
+        return Some("the name ends with a dot or a space, which Windows does not allow");
+    }
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|p| {
+            stem.strip_prefix(p)
+                .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
+        });
+    reserved.then_some("the name is reserved by Windows")
+}
+
+/// True when some component of the `/`-separated `rel` is a [`windows_name_problem`].
+fn unstorable_on_windows(rel: &str) -> bool {
+    rel.split('/').any(|p| windows_name_problem(p).is_some())
+}
+
+/// Walks `rel` below `omp_dir` without following links: a symlink or junction anywhere on the
+/// way (or as the file), a file where a folder is needed, a folder where the file goes, or (on
+/// Windows) a name Windows cannot store blocks it.
 fn check_dest(omp_dir: &Path, rel: &str) -> Dest {
     let parts: Vec<&str> = rel.split('/').collect();
+    if cfg!(windows)
+        && let Some(why) = parts.iter().find_map(|p| windows_name_problem(p))
+    {
+        return Dest::Blocked(why.to_owned());
+    }
     let mut cur = omp_dir.to_owned();
     for (i, part) in parts.iter().enumerate() {
         cur.push(part);
@@ -643,8 +665,7 @@ fn install(src: &Path, dest: &Path, mode: u32) -> Result<()> {
             .prefix(".omp-deck-restore")
             .tempfile_in(dir)?;
         io::copy(&mut File::open(src)?, tmp.as_file_mut())?;
-        tmp.as_file()
-            .set_permissions(Permissions::from_mode((mode & 0o777) | 0o600))?;
+        platform::set_file_mode(tmp.path(), (mode & 0o777) | 0o600)?;
         tmp.as_file().sync_all()?;
         tmp.persist(dest).map(drop).map_err(|e| e.error)
     };
@@ -895,6 +916,59 @@ fn fresh_id() -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{unstorable_on_windows, windows_name_problem};
+
+    #[test]
+    fn windows_name_problems() {
+        for bad in [
+            "CON",
+            "con.txt",
+            "Nul",
+            "AUX.tar.gz",
+            "PRN",
+            "COM1",
+            "com9.log",
+            "LPT1",
+            "LPT9",
+            "a:b",
+            "a?",
+            "a*b",
+            "a<b",
+            "a>b",
+            "a|b",
+            "a\"b",
+            "a.",
+            "a ",
+            "a\u{1}b",
+            "tab\there",
+        ] {
+            assert!(
+                windows_name_problem(bad).is_some(),
+                "{bad:?} should be refused"
+            );
+        }
+        for ok in [
+            "COM0",
+            "COM10",
+            "console",
+            "CONX",
+            "ok.txt",
+            ".gitignore",
+            "a b",
+            "ünï.md",
+            "LPT",
+        ] {
+            assert_eq!(windows_name_problem(ok), None, "{ok:?} should pass");
+        }
+    }
+
+    #[test]
+    fn a_path_is_unstorable_when_any_component_is() {
+        assert!(unstorable_on_windows("rules/con/x.md"));
+        assert!(unstorable_on_windows("a/b/c?.md"));
+        assert!(!unstorable_on_windows("rules/ok/x.md"));
+    }
+
     use super::tidy_failure;
 
     #[test]

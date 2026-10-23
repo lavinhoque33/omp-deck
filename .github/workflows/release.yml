@@ -11,7 +11,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
+  linux:
     # ubuntu-22.04 keeps the glibc requirement (2.35) low for the prebuilt binaries.
     runs-on: ubuntu-22.04
     steps:
@@ -46,7 +46,7 @@ jobs:
         env:
           OMP_DECK_GOOGLE_CLIENT_ID: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_ID }}
           OMP_DECK_GOOGLE_CLIENT_SECRET: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_SECRET }}
-        run: cargo build --release -p omp-deck --locked
+        run: cargo build --release -p omp-deck -p deck-host --locked
 
       - name: Validate desktop file
         run: desktop-file-validate packaging/omp-deck.desktop
@@ -76,7 +76,135 @@ jobs:
           for f in omp-deck-*.tar.gz omp-deck-*.AppImage omp-deck_*.deb omp-deck-*.rpm; do
             sha256sum "$f" > "$f.sha256"
           done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          if-no-files-found: error
+          path: |
+            dist/omp-deck-*.tar.gz
+            dist/omp-deck-*.tar.gz.sha256
+            dist/omp-deck-*.AppImage
+            dist/omp-deck-*.AppImage.sha256
+            dist/omp-deck_*.deb
+            dist/omp-deck_*.deb.sha256
+            dist/omp-deck-*.rpm
+            dist/omp-deck-*.rpm.sha256
+
+  windows:
+    name: windows-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    # The arm64 runner/build is best effort: a failure there must not block the release.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_arch: x86_64
+            experimental: false
+          - arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset_arch: aarch64
+            experimental: true
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches the crate version
+        run: |
+          $m = Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1
+          $version = $m.Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
+          }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          OMP_DECK_GOOGLE_CLIENT_ID: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_ID }}
+          OMP_DECK_GOOGLE_CLIENT_SECRET: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_SECRET }}
+        run: cargo build --release -p omp-deck -p deck-host --locked --target ${{ matrix.target }}
+
+      - name: Fetch ConPTY
+        run: ./packaging/windows/fetch-conpty.ps1 -OutDir conpty -Arch ${{ matrix.arch }} -NoticeFile conpty/THIRD-PARTY-ConPTY.txt
+
+      - name: Package zip
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "omp-deck-$env:VERSION-${{ matrix.asset_arch }}-windows"
+          $rel = "target/${{ matrix.target }}/release"
+          $stage = Join-Path 'dist' "$name-stage"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stage
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          foreach ($f in @("$rel/omp-deck.exe", "$rel/omp-deck-host.exe", 'conpty/conpty.dll', 'conpty/OpenConsole.exe', 'LICENSE-MIT', 'LICENSE-APACHE', 'README.md')) {
+            if (-not (Test-Path $f)) { throw "missing $f" }
+            Copy-Item $f $stage
+          }
+          $fonts = 'crates/omp-deck/assets/fonts'
+          $parts = @(
+            'OmpDeck bundles the following third-party components.',
+            '',
+            '================================================================================',
+            (Get-Content -Raw 'conpty/THIRD-PARTY-ConPTY.txt'),
+            '================================================================================',
+            'Geist font (Geist-VariableFont.ttf)',
+            '',
+            (Get-Content -Raw "$fonts/Geist-OFL.txt"),
+            '================================================================================',
+            'Lucide icons font (lucide.ttf)',
+            '',
+            (Get-Content -Raw "$fonts/lucide-LICENSE.txt")
+          )
+          [System.IO.File]::WriteAllText((Join-Path $stage 'THIRD-PARTY-NOTICES.txt'), ($parts -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+          $zip = Join-Path 'dist' "$name.zip"
+          Remove-Item -Force -ErrorAction SilentlyContinue $zip
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          # Same "<hash>  <file>" format as sha256sum on the Linux assets.
+          [System.IO.File]::WriteAllText("$zip.sha256", "$hash  $name.zip`n", (New-Object System.Text.UTF8Encoding($false)))
+          Get-Content "$zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            dist/omp-deck-*-windows.zip
+            dist/omp-deck-*-windows.zip.sha256
+
+  publish:
+    needs: [linux, windows]
+    # Runs even if the best-effort arm64 job failed (its failure is already masked by continue-on-error);
+    # never runs when the linux build or the x64 windows build failed.
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.windows.result == 'success' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -l
+          test -n "$(ls omp-deck-*-x86_64-windows.zip)"
           cat ./*.sha256 > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -90,5 +218,7 @@ jobs:
             dist/omp-deck_*.deb.sha256
             dist/omp-deck-*.rpm
             dist/omp-deck-*.rpm.sha256
+            dist/omp-deck-*-windows.zip
+            dist/omp-deck-*-windows.zip.sha256
             dist/SHA256SUMS
           generate_release_notes: true

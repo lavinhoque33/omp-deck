@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/deck-core", "crates/deck-term", "crates/omp-deck"]
+members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/omp-deck"]
 
 [workspace.package]
 edition = "2024"
@@ -15,7 +15,11 @@ readme = "README.md"
 
 [workspace.dependencies]
 deck-core = { path = "crates/deck-core" }
+deck-host = { path = "crates/deck-host" }
 deck-term = { path = "crates/deck-term" }
+# Already in Cargo.lock via eframe/arboard/polling; crates add the API features they call.
+windows-sys = "0.61"
+libc = "0.2"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.37"
 epaint = { version = "0.37", features = ["color_fonts"] }

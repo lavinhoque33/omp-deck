@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use deck_core::ctl::{CtlClient, CtlCommand, CtlReply, LiveSnapshot, ctl_dir};
-use deck_core::tmux::Tmux;
 use std::path::PathBuf;
 
 use super::{App, AppEvent, Focus, PendingConfirm, Post, RestartTarget, SpawnReq};
@@ -15,10 +14,6 @@ use crate::confirm::Confirm;
 use crate::statusfmt::Activity;
 use crate::tabs::{Anchor, ClosedTab, Tab, TabRole};
 use deck_core::sessions::SessionEntry;
-
-/// How long a restart waits for tmux to drop the old session before giving up.
-const STOP_WAIT: Duration = Duration::from_secs(2);
-const STOP_POLL: Duration = Duration::from_millis(50);
 
 /// The control client of the active session tab.
 pub(super) struct CtlLink {
@@ -127,7 +122,7 @@ impl App {
         }
         agent_ctl::restart_offer(&RestartFacts {
             link: self.ctl_link(),
-            tmux: self.tmux.is_some() && t.tmux_name.is_some(),
+            backend: !self.backends.is_empty() && t.mux_name.is_some(),
             has_session_file: t.session_path.is_some(),
             extension: self.ctl_ext.is_some(),
             idle: Activity::from_title(t.term.title()) == Activity::Idle,
@@ -310,7 +305,7 @@ impl App {
         ));
     }
 
-    /// Close the tab, stop its tmux session on a worker, then relaunch `--resume` in its place.
+    /// Close the tab, stop its session on a worker, then relaunch `--resume` in its place.
     pub(super) fn execute_restart_live(&mut self, uid: u64, session: &std::path::Path) {
         // The question was asked a while ago: the tab must still be the active, idle, read-only
         // session it was about.
@@ -333,37 +328,38 @@ impl App {
         else {
             return;
         };
-        let Some(tmux) = self.tmux.clone() else {
+        if self.backends.is_empty() {
             return;
-        };
+        }
         let Some(Tab::Terminal(t)) = self.tabs.get(at) else {
             return;
         };
-        let (Some(name), Some(path)) = (t.tmux_name.clone(), t.session_path.clone()) else {
+        let (Some(name), Some(path)) = (t.mux_name.clone(), t.session_path.clone()) else {
             return;
         };
         let tab = ClosedTab {
-            tmux_name: Some(name.clone()),
+            mux_name: Some(name.clone()),
             cwd: t.cwd.clone(),
             session_path: Some(path.clone()),
             title: t.title(&self.labels).to_owned(),
         };
         let anchor = Anchor::at(&self.tab_uids(), at);
         self.close_tab(at, false);
-        self.relaunch_after_stop(tab, tmux, Some(anchor));
+        self.relaunch_after_stop(tab, Some(anchor));
     }
 
-    /// Stop `tab`'s tmux session on a worker, then relaunch it with the control extension; the
+    /// Stop `tab`'s session on a worker, then relaunch it with the control extension; the
     /// session is reserved meanwhile so opening it from the sidebar does not start a second copy.
-    fn relaunch_after_stop(&mut self, tab: ClosedTab, tmux: Tmux, anchor: Option<Anchor>) {
-        let Some(name) = tab.tmux_name.clone() else {
+    fn relaunch_after_stop(&mut self, tab: ClosedTab, anchor: Option<Anchor>) {
+        let Some(name) = tab.mux_name.clone() else {
             return;
         };
         let slot = (tab.session_path.clone(), Some(name.clone()));
         self.spawn.reserve(slot);
         let relaunch = tab.clone();
+        let backends = self.backends.clone();
         let started = crate::omp_worker::try_spawn(&self.ctx, &self.events_tx, move || {
-            let stopped = stop_session(&tmux, &name);
+            let stopped = backends.stop(&name);
             AppEvent::RestartReady {
                 anchor,
                 tab,
@@ -380,7 +376,7 @@ impl App {
 
     /// Sidebar "Restart session": ask first (an open tab may be mid-turn).
     pub(super) fn request_restart_session(&mut self, entry: &SessionEntry) {
-        if self.tmux.is_none() {
+        if self.backends.is_empty() {
             return;
         }
         let tab = self.tabs.iter().find_map(|t| match t {
@@ -389,16 +385,16 @@ impl App {
                     && !t.term.is_exited()
                     && t.session_path.as_deref() == Some(entry.path.as_path()) =>
             {
-                t.tmux_name.clone().map(|n| {
+                t.mux_name.clone().map(|n| {
                     let busy = Activity::from_title(t.term.title()) != Activity::Idle;
                     (t.uid, n, busy)
                 })
             }
             _ => None,
         });
-        let (uid, tmux_name, busy) = match tab {
+        let (uid, mux_name, busy) = match tab {
             Some((uid, name, busy)) => (Some(uid), name, busy),
-            None => match self.running_tmux_name(entry) {
+            None => match self.running_session_name(entry) {
                 Some(name) => (None, name, false),
                 None => {
                     self.toasts
@@ -425,7 +421,7 @@ impl App {
             },
             PendingConfirm::RestartSession(RestartTarget {
                 uid,
-                tmux_name,
+                mux_name,
                 session: entry.path.clone(),
                 cwd: entry.cwd.clone(),
                 title: label,
@@ -434,11 +430,11 @@ impl App {
     }
 
     /// The user confirmed a sidebar restart: in place when the session has a tab, else open it
-    /// in a new tab once the old tmux session is gone.
+    /// in a new tab once the old session is gone.
     pub(super) fn execute_restart_session(&mut self, target: RestartTarget) {
-        let Some(tmux) = self.tmux.clone() else {
+        if self.backends.is_empty() {
             return;
-        };
+        }
         let at = self.tabs.iter().position(|t| {
             matches!(t, Tab::Terminal(x)
                 if x.session_path.as_deref() == Some(target.session.as_path()) && !x.term.is_exited())
@@ -450,7 +446,7 @@ impl App {
                     return;
                 };
                 let tab = ClosedTab {
-                    tmux_name: t.tmux_name.clone(),
+                    mux_name: t.mux_name.clone(),
                     cwd: t.cwd.clone(),
                     session_path: Some(target.session),
                     title: t.title(&self.labels).to_owned(),
@@ -461,7 +457,7 @@ impl App {
             }
             (None, None) => (
                 ClosedTab {
-                    tmux_name: Some(target.tmux_name),
+                    mux_name: Some(target.mux_name),
                     cwd: target.cwd,
                     session_path: Some(target.session),
                     title: target.title,
@@ -474,7 +470,7 @@ impl App {
                 return;
             }
         };
-        self.relaunch_after_stop(tab, tmux, anchor);
+        self.relaunch_after_stop(tab, anchor);
     }
 
     pub(super) fn on_restart_ready(
@@ -484,7 +480,7 @@ impl App {
         stopped: Result<(), String>,
     ) {
         self.spawn
-            .release(&(tab.session_path.clone(), tab.tmux_name.clone()));
+            .release(&(tab.session_path.clone(), tab.mux_name.clone()));
         if let Err(e) = stopped {
             // The old process still runs: attaching shows it again, without control.
             self.toasts
@@ -492,7 +488,7 @@ impl App {
         }
         let argv = self.with_omp_program(crate::tabs::omp_argv(tab.session_path.as_deref()));
         self.spawn_tab_post(SpawnReq {
-            tmux_name: tab.tmux_name,
+            mux_name: tab.mux_name,
             cwd: tab.cwd,
             session_path: tab.session_path,
             title: tab.title,
@@ -502,20 +498,4 @@ impl App {
             focus: Focus::Always,
         });
     }
-}
-
-/// `kill-session`, then wait until tmux no longer lists it.
-fn stop_session(tmux: &Tmux, name: &str) -> Result<(), String> {
-    if let Err(e) = tmux.kill(name) {
-        log::warn!("restart: kill {name}: {e}");
-    }
-    let mut waited = Duration::ZERO;
-    while tmux.has_session(name) {
-        if waited >= STOP_WAIT {
-            return Err(format!("tmux session {name} did not stop"));
-        }
-        std::thread::sleep(STOP_POLL);
-        waited += STOP_POLL;
-    }
-    Ok(())
 }

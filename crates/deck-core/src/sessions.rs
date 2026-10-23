@@ -36,7 +36,7 @@ impl SessionsRoot {
         let path = if let Some(dir) = non_empty("PI_CODING_AGENT_DIR") {
             PathBuf::from(dir).join("sessions")
         } else {
-            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+            let home = crate::platform::home_or_root();
             let cfg = non_empty("PI_CONFIG_DIR").unwrap_or_else(|| ".omp".into());
             home.join(cfg).join("agent").join("sessions")
         };

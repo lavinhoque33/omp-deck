@@ -1,10 +1,9 @@
-//! The app's single system clipboard (arboard; CLIPBOARD + PRIMARY), owned by a dedicated
-//! worker thread so a slow or hung clipboard owner never stalls the UI thread.
+//! The app's single system clipboard (arboard; CLIPBOARD + PRIMARY where the platform has a
+//! PRIMARY selection, i.e. X11/Wayland), owned by a dedicated worker thread so a slow or hung
+//! clipboard owner never stalls the UI thread.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
-
-use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
 
 /// How long a user-initiated paste waits for the clipboard owner before giving up.
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
@@ -12,10 +11,18 @@ const READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// Receives the clipboard text (None = empty/unavailable) on the worker thread.
 type ReadCallback = Box<dyn FnOnce(Option<String>) + Send>;
 
+/// Which selection a request addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Clipboard,
+    /// X11/Wayland PRIMARY; elsewhere reads are empty and writes are dropped.
+    Primary,
+}
+
 enum Request {
-    Set(LinuxClipboardKind, String),
-    Get(LinuxClipboardKind, Sender<Option<String>>),
-    Load(LinuxClipboardKind, ReadCallback),
+    Set(Kind, String),
+    Get(Kind, Sender<Option<String>>),
+    Load(Kind, ReadCallback),
 }
 
 /// Shared system clipboard. Clone = same worker. The worker connects to the display on first
@@ -58,7 +65,7 @@ impl Clipboard {
     }
 
     /// Blocks up to [`READ_TIMEOUT`].
-    fn get(&self, kind: LinuxClipboardKind) -> Option<String> {
+    fn get(&self, kind: Kind) -> Option<String> {
         let (tx, rx) = mpsc::channel();
         self.request(Request::Get(kind, tx));
         match rx.recv_timeout(READ_TIMEOUT) {
@@ -73,31 +80,32 @@ impl Clipboard {
 
     /// CLIPBOARD contents (user-initiated paste; waits at most 500 ms).
     pub fn get_text(&self) -> Option<String> {
-        self.get(LinuxClipboardKind::Clipboard)
+        self.get(Kind::Clipboard)
     }
 
     /// Replaces CLIPBOARD (fire-and-forget).
     pub fn set_text(&self, text: &str) {
-        self.request(Request::Set(LinuxClipboardKind::Clipboard, text.to_owned()));
+        self.request(Request::Set(Kind::Clipboard, text.to_owned()));
     }
 
-    /// PRIMARY selection contents (user-initiated paste; waits at most 500 ms).
+    /// PRIMARY selection contents (user-initiated paste; waits at most 500 ms). Always `None`
+    /// on platforms without a PRIMARY selection (Windows, macOS).
     pub fn get_primary(&self) -> Option<String> {
-        self.get(LinuxClipboardKind::Primary)
+        self.get(Kind::Primary)
     }
 
-    /// Replaces PRIMARY (fire-and-forget).
+    /// Replaces PRIMARY (fire-and-forget; a no-op without a PRIMARY selection).
     pub fn set_primary(&self, text: &str) {
-        self.request(Request::Set(LinuxClipboardKind::Primary, text.to_owned()));
+        self.request(Request::Set(Kind::Primary, text.to_owned()));
     }
 
     /// Reads the clipboard without blocking the caller: `done` runs on the worker thread once
     /// the read completes (OSC 52 queries answer the PTY from there).
     pub(crate) fn load(&self, primary: bool, done: impl FnOnce(Option<String>) + Send + 'static) {
         let kind = if primary {
-            LinuxClipboardKind::Primary
+            Kind::Primary
         } else {
-            LinuxClipboardKind::Clipboard
+            Kind::Clipboard
         };
         self.request(Request::Load(kind, Box::new(done)));
     }
@@ -128,7 +136,7 @@ fn worker(rx: Receiver<Request>) {
         match req {
             Request::Set(kind, text) => {
                 if let Some(cb) = cb
-                    && let Err(e) = cb.set().clipboard(kind).text(text)
+                    && let Err(e) = sys::write(cb, kind, text)
                 {
                     log::debug!("clipboard write ({kind:?}) failed: {e}");
                 }
@@ -142,13 +150,70 @@ fn worker(rx: Receiver<Request>) {
     }
 }
 
-fn read(cb: &mut arboard::Clipboard, kind: LinuxClipboardKind) -> Option<String> {
-    match cb.get().clipboard(kind).text() {
+fn read(cb: &mut arboard::Clipboard, kind: Kind) -> Option<String> {
+    match sys::read(cb, kind) {
         Ok(t) => Some(t),
         Err(arboard::Error::ContentNotAvailable) => None,
         Err(e) => {
             log::debug!("clipboard read ({kind:?}) failed: {e}");
             None
+        }
+    }
+}
+
+/// X11/Wayland: both selections through arboard's Linux extension.
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+mod sys {
+    use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
+
+    use super::Kind;
+
+    fn linux(kind: Kind) -> LinuxClipboardKind {
+        match kind {
+            Kind::Clipboard => LinuxClipboardKind::Clipboard,
+            Kind::Primary => LinuxClipboardKind::Primary,
+        }
+    }
+
+    pub(super) fn read(cb: &mut arboard::Clipboard, kind: Kind) -> Result<String, arboard::Error> {
+        cb.get().clipboard(linux(kind)).text()
+    }
+
+    pub(super) fn write(
+        cb: &mut arboard::Clipboard,
+        kind: Kind,
+        text: String,
+    ) -> Result<(), arboard::Error> {
+        cb.set().clipboard(linux(kind)).text(text)
+    }
+}
+
+/// No PRIMARY selection (Windows, macOS): it reads empty and ignores writes.
+#[cfg(not(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+)))]
+mod sys {
+    use super::Kind;
+
+    pub(super) fn read(cb: &mut arboard::Clipboard, kind: Kind) -> Result<String, arboard::Error> {
+        match kind {
+            Kind::Clipboard => cb.get_text(),
+            Kind::Primary => Err(arboard::Error::ContentNotAvailable),
+        }
+    }
+
+    pub(super) fn write(
+        cb: &mut arboard::Clipboard,
+        kind: Kind,
+        text: String,
+    ) -> Result<(), arboard::Error> {
+        match kind {
+            Kind::Clipboard => cb.set_text(text),
+            Kind::Primary => Ok(()),
         }
     }
 }

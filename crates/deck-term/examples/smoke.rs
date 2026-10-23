@@ -1,15 +1,19 @@
 //! Visual smoke test for the terminal widget.
 //!
-//! `cargo run -p deck-term --example smoke` opens a window running `$SHELL`.
-//! `cargo run -p deck-term --example smoke -- --screenshot /tmp/out.png` prints a test pattern
-//! (truecolor, 256 colors, SGR attributes, CJK, emoji, box drawing, braille, powerline, OSC 8),
-//! saves a screenshot as PNG and exits.
+//! `cargo run -p deck-term --example smoke` opens a window running `$SHELL` (Unix; elsewhere,
+//! where there is no local PTY, it shows the test pattern below).
+//! `cargo run -p deck-term --example smoke -- --screenshot /tmp/out.png` shows a test pattern
+//! (truecolor, 256 colors, SGR attributes, CJK, emoji, box drawing, braille, powerline, OSC 8)
+//! through an in-memory remote session, saves a screenshot as PNG and exits.
 
+use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 
-use deck_term::{SpawnSpec, TermOptions, Terminal, TerminalView, install_fonts};
+use deck_term::{
+    Remote, RemoteEvent, RemoteRx, RemoteTx, TermOptions, Terminal, TerminalView, install_fonts,
+};
 
 fn pattern() -> String {
     let mut s = String::from("\x1b]0;deck-term smoke\x07\x1b[1mdeck-term smoke\x1b[0m\r\n");
@@ -46,6 +50,95 @@ fn pattern() -> String {
     s.push_str("link: \x1b]8;;https://example.com\x1b\\example.com (Ctrl+click)\x1b]8;;\x1b\\\r\n");
     s.push_str("\x1b[5 qprompt$ ");
     s
+}
+
+/// In-memory remote session: replays the test pattern as its snapshot, then stays attached
+/// (input is discarded) until detached.
+struct PatternSession;
+
+struct PatternRx {
+    snapshot: Option<Vec<u8>>,
+    ended: mpsc::Receiver<()>,
+}
+
+struct PatternTx {
+    end: mpsc::Sender<()>,
+}
+
+impl Remote for PatternSession {
+    fn split(self: Box<Self>) -> (Box<dyn RemoteRx>, Box<dyn RemoteTx>) {
+        let (end, ended) = mpsc::channel();
+        let rx = PatternRx {
+            snapshot: Some(pattern().into_bytes()),
+            ended,
+        };
+        (Box::new(rx), Box::new(PatternTx { end }))
+    }
+}
+
+impl RemoteRx for PatternRx {
+    fn recv(&mut self) -> io::Result<RemoteEvent> {
+        if let Some(bytes) = self.snapshot.take() {
+            return Ok(RemoteEvent::Snapshot(bytes));
+        }
+        // Detach, kill or a dropped sender all end the session.
+        let _ = self.ended.recv();
+        Ok(RemoteEvent::Closed)
+    }
+}
+
+impl RemoteTx for PatternTx {
+    fn input(&self, _bytes: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn resize(&self, _cols: u16, _rows: u16, _cell_w: u16, _cell_h: u16) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn palette(&self, _palette: [[u8; 3]; 19]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn kill(&self) -> io::Result<()> {
+        let _ = self.end.send(());
+        Ok(())
+    }
+
+    fn detach(&self) -> io::Result<()> {
+        let _ = self.end.send(());
+        Ok(())
+    }
+}
+
+/// The interactive terminal: `$SHELL` in a local PTY.
+#[cfg(unix)]
+fn interactive(ctx: &egui::Context) -> io::Result<Terminal> {
+    let spec = deck_term::SpawnSpec {
+        program: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+        args: Vec::new(),
+        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        env: vec![
+            ("TERM".into(), "xterm-256color".into()),
+            ("COLORTERM".into(), "truecolor".into()),
+        ],
+        tmux_client: false,
+    };
+    Terminal::spawn(spec, TermOptions::default(), ctx.clone())
+}
+
+/// No local PTY here: the interactive window shows the pattern too.
+#[cfg(not(unix))]
+fn interactive(ctx: &egui::Context) -> io::Result<Terminal> {
+    Ok(pattern_terminal(ctx))
+}
+
+fn pattern_terminal(ctx: &egui::Context) -> Terminal {
+    Terminal::connect(
+        Box::new(PatternSession),
+        TermOptions::default(),
+        ctx.clone(),
+    )
 }
 
 struct Smoke {
@@ -183,35 +276,10 @@ fn main() -> eframe::Result {
                 report.loaded.len(),
                 report.missing
             );
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-            let env = vec![
-                ("TERM".into(), "xterm-256color".into()),
-                ("COLORTERM".into(), "truecolor".into()),
-            ];
-            let spec = if screenshot.is_some() {
-                SpawnSpec {
-                    program: "sh".into(),
-                    args: vec![
-                        "-c".into(),
-                        "printf '%s' \"$1\"; sleep 60".into(),
-                        "sh".into(),
-                        pattern(),
-                    ],
-                    cwd,
-                    env,
-                    tmux_client: false,
-                }
-            } else {
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-                SpawnSpec {
-                    program: shell,
-                    args: Vec::new(),
-                    cwd,
-                    env,
-                    tmux_client: false,
-                }
+            let term = match screenshot {
+                Some(_) => pattern_terminal(&cc.egui_ctx),
+                None => interactive(&cc.egui_ctx)?,
             };
-            let term = Terminal::spawn(spec, TermOptions::default(), cc.egui_ctx.clone())?;
             Ok(Box::new(Smoke {
                 term,
                 screenshot,

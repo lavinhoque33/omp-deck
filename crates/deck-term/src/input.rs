@@ -5,10 +5,13 @@
 //!
 //! Key encoding priority (docs/notes/contracts.md §Key encoding):
 //! 1. kitty keyboard flags active in `TermMode` → kitty CSI-u per flags;
-//! 2. else [`KeyRules::Tmux`] / [`KeyRules::ModifyOtherKeys`] → modifyOtherKeys
+//! 2. else [`KeyRules::Win32`] (the child enabled win32-input-mode, `CSI ? 9001 h`) →
+//!    `CSI Vk;Sc;Uc;Kd;Cs;Rc _` records for key down and up (Windows Terminal's order: kitty
+//!    flags win over win32-input-mode);
+//! 3. else [`KeyRules::Tmux`] / [`KeyRules::ModifyOtherKeys`] → modifyOtherKeys
 //!    (`CSI 27;mod;code~`) for keys legacy cannot express, Alt+char as `ESC char`, everything
 //!    else legacy; under tmux a lone Escape is `ESC O [`;
-//! 3. else xterm legacy.
+//! 4. else xterm legacy.
 
 use alacritty_terminal::term::TermMode;
 
@@ -125,6 +128,9 @@ pub enum KeyRules {
     /// Rule 2 for a tmux client (tmux always asks the outer terminal for level 2), plus lone
     /// Escape as `ESC O [` (tmux ?7727 application-escape form).
     Tmux,
+    /// win32-input-mode (`CSI ? 9001 h`, ConPTY and apps on Windows): every key down and up
+    /// as a Windows `KEY_EVENT_RECORD` (see [`encode_win32_key`]).
+    Win32,
 }
 
 /// Encodes a key event to the bytes the PTY should receive (empty = nothing to send).
@@ -133,10 +139,9 @@ pub fn encode_key(input: &KeyInput<'_>, mode: TermMode, rules: KeyRules) -> Vec<
     if mode.intersects(TermMode::KITTY_KEYBOARD_PROTOCOL) {
         return encode_kitty(input.key, input.mods, text, input.action, mode);
     }
-    if input.action == KeyAction::Release {
-        return Vec::new();
-    }
     match rules {
+        KeyRules::Win32 => encode_win32_key(&KeyInput { text, ..*input }),
+        _ if input.action == KeyAction::Release => Vec::new(),
         KeyRules::Legacy => encode_legacy(input.key, input.mods, text, mode),
         KeyRules::ModifyOtherKeys => encode_mok(input.key, input.mods, text, mode, false),
         KeyRules::Tmux => encode_mok(input.key, input.mods, text, mode, true),
@@ -806,12 +811,257 @@ pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
     }
 }
 
-/// Focus report (`ESC[I` / `ESC[O`) if the app enabled ?1004.
+/// Focus report (`ESC[I` / `ESC[O`) if the app enabled ?1004. Also in win32-input-mode:
+/// Windows Terminal sends no win32 FOCUS_EVENT record (`TerminalInput::HandleFocus`,
+/// microsoft/terminal `src/terminal/input/terminalInput.cpp`).
 pub fn encode_focus(focused: bool, mode: TermMode) -> Option<&'static [u8]> {
     if !mode.contains(TermMode::FOCUS_IN_OUT) {
         return None;
     }
     Some(if focused { b"\x1b[I" } else { b"\x1b[O" })
+}
+
+// win32-input-mode (`CSI ? 9001 h`): keys as Windows `KEY_EVENT_RECORD`s,
+// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, matching Windows Terminal (microsoft/terminal `main`):
+// - `TerminalInput::_makeWin32Output` (`src/terminal/input/terminalInput.cpp`) always writes all
+//   six decimal parameters; Rc is always 1 (`Terminal::SendKeyEvent` / `SendCharEvent` in
+//   `src/cascadia/TerminalCore/Terminal.cpp` synthesize records with repeat count 1, so
+//   auto-repeat is one more key-down record).
+// - Key down and key up are both sent, and modifier keys on their own too (`TermControl.cpp`
+//   `_KeyHandler`). Down Uc is the character the key produced (WM_CHAR: Ctrl+C → 3, Enter → 13,
+//   Ctrl+Enter → 10); non-text keys carry Uc 0; up Uc is recomputed from the key with
+//   `ToUnicodeEx`, i.e. the same character for text keys.
+// - Cs is `dwControlKeyState` with ENHANCED_KEY for the E0-prefixed keys (arrows and the
+//   Insert/Delete/Home/End/PageUp/PageDown block).
+// - Paste is not encoded as key records: `ControlCore::PasteText` filters the text
+//   (`Utils::FilterStringForPaste`, `src/types/utils.cpp`) and brackets it on ?2004 (see
+//   [`encode_paste_win32`]); IME commits go out as plain text (`TsfDataProvider::HandleOutput`);
+//   mouse reports stay VT (`mouseInput.cpp` has no win32 path).
+
+/// `dwControlKeyState` bits (Windows `wincon.h`).
+const RIGHT_ALT_PRESSED: u32 = 0x0001;
+const LEFT_ALT_PRESSED: u32 = 0x0002;
+const LEFT_CTRL_PRESSED: u32 = 0x0008;
+const SHIFT_PRESSED: u32 = 0x0010;
+const ENHANCED_KEY: u32 = 0x0100;
+
+/// Virtual-key codes of the modifier keys (Windows `winuser.h`).
+const VK_SHIFT: u16 = 0x10;
+const VK_CONTROL: u16 = 0x11;
+const VK_MENU: u16 = 0x12;
+
+/// Control-key state of `mods`. egui does not tell left from right: the left keys are
+/// reported, as for a US keyboard.
+fn control_key_state(mods: Mods) -> u32 {
+    let mut cs = 0;
+    if mods.shift {
+        cs |= SHIFT_PRESSED;
+    }
+    if mods.ctrl {
+        cs |= LEFT_CTRL_PRESSED;
+    }
+    if mods.alt {
+        cs |= LEFT_ALT_PRESSED;
+    }
+    cs
+}
+
+/// Virtual-key code of `key` and whether Windows flags it ENHANCED_KEY; `None` for keys
+/// Windows has no virtual key for (F25 and above).
+fn win32_vk(key: Key) -> Option<(u16, bool)> {
+    Some(match key {
+        Key::Char(c) => (vk_for_char(c), false),
+        Key::Enter => (0x0D, false),
+        Key::Tab => (0x09, false),
+        Key::Backspace => (0x08, false),
+        Key::Escape => (0x1B, false),
+        Key::PageUp => (0x21, true),
+        Key::PageDown => (0x22, true),
+        Key::End => (0x23, true),
+        Key::Home => (0x24, true),
+        Key::ArrowLeft => (0x25, true),
+        Key::ArrowUp => (0x26, true),
+        Key::ArrowRight => (0x27, true),
+        Key::ArrowDown => (0x28, true),
+        Key::Insert => (0x2D, true),
+        Key::Delete => (0x2E, true),
+        // VK_F1 = 0x70 ..= VK_F24 = 0x87.
+        Key::F(n @ 1..=24) => (0x6F + u16::from(n), false),
+        Key::F(_) => return None,
+    })
+}
+
+/// Virtual-key code of the key typing `c` on a US layout (0 = none).
+fn us_vk(c: char) -> u16 {
+    match c {
+        'a'..='z' => c.to_ascii_uppercase() as u16,
+        'A'..='Z' | '0'..='9' | ' ' => c as u16,
+        ';' => 0xBA,
+        '=' => 0xBB,
+        ',' => 0xBC,
+        '-' => 0xBD,
+        '.' => 0xBE,
+        '/' => 0xBF,
+        '`' => 0xC0,
+        '[' => 0xDB,
+        '\\' => 0xDC,
+        ']' => 0xDD,
+        '\'' => 0xDE,
+        _ => 0,
+    }
+}
+
+/// Virtual-key code of the key typing `c`: the active keyboard layout's (`VkKeyScanW`, as
+/// Windows Terminal's fallback in `Terminal::_VirtualKeyFromCharacter`) on Windows, else US.
+#[cfg(windows)]
+fn vk_for_char(c: char) -> u16 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VkKeyScanW;
+    if let Ok(unit) = u16::try_from(u32::from(c)) {
+        // SAFETY: plain value call without pointers.
+        let scan = unsafe { VkKeyScanW(unit) };
+        // -1: no key types `c`; else the low byte is the virtual-key code.
+        if scan != -1 {
+            return (scan as u16) & 0xFF;
+        }
+    }
+    us_vk(c)
+}
+
+#[cfg(not(windows))]
+fn vk_for_char(c: char) -> u16 {
+    us_vk(c)
+}
+
+/// Scan code of virtual key `vk` (`MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)`) on Windows; 0
+/// elsewhere (no Windows keyboard layout to ask).
+#[cfg(windows)]
+fn scan_code(vk: u16) -> u16 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
+    // SAFETY: plain value call without pointers.
+    let sc = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) };
+    u16::try_from(sc).unwrap_or(0)
+}
+
+#[cfg(not(windows))]
+fn scan_code(_vk: u16) -> u16 {
+    0
+}
+
+/// Uc of a key without text: the character Windows produces for it (WM_CHAR / `ToUnicodeEx`),
+/// 0 for keys that produce none.
+fn derived_uc(key: Key, mods: Mods) -> u16 {
+    match key {
+        Key::Enter if mods.ctrl => 0x0A,
+        Key::Enter => 0x0D,
+        Key::Tab => 0x09,
+        Key::Backspace if mods.ctrl => 0x7F,
+        Key::Backspace => 0x08,
+        Key::Escape => 0x1B,
+        // Ctrl+Alt is AltGr on Windows; without text from the layout it produces nothing.
+        Key::Char(_) if mods.ctrl && mods.alt => 0,
+        Key::Char(c) if mods.ctrl => match c {
+            'a'..='z' => c as u16 & 0x1F,
+            '[' => 0x1B,
+            '\\' => 0x1C,
+            ']' => 0x1D,
+            '6' if mods.shift => 0x1E,
+            '-' if mods.shift => 0x1F,
+            ' ' => 0x20,
+            _ => 0,
+        },
+        Key::Char(c) if mods.shift && c.is_ascii_lowercase() => c.to_ascii_uppercase() as u16,
+        Key::Char(c) => u16::try_from(u32::from(c)).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// One record: `CSI vk ; sc ; uc ; kd ; cs ; 1 _`.
+fn push_win32(out: &mut Vec<u8>, vk: u16, uc: u16, down: bool, cs: u32) {
+    out.extend_from_slice(b"\x1b[");
+    push_num(out, u32::from(vk));
+    out.push(b';');
+    push_num(out, u32::from(scan_code(vk)));
+    out.push(b';');
+    push_num(out, u32::from(uc));
+    out.extend_from_slice(if down { b";1;" } else { b";0;" });
+    push_num(out, cs);
+    out.extend_from_slice(b";1_");
+}
+
+/// win32-input-mode record(s) of a key event: press/repeat → key down, release → key up.
+/// A down with text carries one record per UTF-16 unit of the text (Windows Terminal sends a
+/// record per WM_CHAR); without text Uc is the character Windows would produce (Ctrl+letter →
+/// its control character). Text typed with Ctrl+Alt is AltGr text and reported with
+/// RIGHT_ALT_PRESSED like Windows does.
+pub fn encode_win32_key(input: &KeyInput<'_>) -> Vec<u8> {
+    let Some((vk, enhanced)) = win32_vk(input.key) else {
+        return Vec::new();
+    };
+    let mut cs = control_key_state(input.mods);
+    if enhanced {
+        cs |= ENHANCED_KEY;
+    }
+    let down = input.action != KeyAction::Release;
+    let mut out = Vec::with_capacity(24);
+    match input.text.filter(|t| down && !t.is_empty()) {
+        Some(text) => {
+            if input.mods.ctrl && input.mods.alt {
+                cs = (cs & !LEFT_ALT_PRESSED) | RIGHT_ALT_PRESSED;
+            }
+            for unit in text.encode_utf16() {
+                push_win32(&mut out, vk, unit, true, cs);
+            }
+        }
+        None => push_win32(&mut out, vk, derived_uc(input.key, input.mods), down, cs),
+    }
+    out
+}
+
+/// win32-input-mode records for modifier keys pressed or released between two key events
+/// (egui reports no events for modifier keys themselves). Order: Ctrl, Alt, Shift; each
+/// record's Cs is the state after its own transition.
+pub fn encode_win32_modifiers(from: Mods, to: Mods) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut state = from;
+    if from.ctrl != to.ctrl {
+        state.ctrl = to.ctrl;
+        push_win32(&mut out, VK_CONTROL, 0, to.ctrl, control_key_state(state));
+    }
+    if from.alt != to.alt {
+        state.alt = to.alt;
+        push_win32(&mut out, VK_MENU, 0, to.alt, control_key_state(state));
+    }
+    if from.shift != to.shift {
+        state.shift = to.shift;
+        push_win32(&mut out, VK_SHIFT, 0, to.shift, control_key_state(state));
+    }
+    out
+}
+
+/// Paste in win32-input-mode, as Windows Terminal's `ControlCore::PasteText`: `\n` and `\r\n`
+/// become `\r`; C0/C1 controls (and DEL) other than HT, LF, CR are removed; bracketed when the
+/// app enabled ?2004 (the filter already removed every ESC, so no end marker survives).
+pub fn encode_paste_win32(text: &str, mode: TermMode) -> Vec<u8> {
+    let bracketed = mode.contains(TermMode::BRACKETED_PASTE);
+    let mut out = Vec::with_capacity(text.len() + if bracketed { 12 } else { 0 });
+    if bracketed {
+        out.extend_from_slice(b"\x1b[200~");
+    }
+    let mut prev = None;
+    for c in text.chars() {
+        match c {
+            '\n' if prev == Some('\r') => {}
+            '\n' => out.push(b'\r'),
+            '\t' | '\r' => push_char(&mut out, c),
+            '\0'..='\x1f' | '\x7f'..='\u{9f}' => {}
+            _ => push_char(&mut out, c),
+        }
+        prev = Some(c);
+    }
+    if bracketed {
+        out.extend_from_slice(b"\x1b[201~");
+    }
+    out
 }
 
 /// Alternate scroll (?1007 in the alt screen without mouse mode): `lines` > 0 scrolls up
@@ -1624,5 +1874,271 @@ mod tests {
         assert!(!wants_alt_scroll(
             TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL | TermMode::MOUSE_REPORT_CLICK
         ));
+    }
+
+    /// One expected win32-input-mode record (`Sc` from the platform, 0 off Windows).
+    fn rec(vk: u16, uc: u16, down: bool, cs: u32) -> Vec<u8> {
+        format!(
+            "\x1b[{vk};{};{uc};{};{cs};1_",
+            scan_code(vk),
+            u8::from(down)
+        )
+        .into_bytes()
+    }
+
+    fn w32(k: Key, m: Mods, text: Option<&str>, action: KeyAction) -> Vec<u8> {
+        let input = KeyInput {
+            key: k,
+            mods: m,
+            text,
+            action,
+        };
+        encode_key(&input, LEGACY, KeyRules::Win32)
+    }
+
+    /// Key down then key up (egui sends the text with the press only).
+    fn down_up(k: Key, m: Mods, text: Option<&str>) -> [Vec<u8>; 2] {
+        [
+            w32(k, m, text, KeyAction::Press),
+            w32(k, m, None, KeyAction::Release),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn win32_record_exact_bytes() {
+        // All six parameters, decimal, Sc 0 without a Windows keyboard layout.
+        assert_eq!(
+            down_up(Key::Enter, Mods::NONE, None),
+            [
+                b"\x1b[13;0;13;1;0;1_".to_vec(),
+                b"\x1b[13;0;13;0;0;1_".to_vec()
+            ]
+        );
+        assert_eq!(
+            w32(Key::Char('c'), Mods::CTRL, None, KeyAction::Press),
+            b"\x1b[67;0;3;1;8;1_"
+        );
+        assert_eq!(
+            w32(Key::ArrowUp, Mods::SHIFT, None, KeyAction::Press),
+            b"\x1b[38;0;0;1;272;1_"
+        );
+    }
+
+    #[test]
+    fn win32_enter_esc_tab() {
+        let (s, c, a) = (SHIFT_PRESSED, LEFT_CTRL_PRESSED, LEFT_ALT_PRESSED);
+        assert_eq!(
+            down_up(Key::Enter, Mods::NONE, None),
+            [rec(0x0D, 13, true, 0), rec(0x0D, 13, false, 0)]
+        );
+        assert_eq!(
+            down_up(Key::Enter, Mods::SHIFT, None),
+            [rec(0x0D, 13, true, s), rec(0x0D, 13, false, s)]
+        );
+        // Ctrl+Enter types LF on Windows.
+        assert_eq!(
+            down_up(Key::Enter, Mods::CTRL, None),
+            [rec(0x0D, 10, true, c), rec(0x0D, 10, false, c)]
+        );
+        assert_eq!(
+            down_up(Key::Enter, Mods::ALT, None),
+            [rec(0x0D, 13, true, a), rec(0x0D, 13, false, a)]
+        );
+        assert_eq!(
+            down_up(Key::Escape, Mods::NONE, None),
+            [rec(0x1B, 27, true, 0), rec(0x1B, 27, false, 0)]
+        );
+        assert_eq!(
+            down_up(Key::Tab, Mods::NONE, None),
+            [rec(0x09, 9, true, 0), rec(0x09, 9, false, 0)]
+        );
+        assert_eq!(
+            down_up(Key::Tab, Mods::SHIFT, None),
+            [rec(0x09, 9, true, s), rec(0x09, 9, false, s)]
+        );
+        assert_eq!(
+            down_up(Key::Backspace, Mods::NONE, None),
+            [rec(0x08, 8, true, 0), rec(0x08, 8, false, 0)]
+        );
+        assert_eq!(
+            w32(Key::Backspace, Mods::CTRL, None, KeyAction::Press),
+            rec(0x08, 0x7F, true, c)
+        );
+    }
+
+    #[test]
+    fn win32_arrows_and_navigation_are_enhanced() {
+        let e = ENHANCED_KEY;
+        assert_eq!(
+            down_up(Key::ArrowUp, Mods::NONE, None),
+            [rec(0x26, 0, true, e), rec(0x26, 0, false, e)]
+        );
+        assert_eq!(
+            w32(Key::ArrowLeft, Mods::SHIFT, None, KeyAction::Press),
+            rec(0x25, 0, true, e | SHIFT_PRESSED)
+        );
+        assert_eq!(
+            w32(Key::ArrowRight, Mods::CTRL, None, KeyAction::Press),
+            rec(0x27, 0, true, e | LEFT_CTRL_PRESSED)
+        );
+        assert_eq!(
+            w32(Key::ArrowDown, Mods::ALT, None, KeyAction::Press),
+            rec(0x28, 0, true, e | LEFT_ALT_PRESSED)
+        );
+        for (k, vk) in [
+            (Key::PageUp, 0x21),
+            (Key::PageDown, 0x22),
+            (Key::End, 0x23),
+            (Key::Home, 0x24),
+            (Key::Insert, 0x2D),
+            (Key::Delete, 0x2E),
+        ] {
+            assert_eq!(
+                w32(k, Mods::NONE, None, KeyAction::Press),
+                rec(vk, 0, true, e)
+            );
+        }
+        // Function keys: not enhanced; Windows has no virtual key past F24.
+        assert_eq!(
+            w32(Key::F(1), Mods::NONE, None, KeyAction::Press),
+            rec(0x70, 0, true, 0)
+        );
+        assert_eq!(
+            w32(Key::F(24), Mods::SHIFT, None, KeyAction::Release),
+            rec(0x87, 0, false, SHIFT_PRESSED)
+        );
+        assert!(w32(Key::F(25), Mods::NONE, None, KeyAction::Press).is_empty());
+    }
+
+    #[test]
+    fn win32_ctrl_c_and_letters() {
+        let c = LEFT_CTRL_PRESSED;
+        // Ctrl+letter: Uc is the control character, down and up.
+        assert_eq!(
+            down_up(Key::Char('c'), Mods::CTRL, None),
+            [rec(0x43, 3, true, c), rec(0x43, 3, false, c)]
+        );
+        assert_eq!(
+            w32(
+                Key::Char('a'),
+                Mods::new(true, false, true),
+                None,
+                KeyAction::Press
+            ),
+            rec(0x41, 1, true, c | SHIFT_PRESSED)
+        );
+        assert_eq!(
+            w32(Key::Char('['), Mods::CTRL, None, KeyAction::Press),
+            rec(0xDB, 0x1B, true, c)
+        );
+        // Plain and shifted letters: Uc from the text; the up record recomputes it.
+        assert_eq!(
+            down_up(Key::Char('a'), Mods::NONE, Some("a")),
+            [rec(0x41, 97, true, 0), rec(0x41, 97, false, 0)]
+        );
+        assert_eq!(
+            down_up(Key::Char('a'), Mods::SHIFT, Some("A")),
+            [
+                rec(0x41, 65, true, SHIFT_PRESSED),
+                rec(0x41, 65, false, SHIFT_PRESSED)
+            ]
+        );
+        // Alt+letter and digits.
+        assert_eq!(
+            w32(Key::Char('x'), Mods::ALT, None, KeyAction::Press),
+            rec(0x58, 120, true, LEFT_ALT_PRESSED)
+        );
+        assert_eq!(
+            w32(Key::Char('7'), Mods::NONE, Some("7"), KeyAction::Press),
+            rec(0x37, 55, true, 0)
+        );
+        assert_eq!(
+            w32(Key::Char(' '), Mods::NONE, Some(" "), KeyAction::Press),
+            rec(0x20, 32, true, 0)
+        );
+        // Auto-repeat is another key-down record with repeat count 1.
+        assert_eq!(
+            w32(Key::Char('a'), Mods::NONE, Some("a"), KeyAction::Repeat),
+            rec(0x41, 97, true, 0)
+        );
+    }
+
+    #[test]
+    fn win32_non_ascii_text() {
+        // Uc is UTF-16: one record per code unit, surrogate pairs as two records.
+        assert_eq!(
+            w32(Key::Char('e'), Mods::NONE, Some("é"), KeyAction::Press),
+            rec(0x45, 0xE9, true, 0)
+        );
+        assert_eq!(
+            w32(Key::Char('e'), Mods::NONE, Some("😀"), KeyAction::Press),
+            [rec(0x45, 0xD83D, true, 0), rec(0x45, 0xDE00, true, 0)].concat()
+        );
+        // AltGr text (Ctrl+Alt) is reported with RIGHT_ALT like Windows does.
+        assert_eq!(
+            w32(
+                Key::Char('q'),
+                Mods::new(false, true, true),
+                Some("@"),
+                KeyAction::Press
+            ),
+            rec(0x51, 64, true, LEFT_CTRL_PRESSED | RIGHT_ALT_PRESSED)
+        );
+        // Ctrl+Alt without layout text produces no character.
+        assert_eq!(
+            w32(
+                Key::Char('q'),
+                Mods::new(false, true, true),
+                None,
+                KeyAction::Press
+            ),
+            rec(0x51, 0, true, LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED)
+        );
+    }
+
+    #[test]
+    fn win32_yields_to_kitty_flags() {
+        let input = KeyInput::press(Key::Enter, Mods::SHIFT);
+        assert_eq!(
+            encode_key(&input, kitty(1), KeyRules::Win32),
+            encode_key(&input, kitty(1), KeyRules::Legacy)
+        );
+        assert_eq!(encode_key(&input, kitty(1), KeyRules::Win32), b"\x1b[13;2u");
+    }
+
+    #[test]
+    fn win32_modifier_records() {
+        let both = Mods::new(true, false, true);
+        assert_eq!(
+            encode_win32_modifiers(Mods::NONE, both),
+            [
+                rec(VK_CONTROL, 0, true, LEFT_CTRL_PRESSED),
+                rec(VK_SHIFT, 0, true, LEFT_CTRL_PRESSED | SHIFT_PRESSED),
+            ]
+            .concat()
+        );
+        assert_eq!(
+            encode_win32_modifiers(both, Mods::ALT),
+            [
+                rec(VK_CONTROL, 0, false, SHIFT_PRESSED),
+                rec(VK_MENU, 0, true, SHIFT_PRESSED | LEFT_ALT_PRESSED),
+                rec(VK_SHIFT, 0, false, LEFT_ALT_PRESSED),
+            ]
+            .concat()
+        );
+        assert!(encode_win32_modifiers(both, both).is_empty());
+    }
+
+    #[test]
+    fn win32_paste_filters_like_windows_terminal() {
+        let raw = "a\r\nb\nc\x1b[201~d\x7f\u{85}\te\u{7}\r";
+        assert_eq!(encode_paste_win32(raw, LEGACY), b"a\rb\rc[201~d\te\r");
+        assert_eq!(
+            encode_paste_win32(raw, TermMode::BRACKETED_PASTE),
+            b"\x1b[200~a\rb\rc[201~d\te\r\x1b[201~"
+        );
+        assert_eq!(encode_paste_win32("\n\n漢", LEGACY), "\r\r漢".as_bytes());
+        assert_eq!(encode_paste_win32("", LEGACY), b"");
     }
 }

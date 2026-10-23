@@ -11,6 +11,7 @@ use crate::icons::{
     ICON_TRIANGLE_ALERT, ICON_WRENCH,
 };
 use deck_core::config::{Density, Theme, UiStyle};
+use deck_core::mux::BackendChoice;
 use deck_core::omp::{Setting, SettingsCatalog};
 use egui::{
     Align2, Color32, CursorIcon, Frame, Margin, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
@@ -102,8 +103,17 @@ pub struct SettingsInput<'a> {
     pub omp_version: Option<&'a str>,
     pub check_updates: bool,
     pub update: &'a UpdateState,
+    pub backend: BackendCard,
     pub drive: DriveCard,
     pub sync: SyncPage<'a>,
+}
+
+/// The session-backend card: the stored choice and which backends exist on this machine.
+#[derive(Clone, Copy)]
+pub struct BackendCard {
+    pub choice: BackendChoice,
+    pub tmux: bool,
+    pub host: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -131,6 +141,8 @@ pub enum SettingsAction {
     InstallOmp,
     /// The Google Drive backup card.
     Drive(DriveAction),
+    /// Where new sessions run (Unix: tmux or the OmpDeck host).
+    SessionBackend(BackendChoice),
     /// The project sync page.
     Sync(SyncAction),
 }
@@ -628,7 +640,7 @@ fn not_found_card(ui: &mut Ui, actions: &mut Vec<SettingsAction>) {
                 ui.add(
                     egui::Label::new(
                         RichText::new(
-                            "OmpDeck edits omp's settings through the `omp` command, but could not find it on your PATH or in ~/.local/bin. Install it with omp's official installer, or add it to PATH and restart OmpDeck.",
+                            format!("OmpDeck edits omp's settings through the `omp` command, but could not find it in {}. Install it with omp's official installer, or add it to PATH and restart OmpDeck.", crate::update::OMP_LOOKUP),
                         )
                         .color(pal.weak),
                     )
@@ -770,6 +782,58 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
                 }
             },
         );
+    });
+
+    card(ui, "Sessions", |ui| {
+        if cfg!(windows) {
+            setting_row(
+                ui,
+                "Session backend",
+                "Sessions run in the OmpDeck session host and keep running when you close their tab",
+                |ui| {
+                    ui.label(theme::strong("OmpDeck host").color(pal.text_strong));
+                },
+            );
+            return;
+        }
+        let b = input.backend;
+        let mut missing = Vec::new();
+        if !b.tmux {
+            missing.push("tmux");
+        }
+        if !b.host {
+            missing.push("omp-deck-host");
+        }
+        let note = if missing.is_empty() {
+            "Where new sessions run. Running sessions keep their backend.".to_owned()
+        } else {
+            format!(
+                "Where new sessions run. Running sessions keep their backend. Not found: {}.",
+                missing.join(", ")
+            )
+        };
+        setting_row(ui, "Session backend", &note, |ui| {
+            let mut idx = match b.choice {
+                BackendChoice::Auto => 0,
+                BackendChoice::Tmux => 1,
+                BackendChoice::Host => 2,
+            };
+            if segmented(
+                ui,
+                &mut idx,
+                &[
+                    (ICON_SPARKLES, "Auto"),
+                    (ICON_TERMINAL, "tmux"),
+                    (ICON_CPU, "OmpDeck host"),
+                ],
+            ) {
+                actions.push(SettingsAction::SessionBackend(match idx {
+                    0 => BackendChoice::Auto,
+                    1 => BackendChoice::Tmux,
+                    _ => BackendChoice::Host,
+                }));
+            }
+        });
     });
 
     card(ui, "Window", |ui| {

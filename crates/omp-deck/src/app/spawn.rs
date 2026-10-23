@@ -1,16 +1,18 @@
 //! Launching terminal tabs. A session tab first has its control directory prepared (and the
-//! tmux session probed) on a worker; the terminal itself is then spawned on the UI thread.
+//! session probed) on a worker; the terminal itself is then created on the UI thread (a host
+//! session connects on the terminal's own reader thread).
 //! Launches are processed one at a time in request order, so restored tabs keep their order.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
-use deck_core::ctl::{ctl_dir, prepare_ctl_dir};
-use deck_core::tmux::{LaunchSpec, direct_launch};
-use deck_term::{SpawnSpec, TermOptions, Terminal};
+use deck_core::ctl::{ctl_dir, ctl_env, prepare_ctl_dir, with_ctl};
+use deck_core::mux::{Launch, Mux};
+use deck_term::{TermOptions, Terminal};
 
 use super::{App, AppEvent, CopyPending, Injector, Tab, TabRole, TermTab, term_theme};
+use crate::host_remote::HostRemote;
 use crate::omp_worker;
 use crate::tabs::Anchor;
 
@@ -46,7 +48,7 @@ pub(super) enum Focus {
 }
 
 pub(super) struct SpawnReq {
-    pub tmux_name: Option<String>,
+    pub mux_name: Option<String>,
     pub cwd: PathBuf,
     pub session_path: Option<PathBuf>,
     pub title: String,
@@ -138,7 +140,7 @@ impl Pump {
             || self.reserved.iter().any(matches)
             || self.queue.iter().any(|j| match j {
                 Job::Spawn { req, .. } => {
-                    matches(&(req.session_path.clone(), req.tmux_name.clone()))
+                    matches(&(req.session_path.clone(), req.mux_name.clone()))
                 }
                 Job::RestoreDone => false,
             })
@@ -151,7 +153,7 @@ impl Pump {
             .iter()
             .cloned()
             .chain(self.queue.iter().filter_map(|j| match j {
-                Job::Spawn { req, .. } => req.tmux_name.clone(),
+                Job::Spawn { req, .. } => req.mux_name.clone(),
                 Job::RestoreDone => None,
             }))
             .chain(self.reserved.iter().filter_map(|(_, n)| n.clone()))
@@ -181,6 +183,59 @@ impl Focus {
     }
 }
 
+/// The terminal for a resolved launch. A tmux client or direct child runs in a local PTY the GUI
+/// owns (Unix); a host session is connected lazily by [`HostRemote`], so nothing here blocks.
+fn open_terminal(
+    launch: Launch,
+    mux: Option<&Mux>,
+    opts: TermOptions,
+    ctx: &egui::Context,
+) -> Result<Terminal, String> {
+    match launch {
+        Launch::Host(spec) => {
+            let Some(Mux::Host(host)) = mux else {
+                return Err("the OmpDeck session host is not available".to_owned());
+            };
+            let remote = HostRemote::new(host.namespace().clone(), spec);
+            Ok(Terminal::connect(Box::new(remote), opts, ctx.clone()))
+        }
+        #[cfg(unix)]
+        Launch::Pty(spec) => {
+            let spec = deck_term::SpawnSpec {
+                program: spec.program,
+                args: spec.args,
+                cwd: spec.cwd,
+                env: spec.env,
+                tmux_client: matches!(mux, Some(Mux::Tmux(_))),
+            };
+            Terminal::spawn(spec, opts, ctx.clone()).map_err(|e| e.to_string())
+        }
+        #[cfg(not(unix))]
+        Launch::Pty(_) => Err("local terminals are not available on this platform".to_owned()),
+    }
+}
+
+/// Launch without any backend (nothing outlives the app): the command itself in a local PTY.
+#[cfg(unix)]
+fn direct(
+    cwd: &std::path::Path,
+    argv: &[String],
+    env: Vec<(String, String)>,
+) -> Result<Launch, String> {
+    let mut spec = deck_core::tmux::direct_launch(cwd, argv);
+    spec.env.extend(env);
+    Ok(Launch::Pty(spec))
+}
+
+#[cfg(not(unix))]
+fn direct(
+    _cwd: &std::path::Path,
+    _argv: &[String],
+    _env: Vec<(String, String)>,
+) -> Result<Launch, String> {
+    Err("the OmpDeck session host (omp-deck-host.exe) was not found".to_owned())
+}
+
 /// A request whose control directory was prepared and whose launch command was resolved.
 pub(super) struct Prepared {
     req: Box<SpawnReq>,
@@ -188,10 +243,12 @@ pub(super) struct Prepared {
     claim: Option<u64>,
     /// Control key; `None` = launch without control (not wanted, or the directory is unsafe).
     key: Option<String>,
-    /// The launch creates the tmux session (an attach ignores the argv).
+    /// The launch creates the session (an attach ignores the argv).
     created: bool,
     /// Resolved on the worker: the working directory is stat'ed there, not on the UI thread.
-    launch: LaunchSpec,
+    launch: Result<Launch, String>,
+    /// The backend that runs the session (`None`: a direct launch).
+    mux: Option<Mux>,
 }
 
 impl App {
@@ -233,6 +290,15 @@ impl App {
         self.running.set_ctl_keep(keep);
     }
 
+    /// The backend a launch for `name` goes to: the one that holds a live session of that name
+    /// (so a session of the other backend is re-attached, never respawned elsewhere), else the
+    /// backend new sessions use.
+    pub(super) fn mux_for(&self, name: &str) -> Option<Mux> {
+        let kind = self.running.latest().and_then(|s| s.owner_of(name));
+        let owner: Option<&Mux> = kind.and_then(|k| self.backends.of_kind(k));
+        owner.or_else(|| self.backends.primary()).cloned()
+    }
+
     fn pump_spawns(&mut self) {
         while let Some(job) = self.spawn.next() {
             let (mut req, claim) = match job {
@@ -242,18 +308,25 @@ impl App {
                 }
                 Job::Spawn { req, claim } => (req, claim),
             };
-            req.tmux_name = req.tmux_name.take().filter(|_| self.tmux.is_some());
+            if req.mux_name.is_none() && !cfg!(unix) {
+                // Without a direct PTY every tab, update and installer tabs included, runs in a
+                // host session of its own.
+                req.mux_name = Some(format!("omp-tool-{}", super::unix_ms()));
+            }
+            let mux = req.mux_name.as_deref().and_then(|n| self.mux_for(n));
+            if mux.is_none() {
+                req.mux_name = None;
+            }
             let wants_ctl = self.ctl_ext.is_some() && req.role == TabRole::Session;
             let key = wants_ctl.then(|| {
-                req.tmux_name.clone().unwrap_or_else(|| {
+                req.mux_name.clone().unwrap_or_else(|| {
                     self.direct_seq += 1;
                     format!("direct-{}-{}", std::process::id(), self.direct_seq)
                 })
             });
-            let tmux = self.tmux.clone();
             let ext = self.ctl_ext.clone();
             let ns = self.ctl_ns.clone();
-            let slot = (req.session_path.clone(), req.tmux_name.clone());
+            let slot = (req.session_path.clone(), req.mux_name.clone());
             let title = req.title.clone();
             let (ctx, tx) = (self.ctx.clone(), self.events_tx.clone());
             let key_for_state = key.clone();
@@ -266,19 +339,24 @@ impl App {
                             None
                         }
                     });
-                    let created = match (&tmux, &req.tmux_name) {
-                        (Some(t), Some(name)) => !t.has_session(name),
+                    let created = match (&mux, &req.mux_name) {
+                        (Some(m), Some(name)) => !m.has_session(name),
                         _ => true,
                     };
                     let argv = match (&key, &ext) {
-                        (Some(key), Some(ext)) => {
-                            crate::agent_ctl::ctl_argv(&req.argv, ext, &ns, key)
-                        }
+                        (Some(_), Some(ext)) => with_ctl(&req.argv, ext),
                         _ => req.argv.clone(),
                     };
-                    let launch = match (&tmux, &req.tmux_name) {
-                        (Some(t), Some(name)) => t.attach_or_create(name, &req.cwd, &argv),
-                        _ => direct_launch(&req.cwd, &argv),
+                    let env: Vec<(String, String)> = key
+                        .iter()
+                        .map(|key| {
+                            let (var, value) = ctl_env(&ctl_dir(&ns, key));
+                            (var.to_owned(), value.to_string_lossy().into_owned())
+                        })
+                        .collect();
+                    let launch = match (&mux, &req.mux_name) {
+                        (Some(m), Some(name)) => Ok(m.launch_with_env(name, &req.cwd, &argv, &env)),
+                        _ => direct(&req.cwd, &argv, env),
                     };
                     AppEvent::SpawnPrepared(Prepared {
                         req,
@@ -286,6 +364,7 @@ impl App {
                         key,
                         created,
                         launch,
+                        mux,
                     })
                 })
             });
@@ -312,9 +391,10 @@ impl App {
             key,
             created,
             launch,
+            mux,
         } = p;
         let SpawnReq {
-            tmux_name,
+            mux_name,
             cwd,
             session_path,
             title,
@@ -323,22 +403,19 @@ impl App {
             post,
             focus,
         } = *req;
-        let spec = SpawnSpec {
-            program: launch.program,
-            args: launch.args,
-            cwd: launch.cwd,
-            env: launch.env,
-            tmux_client: tmux_name.is_some(),
-        };
         let opts = TermOptions {
             scrollback: 10_000,
             theme: term_theme(self.cfg.theme, self.cfg.style),
             clipboard: self.clipboard.clone(),
+            // ConPTY does not implement the kitty keyboard protocol; the host (not this side)
+            // answers `CSI ? u`, so this only selects the key encoder.
+            kitty_keyboard: !cfg!(windows),
         };
-        let term = match Terminal::spawn(spec, opts, self.ctx.clone()) {
+        let opened = launch.and_then(|l| open_terminal(l, mux.as_ref(), opts, &self.ctx));
+        let term = match opened {
             Ok(term) => term,
             Err(e) => {
-                log::error!("failed to spawn terminal: {e}");
+                log::error!("failed to open terminal: {e}");
                 self.toasts
                     .error(&self.ctx, format!("Failed to start terminal: {e}"));
                 self.sync_ctl_keep();
@@ -349,7 +426,8 @@ impl App {
         let uid = self.next_tab_uid;
         self.tabs.push(Tab::Terminal(Box::new(TermTab {
             term,
-            tmux_name,
+            mux_name,
+            mux,
             cwd,
             session_path,
             fallback_title: title,
@@ -465,7 +543,7 @@ mod tests {
     fn job(path: &str, claim: Option<u64>) -> Job {
         Job::Spawn {
             req: Box::new(SpawnReq {
-                tmux_name: None,
+                mux_name: None,
                 cwd: PathBuf::from("/"),
                 session_path: Some(PathBuf::from(path)),
                 title: String::new(),

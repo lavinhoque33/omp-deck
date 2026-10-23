@@ -18,6 +18,7 @@ OPTIONS:
 
 ENVIRONMENT:
     OMP_DECK_TMUX_SOCKET    Use this tmux socket name instead of `omp-deck` (tests)
+    OMP_DECK_HOST_NS        Use this session-host namespace instead of `omp-deck` (tests)
 ";
 
 #[derive(Clone, Debug, Default, PartialEq)]

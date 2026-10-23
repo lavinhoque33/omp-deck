@@ -1248,3 +1248,173 @@ impl Service {
 - Settings → OmpDeck → Google Drive backup: the "Back up automatically" switch becomes a dropdown over
   `SyncInterval::ALL` ("Off" disables; others = period between checks; unchanged config is still skipped). The
   first automatic check after startup/sign-in/turning it on stays 45 s.
+
+## Wave 12: native Windows + OmpDeck host (tmux replacement)
+
+Facts: `docs/notes/windows-host.md`. Goal: OmpDeck builds, tests and runs natively on Windows 10/11 x64
+(arm64 best effort) with sessions that survive closing a tab or the app, via our own per-session host daemon.
+Linux keeps tmux as the default backend; the host is the Linux fallback when tmux is missing (replacing the
+no-persistence "direct" mode there) and can be chosen explicitly. Every crate compiles for
+`x86_64-pc-windows-msvc` with clippy `-D warnings` (cargo-xwin locally, CI natively).
+
+### New crate `crates/deck-host` (lib + bin `omp-deck-host`)
+Depends on nothing of ours. Deps: alacritty_terminal (headless Term), serde/serde_json, thiserror, log,
+getrandom, sha2, dirs; `libc` (unix); `windows-sys` 0.61 (windows). No portable-pty, no tokio.
+
+**Namespaces and endpoints.** `Namespace::new(ns)` with `ns` = `omp-deck` (app) or `omp-deck-test-<unique>`
+(tests; `[A-Za-z0-9_-]{1,40}`). Session names `[A-Za-z0-9_-]{1,64}` (`session_name_for` already conforms).
+- Unix: socket `<base>/<ns>/<name>.sock`, `<base>` = `$XDG_RUNTIME_DIR/omp-deck-host` else
+  `<temp_dir>/omp-deck-host-<uid>`; base and ns dirs 0700 and owned by us (refuse otherwise); sun_path length
+  checked (typed error).
+- Windows: named pipe `\\.\pipe\omp-deck-host.<user>.<ns>.<name>`, `<user>` = 16 hex of sha256(current user
+  SID string). Pipe DACL = current user SID only (+SYSTEM), `PIPE_REJECT_REMOTE_CLIENTS`, first instance created
+  with `FILE_FLAG_FIRST_PIPE_INSTANCE` (a second daemon for the same name fails). Listing = enumerate
+  `\\.\pipe\` entries with the `omp-deck-host.<user>.<ns>.` prefix.
+
+**Wire protocol** (version `PROTOCOL = 1`; both sides send `Hello{protocol, version}` first; a major mismatch is
+a typed error, the GUI can still `Kill`). Frames: `u32 LE length` (≤ 1 MiB) + `u8 kind` + payload. Byte
+payloads raw (`Input`, `Output`, `Snapshot` chunks), control payloads JSON (unknown fields ignored).
+- client -> daemon: `Hello`, `Attach{cols, rows, cell_width, cell_height, history_lines, palette}`, `Input(bytes)`,
+  `Resize{cols, rows, cell_width, cell_height}`, `Palette(Palette)`, `Detach`, `Kill`, `Info`, `Ping`.
+- daemon -> client: `Hello`, `Info(HostInfo)`, `Snapshot(bytes)`… `SnapshotEnd`, `Output(bytes)`,
+  `Exited{code: Option<i32>}`, `Displaced` (another client attached), `Error(String)`, `Pong`.
+- `Palette`: 16 ANSI + fg + bg + cursor as `[u8;3]` (answers OSC 4/10/11/12 queries).
+- `HostInfo { name, protocol, host_version, daemon_pid, child_pid, child_started_unix_ms, cwd, argv,
+  tty: Option<String> /* unix slave path */, term_session_id: Option<String> /* windows */,
+  attached: bool, cols, rows }`.
+- One attached client: a new `Attach` sends `Displaced` to the old one and closes it. Non-attach connections
+  (Info/Kill/Ping) are served concurrently.
+
+**Client API** (`deck_host::Client`, blocking; callers run it on workers):
+- `Namespace::list(&self) -> Vec<String>` (alive = endpoint accepts + Hello within 500 ms), `info(name) ->
+  Result<HostInfo>`, `has(name) -> bool`, `kill(name) -> Result<()>` (returns after the daemon confirmed or the
+  endpoint vanished, ≤ 5 s).
+- `create_or_attach(&Namespace, &SessionSpec, AttachParams) -> Result<Attached>`: attach if alive (never
+  respawn), else spawn the daemon detached (`daemon_exe()` = `omp-deck-host[.exe]` next to `current_exe()`,
+  env override `OMP_DECK_HOST_EXE`) with the spec passed through a 0600 file the daemon deletes, wait ≤ 5 s
+  for the endpoint (daemon startup errors are reported from its log), then attach.
+- `SessionSpec { name, program, args: Vec<String>, cwd, env_set: Vec<(String,String)>, env_remove: Vec<String> }`.
+- `Attached` splits into `AttachedRx` (blocking `recv() -> Result<HostEvent>`; `HostEvent::{Snapshot(Vec<u8>)
+  /* whole replay */, Output(Vec<u8>), Exited(Option<i32>), Displaced, Closed}`) and a cloneable
+  `AttachedTx` (`input(&[u8])`, `resize(..)`, `palette(..)`, `kill()`, `detach()`); drop = detach.
+
+**Daemon** (`omp-deck-host serve --ns <ns> --name <name> --spec <file>`; also `ls`, `info <name>`,
+`kill <name>`, `dump <name>` (attach, print the snapshot as plain text, detach) for debugging and CI):
+- Detached from the GUI: Unix `setsid` + stdio to null; Windows `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
+  CREATE_NO_WINDOW` (+ `CREATE_BREAKAWAY_FROM_JOB`, retried without it on access denied). Release builds use the
+  Windows GUI subsystem (no console window). Logs to `<cache_dir>/omp-deck/host/<ns>/<name>.log` (≤ 1 MiB).
+- Child PTY, own module `deck_host::pty`: Unix `openpty` + `Command` (`setsid`, `TIOCSCTTY`, slave as stdio);
+  Windows ConPTY via `conpty.dll` sideload (exe dir) with kernel32 fallback, flags chosen by CI byte probes
+  (start with `RESIZE_QUIRK | WIN32_INPUT_MODE`; PASSTHROUGH only with the sideloaded DLL on build ≥ 22621 if
+  the probe proves it helps), child created `CREATE_SUSPENDED` with `EXTENDED_STARTUPINFO_PRESENT`, assigned to a
+  `KILL_ON_JOB_CLOSE` job, then resumed; MSVCRT argv quoting; `.cmd`/`.bat` via `cmd.exe /d /c`. No panics on
+  ConPTY errors (typed errors).
+- Output loop: one reader thread; each chunk goes to `vte::ansi::Processor` -> headless `Term`
+  (`scrolling_history = 50_000`), to a side-state scanner, and to the attached client as `Output`. The daemon's
+  `Term` answers every query (DA/DSR/CPR/kitty `CSI ? u`/OSC 4/10/11/12 with the last client palette) by writing
+  to the PTY, attached or not. Windows Term config: `kitty_keyboard = false`; Unix: `true`.
+- Side-state the snapshot needs beyond `Term`: title (from `Event::Title`), `CSI > 4;n m`, `?9001`, `?2031`,
+  `?2026` state, scroll region (DECSTBM). Images (APC) are not retained (same as tmux today).
+- Snapshot on attach (taken under the Term lock between reads, then live `Output` follows): VT replay that a fresh
+  alacritty `Term` turns into the same state: reset; up to `history_lines` scrollback rows then screen rows of the
+  primary grid (SGR, zero-width, OSC 8, WRAPLINE joins); if alt screen active: `?1049h` + alt grid; cursors,
+  DECSC saved cursor, DECSCUSR, every `TermMode` bit, kitty flags (`CSI = flags ; 1 u`), modifyOtherKeys,
+  `?9001`, `?2031`, OSC 4/10/11 overrides, title, scroll region. Pure function
+  `snapshot::encode(&Term, &SideState, history_lines) -> Vec<u8>`, tested by round-tripping through a fresh Term.
+- Resize: PTY + Term resize (cell pixel size kept for `CSI 14t`). Child exit: `Exited{code}` to the client,
+  endpoint removed, daemon exits. `Kill`: Unix `kill(-pgid, SIGHUP)`, `SIGKILL` after 2 s; Windows
+  `TerminateJobObject`; then exit.
+
+### deck-core
+- Depends on deck-host. New `deck_core::mux`:
+  - `BackendChoice { Auto (default), Tmux, Host }` persisted as `AppConfig.session_backend` (`#[serde(default)]`);
+    Windows always resolves to Host.
+  - `enum Mux { Tmux(Tmux), Host(HostMux) }`; `Mux::detect(choice) -> Option<Mux>` (Auto: tmux if installed else
+    host if `daemon_exe()` exists; env `OMP_DECK_TMUX_SOCKET` / `OMP_DECK_HOST_NS` select test namespaces).
+  - `kind()`, `namespace() -> &str`, `launch(name, cwd, argv) -> Launch` with `Launch::Pty(LaunchSpec)` (tmux,
+    unchanged command) | `Launch::Host(deck_host::SessionSpec)` (env per windows-host.md "Env for omp
+    children", Windows adds `TERM_SESSION_ID=<16 hex>` derived from the session name),
+    `alive_sessions()`, `has_session()`, `kill()`, `session_files(root)` (host: breadcrumb of each session via
+    `HostInfo.tty` / `term_session_id`), `pane(name) -> Option<Pane { breadcrumb_key: String, started:
+    SystemTime }>` (replaces `pane_tty` + `pane_started`; tmux keeps its `/proc` path on Linux).
+  - `tmux::direct_launch` stays only as the last-resort Unix fallback when neither backend is available.
+- `deck_core::platform` (one home for OS differences): `hostname()`, `process_start(pid)`, `find_on_path(name)`
+  (PATHEXT on Windows), `is_executable`, `create_private_dir`, `write_private`, `open_private_file`,
+  `file_identity(&fs::Metadata/&File) -> Option<FileId>` (Unix dev/ino, Windows volume serial + file index),
+  `KillableCommand`/`spawn_killable` (Unix process group, Windows job object; `kill_tree()`), `open_path(path)`
+  (xdg-open / ShellExecuteW), `reveal(file)` (file manager selecting the file; `explorer /select,` on Windows),
+  `user_dirs` fallbacks via `dirs` only (no `~/.config`-style hardcoding). Every `std::os::unix` use outside
+  `platform` and `cfg(unix)` tests is gone.
+- ctl on Windows: pipe `\\.\pipe\ompdeck-ctl.<user>.<key>` passed as `OMPDECK_CTL_PIPE` (Rust computes, TS never
+  derives); `ompdeck-ctl.ts` uses `node:net` on win32, no lock file, no mode check, no socket unlink; Unix path
+  unchanged. `Command::env` replaces the `env` wrapper argv on both OSes.
+- omp on Windows: `Omp::detect` searches PATH (PATHEXT), `%LOCALAPPDATA%\omp\omp.exe`,
+  `%USERPROFILE%\.bun\bin\omp.exe`; `.cmd` runs through `cmd.exe /d /c`; install argv = PowerShell
+  `& ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary` (`-NoProfile -ExecutionPolicy Bypass`).
+- gdrive on Windows: no POSIX modes (stored as 0o644/0o755 by origin), `path_id` over `as_encoded_bytes()`,
+  restore skips (and lists in `omp_skipped`) names invalid on Windows (`<>:"|?*`, control chars, reserved
+  CON/PRN/AUX/NUL/COM1-9/LPT1-9, trailing dot/space) and never writes through reparse points.
+- `status.rs` breadcrumb trust uses `Mux::pane`; a bare `omp` title is noise on Windows.
+
+### deck-term
+- Compiles and works on Windows: clipboard without PRIMARY there; local-PTY path (`TrackedPty`, alacritty
+  `EventLoop`) is `cfg(unix)`; Windows uses only remote terminals. Windows font discovery (Cascadia Mono ->
+  Consolas -> Courier New; fallbacks Segoe UI Symbol, Segoe UI Emoji, Segoe UI) with `fc-match` kept on Unix.
+- `TermOptions.kitty_keyboard: bool` (default true).
+- Remote terminals: `pub trait Remote: Send` with `fn split(self: Box<Self>) -> (Box<dyn RemoteRx>,
+  Box<dyn RemoteTx>)`; `RemoteRx::recv(&mut self) -> io::Result<RemoteEvent>` (`Snapshot(Vec<u8>)`,
+  `Output(Vec<u8>)`, `Exited(Option<i32>)`, `Displaced`, `Closed`); `RemoteTx: Send + Sync` with `input`,
+  `resize(cols, rows, cell_w, cell_h)`, `palette([[u8;3]; 19])`, `kill`, `detach`.
+  `Terminal::connect(Box<dyn Remote>, TermOptions, egui::Context) -> Terminal` (same `TerminalView`, events,
+  title, bell, exit, screen_text). In remote mode the local `Term` never answers queries (the host does) except
+  OSC 52 clipboard loads; a `Snapshot` resets the local Term and replays; `Displaced` shows
+  `[attached elsewhere]` and stops input; drop = detach.
+- win32-input-mode: track `CSI ? 9001 h/l` in output (local and remote, like modifyOtherKeys). While on, keys are
+  encoded as `CSI Vk;Sc;Uc;Kd;Cs;Rc _` (key down and up; `Uc` from the text event; `Cs` = Windows control-key
+  state; `Sc` from `MapVirtualKeyW` on Windows, 0 elsewhere); mouse stays VT; paste per Windows Terminal's
+  behavior. Pure encoders, exact-byte tests.
+
+### omp-deck
+- Uses `Mux` everywhere (no direct `Tmux` outside deck-core): launch -> `Terminal::spawn` for `Launch::Pty`,
+  worker `create_or_attach` -> `Terminal::connect` for `Launch::Host` (tab shows "Starting…" meanwhile; errors in
+  the tab); running indicators, Stop, Restart, Delete/Move kill, tab restore, status-bar breadcrumb via `Mux`.
+- Settings → OmpDeck (Unix only): "Session backend" Auto / tmux / OmpDeck host (applies to new tabs; live
+  sessions keep their backend until closed). No-tmux banner replaced: Auto with host available needs none;
+  direct fallback keeps the banner.
+- Windows app: `windows_subsystem = "windows"` (release), embedded icon + version info, client-side title bar
+  (unchanged look), folder picker via `rfd` (Windows only; kdialog/zenity stay on Linux), `platform::open_path`
+  / `reveal`, UI fonts fallback (Segoe UI Variable / Segoe UI), config in `dirs::config_dir()/omp-deck`.
+
+### Packaging / CI
+- CI: add `windows-latest` job (clippy `-D warnings`, `cargo test --workspace`, Windows-only host tests incl.
+  ConPTY byte probes with a test child that echoes what it reads), keep Linux job (+ host backend tests).
+- Release: `omp-deck-<v>-x86_64-windows.zip` (omp-deck.exe, omp-deck-host.exe, conpty.dll, OpenConsole.exe,
+  licenses incl. ConPTY MIT notice) + sha256; arm64 zip if its runner builds green. `packaging/install.ps1`
+  (latest release, sha256 check, `%LOCALAPPDATA%\Programs\OmpDeck`, Start Menu shortcut, rename-aside of locked
+  exes, installs omp via omp.sh/install.ps1 unless `-NoOmp`, `-Uninstall`). Linux tarball/AppImage/deb/rpm also
+  ship `omp-deck-host`.
+
+### Wave 12 as built (Wave A; supersedes the sketch above where they differ)
+- deck-host: no `Client` struct. `Namespace::{new, as_str, log_path, list, has, info, kill}`; free fns
+  `daemon_exe() -> Option<PathBuf>` (env `OMP_DECK_HOST_EXE`), `start(ns, spec, cols, rows)` (create, no attach),
+  `create_or_attach(ns, spec, AttachParams) -> Result<Attached>`, `attach(ns, name, params)`,
+  `peek(ns, name, history_lines) -> (HostInfo, Vec<u8>)` (frame `Peek` 0x0a: snapshot without displacing/resizing).
+  `Attached::split() -> (AttachedRx, AttachedTx)`; `AttachedRx::recv() -> Result<HostEvent>`; `AttachedTx: Clone`
+  `input/resize/palette(&Palette)/kill/detach -> Result<()>`. AttachParams cols/rows 0 = keep size.
+  `snapshot::encode(&mut Term, ..)`; kitty flags replayed as `CSI > f u`; title tracked by the output scanner.
+  Env `OMP_DECK_CONPTY_FLAGS` (default 0x6 = RESIZE_QUIRK | WIN32_INPUT_MODE). CLI `new|ls|info|dump|kill`,
+  `--ns` default `omp-deck`.
+- deck-core: `platform::{hostname, process_start, home_or_root, root_dir, no_window, path_extensions,
+  is_executable, find_in, find_on_path, create_private_dir(_all), open_private_file, write_private, FileId,
+  file_identity, file_mode, set_file_mode, open_regular_file, is_link, path_bytes, tree_open_files,
+  KillableCommand, spawn_killable, KillableChild::kill_tree, open_path, reveal}`; `mux::{BackendChoice, MuxKind,
+  MuxError, Pane, Launch, Mux, HostMux, host_env, term_session_id, is_noise_title, title_is_noise,
+  HOST_NAMESPACE, TMUX_SOCKET_ENV, HOST_NS_ENV, HOST_ENV_REMOVE}`; `Mux::{detect, kind, namespace, launch,
+  launch_with_env, alive_sessions, has_session, kill, session_files, pane}`; `ctl::with_ctl(omp_argv, ext)` (no
+  dir/env wrapper) + `ctl_env(dir) -> (name, value)` (`OMPDECK_CTL_DIR` / `OMPDECK_CTL_PIPE`);
+  `StatusTarget.mux: Option<(Mux, String)>`; `Tmux::pane`, `Tmux::detect_on`; `AppConfig.session_backend`.
+- deck-term: `Remote`/`RemoteRx`/`RemoteTx` (`&self` methods returning `io::Result<()>`; `palette([[u8;3];19])`),
+  `RemoteEvent`, `Terminal::connect(Box<dyn Remote>, TermOptions, Context) -> Terminal`, `Terminal::is_displaced`,
+  `TermOptions.kitty_keyboard`, `KeyRules::Win32`, `encode_win32_key`, `encode_win32_modifiers`,
+  `encode_paste_win32`; `Terminal::spawn`/`SpawnSpec` are `cfg(unix)`. After `detach()`/`kill()` the Remote's
+  `recv` must return `Closed`/error promptly.

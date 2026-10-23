@@ -74,7 +74,7 @@ fn session_name_sanitization() {
 fn effective_cwd_falls_back_to_home_for_missing_dirs() {
     let d = tempfile::tempdir().unwrap();
     assert_eq!(effective_cwd(d.path()), d.path());
-    let fallback = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    let fallback = deck_core::platform::home_or_root();
     assert_eq!(effective_cwd(&d.path().join("gone")), fallback);
     let file = d.path().join("f");
     fs::write(&file, b"").unwrap();

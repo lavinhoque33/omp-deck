@@ -678,10 +678,12 @@ impl App {
             if let Some(r) = &mut self.sync.restore {
                 r.dlg.picking = pick == Pick::RestoreTarget;
             }
-            let start = self.home.clone().unwrap_or_else(|| PathBuf::from("/"));
+            let start = self
+                .home
+                .clone()
+                .unwrap_or_else(deck_core::platform::home_or_root);
             omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-                let path = transfer::picker_command(&start, transfer::on_path)
-                    .and_then(|p| transfer::run_picker(&p));
+                let path = transfer::pick_folder(&start);
                 AppEvent::Sync(SyncEvent::Picked { pick, path })
             });
         } else {

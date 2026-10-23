@@ -2,8 +2,7 @@
 
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -98,26 +97,7 @@ impl AccountStore {
     }
 }
 
-/// Writes `bytes` to `path` atomically (sibling temp file + rename), created mode 0600.
+/// Writes `bytes` to `path` atomically (sibling temp file + rename), created private (0600).
 pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir).map_err(io_err("cannot create", dir))?;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let write = || -> io::Result<()> {
-        let _ = fs::remove_file(&tmp);
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        fs::rename(&tmp, path)
-    };
-    write().map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        io_err("cannot write", path)(e)
-    })
+    crate::platform::write_private(path, bytes).map_err(io_err("cannot write", path))
 }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use deck_core::mux::Mux;
 use deck_core::status::{SessionStatus, StatusTarget, StatusWatcher, breadcrumb_path};
 use deck_core::tmux::Tmux;
 
@@ -76,7 +77,7 @@ fn watcher_follows_appends_publishes_only_changes_and_stops_promptly() {
     assert!(watcher.latest().is_none());
 
     let target = StatusTarget {
-        tmux: None,
+        mux: None,
         session: Some(session.clone()),
         cwd: dir.path().to_path_buf(),
     };
@@ -170,10 +171,14 @@ fn breadcrumb_overrides_target_session_only_when_not_stale() {
         String::from_utf8_lossy(&started.stderr)
     );
 
-    assert_eq!(tmux.pane_tty("omp-missing"), None);
-    let tty = tmux.pane_tty("omp-st").unwrap();
-    assert!(tty.starts_with("/dev/"), "{tty}");
-    let pane_start = tmux.pane_started("omp-st").unwrap();
+    assert_eq!(tmux.pane("omp-missing"), None);
+    let pane = tmux.pane("omp-st").unwrap();
+    assert!(
+        pane.breadcrumb_key.starts_with("pts-"),
+        "{}",
+        pane.breadcrumb_key
+    );
+    let pane_start = pane.started;
     let skew = |a: SystemTime, b: SystemTime| {
         a.duration_since(b)
             .unwrap_or_else(|e| e.duration())
@@ -181,7 +186,7 @@ fn breadcrumb_overrides_target_session_only_when_not_stale() {
     };
     assert!(skew(pane_start, before) < 5.0, "pane start ≈ now");
 
-    let crumb = breadcrumb_path(&agent, &tty);
+    let crumb = breadcrumb_path(&agent, &pane.breadcrumb_key);
     let write_crumb = |session: &Path, fresh: bool| {
         let fresh = if fresh { "fresh\n" } else { "" };
         fs::write(
@@ -197,7 +202,7 @@ fn breadcrumb_overrides_target_session_only_when_not_stale() {
 
     let (watcher, _updates) = watcher_with_counter(&agent);
     watcher.set_target(Some(StatusTarget {
-        tmux: Some((tmux.clone(), "omp-st".into())),
+        mux: Some((Mux::Tmux(tmux.clone()), "omp-st".into())),
         session: Some(known.clone()),
         cwd: dir.path().to_path_buf(),
     }));

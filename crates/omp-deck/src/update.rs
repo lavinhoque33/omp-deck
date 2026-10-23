@@ -9,6 +9,20 @@ use deck_core::omp::{UpdateKind, UpdateStatus};
 /// Background re-check cadence.
 pub const RECHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// Where OmpDeck looks for omp, for messages ("not found on …").
+pub const OMP_LOOKUP: &str = if cfg!(windows) {
+    "PATH or %LOCALAPPDATA%\\omp"
+} else {
+    "PATH or ~/.local/bin"
+};
+
+/// Where omp's official installer puts the binary.
+pub const OMP_INSTALL_DIR: &str = if cfg!(windows) {
+    "%LOCALAPPDATA%\\omp"
+} else {
+    "~/.local/bin"
+};
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum UpdateState {
     #[default]

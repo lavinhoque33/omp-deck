@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -335,6 +336,7 @@ fn credentials_prefer_runtime_values_and_need_a_client_id() {
 }
 
 #[test]
+#[cfg(unix)]
 fn account_file_is_private() {
     let tmp = tempfile::tempdir().unwrap();
     let store = AccountStore::at(tmp.path().join("cfg/google-drive.json"));
@@ -968,7 +970,9 @@ fn a_revoked_grant_signs_out() {
 
 mod project_sync {
     use std::collections::BTreeSet;
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
@@ -1141,6 +1145,7 @@ mod project_sync {
         write(&proj.join(".omp/AGENTS.md"), "remote rules\n");
         write(&proj.join(".omp/config.yml"), "a: 1\n");
         write(&proj.join(".omp/hooks/pre/run.sh"), "#!/bin/sh\n");
+        #[cfg(unix)]
         fs::set_permissions(
             proj.join(".omp/hooks/pre/run.sh"),
             fs::Permissions::from_mode(0o755),
@@ -1148,6 +1153,7 @@ mod project_sync {
         .unwrap();
         write(&proj.join(".omp/node_modules/dep/x.js"), "dep");
         write(&proj.join(".omp/.git/HEAD"), "ref");
+        #[cfg(unix)]
         symlink(proj.join(".omp/AGENTS.md"), proj.join(".omp/link.md")).unwrap();
 
         let out = w
@@ -1202,10 +1208,12 @@ mod project_sync {
             Err(Error::NothingToBackUp(_))
         ));
         let state_file = w.tmp.path().join("cfg/project-sync.json");
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&state_file).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert!(state_file.is_file());
         let state = w.service.project_state();
         assert_eq!(state.projects[&proj].parts, OMP);
         assert_eq!(state.projects[&proj].fingerprint, out.synced.fingerprint);
@@ -1239,11 +1247,14 @@ mod project_sync {
         assert_eq!(read(&target.join(".omp/AGENTS.md")), "remote rules\n");
         assert_eq!(read(&target.join(".omp/config.yml")), "a: 1\n");
         assert_eq!(read(&target.join(".omp/local-only.md")), "mine\n");
-        let mode = fs::metadata(target.join(".omp/hooks/pre/run.sh"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o111, 0o111, "exec bit kept");
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(target.join(".omp/hooks/pre/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "exec bit kept");
+        }
         assert!(
             !target.join(".omp/node_modules").exists() && !target.join(".omp/link.md").exists()
         );
@@ -2212,6 +2223,7 @@ mod project_sync {
     // ------------------------------------------------------------ links, skips, conflicts
 
     #[test]
+    #[cfg(unix)]
     fn symlinked_omp_and_artifact_dirs_are_never_followed() {
         let w = world();
         let outside = w.tmp.path().join("outside");
@@ -2251,6 +2263,7 @@ mod project_sync {
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlinked_artifact_folders_are_listed_as_skipped() {
         let w = world();
         let proj = w.tmp.path().join("proj");
@@ -2343,6 +2356,7 @@ mod project_sync {
     }
 
     #[test]
+    #[cfg(unix)]
     fn left_out_omp_entries_are_reported_with_reasons() {
         let w = world();
         let proj = w.tmp.path().join("proj");
@@ -2378,6 +2392,7 @@ mod project_sync {
     }
 
     #[test]
+    #[cfg(unix)]
     fn restore_never_writes_through_links_and_reports_clashes_in_the_plan() {
         let w = world();
         let proj = w.tmp.path().join("proj");

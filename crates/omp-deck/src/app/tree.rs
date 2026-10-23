@@ -295,7 +295,8 @@ impl App {
         })
     }
 
-    /// The tmux session running `session` while no tab shows it, when its control socket exists.
+    /// The session running `session` in a backend while no tab shows it, when its control
+    /// endpoint exists.
     fn tree_bg_key(&self, session: &Path) -> Option<String> {
         let snap = self.running.latest()?;
         let name = snap.holder(session).map(str::to_owned).or_else(|| {
@@ -303,10 +304,7 @@ impl App {
             let canonical = session_name_for(id);
             (snap.is_alive(&canonical) && snap.files_of(&canonical).is_empty()).then_some(canonical)
         })?;
-        ctl_dir(&self.ctl_ns, &name)
-            .join("ctl.sock")
-            .exists()
-            .then_some(name)
+        ctl_endpoint_exists(&ctl_dir(&self.ctl_ns, &name)).then_some(name)
     }
 
     fn tree_fork_gate(&self, session: &Path) -> Result<(), &'static str> {
@@ -559,7 +557,8 @@ impl App {
     fn tree_forked(&mut self, busy: &TreeBusy, file: PathBuf) {
         self.close_tree();
         let name = self
-            .tmux
+            .backends
+            .primary()
             .is_some()
             .then(|| new_session_name(SystemTime::now()));
         // Like every queued launch: focus only while the user has not switched tabs since asking.
@@ -570,7 +569,7 @@ impl App {
         };
         self.open_resolved_focus(
             ClosedTab {
-                tmux_name: name,
+                mux_name: name,
                 cwd: busy.cwd.clone(),
                 session_path: Some(file),
                 title: format!("{} (fork)", busy.title),
@@ -600,6 +599,16 @@ impl App {
     }
 }
 
+/// Whether a tab's control endpoint is up: its `ctl.sock` (Unix) or its named pipe (Windows,
+/// where the pipe name is the endpoint itself).
+fn ctl_endpoint_exists(dir: &Path) -> bool {
+    if cfg!(windows) {
+        dir.exists()
+    } else {
+        dir.join("ctl.sock").exists()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_tab_with_live_tmux_needs_its_control_socket_to_fork() {
+    fn closed_tab_with_a_live_session_needs_its_control_socket_to_fork() {
         assert_eq!(
             fork_route(&facts(TabFact::None, RunFact::Running { control: false })),
             Err(RUNNING)

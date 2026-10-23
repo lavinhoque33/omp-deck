@@ -2,6 +2,7 @@
 //! modifyOtherKeys 2. Socket `omp-deck-test-<pid>`; a Drop guard kills the server and removes
 //! its socket file (tmux leaves it behind).
 //! Skipped when tmux or python3 is absent.
+#![cfg(unix)]
 
 mod common;
 

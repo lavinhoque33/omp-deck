@@ -7,6 +7,7 @@
 //! definition set and owns the `term*` families.
 
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Command;
 
 use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
@@ -18,7 +19,8 @@ pub const NEUTRAL_FAMILY: &str = "ui-neutral";
 static GEIST: &[u8] = include_bytes!("../assets/fonts/Geist-VariableFont.ttf");
 static LUCIDE: &[u8] = include_bytes!("../assets/fonts/lucide.ttf");
 
-/// Candidates in preference order: (fontconfig family, well-known file paths).
+/// Candidates in preference order: (family, well-known file paths).
+#[cfg(unix)]
 const CANDIDATES: &[(&str, &[&str])] = &[
     (
         "Adwaita Sans",
@@ -37,7 +39,15 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Windows system UI faces, newest first (`SegUIVar` ships with Windows 11).
+#[cfg(not(unix))]
+const CANDIDATES: &[(&str, &[&str])] = &[
+    ("Segoe UI Variable", &[r"C:\Windows\Fonts\SegUIVar.ttf"]),
+    ("Segoe UI", &[r"C:\Windows\Fonts\segoeui.ttf"]),
+    ("Segoe UI Symbol", &[r"C:\Windows\Fonts\seguisym.ttf"]),
+];
 /// `fc-match` hit whose family really is `family` (fc-match always answers with *something*).
+#[cfg(unix)]
 fn fc_lookup(family: &str) -> Option<PathBuf> {
     let out = Command::new("fc-match")
         .args(["-f", "%{family}\n%{file}", family])
@@ -48,6 +58,12 @@ fn fc_lookup(family: &str) -> Option<PathBuf> {
     fam.split(',')
         .any(|f| f.trim().eq_ignore_ascii_case(family))
         .then(|| PathBuf::from(file.trim()))
+}
+
+/// No fontconfig on Windows: only the well-known file paths are probed.
+#[cfg(not(unix))]
+fn fc_lookup(_family: &str) -> Option<PathBuf> {
+    None
 }
 
 fn load_one(family: &str, paths: &[&str]) -> Option<Vec<u8>> {

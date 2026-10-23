@@ -14,7 +14,9 @@ pub fn normalize(text: &str, home: Option<&Path>, base: &Path) -> PathBuf {
     let text = text.trim();
     let expanded = match (text, home) {
         ("~", Some(h)) => h.to_path_buf(),
-        (t, Some(h)) if t.starts_with("~/") => h.join(&t[2..]),
+        (t, Some(h)) if t.starts_with("~/") || (cfg!(windows) && t.starts_with("~\\")) => {
+            h.join(&t[2..])
+        }
         (t, _) => PathBuf::from(t),
     };
     let absolute = if expanded.is_absolute() {
@@ -96,6 +98,7 @@ mod tests {
         assert_eq!(normalize("~/x", None, base), Path::new("/cwd/~/x"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_requires_an_existing_directory_and_follows_symlinks() {
         let dir = tempfile::tempdir().expect("tempdir");

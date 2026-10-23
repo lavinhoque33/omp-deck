@@ -1,5 +1,6 @@
 //! Headless PTY tests: real `sh -c` children through `Terminal` (and `TerminalView` driven by a
 //! hidden egui::Context). Every wait is bounded.
+#![cfg(unix)]
 
 mod common;
 

@@ -13,11 +13,22 @@ alacritty_terminal.workspace = true
 arboard.workspace = true
 thiserror.workspace = true
 log.workspace = true
-# Same version alacritty_terminal 0.26 uses: its EventedReadWrite trait takes polling types.
-polling = "3.11"
 # Kitty graphics decoding; the versions eframe already pulls in.
 png = "0.18"
 miniz_oxide = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+# Same version alacritty_terminal 0.26 uses: its EventedReadWrite trait takes polling types.
+polling = "3.11"
+
+[target.'cfg(windows)'.dependencies]
+# MapVirtualKeyW/VkKeyScanW (win32-input-mode), installed-fonts registry, Windows dir.
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

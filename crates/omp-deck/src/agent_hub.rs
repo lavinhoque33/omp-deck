@@ -981,7 +981,7 @@ fn link_note(ui: &mut Ui, ctl: &CtlView<'_>, out: &mut Vec<HubAction>) {
         }
         Link::Ended => {
             "Statuses come from session files. This session is no longer running (omp \
-             exited or its tmux server went away)."
+             exited or its session backend went away)."
         }
         Link::Live | Link::Connecting => return,
     };

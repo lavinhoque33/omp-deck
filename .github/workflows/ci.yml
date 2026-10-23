@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -29,3 +28,117 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build host and app
+        run: cargo build -p deck-host -p omp-deck
+
+      # conpty.dll + OpenConsole.exe next to omp-deck-host.exe so the host (and the tests that spawn it)
+      # sideload the pinned ConPTY instead of the inbox one.
+      - name: Fetch ConPTY
+        run: ./packaging/windows/fetch-conpty.ps1 -OutDir target/debug -Arch x64
+
+      - run: cargo test --workspace
+
+      - name: Install omp
+        run: |
+          & ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary
+          $ompDir = Join-Path $env:LOCALAPPDATA 'omp'
+          if (-not (Test-Path (Join-Path $ompDir 'omp.exe'))) { throw "omp.exe not found in $ompDir" }
+          # The installer edits the user PATH; later steps need it in this job's PATH.
+          $ompDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & (Join-Path $ompDir 'omp.exe') --version
+
+      - name: Host smoke (omp in ConPTY)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $host_exe = (Resolve-Path 'target/debug/omp-deck-host.exe').Path
+          # Same PATH the previous step appended to GITHUB_PATH (not applied to the current step).
+          $env:PATH = (Join-Path $env:LOCALAPPDATA 'omp') + ';' + $env:PATH
+
+          & $host_exe new e2e -- omp
+          if ($LASTEXITCODE -ne 0) { throw "omp-deck-host new failed ($LASTEXITCODE)" }
+          Start-Sleep -Seconds 8
+
+          $dump = (& $host_exe dump e2e 2>&1 | Out-String)
+          Write-Host "---- dump e2e ----"
+          Write-Host $dump
+          Write-Host "---- end dump ----"
+          $dumpExit = $LASTEXITCODE
+          if ($dumpExit -ne 0) { throw "omp-deck-host dump failed ($dumpExit)" }
+          if ([string]::IsNullOrWhiteSpace($dump)) { throw "dump of e2e is empty: omp produced no output in 8 s" }
+
+          & $host_exe kill e2e
+          if ($LASTEXITCODE -ne 0) { throw "omp-deck-host kill failed ($LASTEXITCODE)" }
+
+          $ls = (& $host_exe ls 2>&1 | Out-String)
+          Write-Host "---- ls ----"
+          Write-Host $ls
+          if ($ls -match '(?m)\be2e\b') { throw "e2e still listed after kill" }
+
+      - name: GUI screenshot
+        # Hosted runners have no GPU; the software-rendered window may fail on some images, so this step
+        # reports but does not gate the job. The screenshot artifact shows what happened.
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $empty = Join-Path $env:RUNNER_TEMP 'empty-sessions'
+          New-Item -ItemType Directory -Force -Path $empty | Out-Null
+          $shot = Join-Path $PWD 'shot.png'
+          Remove-Item -Force -ErrorAction SilentlyContinue $shot
+          $p = Start-Process -FilePath (Resolve-Path 'target/debug/omp-deck.exe').Path `
+            -ArgumentList @('--sessions-root', $empty, '--screenshot', $shot, '--screenshot-after', '6') `
+            -PassThru
+          if (-not $p.WaitForExit(90000)) {
+            $p.Kill($true)
+            throw "omp-deck did not exit within 90 s"
+          }
+          Write-Host "omp-deck exited with $($p.ExitCode)"
+          if (-not (Test-Path $shot)) { throw "screenshot was not written" }
+          Write-Host ("shot.png: {0} bytes" -f (Get-Item $shot).Length)
+
+      - name: Stop leftover host sessions
+        if: always()
+        run: |
+          $exe = 'target/debug/omp-deck-host.exe'
+          if (Test-Path $exe) { & $exe kill e2e 2>&1 | Out-Null }
+          $global:LASTEXITCODE = 0
+
+      - name: Collect host logs
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path host-logs | Out-Null
+          $src = Join-Path $env:LOCALAPPDATA 'omp-deck\host'
+          if (Test-Path $src) { Copy-Item -Recurse -Force "$src\*" host-logs }
+          New-Item -ItemType File -Force -Path host-logs\.keep | Out-Null
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-screenshot
+          path: shot.png
+          if-no-files-found: warn
+
+      - name: Upload host logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-host-logs
+          path: host-logs/**
+          include-hidden-files: true
+          if-no-files-found: warn

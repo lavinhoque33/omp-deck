@@ -2,15 +2,9 @@
 //! the chat draft turns into a message, and the per-agent request bookkeeping the widgets read.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::time::Duration;
 
-use deck_core::ctl::{LiveStatus, ctl_dir, with_ctl};
-
-/// An omp argv that loads the control extension and listens on the socket of tab `key`.
-pub fn ctl_argv(omp_argv: &[String], ext: &Path, namespace: &str, key: &str) -> Vec<String> {
-    with_ctl(omp_argv, ext, &ctl_dir(namespace, key))
-}
+use deck_core::ctl::LiveStatus;
 
 /// How long a tab launched with the extension may take to open its socket before it counts as
 /// read-only (omp itself needs a moment to start).
@@ -30,7 +24,7 @@ pub enum Link {
     ReadOnly,
     /// Had live control, but the connection is gone while the tab still runs.
     Lost,
-    /// The tab's process exited (tmux server gone, omp quit, ...).
+    /// The tab's process exited (the session ended, omp quit, ...).
     Ended,
 }
 
@@ -41,7 +35,7 @@ pub struct LinkFacts {
     /// The socket was connected at some point.
     pub seen: bool,
     /// How long the tab has been waiting for a socket; `None` when no socket is expected (an
-    /// attach to an existing tmux session, or no extension).
+    /// attach to an existing session, or no extension).
     pub waited: Option<Duration>,
 }
 
@@ -62,7 +56,7 @@ pub fn link_state(f: &LinkFacts) -> Link {
 /// The "Restart session with live control" action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Restart {
-    /// Not applicable (connected, no tmux, no session file, no extension).
+    /// Not applicable (connected, no backend, no session file, no extension).
     Hidden,
     /// Offered, but omp is busy (restarting would abort its turn).
     Busy,
@@ -71,7 +65,7 @@ pub enum Restart {
 
 pub struct RestartFacts {
     pub link: Link,
-    pub tmux: bool,
+    pub backend: bool,
     pub has_session_file: bool,
     pub extension: bool,
     /// The tab's activity is exactly idle.
@@ -79,7 +73,7 @@ pub struct RestartFacts {
 }
 
 pub fn restart_offer(f: &RestartFacts) -> Restart {
-    if f.link != Link::ReadOnly || !f.tmux || !f.has_session_file || !f.extension {
+    if f.link != Link::ReadOnly || !f.backend || !f.has_session_file || !f.extension {
         Restart::Hidden
     } else if f.idle {
         Restart::Ready
@@ -252,10 +246,10 @@ mod tests {
     }
 
     #[test]
-    fn restart_is_offered_only_to_read_only_idle_tmux_tabs_with_a_file() {
+    fn restart_is_offered_only_to_read_only_idle_backend_tabs_with_a_file() {
         let base = RestartFacts {
             link: Link::ReadOnly,
-            tmux: true,
+            backend: true,
             has_session_file: true,
             extension: true,
             idle: true,
@@ -286,7 +280,7 @@ mod tests {
                 ..base
             },
             RestartFacts {
-                tmux: false,
+                backend: false,
                 ..base
             },
             RestartFacts {
@@ -342,26 +336,5 @@ mod tests {
         assert!(composer_hint(Some(LiveStatus::Running)).contains("Steer"));
         assert!(composer_hint(Some(LiveStatus::Parked)).contains("wake"));
         assert!(composer_hint(Some(LiveStatus::Idle)).contains("Message"));
-    }
-
-    #[test]
-    fn launch_argv_loads_the_extension_for_the_tabs_socket() {
-        let argv: Vec<String> = ["omp", "--resume", "/s/a.jsonl"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        let wrapped = ctl_argv(&argv, Path::new("/d/ompdeck-ctl.ts"), "omp-deck", "omp-abc");
-        assert_eq!(wrapped[0], "env");
-        assert!(wrapped[1].starts_with("OMPDECK_CTL_DIR="));
-        let dir = ctl_dir("omp-deck", "omp-abc");
-        assert_eq!(
-            wrapped[1],
-            format!("OMPDECK_CTL_DIR={}", dir.display()),
-            "the key maps to its hashed control dir"
-        );
-        assert_eq!(
-            &wrapped[2..],
-            ["omp", "-e", "/d/ompdeck-ctl.ts", "--resume", "/s/a.jsonl"]
-        );
     }
 }

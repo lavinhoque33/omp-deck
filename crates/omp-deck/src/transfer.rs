@@ -38,7 +38,9 @@ pub fn expand_tilde(text: &str, home: Option<&Path>) -> PathBuf {
     let t = text.trim();
     match (t, home) {
         ("~", Some(h)) => h.to_path_buf(),
-        (_, Some(h)) if t.starts_with("~/") => h.join(t.get(2..).unwrap_or_default()),
+        (_, Some(h)) if t.starts_with("~/") || (cfg!(windows) && t.starts_with("~\\")) => {
+            h.join(t.get(2..).unwrap_or_default())
+        }
         _ => PathBuf::from(t),
     }
 }
@@ -69,6 +71,7 @@ pub fn check_dest_fs(path: &Path, src_cwd: &Path) -> Result<(), String> {
 }
 
 /// Native directory picker available on this machine.
+#[cfg(not(windows))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Picker {
     pub program: &'static str,
@@ -76,7 +79,8 @@ pub struct Picker {
 }
 
 /// `kdialog --getexistingdirectory <start>`, else `zenity --file-selection --directory`.
-pub fn picker_command(start: &Path, have: impl Fn(&str) -> bool) -> Option<Picker> {
+#[cfg(not(windows))]
+fn picker_command(start: &Path, have: impl Fn(&str) -> bool) -> Option<Picker> {
     let start = start.to_string_lossy().into_owned();
     if have("kdialog") {
         Some(Picker {
@@ -102,17 +106,31 @@ pub fn picker_command(start: &Path, have: impl Fn(&str) -> bool) -> Option<Picke
     }
 }
 
-pub fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|d| {
-            let p = d.join(program);
-            p.is_file()
-        })
-    })
+/// Whether a native folder dialog exists: the system dialog on Windows, else kdialog or zenity.
+pub fn picker_available() -> bool {
+    cfg!(windows) || has_program("kdialog") || has_program("zenity")
+}
+
+fn has_program(name: &str) -> bool {
+    deck_core::platform::find_on_path(name).is_some()
+}
+
+/// Asks for a folder, starting in `start`. Blocks until the dialog closes: call from a worker.
+/// `None` = cancelled (or no dialog available).
+pub fn pick_folder(start: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        rfd::FileDialog::new().set_directory(start).pick_folder()
+    }
+    #[cfg(not(windows))]
+    {
+        picker_command(start, has_program).and_then(|p| run_picker(&p))
+    }
 }
 
 /// Runs the picker (blocks until the dialog closes: call from a worker). `None` = cancelled.
-pub fn run_picker(picker: &Picker) -> Option<PathBuf> {
+#[cfg(not(windows))]
+fn run_picker(picker: &Picker) -> Option<PathBuf> {
     let out = std::process::Command::new(picker.program)
         .args(&picker.args)
         .stdin(std::process::Stdio::null())
@@ -192,7 +210,7 @@ impl FolderDialog {
             _ => None,
         }
         .or_else(|| home.map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("/"))
+        .unwrap_or_else(deck_core::platform::home_or_root)
     }
 
     /// New text: the lexical check runs now; the filesystem check is queued for a worker
@@ -439,6 +457,7 @@ mod tests {
         assert!(matches!(dlg.checked, Checked::Invalid(_)));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn picker_prefers_kdialog_then_zenity() {
         let start = Path::new("/home/u");

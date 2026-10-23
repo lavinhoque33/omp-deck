@@ -56,7 +56,7 @@ refresh_caches() {
 }
 
 if [ "$uninstall" -eq 1 ]; then
-    rm -f "$bin_dir/$APP" "$apps_dir/$APP.desktop" "$icon_root/scalable/apps/$APP.svg"
+    rm -f "$bin_dir/$APP" "$bin_dir/$APP-host" "$apps_dir/$APP.desktop" "$icon_root/scalable/apps/$APP.svg"
     for s in $SIZES; do
         rm -f "$icon_root/${s}x${s}/apps/$APP.png"
     done
@@ -129,6 +129,10 @@ fi
 
 mkdir -p "$bin_dir" "$apps_dir"
 install -m 0755 "$src/$APP" "$bin_dir/$APP"
+# Session host daemon (no-tmux fallback); releases before it existed do not ship it.
+if [ -x "$src/$APP-host" ]; then
+    install -m 0755 "$src/$APP-host" "$bin_dir/$APP-host"
+fi
 
 # The desktop entry needs an absolute Exec so launchers work even when ~/.local/bin is not on PATH.
 sed -e "s|^Exec=.*|Exec=$bin_dir/$APP %f|" -e "s|^TryExec=.*|TryExec=$bin_dir/$APP|" \

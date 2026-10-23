@@ -7,7 +7,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,13 +18,16 @@ use std::time::{Duration, Instant, SystemTime};
 use memchr::{memchr, memmem};
 use serde::Deserialize;
 
-use crate::tmux::Tmux;
+use crate::mux::Mux;
+use crate::platform::{self, FileId};
 
 // ---------------------------------------------------------------------------------------------
 // Breadcrumb
 
-/// `<agent_dir>/terminal-sessions/<tty with "/dev/" stripped, "/"→"-">`: omp writes it on every
-/// session start/switch (`/new`, `/fork`, `/resume`, `/move`), so it names the pane's current file.
+/// `<agent_dir>/terminal-sessions/<key>`: omp writes it on every session start/switch (`/new`,
+/// `/fork`, `/resume`, `/move`), so it names the pane's current file. The key is omp's terminal
+/// id: the tty minus `/dev/` with `/`→`-` (`pts-6`), or `apple-<TERM_SESSION_ID>` where there is
+/// no tty (the OmpDeck host on Windows).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Breadcrumb {
     pub cwd: PathBuf,
@@ -34,18 +36,30 @@ pub struct Breadcrumb {
     pub fresh: bool,
 }
 
-/// Path of the breadcrumb file for `tty` (`/dev/pts/6` → `terminal-sessions/pts-6`).
-pub fn breadcrumb_path(agent_dir: &Path, tty: &str) -> PathBuf {
-    let name = tty.strip_prefix("/dev/").unwrap_or(tty).replace('/', "-");
-    agent_dir.join("terminal-sessions").join(name)
+/// The breadcrumb key omp derives from a tty path: `/dev/pts/6` → `pts-6`.
+pub fn breadcrumb_key_for_tty(tty: &str) -> String {
+    tty.strip_prefix("/dev/").unwrap_or(tty).replace('/', "-")
 }
 
-/// Reads and parses the breadcrumb of `tty`; `None` if missing or malformed.
-pub fn read_breadcrumb(agent_dir: &Path, tty: &str) -> Option<Breadcrumb> {
-    if tty.trim().is_empty() {
+/// The breadcrumb key omp derives from `TERM_SESSION_ID` when stdin is no tty: `apple-<id>`.
+pub fn breadcrumb_key_for_term_session(id: &str) -> String {
+    format!("apple-{id}")
+}
+
+/// Path of the breadcrumb file for `key`. A raw tty path is accepted too and normalised
+/// (`/dev/pts/6` → `terminal-sessions/pts-6`); an already derived key passes through unchanged.
+pub fn breadcrumb_path(agent_dir: &Path, key: &str) -> PathBuf {
+    agent_dir
+        .join("terminal-sessions")
+        .join(breadcrumb_key_for_tty(key))
+}
+
+/// Reads and parses the breadcrumb of `key`; `None` if missing or malformed.
+pub fn read_breadcrumb(agent_dir: &Path, key: &str) -> Option<Breadcrumb> {
+    if key.trim().is_empty() {
         return None;
     }
-    let text = fs::read_to_string(breadcrumb_path(agent_dir, tty)).ok()?;
+    let text = fs::read_to_string(breadcrumb_path(agent_dir, key)).ok()?;
     parse_breadcrumb(&text)
 }
 
@@ -64,20 +78,20 @@ pub fn parse_breadcrumb(text: &str) -> Option<Breadcrumb> {
     })
 }
 
-/// The breadcrumb for `tty`, unless it predates the pane's process (a stale file left by a
+/// The breadcrumb for `key`, unless it predates the pane's process (a stale file left by a
 /// previous owner of the same pty). omp does not rewrite an unchanged breadcrumb when a tab
 /// restarts with `--resume` on the same session, so an older file is still trusted when it names
 /// the session the tab already knows (`known`). A little slack covers clock-tick rounding of the
 /// process start time.
-fn trusted_breadcrumb(
+pub(crate) fn trusted_breadcrumb(
     agent_dir: &Path,
-    tty: &str,
+    key: &str,
     pane_started: Option<SystemTime>,
     known: Option<&Path>,
 ) -> Option<Breadcrumb> {
-    let crumb = read_breadcrumb(agent_dir, tty)?;
+    let crumb = read_breadcrumb(agent_dir, key)?;
     let modified = pane_started.and_then(|_| {
-        fs::metadata(breadcrumb_path(agent_dir, tty))
+        fs::metadata(breadcrumb_path(agent_dir, key))
             .ok()?
             .modified()
             .ok()
@@ -149,7 +163,7 @@ struct Titles {
 
 pub struct SessionStatsReader {
     path: PathBuf,
-    file_id: Option<(u64, u64)>,
+    file_id: Option<FileId>,
     parsed_to: u64,
     stats: SessionStats,
     titles: Titles,
@@ -176,13 +190,13 @@ impl SessionStatsReader {
 
     /// Reads what changed since the last call. `Ok(true)` if the stats changed.
     ///
-    /// Keyed on (dev, ino): a different inode or a file shorter than what was parsed starts over.
+    /// Keyed on the file's identity: a different file or a file shorter than what was parsed starts over.
     /// Complete lines appended since last time are applied; a half-written last line waits for
     /// its newline. Line 0 (the in-place rewritten title slot) is re-read every call.
     pub fn refresh(&mut self) -> io::Result<bool> {
         let mut file = File::open(&self.path)?;
         let md = file.metadata()?;
-        let id = (md.dev(), md.ino());
+        let id = platform::file_identity(&file)?;
         let len = md.len();
         let mut changed = false;
         if self.file_id != Some(id) || len < self.parsed_to {
@@ -551,7 +565,7 @@ fn run_capture(
     timeout: Duration,
     cancel: Option<&AtomicBool>,
 ) -> Option<Vec<u8>> {
-    let mut child = cmd
+    let mut child = platform::no_window(&mut cmd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -668,17 +682,6 @@ pub fn parse_git_status_v2(out: &str) -> Option<GitInfo> {
     have_head.then_some(info)
 }
 
-/// Executable named `name` somewhere on `PATH`.
-fn on_path(name: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|d| {
-            fs::metadata(d.join(name))
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
-    })
-}
-
 /// Default branch of the repo at `cwd` from `refs/remotes/origin/HEAD`, if known.
 fn default_branch(cwd: &Path, cancel: &AtomicBool) -> Option<String> {
     let mut cmd = Command::new("git");
@@ -726,8 +729,8 @@ const GIT_INTERVAL: Duration = Duration::from_secs(3);
 /// What the watcher follows: the ACTIVE tab only.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusTarget {
-    /// The tab's tmux client + session name (None in direct mode).
-    pub tmux: Option<(Tmux, String)>,
+    /// The tab's multiplexer backend + session name (None in direct mode).
+    pub mux: Option<(Mux, String)>,
     /// The tab's known session file; used when no trustworthy breadcrumb exists.
     pub session: Option<PathBuf>,
     pub cwd: PathBuf,
@@ -851,8 +854,6 @@ struct Worker {
     target: Option<StatusTarget>,
     reader: Option<SessionStatsReader>,
     stats: SessionStats,
-    /// `(tty, pane process start)`; the start is looked up once per tty.
-    pane: Option<(String, Option<SystemTime>)>,
     session: Option<PathBuf>,
     fresh: bool,
     cwd: PathBuf,
@@ -870,12 +871,11 @@ impl Worker {
             shared,
             agent_dir,
             on_update,
-            gh: on_path("gh"),
+            gh: platform::find_on_path("gh").is_some(),
             generation: 0,
             target: None,
             reader: None,
             stats: SessionStats::default(),
-            pane: None,
             session: None,
             fresh: false,
             cwd: PathBuf::new(),
@@ -939,7 +939,6 @@ impl Worker {
     fn reset(&mut self) {
         self.reader = None;
         self.stats = SessionStats::default();
-        self.pane = None;
         self.session = None;
         self.fresh = false;
         self.git = None;
@@ -973,24 +972,18 @@ impl Worker {
         let mut session = target.session.clone();
         let mut cwd = target.cwd.clone();
         let mut fresh = false;
-        if let Some((tmux, name)) = &target.tmux
-            && let Some(tty) = tmux.pane_tty(name)
+        if let Some((mux, name)) = &target.mux
+            && let Some(pane) = mux.pane(name)
+            && let Some(b) = trusted_breadcrumb(
+                &self.agent_dir,
+                &pane.breadcrumb_key,
+                Some(pane.started),
+                target.session.as_deref(),
+            )
         {
-            let started = match &self.pane {
-                Some((t, s)) if *t == tty => *s,
-                _ => {
-                    let s = tmux.pane_started(name);
-                    self.pane = Some((tty.clone(), s));
-                    s
-                }
-            };
-            if let Some(b) =
-                trusted_breadcrumb(&self.agent_dir, &tty, started, target.session.as_deref())
-            {
-                session = Some(b.session);
-                cwd = b.cwd;
-                fresh = b.fresh;
-            }
+            session = Some(b.session);
+            cwd = b.cwd;
+            fresh = b.fresh;
         }
         self.fresh = fresh;
         self.cwd = cwd;
@@ -1093,6 +1086,32 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn breadcrumb_keys_for_both_terminal_forms() {
+        assert_eq!(breadcrumb_key_for_tty("/dev/pts/6"), "pts-6");
+        assert_eq!(breadcrumb_key_for_tty("/dev/ttys003"), "ttys003");
+        assert_eq!(
+            breadcrumb_key_for_tty("pts-6"),
+            "pts-6",
+            "a derived key passes through"
+        );
+        assert_eq!(
+            breadcrumb_key_for_term_session("0123456789abcdef"),
+            "apple-0123456789abcdef"
+        );
+        let agent = Path::new("/a");
+        assert_eq!(
+            breadcrumb_path(agent, "/dev/pts/6"),
+            agent.join("terminal-sessions").join("pts-6")
+        );
+        assert_eq!(
+            breadcrumb_path(agent, "apple-0123456789abcdef"),
+            agent
+                .join("terminal-sessions")
+                .join("apple-0123456789abcdef")
+        );
+    }
+
     use super::*;
     use std::io::Write;
 
@@ -1270,9 +1289,9 @@ mod tests {
         slot.extend_from_slice(b"\"}\n");
         assert_eq!(slot.len(), 256);
         {
-            use std::os::unix::fs::FileExt;
-            let f = fs::OpenOptions::new().write(true).open(&p).unwrap();
-            f.write_all_at(&slot, 0).unwrap();
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.write_all(&slot).unwrap();
         }
         assert!(r.refresh().unwrap());
         assert_eq!(r.stats().title.as_deref(), Some("🖥️ DECK: Neuer Titel"));

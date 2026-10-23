@@ -610,6 +610,7 @@ fn transcript_watcher_follows_appends_and_bumps_revision() {
 }
 
 #[test]
+#[cfg(unix)]
 fn symlinked_and_fifo_transcripts_are_ignored_without_hanging() {
     let (d, session) = store();
     let dir = d.path().join("sess");

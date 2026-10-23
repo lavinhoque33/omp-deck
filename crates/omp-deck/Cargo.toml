@@ -13,6 +13,7 @@ readme.workspace = true
 [dependencies]
 deck-core.workspace = true
 deck-term.workspace = true
+deck-host.workspace = true
 eframe.workspace = true
 egui.workspace = true
 serde.workspace = true
@@ -24,6 +25,14 @@ env_logger.workspace = true
 egui_commonmark.workspace = true
 # Hidden `--screenshot` flag encodes the egui screenshot; png 0.18 is already in the lockfile via eframe.
 png = "0.18"
+
+[target.'cfg(windows)'.dependencies]
+# Native folder dialog (the Unix builds shell out to kdialog / zenity); no async runtime needed.
+rfd = { version = "0.16", default-features = false }
+
+[build-dependencies]
+# Windows: the app icon and version resource of the .exe (a no-op on other targets).
+embed-resource = "3"
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -42,6 +51,7 @@ recommends = "tmux"
 license-file = ["../../LICENSE-MIT", "0"]
 assets = [
     ["target/release/omp-deck", "usr/bin/omp-deck", "755"],
+    ["target/release/omp-deck-host", "usr/bin/omp-deck-host", "755"],
     ["../../packaging/omp-deck.desktop", "usr/share/applications/omp-deck.desktop", "644"],
     ["../../packaging/icons/omp-deck.svg", "usr/share/icons/hicolor/scalable/apps/omp-deck.svg", "644"],
     ["../../packaging/icons/omp-deck-16.png", "usr/share/icons/hicolor/16x16/apps/omp-deck.png", "644"],
@@ -65,6 +75,7 @@ summary = "Desktop wrapper for the omp coding-agent TUI"
 url = "https://github.com/lavinhoque33/omp-deck"
 assets = [
     { source = "../../target/release/omp-deck", dest = "/usr/bin/omp-deck", mode = "755" },
+    { source = "../../target/release/omp-deck-host", dest = "/usr/bin/omp-deck-host", mode = "755" },
     { source = "../../packaging/omp-deck.desktop", dest = "/usr/share/applications/omp-deck.desktop", mode = "644" },
     { source = "../../packaging/icons/omp-deck.svg", dest = "/usr/share/icons/hicolor/scalable/apps/omp-deck.svg", mode = "644" },
     { source = "../../packaging/icons/omp-deck-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/omp-deck.png", mode = "644" },

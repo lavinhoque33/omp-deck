@@ -1,22 +1,39 @@
 //! Live subagent control: the in-process omp extension (`assets/ompdeck-ctl.ts`) serves NDJSON on a
-//! unix socket; [`CtlClient`] connects to it on its own thread. Protocol facts:
+//! unix socket (Unix) or a named pipe (Windows); [`CtlClient`] connects to it on its own thread.
+//! A tab's endpoint is a [`ctl_dir`]: a private directory holding `ctl.sock` on Unix, the pipe
+//! name `\\.\pipe\ompdeck-ctl.<user>.<namespace>.<leaf>` on Windows. Protocol facts:
 //! `docs/notes/omp-control-ext.md`.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Deserialize;
 
-/// The extension source: loaded with `omp -e <file>`, inert unless `OMPDECK_CTL_DIR` is set.
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
+use unix as os;
+#[cfg(windows)]
+use windows as os;
+
+#[cfg(unix)]
+pub use unix::{ctl_dir, prepare_ctl_dir, proc_start_time, prune_ctl_dirs};
+#[cfg(windows)]
+pub use windows::{ctl_dir, prepare_ctl_dir, prune_ctl_dirs};
+
+/// The extension source: loaded with `omp -e <file>`, inert unless `OMPDECK_CTL_DIR` (Unix) or
+/// `OMPDECK_CTL_PIPE` (Windows) is set.
 pub const EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-ctl.ts");
 
 /// The session-delete extension (see [`crate::omp::Omp::delete_session`]): inert unless
@@ -25,8 +42,6 @@ pub const DELETE_EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-del.ts
 
 const EXTENSION_FILE: &str = "ompdeck-ctl.ts";
 const DELETE_EXTENSION_FILE: &str = "ompdeck-del.ts";
-const SOCKET_FILE: &str = "ctl.sock";
-const LOCK_FILE: &str = "ctl.lock";
 /// Longest accepted protocol line; longer ones are dropped.
 const MAX_LINE: usize = 8 * 1024 * 1024;
 const PROTOCOL_VERSION: u32 = 1;
@@ -34,13 +49,6 @@ const BACKOFF_START: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(2);
 /// Read/poll granularity: bounds how long the thread takes to notice shutdown or queued commands.
 const POLL: Duration = Duration::from_millis(50);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// True when `path` is (no-follow) a regular file owned by the euid with mode exactly 0600.
-fn is_private_regular_file(path: &Path, euid: u32) -> bool {
-    fs::symlink_metadata(path)
-        .is_ok_and(|m| m.file_type().is_file() && m.uid() == euid && m.mode() & 0o777 == 0o600)
-}
 
 /// Writes the extension to `<dir>/ompdeck-ctl.ts` if missing, different, or not a private (0600,
 /// euid-owned) regular non-symlink file; returns the path. Anything else at the path (a symlink, a
@@ -57,36 +65,17 @@ pub fn install_delete_extension(dir: &Path) -> io::Result<PathBuf> {
 fn install_asset(dir: &Path, file: &str, source: &str) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let path = dir.join(file);
+    if os::asset_is_current(&path, source)? {
+        return Ok(path);
+    }
     let mut tmp = tempfile::Builder::new()
         .prefix(".ompdeck-ext")
         .tempfile_in(dir)?;
-    // The temp file was just created by this process, so its owner is the effective uid.
-    let me = match euid() {
-        Some(u) => u,
-        None => tmp.as_file().metadata()?.uid(),
-    };
-    if is_private_regular_file(&path, me) && fs::read(&path).is_ok_and(|b| b == source.as_bytes()) {
-        return Ok(path);
-    }
     tmp.write_all(source.as_bytes())?;
-    tmp.as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    os::seal_asset(tmp.path())?;
     tmp.persist(&path).map_err(|e| e.error)?;
     Ok(path)
 }
-
-/// The effective uid, from the `Uid:` line of `/proc/self/status` (real, effective, saved, fs).
-fn euid() -> Option<u32> {
-    static EUID: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| {
-        let status = fs::read_to_string("/proc/self/status").ok()?;
-        let line = status.lines().find_map(|l| l.strip_prefix("Uid:"))?;
-        line.split_whitespace().nth(1)?.parse().ok()
-    });
-    *EUID
-}
-
-/// `sockaddr_un.sun_path` capacity including the trailing NUL.
-const SUN_PATH_MAX: usize = 108;
 
 /// Stable 64-bit FNV-1a: ctl leaf names must not change across builds or runs.
 fn key_hash(key: &str) -> u64 {
@@ -100,30 +89,6 @@ fn key_hash(key: &str) -> u64 {
 
 fn leaf_name(key: &str) -> String {
     format!("{:016x}", key_hash(key))
-}
-
-/// Real directory (no-follow), owned by `euid`, not group/other-writable.
-fn private_dir(m: &fs::Metadata, euid: u32) -> bool {
-    m.file_type().is_dir() && m.uid() == euid && m.mode() & 0o022 == 0
-}
-
-/// The directory that holds all ctl leaves: `$XDG_RUNTIME_DIR/omp-deck/ctl` when that variable is
-/// set, absolute, owned by the euid and not group/other-writable; else `$XDG_CACHE_HOME/omp-deck/ctl`.
-fn ctl_root() -> PathBuf {
-    if let (Some(rt), Some(me)) = (
-        std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()),
-        euid(),
-    ) {
-        let rt = PathBuf::from(rt);
-        if rt.is_absolute() && fs::metadata(&rt).is_ok_and(|m| private_dir(&m, me)) {
-            return rt.join("omp-deck").join("ctl");
-        }
-    }
-    // No cache dir at all yields a relative path, which `prepare_ctl_dir` rejects.
-    dirs::cache_dir()
-        .unwrap_or_default()
-        .join("omp-deck")
-        .join("ctl")
 }
 
 /// Directory component for a tmux socket name (or `direct`): ASCII alnum/`.`/`_`/`-` kept, anything
@@ -155,230 +120,21 @@ fn namespace_component(ns: &str) -> String {
     format!("{prefix}-{fold:08x}")
 }
 
-/// `<ctl root>/<namespace>/<16 hex of a stable 64-bit hash of key>`; socket = `<dir>/ctl.sock`.
-/// `namespace` is the tmux socket name (`omp-deck`, `omp-deck-test-…`) or `direct`, so instances on
-/// different sockets never share (or prune) each other's leaves. `key` is the tmux session name or a
-/// direct-mode tab key. Pure apart from validating `$XDG_RUNTIME_DIR`.
-pub fn ctl_dir(namespace: &str, key: &str) -> PathBuf {
-    ctl_root()
-        .join(namespace_component(namespace))
-        .join(leaf_name(key))
+/// `\\.\pipe\ompdeck-ctl.<user>.<namespace>.<leaf>` for a tab: `user` separates users of one
+/// machine (pipe names are global), the rest mirrors the Unix `<namespace>/<leaf>` layout.
+#[cfg(any(windows, test))]
+fn pipe_name(user: &str, namespace: &str, key: &str) -> String {
+    format!(
+        r"\\.\pipe\ompdeck-ctl.{user}.{}.{}",
+        namespace_component(namespace),
+        leaf_name(key)
+    )
 }
 
-/// Creates every missing component of `dir` with mode 0700, then verifies (no-follow) that the
-/// parent root and the leaf are real directories owned by the euid without group/other write (leaf
-/// exactly 0700) and that `<dir>/ctl.sock` fits `sun_path`. An error means: launch without control.
-pub fn prepare_ctl_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    let bad = |msg: String| io::Error::new(io::ErrorKind::PermissionDenied, msg);
-    if !dir.is_absolute() {
-        return Err(bad(format!("ctl dir {} is not absolute", dir.display())));
-    }
-    let sock_len = dir.join(SOCKET_FILE).as_os_str().len();
-    if sock_len >= SUN_PATH_MAX {
-        return Err(bad(format!(
-            "socket path is {sock_len} bytes, over the sun_path limit"
-        )));
-    }
-    let me = euid().ok_or_else(|| bad("cannot determine the effective uid".into()))?;
-    let mut missing: Vec<&Path> = Vec::new();
-    for p in dir.ancestors() {
-        match fs::symlink_metadata(p) {
-            Ok(_) => break,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(p),
-            Err(e) => return Err(e),
-        }
-    }
-    for p in missing.into_iter().rev() {
-        match fs::DirBuilder::new().mode(0o700).create(p) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
-    }
-    // The namespace dir and the ctl root above it.
-    for root in dir.ancestors().skip(1).take(2) {
-        let m = fs::symlink_metadata(root)?;
-        if !private_dir(&m, me) {
-            return Err(bad(format!(
-                "{} is not a private real directory owned by this user",
-                root.display()
-            )));
-        }
-    }
-    let m = fs::symlink_metadata(dir)?;
-    if !private_dir(&m, me) || m.mode() & 0o777 != 0o700 {
-        return Err(bad(format!(
-            "{} is not a real directory owned by this user with mode 0700",
-            dir.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Start time (clock ticks since boot, `/proc/<pid>/stat` field 22) of `pid`; `None` if it is gone.
-/// Fields after the `)` that closes the (arbitrary) comm start at field 3.
-pub fn proc_start_time(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_ascii_whitespace().nth(19)?.parse().ok()
-}
-
-/// True when `<dir>/ctl.lock` names a process that is still the same one: `pid starttime` with a
-/// matching start time (a bare legacy `pid` counts as live while that pid exists).
-fn lock_owner_live(lock: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(lock) else {
-        return false;
-    };
-    let mut it = text.split_ascii_whitespace();
-    let Some(pid) = it.next().and_then(|p| p.parse::<u32>().ok()) else {
-        return false;
-    };
-    match (
-        it.next().and_then(|t| t.parse::<u64>().ok()),
-        proc_start_time(pid),
-    ) {
-        (_, None) => false,
-        (Some(want), Some(have)) => want == have,
-        (None, Some(_)) => true,
-    }
-}
-
-/// Overall time one prune call may spend probing sockets; leaves left unprobed count as live.
-const PROBE_BUDGET: Duration = Duration::from_millis(500);
-/// Longest wait for a single probe.
-const PROBE_EACH: Duration = Duration::from_millis(250);
-
-/// At most one probe thread exists process-wide: a connect stuck on a full backlog (live server)
-/// must not accumulate threads across prunes.
-static PROBE_BUSY: AtomicBool = AtomicBool::new(false);
-
-/// Clears the busy flag when the probe thread ends (or fails to start).
-struct BusyGuard(&'static AtomicBool);
-
-impl Drop for BusyGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-fn connect_ok(sock: &Path) -> bool {
-    UnixStream::connect(sock).is_ok()
-}
-
-/// True when something accepts connections on `sock`. Anything unproven counts as live: a connect
-/// that doesn't finish within `PROBE_EACH` / before `deadline` (full backlog), a probe thread still
-/// stuck from an earlier call, or a failed thread spawn.
-fn socket_accepts(
-    sock: &Path,
-    deadline: Instant,
-    busy: &'static AtomicBool,
-    connect: fn(&Path) -> bool,
-) -> bool {
-    let wait = PROBE_EACH.min(deadline.saturating_duration_since(Instant::now()));
-    if wait.is_zero() || busy.swap(true, Ordering::AcqRel) {
-        return true;
-    }
-    let guard = BusyGuard(busy);
-    let (tx, rx) = mpsc::channel();
-    let sock = sock.to_path_buf();
-    let spawned = thread::Builder::new()
-        .name("omp-deck-ctl-probe".into())
-        .spawn(move || {
-            let _guard = guard;
-            let _ = tx.send(connect(&sock));
-        });
-    if spawned.is_err() {
-        return true; // the closure (and its guard) was dropped: flag already cleared
-    }
-    rx.recv_timeout(wait).unwrap_or(true)
-}
-
-/// Real directory (no-follow) owned by `me`.
-fn real_dir_of(path: &Path, me: u32) -> Option<fs::Metadata> {
-    fs::symlink_metadata(path)
-        .ok()
-        .filter(|m| m.file_type().is_dir() && m.uid() == me)
-}
-
-/// Removes leaf dirs of `<ctl root>/<namespace>/` (and the `ctl.sock` / `ctl.lock` inside) whose name
-/// isn't the hashed leaf of any key in `alive`. Refuses a symlinked or foreign root/namespace dir
-/// (re-checked, with the leaf, right before each removal). Skips leaves whose lock owner is live
-/// (pid + start time) or whose socket accepts a connection. Non-recursive beyond the two files; only
-/// 16-hex euid-owned dirs.
-pub fn prune_ctl_dirs(namespace: &str, alive: &HashSet<String>) {
-    prune_with(
-        &ctl_root(),
-        namespace,
-        alive,
-        &PROBE_BUSY,
-        connect_ok,
-        PROBE_BUDGET,
-    );
-}
-
-fn prune_with(
-    root: &Path,
-    namespace: &str,
-    alive: &HashSet<String>,
-    busy: &'static AtomicBool,
-    connect: fn(&Path) -> bool,
-    budget: Duration,
-) {
-    let deadline = Instant::now() + budget;
-    let Some(me) = euid() else { return };
-    let root = root.to_path_buf();
-    let ns_dir = root.join(namespace_component(namespace));
-    let checked = |root: &Path, ns: &Path| {
-        real_dir_of(root, me).is_some_and(|m| m.mode() & 0o022 == 0)
-            && real_dir_of(ns, me).is_some()
-    };
-    if !checked(&root, &ns_dir) {
-        return;
-    }
-    let keep: HashSet<String> = alive.iter().map(|k| leaf_name(k)).collect();
-    let Ok(entries) = fs::read_dir(&ns_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.len() != 16 || !name.bytes().all(|b| b.is_ascii_hexdigit()) || keep.contains(name) {
-            continue;
-        }
-        let dir = ns_dir.join(name);
-        if real_dir_of(&dir, me).is_none() {
-            continue;
-        }
-        let lock = dir.join(LOCK_FILE);
-        let sock = dir.join(SOCKET_FILE);
-        if lock_owner_live(&lock)
-            || (fs::symlink_metadata(&sock).is_ok()
-                && socket_accepts(&sock, deadline, busy, connect))
-        {
-            log::debug!("prune ctl dir {}: owner is live", dir.display());
-            continue;
-        }
-        for p in [&sock, &lock] {
-            // Re-validate the whole chain just before each removal.
-            if !checked(&root, &ns_dir) || real_dir_of(&dir, me).is_none() {
-                return;
-            }
-            if fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_dir() && m.uid() == me) {
-                let _ = fs::remove_file(p);
-            }
-        }
-        if let Err(e) = fs::remove_dir(&dir) {
-            log::debug!("prune ctl dir {}: {e}", dir.display());
-        }
-    }
-}
-
-/// `["env", "OMPDECK_CTL_DIR=<dir>", <omp>, "-e", <ext>, <rest of omp args…>]`.
-pub fn with_ctl(omp_argv: &[String], ext: &Path, dir: &Path) -> Vec<String> {
-    let mut out = Vec::with_capacity(omp_argv.len() + 4);
-    out.push("env".to_string());
-    out.push(format!("OMPDECK_CTL_DIR={}", dir.display()));
+/// `["omp", "-e", <ext>, <rest of omp args…>]`: omp loaded with the control extension. The
+/// extension finds its endpoint through [`ctl_env`], set on the process (not argv).
+pub fn with_ctl(omp_argv: &[String], ext: &Path) -> Vec<String> {
+    let mut out = Vec::with_capacity(omp_argv.len() + 2);
     if let Some((program, rest)) = omp_argv.split_first() {
         out.push(program.clone());
         out.push("-e".to_string());
@@ -386,6 +142,12 @@ pub fn with_ctl(omp_argv: &[String], ext: &Path, dir: &Path) -> Vec<String> {
         out.extend(rest.iter().cloned());
     }
     out
+}
+
+/// The environment variable that points the extension at `dir` (a [`ctl_dir`]): `OMPDECK_CTL_DIR`
+/// on Unix, `OMPDECK_CTL_PIPE` (the pipe name) on Windows.
+pub fn ctl_env(dir: &Path) -> (&'static str, OsString) {
+    (os::ENV_VAR, dir.as_os_str().to_owned())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -751,7 +513,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// One thread per client: connects to `<dir>/ctl.sock`, reconnects with backoff (≤ 2 s) when the
+/// One thread per client: connects to the endpoint of `dir` (`<dir>/ctl.sock` on Unix), reconnects with backoff (≤ 2 s) when the
 /// socket is absent or closed; never blocks the caller. Dropping closes the socket and joins the thread.
 pub struct CtlClient {
     shared: Arc<Shared>,
@@ -768,7 +530,7 @@ impl CtlClient {
         let worker = Worker {
             shared: Arc::clone(&shared),
             commands: rx,
-            sock: dir.join(SOCKET_FILE),
+            dir,
             on_update: Box::new(on_update),
             pending: HashSet::new(),
         };
@@ -831,7 +593,7 @@ fn failure(msg: &str) -> CtlReply {
 struct Worker {
     shared: Arc<Shared>,
     commands: Receiver<(u64, CtlCommand)>,
-    sock: PathBuf,
+    dir: PathBuf,
     on_update: Box<dyn Fn() + Send>,
     /// Request ids written to the current connection and not yet answered.
     pending: HashSet<u64>,
@@ -850,7 +612,7 @@ impl Worker {
     fn run(mut self) {
         let mut backoff = BACKOFF_START;
         while !self.stopping() {
-            match UnixStream::connect(&self.sock) {
+            match os::connect(&self.dir) {
                 Ok(stream) => {
                     backoff = BACKOFF_START;
                     let exit = self.session(stream);
@@ -859,7 +621,7 @@ impl Worker {
                         return;
                     }
                 }
-                Err(e) => log::trace!("ctl: connect {}: {e}", self.sock.display()),
+                Err(e) => log::trace!("ctl: connect {}: {e}", self.dir.display()),
             }
             if !self.wait(backoff) {
                 return;
@@ -900,12 +662,7 @@ impl Worker {
         }
     }
 
-    fn session(&mut self, mut stream: UnixStream) -> Exit {
-        if stream.set_read_timeout(Some(POLL)).is_err()
-            || stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err()
-        {
-            return Exit::Disconnected;
-        }
+    fn session(&mut self, mut stream: os::Conn) -> Exit {
         let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
         let mut chunk = vec![0u8; 64 * 1024];
         let mut discarding = false;
@@ -1057,21 +814,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn with_ctl_prefixes_argv() {
+    fn with_ctl_loads_the_extension_without_an_env_wrapper() {
         let argv = vec!["omp".to_string(), "--resume".into(), "/s/a.jsonl".into()];
-        let out = with_ctl(&argv, Path::new("/x/ext.ts"), Path::new("/run/d"));
         assert_eq!(
-            out,
-            [
-                "env",
-                "OMPDECK_CTL_DIR=/run/d",
-                "omp",
-                "-e",
-                "/x/ext.ts",
-                "--resume",
-                "/s/a.jsonl"
-            ]
+            with_ctl(&argv, Path::new("/x/ext.ts")),
+            ["omp", "-e", "/x/ext.ts", "--resume", "/s/a.jsonl"]
         );
+        assert!(with_ctl(&[], Path::new("/x/ext.ts")).is_empty());
+    }
+
+    #[test]
+    fn ctl_env_names_the_endpoint_variable_of_the_os() {
+        let (var, value) = ctl_env(Path::new("/run/d"));
+        assert_eq!(
+            var,
+            if cfg!(windows) {
+                "OMPDECK_CTL_PIPE"
+            } else {
+                "OMPDECK_CTL_DIR"
+            }
+        );
+        assert_eq!(value, "/run/d");
+    }
+
+    #[test]
+    fn pipe_names_are_per_user_namespace_and_key() {
+        let name = pipe_name("0123456789abcdef", "omp-deck", "omp-abc");
+        assert_eq!(
+            name,
+            format!(
+                r"\\.\pipe\ompdeck-ctl.0123456789abcdef.omp-deck.{}",
+                leaf_name("omp-abc")
+            )
+        );
+        assert_ne!(name, pipe_name("0123456789abcdef", "omp-deck", "omp-abd"));
+        assert_ne!(name, pipe_name("0123456789abcdef", "other", "omp-abc"));
+        assert_ne!(name, pipe_name("fedcba9876543210", "omp-deck", "omp-abc"));
+        // Windows limits a pipe name to 256 characters.
+        let long = pipe_name("0123456789abcdef", &"n".repeat(500), &"k".repeat(500));
+        assert!(long.len() < 256, "{}", long.len());
     }
 
     #[test]
@@ -1086,10 +867,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = install_extension(tmp.path()).unwrap();
         assert_eq!(fs::read_to_string(&p).unwrap(), EXTENSION_SOURCE);
-        assert_eq!(
-            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         fs::write(&p, "stale").unwrap();
         install_extension(tmp.path()).unwrap();
         assert_eq!(fs::read_to_string(&p).unwrap(), EXTENSION_SOURCE);
@@ -1122,42 +907,5 @@ mod tests {
             assert!(!c.contains('/'));
         }
         assert!(namespace_component(&long_a).starts_with(&"x".repeat(32)));
-    }
-
-    static STUCK_BUSY: AtomicBool = AtomicBool::new(false);
-
-    fn stuck_connect(_: &Path) -> bool {
-        thread::sleep(Duration::from_secs(3));
-        true
-    }
-
-    #[test]
-    fn prune_returns_within_budget_with_stuck_probe_and_keeps_leaves() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ns = tmp.path().join("ns");
-        let leaves: Vec<PathBuf> = (0..4).map(|i| ns.join(format!("{i:016x}"))).collect();
-        for l in &leaves {
-            fs::create_dir_all(l).unwrap();
-            fs::write(l.join(SOCKET_FILE), "").unwrap();
-        }
-        let run = || {
-            let t = Instant::now();
-            prune_with(
-                tmp.path(),
-                "ns",
-                &HashSet::new(),
-                &STUCK_BUSY,
-                stuck_connect,
-                Duration::from_millis(300),
-            );
-            t.elapsed()
-        };
-        let took = run();
-        assert!(took < Duration::from_millis(900), "prune took {took:?}");
-        assert!(leaves.iter().all(|l| l.is_dir()), "unproven leaves kept");
-        // The first probe is still stuck: a second prune spawns no other and returns at once.
-        assert!(STUCK_BUSY.load(Ordering::Acquire));
-        assert!(run() < Duration::from_millis(100));
-        assert!(leaves.iter().all(|l| l.is_dir()));
     }
 }

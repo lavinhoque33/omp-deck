@@ -5,9 +5,8 @@
 //! db/-wal/-shm files.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, DirBuilder, Permissions};
+use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -19,6 +18,8 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::platform;
 
 use super::{Error, KEEP_SAFETY_COPIES, Result, compact_stamp, io_err, rfc3339};
 
@@ -136,7 +137,7 @@ impl Snapshot {
         let mut read_file = |rel: String| -> Result<()> {
             let path = agent_dir.join(&rel);
             let data = fs::read(&path).map_err(io_err("cannot read", &path))?;
-            let mode = fs::metadata(&path).map_or(0o644, |m| m.permissions().mode() & 0o777);
+            let mode = fs::metadata(&path).map_or(0o644, |m| platform::file_mode(&path, &m));
             let hash = hex(&Sha256::digest(&data));
             add(rel, data, mode, hash)
         };
@@ -480,10 +481,7 @@ impl PreparedRestore {
     }
 
     fn save_safety_copy(&self, agent_dir: &Path) -> Result<()> {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.safety_dir)
+        platform::create_private_dir_all(&self.safety_dir)
             .map_err(io_err("cannot create", &self.safety_dir))?;
         let copy = |rel: &str| -> Result<()> {
             let (from, to) = (agent_dir.join(rel), self.safety_dir.join(rel));
@@ -647,8 +645,7 @@ fn write_atomic(dest: &Path, data: &[u8], mode: u32) -> Result<()> {
             .prefix(".omp-deck-restore")
             .tempfile_in(dir)?;
         tmp.write_all(data)?;
-        tmp.as_file()
-            .set_permissions(Permissions::from_mode(mode | 0o600))?;
+        platform::set_file_mode(tmp.path(), mode | 0o600)?;
         tmp.as_file().sync_all()?;
         tmp.persist(&dest).map(drop).map_err(|e| e.error)
     };

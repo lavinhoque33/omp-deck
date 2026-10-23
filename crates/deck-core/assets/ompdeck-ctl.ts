@@ -1,10 +1,15 @@
 // ompdeck-ctl.ts — OmpDeck control extension (protocol v:1).
-// Load with: omp -e <path>; env OMPDECK_CTL_DIR selects the socket dir. Inert when unset.
+// Load with: omp -e <path>. Unix: env OMPDECK_CTL_DIR selects the socket dir (Bun.listen on <dir>/ctl.sock).
+// Windows: env OMPDECK_CTL_PIPE is the full named-pipe name (node:net); OmpDeck computes it, it is never derived here.
+// Inert when the variable of the OS is unset.
 // Any failure (version drift of omp internals, I/O) degrades to "no socket" or an error reply; it never throws into omp.
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as path from "node:path";
 
-const DIR = process.env.OMPDECK_CTL_DIR;
+const IS_WIN = process.platform === "win32";
+const DIR = IS_WIN ? undefined : process.env.OMPDECK_CTL_DIR;
+const PIPE = IS_WIN ? process.env.OMPDECK_CTL_PIPE : undefined;
 const LOG = process.env.OMPDECK_CTL_LOG; // debug only
 const log = (s: string) => {
   if (!LOG) return;
@@ -13,7 +18,7 @@ const log = (s: string) => {
 const G = globalThis as any; // process-wide: the factory runs for the main session and for every subagent session
 
 export default async function ompdeckCtl(api: any) {
-  if (!DIR) return; // not launched by OmpDeck -> inert
+  if (!DIR && !PIPE) return; // not launched by OmpDeck -> inert
   try {
     // Internal modules are bundled in the omp binary; literal specifiers only (non-literal dynamic import fails).
     let AgentLifecycleManager: any, AgentRegistry: any, sessionFileBelongsToRoot: any, SessionManager: any;
@@ -234,93 +239,118 @@ export default async function ompdeckCtl(api: any) {
       }
       const reply = (s: any, rid: any, r: any) => { let l: string; try { l = JSON.stringify({ t: "reply", rid, ...r }) + "\n"; } catch { l = JSON.stringify({ t: "reply", rid, ok: false, error: "unserializable reply" }) + "\n"; } write(s, l); };
 
-      // ---- endpoint ownership ----
-      // The dir must be a private real directory of ours (created 0700 if missing); never chmod/follow anything.
-      const me = process.getuid?.();
-      const sockPath = path.join(DIR!, "ctl.sock");
-      if (Buffer.byteLength(sockPath) >= 108) { log("socket path too long"); return; }
-      try { fs.mkdirSync(DIR!, { recursive: true, mode: 0o700 }); } catch (e) { log("mkdir failed: " + e); return; }
-      try {
-        const st = fs.lstatSync(DIR!);
-        if (!st.isDirectory() || (me !== undefined && st.uid !== me) || (st.mode & 0o077) !== 0) { log("ctl dir not private"); return; }
-      } catch (e) { log("ctl dir stat failed: " + e); return; }
-      // Exclusive ownership via an O_EXCL pid file; a lock whose pid is dead is reclaimed, a live one means another omp serves this dir.
-      const lockPath = path.join(DIR!, "ctl.lock");
-      // Lock content: "<pid> <starttime>" (/proc/<pid>/stat field 22, parsed after the last ')'). Stale = pid dead or start time differs (pid reuse).
-      const startTime = (pid: number): string | null => {
-        try { const st = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); return st.slice(st.lastIndexOf(")") + 1).trim().split(/\s+/)[19] ?? null; } catch { return null; }
+      // ---- endpoint ----
+      const onOpen = (s: any) => {
+        s.data = { buf: "" }; clients.add(s);
+        write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid }) + "\n" + JSON.stringify(snapshot()) + "\n");
       };
-      const myStart = startTime(process.pid);
-      const myLock = `${process.pid} ${myStart ?? ""}`.trim();
-      const parseLock = (t: string): { pid: number; start: string | null } => { const [p, s] = t.trim().split(/\s+/); return { pid: parseInt(p, 10), start: s ?? null }; };
-      const ownerLive = (t: string): boolean => {
-        const { pid, start } = parseLock(t);
-        if (!Number.isFinite(pid) || pid <= 0) return false;
-        const now = startTime(pid);
-        if (now === null) return false;
-        return start === null ? true : start === now;
+      const onData = (s: any, chunk: any) => {
+        const st = s.data; if (!st) return;
+        st.buf += chunk.toString();
+        if (st.buf.length > 8 * 1024 * 1024) { st.buf = ""; return; } // runaway client without newlines
+        for (let i; (i = st.buf.indexOf("\n")) >= 0;) {
+          const line = st.buf.slice(0, i); st.buf = st.buf.slice(i + 1);
+          let cmd: any; try { cmd = JSON.parse(line); } catch { continue; }
+          if (!cmd || typeof cmd !== "object") continue;
+          let p: Promise<any>; try { p = handle(cmd); } catch (e: any) { p = Promise.reject(e); }
+          p.then(r => reply(s, cmd.rid, r), e => reply(s, cmd.rid, { ok: false, error: String(e?.message ?? e) }));
+        }
       };
-      const tryLock = (): boolean => {
-        try { const fd = fs.openSync(lockPath, "wx", 0o600); try { fs.writeSync(fd, myLock); } finally { fs.closeSync(fd); } return true; }
-        catch (e: any) { if (e?.code !== "EEXIST") { log("lock failed: " + e); } return false; }
-      };
-      let locked = tryLock();
-      if (!locked) {
-        let holder = ""; try { holder = fs.readFileSync(lockPath, "utf8"); } catch {}
-        if (holder !== myLock && ownerLive(holder)) { log(`dir owned by live lock ${holder}`); return; }
-        // Stale (dead pid, or unreadable/garbage): move it aside atomically, confirm it is the one we judged stale, retry once.
-        const aside = `${lockPath}.stale.${process.pid}`;
-        try {
-          fs.renameSync(lockPath, aside);
-          let got = ""; try { got = fs.readFileSync(aside, "utf8"); } catch {}
-          if (got === holder) { fs.unlinkSync(aside); locked = tryLock(); }
-          else { try { fs.linkSync(aside, lockPath); } catch {} try { fs.unlinkSync(aside); } catch {} log("lost lock reclaim race"); return; }
-        } catch (e) { log("stale lock reclaim failed: " + e); return; }
-        if (!locked) return;
-      }
-      const unlock = () => { try { if (fs.readFileSync(lockPath, "utf8") === myLock) fs.unlinkSync(lockPath); } catch {} };
-      // We hold the lock, so any socket here is a leftover of a dead process; still only unlink an actual socket of ours.
-      try {
-        const st = fs.lstatSync(sockPath);
-        if (!st.isSocket() || (me !== undefined && st.uid !== me)) { log("refusing to replace non-socket at ctl.sock"); unlock(); return; }
-        fs.unlinkSync(sockPath);
-      } catch (e: any) { if (e?.code !== "ENOENT") { log("sock stat failed: " + e); unlock(); return; } }
-      let server: any;
-      try {
-        server = Bun.listen<{ buf: string }>({
-          unix: sockPath,
-          socket: {
-            open(s) {
-              s.data = { buf: "" }; clients.add(s);
-              write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid }) + "\n" + JSON.stringify(snapshot()) + "\n");
-            },
-            close(s) { clients.delete(s); },
-            error(s) { clients.delete(s); },
-            data(s, chunk) {
-              s.data.buf += chunk.toString();
-              if (s.data.buf.length > 8 * 1024 * 1024) { s.data.buf = ""; return; } // runaway client without newlines
-              for (let i; (i = s.data.buf.indexOf("\n")) >= 0;) {
-                const line = s.data.buf.slice(0, i); s.data.buf = s.data.buf.slice(i + 1);
-                let cmd: any; try { cmd = JSON.parse(line); } catch { continue; }
-                if (!cmd || typeof cmd !== "object") continue;
-                let p: Promise<any>; try { p = handle(cmd); } catch (e: any) { p = Promise.reject(e); }
-                p.then(r => reply(s, cmd.rid, r), e => reply(s, cmd.rid, { ok: false, error: String(e?.message ?? e) }));
-              }
-            },
-          },
+      const onClose = (s: any) => { clients.delete(s); };
+      let server: { stop(): void };
+      let releaseEndpoint: () => void = () => {}; // Unix: unlink our socket, drop the lock, remove the dir
+      let close: () => void = () => {};
+      if (PIPE) {
+        // Windows: a named pipe has no files to own. A listen error (name held by another omp, or any I/O failure) means
+        // "owned elsewhere": tear down quietly. No lock file, no mode check, no unlink.
+        const srv = net.createServer((s: any) => {
+          try { s.setEncoding("utf8"); } catch {}
+          onOpen(s);
+          s.on("data", (chunk: any) => onData(s, chunk));
+          s.on("close", () => onClose(s));
+          s.on("error", () => onClose(s));
         });
-      } catch (e) { log("listen failed: " + e); unlock(); return; }
-      let ino: number | undefined; try { ino = fs.lstatSync(sockPath).ino; } catch {}
+        srv.on("error", (e: any) => {
+          log("pipe listen failed: " + e);
+          if (G.__ompdeckCtl?.close === close) G.__ompdeckCtl = undefined;
+          close();
+        });
+        try { srv.listen(PIPE); } catch (e) { log("listen failed: " + e); return; }
+        server = { stop() { try { srv.close(); } catch {} for (const c of clients) { try { c.destroy(); } catch {} } clients.clear(); } };
+      } else {
+        // The dir must be a private real directory of ours (created 0700 if missing); never chmod/follow anything.
+        const me = process.getuid?.();
+        const sockPath = path.join(DIR!, "ctl.sock");
+        if (Buffer.byteLength(sockPath) >= 108) { log("socket path too long"); return; }
+        try { fs.mkdirSync(DIR!, { recursive: true, mode: 0o700 }); } catch (e) { log("mkdir failed: " + e); return; }
+        try {
+          const st = fs.lstatSync(DIR!);
+          if (!st.isDirectory() || (me !== undefined && st.uid !== me) || (st.mode & 0o077) !== 0) { log("ctl dir not private"); return; }
+        } catch (e) { log("ctl dir stat failed: " + e); return; }
+        // Exclusive ownership via an O_EXCL pid file; a lock whose pid is dead is reclaimed, a live one means another omp serves this dir.
+        const lockPath = path.join(DIR!, "ctl.lock");
+        // Lock content: "<pid> <starttime>" (/proc/<pid>/stat field 22, parsed after the last ')'). Stale = pid dead or start time differs (pid reuse).
+        const startTime = (pid: number): string | null => {
+          try { const st = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); return st.slice(st.lastIndexOf(")") + 1).trim().split(/\s+/)[19] ?? null; } catch { return null; }
+        };
+        const myStart = startTime(process.pid);
+        const myLock = `${process.pid} ${myStart ?? ""}`.trim();
+        const parseLock = (t: string): { pid: number; start: string | null } => { const [p, s] = t.trim().split(/\s+/); return { pid: parseInt(p, 10), start: s ?? null }; };
+        const ownerLive = (t: string): boolean => {
+          const { pid, start } = parseLock(t);
+          if (!Number.isFinite(pid) || pid <= 0) return false;
+          const now = startTime(pid);
+          if (now === null) return false;
+          return start === null ? true : start === now;
+        };
+        const tryLock = (): boolean => {
+          try { const fd = fs.openSync(lockPath, "wx", 0o600); try { fs.writeSync(fd, myLock); } finally { fs.closeSync(fd); } return true; }
+          catch (e: any) { if (e?.code !== "EEXIST") { log("lock failed: " + e); } return false; }
+        };
+        let locked = tryLock();
+        if (!locked) {
+          let holder = ""; try { holder = fs.readFileSync(lockPath, "utf8"); } catch {}
+          if (holder !== myLock && ownerLive(holder)) { log(`dir owned by live lock ${holder}`); return; }
+          // Stale (dead pid, or unreadable/garbage): move it aside atomically, confirm it is the one we judged stale, retry once.
+          const aside = `${lockPath}.stale.${process.pid}`;
+          try {
+            fs.renameSync(lockPath, aside);
+            let got = ""; try { got = fs.readFileSync(aside, "utf8"); } catch {}
+            if (got === holder) { fs.unlinkSync(aside); locked = tryLock(); }
+            else { try { fs.linkSync(aside, lockPath); } catch {} try { fs.unlinkSync(aside); } catch {} log("lost lock reclaim race"); return; }
+          } catch (e) { log("stale lock reclaim failed: " + e); return; }
+          if (!locked) return;
+        }
+        const unlock = () => { try { if (fs.readFileSync(lockPath, "utf8") === myLock) fs.unlinkSync(lockPath); } catch {} };
+        // We hold the lock, so any socket here is a leftover of a dead process; still only unlink an actual socket of ours.
+        try {
+          const st = fs.lstatSync(sockPath);
+          if (!st.isSocket() || (me !== undefined && st.uid !== me)) { log("refusing to replace non-socket at ctl.sock"); unlock(); return; }
+          fs.unlinkSync(sockPath);
+        } catch (e: any) { if (e?.code !== "ENOENT") { log("sock stat failed: " + e); unlock(); return; } }
+        let bun: any;
+        try {
+          bun = Bun.listen<object>({
+            unix: sockPath,
+            socket: { open: onOpen, close: onClose, error: onClose, data: onData },
+          });
+        } catch (e) { log("listen failed: " + e); unlock(); return; }
+        server = { stop() { try { bun.stop(true); } catch {} } };
+        let ino: number | undefined; try { ino = fs.lstatSync(sockPath).ino; } catch {}
+        releaseEndpoint = () => {
+          // Unlink only an endpoint that is still ours (same inode), then the lock, then the dir if that left it empty.
+          try { if (ino !== undefined && fs.lstatSync(sockPath).ino === ino) fs.unlinkSync(sockPath); } catch {}
+          unlock();
+          try { fs.rmdirSync(DIR!); } catch {}
+        };
+      }
       let offRegistry: any, tick: any, offProgress: any;
-      const close = () => {
+      close = () => {
         try { if (typeof offRegistry === "function") offRegistry(); } catch {}
         try { if (typeof offProgress === "function") offProgress(); } catch {}
         try { clearInterval(tick); clearTimeout(pending); } catch {}
-        try { server.stop(true); } catch {}
-        // Unlink only an endpoint that is still ours (same inode), then the lock, then the dir if that left it empty.
-        try { if (ino !== undefined && fs.lstatSync(sockPath).ino === ino) fs.unlinkSync(sockPath); } catch {}
-        unlock();
-        try { fs.rmdirSync(DIR!); } catch {}
+        try { server.stop(); } catch {}
+        releaseEndpoint();
       };
       try {
         offRegistry = registry.onChange(schedule); // registered/status_changed/metadata_changed(activity)/removed
@@ -332,7 +362,7 @@ export default async function ompdeckCtl(api: any) {
           close,
         };
       } catch (e) { log("setup failed: " + e); close(); return; }
-      log("listening " + sockPath);
+      log("listening " + (PIPE ?? path.join(DIR!, "ctl.sock")));
       recompute();
     }
     function stop() { const c = G.__ompdeckCtl; G.__ompdeckCtl = undefined; c?.close(); }

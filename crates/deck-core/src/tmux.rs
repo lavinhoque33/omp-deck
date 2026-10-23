@@ -8,6 +8,9 @@ use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::config_dir;
+use crate::mux::Pane;
+use crate::platform;
+use crate::status::breadcrumb_key_for_tty;
 
 pub const APP_SOCKET: &str = "omp-deck";
 
@@ -37,12 +40,17 @@ pub struct Tmux {
 impl Tmux {
     /// tmux on PATH (`tmux -V` runs ok) → Some, socket [`APP_SOCKET`], config `config_dir()/tmux.conf`.
     pub fn detect() -> Option<Tmux> {
+        Tmux::detect_on(APP_SOCKET)
+    }
+
+    /// [`detect`](Self::detect) on another socket (tests).
+    pub fn detect_on(socket: &str) -> Option<Tmux> {
         let ok = Command::new("tmux")
             .arg("-V")
             .stdin(Stdio::null())
             .output()
             .is_ok_and(|o| o.status.success());
-        ok.then(|| Tmux::with_socket("tmux", APP_SOCKET, config_dir().join("tmux.conf")))
+        ok.then(|| Tmux::with_socket("tmux", socket, config_dir().join("tmux.conf")))
     }
 
     pub fn with_socket(
@@ -156,16 +164,23 @@ impl Tmux {
         (!text.is_empty()).then_some(text)
     }
 
-    /// tty of the session's active pane (`/dev/pts/N`), the key of omp's terminal breadcrumb.
-    pub fn pane_tty(&self, session: &str) -> Option<String> {
-        self.pane_format(session, "#{pane_tty}")
-    }
-
-    /// When the process that tmux started in the session's active pane began (`/proc`, Linux
-    /// only). A breadcrumb older than this belongs to a previous owner of the same tty.
-    pub fn pane_started(&self, session: &str) -> Option<SystemTime> {
-        let pid: u32 = self.pane_format(session, "#{pane_pid}")?.parse().ok()?;
-        process_start(pid)
+    /// The session's active pane: omp's breadcrumb key (from the pane's tty, `/dev/pts/6` →
+    /// `pts-6`) and when the pane's process started (`/proc`, Linux; elsewhere "now", which only
+    /// trusts breadcrumbs written from here on). A breadcrumb older than the start belongs to a
+    /// previous owner of the same tty.
+    pub fn pane(&self, session: &str) -> Option<Pane> {
+        let text = self.pane_format(session, "#{pane_tty} #{pane_pid}")?;
+        let (tty, pid) = text.split_once(' ')?;
+        let started = pid
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .and_then(platform::process_start)
+            .unwrap_or_else(SystemTime::now);
+        Some(Pane {
+            breadcrumb_key: breadcrumb_key_for_tty(tty),
+            started,
+        })
     }
 
     pub fn has_session(&self, name: &str) -> bool {
@@ -210,25 +225,15 @@ impl Tmux {
         if panes.is_empty() {
             return result;
         }
-        let children = proc_children();
         let canon_root = std::fs::canonicalize(root).ok();
-        for (name, pane_pid) in panes {
-            let files: &mut Vec<PathBuf> = result.entry(name.to_owned()).or_default();
-            let mut stack = vec![pane_pid];
-            let mut visited = HashSet::new();
-            while let Some(pid) = stack.pop() {
-                if !visited.insert(pid) {
-                    continue;
-                }
-                if let Some(kids) = children.get(&pid) {
-                    stack.extend(kids);
-                }
-                for target in open_files(pid) {
-                    if is_top_level_session(&target, root, canon_root.as_deref())
-                        && !files.contains(&target)
-                    {
-                        files.push(target);
-                    }
+        let pids: Vec<u32> = panes.iter().map(|(_, pid)| *pid).collect();
+        for ((name, _), held) in panes.iter().zip(platform::tree_open_files(&pids)) {
+            let files: &mut Vec<PathBuf> = result.entry((*name).to_owned()).or_default();
+            for target in held {
+                if is_top_level_session(&target, root, canon_root.as_deref())
+                    && !files.contains(&target)
+                {
+                    files.push(target);
                 }
             }
             files.sort();
@@ -237,7 +242,7 @@ impl Tmux {
     }
 }
 
-fn is_top_level_session(p: &Path, root: &Path, canon_root: Option<&Path>) -> bool {
+pub(crate) fn is_top_level_session(p: &Path, root: &Path, canon_root: Option<&Path>) -> bool {
     if p.extension().is_none_or(|e| e != "jsonl") {
         return false;
     }
@@ -245,61 +250,6 @@ fn is_top_level_session(p: &Path, root: &Path, canon_root: Option<&Path>) -> boo
         return false;
     };
     grand == root || canon_root.is_some_and(|c| grand == c)
-}
-
-/// Wall-clock start of `pid`: `/proc/<pid>/stat` field 22 (clock ticks since boot, USER_HZ = 100 on
-/// Linux) plus `btime` from `/proc/stat`.
-fn process_start(pid: u32) -> Option<SystemTime> {
-    const USER_HZ: u64 = 100;
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Fields after the last ')' start at field 3 (state); starttime is field 22.
-    let ticks: u64 = stat[stat.rfind(')')? + 1..]
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()?;
-    let btime: u64 = std::fs::read_to_string("/proc/stat")
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("btime "))?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(UNIX_EPOCH + std::time::Duration::from_millis(btime * 1000 + ticks * 1000 / USER_HZ))
-}
-
-/// ppid → children, from `/proc/*/stat`. Vanished/unreadable entries are ignored.
-fn proc_children() -> HashMap<u32, Vec<u32>> {
-    let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
-    let Ok(rd) = std::fs::read_dir("/proc") else {
-        return map;
-    };
-    for e in rd.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            continue;
-        };
-        // "pid (comm) S ppid ..." — comm may contain spaces/parens, so split after the last ')'.
-        let ppid = stat
-            .rfind(')')
-            .and_then(|i| stat[i + 1..].split_whitespace().nth(1))
-            .and_then(|s| s.parse::<u32>().ok());
-        if let Some(ppid) = ppid {
-            map.entry(ppid).or_default().push(pid);
-        }
-    }
-    map
-}
-
-fn open_files(pid: u32) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return Vec::new(); // gone or permission denied
-    };
-    rd.flatten()
-        .filter_map(|e| std::fs::read_link(e.path()).ok())
-        .collect()
 }
 
 /// `"omp-"` + id with every char outside `[A-Za-z0-9_-]` replaced by `_`.
@@ -337,12 +287,12 @@ pub fn direct_launch(cwd: &Path, argv: &[String]) -> LaunchSpec {
     }
 }
 
-/// `cwd` if it is an existing dir, else `$HOME`, else `/`.
+/// `cwd` if it is an existing dir, else `$HOME`, else the filesystem root.
 pub fn effective_cwd(cwd: &Path) -> PathBuf {
     if cwd.is_dir() {
         cwd.to_path_buf()
     } else {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+        platform::home_or_root()
     }
 }
 

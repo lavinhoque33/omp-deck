@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +16,7 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Deserializer};
 
 use crate::omp::Omp;
+use crate::platform;
 
 /// Default wall-clock bound for [`fetch_usage`] (providers answer in up to 10 s each).
 pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -314,30 +315,6 @@ impl UsageSnapshot {
 
 // ---- fetching -----------------------------------------------------------------------------------
 
-/// Kills the child's whole process group (the child leads its own group) and reaps the child on
-/// every exit path, so no descendant outlives the call or keeps the output pipes open.
-struct Reaper(Child);
-
-impl Reaper {
-    fn kill_group(&self) {
-        // The child was spawned with `process_group(0)`, so its pid is the group id.
-        if let Ok(pgid) = i32::try_from(self.0.id()) {
-            // SAFETY: plain syscall with integer arguments; no memory is accessed.
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
-            }
-        }
-    }
-}
-
-impl Drop for Reaper {
-    fn drop(&mut self) {
-        self.kill_group();
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 /// Reads `r` (≤ [`MAX_OUTPUT`]) on a thread; the bytes arrive on the returned channel.
 fn spawn_reader<R: Read + Send + 'static>(r: Option<R>) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
@@ -351,28 +328,26 @@ fn spawn_reader<R: Read + Send + 'static>(r: Option<R>) -> mpsc::Receiver<Vec<u8
     rx
 }
 
-/// Runs `cmd` in its own process group to completion within `timeout`. On timeout, error, or after
-/// the child exits, the whole group is killed; the deadline also bounds waiting for the output
-/// readers (they only block past it if a descendant escaped the group).
+/// Runs `cmd` as a killable process tree (see [`platform::KillableCommand`]) to completion within
+/// `timeout`. On timeout, error, or after the child exits, the whole tree is killed; the deadline
+/// also bounds waiting for the output readers (they only block past it if a descendant escaped).
 pub(crate) fn run_bounded(
-    mut cmd: Command,
+    cmd: Command,
     timeout: Duration,
 ) -> Result<(Option<i32>, String, String), UsageError> {
-    use std::os::unix::process::CommandExt;
-    cmd.process_group(0);
-    let mut child = Reaper(cmd.spawn().map_err(UsageError::Spawn)?);
-    let out = spawn_reader(child.0.stdout.take());
-    let err = spawn_reader(child.0.stderr.take());
+    let mut child = platform::spawn_killable(cmd).map_err(UsageError::Spawn)?;
+    let out = spawn_reader(child.stdout.take());
+    let err = spawn_reader(child.stderr.take());
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child.0.try_wait().map_err(UsageError::Spawn)? {
+        match child.try_wait().map_err(UsageError::Spawn)? {
             Some(s) => break s,
             None if Instant::now() >= deadline => return Err(UsageError::Timeout(timeout)),
             None => std::thread::sleep(Duration::from_millis(15)),
         }
     };
-    // Descendants left behind (`cmd & exit`) hold the pipes open: close them by killing the group.
-    child.kill_group();
+    // Descendants left behind (`cmd & exit`) hold the pipes open: close them by killing the tree.
+    child.kill_tree();
     let collect = |rx: &mpsc::Receiver<Vec<u8>>| {
         let left = deadline.saturating_duration_since(Instant::now());
         rx.recv_timeout(left.max(Duration::from_millis(250)))
@@ -1180,10 +1155,20 @@ pub fn activity(db: &Path, days: u32) -> Result<Activity, UsageError> {
 
 /// `file:` URI for `path` with every byte outside `[A-Za-z0-9/._~-]` percent-encoded.
 fn sqlite_uri(path: &Path, query: &str) -> String {
-    use std::os::unix::ffi::OsStrExt;
-    let mut uri = String::from("file:");
-    for &b in path.as_os_str().as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'~' | b'-') {
+    encode_sqlite_uri(platform::path_bytes(path), query, cfg!(windows))
+}
+
+/// [`sqlite_uri`] over raw path bytes. `windows`: a `C:\dir\db` path becomes `file:///C:/dir/db`
+/// (the drive colon stays literal, backslashes turn into `/`).
+fn encode_sqlite_uri(path: &[u8], query: &str, windows: bool) -> String {
+    let drive = windows && path.len() > 1 && path[0].is_ascii_alphabetic() && path[1] == b':';
+    let mut uri = String::from(if drive { "file:///" } else { "file:" });
+    for (i, &b) in path.iter().enumerate() {
+        let b = if windows && b == b'\\' { b'/' } else { b };
+        if b.is_ascii_alphanumeric()
+            || matches!(b, b'/' | b'.' | b'_' | b'~' | b'-')
+            || (drive && i == 1)
+        {
             uri.push(char::from(b));
         } else {
             uri.push_str(&format!("%{b:02X}"));
@@ -1460,6 +1445,25 @@ impl Heatmap {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sqlite_uris_escape_the_path_per_os() {
+        assert_eq!(
+            encode_sqlite_uri(b"/home/a b/db.sqlite", "mode=ro", false),
+            "file:/home/a%20b/db.sqlite?mode=ro"
+        );
+        assert_eq!(
+            encode_sqlite_uri(b"/x/\xc3\xbc?#%", "q", false),
+            "file:/x/%C3%BC%3F%23%25?q"
+        );
+        // A Windows path becomes an absolute file URI: literal drive colon, slashes for backslashes.
+        assert_eq!(
+            encode_sqlite_uri(br"C:\Users\a b\omp.db", "immutable=1", true),
+            "file:///C:/Users/a%20b/omp.db?immutable=1"
+        );
+        // On Unix a backslash is an ordinary (escaped) file name character.
+        assert_eq!(encode_sqlite_uri(br"/a\b", "q", false), "file:/a%5Cb?q");
+    }
+
     use super::*;
     use rusqlite::params;
 

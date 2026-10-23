@@ -4,11 +4,12 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use deck_core::platform;
 use deck_core::sessions::{SessionEntry, abbreviate_home};
 use deck_core::status::{SessionStats, StatusTarget};
 use egui::{TextEdit, Ui};
 
-use super::{App, AppEvent, PendingConfirm, spawn_opener};
+use super::{App, AppEvent, PendingConfirm};
 use crate::confirm::{self, Confirm, Dialog};
 use crate::inject::{Env, Job, Requires};
 use crate::model_picker::{self, FRESH_TIMEOUT, Pending, PickerAction, SWITCH_TIMEOUT};
@@ -52,13 +53,13 @@ impl App {
             (Some(t), Some(cur)) => {
                 cur.session == t.session_path
                     && cur.cwd == t.cwd
-                    && cur.tmux.as_ref().map(|(_, n)| n) == t.tmux_name.as_ref()
+                    && cur.mux.as_ref().map(|(_, n)| n) == t.mux_name.as_ref()
             }
             _ => false,
         };
         if !unchanged {
             let target = want.map(|t| StatusTarget {
-                tmux: self.tmux.clone().zip(t.tmux_name.clone()),
+                mux: t.mux.clone().zip(t.mux_name.clone()),
                 session: t.session_path.clone(),
                 cwd: t.cwd.clone(),
             });
@@ -515,7 +516,7 @@ impl App {
         }
     }
 
-    /// `omp --export` on a worker, then open the HTML with xdg-open.
+    /// `omp --export` on a worker, then open the HTML with the desktop's default handler.
     fn export_active(&mut self) {
         let (Some(omp), Some(jsonl)) = (&self.omp, self.active_session()) else {
             return;
@@ -526,7 +527,7 @@ impl App {
         std::thread::spawn(move || {
             let dest = session_actions::exports_dir();
             let event = match session_actions::export_html(&program, &jsonl, &dest) {
-                Ok(path) => match spawn_opener(path.as_os_str()) {
+                Ok(path) => match platform::open_path(path.as_os_str()) {
                     Ok(()) => AppEvent::Toast(
                         ToastKind::Success,
                         format!("Exported to {}", abbreviate_home(&path)),
@@ -534,7 +535,7 @@ impl App {
                     Err(e) => AppEvent::Toast(
                         ToastKind::Error,
                         format!(
-                            "Exported to {} but xdg-open failed: {e}",
+                            "Exported to {} but opening it failed: {e}",
                             abbreviate_home(&path)
                         ),
                     ),

@@ -14,9 +14,8 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -28,6 +27,8 @@ use serde::Deserialize;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use serde_json::value::RawValue;
+
+use crate::platform::{self, FileId};
 
 /// Row text cap (characters).
 const TEXT_LIMIT: usize = 200;
@@ -1000,7 +1001,7 @@ struct Builder {
     /// Bytes of the file consumed: complete lines (or a valid last line).
     offset: u64,
     /// Identity of the file the offset belongs to.
-    ident: Option<(u64, u64)>,
+    ident: Option<FileId>,
     /// Something changed since the last snapshot.
     dirty: bool,
 }
@@ -1267,7 +1268,7 @@ impl Builder {
     /// Consumes the complete lines after `self.offset` (plus a last line that already parses).
     fn read_new(&mut self, mut file: File, stop: &AtomicBool) -> io::Result<()> {
         let meta = file.metadata()?;
-        let ident = (meta.dev(), meta.ino());
+        let ident = platform::file_identity(&file)?;
         if self.ident.is_some_and(|i| i != ident) || meta.len() < self.offset {
             self.reset();
         }
@@ -1439,13 +1440,14 @@ fn run(path: &Path, shared: &Shared, on_update: &dyn Fn()) {
     let mut b = Builder::default();
     let mut published = false;
     while !shared.shutdown.load(Ordering::Acquire) {
-        let step = fs::metadata(path).and_then(|meta| {
-            let ident = (meta.dev(), meta.ino());
+        let step = File::open(path).and_then(|file| {
+            let meta = file.metadata()?;
+            let ident = platform::file_identity(&file)?;
             let stale = b.ident.is_some_and(|i| i != ident) || meta.len() < b.offset;
             if published && !stale && meta.len() == b.offset {
                 return Ok(());
             }
-            b.read_new(File::open(path)?, &shared.shutdown)
+            b.read_new(file, &shared.shutdown)
         });
         match step {
             Ok(()) => {

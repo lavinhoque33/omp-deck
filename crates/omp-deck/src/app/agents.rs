@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use deck_core::agents::AgentsTarget;
 use egui::{Frame, Key, Margin, Modifiers};
 
-use super::{App, AppEvent, spawn_opener};
+use super::{App, AppEvent};
 use crate::agent_ctl::{CtlView, Restart};
 use crate::agent_hub::{self, HubAction, HubInput};
 use crate::agent_popup::{self, PopupAction, PopupInput, PopupState, PopupTab};
@@ -198,14 +198,15 @@ impl App {
         }
     }
 
-    /// Open a file with xdg-open off the UI thread.
+    /// Open a file with the desktop's default handler off the UI thread.
     fn open_path(&self, path: PathBuf) {
         let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
             let outcome = if !path.is_absolute() || !path.is_file() {
                 Err(format!("File not found: {}", path.display()))
             } else {
-                spawn_opener(path.as_os_str()).map_err(|e| format!("xdg-open failed: {e}"))
+                deck_core::platform::open_path(path.as_os_str())
+                    .map_err(|e| format!("Could not open the file: {e}"))
             };
             if let Err(msg) = outcome {
                 let _ = tx.send(AppEvent::Toast(ToastKind::Error, msg));

@@ -13,7 +13,7 @@ use egui::{
 };
 
 use crate::core::{Terminal, TerminalEvents};
-use crate::input::{self, Key, KeyAction, KeyInput, Mods, MouseAction, MouseButton};
+use crate::input::{self, Key, KeyAction, KeyInput, KeyRules, Mods, MouseAction, MouseButton};
 use crate::links;
 use crate::render::{self, Frame, GlyphCache, Metrics, PaintParams, PaintScratch, UrlSpan};
 
@@ -56,6 +56,9 @@ pub(crate) struct ViewState {
     /// Keys whose press was dropped by [`Terminal::hold_input_until`]: their releases are
     /// swallowed too, so kitty event reporting never sees a lone release.
     held_keys: Vec<egui::Key>,
+    /// Modifiers the child last saw in win32-input-mode (each change is sent as modifier key
+    /// records, see [`input::encode_win32_modifiers`]).
+    win32_mods: Mods,
 }
 
 impl ViewState {
@@ -64,6 +67,8 @@ impl ViewState {
         self.blink_epoch = Some(Instant::now());
         if !focused {
             self.preedit.clear();
+            // Keys released while unfocused are never seen; start over from "none held".
+            self.win32_mods = Mods::NONE;
         }
     }
 }
@@ -321,7 +326,8 @@ impl<'a> TerminalView<'a> {
         let input_events = ui.input(|i| i.events.clone());
         let mut open_url = None;
         if focused {
-            handle_keyboard(term, &input_events, mode);
+            let modifiers = ui.input(|i| i.modifiers);
+            handle_keyboard(term, &input_events, modifiers, mode);
             mode = term.mode();
         }
         handle_pointer(
@@ -382,9 +388,6 @@ impl<'a> TerminalView<'a> {
             ctx.request_repaint_after(Duration::from_millis(to_next as u64));
         }
 
-        let banner = term
-            .exit_code()
-            .map(|code| format!("[process exited: {code}]"));
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, term.view.frame.bg);
         let view = &mut term.view;
@@ -397,7 +400,7 @@ impl<'a> TerminalView<'a> {
             hover_url,
             graphics: &term.graphics,
             preedit: &view.preedit,
-            banner: banner.as_deref(),
+            banner: term.banner.as_deref(),
         };
         render::paint(
             &view.frame,
@@ -440,7 +443,12 @@ fn after_input(term: &mut Terminal) {
 
 fn paste(term: &mut Terminal, text: Option<String>, mode: TermMode) {
     if let Some(text) = text.filter(|t| !t.is_empty()) {
-        term.write(&input::encode_paste(&text, mode));
+        let bytes = if term.key_rules() == KeyRules::Win32 {
+            input::encode_paste_win32(&text, mode)
+        } else {
+            input::encode_paste(&text, mode)
+        };
+        term.write(&bytes);
         after_input(term);
     }
 }
@@ -491,8 +499,23 @@ fn link_at(term: &Terminal, row: usize, col: usize) -> Option<String> {
         .or_else(|| links::url_at(&*t, point).map(|hit| hit.uri))
 }
 
-fn handle_keyboard(term: &mut Terminal, events: &[Event], mode: TermMode) {
+/// win32-input-mode: sends modifier key records for the changes since the child last saw
+/// the modifiers.
+fn sync_win32_mods(term: &mut Terminal, now: Mods) {
+    let bytes = input::encode_win32_modifiers(term.view.win32_mods, now);
+    term.view.win32_mods = now;
+    if !bytes.is_empty() {
+        term.write(&bytes);
+    }
+}
+
+/// `modifiers`: the state at the end of this frame's events.
+fn handle_keyboard(term: &mut Terminal, events: &[Event], modifiers: Modifiers, mode: TermMode) {
     let rules = term.key_rules();
+    let win32 = rules == KeyRules::Win32;
+    if !win32 {
+        term.view.win32_mods = Mods::NONE;
+    }
     let held = term.input_held();
     let mut i = 0;
     while i < events.len() {
@@ -533,6 +556,9 @@ fn handle_keyboard(term: &mut Terminal, events: &[Event], mode: TermMode) {
                     continue;
                 }
                 let m = *modifiers;
+                if win32 {
+                    sync_win32_mods(term, mods_of(m));
+                }
                 let copy = m.ctrl && m.shift && !m.alt && *key == egui::Key::C;
                 let paste_key = (m.ctrl && m.shift && !m.alt && *key == egui::Key::V)
                     || (m.shift && !m.ctrl && !m.alt && *key == egui::Key::Insert);
@@ -569,7 +595,8 @@ fn handle_keyboard(term: &mut Terminal, events: &[Event], mode: TermMode) {
                     );
                     if !bytes.is_empty() {
                         term.write(&bytes);
-                        // Kitty CSI-u encodes Ctrl+C without a 0x03 byte; omp still sees it.
+                        // Kitty CSI-u and win32 records encode Ctrl+C without a 0x03 byte;
+                        // omp still sees it.
                         if k == Key::Char('c') && mods == Mods::CTRL && *pressed {
                             term.note_ctrl_c();
                         }
@@ -592,6 +619,9 @@ fn handle_keyboard(term: &mut Terminal, events: &[Event], mode: TermMode) {
                     Event::Cut => 'x',
                     _ => 'v',
                 };
+                if win32 {
+                    sync_win32_mods(term, Mods::CTRL);
+                }
                 let bytes =
                     input::encode_key(&KeyInput::press(Key::Char(c), Mods::CTRL), mode, rules);
                 term.write(&bytes);
@@ -610,6 +640,9 @@ fn handle_keyboard(term: &mut Terminal, events: &[Event], mode: TermMode) {
             _ => {}
         }
         i += 1;
+    }
+    if win32 && !held {
+        sync_win32_mods(term, mods_of(modifiers));
     }
 }
 

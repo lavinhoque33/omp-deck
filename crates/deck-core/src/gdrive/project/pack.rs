@@ -6,9 +6,8 @@
 //! member is computed while it streams into the archive.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -24,6 +23,7 @@ use super::{
 };
 use crate::gdrive::archive::{ManifestFile, hex};
 use crate::gdrive::{Error, Result, rfc3339};
+use crate::platform;
 
 const BLOB_PREFIX: &[u8] = b"blob:sha256:";
 /// `blob:sha256:` + 64 hex digits.
@@ -91,11 +91,7 @@ pub(super) fn pack(
 
     let mut pump = Pump::new(cancel, progress, Stage::Packing, total);
     let mut write = || -> io::Result<Packed> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(dest)?;
+        let file = platform::open_private_file(dest)?;
         let gz = GzEncoder::new(
             BufWriter::with_capacity(256 * 1024, file),
             Compression::new(3),

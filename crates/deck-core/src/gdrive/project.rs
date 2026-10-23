@@ -13,10 +13,8 @@ mod restore;
 mod snapshot;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, DirBuilder, File};
+use std::fs::{self, File};
 use std::io::{self, Read};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -29,6 +27,7 @@ use super::archive::{ManifestFile, hex};
 use super::drive::{BackupFile, PROJECT_KIND, to_delete};
 use super::{Error, LastBackup, Result, Service, compact_stamp, hostname, io_err, unix_now};
 use crate::omp::Omp;
+use crate::platform;
 use crate::sessions::SessionsRoot;
 use snapshot::Snapshot;
 
@@ -120,7 +119,7 @@ pub fn measure(root: &SessionsRoot, project: &Path) -> io::Result<ProjectSizes> 
 /// taken by components (as `Path` equality does), so `/a/b/` and `/a/b` are one project.
 pub fn path_id(project: &Path) -> String {
     let normalized: PathBuf = project.components().collect();
-    let digest = Sha256::digest(normalized.as_os_str().as_bytes());
+    let digest = Sha256::digest(crate::platform::path_bytes(&normalized));
     hex(&digest[..8])
 }
 
@@ -475,20 +474,13 @@ struct Staging {
 impl Staging {
     /// Creates `<root>/<random>` (0700) and first removes stale leftovers of crashed jobs.
     fn create(root: &Path) -> Result<Staging> {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(root)
-            .map_err(io_err("cannot create", root))?;
+        platform::create_private_dir_all(root).map_err(io_err("cannot create", root))?;
         sweep_stale(root);
         let mut random = [0u8; 8];
         getrandom::fill(&mut random)
             .map_err(|e| Error::Io(format!("no system randomness: {e}")))?;
         let dir = root.join(hex(&random));
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .map_err(io_err("cannot create", &dir))?;
+        platform::create_private_dir(&dir).map_err(io_err("cannot create", &dir))?;
         Ok(Staging { dir })
     }
 }
@@ -862,12 +854,8 @@ impl Service {
         let archive = stage.dir.join("backup.tar.gz");
         let size = backup.file.size;
         {
-            let mut out = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&archive)
-                .map_err(io_err("cannot create", &archive))?;
+            let mut out =
+                platform::open_private_file(&archive).map_err(io_err("cannot create", &archive))?;
             progress(Progress {
                 stage: Stage::Downloading,
                 done: 0,

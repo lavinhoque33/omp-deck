@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! ctl directory bounds/fallback, `prepare_ctl_dir`, `prune_ctl_dirs`, and `install_extension` hardening.
 //! Env-dependent assertions live in ONE test so the process-wide environment is never raced.
 

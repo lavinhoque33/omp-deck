@@ -1,4 +1,5 @@
-//! Background tmux poller: which tmux sessions are alive and which omp session files they hold.
+//! Background poller: which sessions are alive in the available backends (tmux and/or the
+//! OmpDeck host) and which omp session files they hold.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -6,19 +7,20 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use deck_core::tmux::{Tmux, session_name_for};
+use deck_core::mux::{Mux, MuxKind};
+use deck_core::tmux::session_name_for;
 
 /// Outcome of [`RunningSnapshot::resolve`]; both variants are the name `attach_or_create` gets.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TmuxTarget {
+pub enum SessionTarget {
     Attach(String),
     Create(String),
 }
 
-impl TmuxTarget {
+impl SessionTarget {
     pub fn into_name(self) -> String {
         match self {
-            TmuxTarget::Attach(n) | TmuxTarget::Create(n) => n,
+            SessionTarget::Attach(n) | SessionTarget::Create(n) => n,
         }
     }
 }
@@ -28,6 +30,8 @@ impl TmuxTarget {
 pub struct RunningSnapshot {
     pub alive: HashSet<String>,
     pub files: HashMap<String, Vec<PathBuf>>,
+    /// Backend of each live session (the first one listing it); empty when unknown.
+    owners: HashMap<String, MuxKind>,
     held: HashMap<PathBuf, String>,
 }
 
@@ -42,7 +46,23 @@ impl RunningSnapshot {
                 held.entry(path.clone()).or_insert_with(|| name.clone());
             }
         }
-        RunningSnapshot { alive, files, held }
+        RunningSnapshot {
+            alive,
+            files,
+            owners: HashMap::new(),
+            held,
+        }
+    }
+
+    /// Records which backend each live session belongs to.
+    pub fn with_owners(mut self, owners: HashMap<String, MuxKind>) -> Self {
+        self.owners = owners;
+        self
+    }
+
+    /// The backend holding live session `name`.
+    pub fn owner_of(&self, name: &str) -> Option<MuxKind> {
+        self.owners.get(name).copied()
     }
 
     /// Running = a live tmux session holds the file, or the canonical tmux name for this id is
@@ -60,25 +80,25 @@ impl RunningSnapshot {
     /// Which tmux session a tab for `path` must use: the one that holds the file; else `preferred`
     /// when it is not alive (create it) or alive without a known file (attach: a fresh omp);
     /// else — `preferred` runs another file now — a new name derived from it (`<preferred>-<ms>`).
-    pub fn resolve(&self, preferred: &str, path: Option<&Path>, unix_ms: u128) -> TmuxTarget {
+    pub fn resolve(&self, preferred: &str, path: Option<&Path>, unix_ms: u128) -> SessionTarget {
         if let Some(holder) = path.and_then(|p| self.holder(p)) {
-            return TmuxTarget::Attach(holder.to_owned());
+            return SessionTarget::Attach(holder.to_owned());
         }
         if !self.is_alive(preferred) {
-            return TmuxTarget::Create(preferred.to_owned());
+            return SessionTarget::Create(preferred.to_owned());
         }
         match path {
             Some(_) if !self.files_of(preferred).is_empty() => {
-                TmuxTarget::Create(format!("{preferred}-{unix_ms}"))
+                SessionTarget::Create(format!("{preferred}-{unix_ms}"))
             }
-            _ => TmuxTarget::Attach(preferred.to_owned()),
+            _ => SessionTarget::Attach(preferred.to_owned()),
         }
     }
 
     /// Name for a tab when no trustworthy snapshot exists (the poller could not start): never
     /// attach to a possibly foreign session, always create `<preferred>-<ms>`.
-    pub fn resolve_blind(preferred: &str, unix_ms: u128) -> TmuxTarget {
-        TmuxTarget::Create(format!("{preferred}-{unix_ms}"))
+    pub fn resolve_blind(preferred: &str, unix_ms: u128) -> SessionTarget {
+        SessionTarget::Create(format!("{preferred}-{unix_ms}"))
     }
 
     /// [`resolve`](Self::resolve), or [`resolve_blind`](Self::resolve_blind) when `blind`.
@@ -88,7 +108,7 @@ impl RunningSnapshot {
         preferred: &str,
         path: Option<&Path>,
         unix_ms: u128,
-    ) -> TmuxTarget {
+    ) -> SessionTarget {
         if blind {
             Self::resolve_blind(preferred, unix_ms)
         } else {
@@ -101,12 +121,12 @@ impl RunningSnapshot {
         self.held.get(path).map(String::as_str)
     }
 
-    pub fn files_of(&self, tmux_name: &str) -> &[PathBuf] {
-        self.files.get(tmux_name).map_or(&[], Vec::as_slice)
+    pub fn files_of(&self, mux_name: &str) -> &[PathBuf] {
+        self.files.get(mux_name).map_or(&[], Vec::as_slice)
     }
 
-    pub fn is_alive(&self, tmux_name: &str) -> bool {
-        self.alive.contains(tmux_name)
+    pub fn is_alive(&self, mux_name: &str) -> bool {
+        self.alive.contains(mux_name)
     }
 }
 
@@ -135,9 +155,12 @@ pub struct RunningMonitor {
 }
 
 impl RunningMonitor {
-    /// Without tmux there is nothing to poll: the snapshot is permanently empty.
+    /// Polls every backend in `muxes` (live sessions are the union; control dirs under
+    /// `ctl_ns` are pruned against it). Without a backend there is nothing to poll: the
+    /// snapshot is permanently empty.
     pub fn spawn(
-        tmux: Option<Tmux>,
+        muxes: Vec<Mux>,
+        ctl_ns: String,
         sessions_root: PathBuf,
         interval: Duration,
         on_update: impl Fn() + Send + 'static,
@@ -146,14 +169,14 @@ impl RunningMonitor {
             inner: Mutex::new(Inner::default()),
             cv: Condvar::new(),
         });
-        let Some(tmux) = tmux else {
+        if muxes.is_empty() {
             lock(&shared).latest = Some(Arc::new(RunningSnapshot::default()));
             return RunningMonitor {
                 shared,
                 thread: None,
                 blind: false,
             };
-        };
+        }
         let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("running-monitor".into())
@@ -168,20 +191,14 @@ impl RunningMonitor {
                         }
                         guard.poke = false;
                     }
-                    let alive = tmux.alive_sessions();
+                    let snap = poll(&muxes, &sessions_root);
                     // An empty answer may be a failed query: never prune on it, a running
                     // omp's socket would be lost.
-                    if !alive.is_empty() {
-                        let mut names = alive.clone();
+                    if !snap.alive.is_empty() {
+                        let mut names = snap.alive.clone();
                         names.extend(lock(&worker).ctl_keep.iter().cloned());
-                        deck_core::ctl::prune_ctl_dirs(tmux.socket(), &names);
+                        deck_core::ctl::prune_ctl_dirs(&ctl_ns, &names);
                     }
-                    let files = if alive.is_empty() {
-                        HashMap::new()
-                    } else {
-                        tmux.session_files(&sessions_root)
-                    };
-                    let snap = RunningSnapshot::new(alive, files);
                     let mut guard = lock(&worker);
                     if guard.stop {
                         return;
@@ -232,7 +249,7 @@ impl RunningMonitor {
         self.shared.cv.notify_all();
     }
 
-    /// True when tmux exists but its poller could not start: snapshots carry no information.
+    /// True when backends exist but their poller could not start: snapshots carry no information.
     pub fn is_blind(&self) -> bool {
         self.blind
     }
@@ -246,6 +263,50 @@ impl Drop for RunningMonitor {
             let _ = t.join();
         }
     }
+}
+
+/// One backend's answer to a poll.
+struct Polled {
+    kind: MuxKind,
+    alive: HashSet<String>,
+    files: HashMap<String, Vec<PathBuf>>,
+}
+
+/// Asks every backend (blocking) and merges the answers.
+fn poll(muxes: &[Mux], sessions_root: &Path) -> RunningSnapshot {
+    merge(muxes.iter().map(|mux| {
+        let alive = mux.alive_sessions();
+        let files = if alive.is_empty() {
+            HashMap::new()
+        } else {
+            mux.session_files(sessions_root)
+        };
+        Polled {
+            kind: mux.kind(),
+            alive,
+            files,
+        }
+    }))
+}
+
+/// Union of the backends' sessions. A name listed by several backends belongs to the first.
+fn merge(polled: impl IntoIterator<Item = Polled>) -> RunningSnapshot {
+    let mut alive = HashSet::new();
+    let mut files: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut owners = HashMap::new();
+    for p in polled {
+        for name in p.alive {
+            if alive.insert(name.clone()) {
+                owners.insert(name, p.kind);
+            }
+        }
+        for (name, list) in p.files {
+            if owners.get(&name) == Some(&p.kind) {
+                files.insert(name, list);
+            }
+        }
+    }
+    RunningSnapshot::new(alive, files).with_owners(owners)
 }
 
 #[cfg(test)]
@@ -288,11 +349,11 @@ mod tests {
         );
         assert_eq!(
             s.resolve("omp-a", Some(Path::new("/s/a.jsonl")), 42),
-            TmuxTarget::Create("omp-a-42".into())
+            SessionTarget::Create("omp-a-42".into())
         );
         assert_eq!(
             s.resolve("omp-b", Some(Path::new("/s/b.jsonl")), 42),
-            TmuxTarget::Attach("omp-a".into()),
+            SessionTarget::Attach("omp-a".into()),
             "attach to whichever tmux session holds the file"
         );
     }
@@ -303,24 +364,63 @@ mod tests {
         // Not alive: create under the canonical name.
         assert_eq!(
             s.resolve("omp-a", Some(Path::new("/s/a.jsonl")), 1),
-            TmuxTarget::Create("omp-a".into())
+            SessionTarget::Create("omp-a".into())
         );
         // Alive, file unknown (fresh omp): attach.
         assert_eq!(
             s.resolve("omp-fresh", Some(Path::new("/s/x.jsonl")), 1),
-            TmuxTarget::Attach("omp-fresh".into())
+            SessionTarget::Attach("omp-fresh".into())
         );
         // No file to compare (new tab): the preferred name as is.
         assert_eq!(
             snap(&[("omp-n", &["/s/z.jsonl"])], &["omp-n"]).resolve("omp-n", None, 1),
-            TmuxTarget::Attach("omp-n".into())
+            SessionTarget::Attach("omp-n".into())
         );
     }
 
     #[test]
-    fn no_tmux_gives_empty_snapshot() {
-        let m = RunningMonitor::spawn(None, PathBuf::from("/x"), Duration::from_secs(1), || {});
+    fn no_backend_gives_empty_snapshot() {
+        let m = RunningMonitor::spawn(
+            Vec::new(),
+            "direct".into(),
+            PathBuf::from("/x"),
+            Duration::from_secs(1),
+            || {},
+        );
         assert_eq!(m.latest().as_deref(), Some(&RunningSnapshot::default()));
+    }
+
+    fn polled(kind: MuxKind, files: &[(&str, &[&str])], alive: &[&str]) -> Polled {
+        Polled {
+            kind,
+            alive: alive.iter().map(|a| (*a).to_owned()).collect(),
+            files: files
+                .iter()
+                .map(|(n, f)| ((*n).to_owned(), f.iter().map(PathBuf::from).collect()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn sessions_of_both_backends_are_running_and_routed_to_their_owner() {
+        let s = merge([
+            polled(MuxKind::Tmux, &[("omp-a", &["/s/a.jsonl"])], &["omp-a"]),
+            polled(
+                MuxKind::Host,
+                &[("omp-b", &["/s/b.jsonl"]), ("omp-a", &["/s/stale.jsonl"])],
+                &["omp-b", "omp-a"],
+            ),
+        ]);
+        assert!(s.is_running("a", Path::new("/s/a.jsonl")));
+        assert!(s.is_running("b", Path::new("/s/b.jsonl")));
+        assert_eq!(
+            s.owner_of("omp-a"),
+            Some(MuxKind::Tmux),
+            "first backend wins"
+        );
+        assert_eq!(s.owner_of("omp-b"), Some(MuxKind::Host));
+        assert_eq!(s.owner_of("omp-zzz"), None);
+        assert_eq!(s.files_of("omp-a"), [PathBuf::from("/s/a.jsonl")]);
     }
 
     #[test]
@@ -329,8 +429,8 @@ mod tests {
         alive.insert("omp-a".to_owned());
         let snap = RunningSnapshot::new(alive, HashMap::new());
         let t = snap.resolve_for(true, "omp-a", Some(Path::new("/x.jsonl")), 42);
-        assert_eq!(t, TmuxTarget::Create("omp-a-42".into()));
+        assert_eq!(t, SessionTarget::Create("omp-a-42".into()));
         let t = snap.resolve_for(false, "omp-a", None, 42);
-        assert_eq!(t, TmuxTarget::Attach("omp-a".into()));
+        assert_eq!(t, SessionTarget::Attach("omp-a".into()));
     }
 }

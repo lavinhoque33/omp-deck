@@ -372,8 +372,9 @@ pub fn install_omp_button(ui: &mut Ui) -> bool {
         .min_size(vec2(0.0, 30.0)),
     )
     .on_hover_text(format!(
-        "Run omp's official installer ({}) in a new tab; it installs to ~/.local/bin, no root needed",
-        deck_core::omp::INSTALL_URL
+        "Run omp's official installer ({}) in a new tab; it installs to {}, no admin rights needed",
+        deck_core::omp::INSTALL_URL,
+        crate::update::OMP_INSTALL_DIR
     ))
     .clicked()
 }

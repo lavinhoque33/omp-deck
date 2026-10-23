@@ -185,6 +185,17 @@ impl Palette {
             b: f(c.b, bg.b),
         }
     }
+
+    /// The colors a session host answers OSC 4/10/11/12 queries with (see
+    /// [`crate::RemoteTx::palette`]): ANSI 0..=15, foreground, background, cursor.
+    pub fn host_colors(&self) -> [[u8; 3]; 19] {
+        let mut out = [[0; 3]; 19];
+        let extra = [self.foreground, self.background, self.cursor];
+        for (slot, c) in out.iter_mut().zip(self.ansi.iter().chain(&extra)) {
+            *slot = [c.r, c.g, c.b];
+        }
+        out
+    }
 }
 
 /// Effective color at `index`: app override (OSC 4/10/11/12) else the palette.

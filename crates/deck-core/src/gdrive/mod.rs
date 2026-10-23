@@ -312,21 +312,21 @@ impl Service {
     }
 }
 
-/// `$XDG_DATA_HOME/omp-deck/restore-safety` (fallback `~/.local/share/...`).
+/// `omp-deck/restore-safety` under the platform data directory (`dirs::data_dir()`).
 fn default_safety_root() -> PathBuf {
     dirs::data_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from(".local/share"))
-        .join("omp-deck/restore-safety")
+        .unwrap_or_default()
+        .join("omp-deck")
+        .join("restore-safety")
 }
 
-/// `$XDG_CACHE_HOME/omp-deck/project-sync` (fallback `~/.cache/...`): where project backups are
-/// staged while they are built, uploaded, downloaded and verified.
+/// `omp-deck/project-sync` under the platform cache directory (`dirs::cache_dir()`): where project
+/// backups are staged while they are built, uploaded, downloaded and verified.
 fn default_cache_root() -> PathBuf {
     dirs::cache_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
-        .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("omp-deck/project-sync")
+        .unwrap_or_default()
+        .join("omp-deck")
+        .join("project-sync")
 }
 
 /// The blocking HTTP client: statuses are inspected by the caller, never turned into errors.
@@ -391,11 +391,7 @@ fn unix_now() -> i64 {
 
 /// This machine's hostname (`unknown` when unreadable).
 pub fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_owned())
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
+    crate::platform::hostname().unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// UTC calendar parts of a unix time.

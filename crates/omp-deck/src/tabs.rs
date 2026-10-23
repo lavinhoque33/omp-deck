@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
+use deck_core::mux::{Mux, is_noise_title};
 use deck_core::omp::UpdateKind;
 use deck_term::Terminal;
 
@@ -27,17 +28,19 @@ use crate::widgets::paint_icon;
 pub enum TabRole {
     /// An omp session (resumed, new or forked).
     Session,
-    /// `omp update …` running directly (never tmux, never persisted).
+    /// `omp update …` (never persisted).
     Update(UpdateKind),
-    /// omp's official installer, offered while omp is not found (direct, never persisted).
+    /// omp's official installer, offered while omp is not found (never persisted).
     InstallOmp,
 }
 
-/// A terminal tab: an omp process (usually inside tmux) rendered by deck-term.
+/// A terminal tab: an omp process (usually in a tmux or host session) rendered by deck-term.
 pub struct TermTab {
     pub term: Terminal,
-    /// tmux session name; `None` in degraded (no tmux) mode.
-    pub tmux_name: Option<String>,
+    /// Session name in the backend; `None` for direct tabs (update/installer, or no backend).
+    pub mux_name: Option<String>,
+    /// The backend running the session (`None` with `mux_name`).
+    pub mux: Option<Mux>,
     pub cwd: PathBuf,
     pub session_path: Option<PathBuf>,
     /// Label used until the sidebar knows this session (restored state / click time).
@@ -59,7 +62,7 @@ pub struct TermTab {
     /// Key of this tab's control socket (`deck_core::ctl::ctl_dir(key)`) when it was launched
     /// with the control extension; `None` for update tabs and when no extension is installed.
     pub ctl_key: Option<String>,
-    /// This launch created the tmux session with the extension, so its socket is expected soon
+    /// This launch created the session with the extension, so its socket is expected soon
     /// (attaching to an existing session ignores the argv: no expectation).
     pub ctl_expect: bool,
     /// The control socket was connected at least once.
@@ -117,8 +120,8 @@ impl Tab {
         self.term().and_then(|t| t.session_path.as_deref())
     }
 
-    pub fn tmux_name(&self) -> Option<&str> {
-        self.term().and_then(|t| t.tmux_name.as_deref())
+    pub fn mux_name(&self) -> Option<&str> {
+        self.term().and_then(|t| t.mux_name.as_deref())
     }
 
     pub fn title<'a>(&'a self, labels: &'a HashMap<PathBuf, String>) -> &'a str {
@@ -180,7 +183,7 @@ impl TermTab {
             TabRole::InstallOmp => return "Install omp",
             TabRole::Session => {}
         }
-        osc.filter(|t| !t.trim().is_empty() && !is_hostname(t))
+        osc.filter(|t| !is_noise_title(t))
             .or_else(|| {
                 self.session_path
                     .as_ref()
@@ -271,34 +274,10 @@ pub fn paint_attention_pill(p: &Painter, pal: &Palette, rect: Rect, radius: u8) 
     );
 }
 
-/// Machine hostname (tmux's default pane title), read once.
-fn hostname() -> &'static str {
-    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HOST.get_or_init(|| {
-        std::fs::read_to_string("/proc/sys/kernel/hostname")
-            .map(|s| s.trim().to_owned())
-            .unwrap_or_default()
-    })
-}
-
-/// True when `title` is `host` or its short form (before the first '.'), ignoring surrounding whitespace.
-fn matches_hostname(title: &str, host: &str) -> bool {
-    let t = title.trim();
-    if t.is_empty() || host.is_empty() {
-        return false;
-    }
-    let short = host.split('.').next().unwrap_or(host);
-    t == host || t == short
-}
-
-fn is_hostname(title: &str) -> bool {
-    matches_hostname(title, hostname())
-}
-
 /// What to relaunch when a closed tab is reopened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClosedTab {
-    pub tmux_name: Option<String>,
+    pub mux_name: Option<String>,
     pub cwd: PathBuf,
     pub session_path: Option<PathBuf>,
     pub title: String,
@@ -688,17 +667,6 @@ mod tests {
         // Several files open (a subagent, a pending fork): no guess.
         assert_eq!(followed_path(Some(&a), &[a.clone(), b.clone()]), None);
         assert_eq!(followed_path(Some(&a), &[b.clone(), a.clone()]), None);
-    }
-
-    #[test]
-    fn hostname_titles_are_recognised() {
-        assert!(matches_hostname("axeleratorPC", "axeleratorPC"));
-        assert!(matches_hostname(" axeleratorPC\n", "axeleratorPC.lan"));
-        assert!(matches_hostname("axeleratorPC.lan", "axeleratorPC.lan"));
-        assert!(!matches_hostname("axeleratorPC2", "axeleratorPC.lan"));
-        assert!(!matches_hostname("omp - proj", "axeleratorPC"));
-        assert!(!matches_hostname("", ""));
-        assert!(!matches_hostname("x", ""));
     }
 
     #[test]
