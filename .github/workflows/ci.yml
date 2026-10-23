@@ -54,6 +54,14 @@ jobs:
 
       - run: cargo test --workspace --no-fail-fast
 
+      # Release builds use the GUI subsystem and optimizations; run the host's process/ConPTY tests against them too.
+      - name: Host tests (release build)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --release -p deck-host
+          ./packaging/windows/fetch-conpty.ps1 -OutDir target/release -Arch x64
+          cargo test --release -p deck-host --no-fail-fast
+
       - name: Install omp
         if: ${{ !cancelled() }}
         run: |

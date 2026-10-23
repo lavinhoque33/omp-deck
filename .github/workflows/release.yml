@@ -197,15 +197,21 @@ jobs:
             if ($p.ExitCode -ne 0) { throw "omp-deck-host $HostArgs failed ($($p.ExitCode)): $text" }
             return $text
           }
-          Invoke-Host "new smoke --ns $ns -- ping.exe -n 30 127.0.0.1" | Out-Null
-          Start-Sleep -Seconds 3
-          $screen = Invoke-Host "dump smoke --ns $ns"
-          Write-Host $screen
-          Invoke-Host "kill smoke --ns $ns" | Out-Null
-          if ($screen -notmatch '127\.0\.0\.1') { throw "packaged host did not run the session" }
-          $log = Get-Content -Raw (Join-Path $env:LOCALAPPDATA "omp-deck\host\$ns\smoke.log")
-          Write-Host $log
-          if ($log -notmatch 'sideloaded conpty.dll') { throw "packaged host did not load the bundled conpty.dll" }
+          $logDir = Join-Path $env:LOCALAPPDATA "omp-deck\host\$ns"
+          try {
+            Invoke-Host "new smoke --ns $ns -- ping.exe -n 30 127.0.0.1" | Out-Null
+            Start-Sleep -Seconds 3
+            Write-Host "ls: $(Invoke-Host "ls --ns $ns")"
+            $screen = Invoke-Host "dump smoke --ns $ns"
+            Write-Host $screen
+            Invoke-Host "kill smoke --ns $ns" | Out-Null
+            if ($screen -notmatch '127\.0\.0\.1') { throw "packaged host did not run the session" }
+            $log = Get-Content -Raw (Join-Path $logDir 'smoke.log')
+            if ($log -notmatch 'sideloaded conpty.dll') { throw "packaged host did not load the bundled conpty.dll" }
+          } finally {
+            Write-Host "---- host logs ----"
+            Get-ChildItem -Recurse -File $logDir -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "== $($_.FullName)"; Get-Content -Raw $_.FullName }
+          }
 
       - name: Installer round trip
         # packaging/install.ps1 -ZipPath under Windows PowerShell 5.1 and PowerShell 7: install, reinstall while
