@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Client, TestNs, env, wait_until};
 use deck_host::{Error, HostEvent, SessionSpec};
@@ -247,35 +247,43 @@ fn clients_that_drop_immediately_do_not_break_the_endpoint() {
     let path = format!(r"\\.\pipe\{pipe}");
     // Several threads connecting and dropping at once also hit the window between a new
     // instance and the daemon's next ConnectNamedPipe (client gone first: ERROR_NO_DATA).
-    let workers: Vec<_> = (0..4)
+    // Every attempt retries while all instances are busy, so exactly THREADS × CYCLES real
+    // connect-and-drop cycles happen; only an endpoint that stops accepting fails the test.
+    const THREADS: usize = 4;
+    const CYCLES: usize = 25;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let workers: Vec<_> = (0..THREADS)
         .map(|t| {
             let path = path.clone();
             std::thread::spawn(move || {
-                let mut connected = 0;
-                for i in 0..50 {
-                    // Busy instances are expected while the daemon recycles; count real
-                    // connects.
-                    let Ok(mut f) = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&path)
-                    else {
-                        std::thread::sleep(Duration::from_millis(2));
-                        continue;
+                for i in 0..CYCLES {
+                    let mut f = loop {
+                        match std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&path)
+                        {
+                            Ok(f) => break f,
+                            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                                assert!(Instant::now() < deadline, "endpoint stopped accepting");
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(e) => panic!("connect {t}/{i}: {e}"),
+                        }
                     };
-                    connected += 1;
                     if (i + t) % 2 == 1 {
                         // A partial frame, then gone before reading the Hello reply.
                         let _ = f.write_all(&[5, 0]);
                     }
                     drop(f);
                 }
-                connected
             })
         })
         .collect();
-    let connected: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
-    assert!(connected >= 10, "only {connected} raw connects succeeded");
+    for w in workers {
+        w.join().unwrap();
+    }
     assert_eq!(ns.0.list(), ["drop"]);
     assert!(ns.0.info("drop").is_ok());
     let mut c = Client::attach(&ns, "drop", 80, 24);
