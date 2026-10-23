@@ -17,7 +17,6 @@ use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
 use super::{POLL, auth_line, load_or_create_secret, pipe_name, pipe_token};
-use crate::config::config_dir;
 use crate::platform;
 
 /// The extension picks its endpoint from this variable (the full pipe name; it never derives one).
@@ -68,32 +67,27 @@ pub(super) struct Conn {
 
 const TOKEN_VAR: &str = "OMPDECK_CTL_TOKEN";
 
-/// Where the per-user secret lives: `<config dir>/ctl.key`.
-fn secret_path() -> PathBuf {
-    config_dir().join("ctl.key")
-}
-
 /// The token of the pipe named `dir` (see [`pipe_token`]).
-fn token_for(dir: &Path) -> io::Result<String> {
+fn token_for(dir: &Path, key_file: &Path) -> io::Result<String> {
     let name = dir
         .to_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pipe name is not UTF-8"))?;
-    Ok(pipe_token(&load_or_create_secret(&secret_path())?, name))
+    Ok(pipe_token(&load_or_create_secret(key_file)?, name))
 }
 
 /// The extension's environment: the pipe name and the token that authenticates clients of it.
-pub(super) fn env(dir: &Path) -> io::Result<Vec<(&'static str, OsString)>> {
+pub(super) fn env(dir: &Path, key_file: &Path) -> io::Result<Vec<(&'static str, OsString)>> {
     Ok(vec![
         (ENV_VAR, dir.as_os_str().to_owned()),
-        (TOKEN_VAR, OsString::from(token_for(dir)?)),
+        (TOKEN_VAR, OsString::from(token_for(dir, key_file)?)),
     ])
 }
 
 /// Opens the pipe `dir` names and authenticates (the extension ignores anything before the
 /// token). A missing pipe is `NotFound`.
-pub(super) fn connect(dir: &Path) -> io::Result<Conn> {
+pub(super) fn connect(dir: &Path, key_file: &Path) -> io::Result<Conn> {
     let mut pipe = OpenOptions::new().read(true).write(true).open(dir)?;
-    pipe.write_all(&auth_line(&token_for(dir)?))?;
+    pipe.write_all(&auth_line(&token_for(dir, key_file)?))?;
     Ok(Conn { pipe })
 }
 

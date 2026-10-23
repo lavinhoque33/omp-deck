@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use deck_core::ctl::{
-    CtlClient, CtlCommand, CtlReply, ctl_dir, ctl_env, prepare_ctl_dir, prune_ctl_dirs,
+    CtlClient, CtlCommand, CtlReply, ctl_dir, ctl_env_with_key, prepare_ctl_dir, prune_ctl_dirs,
 };
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
@@ -71,13 +71,15 @@ fn read_line(pipe: &mut File) -> String {
 fn a_tab_pipe_serves_snapshots_and_takes_commands_at_the_same_time() {
     let dir = ctl_dir("omp-deck-test-pipe", "omp-pipe-roundtrip");
     prepare_ctl_dir(&dir).unwrap();
-    let env = ctl_env(&dir).unwrap();
+    let key_dir = tempfile::tempdir().unwrap();
+    let key_file = key_dir.path().join("ctl.key");
+    let env = ctl_env_with_key(&dir, &key_file).unwrap();
     assert_eq!(env[0].0, "OMPDECK_CTL_PIPE");
     assert_eq!(env[1].0, "OMPDECK_CTL_TOKEN");
     let token = env[1].1.to_str().unwrap().to_owned();
     assert_eq!(token.len(), 64);
     let mut server = serve(&dir);
-    let client = CtlClient::spawn(dir.clone(), || {});
+    let client = CtlClient::spawn_with_key(dir.clone(), key_file, || {});
     // SAFETY: the pipe handle is valid; ConnectNamedPipe blocks until the client opened it.
     let connected = unsafe {
         ConnectNamedPipe(

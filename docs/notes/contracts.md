@@ -1408,10 +1408,15 @@ payloads raw (`Input`, `Output`, `Snapshot` chunks), control payloads JSON (unkn
   is_executable, find_in, find_on_path, create_private_dir(_all), open_private_file, write_private, FileId,
   file_identity, file_mode, set_file_mode, open_regular_file, is_link, path_bytes, tree_open_files,
   KillableCommand, spawn_killable, KillableChild::kill_tree, open_path, reveal}`; `mux::{BackendChoice, MuxKind,
-  MuxError, Pane, Launch, Mux, HostMux, host_env, term_session_id, is_noise_title, title_is_noise,
-  HOST_NAMESPACE, TMUX_SOCKET_ENV, HOST_NS_ENV, HOST_ENV_REMOVE}`; `Mux::{detect, kind, namespace, launch,
+  MuxError, Pane, Launch, LaunchSpec, Mux, HostMux, host_env, term_session_id, is_noise_title, title_is_noise,
+  session_name_for, new_session_name, direct_launch, effective_cwd, terminal_env, HOST_NAMESPACE,
+  TMUX_SOCKET_ENV, HOST_NS_ENV, HOST_ENV_REMOVE}` (moved from `tmux`, no re-exports; the env overrides accept only
+  `omp-deck-test-…` names that are valid host namespaces, ≤ 40 bytes); `Mux::{detect, kind, namespace, launch,
   launch_with_env, alive_sessions, has_session, kill, session_files, pane}`; `ctl::with_ctl(omp_argv, ext)` (no
-  dir/env wrapper) + `ctl_env(dir) -> (name, value)` (`OMPDECK_CTL_DIR` / `OMPDECK_CTL_PIPE`);
+  dir/env wrapper) + `ctl_env(dir) -> io::Result<Vec<(&'static str, OsString)>>` (`OMPDECK_CTL_DIR`; Windows
+  `OMPDECK_CTL_PIPE` + `OMPDECK_CTL_TOKEN` = sha256(secret ‖ pipe), secret in `default_key_file()`);
+  `ctl_env_with_key(dir, key_file)` / `CtlClient::spawn_with_key` inject the key file (tests).
+  `TabState.session_name` (serde alias `tmux_name`).
   `StatusTarget.mux: Option<(Mux, String)>`; `Tmux::pane`, `Tmux::detect_on`; `AppConfig.session_backend`.
 - deck-term: `Remote`/`RemoteRx`/`RemoteTx` (`&self` methods returning `io::Result<()>`; `palette([[u8;3];19])`),
   `RemoteEvent`, `Terminal::connect(Box<dyn Remote>, TermOptions, Context) -> Terminal`, `Terminal::is_displaced`,

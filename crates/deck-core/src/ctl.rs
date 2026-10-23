@@ -149,7 +149,18 @@ pub fn with_ctl(omp_argv: &[String], ext: &Path) -> Vec<String> {
 /// `OMPDECK_CTL_TOKEN` (see [`pipe_token`]). An error (the secret file cannot be read or created)
 /// means: launch without control.
 pub fn ctl_env(dir: &Path) -> io::Result<Vec<(&'static str, OsString)>> {
-    os::env(dir)
+    ctl_env_with_key(dir, &default_key_file())
+}
+
+/// [`ctl_env`] with the per-user secret read from (or created at) `key_file` instead of
+/// [`default_key_file`]. Only Windows uses a secret; elsewhere `key_file` is ignored.
+pub fn ctl_env_with_key(dir: &Path, key_file: &Path) -> io::Result<Vec<(&'static str, OsString)>> {
+    os::env(dir, key_file)
+}
+
+/// Where the per-user ctl secret lives by default: `<config dir>/ctl.key`.
+pub fn default_key_file() -> PathBuf {
+    crate::config::config_dir().join("ctl.key")
 }
 
 /// Capability token of one pipe: `hex(sha256(secret || pipe name))`. A pipe has no owner or mode
@@ -564,12 +575,23 @@ impl CtlClient {
     /// `on_update` runs on the client thread whenever the snapshot changes, the connection state
     /// changes, or a reply arrives.
     pub fn spawn(dir: PathBuf, on_update: impl Fn() + Send + 'static) -> CtlClient {
+        Self::spawn_with_key(dir, default_key_file(), on_update)
+    }
+
+    /// [`spawn`](Self::spawn) authenticating with the secret at `key_file` (it must be the one
+    /// [`ctl_env_with_key`] used for the extension). Ignored where no secret is used.
+    pub fn spawn_with_key(
+        dir: PathBuf,
+        key_file: PathBuf,
+        on_update: impl Fn() + Send + 'static,
+    ) -> CtlClient {
         let shared = Arc::new(Shared::default());
         let (tx, rx) = mpsc::channel();
         let worker = Worker {
             shared: Arc::clone(&shared),
             commands: rx,
             dir,
+            key_file,
             on_update: Box::new(on_update),
             pending: HashSet::new(),
         };
@@ -633,6 +655,7 @@ struct Worker {
     shared: Arc<Shared>,
     commands: Receiver<(u64, CtlCommand)>,
     dir: PathBuf,
+    key_file: PathBuf,
     on_update: Box<dyn Fn() + Send>,
     /// Request ids written to the current connection and not yet answered.
     pending: HashSet<u64>,
@@ -651,7 +674,7 @@ impl Worker {
     fn run(mut self) {
         let mut backoff = BACKOFF_START;
         while !self.stopping() {
-            match os::connect(&self.dir) {
+            match os::connect(&self.dir, &self.key_file) {
                 Ok(stream) => {
                     backoff = BACKOFF_START;
                     let exit = self.session(stream);

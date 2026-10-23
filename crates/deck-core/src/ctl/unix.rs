@@ -23,7 +23,10 @@ const SOCKET_FILE: &str = "ctl.sock";
 const LOCK_FILE: &str = "ctl.lock";
 
 /// The extension's environment for the socket dir `dir`.
-pub(super) fn env(dir: &Path) -> io::Result<Vec<(&'static str, std::ffi::OsString)>> {
+pub(super) fn env(
+    dir: &Path,
+    _key_file: &Path,
+) -> io::Result<Vec<(&'static str, std::ffi::OsString)>> {
     Ok(vec![(ENV_VAR, dir.as_os_str().to_owned())])
 }
 
@@ -31,7 +34,7 @@ pub(super) fn env(dir: &Path) -> io::Result<Vec<(&'static str, std::ffi::OsStrin
 pub(super) type Conn = UnixStream;
 
 /// Connects to `<dir>/ctl.sock`.
-pub(super) fn connect(dir: &Path) -> io::Result<Conn> {
+pub(super) fn connect(dir: &Path, _key_file: &Path) -> io::Result<Conn> {
     let stream = UnixStream::connect(dir.join(SOCKET_FILE))?;
     stream.set_read_timeout(Some(POLL))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;

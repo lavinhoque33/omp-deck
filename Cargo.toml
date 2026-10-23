@@ -4,10 +4,10 @@ members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/o
 
 [workspace.package]
 edition = "2024"
-version = "0.6.0"
+version = "0.7.0"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Desktop wrapper for the omp coding-agent TUI: session sidebar, tabs, embedded terminal backed by tmux"
+description = "Desktop wrapper for the omp coding-agent TUI: session sidebar, tabs, embedded terminal backed by tmux or its own session host (Linux, Windows)"
 repository = "https://github.com/lavinhoque33/omp-deck"
 homepage = "https://github.com/lavinhoque33/omp-deck"
 authors = ["lavinhoque33 <caspianprince33@yahoo.com>"]

@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use deck_core::ctl::{
-    CtlClient, ctl_dir, ctl_env, install_extension, prepare_ctl_dir, prune_ctl_dirs, with_ctl,
+    CtlClient, ctl_dir, ctl_env_with_key, install_extension, prepare_ctl_dir, prune_ctl_dirs,
+    with_ctl,
 };
 use deck_core::mux::{HostMux, Launch, Mux};
 
@@ -138,12 +139,14 @@ fn live_omp_serves_a_snapshot_of_its_session_through_the_host() {
     // The app's own steps: install the extension, prepare the endpoint, launch through the host.
     let ns_name = format!("omp-deck-test-ctl-{}", std::process::id());
     let name = "omp-live0001";
+    // The Windows ctl secret lives in the sandbox, not in the real config dir.
+    let key_file = data.join("ctl.key");
     let ext = install_extension(&data).unwrap();
     let dir = ctl_dir(&ns_name, name);
     prepare_ctl_dir(&dir).unwrap();
     let mut launch_env = env;
     launch_env.extend(
-        ctl_env(&dir)
+        ctl_env_with_key(&dir, &key_file)
             .unwrap()
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.to_string_lossy().into_owned())),
@@ -171,7 +174,7 @@ fn live_omp_serves_a_snapshot_of_its_session_through_the_host() {
     // The real client finds the extension's endpoint once omp has started. While waiting, keep
     // the last screen of the session: omp's own error shows there if it exits early (the host
     // lingers 10 s after an unseen exit).
-    let client = CtlClient::spawn(dir.clone(), || {});
+    let client = CtlClient::spawn_with_key(dir.clone(), key_file.clone(), || {});
     let start = Instant::now();
     let mut screen = String::new();
     let mut last_peek = Instant::now();

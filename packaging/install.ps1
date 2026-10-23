@@ -108,7 +108,15 @@ if ($localZip) {
     if ($Version) { Say "Note: -Version is ignored because -ZipPath was given." }
     if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw "ZipPath not found: $ZipPath" }
     $ZipPath = (Resolve-Path -LiteralPath $ZipPath).ProviderPath
-    $Version = if ((Split-Path -Leaf $ZipPath) -match '^omp-deck-(.+?)-(x86_64|aarch64)-windows\.zip$') { $Matches[1] } else { 'local' }
+    if ((Split-Path -Leaf $ZipPath) -match '^omp-deck-(.+?)-(x86_64|aarch64)-windows\.zip$') {
+        $Version = $Matches[1]
+        if ($Matches[2] -ne $assetArch) {
+            throw "$ZipPath is a $($Matches[2]) build but this machine needs $assetArch."
+        }
+    }
+    else {
+        $Version = 'local'
+    }
 }
 elseif ($Version) {
     $Version = $Version.TrimStart('v', 'V')

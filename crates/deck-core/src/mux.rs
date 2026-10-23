@@ -128,19 +128,18 @@ impl HostMux {
     }
 }
 
-/// `value` when it is a test name, `omp-deck-test-` plus `[A-Za-z0-9_-]+`; otherwise (unset,
+/// `value` when it is a test name, `omp-deck-test-` plus `[A-Za-z0-9_-]+`, at most 40 bytes; otherwise (unset,
 /// empty or anything else, with a warning for the latter) `default`. A stray environment variable
 /// can therefore never point the app at another tmux server or host namespace.
 fn checked_override(value: Option<&str>, default: &str, var: &str) -> String {
     match value {
         None | Some("") => default.to_owned(),
+        // `valid_namespace` is `[A-Za-z0-9_-]{1,40}`: the host's namespace rule, and a bound that
+        // keeps a tmux socket path short too.
         Some(v)
-            if v.strip_prefix("omp-deck-test-").is_some_and(|rest| {
-                !rest.is_empty()
-                    && rest
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            }) =>
+            if v.strip_prefix("omp-deck-test-")
+                .is_some_and(|rest| !rest.is_empty())
+                && deck_host::valid_namespace(v) =>
         {
             v.to_owned()
         }
@@ -701,9 +700,15 @@ mod tests {
             "omp-deck-test-é",
             "x-omp-deck-test-1",
             "OMP-DECK-TEST-1",
+            // 41 bytes: too long for a host namespace.
+            "omp-deck-test-aaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
             assert_eq!(check(Some(bad)), "omp-deck", "{bad:?}");
         }
+        // Exactly 40 bytes is the longest accepted name.
+        let longest = format!("omp-deck-test-{}", "a".repeat(26));
+        assert_eq!(longest.len(), 40);
+        assert_eq!(check(Some(&longest)), longest);
         assert_eq!(check(None), "omp-deck");
     }
 
