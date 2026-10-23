@@ -52,9 +52,10 @@ jobs:
       - name: Fetch ConPTY
         run: ./packaging/windows/fetch-conpty.ps1 -OutDir target/debug -Arch x64
 
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
 
       - name: Install omp
+        if: ${{ !cancelled() }}
         run: |
           & ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary
           $ompDir = Join-Path $env:LOCALAPPDATA 'omp'
@@ -64,6 +65,7 @@ jobs:
           & (Join-Path $ompDir 'omp.exe') --version
 
       - name: Host smoke (omp in ConPTY)
+        if: ${{ !cancelled() }}
         run: |
           $ErrorActionPreference = 'Stop'
           $host_exe = (Resolve-Path 'target/debug/omp-deck-host.exe').Path
@@ -91,6 +93,7 @@ jobs:
           if ($ls -match '(?m)\be2e\b') { throw "e2e still listed after kill" }
 
       - name: GUI screenshot
+        if: ${{ !cancelled() }}
         # Hosted runners have no GPU; the software-rendered window may fail on some images, so this step
         # reports but does not gate the job. The screenshot artifact shows what happened.
         continue-on-error: true
