@@ -9,6 +9,7 @@ mod account;
 mod archive;
 mod drive;
 mod oauth;
+mod project;
 
 #[cfg(test)]
 mod tests;
@@ -22,6 +23,11 @@ pub use account::{Account, AccountStore, LastBackup};
 pub use archive::{HISTORY_DB, Manifest, PreparedRestore, RestorePlan, RestoreReport};
 pub use drive::{BackupFile, to_delete};
 pub use oauth::{LOGIN_TIMEOUT, LoginFlow, SCOPES};
+pub use project::{
+    KEEP_PROJECT_BACKUPS, OmpDir, PROJECT_PREFIX, Parts, PreparedProjectRestore, Progress,
+    ProjectBackup, ProjectBackupOutcome, ProjectRestorePlan, ProjectRestoreReport, ProjectSizes,
+    ProjectSyncState, ProjectSynced, SessionPlan, Stage, measure, path_id,
+};
 
 use crate::usage::Date;
 
@@ -47,7 +53,7 @@ pub enum Error {
     /// A non-success answer from Google, already worded for the user.
     #[error("{0}")]
     Google(String),
-    #[error("sign-in cancelled")]
+    #[error("cancelled")]
     Cancelled,
     #[error("sign-in timed out: the browser never came back")]
     TimedOut,
@@ -157,6 +163,8 @@ pub struct Service {
     pub agent_dir: PathBuf,
     /// Where restores keep the local safety copies.
     pub safety_root: PathBuf,
+    /// Where project backups are staged (never `/tmp`: archives can be large).
+    pub cache_root: PathBuf,
 }
 
 impl Service {
@@ -169,6 +177,7 @@ impl Service {
             store: AccountStore::default_location(),
             agent_dir,
             safety_root: default_safety_root(),
+            cache_root: default_cache_root(),
         }
     }
 
@@ -311,6 +320,15 @@ fn default_safety_root() -> PathBuf {
         .join("omp-deck/restore-safety")
 }
 
+/// `$XDG_CACHE_HOME/omp-deck/project-sync` (fallback `~/.cache/...`): where project backups are
+/// staged while they are built, uploaded, downloaded and verified.
+fn default_cache_root() -> PathBuf {
+    dirs::cache_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(".cache"))
+        .join("omp-deck/project-sync")
+}
+
 /// The blocking HTTP client: statuses are inspected by the caller, never turned into errors.
 fn http() -> ureq::Agent {
     ureq::Agent::config_builder()
@@ -320,6 +338,24 @@ fn http() -> ureq::Agent {
         .user_agent(concat!("omp-deck/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
+}
+
+/// The blocking HTTP client for big transfers: no global deadline (a multi-GB transfer is
+/// legitimately long), a stall timeout instead. Uploads never follow redirects, so a resumable
+/// session's `308` arrives as data.
+fn transfer_http(follow_redirects: bool) -> ureq::Agent {
+    let stall = Some(Duration::from_secs(60));
+    let mut config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_global(None)
+        .timeout_per_read(stall)
+        .timeout_per_write(stall)
+        .user_agent(concat!("omp-deck/", env!("CARGO_PKG_VERSION")));
+    if !follow_redirects {
+        config = config.max_redirects(0);
+    }
+    config.build().into()
 }
 
 fn network(e: ureq::Error) -> Error {
@@ -354,7 +390,7 @@ fn unix_now() -> i64 {
 }
 
 /// This machine's hostname (`unknown` when unreadable).
-fn hostname() -> String {
+pub fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_owned())
         .ok()

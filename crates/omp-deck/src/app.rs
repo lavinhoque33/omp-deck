@@ -63,6 +63,7 @@ mod agents;
 mod bar;
 mod ctl;
 mod drive;
+mod project_sync;
 mod spawn;
 mod tree;
 mod usage;
@@ -133,6 +134,8 @@ enum AppEvent {
     Usage(UsageEvent),
     /// A Google Drive backup job finished.
     Drive(drive::DriveEvent),
+    /// A project sync worker finished.
+    Sync(project_sync::SyncEvent),
 }
 
 /// A modal question awaiting the user's answer, with what to do on "yes".
@@ -306,6 +309,8 @@ pub struct App {
     shot: Option<ShotPlan>,
     /// Google Drive backup of the omp config.
     drive: drive::DriveUi,
+    /// Project sync (per-folder `.omp` + sessions backups).
+    sync: project_sync::SyncUi,
 }
 
 /// Minimum time between two window-title updates.
@@ -501,6 +506,7 @@ impl App {
             started: Instant::now(),
             shot,
             drive,
+            sync: project_sync::SyncUi::new(),
         };
         if let Some(e) = startup_error {
             app.toasts.error(&app.ctx, format!("Folder ignored: {e}"));
@@ -1193,6 +1199,7 @@ impl App {
                 AppEvent::TreeForked(r) => self.on_tree_forked(r),
                 AppEvent::Usage(u) => self.on_usage_event(u),
                 AppEvent::Drive(ev) => self.on_drive_event(ev),
+                AppEvent::Sync(ev) => self.on_sync_event(ev),
             }
         }
     }
@@ -1213,6 +1220,7 @@ impl App {
                     omp_available: self.omp.is_some(),
                     can_stop: self.tmux.is_some(),
                     busy: &self.moving,
+                    drive: self.drive_menu(),
                 },
             },
             csd: !self.cfg.native_decorations,
@@ -1331,6 +1339,7 @@ impl App {
             labels: &self.labels,
             active_tab: self.active,
             tab_activity: &tab_activity,
+            drive: self.drive_menu(),
         };
         let panel = egui::Panel::left("sidebar")
             .resizable(true)
@@ -1385,6 +1394,8 @@ impl App {
             SidebarAction::ActivateTab(i) => self.activate(i),
             SidebarAction::CloseTab(i) => self.request_close(i),
             SidebarAction::KillTab(i) => self.kill_tab(i),
+            SidebarAction::BackupProject(dir) => self.open_backup_dialog(dir),
+            SidebarAction::RestoreProject(dir) => self.open_restore(Some(dir)),
         }
     }
 
@@ -1425,6 +1436,8 @@ impl App {
             }
             Some(Tab::Settings) => {
                 self.terminal_focused = false;
+                let account = self.drive.card(self.cfg.drive_auto_backup);
+                let rows = self.sync_rows();
                 let input = SettingsInput {
                     font_size: self.cfg.font_size,
                     font_range: (MIN_FONT, MAX_FONT),
@@ -1437,7 +1450,8 @@ impl App {
                     omp_version: self.update.version.as_deref(),
                     check_updates: self.cfg.check_updates,
                     update: &self.update.state,
-                    drive: self.drive.card(self.cfg.drive_auto_backup),
+                    drive: account.clone(),
+                    sync: self.sync_page(&account, &rows),
                 };
                 let actions = egui::CentralPanel::no_frame()
                     .show(ui, |ui| settings_page::show(ui, &mut self.settings, &input))
@@ -1465,6 +1479,7 @@ impl App {
                         }
                         SettingsAction::InstallOmp => self.open_install_tab(),
                         SettingsAction::Drive(a) => self.apply_drive_action(a),
+                        SettingsAction::Sync(a) => self.apply_sync_action(a),
                     }
                 }
             }
@@ -1523,6 +1538,7 @@ impl App {
             || self.dialog.is_some()
             || self.folder_dialog.is_some()
             || self.drive.modal_open()
+            || self.sync.modal_open()
     }
 
     fn show_confirm(&mut self, ctx: &egui::Context) {
@@ -2506,6 +2522,7 @@ impl eframe::App for App {
         if self.confirm.is_none()
             && self.folder_dialog.is_none()
             && self.dialog.is_none()
+            && !self.sync.modal_open()
             && self.popup.is_none()
             && self.tree.is_none()
             && !self.usage_open
@@ -2521,6 +2538,7 @@ impl eframe::App for App {
         self.drive_status(&ctx);
         self.drive_usage(&ctx);
         self.drive_tick(&ctx);
+        self.sync_tick(&ctx);
         self.drive_agents();
         self.show_status_bar(ui);
         self.show_sidebar(ui, &snap);
@@ -2530,6 +2548,7 @@ impl eframe::App for App {
         self.show_tree(&ctx);
         self.show_usage(&ctx);
         self.show_drive_picker(&ctx);
+        self.show_sync_dialogs(&ctx);
         self.show_confirm(&ctx);
         self.show_action_dialog(&ctx);
         self.show_folder_dialog(&ctx);

@@ -991,6 +991,52 @@ impl Omp {
         let out = self.finish(unpack, None)?;
         parse_unpack(&out.stdout, &out.stderr)
     }
+
+    /// `omp session unpack <tar> --cwd <cwd>` for a hand-built pack-format archive (project
+    /// restore). `cwd` must exist. stdin is null and the terminal-identifying env vars are
+    /// removed so omp writes no `terminal-sessions` breadcrumb; 120 s timeout, the process group
+    /// is killed on timeout. Blocking: run on a worker.
+    pub fn unpack_session(&self, tar: &Path, cwd: &Path) -> Result<MoveOutcome, OmpError> {
+        use crate::usage::{UsageError, run_bounded};
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        /// What omp keys its terminal breadcrumb on (`docs/notes/project-sync.md`).
+        const TERMINAL_VARS: [&str; 8] = [
+            "TMUX",
+            "TMUX_PANE",
+            "ZELLIJ_PANE_ID",
+            "CMUX_SURFACE_ID",
+            "KITTY_WINDOW_ID",
+            "WEZTERM_PANE",
+            "TERM_SESSION_ID",
+            "WT_SESSION",
+        ];
+        let tar = std::path::absolute(tar)?;
+        let cwd = std::path::absolute(cwd)?;
+        let mut cmd = self.command(&[
+            "session".as_ref(),
+            "unpack".as_ref(),
+            tar.as_os_str(),
+            "--cwd".as_ref(),
+            cwd.as_os_str(),
+        ]);
+        for var in TERMINAL_VARS {
+            cmd.env_remove(var);
+        }
+        let (code, stdout, stderr) = run_bounded(cmd, TIMEOUT).map_err(|e| match e {
+            UsageError::Spawn(e) => OmpError::Spawn(e),
+            _ => OmpError::Failed {
+                code: None,
+                message: format!(
+                    "omp did not finish unpacking within {} s",
+                    TIMEOUT.as_secs()
+                ),
+            },
+        })?;
+        if code != Some(0) {
+            return Err(failure(code, &stdout, &stderr));
+        }
+        parse_unpack(&stdout, &stderr)
+    }
 }
 
 /// Kills and reaps the child on every exit path.

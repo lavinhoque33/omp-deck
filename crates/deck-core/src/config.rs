@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,10 @@ pub struct AppConfig {
     pub folder_tabs: BTreeMap<PathBuf, FolderTabs>,
     /// Back up the omp config to Google Drive automatically when it changed (while signed in).
     pub drive_auto_backup: bool,
+    /// Project folders backed up to Google Drive (Settings → Sync), in table order.
+    pub project_sync: Vec<SyncRow>,
+    /// How often the rows are backed up automatically.
+    pub project_sync_interval: SyncInterval,
 }
 
 impl Default for AppConfig {
@@ -77,6 +82,57 @@ impl Default for AppConfig {
             recent_folders: Vec::new(),
             folder_tabs: BTreeMap::new(),
             drive_auto_backup: true,
+            project_sync: Vec::new(),
+            project_sync_interval: SyncInterval::default(),
+        }
+    }
+}
+
+/// One project folder of the Sync page: which parts of it are kept on Drive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncRow {
+    pub path: PathBuf,
+    /// The project's `<folder>/.omp` directory.
+    pub omp: bool,
+    /// The project's omp sessions.
+    pub sessions: bool,
+}
+
+/// How often the Sync rows are backed up automatically.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncInterval {
+    Off,
+    Hourly,
+    #[default]
+    Every6Hours,
+    Daily,
+}
+
+impl SyncInterval {
+    pub const ALL: [SyncInterval; 4] = [
+        SyncInterval::Off,
+        SyncInterval::Hourly,
+        SyncInterval::Every6Hours,
+        SyncInterval::Daily,
+    ];
+
+    /// `None` = automatic backup is off.
+    pub fn period(self) -> Option<Duration> {
+        let hours = match self {
+            SyncInterval::Off => return None,
+            SyncInterval::Hourly => 1,
+            SyncInterval::Every6Hours => 6,
+            SyncInterval::Daily => 24,
+        };
+        Some(Duration::from_secs(hours * 3600))
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SyncInterval::Off => "Off",
+            SyncInterval::Hourly => "Every hour",
+            SyncInterval::Every6Hours => "Every 6 hours",
+            SyncInterval::Daily => "Every day",
         }
     }
 }
@@ -370,5 +426,43 @@ mod tests {
         cfg.model_provider_filter = Some("openai".into());
         cfg.save_to(&path).unwrap();
         assert_eq!(AppConfig::load_from(&path), cfg);
+    }
+
+    #[test]
+    fn old_state_without_sync_keys_gets_defaults_and_sync_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        fs::write(&p, br#"{"drive_auto_backup": false, "open_tabs": []}"#).unwrap();
+        let cfg = AppConfig::load_from(&p);
+        assert!(cfg.project_sync.is_empty());
+        assert_eq!(cfg.project_sync_interval, SyncInterval::Every6Hours);
+        assert!(!cfg.drive_auto_backup);
+
+        let mut cfg = sample();
+        cfg.project_sync = vec![SyncRow {
+            path: "/home/u/x".into(),
+            omp: true,
+            sessions: false,
+        }];
+        cfg.project_sync_interval = SyncInterval::Daily;
+        cfg.save_to(&p).unwrap();
+        assert_eq!(AppConfig::load_from(&p), cfg);
+    }
+
+    #[test]
+    fn sync_intervals_have_periods_and_labels() {
+        let periods: Vec<_> = SyncInterval::ALL.iter().map(|i| i.period()).collect();
+        assert_eq!(
+            periods,
+            [
+                None,
+                Some(Duration::from_secs(3600)),
+                Some(Duration::from_secs(6 * 3600)),
+                Some(Duration::from_secs(24 * 3600)),
+            ]
+        );
+        let labels: std::collections::BTreeSet<_> =
+            SyncInterval::ALL.iter().map(|i| i.label()).collect();
+        assert_eq!(labels.len(), 4);
     }
 }

@@ -1040,3 +1040,165 @@ shape, stats.db schema, extension imports, timings).
   above the scope chip; click → `SidebarAction::ActivateTab(i)`, ✕/middle-click → `CloseTab(i)` (app routes
   both through `apply_tab_action`, i.e. `request_close`). Session rows whose file is open in a tab show
   that tab's Busy/Attention (`SidebarInput::tab_activity`, built per frame) instead of the running LED.
+
+## Wave 10: project sync (per-project `.omp` + sessions to Google Drive)
+
+Facts: `docs/notes/project-sync.md` (omp pack/unpack format + conflict rules, project `.omp`, Drive resumable
+upload, ureq traps). A **separate workflow** from the config backup (`google-drive-backup.md`): the config
+backup's files, archive, list query (`omp-backup-` prefix), retention, card and auto timer stay unchanged.
+Sessions are restored only through `omp session unpack` (omp performs the store writes).
+
+### deck_core::config (additions, `#[serde(default)]`, old state files load)
+
+```rust
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncRow { pub path: PathBuf, pub omp: bool, pub sessions: bool }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncInterval { Off, Hourly, #[default] Every6Hours, Daily }
+impl SyncInterval { pub fn period(self) -> Option<Duration>; pub const ALL: [SyncInterval; 4]; pub fn label(self) -> &'static str }
+// AppConfig gains: pub project_sync: Vec<SyncRow> (default empty), pub project_sync_interval: SyncInterval.
+```
+
+### deck_core::gdrive::project (new; re-exported from `gdrive`)
+
+```rust
+pub const PROJECT_PREFIX: &str = "omp-project-";
+pub const KEEP_PROJECT_BACKUPS: usize = 3;          // per (host, path_id)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Parts { pub omp: bool, pub sessions: bool }
+impl Parts { pub fn any(self) -> bool }
+
+pub enum OmpDir { Missing, Global, Present { files: u64, bytes: u64 } }   // Global: folder is $HOME
+pub struct ProjectSizes { pub omp: OmpDir, pub sessions: u64, pub session_bytes: u64 } // jsonl + artifacts
+/// Blocking (worker). Sessions = `sessions::scan(root)` group whose `cwd` equals `project`.
+pub fn measure(root: &SessionsRoot, project: &Path) -> std::io::Result<ProjectSizes>;
+/// Lexical identity of a project path: sha256(path bytes) → first 16 hex.
+pub fn path_id(project: &Path) -> String;
+
+pub enum Stage { Scanning, Packing, Uploading, Downloading, Verifying, RestoringOmp, RestoringSessions }
+pub struct Progress { pub stage: Stage, pub done: u64, pub total: u64 }  // bytes or items per stage
+
+/// Per-path local sync state, `config_dir()/project-sync.json` (0600, atomic write); separate from
+/// google-drive.json so the two Drive lanes never race on one file.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProjectSyncState { pub projects: BTreeMap<PathBuf, ProjectSynced> }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProjectSynced { pub fingerprint: String, pub parts: Parts, pub last: LastBackup }
+
+pub struct ProjectBackup {            // one Drive file, parsed from appProperties (no download)
+    pub file: BackupFile, pub host: String, pub path_id: String, pub path: String, pub name: String,
+    pub omp_bytes: Option<u64>, pub sessions: Option<u64>, pub session_bytes: Option<u64>,
+}
+pub struct ProjectBackupOutcome { pub backup: ProjectBackup, pub synced: ProjectSynced, pub pruned: usize }
+
+pub struct SessionPlan { pub id: String, pub title: String, pub modified_unix: i64, pub bytes: u64, pub new_id: bool }
+pub struct ProjectRestorePlan {
+    pub target: PathBuf, pub create_target: bool,        // target missing → created on apply
+    pub omp_exists: bool, pub omp_overwritten: Vec<String>, pub omp_added: Vec<String>, // rel to .omp
+    pub sessions: Vec<SessionPlan>,
+}
+pub struct PreparedProjectRestore { pub backup: ProjectBackup, pub plan: ProjectRestorePlan, /* staging */ }
+pub struct ProjectRestoreReport {
+    pub omp_written: usize, pub omp_overwritten: usize, pub safety_dir: Option<PathBuf>,
+    pub sessions_added: Vec<PathBuf>, pub sessions_failed: Vec<(String /*title or id*/, String /*why*/)>,
+}
+
+impl Service {
+    pub fn project_state(&self) -> ProjectSyncState;   // small file; missing/corrupt → default (+warn)
+    /// None = unchanged since the last backup of this path with these parts (skipped unless `force`).
+    /// `!parts.any()` or nothing present → Err(NothingToBackUp).
+    pub fn backup_project(&self, root: &SessionsRoot, project: &Path, parts: Parts, force: bool,
+        cancel: &AtomicBool, progress: &(dyn Fn(Progress) + Sync)) -> Result<Option<ProjectBackupOutcome>>;
+    pub fn list_projects(&self) -> Result<Vec<ProjectBackup>>;   // newest first, kind=project only
+    /// Downloads + verifies into staging; touches nothing outside the cache dir.
+    pub fn prepare_project_restore(&self, backup: &ProjectBackup, target: &Path, parts: Parts,
+        root: &SessionsRoot, cancel: &AtomicBool, progress: &(dyn Fn(Progress) + Sync)) -> Result<PreparedProjectRestore>;
+    /// `omp: None` (omp not installed) allows a `.omp`-only restore; sessions then fail with `Error::Io`.
+    pub fn apply_project_restore(&self, prepared: PreparedProjectRestore, omp: Option<&Omp>,
+        cancel: &AtomicBool, progress: &(dyn Fn(Progress) + Sync)) -> Result<ProjectRestoreReport>;
+}
+```
+
+- **Service concurrency**: the project lane and the config lane may run at once; each job builds its own
+  `Drive` (own access token). Only the project lane writes `project-sync.json`.
+- **Snapshot**: `.omp` = regular files under `<project>/.omp` (skip `node_modules`, `.git`, symlinks,
+  non-regular; depth ≤ 16; not offered when `project == $HOME`). Sessions = scan group with `cwd == project`;
+  each jsonl cut at its last `\n` at snapshot time, its `<stem>/` artifacts, and every blob referenced (regex in
+  facts) from `<agent>/blobs/<hex>` (missing → skipped + logged). **Fingerprint** = sha256 over parts flags and
+  each included file's (part, rel path, len, mtime ns) — metadata only, no content reads.
+- **Archive** `omp-project-<YYYYMMDDTHHMMSSZ>-<host>-<slug>.tar.gz` (slug = sanitized folder name ≤ 40),
+  streamed to `$XDG_CACHE_HOME/omp-deck/project-sync/<random>/` (never /tmp; removed after; stale > 24 h
+  dirs swept at job start). Members: `omp/<rel>`, `sessions/<id>/session.jsonl`, `sessions/<id>/artifacts/<rel>`,
+  `blobs/<hex>` (deduped), then **`manifest.json` last**: `{format:1, kind:"project", created, host,
+  app_version, omp_version, project (abs path), name, fingerprint, omp: Option<{files:[{path,size,sha256,mode}]}>,
+  sessions: Option<{items:[{id, file_name, title, modified_unix, size, sha256, artifacts:[ManifestFile],
+  blobs:[hex]}], blobs:[{sha256,size}]}>}`.
+- **Upload**: resumable, 8 MiB chunks (256 KiB multiple), 308 handled (`max_redirects(0)`), resume via
+  `bytes */total` on network/5xx (≤ 5 attempts, backoff), 404/410 → one fresh session; no global timeout over
+  the transfer (stall timeout ≥ 60 s). appProperties (each ≤ 124 B): `kind=project`, `host`, `pid` (path_id),
+  `fp` (fingerprint), `name`, `path` (if too long: `…` + tail), `omp` (bytes), `sess` (count), `sessb` (bytes).
+  After upload: keep newest `KEEP_PROJECT_BACKUPS` per (host, pid); prune failure only logged. List query
+  `appProperties has { key='kind' and value='project' } and trashed = false`, `spaces=appDataFolder`, paginated.
+- **Prepare restore**: stream-download to the cache dir, extract to staging with validation (regular files only,
+  safe relative paths under the four prefixes, manifest present exactly once, every member listed with matching
+  size + sha256, no extras, `format==1`, `kind=="project"`). Plan: `.omp` overwritten/added relative paths
+  (when `parts.omp`); sessions with `new_id = true` when any `*_<id>.jsonl` exists in a project dir of the
+  sessions root. `parts` not present in the backup → `InvalidBackup`. `.omp` into `$HOME` → error.
+- **Apply**: create target if missing. `.omp`: safety copy of every overwritten file to
+  `$XDG_DATA_HOME/omp-deck/restore-safety/project-<stamp>/` (newest 5 project copies kept), then atomic writes
+  (exec bit kept); **never deletes** local files. Sessions: per item build a pack-format tar in staging
+  (`manifest.json {version:1,id,cwd:<original project>,omp:<omp_version or "unknown">}`, `session.jsonl` with the
+  header id rewritten to a fresh UUIDv7-shaped id when `new_id`, `artifacts/**`, its `blobs/<hex>`), then
+  `omp session unpack <tar> --cwd <target>` (stdin null, terminal env vars removed per facts, 120 s timeout,
+  process killed on timeout). stdout path → `sessions_added`; non-zero exit or unexpected stderr mode →
+  `sessions_failed` entry (continue with the rest). Cancel between items.
+
+### omp-deck
+
+- Settings nav gains **Sync** (cloud icon) right under OmpDeck; omp catalog tabs shift down. Page:
+  account strip (email / Sign in / "not available in this build", reusing `DriveAction`), **Projects** table
+  (rows from `cfg.project_sync`): folder (`~`-abbreviated, tooltip full path, Change…), `.omp` switch + size
+  (disabled with reason when Missing/Global), Sessions switch + `N sessions · size`, last backup (relative age,
+  Never, or error with tooltip), row actions Back up now (progress while running) and Remove. "Add folder…"
+  (native picker when kdialog/zenity exists, else typed path). Interval selector (`SyncInterval`). Short note:
+  stored in the private Drive app folder, counts toward Drive storage, `.omp` may contain secrets.
+  **Restore…** opens the restore dialog.
+- **Restore dialog** (modal): cloud projects grouped by (host, pid): name, path, host ("this PC" when equal),
+  newest date, parts + sizes, older versions selectable. Target folder (preset to the original path when it
+  exists here, else empty; Browse…/typed; missing → "will be created"), `.omp` / Sessions checkboxes (only parts
+  in the backup). Continue → prepare (progress, Cancel) → confirm with the plan: warning (danger) when the
+  target `.omp` exists and N files will be overwritten (first few listed); "K sessions will be added alongside
+  existing ones (J get a new id)". Restore → progress → toast summary; sessions failures listed; sidebar
+  refresh (`SessionWatcher::refresh_now`).
+- **Sidebar**: project header menu gains "Back up to Google Drive…" and "Restore from Google Drive…"; the
+  shared session menu (rows + tabs) gains a "Google Drive" submenu with both for `entry.cwd`. Hidden when the
+  build has no credentials; disabled with a reason when signed out or the project lane is busy. Backup dialog:
+  folder, both switches with sizes (measured on a worker), "Keep this folder in Sync" (default on: adds/updates
+  the row), "Back up now" (forced). Restore from the sidebar = restore dialog with the target fixed.
+- **Lane**: its own job phase, one project job at a time, independent of the config lane; progress throttled
+  (≤ 10 repaints/s). Auto: first pass 2 min after startup/sign-in, then every `SyncInterval::period()`, rows in
+  order, unchanged rows skipped by fingerprint; first automatic failure per pass toasts, the rest log. Sizes are
+  measured on a worker when the page/dialog opens, after row changes and after jobs — never per frame.
+
+### Wave 10 fix-loop additions
+
+- `OmpDir::Symlink`: a symlinked `<folder>/.omp` is never followed or backed up (switch disabled with a reason);
+  symlinked artifact dirs and skipped `.omp` entries (symlinks, special files, non-UTF-8 or `\` names, too deep,
+  unreadable) are listed in `ProjectBackupOutcome.skipped: Vec<String>` (`"<what>: <reason>"`).
+- `ProjectSynced.unresolved_blobs: BTreeMap<String, String>` (`#[serde(default)]`): missing/damaged blob state
+  observed while packing; any later change makes the row count as changed.
+- Sessions with a jsonl/artifact/blob member > 2 GiB (omp's pack limit) are excluded at backup (listed in
+  `skipped`) and flagged at prepare in `SessionPlan.problem: Option<String>` (reported failed, omp not run).
+- Restore never writes through symlinks: `<target>/.omp` that is a symlink or file, or a target that is a file,
+  fails at prepare; a symlinked file/intermediate dir or a file/folder clash inside `.omp` is listed in
+  `ProjectRestorePlan.omp_skipped` / `ProjectRestoreReport.omp_skipped` and not written (re-checked at apply).
+  A target folder that is itself a symlinked path is allowed (user-chosen). Concurrent symlink swaps between
+  check and write are out of the threat model (needs write access to the user's own folders).
+- Prepare checks each archived session header id equals its item id. Apply runs omp with
+  `PI_CODING_AGENT_DIR = <prepared root>.agent_dir()` and `TMPDIR`/`TMP`/`TEMP` inside the staging dir; omp
+  failure text is reduced to its `error:` line (≤ 240 chars).
+- Cancel after the first write returns `Ok(ProjectRestoreReport { cancelled: true, .. })` with what was done;
+  `Err(Cancelled)` (displays "cancelled") only when nothing was written.
+- Transfers: initiation, chunks and downloads retry network/429/5xx with bounded backoff; a 308 that does not
+  advance, or a download that does not pass its high-water mark, counts as a failure. The access token is
+  fetched before packing (offline fails at once). `Service.cache_root` (pub) = `$XDG_CACHE_HOME/omp-deck/project-sync`.

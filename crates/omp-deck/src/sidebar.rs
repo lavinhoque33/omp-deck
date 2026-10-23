@@ -7,11 +7,12 @@ use std::time::{Duration, SystemTime};
 
 use crate::icons::Icon;
 use crate::icons::{
-    ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CHEVRONS_DOWN_UP, ICON_CHEVRONS_UP_DOWN,
-    ICON_CIRCLE_STOP, ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS,
-    ICON_FOLDER, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_KEY_ROUND,
-    ICON_LIST_TREE, ICON_PLAY, ICON_PLUS, ICON_POWER, ICON_REFRESH_CW, ICON_ROTATE_CCW,
-    ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL, ICON_TRASH_2, ICON_X,
+    ICON_ARCHIVE_RESTORE, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CHEVRONS_DOWN_UP,
+    ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_STOP, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_COPY,
+    ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS, ICON_FOLDER, ICON_FOLDER_OPEN,
+    ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_KEY_ROUND, ICON_LIST_TREE, ICON_PLAY, ICON_PLUS,
+    ICON_POWER, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL,
+    ICON_TRASH_2, ICON_X,
 };
 use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot};
 use egui::collapsing_header::CollapsingState;
@@ -126,6 +127,19 @@ pub enum SidebarAction {
     CloseTab(usize),
     /// Kill the process of the tab at this strip index (tabs whose session menu has no "Stop").
     KillTab(usize),
+    /// Back up this project folder to Google Drive (opens the backup dialog).
+    BackupProject(PathBuf),
+    /// Restore a backup of this project folder from Google Drive (opens the restore dialog).
+    RestoreProject(PathBuf),
+}
+
+/// The "Google Drive" menu entries: hidden without credentials, disabled with a reason while
+/// signed out or a project job runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriveMenu {
+    Hidden,
+    Off(&'static str),
+    On,
 }
 
 #[derive(Default)]
@@ -172,6 +186,8 @@ pub struct SidebarInput<'a> {
     pub active_tab: usize,
     /// Live omp state (`Busy` / `Attention` only) of sessions open in a tab, by session file.
     pub tab_activity: &'a HashMap<&'a Path, TabStatus>,
+    /// Google Drive project sync entries of the context menus.
+    pub drive: DriveMenu,
 }
 
 /// Which project groups are open. A group is open while filtering, else by its user override,
@@ -532,7 +548,7 @@ pub fn show(
                 let open_t = state.openness(ui.ctx());
                 let hdr = group_header(ui, group, row_count, open_t, &mut out);
                 let mut menu_collapse = None;
-                crate::theme::context_menu(&hdr.resp, 210.0, |ui| {
+                crate::theme::context_menu(&hdr.resp, 236.0, |ui| {
                     if menu_item(ui, ICON_PLUS, "New session here", None, true, false).clicked() {
                         out.actions.push(SidebarAction::New(group.cwd.clone()));
                         out.interacted = true;
@@ -560,6 +576,7 @@ pub fn show(
                         });
                         ui.close();
                     }
+                    drive_items(ui, input.drive, &group.cwd, true, &mut out);
                     ui.separator();
                     if menu_item(ui, ICON_CHEVRONS_DOWN_UP, "Collapse all", None, true, false)
                         .clicked()
@@ -1327,6 +1344,7 @@ pub struct MenuEnv<'a> {
     pub can_stop: bool,
     /// Session files with a move/copy/delete in flight.
     pub busy: &'a HashSet<PathBuf>,
+    pub drive: DriveMenu,
 }
 
 impl MenuEnv<'_> {
@@ -1345,6 +1363,7 @@ impl SidebarInput<'_> {
             omp_available: self.omp_available,
             can_stop: self.can_stop,
             busy: self.busy,
+            drive: self.drive,
         }
     }
 }
@@ -1441,6 +1460,16 @@ fn session_menu(
         out.actions.push(SidebarAction::OpenFolder(dir));
         ui.close();
     }
+    if env.drive != DriveMenu::Hidden {
+        let pal = Palette::of_ui(ui);
+        ui.menu_button(
+            (
+                icon_text(ICON_CLOUD, 17.0, pal.glyph),
+                RichText::new("Google Drive").color(pal.text),
+            ),
+            |ui| drive_items(ui, env.drive, &entry.cwd, false, out),
+        );
+    }
     if env.omp_available {
         ui.separator();
         let idle = !env.busy.contains(&entry.path);
@@ -1473,6 +1502,42 @@ fn session_menu(
         .clicked()
         {
             out.actions.push(SidebarAction::Stop(entry.clone()));
+            ui.close();
+        }
+    }
+}
+
+/// "Back up to Google Drive…" and "Restore from Google Drive…" for `cwd`.
+fn drive_items(
+    ui: &mut Ui,
+    drive: DriveMenu,
+    cwd: &Path,
+    separator: bool,
+    out: &mut SidebarOutput,
+) {
+    let (enabled, why) = match drive {
+        DriveMenu::Hidden => return,
+        DriveMenu::Off(why) => (false, Some(why)),
+        DriveMenu::On => (true, None),
+    };
+    if separator {
+        ui.separator();
+    }
+    for (icon, label, restore) in [
+        (ICON_CLOUD_UPLOAD, "Back up to Google Drive…", false),
+        (ICON_ARCHIVE_RESTORE, "Restore from Google Drive…", true),
+    ] {
+        let mut resp = menu_item(ui, icon, label, None, enabled, false);
+        if let Some(why) = why {
+            resp = resp.on_disabled_hover_text(why);
+        }
+        if resp.clicked() {
+            out.actions.push(if restore {
+                SidebarAction::RestoreProject(cwd.to_path_buf())
+            } else {
+                SidebarAction::BackupProject(cwd.to_path_buf())
+            });
+            out.interacted = true;
             ui.close();
         }
     }

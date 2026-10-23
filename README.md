@@ -35,6 +35,10 @@ embedded, fully interactive terminal backed by tmux, so closing a tab or the who
   custom agents, skills, …) and prompt history to a private Drive app folder, automatically when it
   changes or on demand, and restore it on any machine (Settings → OmpDeck). See
   [below](#google-drive-backup).
+- **Project sync**: back up chosen project folders' `.omp` folder and omp sessions to the same private
+  Drive app folder (Settings → Sync, or right-click a project in the sidebar), and restore them into any
+  folder on any machine; restored sessions are added alongside the existing ones. See
+  [below](#project-sync).
 - **Per-folder mode**: scope the sidebar to a single project folder.
 - **Appearance**: a flat, neutral default look (Geist font, lucide icons, compact spacing) or the
   "Midnight neon" style, each in dark and light, plus a Comfortable density option (Settings → OmpDeck).
@@ -123,8 +127,9 @@ Ctrl+C, Ctrl+X and Ctrl+V go straight to omp (omp uses Ctrl+V for image paste).
 
 | Path | Contents |
 | --- | --- |
-| `$XDG_CONFIG_HOME/omp-deck/` (default `~/.config/omp-deck/`) | `state.json` (window, tabs, settings), generated `tmux.conf`, `google-drive.json` (Google sign-in, mode 0600) |
-| `$XDG_DATA_HOME/omp-deck/` (default `~/.local/share/omp-deck/`) | live-control extension loaded into omp tabs, `restore-safety/` (copies kept before a Drive restore) |
+| `$XDG_CONFIG_HOME/omp-deck/` (default `~/.config/omp-deck/`) | `state.json` (window, tabs, settings, Sync folders), generated `tmux.conf`, `google-drive.json` (Google sign-in, mode 0600), `project-sync.json` (last project backups, mode 0600) |
+| `$XDG_DATA_HOME/omp-deck/` (default `~/.local/share/omp-deck/`) | live-control extension loaded into omp tabs, `restore-safety/` (copies kept before a Drive restore; `project-*` for project restores) |
+| `$XDG_CACHE_HOME/omp-deck/project-sync/` (default `~/.cache/omp-deck/…`) | temporary archives while a project backup or restore runs (removed afterwards) |
 
 Environment: `OMP_DECK_TMUX_SOCKET` selects a different tmux socket (name must match `omp-deck-test-[A-Za-z0-9_-]+`);
 `OMP_DECK_GOOGLE_CLIENT_ID` / `OMP_DECK_GOOGLE_CLIENT_SECRET` supply or override the Google OAuth
@@ -164,6 +169,40 @@ up the restored config.
 **Sign out** revokes OmpDeck's access at Google and deletes the local sign-in. Builds made without
 Google OAuth credentials show the card as "not available in this build". Maintainers: see
 [docs/google-drive-setup.md](docs/google-drive-setup.md).
+
+## Project sync
+
+Settings → **Sync** is a separate workflow from the config backup above and uses the same Google
+sign-in. Each row of the **Projects** table is a folder (**Add folder…**, **Change…**) with two
+switches, each showing how much it would upload:
+
+- **.omp folder**: the project's `<folder>/.omp` (project `AGENTS.md`, rules, skills, commands, agents,
+  `config.yml`, `mcp.json`, plans, …). `node_modules/`, `.git/`, symlinks and special files are skipped
+  (and listed). A project `.omp` can hold secrets; it is stored only in your private Drive app folder.
+  Not offered for your home folder, whose `.omp` is omp's global directory.
+- **Sessions**: every omp session whose project is this folder, with its attachments, subagent
+  transcripts and referenced images. Sessions that are being written are saved up to their last complete
+  line.
+
+**Back up now** uploads one row at once. **Back up listed projects automatically** (Off, Every hour,
+Every 6 hours (default), Every day) uploads only rows whose files changed since their last backup. Each backup is one
+`omp-project-<UTC time>-<host>-<folder>.tar.gz`; Drive keeps the newest 3 per project and machine.
+Backups count toward your Drive storage. Right-click a project (or a session, under **Google Drive**) in the
+sidebar → **Back up to Google Drive…** for a one-off backup, optionally adding the folder to the table.
+
+**Restore…** (on the Sync page, or **Restore from Google Drive…** in the sidebar menu, which restores
+into that project's folder) lists project backups by project and machine, newest first, with older
+versions selectable. Pick the folder to restore into (it is created if missing) and **.omp folder** and/or
+**Sessions**. OmpDeck downloads and verifies the backup, then shows what will change before writing:
+
+- **.omp**: files from the backup are written into `<folder>/.omp`. If the folder already has a `.omp`,
+  you are warned which files will be overwritten; on Restore they are replaced (the old versions are
+  copied to `~/.local/share/omp-deck/restore-safety/project-<time>/`, last 5 kept). Files the backup lacks
+  are kept. OmpDeck never writes through symlinks; such files are skipped and listed.
+- **Sessions**: each session is added through `omp session unpack --cwd <folder>`, so omp moves it to the
+  new folder and tells the agent where it now lives. Existing sessions are never replaced or removed; a
+  session that already exists on this machine is added as a copy with a new id. Restoring sessions needs
+  omp installed.
 
 ## Uninstall
 

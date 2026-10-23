@@ -29,6 +29,7 @@ mod sidebar;
 mod statusbar;
 mod statusfmt;
 mod summary;
+mod sync_view;
 mod tabs;
 mod theme;
 mod titlebar;

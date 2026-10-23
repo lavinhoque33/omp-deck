@@ -114,6 +114,16 @@ impl DriveUi {
     pub(super) fn modal_open(&self) -> bool {
         self.picker.is_some()
     }
+
+    /// The Drive service (`None` = no OAuth client in this build); shared with project sync.
+    pub(super) fn service(&self) -> Option<&Service> {
+        self.service.as_ref()
+    }
+
+    /// Signed in with a usable account.
+    pub(super) fn signed_in(&self) -> bool {
+        self.service.is_some() && self.account.is_some()
+    }
 }
 
 impl App {
@@ -371,7 +381,7 @@ impl App {
     }
 
     /// The message for `e`; a revoked sign-in also switches the card to signed out.
-    fn drive_error(&mut self, e: Error) -> String {
+    pub(super) fn drive_error(&mut self, e: Error) -> String {
         if matches!(e, Error::SignedOut | Error::NotSignedIn) {
             self.drive.account = None;
         }

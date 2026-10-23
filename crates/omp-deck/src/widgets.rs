@@ -304,17 +304,20 @@ pub fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
 /// Title + description on the left, control on the right.
 pub fn setting_row(ui: &mut Ui, title: &str, sub: &str, right: impl FnOnce(&mut Ui)) {
     let pal = Palette::of_ui(ui);
-    egui::Sides::new().height(theme::dens(40.0, 44.0)).show(
-        ui,
-        |ui| {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                ui.label(RichText::new(title).color(pal.text_strong));
-                ui.label(RichText::new(sub).small().color(pal.weak));
-            });
-        },
-        right,
-    );
+    egui::Sides::new()
+        .shrink_left()
+        .height(theme::dens(40.0, 44.0))
+        .show(
+            ui,
+            |ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(RichText::new(title).color(pal.text_strong));
+                    ui.label(RichText::new(sub).small().color(pal.weak));
+                });
+            },
+            right,
+        );
 }
 
 /// Centered icon-in-circle + title + description.

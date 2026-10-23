@@ -357,7 +357,7 @@ fn logical_hash(conn: &Connection) -> rusqlite::Result<String> {
     Ok(hex(&h.finalize()))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -452,7 +452,7 @@ impl PreparedRestore {
     /// no longer have, and restores `history.db` into the live database.
     pub(super) fn apply(&self, agent_dir: &Path) -> Result<RestoreReport> {
         self.save_safety_copy(agent_dir)?;
-        prune_safety(&self.safety_root, KEEP_SAFETY_COPIES);
+        prune_safety(&self.safety_root, KEEP_SAFETY_COPIES, false);
         let keep_note = |e: Error| {
             Error::Io(format!(
                 "{e} (restore incomplete; the previous files are in {})",
@@ -679,14 +679,25 @@ fn restore_history(live: &Path, data: &[u8]) -> Result<()> {
     copy_db(&src, &mut dst)
 }
 
-/// Keeps the newest `keep` safety copies (directory names are UTC timestamps).
-fn prune_safety(root: &Path, keep: usize) {
+/// Directory-name prefix of project-restore safety copies; they share the safety root with the
+/// config copies but are pruned separately.
+pub(super) const PROJECT_SAFETY_PREFIX: &str = "project-";
+
+/// Keeps the newest `keep` safety copies of one kind (directory names are UTC timestamps):
+/// project copies when `project`, config copies otherwise.
+pub(super) fn prune_safety(root: &Path, keep: usize, project: bool) {
     let Ok(rd) = fs::read_dir(root) else {
         return;
     };
     let mut dirs: Vec<PathBuf> = rd
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(PROJECT_SAFETY_PREFIX)
+                == project
+        })
         .map(|e| e.path())
         .collect();
     dirs.sort();

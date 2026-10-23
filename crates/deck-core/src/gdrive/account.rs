@@ -80,26 +80,12 @@ impl AccountStore {
     /// Atomic (temp file + rename); the file is created 0600 because it holds the refresh token.
     pub fn save(&self, account: &Account) -> Result<()> {
         let json = serde_json::to_vec_pretty(account).map_err(|e| Error::Io(e.to_string()))?;
-        let dir = self.path.parent().unwrap_or(Path::new("."));
-        fs::create_dir_all(dir).map_err(io_err("cannot create", dir))?;
-        let mut tmp = self.path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-        let write = || -> io::Result<()> {
-            let _ = fs::remove_file(&tmp);
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(&json)?;
-            f.sync_all()?;
-            fs::rename(&tmp, &self.path)
-        };
-        write().map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            io_err("cannot write", &self.path)(e)
-        })
+        write_private(&self.path, &json)
+    }
+
+    /// `name` in the directory of the account file (the project sync state lives beside it).
+    pub(super) fn sibling(&self, name: &str) -> PathBuf {
+        self.path.with_file_name(name)
     }
 
     pub fn delete(&self) -> Result<()> {
@@ -110,4 +96,28 @@ impl AccountStore {
             _ => Ok(()),
         }
     }
+}
+
+/// Writes `bytes` to `path` atomically (sibling temp file + rename), created mode 0600.
+pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir).map_err(io_err("cannot create", dir))?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let write = || -> io::Result<()> {
+        let _ = fs::remove_file(&tmp);
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        io_err("cannot write", path)(e)
+    })
 }

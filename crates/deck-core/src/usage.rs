@@ -354,7 +354,7 @@ fn spawn_reader<R: Read + Send + 'static>(r: Option<R>) -> mpsc::Receiver<Vec<u8
 /// Runs `cmd` in its own process group to completion within `timeout`. On timeout, error, or after
 /// the child exits, the whole group is killed; the deadline also bounds waiting for the output
 /// readers (they only block past it if a descendant escaped the group).
-fn run_bounded(
+pub(crate) fn run_bounded(
     mut cmd: Command,
     timeout: Duration,
 ) -> Result<(Option<i32>, String, String), UsageError> {

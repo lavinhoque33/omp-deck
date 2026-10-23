@@ -312,3 +312,92 @@ cat >/dev/null"#,
     let e = dies.fork_at(&src, "a1").unwrap_err().to_string();
     assert_eq!(e, "session locked by a live omp");
 }
+
+#[cfg(unix)]
+#[test]
+fn unpack_session_runs_detached_from_the_terminal_and_reports_the_mode() {
+    use deck_core::omp::MoveKind;
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("proj");
+    fs::create_dir_all(&cwd).unwrap();
+    let seen = tmp.path().join("seen");
+    let script = tmp.path().join("omp.sh");
+    // Records argv and the terminal variables, closes nothing: stdin must already be null.
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n{{ echo \"$@\"; for v in TMUX TMUX_PANE ZELLIJ_PANE_ID CMUX_SURFACE_ID \
+             KITTY_WINDOW_ID WEZTERM_PANE TERM_SESSION_ID WT_SESSION KEEP; do eval \"echo $v=\\${{$v-unset}}\"; done; \
+             if [ -t 0 ]; then echo tty-stdin; fi; }} > {}\n\
+             echo /agent/sessions/x/new.jsonl\n\
+             echo 'Unpacked session (abc).' >&2\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut omp = Omp::at(&script);
+    for v in [
+        "TMUX",
+        "TMUX_PANE",
+        "ZELLIJ_PANE_ID",
+        "CMUX_SURFACE_ID",
+        "KITTY_WINDOW_ID",
+        "WEZTERM_PANE",
+        "TERM_SESSION_ID",
+        "WT_SESSION",
+    ] {
+        omp = omp.with_env(v, "terminal-value");
+    }
+    let omp = omp.with_env("KEEP", "yes");
+    let tar = tmp.path().join("s.tar");
+    // A sibling test forking while the script's write handle was open can make the first exec
+    // fail with "Text file busy"; that is the harness, not the code under test.
+    let out = (0..20)
+        .find_map(|_| match omp.unpack_session(&tar, &cwd) {
+            Err(e) if e.to_string().contains("busy") => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            }
+            r => Some(r),
+        })
+        .expect("exec stayed busy")
+        .unwrap();
+    assert_eq!(out.kind, MoveKind::Created);
+    assert_eq!(
+        out.new_path,
+        std::path::PathBuf::from("/agent/sessions/x/new.jsonl")
+    );
+    let seen = fs::read_to_string(&seen).unwrap();
+    let mut lines = seen.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        format!("session unpack {} --cwd {}", tar.display(), cwd.display())
+    );
+    let rest: Vec<&str> = lines.collect();
+    assert_eq!(
+        rest,
+        [
+            "TMUX=unset",
+            "TMUX_PANE=unset",
+            "ZELLIJ_PANE_ID=unset",
+            "CMUX_SURFACE_ID=unset",
+            "KITTY_WINDOW_ID=unset",
+            "WEZTERM_PANE=unset",
+            "TERM_SESSION_ID=unset",
+            "WT_SESSION=unset",
+            "KEEP=yes",
+        ]
+    );
+
+    let failing = tmp.path().join("fail.sh");
+    fs::write(
+        &failing,
+        "#!/bin/sh\necho 'error: Bad session archive' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&failing, fs::Permissions::from_mode(0o755)).unwrap();
+    let err = Omp::at(&failing).unpack_session(&tar, &cwd).unwrap_err();
+    assert!(err.to_string().contains("Bad session archive"), "{err}");
+}

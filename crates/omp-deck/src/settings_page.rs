@@ -23,6 +23,7 @@ use crate::omp_rows::{
     show_secret_modal, skeleton,
 };
 use crate::omp_settings::{Model, TabHits, TabModel};
+use crate::sync_view::{self, SyncAction, SyncPage};
 use crate::theme::{self, Palette};
 use crate::update::{UpdateState, status_line};
 use crate::widgets::{
@@ -31,6 +32,9 @@ use crate::widgets::{
 
 /// Nav entry for OmpDeck's own preferences.
 const OMPDECK_ENTRY: usize = 0;
+/// Nav entry for project sync (right under OmpDeck); omp's catalog tabs follow at `2 + i`.
+const SYNC_ENTRY: usize = 1;
+const OMP_TABS_FROM: usize = 2;
 const CONTENT_MAX_W: f32 = 760.0;
 
 enum Modal {
@@ -52,7 +56,7 @@ struct OmpPane {
 
 #[derive(Default)]
 pub struct SettingsState {
-    /// 0 = OmpDeck, `1 + i` = omp tab `i`.
+    /// 0 = OmpDeck, 1 = Sync, `2 + i` = omp tab `i`.
     selected: usize,
     /// (selected category or search marker, search query) last shown; used to reset scroll.
     view_key: Option<(usize, String)>,
@@ -99,6 +103,7 @@ pub struct SettingsInput<'a> {
     pub check_updates: bool,
     pub update: &'a UpdateState,
     pub drive: DriveCard,
+    pub sync: SyncPage<'a>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -126,6 +131,8 @@ pub enum SettingsAction {
     InstallOmp,
     /// The Google Drive backup card.
     Drive(DriveAction),
+    /// The project sync page.
+    Sync(SyncAction),
 }
 
 fn tab_icon(id: &str) -> Icon {
@@ -209,10 +216,16 @@ pub fn show(
                         omp_view(ui, &mut state.omp, View::Search, &mut actions);
                     } else if state.selected == OMPDECK_ENTRY {
                         ompdeck_section(ui, input, &mut actions);
+                    } else if state.selected == SYNC_ENTRY {
+                        actions.extend(
+                            sync_view::page(ui, &input.sync)
+                                .into_iter()
+                                .map(SettingsAction::Sync),
+                        );
                     } else if !input.omp_found {
                         not_found_card(ui, &mut actions);
                     } else {
-                        let tab = state.selected - 1;
+                        let tab = state.selected - OMP_TABS_FROM;
                         omp_view(ui, &mut state.omp, View::Tab(tab), &mut actions);
                     }
                 });
@@ -246,6 +259,18 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
         state.selected = OMPDECK_ENTRY;
         state.omp.query.clear();
     }
+    if nav_item(
+        ui,
+        ICON_CLOUD,
+        "Sync",
+        state.selected == SYNC_ENTRY && !searching,
+        None,
+    )
+    .clicked()
+    {
+        state.selected = SYNC_ENTRY;
+        state.omp.query.clear();
+    }
     ui.add_space(12.0);
     ui.label(theme::section_caption("omp", pal.weak));
     ui.add_space(4.0);
@@ -260,7 +285,7 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
                     }
                     None => Some((tab.rows.len().to_string(), false)),
                 };
-                let selected = !searching && state.selected == i + 1;
+                let selected = !searching && state.selected == i + OMP_TABS_FROM;
                 if nav_item(
                     ui,
                     tab_icon(&tab.id),
@@ -270,7 +295,7 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
                 )
                 .clicked()
                 {
-                    state.selected = i + 1;
+                    state.selected = i + OMP_TABS_FROM;
                     state.omp.query.clear();
                 }
             }
@@ -286,8 +311,16 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
             } else {
                 ICON_TRIANGLE_ALERT
             };
-            if nav_item(ui, icon, label, state.selected >= 1 && !searching, None).clicked() {
-                state.selected = 1;
+            if nav_item(
+                ui,
+                icon,
+                label,
+                state.selected >= OMP_TABS_FROM && !searching,
+                None,
+            )
+            .clicked()
+            {
+                state.selected = OMP_TABS_FROM;
                 state.omp.query.clear();
             }
         }
