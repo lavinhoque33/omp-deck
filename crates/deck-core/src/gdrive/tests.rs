@@ -1847,10 +1847,13 @@ mod project_sync {
     #[test]
     fn sessions_restore_through_omp_keeping_or_replacing_the_id() {
         let w = world();
-        // /tmp is a small tmpfs and omp's sandbox HOME is big: keep it on the disk.
+        // /tmp is a small tmpfs and omp's sandbox HOME is big: keep it on the disk. CI runners
+        // may not have ~/.cache yet.
+        let cache = dirs::cache_dir().unwrap();
+        fs::create_dir_all(&cache).unwrap();
         let disk = tempfile::Builder::new()
             .prefix("omp-deck-sync-test-")
-            .tempdir_in(dirs::cache_dir().unwrap())
+            .tempdir_in(&cache)
             .unwrap();
         let Some((omp, _)) = real_omp(disk.path(), "same") else {
             return;
