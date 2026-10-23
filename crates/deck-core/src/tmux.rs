@@ -5,22 +5,14 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use crate::config::config_dir;
-use crate::mux::Pane;
+use crate::mux::{LaunchSpec, OMP_ENV, Pane, effective_cwd, terminal_env};
 use crate::platform;
 use crate::status::breadcrumb_key_for_tty;
 
 pub const APP_SOCKET: &str = "omp-deck";
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LaunchSpec {
-    pub program: String,
-    pub args: Vec<String>,
-    pub cwd: PathBuf,
-    pub env: Vec<(String, String)>,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TmuxError {
@@ -250,72 +242,6 @@ pub(crate) fn is_top_level_session(p: &Path, root: &Path, canon_root: Option<&Pa
         return false;
     };
     grand == root || canon_root.is_some_and(|c| grand == c)
-}
-
-/// `"omp-"` + id with every char outside `[A-Za-z0-9_-]` replaced by `_`.
-pub fn session_name_for(id: &str) -> String {
-    let mut s = String::from("omp-");
-    s.extend(id.chars().map(|c| {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-            c
-        } else {
-            '_'
-        }
-    }));
-    s
-}
-
-/// `omp-new-<unix-ms>`.
-pub fn new_session_name(now: SystemTime) -> String {
-    let ms = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
-    format!("omp-new-{ms}")
-}
-
-/// Degraded mode (no tmux): `env -u WINDOWID -u ALACRITTY_WINDOW_ID <argv...>`; same env/cwd rules.
-pub fn direct_launch(cwd: &Path, argv: &[String]) -> LaunchSpec {
-    // alacritty forces WINDOWID/ALACRITTY_WINDOW_ID into the child env; strip them via env(1).
-    let mut args: Vec<String> = ["-u", "WINDOWID", "-u", "ALACRITTY_WINDOW_ID"]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
-    args.extend(argv.iter().cloned());
-    LaunchSpec {
-        program: "env".into(),
-        args,
-        cwd: effective_cwd(cwd),
-        env: terminal_env(),
-    }
-}
-
-/// `cwd` if it is an existing dir, else `$HOME`, else the filesystem root.
-pub fn effective_cwd(cwd: &Path) -> PathBuf {
-    if cwd.is_dir() {
-        cwd.to_path_buf()
-    } else {
-        platform::home_or_root()
-    }
-}
-
-/// Overrides omp honours: inside tmux it would otherwise disable images (OmpDeck renders kitty
-/// Unicode-placeholder images) and never emit OSC 8 hyperlinks.
-const OMP_ENV: [(&str, &str); 3] = [
-    ("PI_FORCE_IMAGE_PROTOCOL", "kitty"),
-    ("PI_KITTY_PLACEHOLDERS", "1"),
-    ("PI_FORCE_HYPERLINKS", "1"),
-];
-
-/// Environment of the PTY child (tmux client or omp itself); a tmux server started by it
-/// inherits the omp overrides, and the generated config sets them for running servers too.
-pub fn terminal_env() -> Vec<(String, String)> {
-    [
-        ("TERM", "xterm-256color"),
-        ("COLORTERM", "truecolor"),
-        ("TERM_PROGRAM", "omp-deck"),
-    ]
-    .into_iter()
-    .chain(OMP_ENV)
-    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-    .collect()
 }
 
 const CONFIG_TEXT: &str = r#"# OmpDeck generated tmux.conf — rewritten at startup; do not edit

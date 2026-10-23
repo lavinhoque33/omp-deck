@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
-use deck_core::tmux::{
-    Tmux, config_text, direct_launch, effective_cwd, new_session_name, session_name_for,
-    terminal_env,
+use deck_core::mux::{
+    direct_launch, effective_cwd, new_session_name, session_name_for, terminal_env,
 };
+use deck_core::tmux::{Tmux, config_text};
 
 /// Kills the test server on drop (also on panic) and removes its socket file, which tmux
 /// leaves behind after `kill-server`.

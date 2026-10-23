@@ -103,7 +103,7 @@ pub enum SidebarAction {
     },
     /// Hand a directory to the desktop's opener.
     OpenFolder(PathBuf),
-    /// Ask to stop the tmux session running this omp session.
+    /// Ask to stop the session running this omp session.
     Stop(SessionEntry),
     /// Ask to restart the running session (stop its process, resume it with live control).
     Restart(SessionEntry),
@@ -161,7 +161,7 @@ pub struct SidebarInput<'a> {
     pub now: SystemTime,
     /// A manual refresh is in flight (the refresh button spins).
     pub refreshing: bool,
-    /// Sessions can be stopped (tmux available).
+    /// Sessions can be stopped (a session backend available).
     pub can_stop: bool,
     /// omp was found: session copy/move are offered.
     pub omp_available: bool,
@@ -1340,7 +1340,7 @@ pub struct MenuEnv<'a> {
     pub groups: &'a [ProjectGroup],
     /// omp was found: copy/move/delete are offered.
     pub omp_available: bool,
-    /// Sessions can be stopped and restarted (tmux available).
+    /// Sessions can be stopped and restarted (a session backend available).
     pub can_stop: bool,
     /// Session files with a move/copy/delete in flight.
     pub busy: &'a HashSet<PathBuf>,

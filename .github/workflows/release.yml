@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Dry run from any branch: builds, tests and packages every asset, publishes nothing.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -20,7 +22,7 @@ jobs:
       - name: Check tag matches the crate version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
             exit 1
           fi
@@ -120,7 +122,7 @@ jobs:
         run: |
           $m = Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1
           $version = $m.Matches[0].Groups[1].Value
-          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and "v$version" -ne $env:GITHUB_REF_NAME) {
             throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
           }
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -177,6 +179,99 @@ jobs:
           [System.IO.File]::WriteAllText("$zip.sha256", "$hash  $name.zip`n", (New-Object System.Text.UTF8Encoding($false)))
           Get-Content "$zip.sha256"
 
+      - name: Smoke the packaged zip
+        # The release exes use the GUI subsystem: Start-Process -Wait with redirected output exercises the
+        # CLI's console handling, and the host must sideload the bundled conpty.dll.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'zip-smoke'
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $dir
+          Expand-Archive -Path "dist/omp-deck-$env:VERSION-${{ matrix.asset_arch }}-windows.zip" -DestinationPath $dir
+          $host_exe = Join-Path $dir 'omp-deck-host.exe'
+          $ns = 'omp-deck-test-release'
+          function Invoke-Host([string]$HostArgs) {
+            $out = Join-Path $env:RUNNER_TEMP 'host-out.txt'
+            $p = Start-Process -FilePath $host_exe -ArgumentList $HostArgs -Wait -PassThru -NoNewWindow `
+              -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+            $text = (Get-Content -Raw $out -ErrorAction SilentlyContinue) + (Get-Content -Raw "$out.err" -ErrorAction SilentlyContinue)
+            if ($p.ExitCode -ne 0) { throw "omp-deck-host $HostArgs failed ($($p.ExitCode)): $text" }
+            return $text
+          }
+          Invoke-Host "new smoke --ns $ns -- ping.exe -n 30 127.0.0.1" | Out-Null
+          Start-Sleep -Seconds 3
+          $screen = Invoke-Host "dump smoke --ns $ns"
+          Write-Host $screen
+          Invoke-Host "kill smoke --ns $ns" | Out-Null
+          if ($screen -notmatch '127\.0\.0\.1') { throw "packaged host did not run the session" }
+          $log = Get-Content -Raw (Join-Path $env:LOCALAPPDATA "omp-deck\host\$ns\smoke.log")
+          Write-Host $log
+          if ($log -notmatch 'sideloaded conpty.dll') { throw "packaged host did not load the bundled conpty.dll" }
+
+      - name: Installer round trip
+        # packaging/install.ps1 -ZipPath under Windows PowerShell 5.1 and PowerShell 7: install, reinstall while
+        # the installed omp-deck-host.exe is running (rename-aside path), uninstall.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = (Resolve-Path "dist/omp-deck-$env:VERSION-${{ matrix.asset_arch }}-windows.zip").Path
+          $script = (Resolve-Path 'packaging/install.ps1').Path
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\OmpDeck'
+          $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'OmpDeck.lnk'
+          $ns = 'omp-deck-test-inst'
+          $shells = @(
+            @{ Name = 'Windows PowerShell 5.1'; Exe = 'powershell.exe' },
+            @{ Name = 'PowerShell 7'; Exe = 'pwsh' }
+          )
+
+          function Invoke-Installer($shell, [string[]]$extra) {
+            & $shell.Exe -NoProfile -ExecutionPolicy Bypass -File $script @extra
+            if ($LASTEXITCODE -ne 0) { throw "$($shell.Name): install.ps1 $extra failed ($LASTEXITCODE)" }
+          }
+          function Assert-Installed($label) {
+            foreach ($f in 'omp-deck.exe', 'omp-deck-host.exe', 'conpty.dll', 'OpenConsole.exe') {
+              if (-not (Test-Path -LiteralPath (Join-Path $installDir $f))) { throw "$label`: $f missing in $installDir" }
+            }
+            if (-not (Test-Path -LiteralPath $shortcut)) { throw "$label`: Start Menu shortcut missing" }
+            $target = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut).TargetPath
+            if ($target -ne (Join-Path $installDir 'omp-deck.exe')) { throw "$label`: shortcut targets '$target'" }
+          }
+          function Invoke-InstalledHost([string]$HostArgs) {
+            $out = Join-Path $env:RUNNER_TEMP 'inst-host-out.txt'
+            $p = Start-Process -FilePath (Join-Path $installDir 'omp-deck-host.exe') -ArgumentList $HostArgs `
+              -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+            $text = (Get-Content -Raw $out -ErrorAction SilentlyContinue) + (Get-Content -Raw "$out.err" -ErrorAction SilentlyContinue)
+            if ($p.ExitCode -ne 0) { throw "omp-deck-host $HostArgs failed ($($p.ExitCode)): $text" }
+          }
+
+          foreach ($shell in $shells) {
+            Write-Host "::group::$($shell.Name)"
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $installDir, $shortcut
+
+            Invoke-Installer $shell @('-ZipPath', $zip, '-NoOmp')
+            Assert-Installed "$($shell.Name) first install"
+
+            # Lock the installed host exe: the detached daemon runs from the install dir.
+            Invoke-InstalledHost "new lockcheck --ns $ns -- ping.exe -n 60 127.0.0.1"
+            Start-Sleep -Seconds 2
+            $lockedBefore = @(Get-Process omp-deck-host -ErrorAction SilentlyContinue).Count
+            if ($lockedBefore -lt 1) { throw "$($shell.Name): no omp-deck-host daemon is running" }
+
+            Invoke-Installer $shell @('-ZipPath', $zip, '-NoOmp')
+            Assert-Installed "$($shell.Name) reinstall over running host"
+            $aside = @(Get-ChildItem -LiteralPath $installDir -Filter 'omp-deck-host.exe.old-*')
+            if ($aside.Count -lt 1) { throw "$($shell.Name): running omp-deck-host.exe was not renamed aside" }
+
+            Invoke-InstalledHost "kill lockcheck --ns $ns"
+            $deadline = (Get-Date).AddSeconds(15)
+            while ((Get-Process omp-deck-host -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+            if (Get-Process omp-deck-host -ErrorAction SilentlyContinue) { throw "$($shell.Name): host daemon did not exit after kill" }
+
+            Invoke-Installer $shell @('-Uninstall')
+            if (Test-Path -LiteralPath $installDir) { throw "$($shell.Name): install dir still present after -Uninstall" }
+            if (Test-Path -LiteralPath $shortcut) { throw "$($shell.Name): shortcut still present after -Uninstall" }
+            Write-Host "::endgroup::"
+            Write-Host "$($shell.Name): OK"
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist-windows-${{ matrix.arch }}
@@ -189,7 +284,7 @@ jobs:
     needs: [linux, windows]
     # Runs even if the best-effort arm64 job failed (its failure is already masked by continue-on-error);
     # never runs when the linux build or the x64 windows build failed.
-    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.windows.result == 'success' }}
+    if: ${{ github.event_name == 'push' && !cancelled() && needs.linux.result == 'success' && needs.windows.result == 'success' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4

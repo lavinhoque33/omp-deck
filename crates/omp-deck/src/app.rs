@@ -14,6 +14,7 @@ use crate::icons::{
 use deck_core::agents::{AgentsTarget, AgentsWatcher};
 use deck_core::config::{AppConfig, Density, FolderTabs, TabState, Theme, UiStyle, WindowGeometry};
 use deck_core::mux::{BackendChoice, MuxKind};
+use deck_core::mux::{new_session_name, session_name_for};
 use deck_core::omp::{
     MoveKind, MoveOutcome, Omp, Setting, UpdateKind, UpdateStatus, fork_argv, install_argv,
     update_argv,
@@ -23,7 +24,6 @@ use deck_core::sessions::{
     ProjectGroup, SessionEntry, SessionWatcher, SessionsRoot, abbreviate_home, find_fork,
 };
 use deck_core::status::{StatusTarget, StatusWatcher};
-use deck_core::tmux::{new_session_name, session_name_for};
 use deck_term::{Clipboard, TermTheme, TerminalView};
 use egui::{Frame, Key, Margin, Modifiers, RichText};
 use serde_json::Value;
@@ -585,7 +585,7 @@ impl App {
         });
     }
 
-    /// Queue a terminal tab running `argv` (in tmux when `mux_name` is given and tmux exists).
+    /// Queue a terminal tab running `argv` (in a backend session when `mux_name` is given and a backend exists).
     /// Session tabs first get their control directory prepared on a worker (see `spawn.rs`).
     fn spawn_tab_with(
         &mut self,
@@ -617,9 +617,9 @@ impl App {
         });
     }
 
-    /// Focus the tab already showing `req.session_path`, else spawn one on the tmux session that
+    /// Focus the tab already showing `req.session_path`, else spawn one on the session that
     /// holds that file (or a unique name when the preferred one now runs another file). Before the
-    /// first tmux snapshot exists the request waits in `deferred_opens`; if the poller could not
+    /// first backend snapshot exists the request waits in `deferred_opens`; if the poller could not
     /// start, the snapshot is empty and names are made unique instead.
     fn open_resolved(&mut self, req: ClosedTab) {
         self.open_resolved_focus(req, Focus::Claim);
@@ -830,8 +830,8 @@ impl App {
         }
     }
 
-    /// Re-open tabs from the previous run once the first tmux snapshot is available:
-    /// alive tmux session → re-attach; else resume its session file; else drop.
+    /// Re-open tabs from the previous run once the first backend snapshot is available:
+    /// alive session → re-attach; else resume its session file; else drop.
     fn restore_tabs(&mut self, snap: &RunningSnapshot) {
         let Some((states, active)) = self.pending_restore.take() else {
             return;
@@ -840,18 +840,18 @@ impl App {
             if self
                 .tabs
                 .iter()
-                .any(|t| t.mux_name() == Some(st.tmux_name.as_str()))
+                .any(|t| t.mux_name() == Some(st.session_name.as_str()))
             {
                 continue;
             }
             let path = st.session_path.clone().filter(|p| p.is_file());
-            if !snap.is_alive(&st.tmux_name) && path.is_none() {
+            if !snap.is_alive(&st.session_name) && path.is_none() {
                 continue;
             }
             let name = snap
                 .resolve_for(
                     self.running.is_blind(),
-                    &st.tmux_name,
+                    &st.session_name,
                     path.as_deref(),
                     unix_ms(),
                 )
@@ -875,7 +875,7 @@ impl App {
 
     /// A fresh `omp` tab learns its session file once omp has created it; a tab whose omp moved to
     /// another file (`/new`, `/fork`, `/resume`, also while the tab was hidden) follows when the
-    /// monitor sees exactly one file open for its tmux session. A pending copy waits for
+    /// monitor sees exactly one file open for its session. A pending copy waits for
     /// `find_fork` instead: omp may hold the source file open too.
     fn sync_session_paths(&mut self, snap: &RunningSnapshot) {
         for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
@@ -1115,7 +1115,7 @@ impl App {
         });
     }
 
-    /// tmux session currently running `entry`: the holder of its file, a live tab on it, else the
+    /// session currently running `entry`: the holder of its file, a live tab on it, else the
     /// canonical name.
     fn running_session_name(&self, entry: &SessionEntry) -> Option<String> {
         let snap = self.running.latest();
@@ -1138,7 +1138,7 @@ impl App {
         })
     }
 
-    /// Ask before stopping the tmux session that runs `entry`.
+    /// Ask before stopping the session that runs `entry`.
     fn request_stop(&mut self, entry: &SessionEntry) {
         let Some(mux_name) = self.running_session_name(entry) else {
             self.toasts
@@ -1659,7 +1659,7 @@ impl App {
                     active_tab = Some(open_tabs.len());
                 }
                 open_tabs.push(TabState {
-                    tmux_name: mux_name,
+                    session_name: mux_name,
                     cwd: t.cwd.clone(),
                     session_path: t.session_path.clone(),
                     title: t.title(&self.labels).to_owned(),
@@ -2150,16 +2150,16 @@ impl App {
         ));
     }
 
-    /// Stop the session if it runs (kill every tmux session involved + close its tabs), then
+    /// Stop the session if it runs (kill every session involved + close its tabs), then
     /// `omp session pack/unpack` on a worker, retrying while omp still sees the dying process.
     /// A tab that was open comes back afterwards: on the new path after success, on the original
-    /// path (re-attached if its tmux session survived) after a failure.
+    /// path (re-attached if its session survived) after a failure.
     fn execute_move(&mut self, entry: SessionEntry, dest: PathBuf) {
         if self.omp.is_none() || !self.moving.insert(entry.path.clone()) {
             return;
         }
         let holder = self.running_session_name(&entry);
-        // The monitor snapshot can lag behind a tab that was just opened: kill the tmux session
+        // The monitor snapshot can lag behind a tab that was just opened: kill the session
         // each matching tab recorded as well, not only the snapshot's holder.
         let mut kill_names: Vec<String> = holder.iter().cloned().collect();
         let mut tab_state: Option<ClosedTab> = None;
@@ -2231,7 +2231,7 @@ impl App {
                         tab.session_path = Some(outcome.new_path.clone());
                     }
                     Err(_) => {
-                        // Re-attach a tmux session that survived; else resume the original file
+                        // Re-attach a session that survived; else resume the original file
                         // under its canonical name.
                         let alive = kill_names.iter().find(|n| backends.has_session(n)).cloned();
                         tab.mux_name = alive.or_else(|| persistent.then(|| session_name_for(&id)));

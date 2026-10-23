@@ -7,8 +7,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use deck_core::mux::session_name_for;
 use deck_core::mux::{Mux, MuxKind};
-use deck_core::tmux::session_name_for;
 
 /// Outcome of [`RunningSnapshot::resolve`]; both variants are the name `attach_or_create` gets.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,7 +38,7 @@ pub struct RunningSnapshot {
 impl RunningSnapshot {
     pub fn new(alive: HashSet<String>, files: HashMap<String, Vec<PathBuf>>) -> Self {
         let mut held = HashMap::new();
-        // Deterministic owner when several tmux sessions claim one file: smallest name.
+        // Deterministic owner when several sessions claim one file: smallest name.
         let mut names: Vec<&String> = files.keys().collect();
         names.sort();
         for name in names {
@@ -65,7 +65,7 @@ impl RunningSnapshot {
         self.owners.get(name).copied()
     }
 
-    /// Running = a live tmux session holds the file, or the canonical tmux name for this id is
+    /// Running = a live session holds the file, or the canonical tmux name for this id is
     /// alive without a known file (a fresh omp that has not opened its jsonl yet). A canonical
     /// session that holds a *different* file (after `/new`, `/fork`, `/resume`) does not make this
     /// one running.
@@ -77,7 +77,7 @@ impl RunningSnapshot {
         self.alive.contains(&name) && self.files_of(&name).is_empty()
     }
 
-    /// Which tmux session a tab for `path` must use: the one that holds the file; else `preferred`
+    /// Which session a tab for `path` must use: the one that holds the file; else `preferred`
     /// when it is not alive (create it) or alive without a known file (attach: a fresh omp);
     /// else — `preferred` runs another file now — a new name derived from it (`<preferred>-<ms>`).
     pub fn resolve(&self, preferred: &str, path: Option<&Path>, unix_ms: u128) -> SessionTarget {
@@ -116,7 +116,7 @@ impl RunningSnapshot {
         }
     }
 
-    /// Name of a live tmux session holding `path` open.
+    /// Name of a live session holding `path` open.
     pub fn holder(&self, path: &Path) -> Option<&str> {
         self.held.get(path).map(String::as_str)
     }
@@ -224,7 +224,7 @@ impl RunningMonitor {
         let failed = thread.is_none();
         if failed {
             // Resolve waiting requests against an empty snapshot; `is_blind` makes them pick
-            // unique tmux names instead of trusting it.
+            // unique names instead of trusting it.
             lock(&shared).latest = Some(Arc::new(RunningSnapshot::default()));
         }
         RunningMonitor {

@@ -200,7 +200,10 @@ pub enum Density {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TabState {
-    pub tmux_name: String,
+    /// Name of the tab's backend session (tmux session or host session). Old state files call
+    /// it `tmux_name`.
+    #[serde(alias = "tmux_name")]
+    pub session_name: String,
     pub cwd: PathBuf,
     pub session_path: Option<PathBuf>,
     pub title: String,
@@ -299,7 +302,7 @@ mod tests {
             font_size: 16.5,
             theme: Theme::Light,
             open_tabs: vec![TabState {
-                tmux_name: "omp-abc".into(),
+                session_name: "omp-abc".into(),
                 cwd: "/home/u/x".into(),
                 session_path: Some("/s/a.jsonl".into()),
                 title: "T".into(),
@@ -526,6 +529,26 @@ mod tests {
             AppConfig::load_from(&p).drive_backup_interval,
             SyncInterval::Off
         );
+    }
+
+    #[test]
+    fn old_state_files_with_tmux_name_load_and_are_rewritten_as_session_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        fs::write(
+            &p,
+            r#"{"open_tabs":[{"tmux_name":"omp-abc","cwd":"/w","session_path":null,"title":"t"}],"active_tab":0}"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load_from(&p);
+        assert_eq!(cfg.open_tabs.len(), 1);
+        assert_eq!(cfg.open_tabs[0].session_name, "omp-abc");
+        assert_eq!(cfg.active_tab, Some(0));
+        cfg.save_to(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("\"session_name\""), "{text}");
+        assert!(!text.contains("tmux_name"), "{text}");
+        assert_eq!(AppConfig::load_from(&p).open_tabs, cfg.open_tabs);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use deck_core::ctl::{CtlClient, CtlCommand, CtlReply, ctl_dir};
-use deck_core::tmux::{new_session_name, session_name_for};
+use deck_core::mux::{new_session_name, session_name_for};
 use deck_core::tree::TreeWatcher;
 use egui::{Key, Modifiers};
 

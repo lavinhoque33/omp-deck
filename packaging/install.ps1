@@ -14,6 +14,10 @@
 .PARAMETER Version
   Install this release (x.y.z, with or without a leading v) instead of the latest.
 
+.PARAMETER ZipPath
+  Install from this local release zip instead of downloading. It is verified against <zip>.sha256 next to it
+  when that file exists (otherwise a warning says it is unverified). -Version is ignored.
+
 .PARAMETER NoOmp
   Do not install omp when it is missing.
 
@@ -25,7 +29,8 @@
 param(
     [string]$Version = '',
     [switch]$NoOmp,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [string]$ZipPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -98,7 +103,14 @@ switch ($rawArch.ToUpperInvariant()) {
 
 # --- version ------------------------------------------------------------------------------------------------
 $headers = @{ 'User-Agent' = 'omp-deck-installer'; 'Accept' = 'application/vnd.github+json' }
-if ($Version) {
+$localZip = [bool]$ZipPath
+if ($localZip) {
+    if ($Version) { Say "Note: -Version is ignored because -ZipPath was given." }
+    if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw "ZipPath not found: $ZipPath" }
+    $ZipPath = (Resolve-Path -LiteralPath $ZipPath).ProviderPath
+    $Version = if ((Split-Path -Leaf $ZipPath) -match '^omp-deck-(.+?)-(x86_64|aarch64)-windows\.zip$') { $Matches[1] } else { 'local' }
+}
+elseif ($Version) {
     $Version = $Version.TrimStart('v', 'V')
 }
 else {
@@ -120,20 +132,36 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 try {
     # --- download + verify ----------------------------------------------------------------------------------
-    $zip = Join-Path $tmp "$name.zip"
-    Step "Downloading $name.zip"
-    try { Invoke-WebRequest -UseBasicParsing -Uri "$base/$name.zip" -OutFile $zip -Headers @{ 'User-Agent' = 'omp-deck-installer' } }
-    catch { throw "Download failed: $base/$name.zip ($($_.Exception.Message)). Does release v$Version have a $assetArch Windows build?" }
+    if ($localZip) {
+        $zip = $ZipPath
+        $sumFile = "$ZipPath.sha256"
+        if (Test-Path -LiteralPath $sumFile -PathType Leaf) {
+            Step 'Verifying sha256'
+            $sumText = Get-Content -Raw -LiteralPath $sumFile
+        }
+        else {
+            Warn "No $sumFile next to the zip; installing UNVERIFIED."
+            $sumText = $null
+        }
+    }
+    else {
+        $zip = Join-Path $tmp "$name.zip"
+        Step "Downloading $name.zip"
+        try { Invoke-WebRequest -UseBasicParsing -Uri "$base/$name.zip" -OutFile $zip -Headers @{ 'User-Agent' = 'omp-deck-installer' } }
+        catch { throw "Download failed: $base/$name.zip ($($_.Exception.Message)). Does release v$Version have a $assetArch Windows build?" }
 
-    Step 'Verifying sha256'
-    try { $sumText = (Invoke-WebRequest -UseBasicParsing -Uri "$base/$name.zip.sha256" -Headers @{ 'User-Agent' = 'omp-deck-installer' }).Content }
-    catch { throw "Could not fetch the checksum file $base/$name.zip.sha256; refusing to install an unverified download." }
-    if ($sumText -is [byte[]]) { $sumText = [Text.Encoding]::UTF8.GetString($sumText) }
-    $expected = ([string]$sumText).Trim().Split([char[]]" `t`r`n", [StringSplitOptions]::RemoveEmptyEntries)[0].ToLowerInvariant()
-    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
-    if ($expected -notmatch '^[0-9a-f]{64}$') { throw "Malformed checksum file for $name.zip" }
-    if ($actual -ne $expected) { throw "Checksum mismatch for $name.zip (expected $expected, got $actual)" }
-    Say "sha256 OK: $actual"
+        Step 'Verifying sha256'
+        try { $sumText = (Invoke-WebRequest -UseBasicParsing -Uri "$base/$name.zip.sha256" -Headers @{ 'User-Agent' = 'omp-deck-installer' }).Content }
+        catch { throw "Could not fetch the checksum file $base/$name.zip.sha256; refusing to install an unverified download." }
+        if ($sumText -is [byte[]]) { $sumText = [Text.Encoding]::UTF8.GetString($sumText) }
+    }
+    if ($null -ne $sumText) {
+        $expected = ([string]$sumText).Trim().Split([char[]]" `t`r`n", [StringSplitOptions]::RemoveEmptyEntries)[0].ToLowerInvariant()
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+        if ($expected -notmatch '^[0-9a-f]{64}$') { throw "Malformed checksum file for $zip" }
+        if ($actual -ne $expected) { throw "Checksum mismatch for $zip (expected $expected, got $actual)" }
+        Say "sha256 OK: $actual"
+    }
 
     # --- install --------------------------------------------------------------------------------------------
     Step "Installing to $InstallDir"

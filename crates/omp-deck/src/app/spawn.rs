@@ -222,7 +222,7 @@ fn direct(
     argv: &[String],
     env: Vec<(String, String)>,
 ) -> Result<Launch, String> {
-    let mut spec = deck_core::tmux::direct_launch(cwd, argv);
+    let mut spec = deck_core::mux::direct_launch(cwd, argv);
     spec.env.extend(env);
     Ok(Launch::Pty(spec))
 }

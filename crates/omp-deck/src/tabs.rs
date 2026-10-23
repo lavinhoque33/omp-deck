@@ -369,7 +369,7 @@ pub fn omp_argv(session_path: Option<&Path>) -> Vec<String> {
     argv
 }
 
-/// The session file a tab should switch to given the files its tmux session has open: the first one
+/// The session file a tab should switch to given the files its session has open: the first one
 /// for a tab that knows none yet, or the only one when omp moved on (`/new`, `/fork`, `/resume`).
 pub fn followed_path<'a>(current: Option<&Path>, files: &'a [PathBuf]) -> Option<&'a PathBuf> {
     match (current, files) {

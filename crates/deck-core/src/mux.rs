@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::platform;
 use crate::status::{breadcrumb_key_for_term_session, breadcrumb_key_for_tty, trusted_breadcrumb};
-use crate::tmux::{self, LaunchSpec, Tmux, TmuxError};
+use crate::tmux::{self, Tmux, TmuxError};
 
 /// Namespace of the app's own host sessions (tests use `omp-deck-test-<unique>`).
 pub const HOST_NAMESPACE: &str = "omp-deck";
@@ -57,6 +57,15 @@ pub struct Pane {
     pub breadcrumb_key: String,
     /// When the pane's process started: a breadcrumb older than this is a previous owner's.
     pub started: SystemTime,
+}
+
+/// A process to run in a local PTY: `program args…` in `cwd` with `env` added.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub env: Vec<(String, String)>,
 }
 
 /// How to start a tab's terminal process.
@@ -146,7 +155,7 @@ impl Mux {
     /// The backend for `choice`. Windows always uses the host. Elsewhere `Auto` is tmux when
     /// installed, else the host when its daemon exists; `Tmux` / `Host` demand that backend.
     /// `OMP_DECK_TMUX_SOCKET` / `OMP_DECK_HOST_NS` move either backend to a test namespace.
-    /// `None`: nothing usable (the caller falls back to [`tmux::direct_launch`]).
+    /// `None`: nothing usable (the caller falls back to [`direct_launch`]).
     pub fn detect(choice: BackendChoice) -> Option<Mux> {
         let choice = if cfg!(windows) {
             BackendChoice::Host
@@ -280,6 +289,74 @@ fn files_from_breadcrumbs(
         .collect()
 }
 
+// ---- session names, working dir, terminal environment --------------------------------------------
+
+/// `"omp-"` + id with every char outside `[A-Za-z0-9_-]` replaced by `_`.
+pub fn session_name_for(id: &str) -> String {
+    let mut s = String::from("omp-");
+    s.extend(id.chars().map(|c| {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            c
+        } else {
+            '_'
+        }
+    }));
+    s
+}
+
+/// `omp-new-<unix-ms>`.
+pub fn new_session_name(now: SystemTime) -> String {
+    let ms = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    format!("omp-new-{ms}")
+}
+
+/// Degraded mode (no tmux): `env -u WINDOWID -u ALACRITTY_WINDOW_ID <argv...>`; same env/cwd rules.
+pub fn direct_launch(cwd: &Path, argv: &[String]) -> LaunchSpec {
+    // alacritty forces WINDOWID/ALACRITTY_WINDOW_ID into the child env; strip them via env(1).
+    let mut args: Vec<String> = ["-u", "WINDOWID", "-u", "ALACRITTY_WINDOW_ID"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    args.extend(argv.iter().cloned());
+    LaunchSpec {
+        program: "env".into(),
+        args,
+        cwd: effective_cwd(cwd),
+        env: terminal_env(),
+    }
+}
+
+/// `cwd` if it is an existing dir, else `$HOME`, else the filesystem root.
+pub fn effective_cwd(cwd: &Path) -> PathBuf {
+    if cwd.is_dir() {
+        cwd.to_path_buf()
+    } else {
+        platform::home_or_root()
+    }
+}
+
+/// Overrides omp honours: inside tmux it would otherwise disable images (OmpDeck renders kitty
+/// Unicode-placeholder images) and never emit OSC 8 hyperlinks.
+pub(crate) const OMP_ENV: [(&str, &str); 3] = [
+    ("PI_FORCE_IMAGE_PROTOCOL", "kitty"),
+    ("PI_KITTY_PLACEHOLDERS", "1"),
+    ("PI_FORCE_HYPERLINKS", "1"),
+];
+
+/// Environment of the PTY child (tmux client or omp itself); a tmux server started by it
+/// inherits the omp overrides, and the generated config sets them for running servers too.
+pub fn terminal_env() -> Vec<(String, String)> {
+    [
+        ("TERM", "xterm-256color"),
+        ("COLORTERM", "truecolor"),
+        ("TERM_PROGRAM", "omp-deck"),
+    ]
+    .into_iter()
+    .chain(OMP_ENV)
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect()
+}
+
 // ---- host launch -------------------------------------------------------------------------------
 
 /// Variables of the parent environment that make omp believe it runs in another terminal or
@@ -323,14 +400,14 @@ pub fn term_session_id(session: &str) -> String {
 }
 
 /// The environment a host session's program gets: `(set, remove)`. `set` is the terminal
-/// identity of [`tmux::terminal_env`] (+ `TERM_SESSION_ID` when `windows`) followed by `extra`;
+/// identity of [`terminal_env`] (+ `TERM_SESSION_ID` when `windows`) followed by `extra`;
 /// `remove` is [`HOST_ENV_REMOVE`] (the host removes first, then sets).
 pub fn host_env(
     session: &str,
     extra: &[(String, String)],
     windows: bool,
 ) -> (Vec<(String, String)>, Vec<String>) {
-    let mut set = tmux::terminal_env();
+    let mut set = terminal_env();
     if windows {
         set.push(("TERM_SESSION_ID".to_owned(), term_session_id(session)));
     }
@@ -366,7 +443,7 @@ fn host_spec(
         name: name.to_owned(),
         program,
         args: args.to_vec(),
-        cwd: tmux::effective_cwd(cwd),
+        cwd: effective_cwd(cwd),
         env_set,
         env_remove,
     }

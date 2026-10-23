@@ -64,6 +64,12 @@ jobs:
           $ompDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           & (Join-Path $ompDir 'omp.exe') --version
 
+      - name: Live control over the named pipe (real omp)
+        if: ${{ !cancelled() }}
+        run: |
+          $env:OMPDECK_TEST_OMP = Join-Path $env:LOCALAPPDATA 'omp\omp.exe'
+          cargo test -p deck-core --test ctl_live -- --nocapture
+
       - name: Host smoke (omp in ConPTY)
         if: ${{ !cancelled() }}
         run: |
@@ -112,7 +118,7 @@ jobs:
           $cfgDir = Join-Path $env:APPDATA 'omp-deck'
           New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
           $state = @{
-            open_tabs = @(@{ tmux_name = "omp-$id"; cwd = $proj; session_path = $file; title = 'CI session' })
+            open_tabs = @(@{ session_name = "omp-$id"; cwd = $proj; session_path = $file; title = 'CI session' })
             active_tab = 0
             check_updates = $false
           } | ConvertTo-Json -Depth 5
@@ -122,8 +128,17 @@ jobs:
           Remove-Item -Force -ErrorAction SilentlyContinue $shot
           New-Item -ItemType Directory -Force -Path app-logs | Out-Null
           $p = Start-Process -FilePath (Resolve-Path 'target/debug/omp-deck.exe').Path `
-            -ArgumentList @('--sessions-root', $root, '--screenshot', $shot, '--screenshot-after', '20') `
+            -ArgumentList @('--sessions-root', $root, '--screenshot', $shot, '--screenshot-after', '24') `
             -RedirectStandardOutput app-logs/stdout.txt -RedirectStandardError app-logs/stderr.txt -PassThru
+          # Real Windows key events into the focused terminal tab: they travel egui -> win32-input-mode records ->
+          # omp-deck-host -> ConPTY -> omp. Shift+Enter must insert a newline in omp's editor, not submit.
+          Start-Sleep -Seconds 14
+          $ws = New-Object -ComObject WScript.Shell
+          Write-Host ("AppActivate: {0}" -f $ws.AppActivate($p.Id))
+          Start-Sleep -Milliseconds 500
+          $ws.SendKeys('typed on windows')
+          $ws.SendKeys('+{ENTER}')
+          $ws.SendKeys('second line')
           $exited = $p.WaitForExit(120000)
           if (-not $exited) { $p.Kill($true) }
           Write-Host "---- omp-deck stderr ----"; Get-Content app-logs/stderr.txt -ErrorAction SilentlyContinue | Select-Object -Last 80
@@ -135,7 +150,14 @@ jobs:
           # The restored tab's session must still be alive in the host after the app exited (detach, not kill).
           $ls = (& target/debug/omp-deck-host.exe ls | Out-String)
           if ($ls -notmatch "omp-$id") { throw "restored tab's host session is not running after the app exited" }
+          $screen = (& target/debug/omp-deck-host.exe dump "omp-$id" | Out-String)
+          Write-Host "---- dump after typing ----"; Write-Host $screen
           & target/debug/omp-deck-host.exe kill "omp-$id"
+          $lines = $screen -split "`r?`n"
+          $first = [array]::FindIndex($lines, [Predicate[string]] { param($l) $l -match 'typed on windows' })
+          $second = [array]::FindIndex($lines, [Predicate[string]] { param($l) $l -match 'second line' })
+          if ($first -lt 0 -or $second -lt 0) { throw "typed text did not reach omp's editor" }
+          if ($second -le $first) { throw "Shift+Enter did not start a new line in omp's editor" }
 
       - name: Stop leftover host sessions
         if: always()

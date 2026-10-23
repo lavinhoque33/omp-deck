@@ -17,8 +17,10 @@ OPTIONS:
     -h, --help              Print this help
 
 ENVIRONMENT:
-    OMP_DECK_TMUX_SOCKET    Use this tmux socket name instead of `omp-deck` (tests)
-    OMP_DECK_HOST_NS        Use this session-host namespace instead of `omp-deck` (tests)
+    OMP_DECK_TMUX_SOCKET    tmux socket name for tests; only `omp-deck-test-…` names are
+                            accepted (unset: the production `omp-deck`)
+    OMP_DECK_HOST_NS        session-host namespace for tests; only `omp-deck-test-…` names
+                            are accepted (unset: the production `omp-deck`)
 ";
 
 #[derive(Clone, Debug, Default, PartialEq)]
