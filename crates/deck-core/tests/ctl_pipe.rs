@@ -4,7 +4,7 @@
 #![cfg(windows)]
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
@@ -57,11 +57,25 @@ fn serve(name: &Path) -> File {
     unsafe { File::from_raw_handle(handle as _) }
 }
 
+/// One line from the pipe, read byte by byte so nothing past it is consumed.
+fn read_line(pipe: &mut File) -> String {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while pipe.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+        line.push(byte[0]);
+    }
+    String::from_utf8(line).unwrap()
+}
+
 #[test]
 fn a_tab_pipe_serves_snapshots_and_takes_commands_at_the_same_time() {
     let dir = ctl_dir("omp-deck-test-pipe", "omp-pipe-roundtrip");
     prepare_ctl_dir(&dir).unwrap();
-    assert_eq!(ctl_env(&dir).0, "OMPDECK_CTL_PIPE");
+    let env = ctl_env(&dir).unwrap();
+    assert_eq!(env[0].0, "OMPDECK_CTL_PIPE");
+    assert_eq!(env[1].0, "OMPDECK_CTL_TOKEN");
+    let token = env[1].1.to_str().unwrap().to_owned();
+    assert_eq!(token.len(), 64);
     let mut server = serve(&dir);
     let client = CtlClient::spawn(dir.clone(), || {});
     // SAFETY: the pipe handle is valid; ConnectNamedPipe blocks until the client opened it.
@@ -73,6 +87,10 @@ fn a_tab_pipe_serves_snapshots_and_takes_commands_at_the_same_time() {
     };
     assert!(connected != 0 || std::io::Error::last_os_error().raw_os_error() == Some(535));
 
+    // The client speaks first: its token, before it is sent anything.
+    let auth: serde_json::Value = serde_json::from_str(&read_line(&mut server)).unwrap();
+    assert_eq!(auth["t"], "auth");
+    assert_eq!(auth["token"], token);
     server
         .write_all(
             b"{\"t\":\"hello\",\"v\":1,\"pid\":4242}\n\
@@ -88,9 +106,7 @@ fn a_tab_pipe_serves_snapshots_and_takes_commands_at_the_same_time() {
         id: "0-A".into(),
         root: "/s/main.jsonl".into(),
     });
-    let mut line = String::new();
-    BufReader::new(&mut server).read_line(&mut line).unwrap();
-    let cmd: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let cmd: serde_json::Value = serde_json::from_str(&read_line(&mut server)).unwrap();
     assert_eq!(cmd["rid"], rid);
     assert_eq!(cmd["t"], "kill");
     server

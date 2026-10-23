@@ -4,7 +4,7 @@
 #[cfg(unix)]
 mod unix;
 #[cfg(any(windows, test))]
-mod winargs;
+pub(crate) mod winargs;
 #[cfg(windows)]
 mod windows;
 

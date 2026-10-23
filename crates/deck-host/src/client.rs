@@ -1,7 +1,6 @@
 //! Blocking client API: start sessions, attach, stream events.
 
 use std::path::PathBuf;
-use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -113,7 +112,7 @@ fn spawn_and_wait(ns: &Namespace, request: &SpawnRequest) -> Result<()> {
 fn wait_ready(
     ns: &Namespace,
     name: &str,
-    child: &mut Child,
+    child: &mut spawn::Launcher,
     log: Option<&std::path::Path>,
     log_start: u64,
 ) -> Result<()> {
@@ -121,6 +120,16 @@ fn wait_ready(
     let mut exited = false;
     loop {
         if ns.has(name) {
+            // Unix: the launcher exits right after the daemon reports readiness; reap it so
+            // no zombie stays behind in the calling (GUI) process. Windows: `child` is the
+            // daemon itself and keeps running.
+            #[cfg(unix)]
+            while !exited && Instant::now() < deadline {
+                exited = child.try_wait()?.is_some();
+                if !exited {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             return Ok(());
         }
         if !exited && let Some(status) = child.try_wait()? {

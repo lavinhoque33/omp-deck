@@ -4,12 +4,16 @@
 // Inert when the variable of the OS is unset.
 // Any failure (version drift of omp internals, I/O) degrades to "no socket" or an error reply; it never throws into omp.
 import * as fs from "node:fs";
+import * as crypto from "node:crypto";
 import * as net from "node:net";
 import * as path from "node:path";
 
 const IS_WIN = process.platform === "win32";
 const DIR = IS_WIN ? undefined : process.env.OMPDECK_CTL_DIR;
-const PIPE = IS_WIN ? process.env.OMPDECK_CTL_PIPE : undefined;
+// A named pipe has no owner/mode check, so a connection must prove it knows OMPDECK_CTL_TOKEN (derived by OmpDeck from
+// a private per-user secret) before it is sent anything or heard.
+const TOKEN = IS_WIN ? process.env.OMPDECK_CTL_TOKEN : undefined;
+const PIPE = IS_WIN && TOKEN ? process.env.OMPDECK_CTL_PIPE : undefined;
 const LOG = process.env.OMPDECK_CTL_LOG; // debug only
 const log = (s: string) => {
   if (!LOG) return;
@@ -263,12 +267,36 @@ export default async function ompdeckCtl(api: any) {
       if (PIPE) {
         // Windows: a named pipe has no files to own. A listen error (name held by another omp, or any I/O failure) means
         // "owned elsewhere": tear down quietly. No lock file, no mode check, no unlink.
+        const want = Buffer.from(TOKEN!);
+        const tokenOk = (line: string): boolean => {
+          let m: any; try { m = JSON.parse(line); } catch { return false; }
+          if (!m || m.t !== "auth" || typeof m.token !== "string") return false;
+          const got = Buffer.from(m.token);
+          return got.length === want.length && crypto.timingSafeEqual(got, want);
+        };
+        const AUTH_MS = 2000, MAX_PENDING = 8;
+        let pending = 0; // connections that have not authenticated yet: a flood of them is cut off
         const srv = net.createServer((s: any) => {
           try { s.setEncoding("utf8"); } catch {}
-          onOpen(s);
-          s.on("data", (chunk: any) => onData(s, chunk));
-          s.on("close", () => onClose(s));
-          s.on("error", () => onClose(s));
+          if (pending >= MAX_PENDING) { s.destroy(); return; }
+          pending++;
+          let authed = false, counted = true, pre = "";
+          const settle = () => { if (counted) { counted = false; pending--; } };
+          const timer = setTimeout(() => { if (!authed) { settle(); s.destroy(); } }, AUTH_MS);
+          const end = () => { clearTimeout(timer); settle(); if (authed) onClose(s); };
+          s.on("data", (chunk: any) => {
+            if (authed) return onData(s, chunk);
+            pre += chunk;
+            const i = pre.indexOf("\n");
+            if (i < 0) { if (pre.length > 1024) { clearTimeout(timer); settle(); s.destroy(); } return; }
+            clearTimeout(timer); settle();
+            if (!tokenOk(pre.slice(0, i))) { s.destroy(); return; }
+            authed = true; onOpen(s);
+            const rest = pre.slice(i + 1); pre = "";
+            if (rest) onData(s, rest);
+          });
+          s.on("close", end);
+          s.on("error", end);
         });
         srv.on("error", (e: any) => {
           log("pipe listen failed: " + e);

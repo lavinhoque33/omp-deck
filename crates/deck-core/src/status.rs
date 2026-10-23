@@ -1469,19 +1469,28 @@ mod tests {
         assert_eq!(r.stats().context_tokens, Some(500));
     }
 
+    /// Breadcrumb text names absolute paths: on Windows they carry a drive.
+    fn abs(text: &str) -> String {
+        if cfg!(windows) {
+            text.replace("\n/", "\nC:/").replacen('/', "C:/", 1)
+        } else {
+            text.to_owned()
+        }
+    }
+
     #[test]
     fn breadcrumb_parsing_and_path() {
-        let b = parse_breadcrumb(
+        let b = parse_breadcrumb(&abs(
             "/home/u/proj\n/home/u/.omp/agent/sessions/-p/a.jsonl\ncwdstat 66306 25455169\n",
-        )
+        ))
         .unwrap();
-        assert_eq!(b.cwd, Path::new("/home/u/proj"));
+        assert_eq!(b.cwd, Path::new(&abs("/home/u/proj")));
         assert_eq!(
             b.session,
-            Path::new("/home/u/.omp/agent/sessions/-p/a.jsonl")
+            Path::new(&abs("/home/u/.omp/agent/sessions/-p/a.jsonl"))
         );
         assert!(!b.fresh);
-        let f = parse_breadcrumb("/tmp/x\n/tmp/s/a.jsonl\nfresh\ncwdstat 1 2").unwrap();
+        let f = parse_breadcrumb(&abs("/tmp/x\n/tmp/s/a.jsonl\nfresh\ncwdstat 1 2")).unwrap();
         assert!(f.fresh);
         assert_eq!(parse_breadcrumb("/tmp/x\nrelative.jsonl\n"), None);
         assert_eq!(parse_breadcrumb("/tmp/x"), None);
@@ -1499,14 +1508,14 @@ mod tests {
         fs::create_dir_all(d.path().join("terminal-sessions")).unwrap();
         fs::write(
             d.path().join("terminal-sessions/pts-7"),
-            "/w\n/w/s.jsonl\nfresh\ncwdstat 1 2\n",
+            abs("/w\n/w/s.jsonl\nfresh\ncwdstat 1 2\n"),
         )
         .unwrap();
         assert_eq!(
             read_breadcrumb(d.path(), "/dev/pts/7"),
             Some(Breadcrumb {
-                cwd: "/w".into(),
-                session: "/w/s.jsonl".into(),
+                cwd: abs("/w").into(),
+                session: abs("/w/s.jsonl").into(),
                 fresh: true
             })
         );
@@ -1520,19 +1529,22 @@ mod tests {
         let dir = d.path().join("terminal-sessions");
         fs::create_dir_all(&dir).unwrap();
         let f = dir.join("pts-3");
-        fs::write(&f, "/w\n/w/s.jsonl\ncwdstat 1 2\n").unwrap();
+        fs::write(&f, abs("/w\n/w/s.jsonl\ncwdstat 1 2\n")).unwrap();
         let now = SystemTime::now();
         let past = Some(now - Duration::from_secs(60));
         let future = Some(now + Duration::from_secs(60));
         let tty = "/dev/pts/3";
-        let other = Path::new("/w/other.jsonl");
+        let other = PathBuf::from(abs("/w/other.jsonl"));
         assert!(trusted_breadcrumb(d.path(), tty, past, None).is_some());
         // Written before the pane's process started: a previous pty owner's leftovers…
         assert!(trusted_breadcrumb(d.path(), tty, future, None).is_none());
-        assert!(trusted_breadcrumb(d.path(), tty, future, Some(other)).is_none());
+        assert!(trusted_breadcrumb(d.path(), tty, future, Some(other.as_path())).is_none());
         // …unless it names the session the tab already runs (omp skips rewriting an unchanged
         // breadcrumb on `--resume`).
-        assert!(trusted_breadcrumb(d.path(), tty, future, Some(Path::new("/w/s.jsonl"))).is_some());
+        assert!(
+            trusted_breadcrumb(d.path(), tty, future, Some(Path::new(&abs("/w/s.jsonl"))))
+                .is_some()
+        );
         // Unknown start time and no known session: rejected.
         assert!(trusted_breadcrumb(d.path(), tty, None, None).is_none());
     }

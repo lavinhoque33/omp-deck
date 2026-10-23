@@ -269,3 +269,33 @@ pub fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// Runs the `omp-deck-host` CLI: (success, stdout, stderr). Fails the test instead of hanging
+/// if the output pipes do not close within 30 s (e.g. a daemon inherited them).
+pub fn run_cli(args: &[&str]) -> (bool, String, String) {
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_omp-deck-host"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| {
+            panic!(
+                "`omp-deck-host {}` did not finish (output pipes still open)",
+                args.join(" ")
+            )
+        })
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}

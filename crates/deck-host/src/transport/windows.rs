@@ -9,7 +9,7 @@
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -46,19 +46,12 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::error::{Error, Result};
 use crate::namespace::Namespace;
+use crate::winproc::owned;
 
 const PIPE_BUFFER: u32 = 64 * 1024;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn owned(handle: HANDLE, call: &'static str) -> Result<OwnedHandle> {
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return Err(Error::last_os(call));
-    }
-    // SAFETY: a valid handle we own exclusively from here on.
-    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
 fn raw(handle: &OwnedHandle) -> HANDLE {

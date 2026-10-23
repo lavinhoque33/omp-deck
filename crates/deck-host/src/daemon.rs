@@ -4,6 +4,7 @@
 //! Threads: accept loop (main), one per connection, PTY reader, PTY writer, child waiter,
 //! sync-update timer, one writer per attached client.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -37,6 +38,12 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Shutdown waits this long for clients to receive `Exited`.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// A session whose child exited before any client attached keeps serving this long, so the
+/// first attach (or `dump`) still sees the final screen and the exit code.
+const EXIT_LINGER: Duration = Duration::from_secs(10);
+/// Bytes queued for the PTY (client input plus query replies) before the attached client's
+/// input stops being read (backpressure) and query replies are dropped.
+const INPUT_BUDGET: usize = 8 << 20;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Options of `omp-deck-host serve`.
@@ -121,7 +128,7 @@ fn start(
         ..Config::default()
     };
     let term = Term::new(config, &term_size(size), EventProxy(event_tx));
-    let (input, input_rx) = mpsc::channel::<Vec<u8>>();
+    let input = InputQueue::new(INPUT_BUDGET);
     let spec = &request.spec;
     let mut argv = vec![spec.program.to_string_lossy().into_owned()];
     argv.extend(spec.args.iter().cloned());
@@ -135,12 +142,15 @@ fn start(
             size,
             client: None,
             next_client: 1,
+            ever_attached: false,
+            replies: Vec::new(),
         }),
         sync_cv: Condvar::new(),
         status: Mutex::new(Status {
             exited: None,
             reader_done: false,
             busy: 0,
+            first_attach_done: false,
             shutting_down: false,
         }),
         status_cv: Condvar::new(),
@@ -159,13 +169,17 @@ fn start(
     });
 
     let mut writer = spawned.writer;
+    let s = Arc::clone(&shared);
     spawn_thread("pty-writer", move || {
-        for bytes in input_rx {
-            if let Err(e) = writer.write_all(&bytes) {
+        while let Some(bytes) = s.input.pop() {
+            let written = writer.write_all(&bytes);
+            s.input.written(bytes.len());
+            if let Err(e) = written {
                 log::warn!("pty write: {e}");
                 break;
             }
         }
+        s.input.close();
     })?;
     let s = Arc::clone(&shared);
     let reader = spawned.reader;
@@ -179,9 +193,120 @@ fn start(
         // Windows: closing the pseudoconsole ends its output pipe; the reader keeps draining.
         s.child.close_console();
         s.wait_status(DRAIN_TIMEOUT, |st| st.reader_done);
+        s.input.close();
+        s.update_status(|st| st.exited = Some(code));
+        // Nobody has seen this session yet (e.g. the program failed at launch): keep serving
+        // until the first attach received the final screen and `Exited`, or a kill.
+        if !s.core().ever_attached {
+            s.wait_status(EXIT_LINGER, |st| st.first_attach_done);
+        }
         finish(&s, code);
     })?;
     Ok((shared, listener))
+}
+
+/// Byte-budgeted queue of writes to the PTY, drained by the PTY writer thread. Bytes count
+/// against the budget until written, so a child that stops reading stalls producers instead
+/// of growing memory.
+struct InputQueue {
+    state: Mutex<InputState>,
+    /// Signals both "chunk available" (writer) and "room freed / closed" (producers).
+    cv: Condvar,
+    budget: usize,
+}
+
+struct InputState {
+    chunks: VecDeque<Vec<u8>>,
+    /// Queued plus in-flight bytes.
+    bytes: usize,
+    closed: bool,
+}
+
+impl InputQueue {
+    fn new(budget: usize) -> InputQueue {
+        InputQueue {
+            state: Mutex::new(InputState {
+                chunks: VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            cv: Condvar::new(),
+            budget,
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, InputState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn fits(&self, st: &InputState, len: usize) -> bool {
+        // An oversized chunk is admitted into an empty queue rather than never.
+        st.closed || st.bytes == 0 || st.bytes + len <= self.budget
+    }
+
+    /// Blocks until `len` more bytes fit (or the queue closed).
+    fn wait_room(&self, len: usize) {
+        let st = self.state();
+        let _st = self
+            .cv
+            .wait_while(st, |st| !self.fits(st, len))
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+
+    /// Queues `bytes` regardless of the budget (after [`InputQueue::wait_room`]).
+    fn push(&self, bytes: Vec<u8>) {
+        let mut st = self.state();
+        if st.closed {
+            return;
+        }
+        st.bytes += bytes.len();
+        st.chunks.push_back(bytes);
+        self.cv.notify_all();
+    }
+
+    /// Queues `bytes` if they fit; `false` if over budget. Never blocks on the child.
+    fn try_push(&self, bytes: Vec<u8>) -> bool {
+        let mut st = self.state();
+        if st.closed {
+            return true;
+        }
+        if st.bytes + bytes.len() > self.budget {
+            return false;
+        }
+        st.bytes += bytes.len();
+        st.chunks.push_back(bytes);
+        self.cv.notify_all();
+        true
+    }
+
+    /// Next chunk for the writer; `None` once closed.
+    fn pop(&self) -> Option<Vec<u8>> {
+        let st = self.state();
+        let mut st = self
+            .cv
+            .wait_while(st, |st| st.chunks.is_empty() && !st.closed)
+            .unwrap_or_else(PoisonError::into_inner);
+        if st.closed {
+            return None;
+        }
+        st.chunks.pop_front()
+    }
+
+    /// The writer finished `len` bytes.
+    fn written(&self, len: usize) {
+        let mut st = self.state();
+        st.bytes = st.bytes.saturating_sub(len);
+        self.cv.notify_all();
+    }
+
+    /// Drops everything queued and wakes all waiters (the PTY is gone).
+    fn close(&self) {
+        let mut st = self.state();
+        st.closed = true;
+        st.chunks.clear();
+        st.bytes = 0;
+        self.cv.notify_all();
+    }
 }
 
 fn spawn_thread(name: &str, f: impl FnOnce() + Send + 'static) -> Result<()> {
@@ -221,6 +346,11 @@ struct Core {
     size: PtySize,
     client: Option<ClientHandle>,
     next_client: u64,
+    /// Whether any client ever attached.
+    ever_attached: bool,
+    /// Query replies collected while locked; pushed to the PTY after unlocking
+    /// ([`Shared::send_replies`]).
+    replies: Vec<u8>,
 }
 
 struct Status {
@@ -229,6 +359,9 @@ struct Status {
     reader_done: bool,
     /// Threads that must deliver something before the process exits.
     busy: usize,
+    /// A client received the final screen and `Exited` (or killed the session) after the
+    /// child exited.
+    first_attach_done: bool,
     shutting_down: bool,
 }
 
@@ -238,7 +371,7 @@ struct Shared {
     sync_cv: Condvar,
     status: Mutex<Status>,
     status_cv: Condvar,
-    input: Sender<Vec<u8>>,
+    input: InputQueue,
     child: PtyChild,
     listener: Arc<Listener>,
     name: String,
@@ -272,6 +405,18 @@ impl Shared {
         done(&guard)
     }
 
+    /// Pushes the query replies collected under `core` to the PTY, after unlocking it.
+    fn send_replies(&self, mut core: MutexGuard<'_, Core>) {
+        if core.replies.is_empty() {
+            return;
+        }
+        let replies = std::mem::take(&mut core.replies);
+        drop(core);
+        if !self.input.try_push(replies) {
+            log::warn!("PTY input queue full; dropping terminal query replies");
+        }
+    }
+
     fn info(&self, core: &Core) -> HostInfo {
         HostInfo {
             name: self.name.clone(),
@@ -292,14 +437,15 @@ impl Shared {
 }
 
 impl Core {
-    /// Feeds PTY output to the terminal and side scanner and answers queued terminal queries.
-    fn feed(&mut self, bytes: &[u8], input: &Sender<Vec<u8>>) {
+    /// Feeds PTY output to the terminal and side scanner and collects query replies.
+    fn feed(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
         self.scanner.advance(bytes);
-        self.answer_queries(input);
+        self.answer_queries();
     }
 
-    fn answer_queries(&mut self, input: &Sender<Vec<u8>>) {
+    /// Appends replies to queued terminal queries to `self.replies`.
+    fn answer_queries(&mut self) {
         while let Ok(event) = self.events.try_recv() {
             let reply = match event {
                 Event::PtyWrite(text) => text,
@@ -316,15 +462,15 @@ impl Core {
                 }),
                 _ => continue,
             };
-            let _ = input.send(reply.into_bytes());
+            self.replies.extend_from_slice(reply.as_bytes());
         }
     }
 
     /// Ends a pending synchronized update so the terminal reflects everything received.
-    fn flush_sync(&mut self, input: &Sender<Vec<u8>>) {
+    fn flush_sync(&mut self) {
         if self.processor.sync_timeout().sync_timeout().is_some() {
             self.processor.stop_sync(&mut self.term);
-            self.answer_queries(input);
+            self.answer_queries();
         }
     }
 
@@ -352,8 +498,8 @@ impl Core {
         self.scanner.resize(rows);
     }
 
-    fn snapshot(&mut self, history_lines: u32, input: &Sender<Vec<u8>>) -> Vec<u8> {
-        self.flush_sync(input);
+    fn snapshot(&mut self, history_lines: u32) -> Vec<u8> {
+        self.flush_sync();
         let side = self.scanner.state().clone();
         snapshot::encode(&mut self.term, &side, history_lines as usize)
     }
@@ -394,7 +540,7 @@ fn read_loop(shared: &Shared, mut reader: pty::PtyReader) {
         };
         let chunk = &buf[..n];
         let mut core = shared.core();
-        core.feed(chunk, &shared.input);
+        core.feed(chunk);
         if core.processor.sync_timeout().sync_timeout().is_some() {
             shared.sync_cv.notify_one();
         }
@@ -411,6 +557,7 @@ fn read_loop(shared: &Shared, mut reader: pty::PtyReader) {
                 Err(TrySendError::Disconnected(_)) => core.client = None,
             }
         }
+        shared.send_replies(core);
     }
     shared.update_status(|st| st.reader_done = true);
 }
@@ -429,8 +576,9 @@ fn sync_timer(shared: &Shared) {
             Some(at) => {
                 let now = Instant::now();
                 if at <= now {
-                    core.flush_sync(&shared.input);
-                    core
+                    core.flush_sync();
+                    shared.send_replies(core);
+                    shared.core()
                 } else {
                     shared
                         .sync_cv
@@ -576,7 +724,9 @@ fn conn_loop(conn: &mut Conn<'_>) -> Result<()> {
             }
             Kind::Peek => {
                 let params: PeekParams = protocol::parse(&conn.payload)?;
-                let snapshot = shared.core().snapshot(params.history_lines, &shared.input);
+                let mut core = shared.core();
+                let snapshot = core.snapshot(params.history_lines);
+                shared.send_replies(core);
                 for chunk in snapshot.chunks(SNAPSHOT_CHUNK) {
                     conn.reply(Kind::Snapshot, chunk)?;
                 }
@@ -587,9 +737,12 @@ fn conn_loop(conn: &mut Conn<'_>) -> Result<()> {
                 attach(conn, &params)?;
             }
             Kind::Input => {
-                let core = shared.core();
-                if conn.is_current(&core) {
-                    let _ = shared.input.send(conn.payload.clone());
+                // Backpressure: while the PTY input queue is over budget this connection's
+                // socket is not read, which in turn blocks the client's writes.
+                shared.input.wait_room(conn.payload.len());
+                let current = conn.is_current(&shared.core());
+                if current {
+                    shared.input.push(conn.payload.clone());
                 }
             }
             Kind::Resize => {
@@ -627,9 +780,15 @@ fn attach(conn: &mut Conn<'_>, params: &AttachParams) -> Result<()> {
         })?;
         return conn.reply(Kind::Exited, &payload);
     }
+    let mut core = shared.core();
+    // Checked under the core lock: the child waiter reads `ever_attached` (also under it)
+    // after recording the exit, so either it sees this attach or this sees the exit.
+    let exited = shared.status().exited;
+    if let Some(code) = exited {
+        return attach_after_exit(conn, core, params.history_lines, code);
+    }
     let writer_stream = conn.stream.try_clone()?;
     let (queue, rx) = mpsc::sync_channel(CLIENT_QUEUE);
-    let mut core = shared.core();
     core.resize(
         &shared.child,
         params.cols,
@@ -638,7 +797,7 @@ fn attach(conn: &mut Conn<'_>, params: &AttachParams) -> Result<()> {
         params.cell_height,
     );
     core.palette = params.palette;
-    let snapshot = core.snapshot(params.history_lines, &shared.input);
+    let snapshot = core.snapshot(params.history_lines);
     if let Some(old) = core.client.take() {
         // The old writer sends this, then sees the queue closed and ends its stream.
         let _ = old.queue.try_send(Out::Frame(Kind::Displaced, Vec::new()));
@@ -648,8 +807,9 @@ fn attach(conn: &mut Conn<'_>, params: &AttachParams) -> Result<()> {
     // Fresh queue with capacity ≥ 1: cannot fail.
     let _ = queue.try_send(Out::Snapshot(snapshot));
     core.client = Some(ClientHandle { id, queue });
+    core.ever_attached = true;
     conn.attached = Some(id);
-    drop(core);
+    shared.send_replies(core);
 
     shared.update_status(|st| st.busy += 1);
     let s = Arc::clone(shared);
@@ -661,6 +821,31 @@ fn attach(conn: &mut Conn<'_>, params: &AttachParams) -> Result<()> {
         shared.update_status(|st| st.busy -= 1);
     }
     spawned
+}
+
+/// Attach while the session lingers after its child exited unseen: the final screen, then
+/// `Exited`, written directly (no PTY, nothing else will follow); the daemon then ends.
+fn attach_after_exit(
+    conn: &mut Conn<'_>,
+    mut core: MutexGuard<'_, Core>,
+    history_lines: u32,
+    code: Option<i32>,
+) -> Result<()> {
+    let shared = conn.shared;
+    let snapshot = core.snapshot(history_lines);
+    core.replies.clear();
+    drop(core);
+    shared.update_status(|st| st.busy += 1);
+    let result = snapshot
+        .chunks(SNAPSHOT_CHUNK)
+        .try_for_each(|c| conn.reply(Kind::Snapshot, c))
+        .and_then(|()| conn.reply(Kind::SnapshotEnd, &[]))
+        .and_then(|()| conn.reply_json(Kind::Exited, &ExitedPayload { code }));
+    shared.update_status(|st| {
+        st.busy -= 1;
+        st.first_attach_done |= result.is_ok();
+    });
+    result
 }
 
 fn client_writer(mut stream: Stream, rx: &Receiver<Out>) {
@@ -700,7 +885,11 @@ fn kill(conn: &mut Conn<'_>) -> Result<()> {
     } else {
         Ok(())
     };
-    shared.update_status(|st| st.busy -= 1);
+    shared.update_status(|st| {
+        st.busy -= 1;
+        // Ends a linger after an unseen exit.
+        st.first_attach_done = true;
+    });
     result
 }
 

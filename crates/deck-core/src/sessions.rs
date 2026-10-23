@@ -122,10 +122,18 @@ mod tests {
 
     #[test]
     fn absolutize_normalizes_lexically() {
-        assert_eq!(absolutize("/a/./b/../c".into()), Path::new("/a/c"));
+        #[cfg(unix)]
+        {
+            assert_eq!(absolutize("/a/./b/../c".into()), Path::new("/a/c"));
+            assert_eq!(absolutize("/../a".into()), Path::new("/a"));
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(absolutize(r"C:\a\.\b\..\c".into()), Path::new(r"C:\a\c"));
+            assert_eq!(absolutize(r"C:\..\a".into()), Path::new(r"C:\a"));
+        }
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(absolutize("x/../y".into()), cwd.join("y"));
-        assert_eq!(absolutize("/../a".into()), Path::new("/a"));
     }
 }
 

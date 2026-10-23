@@ -1084,7 +1084,15 @@ mod project_sync {
 
     /// `<agent>/sessions/<enc>/<ts>_<id>.jsonl`: omp's layout, header on line 2 after a title.
     fn session(agent: &Path, id: &str, cwd: &Path, tail: &str) -> PathBuf {
-        let enc = cwd.display().to_string().replace('/', "-");
+        // omp's directory name for a cwd (session-paths.ts, `encodeLegacyAbsoluteSessionDirName`):
+        // no leading separator, every `/`, `\\` and `:` becomes `-`, wrapped in `--`.
+        let enc = format!(
+            "--{}--",
+            cwd.display()
+                .to_string()
+                .trim_start_matches(['/', '\\'])
+                .replace(['/', '\\', ':'], "-")
+        );
         let path = agent
             .join("sessions")
             .join(enc)
@@ -1927,6 +1935,25 @@ mod project_sync {
         assert!(w.service.project_state().projects.is_empty());
     }
 
+    /// A directory handle that can have its modification time set (Windows needs backup
+    /// semantics and write access to open a directory at all).
+    fn open_dir_for_times(dir: &Path) -> fs::File {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(dir)
+                .unwrap()
+        }
+        #[cfg(not(windows))]
+        {
+            fs::File::open(dir).unwrap()
+        }
+    }
+
     #[test]
     fn stale_staging_directories_are_swept_at_job_start() {
         let w = world();
@@ -1935,8 +1962,7 @@ mod project_sync {
         write(&stale.join("leftover.tar.gz"), "partial");
         write(&fresh.join("running.tar.gz"), "in use");
         let two_days_ago = std::time::SystemTime::now() - Duration::from_secs(48 * 3600);
-        fs::File::open(&stale)
-            .unwrap()
+        open_dir_for_times(&stale)
             .set_modified(two_days_ago)
             .unwrap();
         let proj = w.tmp.path().join("proj");
@@ -2740,6 +2766,7 @@ mod project_sync {
 
     // ------------------------------------------------------------ restoring sessions
 
+    #[cfg(unix)]
     fn fake_omp(dir: &Path, name: &str, body: &str) -> Omp {
         let path = dir.join(name);
         let mut stage = path.as_os_str().to_owned();
@@ -2757,6 +2784,7 @@ mod project_sync {
     }
 
     /// A project with `ids` sessions and `files` in `.omp`, backed up; its list entry.
+    #[cfg(unix)]
     fn backed_up(w: &World, ids: &[&str], files: &[&str]) -> (PathBuf, ProjectBackup) {
         let proj = w.tmp.path().join("proj");
         fs::create_dir_all(&proj).unwrap();
@@ -2775,8 +2803,10 @@ mod project_sync {
         (proj, backup)
     }
 
+    #[cfg(unix)]
     const OK_OMP: &str = "echo /store/sessions/x/new.jsonl; echo 'Unpacked session (abc).' >&2";
 
+    #[cfg(unix)]
     #[test]
     fn session_unpack_runs_in_the_prepared_store_with_its_scratch_in_the_staging_dir() {
         let w = world();
@@ -2835,6 +2865,7 @@ mod project_sync {
         assert_eq!(w.staging(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn omp_failures_are_reported_as_one_clean_line() {
         let w = world();
@@ -2865,6 +2896,7 @@ mod project_sync {
     }
 
     /// A progress callback that cancels once `stage` has finished its first item.
+    #[cfg(unix)]
     fn stop_after(stage: Stage, cancel: &AtomicBool) -> impl Fn(Progress) + Sync + '_ {
         move |p: Progress| {
             if p.stage == stage && p.done == 1 {
@@ -2873,6 +2905,7 @@ mod project_sync {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn cancelling_keeps_what_was_already_restored() {
         let w = world();

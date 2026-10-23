@@ -184,17 +184,15 @@ pub struct Tree {
     pgid: i32,
 }
 
-pub fn prepare(cmd: &mut Command) {
+/// Starts `cmd` as the leader of its own process group, which [`Tree::kill`] signals as a whole.
+pub fn spawn(cmd: &mut Command) -> io::Result<(Child, Tree)> {
     cmd.process_group(0);
+    let child = cmd.spawn()?;
+    let pgid = i32::try_from(child.id()).unwrap_or(0);
+    Ok((child, Tree { pgid }))
 }
 
 impl Tree {
-    pub fn attach(child: &Child) -> Tree {
-        Tree {
-            pgid: i32::try_from(child.id()).unwrap_or(0),
-        }
-    }
-
     pub fn kill(&self) {
         if self.pgid > 0 {
             // SAFETY: plain syscall with integer arguments; no memory is accessed.

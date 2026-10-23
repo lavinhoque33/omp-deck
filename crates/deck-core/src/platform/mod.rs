@@ -169,12 +169,11 @@ impl KillableCommand {
         KillableCommand { cmd }
     }
 
-    /// Spawns the command. On Windows the child is assigned to its job right after creation, so a
-    /// grandchild forked in that instant escapes; the job also kills on handle close.
+    /// Spawns the command. Windows: the child starts suspended, joins its kill-on-close job and
+    /// only then runs (the spawn fails if it cannot join), so no descendant escapes the job; the
+    /// command's creation flags are replaced. Unix: the child leads a new process group.
     pub fn spawn(mut self) -> io::Result<KillableChild> {
-        imp::prepare(&mut self.cmd);
-        let child = self.cmd.spawn()?;
-        let tree = imp::Tree::attach(&child);
+        let (child, tree) = imp::spawn(&mut self.cmd)?;
         Ok(KillableChild { child, tree })
     }
 }

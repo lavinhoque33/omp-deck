@@ -14,12 +14,15 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Foundation::{FILETIME, HANDLE};
+use windows_sys::Win32::Foundation::{FILETIME, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::{
     GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -28,8 +31,8 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, OpenThread,
+    PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
@@ -238,31 +241,75 @@ pub fn open_regular_file(path: &Path) -> io::Result<File> {
 
 /// Job object that kills everything inside when terminated or when its last handle closes.
 pub struct Tree {
-    job: Option<OwnedHandle>,
+    job: OwnedHandle,
 }
 
-pub fn prepare(cmd: &mut Command) {
-    no_window(cmd);
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+/// Starts `cmd` suspended, puts it into a fresh kill-on-close job, then lets it run: nothing it
+/// starts can be outside the job. If the job cannot be set up or joined the child is killed and
+/// the spawn fails.
+pub fn spawn(cmd: &mut Command) -> io::Result<(Child, Tree)> {
+    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    let mut child = cmd.spawn()?;
+    let started = new_job(&child).and_then(|job| resume(child.id()).map(|()| job));
+    match started {
+        Ok(job) => Ok((child, Tree { job })),
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(e)
+        }
+    }
+}
+
+/// Resumes the (single) initial thread of the suspended process `pid`: std does not hand out the
+/// thread handle, so it is found through a thread snapshot.
+fn resume(pid: u32) -> io::Result<()> {
+    // SAFETY: plain snapshot of all threads; the handle is owned and closed by `OwnedHandle`.
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snap == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: we own the snapshot handle.
+    let _snap = unsafe { OwnedHandle::from_raw_handle(snap as RawHandle) };
+    // SAFETY: plain data; all-zero is a valid value before `dwSize` is set.
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = size_of::<THREADENTRY32>() as u32;
+    let mut resumed = false;
+    // SAFETY: `entry.dwSize` is set and `snap` is a thread snapshot.
+    let mut more = unsafe { Thread32First(snap, &mut entry) } != 0;
+    while more {
+        if entry.th32OwnerProcessID == pid {
+            // SAFETY: opens a thread by id for suspend/resume only; closed below.
+            let raw = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if raw.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: we own the new handle.
+            let thread = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
+            // SAFETY: the handle is valid and has THREAD_SUSPEND_RESUME.
+            if unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) } == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            resumed = true;
+        }
+        // SAFETY: as for `Thread32First`.
+        more = unsafe { Thread32Next(snap, &mut entry) } != 0;
+    }
+    if resumed {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "the suspended child has no thread to resume",
+        ))
+    }
 }
 
 impl Tree {
-    /// Puts `child` into a fresh kill-on-close job; without one (job creation or assignment
-    /// refused) only the child itself can be killed.
-    pub fn attach(child: &Child) -> Tree {
-        match new_job(child) {
-            Ok(job) => Tree { job: Some(job) },
-            Err(e) => {
-                log::warn!("job object unavailable, killing the child only: {e}");
-                Tree { job: None }
-            }
-        }
-    }
-
     pub fn kill(&self) {
-        if let Some(job) = &self.job {
-            // SAFETY: the job handle is valid while `self` lives.
-            unsafe { TerminateJobObject(job.as_raw_handle() as HANDLE, 1) };
-        }
+        // SAFETY: the job handle is valid while `self` lives.
+        unsafe { TerminateJobObject(self.job.as_raw_handle() as HANDLE, 1) };
     }
 }
 

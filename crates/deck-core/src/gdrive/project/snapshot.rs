@@ -213,7 +213,7 @@ fn project_sessions(
     let mut out = Vec::new();
     let mut ids = HashSet::new();
     for group in sessions::scan(root) {
-        if group.cwd != project {
+        if !same_path(&group.cwd, project) {
             continue;
         }
         for e in group.sessions {
@@ -420,9 +420,9 @@ mod tests {
         write(
             &path,
             &format!(
-                "{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"{}\"}}\n\
+                "{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":{}}}\n\
                  {{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n",
-                cwd.display()
+                serde_json::to_string(&cwd.display().to_string()).unwrap()
             ),
         );
         write(&path.with_extension("").join("sub.jsonl"), "{}\n");

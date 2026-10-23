@@ -2217,7 +2217,7 @@ mod tests {
     #[test]
     fn activity_handles_paths_that_need_uri_escaping() {
         let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("a b#c?d%e");
+        let sub = dir.path().join("a b#c&d%e'f");
         std::fs::create_dir(&sub).unwrap();
         let db = sub.join("stats.db");
         let c = make_db(&db, false);

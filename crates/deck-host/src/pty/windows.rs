@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -25,15 +25,15 @@ use windows_sys::Win32::System::LibraryLoader::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
+    GetExitCodeProcess, INFINITE, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, WaitForSingleObject,
 };
 
 use super::{PtySize, Spawned, winargs};
 use crate::error::{Error, Result};
 use crate::protocol::SessionSpec;
+use crate::winproc::{AttributeList, check, owned};
 
 /// `PSEUDOCONSOLE_RESIZE_QUIRK` (not in windows-sys): avoids a full repaint on resize.
 const PSEUDOCONSOLE_RESIZE_QUIRK: u32 = 0x2;
@@ -144,22 +144,6 @@ fn hresult(hr: i32, call: &'static str) -> Result<()> {
     }
 }
 
-fn check(ok: i32, call: &'static str) -> Result<()> {
-    if ok == 0 {
-        Err(Error::last_os(call))
-    } else {
-        Ok(())
-    }
-}
-
-fn owned(handle: HANDLE, call: &'static str) -> Result<OwnedHandle> {
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return Err(Error::last_os(call));
-    }
-    // SAFETY: a valid handle we own exclusively from here on.
-    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
-}
-
 fn pipe() -> Result<(OwnedHandle, OwnedHandle)> {
     let (mut read, mut write) = (null_mut(), null_mut());
     // SAFETY: valid out pointers; default security, not inheritable.
@@ -244,40 +228,16 @@ pub(crate) fn spawn(spec: &SessionSpec, size: PtySize) -> Result<Spawned> {
     drop(in_read);
     drop(out_write);
 
-    let mut attr_size = 0usize;
-    // SAFETY: size query with a null list; fails with ERROR_INSUFFICIENT_BUFFER by design.
-    unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut attr_size) };
-    // u64 elements keep the opaque list pointer-aligned.
-    let mut attr_buf = vec![0u64; attr_size.div_ceil(8)];
-    let attrs = attr_buf.as_mut_ptr().cast();
-    // SAFETY: attr_buf holds attr_size bytes.
-    check(
-        unsafe { InitializeProcThreadAttributeList(attrs, 1, 0, &mut attr_size) },
-        "InitializeProcThreadAttributeList",
-    )?;
-    struct AttrList(*mut std::ffi::c_void);
-    impl Drop for AttrList {
-        fn drop(&mut self) {
-            // SAFETY: initialized list, deleted once before its buffer is freed.
-            unsafe { DeleteProcThreadAttributeList(self.0) };
-        }
+    let mut attrs = AttributeList::new(1)?;
+    // SAFETY: the attribute value is the HPCON itself (not a pointer to it), as documented;
+    // nothing to keep alive.
+    unsafe {
+        attrs.set(
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            console.0 as *const std::ffi::c_void,
+            std::mem::size_of::<HPCON>(),
+        )?;
     }
-    let _attrs_guard = AttrList(attrs);
-    // SAFETY: the attribute value is the HPCON itself (not a pointer to it), as documented.
-    check(
-        unsafe {
-            UpdateProcThreadAttribute(
-                attrs,
-                0,
-                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                console.0 as *const std::ffi::c_void,
-                std::mem::size_of::<HPCON>(),
-                null_mut(),
-                null(),
-            )
-        },
-        "UpdateProcThreadAttribute",
-    )?;
 
     // SAFETY: STARTUPINFOEXW is plain old data.
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -288,7 +248,7 @@ pub(crate) fn spawn(spec: &SessionSpec, size: PtySize) -> Result<Spawned> {
     si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
     si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
     si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
-    si.lpAttributeList = attrs;
+    si.lpAttributeList = attrs.as_ptr();
 
     // SAFETY: plain old data out struct.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };

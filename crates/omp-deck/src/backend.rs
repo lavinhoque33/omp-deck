@@ -100,13 +100,11 @@ impl Backends {
         banner_text(self, cfg!(windows))
     }
 
-    /// Namespace that scopes the control endpoints of every tab: the first backend's (tmux's
-    /// socket, else the host namespace), `direct` without any backend.
+    /// Namespace that scopes the control endpoints of every tab, fixed at startup: the one of
+    /// the backend new sessions use (tmux's socket or the host namespace; both are `omp-deck`
+    /// in production, so existing tabs stay reachable), `direct` without any backend.
     pub fn ctl_namespace(&self) -> String {
-        self.muxes
-            .first()
-            .map_or("direct", Mux::namespace)
-            .to_owned()
+        self.primary().map_or("direct", Mux::namespace).to_owned()
     }
 
     /// Writes tmux's generated config; the host needs none.

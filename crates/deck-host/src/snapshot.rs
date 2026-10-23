@@ -416,6 +416,12 @@ impl Writer {
             }
             if continuation && end < cols {
                 self.default_attrs();
+                if end == 0 {
+                    // Still wrap-pending at the end of the previous row: `CSI K` there would
+                    // cancel the wrap (and erase that row's last cell). A blank realizes the
+                    // wrap; CR returns to the start of the continuation row.
+                    self.out.extend_from_slice(b" \r");
+                }
                 self.out.extend_from_slice(b"\x1b[K");
             }
             if line != lines - 1 && !wraps {
@@ -712,6 +718,21 @@ mod tests {
         f.feed("x漢字".as_bytes());
         let mut b = f.replay(0);
         assert_same(&mut f.term, &mut b.term);
+    }
+
+    #[test]
+    fn blank_continuation_row_after_wrap() {
+        let mut f = Fixture::new(8, 5);
+        // Row 0 wraps into row 1, which is then erased entirely; more rows follow.
+        f.feed(b"\x1b[44mabcdefghX\x1b[0m\x1b[2K\r\nnext\r\nlast");
+        assert!(
+            f.term.grid()[Line(0)][Column(7)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        );
+        let mut b = f.replay(0);
+        assert_same(&mut f.term, &mut b.term);
+        assert_eq!(rows_of(&b.term)[2][0].c, 'n');
     }
 
     #[test]

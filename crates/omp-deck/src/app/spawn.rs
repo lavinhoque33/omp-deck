@@ -343,17 +343,28 @@ impl App {
                         (Some(m), Some(name)) => !m.has_session(name),
                         _ => true,
                     };
+                    // The environment is part of "control available": without it omp must not
+                    // load the extension, and the tab offers the restart-with-control path.
+                    let (key, env) = match key {
+                        Some(key) => match ctl_env(&ctl_dir(&ns, &key)) {
+                            Ok(vars) => {
+                                let env: Vec<(String, String)> = vars
+                                    .into_iter()
+                                    .map(|(k, v)| (k.to_owned(), v.to_string_lossy().into_owned()))
+                                    .collect();
+                                (Some(key), env)
+                            }
+                            Err(e) => {
+                                log::warn!("live control unavailable for {key}: {e}");
+                                (None, Vec::new())
+                            }
+                        },
+                        None => (None, Vec::new()),
+                    };
                     let argv = match (&key, &ext) {
                         (Some(_), Some(ext)) => with_ctl(&req.argv, ext),
                         _ => req.argv.clone(),
                     };
-                    let env: Vec<(String, String)> = key
-                        .iter()
-                        .map(|key| {
-                            let (var, value) = ctl_env(&ctl_dir(&ns, key));
-                            (var.to_owned(), value.to_string_lossy().into_owned())
-                        })
-                        .collect();
                     let launch = match (&mux, &req.mux_name) {
                         (Some(m), Some(name)) => Ok(m.launch_with_env(name, &req.cwd, &argv, &env)),
                         _ => direct(&req.cwd, &argv, env),

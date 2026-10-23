@@ -16,6 +16,8 @@ pub mod pty;
 pub mod snapshot;
 mod spawn;
 mod transport;
+#[cfg(windows)]
+mod winproc;
 
 pub use client::{
     Attached, AttachedRx, AttachedTx, HostEvent, attach, create_or_attach, daemon_exe, peek, start,

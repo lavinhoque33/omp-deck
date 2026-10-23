@@ -144,10 +144,49 @@ pub fn with_ctl(omp_argv: &[String], ext: &Path) -> Vec<String> {
     out
 }
 
-/// The environment variable that points the extension at `dir` (a [`ctl_dir`]): `OMPDECK_CTL_DIR`
-/// on Unix, `OMPDECK_CTL_PIPE` (the pipe name) on Windows.
-pub fn ctl_env(dir: &Path) -> (&'static str, OsString) {
-    (os::ENV_VAR, dir.as_os_str().to_owned())
+/// The environment that points the extension at `dir` (a [`ctl_dir`]) and, on Windows, lets it
+/// authenticate clients: Unix `OMPDECK_CTL_DIR`; Windows `OMPDECK_CTL_PIPE` (the pipe name) and
+/// `OMPDECK_CTL_TOKEN` (see [`pipe_token`]). An error (the secret file cannot be read or created)
+/// means: launch without control.
+pub fn ctl_env(dir: &Path) -> io::Result<Vec<(&'static str, OsString)>> {
+    os::env(dir)
+}
+
+/// Capability token of one pipe: `hex(sha256(secret || pipe name))`. A pipe has no owner or mode
+/// check, so the extension serves nothing to a connection that does not send this first (see
+/// [`auth_line`]); the secret is per user and stable, so a restarted app can reconnect to live tabs.
+#[cfg(any(windows, test))]
+fn pipe_token(secret: &[u8], pipe: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(secret);
+    h.update(pipe.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The first line a client sends on a pipe: `{"t":"auth","token":"<token>"}\n`.
+#[cfg(any(windows, test))]
+fn auth_line(token: &str) -> Vec<u8> {
+    let mut line = serde_json::json!({"t": "auth", "token": token})
+        .to_string()
+        .into_bytes();
+    line.push(b'\n');
+    line
+}
+
+/// The 32-byte per-user secret at `path`, created (private, atomically) when missing or of the
+/// wrong size.
+#[cfg(any(windows, test))]
+fn load_or_create_secret(path: &Path) -> io::Result<[u8; 32]> {
+    let read = || -> Option<[u8; 32]> { fs::read(path).ok()?.try_into().ok() };
+    if let Some(secret) = read() {
+        return Ok(secret);
+    }
+    let mut fresh = [0u8; 32];
+    getrandom::fill(&mut fresh).map_err(|e| io::Error::other(format!("no randomness: {e}")))?;
+    crate::platform::write_private(path, &fresh)?;
+    // Another instance may have created it in the same instant: whatever is on disk now wins.
+    read().ok_or_else(|| io::Error::other("ctl.key is unreadable"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -823,18 +862,53 @@ mod tests {
         assert!(with_ctl(&[], Path::new("/x/ext.ts")).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn ctl_env_names_the_endpoint_variable_of_the_os() {
-        let (var, value) = ctl_env(Path::new("/run/d"));
-        assert_eq!(
-            var,
-            if cfg!(windows) {
-                "OMPDECK_CTL_PIPE"
-            } else {
-                "OMPDECK_CTL_DIR"
-            }
+    fn ctl_env_points_the_extension_at_the_socket_dir() {
+        let env = ctl_env(Path::new("/run/d")).unwrap();
+        assert_eq!(env, [("OMPDECK_CTL_DIR", OsString::from("/run/d"))]);
+    }
+
+    #[test]
+    fn pipe_tokens_bind_secret_and_pipe() {
+        let secret = [7u8; 32];
+        let t = pipe_token(&secret, r"\\.\pipe\ompdeck-ctl.u.ns.leaf");
+        assert_eq!(t.len(), 64);
+        assert!(
+            t.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         );
-        assert_eq!(value, "/run/d");
+        // Pinned: sha256(secret || pipe) in lowercase hex.
+        let mut input = secret.to_vec();
+        input.extend_from_slice(br"\\.\pipe\ompdeck-ctl.u.ns.leaf");
+        use sha2::{Digest, Sha256};
+        let want: String = Sha256::digest(&input)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(t, want);
+        assert_ne!(t, pipe_token(&secret, r"\\.\pipe\ompdeck-ctl.u.ns.other"));
+        assert_ne!(t, pipe_token(&[8u8; 32], r"\\.\pipe\ompdeck-ctl.u.ns.leaf"));
+    }
+
+    #[test]
+    fn auth_line_is_one_json_line_with_the_token() {
+        let line = auth_line("abc");
+        assert_eq!(line, b"{\"t\":\"auth\",\"token\":\"abc\"}\n");
+    }
+
+    #[test]
+    fn the_secret_is_created_once_and_reused() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("omp-deck/ctl.key");
+        let first = load_or_create_secret(&path).unwrap();
+        assert_ne!(first, [0u8; 32]);
+        assert_eq!(load_or_create_secret(&path).unwrap(), first);
+        assert_eq!(fs::read(&path).unwrap(), first);
+        // A truncated key file is replaced, not trusted.
+        fs::write(&path, b"short").unwrap();
+        let second = load_or_create_secret(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), second);
     }
 
     #[test]

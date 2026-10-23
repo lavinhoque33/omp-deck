@@ -312,15 +312,7 @@ fn group_accessible_endpoint_dir_is_refused() {
 #[test]
 fn cli_new_ls_dump_kill() {
     let ns = TestNs::new();
-    let exe = env!("CARGO_BIN_EXE_omp-deck-host");
-    let run = |args: &[&str]| {
-        let out = std::process::Command::new(exe).args(args).output().unwrap();
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    };
+    let run = common::run_cli;
     let nsa = ns.0.as_str();
     let (ok, stdout, stderr) = run(&[
         "new",
@@ -346,4 +338,129 @@ fn cli_new_ls_dump_kill() {
     assert_eq!(info["cols"], 40);
     assert!(run(&["kill", "--ns", nsa, "cli"]).0);
     assert_eq!(run(&["ls", "--ns", nsa]).1, "");
+}
+
+fn zombie_children() -> Vec<String> {
+    let me = std::process::id().to_string();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path().join("stat")).ok())
+        .filter(|stat| {
+            // `pid (comm) state ppid …`; comm may contain spaces.
+            let rest = stat.rsplit_once(") ").map_or("", |(_, r)| r);
+            let mut fields = rest.split(' ');
+            fields.next() == Some("Z") && fields.next() == Some(me.as_str())
+        })
+        .collect()
+}
+
+#[test]
+fn launcher_is_reaped() {
+    let ns = TestNs::new();
+    deck_host::start(&ns.0, &shell("z"), 80, 24).unwrap();
+    let _c = Client::create(&ns, &shell("z2"), 80, 24);
+    // Other tests' launchers may be zombies for a moment, but none may stay.
+    wait_until("no zombie children", || zombie_children().is_empty());
+}
+
+#[test]
+fn child_exiting_at_launch_is_still_served_with_final_screen_and_code() {
+    let ns = TestNs::new();
+    let nsa = ns.0.as_str();
+    let (ok, _, stderr) = common::run_cli(&[
+        "new",
+        "--ns",
+        nsa,
+        "quick",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo launch-error; exit 5",
+    ]);
+    assert!(ok, "{stderr}");
+    let (_, dump, _) = common::run_cli(&["dump", "--ns", nsa, "quick"]);
+    assert!(dump.contains("launch-error"), "{dump}");
+
+    // The first attach (here via create_or_attach) sees the final screen, then the code.
+    let attached = deck_host::create_or_attach(&ns.0, &shell("quick"), params(80, 24)).unwrap();
+    let mut c = Client::new(attached, 80, 24);
+    c.expect_snapshot();
+    assert!(c.screen().contains("launch-error"), "{}", c.screen());
+    assert_eq!(c.next(), HostEvent::Exited(Some(5)));
+    assert_eq!(c.next(), HostEvent::Closed);
+    wait_until("endpoint gone", || !ns.0.has("quick"));
+
+    // Logs are private.
+    let log = ns.0.log_path("quick").unwrap();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&log), 0o600);
+    assert_eq!(mode(log.parent().unwrap()), 0o700);
+    assert_eq!(mode(log.parent().unwrap().parent().unwrap()), 0o700);
+}
+
+#[test]
+fn unseen_exit_lingers_until_killed() {
+    let ns = TestNs::new();
+    deck_host::start(&ns.0, &spec("gone", "/bin/sh", &["-c", "exit 2"]), 80, 24).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(ns.0.has("gone"));
+    ns.0.kill("gone").unwrap();
+    assert!(!ns.0.has("gone"));
+}
+
+fn rss_kib(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap()
+}
+
+#[test]
+fn input_to_a_child_that_never_reads_is_bounded() {
+    let ns = TestNs::new();
+    let c = Client::create(
+        &ns,
+        &spec(
+            "full",
+            "/bin/sh",
+            &["-c", "stty raw -echo; exec sleep 1000"],
+        ),
+        80,
+        24,
+    );
+    let daemon = ns.0.info("full").unwrap().daemon_pid;
+    let tx = c.tx.clone();
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sent2 = std::sync::Arc::clone(&sent);
+    std::thread::spawn(move || {
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..64 {
+            if tx.input(&chunk).is_err() {
+                break;
+            }
+            sent2.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    // The sender stalls once the daemon stops reading it (budget plus socket buffers).
+    let mut last = 0;
+    wait_until("sender stalled", || {
+        std::thread::sleep(Duration::from_millis(300));
+        let now = sent.load(std::sync::atomic::Ordering::Relaxed);
+        let stalled = now == last && now > 0;
+        last = now;
+        stalled
+    });
+    assert!(last < 32 << 20, "sent {last} bytes without backpressure");
+    assert!(
+        rss_kib(daemon) < 48 * 1024,
+        "daemon RSS {} KiB",
+        rss_kib(daemon)
+    );
+    // Other connections are still served.
+    assert!(ns.0.info("full").unwrap().attached);
+    ns.0.kill("full").unwrap();
+    assert!(!ns.0.has("full"));
 }

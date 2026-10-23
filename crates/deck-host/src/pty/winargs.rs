@@ -1,5 +1,6 @@
 //! Windows command lines: MSVCRT argv quoting, `PATH`/`PATHEXT` program resolution and
-//! `.cmd`/`.bat` programs through `cmd.exe /d /s /c`. Pure string functions (tested on every OS).
+//! `.cmd`/`.bat` programs through `cmd.exe /d /v:off /s /c`. Pure string functions (tested
+//! on every OS).
 
 use std::path::{Path, PathBuf};
 
@@ -81,8 +82,8 @@ pub(crate) fn resolve_program(
 }
 
 /// Full command line for CreateProcessW. Batch programs become
-/// `<comspec> /d /s /c ""<program>" "<arg>"…"` (every argument quoted, characters cmd.exe
-/// would still interpret inside quotes rejected).
+/// `<comspec> /d /v:off /s /c ""<program>" "<arg>"…"` (every argument quoted, characters
+/// cmd.exe would still interpret inside quotes rejected; delayed expansion off so `!` survives).
 pub(crate) fn command_line(program: &Path, args: &[String], comspec: &str) -> Result<String> {
     let program_str = program.to_string_lossy();
     let mut line = String::new();
@@ -94,7 +95,7 @@ pub(crate) fn command_line(program: &Path, args: &[String], comspec: &str) -> Re
             return Err(Error::UnsafeBatchArgument(bad.clone()));
         }
         quote_arg(comspec, false, &mut line);
-        line.push_str(" /d /s /c \"\"");
+        line.push_str(" /d /v:off /s /c \"\"");
         line.push_str(&program_str);
         line.push('"');
         for arg in args {
@@ -154,7 +155,16 @@ mod tests {
         .unwrap();
         assert_eq!(
             bat,
-            r#"C:\Windows\System32\cmd.exe /d /s /c ""C:\npm\omp.CMD" "--resume" "C:\a b\\" "x&y"""#
+            r#"C:\Windows\System32\cmd.exe /d /v:off /s /c ""C:\npm\omp.CMD" "--resume" "C:\a b\\" "x&y"""#
+        );
+        assert_eq!(
+            command_line(
+                Path::new(r"C:\npm\omp.cmd"),
+                &["--session".into(), r"C:\work\!name!\session.jsonl".into()],
+                "cmd.exe",
+            )
+            .unwrap(),
+            r#"cmd.exe /d /v:off /s /c ""C:\npm\omp.cmd" "--session" "C:\work\!name!\session.jsonl"""#
         );
         assert!(matches!(
             command_line(Path::new("x.bat"), &["100%".into()], "cmd.exe"),

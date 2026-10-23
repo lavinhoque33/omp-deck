@@ -181,15 +181,7 @@ fn queries_are_answered_while_detached() {
 #[test]
 fn cli_new_ls_dump_kill() {
     let ns = TestNs::new();
-    let exe = env!("CARGO_BIN_EXE_omp-deck-host");
-    let run = |args: &[&str]| {
-        let out = std::process::Command::new(exe).args(args).output().unwrap();
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    };
+    let run = common::run_cli;
     let nsa = ns.0.as_str();
     let (ok, stdout, stderr) = run(&[
         "new",
@@ -210,4 +202,28 @@ fn cli_new_ls_dump_kill() {
     });
     assert!(run(&["kill", "--ns", nsa, "cli"]).0);
     assert_eq!(run(&["ls", "--ns", nsa]).1.trim(), "");
+}
+
+#[test]
+fn child_exiting_at_launch_is_still_served_with_final_screen_and_code() {
+    let ns = TestNs::new();
+    deck_host::start(
+        &ns.0,
+        &spec(
+            "quick",
+            "cmd.exe",
+            &["/d", "/c", "echo launch-error& exit 5"],
+        ),
+        80,
+        24,
+    )
+    .unwrap();
+    wait_until("output rendered", || {
+        deck_host::peek(&ns.0, "quick", 0)
+            .is_ok_and(|(_, snap)| String::from_utf8_lossy(&snap).contains("launch-error"))
+    });
+    let mut c = Client::attach(&ns, "quick", 80, 24);
+    assert!(c.screen().contains("launch-error"), "{}", c.screen());
+    assert_eq!(c.next(), HostEvent::Exited(Some(5)));
+    wait_until("endpoint gone", || !ns.0.has("quick"));
 }
