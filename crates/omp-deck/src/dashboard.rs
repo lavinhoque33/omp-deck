@@ -663,7 +663,7 @@ fn paint_card(
     } else if card.status == Status::Attention {
         pal.warn.gamma_multiply(0.7)
     } else if hovered {
-        theme::mix(pal.stroke, pal.weak, 0.4)
+        theme::hover_stroke(pal)
     } else {
         pal.stroke
     };

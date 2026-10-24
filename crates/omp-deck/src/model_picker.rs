@@ -457,10 +457,8 @@ fn provider_dropdown(ui: &mut Ui, state: &mut PickerState, input: &PickerInput<'
             1.0,
             if state.provider_open {
                 pal.accent
-            } else if theme::neutral() {
-                theme::mix(pal.stroke, pal.weak, 0.4 * hov)
             } else {
-                theme::mix(pal.stroke, pal.accent, 0.5 * hov)
+                theme::mix(pal.stroke, theme::hover_stroke(pal), hov)
             },
         ),
         StrokeKind::Inside,

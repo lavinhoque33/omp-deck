@@ -358,11 +358,7 @@ fn card(
     let border = if selected {
         pal.accent
     } else if hovered {
-        if theme::neutral() {
-            theme::mix(pal.stroke, pal.weak, 0.4)
-        } else {
-            pal.accent.gamma_multiply(0.55)
-        }
+        theme::hover_stroke(pal)
     } else {
         pal.stroke
     };

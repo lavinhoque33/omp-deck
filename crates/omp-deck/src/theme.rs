@@ -91,9 +91,10 @@ const NEUTRAL_DARK: Palette = Palette {
     bg: rgb(0x0b0b0d),
     panel: rgb(0x0f0f11),
     bar: rgb(0x0f0f11),
-    surface: rgb(0x17171a),
-    raised: rgb(0x1f1f23),
-    stroke: rgb(0x232327),
+    surface: rgb(0x18181b),
+    raised: rgb(0x26262b),
+    // Hairlines must stay visible on the near-black panels (sidebar | tabs | cards).
+    stroke: rgb(0x34343a),
     text: rgb(0xd4d4d8),
     text_strong: rgb(0xfafafa),
     weak: rgb(0x71717a),
@@ -307,7 +308,7 @@ fn build(style: &mut Style, p: &Palette, dark: bool, neutral: bool, density: Den
     w.noninteractive.corner_radius = r;
 
     if neutral {
-        let hover_stroke = mix(p.stroke, p.weak, 0.35);
+        let hover_stroke = hover_stroke(p);
         let (rest, hover) = if dark {
             (p.surface, p.raised)
         } else {
@@ -479,9 +480,18 @@ pub fn paint_bar(painter: &Painter, rect: Rect, p: &Palette) {
     }
 }
 
-/// Hover / quiet-selection fill for list rows and ghost buttons (Neutral: surface; Neon: raised).
+/// Hover / quiet-selection fill for list rows and ghost buttons.
 pub fn hover_fill(p: &Palette) -> Color32 {
-    if neutral() { p.surface } else { p.raised }
+    p.raised
+}
+
+/// Outline of a hovered row, tab, card or button: clearly brighter than the resting hairline.
+pub fn hover_stroke(p: &Palette) -> Color32 {
+    if neutral() {
+        mix(p.stroke, p.text, 0.4)
+    } else {
+        p.accent.gamma_multiply(0.6)
+    }
 }
 
 /// Fill of an active / selected control: the raised surface in Neutral, an `alpha` accent wash in Neon.

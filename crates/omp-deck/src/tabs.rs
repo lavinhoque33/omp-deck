@@ -531,6 +531,14 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
             radius,
             theme::hover_fill(pal).gamma_multiply(0.8 * hov * (1.0 - sel)),
         );
+        if hov > 0.01 {
+            p.rect_stroke(
+                pill,
+                radius,
+                Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(hov)),
+                StrokeKind::Inside,
+            );
+        }
         if sel > 0.01 {
             p.rect(
                 pill,

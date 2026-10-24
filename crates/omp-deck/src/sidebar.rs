@@ -1317,8 +1317,17 @@ fn paint_header_neutral(
 /// Header hover wash and the open/closed chevron at the left (Neon: rotated by `open_t`).
 fn paint_header_chrome(p: &egui::Painter, pal: &Palette, rect: Rect, open_t: f32, hov: f32) {
     let color = theme::mix(pal.weak, pal.text_strong, hov);
+    if hov > 0.01 {
+        let radius = if theme::neutral() { 6 } else { 9 };
+        p.rect(
+            rect,
+            radius,
+            theme::hover_fill(pal).gamma_multiply(0.75 * hov),
+            Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(hov)),
+            StrokeKind::Inside,
+        );
+    }
     if theme::neutral() {
-        p.rect_filled(rect, 6, pal.surface.gamma_multiply(0.7 * hov));
         let chev = if open_t > 0.5 {
             ICON_CHEVRON_DOWN
         } else {
@@ -1328,7 +1337,6 @@ fn paint_header_chrome(p: &egui::Painter, pal: &Palette, rect: Rect, open_t: f32
         paint_icon(p, c, Align2::CENTER_CENTER, chev, 14.0, color);
         return;
     }
-    p.rect_filled(rect, 9, pal.raised.gamma_multiply(0.55 * hov));
     // Rotated by the open animation (0 = right, 1 = down).
     let c = pos2(rect.left() + 14.0, rect.center().y);
     let a = open_t * std::f32::consts::FRAC_PI_2;
@@ -1683,46 +1691,54 @@ fn paint_row_neutral(
     p.galley(pos2(age_x, y - age.size().y / 2.0), age, pal.weak);
 }
 
-/// List row hover wash and selection. Neutral: surface fill + 2 px accent edge; Neon: accent-tinted
-/// card with a gradient edge.
+/// List row hover and selection. Hover lifts the row (raised fill + a bright outline, also on the
+/// active row); selection: Neutral raised fill + 2 px accent edge, Neon accent-tinted card with a
+/// gradient edge.
 fn paint_row_bg(p: &egui::Painter, pal: &Palette, pill: Rect, (hov, sel): (f32, f32)) {
-    if theme::neutral() {
-        p.rect_filled(pill, 6, pal.surface.gamma_multiply(0.6 * hov * (1.0 - sel)));
-        if sel > 0.01 {
-            p.rect_filled(pill, 6, pal.surface.gamma_multiply(sel));
+    let neutral = theme::neutral();
+    let radius = if neutral { 6 } else { 10 };
+    p.rect_filled(
+        pill,
+        radius,
+        theme::hover_fill(pal).gamma_multiply(0.75 * hov * (1.0 - sel)),
+    );
+    if sel > 0.01 {
+        if neutral {
+            p.rect_filled(pill, radius, pal.raised.gamma_multiply(sel));
             let bar = Rect::from_center_size(
                 pos2(pill.left() + 1.0, pill.center().y),
                 vec2(2.0, 14.0 * sel),
             );
             p.rect_filled(bar, 1, pal.accent);
+        } else {
+            p.rect(
+                pill,
+                radius,
+                theme::mix(pal.surface, pal.accent, 0.20).gamma_multiply(sel),
+                Stroke::new(1.0, pal.accent.gamma_multiply(0.5 * sel)),
+                StrokeKind::Inside,
+            );
+            let bar = Rect::from_center_size(
+                pos2(pill.left() + 3.0, pill.center().y),
+                vec2(3.0, 20.0 * sel),
+            );
+            let mut m = egui::epaint::Mesh::default();
+            m.colored_vertex(bar.left_top(), pal.accent_a);
+            m.colored_vertex(bar.right_top(), pal.accent_a);
+            m.colored_vertex(bar.left_bottom(), pal.accent_b);
+            m.colored_vertex(bar.right_bottom(), pal.accent_b);
+            m.add_triangle(0, 1, 2);
+            m.add_triangle(1, 3, 2);
+            p.add(Shape::mesh(m));
         }
-        return;
     }
-    p.rect_filled(
-        pill,
-        10,
-        pal.raised.gamma_multiply(0.75 * hov * (1.0 - sel)),
-    );
-    if sel > 0.01 {
-        p.rect(
+    if hov > 0.01 {
+        p.rect_stroke(
             pill,
-            10,
-            theme::mix(pal.surface, pal.accent, 0.20).gamma_multiply(sel),
-            Stroke::new(1.0, pal.accent.gamma_multiply(0.5 * sel)),
+            radius,
+            Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(hov)),
             StrokeKind::Inside,
         );
-        let bar = Rect::from_center_size(
-            pos2(pill.left() + 3.0, pill.center().y),
-            vec2(3.0, 20.0 * sel),
-        );
-        let mut m = egui::epaint::Mesh::default();
-        m.colored_vertex(bar.left_top(), pal.accent_a);
-        m.colored_vertex(bar.right_top(), pal.accent_a);
-        m.colored_vertex(bar.left_bottom(), pal.accent_b);
-        m.colored_vertex(bar.right_bottom(), pal.accent_b);
-        m.add_triangle(0, 1, 2);
-        m.add_triangle(1, 3, 2);
-        p.add(Shape::mesh(m));
     }
 }
 
