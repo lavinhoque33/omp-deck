@@ -2,12 +2,15 @@
 //! app config, and the per-OS glue in [`platform`].
 
 pub mod agents;
+pub mod changes;
 pub mod config;
 pub mod ctl;
 pub mod gdrive;
+pub(crate) mod git;
 pub mod mux;
 pub mod omp;
 pub mod platform;
+pub mod selfupdate;
 pub mod sessions;
 pub mod status;
 pub mod tmux;

@@ -156,6 +156,7 @@ impl App {
             || self.popup.is_some()
             || self.tree.is_some()
             || self.usage_open
+            || self.palette.is_some()
             || egui::Popup::is_any_open(ctx))
             && let Some(t) = self.tabs.get(self.active).and_then(Tab::term)
         {
@@ -330,6 +331,20 @@ impl App {
         self.ctx.request_repaint();
     }
 
+    /// What the availability rules of the session actions see for `tab` (status bar and palette).
+    pub(super) fn action_ctx(&self, tab: &crate::tabs::TermTab) -> ActionCtx {
+        let activity = Activity::from_title(tab.term.title());
+        ActionCtx {
+            busy: activity.is_busy(),
+            idle: activity == Activity::Idle,
+            has_session_file: tab.session_path.is_some(),
+            last_turn_failed: self.bar_view.last_turn_failed,
+            has_last_reply: self.bar_view.has_reply,
+            exited: tab.term.is_exited(),
+            omp_found: self.omp.is_some(),
+        }
+    }
+
     pub(super) fn show_status_bar(&mut self, ui: &mut Ui) {
         let Some(Tab::Terminal(tab)) = self.tabs.get(self.active) else {
             return;
@@ -345,15 +360,7 @@ impl App {
             activity,
             pending: tab.pending_switch.as_ref(),
             assumed: tab.assumed_switch.as_ref(),
-            actions: ActionCtx {
-                busy: activity.is_busy(),
-                idle: activity == Activity::Idle,
-                has_session_file: tab.session_path.is_some(),
-                last_turn_failed: self.bar_view.last_turn_failed,
-                has_last_reply: self.bar_view.has_reply,
-                exited: tab.term.is_exited(),
-                omp_found: self.omp.is_some(),
-            },
+            actions: self.action_ctx(tab),
             agents: statusbar::AgentsChip {
                 counts: self.agents_view.counts,
                 open: self.hub_open,
@@ -414,6 +421,7 @@ impl App {
             BarAction::CopyPath(p) => self.copy_text(&p, "path"),
             BarAction::OpenUrl(u) => self.open_external(u),
             BarAction::ToggleAgentHub => self.toggle_agent_hub(),
+            BarAction::ToggleChanges => self.toggle_changes_panel(),
             BarAction::OpenTree => self.open_tree_active(),
             BarAction::OpenUsage => self.open_usage(),
         }
@@ -437,7 +445,7 @@ impl App {
     /// The model the active session runs as far as the deck knows: an unconfirmed switch's
     /// model (omp applies it before anything queued now), else an assumed switch's model while
     /// the bar can only show omp's defaults (the same rule as the model chip).
-    fn current_model(&self) -> Option<String> {
+    pub(super) fn current_model(&self) -> Option<String> {
         let v = &self.bar_view;
         let tab = match self.tabs.get(self.active) {
             Some(Tab::Terminal(t)) => Some(t),
@@ -454,7 +462,7 @@ impl App {
     }
 
     /// Send `/switch` or `/effort` to the active tab and show the optimistic state.
-    fn queue_change(&mut self, selector: &str, level: Option<&str>) {
+    pub(super) fn queue_change(&mut self, selector: &str, level: Option<&str>) {
         let current = self.current_model();
         let Some(change) = model_picker::plan_switch(current.as_deref(), selector, level) else {
             return;
@@ -479,7 +487,7 @@ impl App {
         self.ctx.request_repaint();
     }
 
-    fn run_action(&mut self, action: Action) {
+    pub(super) fn run_action(&mut self, action: Action) {
         match action {
             Action::Fork => self.fork_active(),
             Action::CopyLast => match self
@@ -507,14 +515,14 @@ impl App {
         }
     }
 
-    fn active_session(&self) -> Option<PathBuf> {
+    pub(super) fn active_session(&self) -> Option<PathBuf> {
         self.tabs
             .get(self.active)
             .and_then(Tab::session_path)
             .map(PathBuf::from)
     }
 
-    fn find_entry(&self, path: &std::path::Path) -> Option<SessionEntry> {
+    pub(super) fn find_entry(&self, path: &std::path::Path) -> Option<SessionEntry> {
         let groups = self.watcher.latest()?;
         groups
             .iter()

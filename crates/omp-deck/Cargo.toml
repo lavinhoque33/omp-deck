@@ -25,8 +25,21 @@ env_logger.workspace = true
 egui_commonmark.workspace = true
 # Hidden `--screenshot` flag encodes the egui screenshot; png 0.18 is already in the lockfile via eframe.
 png = "0.18"
+# Self-update downloads into a temporary folder that is removed afterwards.
+tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Desktop notifications: one session-bus connection (Notify, ActivationToken, ActionInvoked) and the
+# xdg-activation request that raises the window on Wayland, on winit's own wl_display.
+zbus.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+raw-window-handle = "0.6"
+futures-lite = "2"
 
 [target.'cfg(windows)'.dependencies]
+tauri-winrt-notification.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Shell"] }
 # Native folder dialog (the Unix builds shell out to kdialog / zenity); no async runtime needed.
 rfd = { version = "0.16", default-features = false }
 # wgpu (DX12, with the WARP software adapter) is the Windows renderer: GPU-less machines (VMs,
@@ -36,9 +49,6 @@ eframe = { workspace = true, features = ["wgpu"] }
 [build-dependencies]
 # Windows: the app icon and version resource of the .exe (a no-op on other targets).
 embed-resource = "3"
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [package.metadata.deb]
 name = "omp-deck"

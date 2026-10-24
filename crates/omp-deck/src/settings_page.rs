@@ -19,6 +19,7 @@ use egui::{
 use serde_json::Value;
 
 use crate::drive_view::{self, DriveAction, DriveCard};
+use crate::notify_view::{self, NotifyAction, NotifyInput};
 use crate::omp_rows::{
     JsonModal, ModalOutcome, RowEvent, SecretModal, note_banner, show_json_modal, show_row,
     show_secret_modal, skeleton,
@@ -79,6 +80,43 @@ impl SettingsState {
         }
     }
 
+    /// Show OmpDeck's own preferences page.
+    pub fn show_ompdeck(&mut self) {
+        self.selected = OMPDECK_ENTRY;
+        self.omp.query.clear();
+    }
+
+    /// Show the project sync page.
+    pub fn show_sync(&mut self) {
+        self.selected = SYNC_ENTRY;
+        self.omp.query.clear();
+    }
+
+    /// `(id, label)` of omp's settings categories once the catalog is loaded.
+    pub fn omp_pages(&self) -> Vec<(String, String)> {
+        self.omp.model.as_ref().map_or_else(Vec::new, |m| {
+            m.tabs
+                .iter()
+                .map(|t| (t.id.clone(), t.label.clone()))
+                .collect()
+        })
+    }
+
+    /// Show omp's settings category `id`; false when the catalog has none by that id.
+    pub fn show_omp_page(&mut self, id: &str) -> bool {
+        let Some(i) = self
+            .omp
+            .model
+            .as_ref()
+            .and_then(|m| m.tabs.iter().position(|t| t.id == id))
+        else {
+            return false;
+        };
+        self.selected = OMP_TABS_FROM + i;
+        self.omp.query.clear();
+        true
+    }
+
     /// A write finished; returns the row's label for the toast (the key if the row is gone).
     pub fn write_done(&mut self, key: &str, outcome: Result<Option<Value>, String>) -> String {
         match self.omp.model.as_mut().and_then(|m| m.find_mut(key)) {
@@ -106,6 +144,8 @@ pub struct SettingsInput<'a> {
     pub backend: BackendCard,
     pub drive: DriveCard,
     pub sync: SyncPage<'a>,
+    pub notify: NotifyInput<'a>,
+    pub app_update: crate::app_update::SettingsCard<'a>,
 }
 
 /// The session-backend card: the stored choice and which backends exist on this machine.
@@ -145,6 +185,8 @@ pub enum SettingsAction {
     SessionBackend(BackendChoice),
     /// The project sync page.
     Sync(SyncAction),
+    Notify(NotifyAction),
+    AppUpdate(crate::app_update::SettingsAction),
 }
 
 fn tab_icon(id: &str) -> Icon {
@@ -849,6 +891,17 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
             },
         );
     });
+
+    actions.extend(
+        notify_view::card_ui(ui, &input.notify)
+            .into_iter()
+            .map(SettingsAction::Notify),
+    );
+    actions.extend(
+        crate::app_update::settings_card(ui, &input.app_update)
+            .into_iter()
+            .map(SettingsAction::AppUpdate),
+    );
 
     card(ui, "Updates", |ui| {
         setting_row(

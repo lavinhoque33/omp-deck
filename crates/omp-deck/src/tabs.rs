@@ -400,6 +400,8 @@ pub struct TabBarInput<'a> {
     pub active: usize,
     pub scroll_to_active: bool,
     pub menu: MenuEnv<'a>,
+    /// An overlay owns the pointer: no hover tooltips on the strip.
+    pub modal_open: bool,
 }
 
 /// Height of a tab's hit area (the full bar height); the pill is painted inset.
@@ -590,9 +592,11 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
         }
     }
 
-    let resp = resp
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_ui(|ui| {
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    let resp = if input.modal_open {
+        resp
+    } else {
+        resp.on_hover_ui(|ui| {
             ui.label(title);
             if let Some(hint) = status.hint() {
                 ui.weak(hint);
@@ -603,7 +607,8 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
             if let Some(code) = term.and_then(|t| t.term.exit_code()) {
                 ui.weak(format!("process exited: {code}"));
             }
-        });
+        })
+    };
 
     let mut action = None;
     if close.clicked() || (resp.middle_clicked() && !close.hovered()) {

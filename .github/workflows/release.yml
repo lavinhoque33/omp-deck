@@ -242,6 +242,10 @@ jobs:
             if (-not (Test-Path -LiteralPath $shortcut)) { throw "$label`: Start Menu shortcut missing" }
             $target = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut).TargetPath
             if ($target -ne (Join-Path $installDir 'omp-deck.exe')) { throw "$label`: shortcut targets '$target'" }
+            # Desktop notifications (toasts) need the AppUserModelID on the shortcut.
+            $item = (New-Object -ComObject Shell.Application).NameSpace((Split-Path -Parent $shortcut)).ParseName((Split-Path -Leaf $shortcut))
+            $aumid = $item.ExtendedProperty('System.AppUserModel.ID')
+            if ($aumid -ne 'io.github.lavinhoque33.OmpDeck') { throw "$label`: shortcut AppUserModelID is '$aumid'" }
           }
           function Invoke-InstalledHost([string]$HostArgs) {
             $out = Join-Path $env:RUNNER_TEMP 'inst-host-out.txt'

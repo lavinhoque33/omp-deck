@@ -44,6 +44,19 @@ host), so closing a tab or the whole app leaves omp running.
   and branch: start a session in a new worktree, move a running session into one, finish it (the agent
   merges following the project's own rules) and let OmpDeck remove it once it is merged. See
   [below](#worktree-sessions).
+- **Desktop notifications**: when a background tab finishes a turn, needs your attention or exits, OmpDeck
+  shows a desktop notification (KDE/GNOME notifications on Linux, toasts on Windows); clicking it brings
+  OmpDeck forward on that tab. By default only while the OmpDeck window is not focused; each event can be
+  turned off in Settings → OmpDeck → Notifications.
+- **Changes panel** (Ctrl+Shift+G, or click the git chip in the status bar): the active tab's git changes,
+  grouped into conflicted, staged, changed and untracked files, with a diff view, stage / unstage, discard,
+  delete untracked files (both confirmed first) and copy the whole diff.
+- **Command palette** (Ctrl+Shift+K) runs any OmpDeck action by typing part of its name: menus, session
+  and project actions, model and thinking switches, settings pages. The **quick switcher** (Ctrl+Shift+E)
+  jumps to an open tab, a session or a project.
+- **OmpDeck updates**: OmpDeck checks for new releases (at startup and every 6 hours, can be turned off) and
+  shows a title-bar badge; **Update and restart** downloads, verifies and installs the new version, then
+  restarts OmpDeck with your tabs re-attached. See [below](#updating-ompdeck).
 - **Per-folder mode**: scope the sidebar to a single project folder.
 - **Appearance**: a flat, neutral default look (Geist font, lucide icons, compact spacing) or the
   "Midnight neon" style, each in dark and light, plus a Comfortable density option (Settings → OmpDeck).
@@ -126,6 +139,21 @@ cargo install --git https://github.com/lavinhoque33/omp-deck omp-deck deck-host 
 This installs only the binaries (`omp-deck` and `omp-deck-host`). For the menu entry and icon, use one of the
 packages above.
 
+### Updating OmpDeck
+
+When a newer release exists, a title-bar badge "OmpDeck x.y.z" offers **Update and restart** (also in
+Settings → OmpDeck and the command palette). The download is checked against the release's `.sha256`
+file before anything is replaced; running sessions keep running and the tabs re-attach after the restart.
+
+- `install.sh`, tarball and Windows installs (or any folder you can write to) are updated in place.
+- The AppImage file is replaced with the new one.
+- `.deb` / `.rpm` installs are updated through your package manager after your system asks for your
+  password (`pkexec`); without `pkexec`, OmpDeck shows the command to run.
+- Builds run from a source checkout (`cargo run`) never update themselves.
+
+**Skip this version** hides the badge until a newer release appears; Settings → OmpDeck turns the
+automatic check off.
+
 ## Usage
 
 ```
@@ -145,6 +173,9 @@ The default session store is `$PI_CODING_AGENT_DIR/sessions` if set, otherwise `
 | Shortcut | Action |
 | --- | --- |
 | Ctrl+Shift+T | Reopen last closed tab |
+| Ctrl+Shift+K | Command palette |
+| Ctrl+Shift+E | Quick switcher: open tabs, sessions, projects |
+| Ctrl+Shift+G | Changes panel |
 | Ctrl+PgUp / Ctrl+PgDn | Previous / next tab |
 | Ctrl+Shift+A | Agent hub |
 | Ctrl+Shift+B | Session tree |

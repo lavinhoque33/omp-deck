@@ -5,7 +5,7 @@
 .DESCRIPTION
   Downloads the latest (or -Version) OmpDeck release zip for this machine's architecture, verifies its sha256
   against the published .sha256 asset, installs it to %LOCALAPPDATA%\Programs\OmpDeck, creates a Start Menu
-  shortcut and installs omp (the coding-agent TUI OmpDeck wraps) when it is not found.
+  shortcut (carrying OmpDeck's AppUserModelID, which desktop notifications need) and installs omp (the coding-agent TUI OmpDeck wraps) when it is not found.
 
   Install:   irm https://raw.githubusercontent.com/lavinhoque33/omp-deck/main/packaging/install.ps1 | iex
   Options:   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/lavinhoque33/omp-deck/main/packaging/install.ps1))) -Version 0.9.0 -NoOmp
@@ -41,10 +41,80 @@ $Repo = 'lavinhoque33/omp-deck'
 $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\OmpDeck'
 $Shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'OmpDeck.lnk'
 $OmpInstallUrl = 'https://omp.sh/install.ps1'
+# AppUserModelID of OmpDeck: desktop notifications (toasts) need the Start Menu shortcut to carry it, and the app
+# sets the same id on its process (crates/omp-deck/src/notify.rs).
+$AppUserModelId = 'io.github.lavinhoque33.OmpDeck'
 
 function Say([string]$m) { Write-Host $m }
 function Step([string]$m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Warn([string]$m) { Write-Warning $m }
+
+# Stamps System.AppUserModel.ID (PKEY_AppUserModel_ID {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3},5) on a .lnk through
+# IPersistFile + IPropertyStore; WScript.Shell shortcuts cannot carry property-store values.
+function Set-ShortcutAppUserModelId([string]$path, [string]$appId) {
+    if (-not ('OmpDeckShortcutAumid' -as [type])) {
+        Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+
+public static class OmpDeckShortcutAumid
+{
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    struct PropertyKey { public Guid fmtid; public uint pid; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PropVariant { public ushort vt; public ushort r1; public ushort r2; public ushort r3; public IntPtr p; public IntPtr p2; }
+
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPropertyStore
+    {
+        [PreserveSig] int GetCount(out uint count);
+        [PreserveSig] int GetAt(uint index, out PropertyKey key);
+        [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant value);
+        [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant value);
+        [PreserveSig] int Commit();
+    }
+
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    class CShellLink { }
+
+    [DllImport("propsys.dll", CharSet = CharSet.Unicode)]
+    static extern int InitPropVariantFromString(string value, out PropVariant variant);
+
+    [DllImport("ole32.dll")]
+    static extern int PropVariantClear(ref PropVariant variant);
+
+    static void Check(int hr, string what)
+    {
+        if (hr < 0) throw new COMException(what + " failed", hr);
+    }
+
+    public static void Set(string path, string appId)
+    {
+        object link = new CShellLink();
+        try
+        {
+            ((IPersistFile)link).Load(path, 0);
+            var store = (IPropertyStore)link;
+            var key = new PropertyKey { fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5 };
+            PropVariant value;
+            Check(InitPropVariantFromString(appId, out value), "InitPropVariantFromString");
+            try
+            {
+                Check(store.SetValue(ref key, ref value), "IPropertyStore.SetValue");
+                Check(store.Commit(), "IPropertyStore.Commit");
+            }
+            finally { PropVariantClear(ref value); }
+            ((IPersistFile)link).Save(path, true);
+        }
+        finally { Marshal.FinalReleaseComObject(link); }
+    }
+}
+'@
+    }
+    [OmpDeckShortcutAumid]::Set($path, $appId)
+}
 
 # Renames a possibly locked file aside (running exes can be renamed, not overwritten or deleted).
 function Move-Aside([string]$path, [string]$stamp) {
@@ -204,6 +274,8 @@ try {
         $lnk.Description = 'OmpDeck - desktop wrapper for the omp coding agent'
         $lnk.Save()
         Say "Start Menu shortcut: $Shortcut"
+        try { Set-ShortcutAppUserModelId $Shortcut $AppUserModelId }
+        catch { Warn "Could not set the shortcut's AppUserModelID (desktop notifications may show PowerShell as their source): $($_.Exception.Message)" }
     }
     catch {
         Warn "Could not create the Start Menu shortcut: $($_.Exception.Message)"

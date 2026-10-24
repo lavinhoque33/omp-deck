@@ -41,8 +41,10 @@ use crate::confirm::{self, Confirm};
 use crate::folder_scope;
 use crate::inject::Injector;
 use crate::model_picker::{ModelsCache, PickerState};
+use crate::notify_view::NotifyInput;
 use crate::omp_settings::{config_dir_display, defaults_from_catalog};
 use crate::omp_worker::{self, MovedTab, OmpEvent};
+use crate::palette::PaletteState;
 use crate::running::{RunningMonitor, RunningSnapshot};
 use crate::settings_page::{self, SettingsAction, SettingsInput, SettingsState};
 use crate::sidebar::{self, MenuEnv, SidebarAction, SidebarCache, SidebarInput};
@@ -63,9 +65,13 @@ use crate::usage_view;
 use crate::widgets::{empty_state, icon_text, menu_item};
 
 mod agents;
+mod app_update;
 mod bar;
+mod changes;
 mod ctl;
 mod drive;
+mod notifications;
+mod palette;
 mod project_sync;
 mod spawn;
 mod tree;
@@ -142,6 +148,10 @@ enum AppEvent {
     Sync(project_sync::SyncEvent),
     /// A git worktree worker finished.
     Worktree(WtEvent),
+    /// A Changes panel git worker finished.
+    Changes(changes::ChangesEvent),
+    /// An OmpDeck self-update worker reported.
+    AppUpdate(app_update::AppUpdateEvent),
 }
 
 /// A modal question awaiting the user's answer, with what to do on "yes".
@@ -189,6 +199,8 @@ enum PendingConfirm {
     DropSyncRow {
         path: PathBuf,
     },
+    /// Discard or delete files from the Changes panel.
+    Changes(changes::PendingWrite),
 }
 
 /// What a sidebar restart was asked about.
@@ -330,6 +342,14 @@ pub struct App {
     drive: drive::DriveUi,
     /// Project sync (per-folder `.omp` + sessions backups).
     sync: project_sync::SyncUi,
+    /// Changes panel (Wave 14).
+    changes: changes::ChangesUi,
+    /// OmpDeck self-update (Wave 14).
+    app_update: app_update::AppUpdateUi,
+    /// Desktop notifications (Wave 14).
+    notify: notifications::NotifyUi,
+    /// The command palette / quick switcher while open (Wave 14).
+    palette: Option<PaletteState>,
 }
 
 /// Minimum time between two window-title updates.
@@ -534,6 +554,10 @@ impl App {
             shot,
             drive,
             sync: project_sync::SyncUi::new(),
+            changes: changes::ChangesUi::default(),
+            app_update: app_update::AppUpdateUi::new(),
+            notify: notifications::NotifyUi::new(&cc.egui_ctx),
+            palette: None,
         };
         if let Some(e) = startup_error {
             app.toasts.error(&app.ctx, format!("Folder ignored: {e}"));
@@ -1185,10 +1209,13 @@ impl App {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        self.palette_shortcuts(ctx);
         let hub_available = self.active_session_tab();
         // Most specific first (egui ignores extra Shift/Alt when matching).
         let tree_key = (hub_available || self.tree.is_some()) && self.tree_shortcut(ctx);
         let usage_key = self.usage_shortcut(ctx);
+        let changes_key =
+            self.changes_available() && ctx.input_mut(|i| i.consume_key(ctrl_shift, Key::G));
         let (reopen, prev, next, bigger, smaller, reset, hub) = ctx.input_mut(|i| {
             (
                 i.consume_key(ctrl_shift, Key::T),
@@ -1205,6 +1232,9 @@ impl App {
         }
         if hub {
             self.toggle_agent_hub();
+        }
+        if changes_key {
+            self.toggle_changes_panel();
         }
         if tree_key {
             self.toggle_tree();
@@ -1253,6 +1283,8 @@ impl App {
                 AppEvent::Drive(ev) => self.on_drive_event(ev),
                 AppEvent::Sync(ev) => self.on_sync_event(ev),
                 AppEvent::Worktree(ev) => self.on_wt_event(ev),
+                AppEvent::Changes(ev) => self.on_changes_event(ev),
+                AppEvent::AppUpdate(ev) => self.on_app_update_event(ev),
             }
         }
     }
@@ -1275,6 +1307,7 @@ impl App {
                 labels: &self.labels,
                 active: self.active,
                 scroll_to_active: self.scroll_to_active,
+                modal_open: self.modal_open(),
                 menu: MenuEnv {
                     groups: groups.as_deref().map_or(&[][..], Vec::as_slice),
                     omp_available: self.omp.is_some(),
@@ -1304,6 +1337,7 @@ impl App {
                 available: self.update.available(),
                 channel: self.update.channel(),
             }),
+            app_update: self.app_update_bar(),
         };
         let action = titlebar::show(ui, &input);
         self.scroll_to_active = false;
@@ -1326,6 +1360,7 @@ impl App {
             BarAction::RunUpdate(kind) => self.open_update_tab(kind),
             BarAction::SwitchChannel(kind) => self.confirm_channel_switch(kind),
             BarAction::CheckUpdates => self.check_updates_manually(),
+            BarAction::AppUpdate(a) => self.apply_app_update_action(a),
         }
     }
 
@@ -1525,6 +1560,11 @@ impl App {
                     },
                     drive: account.clone(),
                     sync: self.sync_page(&account, &rows),
+                    app_update: self.app_update.card(self.cfg.check_app_updates),
+                    notify: NotifyInput {
+                        cfg: &self.cfg.notify,
+                        unavailable: self.notify.unavailable.as_deref(),
+                    },
                 };
                 let actions = egui::CentralPanel::no_frame()
                     .show(ui, |ui| settings_page::show(ui, &mut self.settings, &input))
@@ -1554,6 +1594,8 @@ impl App {
                         SettingsAction::InstallOmp => self.open_install_tab(),
                         SettingsAction::Drive(a) => self.apply_drive_action(a),
                         SettingsAction::Sync(a) => self.apply_sync_action(a),
+                        SettingsAction::Notify(a) => self.apply_notify_action(a),
+                        SettingsAction::AppUpdate(a) => self.apply_app_update_setting(a),
                     }
                 }
             }
@@ -1614,6 +1656,7 @@ impl App {
             || self.wt.dialog.is_some()
             || self.drive.modal_open()
             || self.sync.modal_open()
+            || self.palette.is_some()
     }
 
     fn show_confirm(&mut self, ctx: &egui::Context) {
@@ -1657,6 +1700,7 @@ impl App {
             PendingConfirm::DeleteSession(entry) => self.execute_delete(entry),
             PendingConfirm::RemoveWorktree { wt, base } => self.execute_remove(wt, base),
             PendingConfirm::DropSyncRow { path } => self.drop_sync_row(&path),
+            PendingConfirm::Changes(w) => self.execute_changes_write(w),
             PendingConfirm::ClearDraft { .. } | PendingConfirm::RestoreBackup(_) => {}
         }
     }
@@ -2556,7 +2600,7 @@ impl eframe::App for App {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !self.fonts_finalized {
             self.fonts_finalized = true;
@@ -2601,6 +2645,7 @@ impl eframe::App for App {
             && self.popup.is_none()
             && self.tree.is_none()
             && !self.usage_open
+            && self.palette.is_none()
             && !egui::Popup::is_any_open(&ctx)
             && ctx.memory(|m| m.focused()).is_none()
         {
@@ -2613,11 +2658,14 @@ impl eframe::App for App {
         self.drive_status(&ctx);
         self.drive_usage(&ctx);
         self.drive_tick(&ctx);
+        self.drive_notifications(&ctx, frame);
         self.sync_tick(&ctx);
         self.drive_agents();
+        self.drive_changes(&ctx);
         self.show_status_bar(ui);
         self.show_sidebar(ui, &snap);
         self.show_agent_hub(ui);
+        self.show_changes_panel(ui);
         self.show_central(ui);
         self.show_agent_popup(&ctx);
         self.show_tree(&ctx);
@@ -2625,6 +2673,7 @@ impl eframe::App for App {
         self.show_drive_picker(&ctx);
         self.show_sync_dialogs(&ctx);
         self.show_confirm(&ctx);
+        self.show_palette(&ctx);
         self.show_action_dialog(&ctx);
         self.show_folder_dialog(&ctx);
         self.show_worktree_dialog(&ctx);
@@ -2633,6 +2682,7 @@ impl eframe::App for App {
         self.pump_update_queue();
         self.drive_copies(&ctx);
         self.tick_updates(&ctx);
+        self.tick_app_update(&ctx);
         // Age chips tick over without any other event.
         ctx.request_repaint_after(AGE_REFRESH);
         match self.toasts.show(&ctx) {

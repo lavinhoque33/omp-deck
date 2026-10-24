@@ -43,6 +43,8 @@ pub struct BarInput<'a> {
     pub native_decorations: bool,
     pub strip: StripInput<'a>,
     pub omp: Option<OmpBar<'a>>,
+    /// A newer OmpDeck release to announce (pill + popover).
+    pub app_update: Option<crate::app_update::PillView<'a>>,
 }
 
 /// omp CLI state shown in the bar; absent when omp was not found.
@@ -71,6 +73,7 @@ pub enum BarAction {
     /// Ask before switching channel (Canary / Stable).
     SwitchChannel(UpdateKind),
     CheckUpdates,
+    AppUpdate(crate::app_update::UpdateAction),
     Quit,
 }
 
@@ -297,13 +300,17 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                 }
             }
 
+            let pill_label = input.app_update.as_ref().map(|p| p.label());
             let badge_w = input
                 .omp
                 .as_ref()
                 .and_then(|o| o.available)
                 .map_or(0.0, |(_, latest)| {
                     4.0 + badge_width(&badge_galley(ui, &format!("Update {latest}")))
-                });
+                })
+                + pill_label
+                    .as_ref()
+                    .map_or(0.0, |l| 4.0 + badge_width(&badge_galley(ui, l)));
             let right_w = 68.0 + badge_w + 12.0;
             let right_rect = egui::Rect::from_min_max(
                 pos2(rect.right() - right_w, rect.top()),
@@ -327,9 +334,24 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                         && let Some((_, latest)) = o.available
                     {
                         ui.add_space(4.0);
-                        let badge = update_badge(ui, &format!("Update {latest}"));
+                        let badge = update_badge(
+                            ui,
+                            &format!("Update {latest}"),
+                            "An omp update is available",
+                        );
                         if let Some(a) = update_popover(&badge, o) {
                             action = Some(a);
+                        }
+                    }
+                    if let (Some(p), Some(label)) = (&input.app_update, &pill_label) {
+                        ui.add_space(4.0);
+                        let badge = update_badge(ui, label, &p.tip());
+                        if let Some(a) = theme::dropdown_menu(&badge, 300.0, |ui| {
+                            crate::app_update::popover(ui, p)
+                        })
+                        .and_then(|r| r.inner)
+                        {
+                            action = Some(BarAction::AppUpdate(a));
                         }
                     }
                 },
@@ -471,6 +493,22 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
             }
             omp_submenu(ui, o, &mut action);
         }
+        if menu_item(
+            ui,
+            ICON_ROCKET,
+            "Check for OmpDeck updates",
+            None,
+            true,
+            false,
+        )
+        .clicked()
+        {
+            pick(
+                ui,
+                &mut action,
+                BarAction::AppUpdate(crate::app_update::UpdateAction::Check),
+            );
+        }
         ui.separator();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -543,7 +581,7 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
 }
 
 /// Pill-shaped accent-gradient badge announcing an available update.
-fn update_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
+fn update_badge(ui: &mut egui::Ui, label: &str, tip: &str) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let galley = badge_galley(ui, label);
     let (rect, resp) = ui.allocate_exact_size(
@@ -597,7 +635,7 @@ fn update_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
         galley,
         label_fg,
     );
-    resp.on_hover_text("An omp update is available")
+    resp.on_hover_text(tip)
         .on_hover_cursor(CursorIcon::PointingHand)
 }
 

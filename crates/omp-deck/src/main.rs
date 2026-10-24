@@ -7,7 +7,9 @@ mod agent_model;
 mod agent_output;
 mod agent_popup;
 mod app;
+mod app_update;
 mod backend;
+mod changes_view;
 mod cli;
 mod clipboard_bridge;
 mod composer;
@@ -21,9 +23,12 @@ mod icons;
 mod inject;
 mod model_order;
 mod model_picker;
+mod notify;
+mod notify_view;
 mod omp_rows;
 mod omp_settings;
 mod omp_worker;
+mod palette;
 mod running;
 mod scope_bar;
 mod session_actions;
@@ -146,6 +151,8 @@ fn report_fatal(err: &anyhow::Error) {
 
 fn main() -> anyhow::Result<()> {
     init_logging();
+    #[cfg(windows)]
+    notify::init_process();
     if let Err(e) = run() {
         report_fatal(&e);
         std::process::exit(1);
@@ -219,6 +226,8 @@ fn run() -> anyhow::Result<()> {
     let result = run_window(options, init);
     // Terminal drops hand tmux detaches to background threads; let them finish before exiting.
     deck_term::wait_detached(std::time::Duration::from_secs(2));
+    // A self-update restart: the old process is gone (state flushed, sessions detached).
+    app_update::spawn_successor();
     result
 }
 

@@ -67,6 +67,9 @@ impl App {
             return;
         }
         self.hub_open = !self.hub_open;
+        if self.hub_open {
+            self.changes.open = false;
+        }
         self.focus_pending = true;
     }
 

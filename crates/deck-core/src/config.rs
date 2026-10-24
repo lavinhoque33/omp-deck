@@ -84,6 +84,46 @@ pub struct AppConfig {
     /// Worktrees OmpDeck removed, keyed by their former path (so their sessions can be grouped
     /// under the primary repo).
     pub removed_worktrees: BTreeMap<PathBuf, RemovedWorktree>,
+    /// Desktop notification settings.
+    pub notify: NotifyConfig,
+    /// Look for new OmpDeck releases at startup and every 6 h.
+    pub check_app_updates: bool,
+    /// Version the user chose to skip ("Skip this version").
+    pub skipped_app_version: Option<String>,
+    /// Command-palette command ids, newest first, at most [`MAX_PALETTE_RECENT`].
+    pub palette_recent: Vec<String>,
+    /// Width of the changes panel in points (0 = default).
+    pub changes_panel_width: f32,
+}
+
+/// Most palette commands remembered in [`AppConfig::palette_recent`].
+pub const MAX_PALETTE_RECENT: usize = 20;
+
+/// Which events raise a desktop notification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    pub enabled: bool,
+    /// A busy tab became idle (turn finished).
+    pub turn_finished: bool,
+    /// A tab needs attention (question / approval).
+    pub attention: bool,
+    /// A tab's process exited.
+    pub exited: bool,
+    /// `false` also notifies for background tabs while the window has focus.
+    pub only_when_unfocused: bool,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        NotifyConfig {
+            enabled: true,
+            turn_finished: true,
+            attention: true,
+            exited: true,
+            only_when_unfocused: true,
+        }
+    }
 }
 
 /// What is remembered about a removed worktree.
@@ -116,6 +156,11 @@ impl Default for AppConfig {
             project_sync_interval: SyncInterval::default(),
             session_backend: BackendChoice::default(),
             worktree_bases: BTreeMap::new(),
+            notify: NotifyConfig::default(),
+            check_app_updates: true,
+            skipped_app_version: None,
+            palette_recent: Vec::new(),
+            changes_panel_width: 0.0,
             removed_worktrees: BTreeMap::new(),
         }
     }

@@ -1535,3 +1535,126 @@ OmpDeck composes `omp worktree add` + plain `omp`, omp's `/wt`, and git. OmpDeck
   base in another worktree → merge there; base checked out nowhere → merge base into the worktree and
   `push . HEAD:refs/heads/<base>`); all values single-quoted + code-spanned; injection retried every 1.5 s until
   `FINISH_TAB_TIMEOUT`; exited tabs are replaced by a resumed session.
+
+## Wave 14: notifications, changes panel, command palette, OmpDeck self-update
+
+Facts + user decisions: `docs/notes/wave14.md`. New workspace deps (root `Cargo.toml`): `zip` (deflate-flate2),
+`zbus` 5 (async-io), `tauri-winrt-notification` 0.8, `wayland-client` 0.31 (system), `wayland-protocols` 0.32
+(client, staging). Platform-gate them per target in the crate manifests.
+
+### deck-core
+- `config::AppConfig` gains (serde default; old configs load):
+  - `notify: NotifyConfig { enabled: bool = true, turn_finished: bool = true, attention: bool = true,
+    exited: bool = true, only_when_unfocused: bool = true }`
+    (`only_when_unfocused = false` also notifies for background tabs while the window has focus).
+  - `check_app_updates: bool = true`; `skipped_app_version: Option<String>` ("Skip this version").
+  - `palette_recent: Vec<String>` (command ids, newest first, ≤ 20).
+  - `changes_panel_width: f32` (0 = default).
+- New `pub(crate) mod git`: the shared git runner moved out of `worktree.rs` (`git_command`, raw-bytes and string
+  variants, exit code + stderr, timeouts, `LC_ALL=C`, `GIT_TERMINAL_PROMPT=0`, `no_window`, tree kill);
+  `worktree.rs` uses it (behavior unchanged).
+- New `pub mod changes` (blocking; callers use workers):
+  - `pub enum Change { Modified, Added, Deleted, Renamed, Copied, TypeChanged }`
+  - `pub struct ChangedFile { pub path: String /* display, repo-relative, lossy */, pub os_path: OsString /* exact,
+    for commands */, pub orig_path: Option<String>, pub staged: Option<Change>, pub unstaged: Option<Change>,
+    pub untracked: bool, pub conflicted: bool, pub is_dir: bool }`
+  - `pub struct Changes { pub root: PathBuf, pub branch: Option<String>, pub files: Vec<ChangedFile> }`
+  - `pub fn list(cwd: &Path) -> Result<Option<Changes>, ChangesError>` (`None` = not inside a work tree).
+  - `pub enum DiffSide { Staged, Unstaged, Untracked }`;
+    `pub struct FileDiff { pub text: String, pub binary: bool, pub truncated: bool, pub added: u32, pub removed: u32 }`;
+    `pub fn diff(root: &Path, file: &ChangedFile, side: DiffSide) -> Result<FileDiff, ChangesError>` (cap 2 MiB /
+    20 000 lines → `truncated`; untracked synthesized in Rust; empty text for mode/EOL-only changes is valid).
+  - `pub fn patch(root: &Path) -> Result<String, ChangesError>`: staged + unstaged unified diff (for Copy diff).
+  - Writes, each re-verifying `rev-parse --show-toplevel == root` first (else `ChangesError::RootChanged`):
+    `stage(root, &[&ChangedFile])` (`add --`), `unstage` (`restore --staged --`; unborn HEAD → `rm --cached --`),
+    `discard(root, &[&ChangedFile])` (tracked unstaged changes only: `restore --`; refuses conflicted),
+    `delete_untracked(root, &[&ChangedFile])` (`clean -f[d] --` per path after a `clean -n` dry run lists exactly
+    that path; never `-x`, never without a pathspec). Every path operand after `--` with `GIT_LITERAL_PATHSPECS=1`.
+  - `ChangesError` (thiserror): `Git { command, stderr }`, `RootChanged`, `Conflicted`, `Io`, `Timeout`.
+- New `pub mod selfupdate` (blocking; callers use workers):
+  - `pub enum InstallKind { UserDir { dir: PathBuf } /* install.sh / tarball, writable */, AppImage { file: PathBuf },
+    Deb, Rpm, WindowsDir { dir: PathBuf }, Dev /* cargo target dir */, Unsupported { reason: String } }`;
+    `pub fn detect() -> InstallKind` (`$APPIMAGE`, `current_exe` location, `dpkg -S`/`rpm -qf` for `/usr`, dir
+    writability probe; read-only/unknown → Unsupported).
+  - `pub struct Release { pub version: String /* "0.9.0" */, pub tag: String, pub page_url: String }`;
+    `pub fn latest() -> Result<Release, UpdateError>` (redirect of `<base>/releases/latest`, no API; base =
+    `OMP_DECK_UPDATE_BASE` env or `https://github.com/lavinhoque33/omp-deck`, so tests/sandboxes can serve a fake
+    release over local HTTP); `pub fn is_newer(latest: &str, current: &str) -> bool` (numeric semver, pre-release
+    tags never newer than their release).
+  - `pub fn asset_for(kind: &InstallKind, version: &str) -> Option<String>` (arch from `std::env::consts::ARCH`).
+  - `pub fn download(release: &Release, asset: &str, dir: &Path, progress: &dyn Fn(u64, Option<u64>),
+    cancel: &AtomicBool) -> Result<PathBuf, UpdateError>`: streams to `dir`, verifies against `<asset>.sha256`
+    (mismatch → error, file deleted).
+  - `pub fn apply(kind: &InstallKind, downloaded: &Path) -> Result<Applied, UpdateError>`:
+    UserDir: unpack, write `omp-deck-host` then `omp-deck` as temp files in the same dir (0755), `rename` over;
+    AppImage: chmod + `rename` over `$APPIMAGE`; WindowsDir: unzip, for each of `omp-deck-host.exe`, `conpty.dll`,
+    `OpenConsole.exe`, `omp-deck.exe` rename the existing file to `<name>.old-<yyyyMMddHHmmss>` then write the new
+    one (roll back renamed files on failure); Deb/Rpm: `pkexec dnf|apt-get install -y <file>` (or `rpm -U`/
+    `dpkg -i` when dnf/apt are missing) with a 15 min timeout; pkexec missing or auth dismissed →
+    `UpdateError::NeedsManual { command: String }`. `Applied { restart: (PathBuf, Vec<OsString>) }` = what to exec
+    after exit (AppImage → `$APPIMAGE`; others → the installed `omp-deck` path) with the original args.
+  - `pub fn sweep_leftovers()`: Windows: delete `*.old-*` next to the exe (best effort, ignores locked files).
+  - `UpdateError` (thiserror): `Http`, `Checksum`, `NoAsset`, `Unsupported(String)`, `NeedsManual { command }`,
+    `Io`, `Timeout`, `Cancelled`.
+
+### omp-deck
+- **Notifications** (`notify.rs` + platform files): a notifier thread (Linux: one zbus session connection,
+  `Notify` with `actions ["default","Open"]`, hints `desktop-entry=omp-deck`, app icon `omp-deck`, replaces_id per
+  tab; listens to `ActivationToken` + `ActionInvoked` + `NotificationClosed`; Windows: WinRT toast with AUMID
+  `io.github.lavinhoque33.OmpDeck` + `SetCurrentProcessExplicitAppUserModelID` at startup, PowerShell AUMID
+  fallback when the Start-menu shortcut lacks it). Triggers from `tabs::TabStatus` transitions of a tab that is not
+  (active and window focused) — or only when the window is unfocused, per `notify.only_when_unfocused`: Busy→Idle
+  (turn finished; only after ≥ 3 s busy), →Attention, →Exited (`[code]`), each gated by its toggle. Title = tab
+  title; body = event + project. Activating the tab closes its notification. Click → activate that tab and raise
+  the window (Wayland: xdg-activation with the received token; else/fallback `Focus` + `RequestUserAttention`;
+  Windows `Minimized(false)` + `Focus`). No D-Bus/notification server → silently disabled (log once). Settings →
+  OmpDeck → Notifications (toggles + "Send test notification"). `packaging/install.ps1` sets
+  `System.AppUserModel.ID` on the `OmpDeck.lnk` shortcut (Wave 14 owner of that file: the notifications agent).
+- **Command palette** (`palette.rs`): Ctrl+Shift+K = commands; Ctrl+Shift+E = quick switcher (open tabs, sessions,
+  projects; newest first on empty query). One modal overlay (search box, ranked rows with highlighted matches,
+  shortcut hints, disabled rows greyed with the reason as tooltip, ↑↓/Enter/Esc, mouse). In-house fuzzy scorer
+  (case-folded subsequence, bonuses for consecutive/word-start/path-segment matches, length penalty) unit-tested.
+  Commands cover every action in the title-bar app menu, ⋯ menu, status-bar actions, active tab / session / project
+  context menus (target = active tab's session / project), settings pages, Usage, Agent hub, Session tree,
+  worktree actions, Drive actions (open dialogs only), plus the new `App::toggle_changes_panel()`,
+  `App::check_app_update_manually()`, `App::start_app_update()`, notifications toggles. Dispatch through the same
+  functions as the menus; availability via `session_actions::availability` and the existing gates.
+  `palette_recent` boosts recent commands.
+- **Changes panel** (`changes_view.rs`, `app/changes.rs`): right panel `changes` (exclusive with the agent hub),
+  toggled by Ctrl+Shift+G (verify unbound in omp v18.12.6; else report), the status-bar git chip ("Review
+  changes"), palette. Shows the active tab's live cwd repo (`SessionStatus.cwd`, fallback `tab.cwd`): branch, root,
+  sections Conflicted / Staged / Changes / Untracked with counts, per-file + section actions Stage/Unstage, Discard
+  (confirm, danger, lists paths), Delete untracked (confirm), Copy diff (whole patch), open file's folder. Selecting
+  a file shows its diff (virtualised rows, hunk headers, old/new line numbers, add/remove colours from the theme,
+  binary/too-large/EOL-only placeholders). Refresh on open, tab switch, after actions, every 3 s while open (worker,
+  cancellable). Not a repo → empty state. Width persisted in `changes_panel_width`.
+- **Self-update** (`app_update.rs`, `app/app_update.rs`): own tracker (startup + every 6 h when
+  `check_app_updates`, manual "Check for OmpDeck updates"), independent of omp being installed. Title-bar pill
+  "OmpDeck X.Y.Z" (distinct from the omp pill) with popover: release page link, **Update and restart**
+  (progress, cancel; download → verify → apply), deb/rpm "Install (asks for your password)"; `NeedsManual` →
+  copyable command + release page; Dev/Unsupported → explanation, no button; "Skip this version". Restart =
+  flush state (same path as `on_exit`), spawn the successor after the flush, exit; tabs re-attach. Startup calls
+  `selfupdate::sweep_leftovers()` on a worker. Settings → OmpDeck: toggle + "Check now" + current version.
+
+### Wave 14 as built (supersedes the sketch above where they differ)
+- `selfupdate::UpdateError::{Checksum, NoAsset}` carry a `String`. `latest()` has its own 15 s deadline, no redirect
+  following; downloads keep the stall-based client. `detect()` honours the verification override
+  `OMP_DECK_UPDATE_KIND=deb|rpm|appimage:<file>|dir:<dir>|dev` (overridden deb/rpm restart the current exe);
+  under `/usr`, only dpkg/rpm-owned exes are Deb/Rpm, others fall through to the writability probe.
+  `download` fetches `<asset>.sha256` first and refuses a release without one; the caller owns the temp dir
+  (kept while a NeedsManual command is shown). Startup sweeps `omp-deck-update-*` temp dirs older than a day.
+- Update UI: checks wait for install detection and never run on Dev; a later failed check keeps a known release's
+  Update button; a window close during download cancels and waits, during apply defers ("Finishing the OmpDeck
+  update…") and then closes without relaunching; a successful Update and restart flushes `state.json` before
+  spawning the successor (observed ~30 ms after the flush, the old GUI exits ~90 ms later).
+- `changes`: binary diffs have empty text; untracked directories share one byte budget; `discard` skips untracked,
+  unchanged and intent-to-add entries; `stage` on a conflicted file marks it resolved; unstaging a staged rename also
+  unstages its source; `delete_untracked` accepts only `Would remove` lines for the requested path and refuses when
+  git would keep something that still exists (nested repo). Panel: `ChangesUi::retarget` clears the listing on every
+  tab/cwd change; destructive confirms re-check the repo at confirm time; file list rendered with `show_rows`.
+- Notifications: zbus connection with a 5 s method timeout; the notifier keeps only the newest pending `Show` per tab.
+  Palette: per-model (`Model: <provider> / <name>`, favourites first) and `Thinking: <level>` rows through
+  `queue_change`; "Tab: Kill session process" disabled for session-backed tabs (Stop with confirm instead);
+  worktree rows gate on the sidebar group or `GitInfo.worktree_of` and resolve the real root at run time.
+  `install.ps1` stamps `System.AppUserModel.ID` on `OmpDeck.lnk`; the release workflow's installer round trip
+  asserts it.

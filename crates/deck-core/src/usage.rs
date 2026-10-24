@@ -315,13 +315,15 @@ impl UsageSnapshot {
 
 // ---- fetching -----------------------------------------------------------------------------------
 
-/// Reads `r` (≤ [`MAX_OUTPUT`]) on a thread; the bytes arrive on the returned channel.
-fn spawn_reader<R: Read + Send + 'static>(r: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+/// Reads `r` on a thread, keeping the first `cap` bytes and discarding the rest (so a chatty child
+/// never blocks on a full pipe); the kept bytes arrive on the returned channel.
+fn spawn_reader<R: Read + Send + 'static>(r: Option<R>, cap: u64) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(r) = r {
-            let _ = r.take(MAX_OUTPUT).read_to_end(&mut buf);
+        if let Some(mut r) = r {
+            let _ = (&mut r).take(cap).read_to_end(&mut buf);
+            let _ = std::io::copy(&mut r, &mut std::io::sink());
         }
         let _ = tx.send(buf);
     });
@@ -335,9 +337,26 @@ pub(crate) fn run_bounded(
     cmd: Command,
     timeout: Duration,
 ) -> Result<(Option<i32>, String, String), UsageError> {
+    let (code, stdout, stderr) = run_bounded_bytes(cmd, timeout, MAX_OUTPUT)?;
+    Ok((
+        code,
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    ))
+}
+
+/// Exit code, stdout and stderr bytes.
+pub(crate) type RawOutput = (Option<i32>, Vec<u8>, Vec<u8>);
+
+/// [`run_bounded`] returning raw bytes; each stream keeps at most `cap` bytes.
+pub(crate) fn run_bounded_bytes(
+    cmd: Command,
+    timeout: Duration,
+    cap: u64,
+) -> Result<RawOutput, UsageError> {
     let mut child = platform::spawn_killable(cmd).map_err(UsageError::Spawn)?;
-    let out = spawn_reader(child.stdout.take());
-    let err = spawn_reader(child.stderr.take());
+    let out = spawn_reader(child.stdout.take(), cap);
+    let err = spawn_reader(child.stderr.take(), cap);
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait().map_err(UsageError::Spawn)? {
@@ -355,11 +374,7 @@ pub(crate) fn run_bounded(
     };
     let stdout = collect(&out)?;
     let stderr = collect(&err)?;
-    Ok((
-        status.code(),
-        String::from_utf8_lossy(&stdout).into_owned(),
-        String::from_utf8_lossy(&stderr).into_owned(),
-    ))
+    Ok((status.code(), stdout, stderr))
 }
 
 /// Last few non-empty lines (≤ 600 chars) of `stderr`, falling back to `stdout`.

@@ -7,9 +7,9 @@
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
+use crate::git::{self, GitOut, native};
 use crate::omp::Omp;
 use crate::usage::{UsageError, run_bounded};
 
@@ -238,15 +238,12 @@ pub fn default_location(base: &Path, primary: &Path, branch: &str) -> PathBuf {
 // ---------------------------------------------------------------------------------------------
 // git runner
 
-struct GitOut {
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
-impl GitOut {
-    fn ok(&self) -> bool {
-        self.code == Some(0)
+impl From<git::GitError> for WorktreeError {
+    fn from(e: git::GitError) -> Self {
+        match e {
+            git::GitError::Timeout => WorktreeError::Timeout,
+            git::GitError::Spawn(e) => WorktreeError::Io(e),
+        }
     }
 }
 
@@ -261,23 +258,6 @@ fn usage_err(e: UsageError) -> WorktreeError {
     }
 }
 
-fn git_command(cwd: &Path, args: &[&str], read_only: bool) -> Command {
-    let mut cmd = Command::new("git");
-    if read_only {
-        cmd.arg("--no-optional-locks");
-    }
-    cmd.arg("-C")
-        .arg(cwd)
-        .args(args)
-        .env("LC_ALL", "C")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    crate::platform::no_window(&mut cmd);
-    cmd
-}
-
 /// Runs git and returns its output whatever the exit code (callers interpret it).
 fn git_raw(
     cwd: &Path,
@@ -285,25 +265,13 @@ fn git_raw(
     read_only: bool,
     timeout: Duration,
 ) -> Result<GitOut, WorktreeError> {
-    let (code, stdout, stderr) =
-        run_bounded(git_command(cwd, args, read_only), timeout).map_err(usage_err)?;
-    Ok(GitOut {
-        code,
-        stdout,
-        stderr,
-    })
+    Ok(git::raw(cwd, args, read_only, timeout)?)
 }
 
 fn failed(args: &[&str], out: &GitOut) -> WorktreeError {
-    let stderr = out.stderr.trim();
-    let stderr = if stderr.is_empty() {
-        out.stdout.trim()
-    } else {
-        stderr
-    };
     WorktreeError::Git {
         command: format!("git {}", args.first().copied().unwrap_or("")),
-        stderr: stderr.to_owned(),
+        stderr: out.message(),
     }
 }
 
@@ -320,13 +288,6 @@ fn git_ok(
     } else {
         Err(failed(args, &out))
     }
-}
-
-/// A path printed by git (forward slashes on Windows) as a native path.
-fn native(printed: &str) -> PathBuf {
-    #[cfg(windows)]
-    let printed = printed.replace('/', "\\");
-    PathBuf::from(printed)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -726,6 +687,7 @@ pub fn remove(wt: &Worktree, base: &str, delete_branch: bool) -> Result<Removed,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn branch_deletion_is_conditional_on_the_verified_tip() {

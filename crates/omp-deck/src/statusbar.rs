@@ -454,6 +454,7 @@ pub enum BarAction {
     ToggleAgentHub,
     OpenTree,
     OpenUsage,
+    ToggleChanges,
 }
 
 pub struct BarInput<'a> {
@@ -952,7 +953,7 @@ fn paint_pie(p: &Painter, c: Pos2, r: f32, fill: Option<f32>, color: Color32) {
 
 fn git_chip(ui: &mut Ui, g: &GitView, out: &mut Vec<BarAction>) {
     let pal = Palette::of_ui(ui);
-    let r = chip(ui, "git", Sense::hover(), |ui| {
+    let r = chip(ui, "git", Sense::click(), |ui| {
         ui.label(icon_text(
             if g.worktree_of.is_some() {
                 ICON_FOLDER_GIT_2
@@ -976,7 +977,15 @@ fn git_chip(ui: &mut Ui, g: &GitView, out: &mut Vec<BarAction>) {
             ui.add(text(&g.untracked, 13.8, pal.weak));
         }
     });
-    r.on_hover_text(&g.tooltip);
+    if r.on_hover_text(format!(
+        "{}\nClick to review changes (Ctrl+Shift+G)",
+        g.tooltip
+    ))
+    .on_hover_cursor(CursorIcon::PointingHand)
+    .clicked()
+    {
+        out.push(BarAction::ToggleChanges);
+    }
     if let Some((label, url)) = &g.pr {
         let pr = chip(ui, "pr", Sense::click(), |ui| {
             ui.add(text("PR", 13.2, pal.weak));

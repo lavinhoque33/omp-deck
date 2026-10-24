@@ -330,7 +330,7 @@ fn default_cache_root() -> PathBuf {
 }
 
 /// The blocking HTTP client: statuses are inspected by the caller, never turned into errors.
-fn http() -> ureq::Agent {
+pub(crate) fn http() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(15)))
@@ -343,7 +343,7 @@ fn http() -> ureq::Agent {
 /// The blocking HTTP client for big transfers: no global deadline (a multi-GB transfer is
 /// legitimately long), a stall timeout instead. Uploads never follow redirects, so a resumable
 /// session's `308` arrives as data.
-fn transfer_http(follow_redirects: bool) -> ureq::Agent {
+pub(crate) fn transfer_http(follow_redirects: bool) -> ureq::Agent {
     let stall = Some(Duration::from_secs(60));
     let mut config = ureq::Agent::config_builder()
         .http_status_as_error(false)

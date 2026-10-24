@@ -168,6 +168,24 @@ pub fn build_rows(
     rows
 }
 
+/// Catalog indices in the order the palette lists models: starred first (in starring order, flagged
+/// `true`), then the dropdown's provider groups without repeating the starred ones.
+pub fn palette_models(models: &[ModelInfo], favorites: &[String]) -> Vec<(usize, bool)> {
+    build_rows(models, "", None, favorites)
+        .into_iter()
+        .filter_map(|r| match r {
+            Row::Favorite(i) => Some((i, true)),
+            Row::Model(i) => Some((i, false)),
+            Row::Header(_) | Row::FavoritesHeader => None,
+        })
+        .fold(Vec::new(), |mut out, (i, star)| {
+            if !out.iter().any(|(j, _)| *j == i) {
+                out.push((i, star));
+            }
+            out
+        })
+}
+
 /// The levels the pills offer: `off`, `auto` and the model's own; empty without thinking support.
 pub fn level_options(model: Option<&ModelInfo>) -> Vec<String> {
     let Some(m) = model.filter(|m| !m.thinking.is_empty()) else {
@@ -301,6 +319,8 @@ pub struct PickerState {
     refocus_search: bool,
     /// Bumped on every open: part of the list's scroll id so an old scroll offset never survives.
     opens: u64,
+    /// Open the popup on the next drawn frame (the command palette's "Switch model…").
+    open_requested: bool,
 }
 
 /// Everything the cached rows were built from.
@@ -312,6 +332,11 @@ struct RowsKey {
 }
 
 impl PickerState {
+    /// Ask for the dropdown to open as if its chip had been clicked.
+    pub fn request_open(&mut self) {
+        self.open_requested = true;
+    }
+
     fn refresh_providers(&mut self, catalog: &ModelsCache) {
         if self.providers_gen != Some(catalog.generation) {
             self.providers = provider_counts(catalog.all());
@@ -582,6 +607,9 @@ pub fn show(
     let mut actions = Vec::new();
     let ctx = chip.ctx.clone();
     let popup_id = egui::Popup::default_response_id(chip);
+    if std::mem::take(&mut state.open_requested) {
+        egui::Popup::open_id(&ctx, popup_id);
+    }
     let open = egui::Popup::is_id_open(&ctx, popup_id);
     if !open {
         // Reset while closed: the frame that opens the popup runs egui's invisible sizing pass, and
@@ -1114,6 +1142,26 @@ mod tests {
             cost_input: None,
             cost_output: None,
         }
+    }
+
+    #[test]
+    fn palette_lists_starred_models_first_and_once() {
+        let models = vec![
+            model("beta", "b1", "B", &[]),
+            model("alpha", "a1", "A", &[]),
+            model("alpha", "a2", "A2", &[]),
+        ];
+        let favs = vec![
+            "alpha/a2".to_owned(),
+            "beta/b1".to_owned(),
+            "gone/x".to_owned(),
+        ];
+        let list = palette_models(&models, &favs);
+        assert_eq!(list[..2], [(2, true), (0, true)]);
+        let mut rest: Vec<usize> = list[2..].iter().map(|(i, _)| *i).collect();
+        assert!(list[2..].iter().all(|(_, star)| !star));
+        rest.sort_unstable();
+        assert_eq!(rest, vec![1], "a starred model is not listed again");
     }
 
     fn catalog() -> Vec<ModelInfo> {

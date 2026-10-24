@@ -1,0 +1,1249 @@
+//! App-side glue for the command palette (Ctrl+Shift+K) and the quick switcher (Ctrl+Shift+E):
+//! which commands exist and whether they are available right now, the switcher's tabs / sessions /
+//! projects, and the dispatch of the picked row through the same functions the menus call.
+
+use std::path::PathBuf;
+
+use deck_core::config::{Density, MAX_PALETTE_RECENT, Theme, UiStyle};
+use deck_core::omp::UpdateKind;
+use deck_core::sessions::abbreviate_home;
+use egui::{Key, Modifiers};
+
+use super::bar::ActionDialog;
+use super::{App, DEFAULT_FONT};
+use crate::drive_view::DriveAction;
+use crate::icons::*;
+use crate::model_picker;
+use crate::notify_view::NotifyAction;
+use crate::palette::{Item, Mode, Outcome, PaletteState, Target};
+use crate::session_actions::{self, Action, ActionCtx, Availability, CompactMode, Kind};
+use crate::sidebar::{DriveMenu, SidebarAction, resume_command};
+use crate::sync_view::SyncAction;
+use crate::tabs::{self, Tab, TabRole};
+use crate::transfer::TransferKind;
+use crate::update::Channel;
+
+const NEED_SESSION: &str = "Open an omp session tab first";
+const NEED_OMP: &str = "omp was not found";
+const NEED_TAB: &str = "Open a tab first";
+const NEED_ENTRY: &str = "This session is not in the sidebar yet";
+const NEED_PROJECT: &str = "Open a tab or focus a folder first";
+const NOT_WORKTREE: &str = "This project is not a linked git worktree";
+const NO_BACKEND: &str = "No session backend is available";
+
+/// Why a command cannot run now (`None` = it can).
+type Why = Option<&'static str>;
+
+impl App {
+    /// Ctrl+Shift+K / Ctrl+Shift+E (called from `handle_shortcuts`, before the terminal sees keys).
+    pub(super) fn palette_shortcuts(&mut self, ctx: &egui::Context) {
+        let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        let (commands, switcher) = ctx.input_mut(|i| {
+            (
+                i.consume_key(ctrl_shift, Key::K),
+                i.consume_key(ctrl_shift, Key::E),
+            )
+        });
+        for (pressed, mode) in [(commands, Mode::Commands), (switcher, Mode::Switcher)] {
+            if !pressed {
+                continue;
+            }
+            match &self.palette {
+                Some(p) if p.mode == mode => self.close_palette(),
+                Some(_) => self.open_palette(mode),
+                None if !self.modal_open() => self.open_palette(mode),
+                None => {}
+            }
+        }
+    }
+
+    pub(super) fn open_palette(&mut self, mode: Mode) {
+        // Keys that arrived in the same frame as the shortcut must not reach the terminal that still
+        // holds focus for this frame; the overlay takes over from the next frame.
+        self.ctx.input_mut(|i| {
+            i.events
+                .retain(|e| !matches!(e, egui::Event::Key { .. } | egui::Event::Text(_)));
+        });
+        let items = match mode {
+            Mode::Commands => self.palette_commands(),
+            Mode::Switcher => self.switcher_items(),
+        };
+        self.palette = Some(PaletteState::new(
+            mode,
+            items,
+            self.cfg.palette_recent.clone(),
+        ));
+    }
+
+    fn close_palette(&mut self) {
+        self.palette = None;
+        self.focus_pending = true;
+    }
+
+    /// Per frame: draw the overlay while it is open and run what it picked.
+    pub(super) fn show_palette(&mut self, ctx: &egui::Context) {
+        let Some(state) = &mut self.palette else {
+            return;
+        };
+        match state.show(ctx) {
+            Outcome::Open => {}
+            Outcome::Close => self.close_palette(),
+            Outcome::Run(target) => {
+                self.close_palette();
+                self.run_target(target);
+            }
+        }
+    }
+
+    fn run_target(&mut self, target: Target) {
+        match target {
+            Target::Command(id) => {
+                self.remember_command(&id);
+                // The overlay was built a moment ago; the state may have moved on.
+                if let Some(why) = self.command_blocked(&id) {
+                    self.toasts.info(&self.ctx, why);
+                    return;
+                }
+                self.run_command(&id);
+            }
+            Target::Tab(uid) => {
+                if let Some(i) = self.tabs.iter().position(|t| t.uid() == Some(uid)) {
+                    self.activate(i);
+                }
+            }
+            Target::Session(path) => match self.find_entry(&path) {
+                Some(entry) => self.open_session(&entry),
+                None => self.refresh_sessions(),
+            },
+            Target::Project(dir) => self.set_scope(Some(dir)),
+        }
+    }
+
+    fn remember_command(&mut self, id: &str) {
+        let recent = &mut self.cfg.palette_recent;
+        recent.retain(|r| r != id);
+        recent.insert(0, id.to_owned());
+        recent.truncate(MAX_PALETTE_RECENT);
+        self.dirty = true;
+    }
+
+    fn command_blocked(&self, id: &str) -> Why {
+        self.palette_commands()
+            .into_iter()
+            .find(|i| matches!(&i.target, Target::Command(c) if c == id))
+            .and_then(|i| i.disabled)
+    }
+
+    // ------------------------------------------------------------ switcher
+
+    fn switcher_items(&self) -> Vec<Item> {
+        let running = self.running.latest();
+        let mut items = Vec::new();
+        for tab in &self.tabs {
+            match tab {
+                Tab::Settings => items.push(Item {
+                    target: Target::Command("app.settings".to_owned()),
+                    label: "Settings".to_owned(),
+                    detail: "open tab".to_owned(),
+                    hint: None,
+                    icon: ICON_SETTINGS,
+                    disabled: None,
+                    running: false,
+                }),
+                Tab::Terminal(t) => items.push(Item {
+                    target: Target::Tab(t.uid),
+                    label: tab.label(&self.labels).to_owned(),
+                    detail: abbreviate_home(&t.cwd),
+                    hint: None,
+                    icon: if t.role == TabRole::Session {
+                        ICON_TERMINAL
+                    } else {
+                        ICON_DOWNLOAD
+                    },
+                    disabled: None,
+                    running: !t.term.is_exited(),
+                }),
+            }
+        }
+        let Some(groups) = self.watcher.latest() else {
+            return items;
+        };
+        let open: Vec<&std::path::Path> = self.tabs.iter().filter_map(Tab::session_path).collect();
+        let mut sessions: Vec<(&deck_core::sessions::SessionEntry, &str)> = groups
+            .iter()
+            .flat_map(|g| g.sessions.iter().map(move |e| (e, g.display.as_str())))
+            .filter(|(e, _)| !open.contains(&e.path.as_path()))
+            .collect();
+        sessions.sort_by_key(|(e, _)| std::cmp::Reverse(e.modified));
+        for (e, project) in sessions {
+            items.push(Item {
+                target: Target::Session(e.path.clone()),
+                label: e.label().to_owned(),
+                detail: project.to_owned(),
+                hint: None,
+                icon: ICON_MESSAGES_SQUARE,
+                disabled: None,
+                running: running
+                    .as_ref()
+                    .is_some_and(|r| r.is_running(&e.id, &e.path)),
+            });
+        }
+        let mut projects: Vec<_> = groups.iter().filter(|g| !g.sessions.is_empty()).collect();
+        projects.sort_by_key(|g| std::cmp::Reverse(g.sessions.iter().map(|e| e.modified).max()));
+        for g in projects {
+            items.push(Item {
+                target: Target::Project(g.cwd.clone()),
+                label: g.display.clone(),
+                detail: format!("focus folder · {} sessions", g.sessions.len()),
+                hint: None,
+                icon: ICON_FOLDER,
+                disabled: None,
+                running: false,
+            });
+        }
+        items
+    }
+
+    /// The linked worktree of the active tab's folder: from the sidebar groups, else from the git
+    /// status snapshot (a fresh worktree session has no session file, hence no group yet).
+    fn active_worktree(&self) -> Option<deck_core::worktree::Worktree> {
+        let term = self.tabs.get(self.active).and_then(Tab::term);
+        let cwd = term.map(|t| t.cwd.clone()).or_else(|| self.scope.clone())?;
+        let from_group = self.watcher.latest().and_then(|gs| {
+            gs.iter()
+                .find(|g| g.cwd == cwd)
+                .and_then(|g| g.worktree.clone())
+        });
+        from_group.or_else(|| {
+            let git = self.bar_view.git.as_ref()?;
+            term.filter(|t| t.role == TabRole::Session)?;
+            Some(deck_core::worktree::Worktree {
+                path: cwd,
+                primary: git.worktree_of.clone()?,
+                branch: Some(git.branch.clone()).filter(|b| !b.is_empty()),
+            })
+        })
+    }
+
+    /// The worktree a picked Finish / Cancel / Remove acts on. The status-snapshot fallback of
+    /// [`Self::active_worktree`] only gates the rows (the tab may sit in a subdirectory), so here the
+    /// real root comes from `worktree::resolve` (a few small file reads, once per click).
+    fn worktree_to_act_on(&self) -> Option<deck_core::worktree::Worktree> {
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .and_then(Tab::term)
+            .map(|t| t.cwd.clone())
+            .or_else(|| self.scope.clone())?;
+        self.watcher
+            .latest()
+            .and_then(|gs| {
+                gs.iter()
+                    .find(|g| g.cwd == cwd)
+                    .and_then(|g| g.worktree.clone())
+            })
+            .or_else(|| deck_core::worktree::resolve(&cwd))
+    }
+
+    // ------------------------------------------------------------ commands
+
+    fn palette_commands(&self) -> Vec<Item> {
+        let term = self.tabs.get(self.active).and_then(Tab::term);
+        let session_tab = term.filter(|t| t.role == TabRole::Session);
+        let actx: Option<ActionCtx> = session_tab.map(|t| self.action_ctx(t));
+        let omp = self.omp.is_some();
+        let entry = self.active_session().and_then(|p| self.find_entry(&p));
+        let cwd: Option<PathBuf> = term.map(|t| t.cwd.clone()).or_else(|| self.scope.clone());
+        let groups = self.watcher.latest();
+        let worktree = self.active_worktree();
+        let drive = self.drive_menu();
+        let live = term.is_some_and(|t| !t.term.is_exited());
+        let can_stop = !self.backends.is_empty();
+        let cfg = &self.cfg;
+
+        let mut items: Vec<Item> = Vec::new();
+        let mut add = |id: &str, label: &str, hint: Option<&'static str>, icon: Icon, why: Why| {
+            items.push(Item {
+                target: Target::Command(id.to_owned()),
+                label: label.to_owned(),
+                detail: String::new(),
+                hint,
+                icon,
+                disabled: why,
+                running: false,
+            });
+        };
+        let need = |ok: bool, why: &'static str| (!ok).then_some(why);
+        let drive_why = |d: DriveMenu| match d {
+            DriveMenu::On => None,
+            DriveMenu::Off(why) => Some(why),
+            DriveMenu::Hidden => Some("Google Drive is not configured"),
+        };
+        let kind_why = |kind: Kind| -> Why {
+            let c = actx.as_ref()?;
+            if !session_actions::visible(kind, c) {
+                return Some(match kind {
+                    Kind::Retry => "Only after a failed turn",
+                    Kind::Stop => "Only while omp is working",
+                    _ => "Not available right now",
+                });
+            }
+            match session_actions::availability(kind, c) {
+                Availability::Enabled => None,
+                Availability::Disabled(why) => Some(why),
+            }
+        };
+        let session_why = |kind: Kind| -> Why {
+            if actx.is_none() {
+                Some(NEED_SESSION)
+            } else {
+                kind_why(kind)
+            }
+        };
+        let entry_why = need(entry.is_some(), NEED_ENTRY);
+
+        // Tabs.
+        add(
+            "tab.reopen",
+            "Tab: Reopen closed tab",
+            Some("Ctrl+Shift+T"),
+            ICON_HISTORY,
+            need(!self.closed.is_empty(), "No closed tab to reopen"),
+        );
+        add(
+            "tab.close",
+            "Tab: Close tab",
+            None,
+            ICON_X,
+            need(!self.tabs.is_empty(), NEED_TAB),
+        );
+        add(
+            "tab.kill",
+            "Tab: Kill session process",
+            None,
+            ICON_POWER,
+            // The menus offer Kill only where Stop (with its confirm) does not apply.
+            need(live, "No running process in this tab").or(need(
+                !(entry.is_some() && can_stop),
+                "Use “Session: Stop session process” for this tab",
+            )),
+        );
+        add(
+            "tab.next",
+            "Tab: Next tab",
+            Some("Ctrl+PgDn"),
+            ICON_CHEVRON_RIGHT,
+            need(self.tabs.len() > 1, "Only one tab is open"),
+        );
+        add(
+            "tab.prev",
+            "Tab: Previous tab",
+            Some("Ctrl+PgUp"),
+            ICON_CHEVRON_LEFT,
+            need(self.tabs.len() > 1, "Only one tab is open"),
+        );
+
+        // Sessions of the active tab.
+        add(
+            "session.new",
+            "Session: New session in this project",
+            None,
+            ICON_PLUS,
+            need(cwd.is_some(), NEED_PROJECT),
+        );
+        add(
+            "session.new_worktree",
+            "Session: New session in a new worktree…",
+            None,
+            ICON_GIT_BRANCH_PLUS,
+            cwd.as_ref()
+                .map_or(Some(NEED_PROJECT), |_| need(omp, NEED_OMP)),
+        );
+        add(
+            "session.fork",
+            "Session: Fork to new tab",
+            None,
+            ICON_GIT_FORK,
+            session_why(Kind::Fork),
+        );
+        add(
+            "session.compact",
+            "Session: Compact",
+            None,
+            ICON_FOLD_VERTICAL,
+            session_why(Kind::Compact),
+        );
+        add(
+            "session.compact_soft",
+            "Session: Compact (soft)",
+            None,
+            ICON_FOLD_VERTICAL,
+            session_why(Kind::Compact),
+        );
+        add(
+            "session.compact_snap",
+            "Session: Compact (snapcompact)",
+            None,
+            ICON_FOLD_VERTICAL,
+            session_why(Kind::Compact),
+        );
+        add(
+            "session.compact_focus",
+            "Session: Compact with focus…",
+            None,
+            ICON_FOLD_VERTICAL,
+            session_why(Kind::Compact),
+        );
+        add(
+            "session.handoff",
+            "Session: Handoff",
+            None,
+            ICON_HANDSHAKE,
+            session_why(Kind::Handoff),
+        );
+        add(
+            "session.handoff_focus",
+            "Session: Handoff with focus…",
+            None,
+            ICON_HANDSHAKE,
+            session_why(Kind::Handoff),
+        );
+        add(
+            "session.rename",
+            "Session: Rename…",
+            None,
+            ICON_PENCIL,
+            session_why(Kind::Rename),
+        );
+        add(
+            "session.autoname",
+            "Session: Auto-name",
+            None,
+            ICON_SPARKLES,
+            session_why(Kind::AutoName),
+        );
+        add(
+            "session.plan",
+            "Session: Toggle plan mode",
+            None,
+            ICON_MAP,
+            session_why(Kind::PlanMode),
+        );
+        add(
+            "session.context",
+            "Session: Show context",
+            None,
+            ICON_GAUGE,
+            session_why(Kind::Context),
+        );
+        add(
+            "session.retry",
+            "Session: Retry last turn",
+            None,
+            ICON_ROTATE_CCW,
+            session_why(Kind::Retry),
+        );
+        add(
+            "session.stop_turn",
+            "Session: Stop current turn",
+            None,
+            ICON_CIRCLE_STOP,
+            session_why(Kind::Stop),
+        );
+        add(
+            "session.copy_last",
+            "Session: Copy last response",
+            None,
+            ICON_COPY,
+            session_why(Kind::CopyLast),
+        );
+        add(
+            "session.export",
+            "Session: Export to HTML",
+            None,
+            ICON_EXTERNAL_LINK,
+            session_why(Kind::Export),
+        );
+        add(
+            "session.tui_hub",
+            "Session: Open omp's agent hub (terminal)",
+            None,
+            ICON_NETWORK,
+            session_why(Kind::AgentHub),
+        );
+        add(
+            "session.tree",
+            "Session: Session tree…",
+            Some("Ctrl+Shift+B"),
+            ICON_LIST_TREE,
+            entry_why.or(need(
+                entry.is_some() || session_tab.is_some_and(|t| t.session_path.is_some()),
+                NEED_SESSION,
+            )),
+        );
+        add(
+            "session.copy_path",
+            "Session: Copy session path",
+            None,
+            ICON_FILE_TEXT,
+            entry_why,
+        );
+        add(
+            "session.copy_id",
+            "Session: Copy session id",
+            None,
+            ICON_KEY_ROUND,
+            entry_why,
+        );
+        add(
+            "session.copy_resume",
+            "Session: Copy resume command",
+            None,
+            ICON_TERMINAL,
+            entry_why,
+        );
+        add(
+            "session.show_file",
+            "Session: Show session file",
+            None,
+            ICON_EXTERNAL_LINK,
+            entry_why,
+        );
+        let linked = entry.as_ref().is_some_and(|e| {
+            groups
+                .as_ref()
+                .is_some_and(|gs| gs.iter().any(|g| g.cwd == e.cwd && g.worktree.is_some()))
+        });
+        add(
+            "session.move_worktree",
+            "Session: Move to new worktree…",
+            None,
+            ICON_GIT_BRANCH_PLUS,
+            entry_why
+                .or(need(omp, NEED_OMP))
+                .or(need(live, "Open the session in a tab first"))
+                .or(need(!linked, "This session already runs in a worktree")),
+        );
+        let transfer_busy = entry
+            .as_ref()
+            .is_some_and(|e| self.moving.contains(&e.path));
+        let transfer_why = entry_why.or(need(omp, NEED_OMP)).or(need(
+            !transfer_busy,
+            "A copy or move of this session is running",
+        ));
+        add(
+            "session.copy_project",
+            "Session: Copy to project…",
+            None,
+            ICON_FILES,
+            transfer_why,
+        );
+        add(
+            "session.move_project",
+            "Session: Move to project…",
+            None,
+            ICON_FOLDER_OUTPUT,
+            transfer_why,
+        );
+        add(
+            "session.delete",
+            "Session: Delete…",
+            None,
+            ICON_TRASH_2,
+            transfer_why,
+        );
+        add(
+            "session.restart",
+            "Session: Restart",
+            None,
+            ICON_ROTATE_CCW,
+            entry_why
+                .or(need(live, "The session is not running"))
+                .or(need(can_stop, NO_BACKEND)),
+        );
+        add(
+            "session.stop",
+            "Session: Stop session process",
+            None,
+            ICON_CIRCLE_STOP,
+            entry_why
+                .or(need(live, "The session is not running"))
+                .or(need(can_stop, NO_BACKEND)),
+        );
+
+        // Models and thinking of the active omp tab (same gating as the status-bar picker).
+        let model_why = need(
+            session_tab.is_some_and(|t| !t.term.is_exited()),
+            NEED_SESSION,
+        );
+        add(
+            "model.switch",
+            "Model: Switch model…",
+            None,
+            ICON_BRAIN,
+            model_why,
+        );
+        let current = self.current_model();
+        let info = current.as_deref().and_then(|s| self.models.get(s));
+        for (i, star) in model_picker::palette_models(self.models.all(), &cfg.favorite_models) {
+            let m = &self.models.all()[i];
+            let label = format!(
+                "Model: {}{} / {}",
+                if star { "★ " } else { "" },
+                m.provider,
+                m.name
+            );
+            let why = model_why.or(need(
+                current.as_deref() != Some(m.selector.as_str()),
+                "Already the current model",
+            ));
+            add(
+                &format!("model.pick.{}", m.selector),
+                &label,
+                None,
+                ICON_BRAIN,
+                why,
+            );
+        }
+        let levels = model_picker::level_options(info);
+        let level_why = model_why.or(need(
+            current.is_some(),
+            "The current model is not known yet",
+        ));
+        for level in &levels {
+            add(
+                &format!("thinking.{level}"),
+                &format!("Thinking: {level}"),
+                None,
+                ICON_BRAIN,
+                level_why,
+            );
+        }
+
+        // Projects.
+        let project_why = need(cwd.is_some(), NEED_PROJECT);
+        add(
+            "project.focus",
+            "Project: Focus this folder",
+            None,
+            ICON_FOCUS,
+            project_why.or(need(
+                cwd.is_none() || self.scope != cwd,
+                "This folder is already focused",
+            )),
+        );
+        add(
+            "project.unfocus",
+            "Project: Show all projects",
+            None,
+            ICON_GLOBE,
+            need(self.scope.is_some(), "No folder is focused"),
+        );
+        add(
+            "project.open_folder",
+            "Project: Open folder",
+            None,
+            ICON_FOLDER_OPEN,
+            project_why,
+        );
+        add(
+            "project.copy_path",
+            "Project: Copy path",
+            None,
+            ICON_COPY,
+            project_why,
+        );
+        if drive != DriveMenu::Hidden {
+            add(
+                "project.drive_backup",
+                "Project: Back up to Google Drive…",
+                None,
+                ICON_CLOUD_UPLOAD,
+                project_why.or(drive_why(drive)),
+            );
+            add(
+                "project.drive_restore",
+                "Project: Restore from Google Drive…",
+                None,
+                ICON_ARCHIVE_RESTORE,
+                project_why.or(drive_why(drive)),
+            );
+        }
+        let finishing = worktree
+            .as_ref()
+            .is_some_and(|w| self.wt.finishing.contains_key(&w.path));
+        let wt_why = need(worktree.is_some(), NOT_WORKTREE);
+        add(
+            "worktree.finish",
+            "Worktree: Finish",
+            None,
+            ICON_GIT_MERGE,
+            wt_why
+                .or(need(omp, NEED_OMP))
+                .or(need(!finishing, "Already finishing")),
+        );
+        add(
+            "worktree.cancel",
+            "Worktree: Cancel finishing",
+            None,
+            ICON_X,
+            wt_why.or(need(finishing, "Not finishing")),
+        );
+        add(
+            "worktree.remove",
+            "Worktree: Remove…",
+            None,
+            ICON_TRASH_2,
+            wt_why,
+        );
+
+        // Views.
+        add(
+            "view.usage",
+            "View: Usage",
+            Some("Ctrl+Shift+U"),
+            ICON_CHART_PIE,
+            None,
+        );
+        add(
+            "view.hub",
+            "View: Agent hub",
+            Some("Ctrl+Shift+A"),
+            ICON_NETWORK,
+            need(self.active_session_tab(), NEED_SESSION),
+        );
+        add(
+            "view.changes",
+            "View: Review changes",
+            Some("Ctrl+Shift+G"),
+            ICON_GIT_BRANCH,
+            need(self.changes_available(), NEED_TAB),
+        );
+        add(
+            "view.switcher",
+            "Go to tab, session or project…",
+            Some("Ctrl+Shift+E"),
+            ICON_SEARCH,
+            None,
+        );
+
+        // Settings pages.
+        add(
+            "app.settings",
+            "Settings: Open settings",
+            None,
+            ICON_SETTINGS,
+            None,
+        );
+        add(
+            "settings.ompdeck",
+            "Settings: OmpDeck",
+            None,
+            ICON_SLIDERS_HORIZONTAL,
+            None,
+        );
+        add("settings.sync", "Settings: Sync", None, ICON_CLOUD, None);
+        for (id, label) in self.settings.omp_pages() {
+            add(
+                &format!("settings.omp.{id}"),
+                &format!("Settings: omp — {label}"),
+                None,
+                ICON_SETTINGS_2,
+                None,
+            );
+        }
+
+        // Appearance.
+        add(
+            "font.larger",
+            "Font: Larger",
+            Some("Ctrl+Shift+="),
+            ICON_A_LARGE_SMALL,
+            None,
+        );
+        add(
+            "font.smaller",
+            "Font: Smaller",
+            Some("Ctrl+Shift+-"),
+            ICON_A_LARGE_SMALL,
+            None,
+        );
+        add(
+            "font.reset",
+            "Font: Reset size",
+            Some("Ctrl+Shift+0"),
+            ICON_A_LARGE_SMALL,
+            None,
+        );
+        add(
+            "theme.dark",
+            "Theme: Dark",
+            None,
+            ICON_MOON,
+            need(cfg.theme != Theme::Dark, "Already active"),
+        );
+        add(
+            "theme.light",
+            "Theme: Light",
+            None,
+            ICON_SUN,
+            need(cfg.theme != Theme::Light, "Already active"),
+        );
+        add(
+            "style.neutral",
+            "Style: Neutral",
+            None,
+            ICON_SQUARE,
+            need(cfg.style != UiStyle::Neutral, "Already active"),
+        );
+        add(
+            "style.neon",
+            "Style: Midnight neon",
+            None,
+            ICON_SPARKLES,
+            need(cfg.style != UiStyle::Neon, "Already active"),
+        );
+        add(
+            "density.compact",
+            "Density: Compact",
+            None,
+            ICON_FOLD_VERTICAL,
+            need(cfg.density != Density::Compact, "Already active"),
+        );
+        add(
+            "density.comfortable",
+            "Density: Comfortable",
+            None,
+            ICON_CHEVRONS_UP_DOWN,
+            need(cfg.density != Density::Comfortable, "Already active"),
+        );
+        let native = if cfg.native_decorations {
+            "Window: Use OmpDeck's own title bar"
+        } else {
+            "Window: Use the native title bar"
+        };
+        add(
+            "window.native_titlebar",
+            native,
+            None,
+            ICON_APP_WINDOW,
+            None,
+        );
+
+        // Updates.
+        add(
+            "omp.check",
+            "Updates: Check for omp updates",
+            None,
+            ICON_REFRESH_CW,
+            need(omp, NEED_OMP),
+        );
+        add(
+            "omp.update",
+            "Updates: Update omp",
+            None,
+            ICON_CIRCLE_ARROW_UP,
+            need(omp, NEED_OMP),
+        );
+        add(
+            "omp.update_plugins",
+            "Updates: Update omp plugins",
+            None,
+            ICON_PUZZLE,
+            need(omp, NEED_OMP),
+        );
+        match self.update.channel() {
+            Channel::Stable => add(
+                "omp.canary",
+                "Updates: Switch omp to the canary channel",
+                None,
+                ICON_ROCKET,
+                need(omp, NEED_OMP),
+            ),
+            Channel::Canary => add(
+                "omp.stable",
+                "Updates: Switch omp back to the stable channel",
+                None,
+                ICON_ROCKET,
+                need(omp, NEED_OMP),
+            ),
+        }
+        if !omp {
+            add(
+                "omp.install",
+                "Updates: Install omp",
+                None,
+                ICON_DOWNLOAD,
+                None,
+            );
+        } else {
+            add(
+                "omp.models",
+                "Models: Reload model list",
+                None,
+                ICON_BRAIN,
+                None,
+            );
+        }
+        add(
+            "app.check_update",
+            "Updates: Check for OmpDeck updates",
+            None,
+            ICON_REFRESH_CW,
+            None,
+        );
+        add(
+            "app.start_update",
+            "Updates: Update OmpDeck and restart",
+            None,
+            ICON_CIRCLE_ARROW_UP,
+            self.app_update_blocked(),
+        );
+
+        // Notifications.
+        let n = &cfg.notify;
+        let on_off = |v: bool| if v { "turn off" } else { "turn on" };
+        add(
+            "notify.toggle",
+            &format!(
+                "Notifications: {}",
+                if n.enabled { "Turn off" } else { "Turn on" }
+            ),
+            None,
+            ICON_BELL,
+            None,
+        );
+        add(
+            "notify.turn_finished",
+            &format!(
+                "Notifications: {} “turn finished”",
+                cap(on_off(n.turn_finished))
+            ),
+            None,
+            ICON_BELL,
+            need(n.enabled, "Notifications are off"),
+        );
+        add(
+            "notify.attention",
+            &format!(
+                "Notifications: {} “needs attention”",
+                cap(on_off(n.attention))
+            ),
+            None,
+            ICON_BELL,
+            need(n.enabled, "Notifications are off"),
+        );
+        add(
+            "notify.exited",
+            &format!("Notifications: {} “session ended”", cap(on_off(n.exited))),
+            None,
+            ICON_BELL,
+            need(n.enabled, "Notifications are off"),
+        );
+        add(
+            "notify.unfocused",
+            &format!(
+                "Notifications: {} “only when not focused”",
+                cap(on_off(n.only_when_unfocused))
+            ),
+            None,
+            ICON_BELL,
+            need(n.enabled, "Notifications are off"),
+        );
+        add(
+            "notify.test",
+            "Notifications: Send test notification",
+            None,
+            ICON_BELL,
+            None,
+        );
+
+        // Google Drive.
+        if drive != DriveMenu::Hidden {
+            let why = drive_why(drive);
+            add(
+                "drive.backup_now",
+                "Drive: Back up omp config now",
+                None,
+                ICON_CLOUD_UPLOAD,
+                why,
+            );
+            add(
+                "drive.restore",
+                "Drive: Restore omp config…",
+                None,
+                ICON_ARCHIVE_RESTORE,
+                why,
+            );
+            add(
+                "sync.restore",
+                "Drive: Restore a project backup…",
+                None,
+                ICON_ARCHIVE_RESTORE,
+                why,
+            );
+            add(
+                "sync.manage",
+                "Drive: Manage cloud backups…",
+                None,
+                ICON_CLOUD,
+                why,
+            );
+        }
+
+        // Sessions list and app.
+        add(
+            "app.refresh",
+            "Sessions: Refresh list",
+            None,
+            ICON_REFRESH_CW,
+            None,
+        );
+        add("app.quit", "OmpDeck: Quit", None, ICON_LOG_OUT, None);
+        items
+    }
+
+    fn run_command(&mut self, id: &str) {
+        let active = self.active;
+        let cwd = self
+            .tabs
+            .get(active)
+            .and_then(Tab::term)
+            .map(|t| t.cwd.clone())
+            .or_else(|| self.scope.clone());
+        let entry = self.active_session().and_then(|p| self.find_entry(&p));
+        if let Some(page) = id.strip_prefix("settings.omp.") {
+            self.open_settings();
+            if !self.settings.show_omp_page(page) {
+                self.toasts
+                    .info(&self.ctx, "That settings page is not loaded yet");
+            }
+            return;
+        }
+        if let Some(selector) = id.strip_prefix("model.pick.") {
+            self.queue_change(selector, None);
+            return;
+        }
+        if let Some(level) = id.strip_prefix("thinking.") {
+            match self.current_model() {
+                Some(m) => self.queue_change(&m, Some(level)),
+                None => self
+                    .toasts
+                    .info(&self.ctx, "The current model is not known yet"),
+            }
+            return;
+        }
+        match id {
+            "model.switch" => self.picker.request_open(),
+            "tab.reopen" => self.reopen_closed(),
+            "tab.close" => self.request_close(active),
+            "tab.kill" => self.kill_tab(active),
+            "tab.next" => self.activate(tabs::wrap_index(active, self.tabs.len(), 1)),
+            "tab.prev" => self.activate(tabs::wrap_index(active, self.tabs.len(), -1)),
+            "session.new" => {
+                if let Some(cwd) = cwd {
+                    self.new_session(cwd);
+                }
+            }
+            "session.new_worktree" => {
+                if let Some(cwd) = cwd {
+                    self.open_new_worktree(cwd);
+                }
+            }
+            "session.fork" => self.run_action(Action::Fork),
+            "session.compact" => self.run_action(Action::Compact(CompactMode::Default)),
+            "session.compact_soft" => self.run_action(Action::Compact(CompactMode::Soft)),
+            "session.compact_snap" => self.run_action(Action::Compact(CompactMode::Snapcompact)),
+            "session.compact_focus" => {
+                self.dialog = Some(ActionDialog::CompactFocus {
+                    focus: String::new(),
+                    first: true,
+                });
+            }
+            "session.handoff" => self.run_action(Action::Handoff(None)),
+            "session.handoff_focus" => {
+                self.dialog = Some(ActionDialog::Handoff {
+                    focus: String::new(),
+                    first: true,
+                });
+            }
+            "session.rename" => {
+                self.dialog = Some(ActionDialog::Rename {
+                    title: String::new(),
+                    first: true,
+                });
+            }
+            "session.autoname" => self.run_action(Action::AutoName),
+            "session.plan" => self.run_action(Action::PlanMode),
+            "session.context" => self.run_action(Action::Context),
+            "session.retry" => self.run_action(Action::Retry),
+            "session.stop_turn" => self.run_action(Action::Stop),
+            "session.copy_last" => self.run_action(Action::CopyLast),
+            "session.export" => self.run_action(Action::ExportHtml),
+            "session.tui_hub" => self.run_action(Action::AgentHub),
+            "session.tree" => match entry {
+                Some(e) => self.apply_sidebar_action(SidebarAction::Tree(e)),
+                None => self.open_tree_active(),
+            },
+            "session.copy_path" => {
+                if let Some(e) = entry {
+                    let text = e.path.to_string_lossy().into_owned();
+                    self.copy_text(&text, "session path");
+                }
+            }
+            "session.copy_id" => {
+                if let Some(e) = entry {
+                    self.copy_text(&e.id, "session id");
+                }
+            }
+            "session.copy_resume" => {
+                if let Some(e) = entry {
+                    self.copy_text(&resume_command(&e.path), "resume command");
+                }
+            }
+            "session.show_file" => {
+                if let Some(dir) = entry.as_ref().and_then(|e| e.path.parent()) {
+                    self.open_folder(dir.to_path_buf());
+                }
+            }
+            "session.move_worktree" => {
+                if let Some(e) = entry {
+                    self.open_move_to_worktree(&e);
+                }
+            }
+            "session.copy_project" | "session.move_project" => {
+                if let Some(entry) = entry {
+                    let kind = if id == "session.copy_project" {
+                        TransferKind::Copy
+                    } else {
+                        TransferKind::Move
+                    };
+                    self.apply_sidebar_action(SidebarAction::Transfer {
+                        kind,
+                        entry,
+                        dest: None,
+                    });
+                }
+            }
+            "session.delete" => {
+                if let Some(e) = entry {
+                    self.request_delete(e);
+                }
+            }
+            "session.restart" => {
+                if let Some(e) = entry {
+                    self.request_restart_session(&e);
+                }
+            }
+            "session.stop" => {
+                if let Some(e) = entry {
+                    self.request_stop(&e);
+                }
+            }
+            "project.focus" => self.set_scope(cwd),
+            "project.unfocus" => self.set_scope(None),
+            "project.open_folder" => {
+                if let Some(cwd) = cwd {
+                    self.open_folder(cwd);
+                }
+            }
+            "project.copy_path" => {
+                if let Some(cwd) = cwd {
+                    self.copy_text(&cwd.to_string_lossy(), "project path");
+                }
+            }
+            "project.drive_backup" => {
+                if let Some(cwd) = cwd {
+                    self.open_backup_dialog(cwd);
+                }
+            }
+            "project.drive_restore" => self.open_restore(cwd),
+            "worktree.finish" | "worktree.cancel" | "worktree.remove" => {
+                match self.worktree_to_act_on() {
+                    Some(wt) => match id {
+                        "worktree.finish" => self.request_finish(wt),
+                        "worktree.cancel" => self.cancel_finish(&wt.path),
+                        _ => self.request_remove(wt),
+                    },
+                    None => self.toasts.info(&self.ctx, NOT_WORKTREE),
+                }
+            }
+            "view.usage" => self.toggle_usage(),
+            "view.hub" => self.toggle_agent_hub(),
+            "view.changes" => self.toggle_changes_panel(),
+            "view.switcher" => self.open_palette(Mode::Switcher),
+            "app.settings" => self.open_settings(),
+            "settings.ompdeck" => {
+                self.open_settings();
+                self.settings.show_ompdeck();
+            }
+            "settings.sync" => {
+                self.open_settings();
+                self.settings.show_sync();
+            }
+            "font.larger" => self.set_font_size(self.cfg.font_size + 1.0),
+            "font.smaller" => self.set_font_size(self.cfg.font_size - 1.0),
+            "font.reset" => self.set_font_size(DEFAULT_FONT),
+            "theme.dark" => self.set_theme(Theme::Dark),
+            "theme.light" => self.set_theme(Theme::Light),
+            "style.neutral" => self.set_style(UiStyle::Neutral),
+            "style.neon" => self.set_style(UiStyle::Neon),
+            "density.compact" => self.set_density(Density::Compact),
+            "density.comfortable" => self.set_density(Density::Comfortable),
+            "window.native_titlebar" => self.set_native_decorations(!self.cfg.native_decorations),
+            "omp.check" => self.check_updates_manually(),
+            "omp.update" => self.open_update_tab(UpdateKind::Omp),
+            "omp.update_plugins" => self.open_update_tab(UpdateKind::Plugins),
+            "omp.canary" => self.confirm_channel_switch(UpdateKind::Canary),
+            "omp.stable" => self.confirm_channel_switch(UpdateKind::Stable),
+            "omp.install" => self.open_install_tab(),
+            "omp.models" => self.reload_models(),
+            "app.check_update" => self.check_app_update_manually(),
+            "app.start_update" => self.start_app_update(),
+            "notify.toggle" => {
+                self.apply_notify_action(NotifyAction::Enabled(!self.cfg.notify.enabled))
+            }
+            "notify.turn_finished" => {
+                self.apply_notify_action(NotifyAction::TurnFinished(!self.cfg.notify.turn_finished))
+            }
+            "notify.attention" => {
+                self.apply_notify_action(NotifyAction::Attention(!self.cfg.notify.attention))
+            }
+            "notify.exited" => {
+                self.apply_notify_action(NotifyAction::Exited(!self.cfg.notify.exited))
+            }
+            "notify.unfocused" => self.apply_notify_action(NotifyAction::OnlyWhenUnfocused(
+                !self.cfg.notify.only_when_unfocused,
+            )),
+            "notify.test" => self.send_test_notification(),
+            "drive.backup_now" => self.apply_drive_action(DriveAction::BackupNow),
+            "drive.restore" => self.apply_drive_action(DriveAction::OpenRestore),
+            "sync.restore" => self.apply_sync_action(SyncAction::OpenRestore),
+            "sync.manage" => self.apply_sync_action(SyncAction::OpenManager),
+            "app.refresh" => self.refresh_sessions(),
+            "app.quit" => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            other => log::warn!("unknown palette command {other}"),
+        }
+        self.focus_pending = true;
+    }
+}
+
+/// First letter upper-case ("turn off" → "Turn off").
+fn cap(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cap;
+
+    #[test]
+    fn cap_uppercases_the_first_letter_only() {
+        assert_eq!(cap("turn off"), "Turn off");
+        assert_eq!(cap(""), "");
+        assert_eq!(cap("élan"), "Élan");
+    }
+}
