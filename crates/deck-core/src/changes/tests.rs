@@ -26,6 +26,9 @@ fn git(dir: &Path, args: &[&str]) -> String {
 fn init() -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     git(dir.path(), &["init", "-q", "-b", "main"]);
+    // The library's own git runs (restore, add, …) must see LF-only checkouts whatever the
+    // machine's `core.autocrlf` is (windows-latest sets it to true system-wide).
+    git(dir.path(), &["config", "core.autocrlf", "false"]);
     dir
 }
 
