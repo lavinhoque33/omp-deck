@@ -267,6 +267,9 @@ pub struct HostInfo {
     pub attached: bool,
     pub cols: u16,
     pub rows: u16,
+    /// Current terminal title (OSC 0/2); `None` when none was set or from an older daemon.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[cfg(test)]
@@ -331,5 +334,14 @@ mod tests {
         assert_eq!(Kind::Kill as u8, 0x07);
         let hello: Hello = parse(br#"{"protocol":7,"version":"9.9.9","future":true}"#).unwrap();
         assert_eq!(hello.protocol, 7);
+    }
+
+    #[test]
+    fn info_without_title_from_an_old_daemon_parses() {
+        let old = br#"{"name":"n","protocol":1,"host_version":"0","daemon_pid":1,"child_pid":2,
+            "child_started_unix_ms":3,"cwd":"/","argv":[],"tty":null,"term_session_id":null,
+            "attached":false,"cols":80,"rows":24}"#;
+        let info: HostInfo = parse(old).unwrap();
+        assert_eq!(info.title, None);
     }
 }

@@ -13,6 +13,7 @@ use crate::icons::{
 };
 use deck_core::agents::{AgentsTarget, AgentsWatcher};
 use deck_core::config::{AppConfig, Density, FolderTabs, TabState, Theme, UiStyle, WindowGeometry};
+use deck_core::fleet::FleetWatcher;
 use deck_core::mux::{BackendChoice, MuxKind};
 use deck_core::mux::{new_session_name, session_name_for};
 use deck_core::omp::{
@@ -30,7 +31,6 @@ use egui::{Frame, Key, Margin, Modifiers, RichText};
 use serde_json::Value;
 
 use crate::agent_ctl::Req;
-use crate::agent_hub::HubState;
 use crate::agent_model::AgentsView;
 use crate::agent_popup::PopupState;
 use crate::backend::Backends;
@@ -38,6 +38,7 @@ use crate::cli::Cli;
 use crate::clipboard_bridge;
 use crate::config_writer::ConfigWriter;
 use crate::confirm::{self, Confirm};
+use crate::dashboard::DashState;
 use crate::folder_scope;
 use crate::inject::Injector;
 use crate::model_picker::{ModelsCache, PickerState};
@@ -45,6 +46,7 @@ use crate::notify_view::NotifyInput;
 use crate::omp_settings::{config_dir_display, defaults_from_catalog};
 use crate::omp_worker::{self, MovedTab, OmpEvent};
 use crate::palette::PaletteState;
+use crate::panes::Split;
 use crate::running::{RunningMonitor, RunningSnapshot};
 use crate::settings_page::{self, SettingsAction, SettingsInput, SettingsState};
 use crate::sidebar::{self, MenuEnv, SidebarAction, SidebarCache, SidebarInput};
@@ -74,6 +76,8 @@ mod notifications;
 mod palette;
 mod project_sync;
 mod spawn;
+mod split;
+use split::PaneClaim;
 mod tree;
 mod usage;
 mod worktree;
@@ -105,7 +109,7 @@ pub struct AppInit {
     pub folder: Option<Result<PathBuf, String>>,
     /// Process working directory at startup: base of relative typed scope paths.
     pub start_dir: PathBuf,
-    /// The installed control extension; `None` = live control unavailable (read-only hub).
+    /// The installed control extension; `None` = live control unavailable (read-only agents).
     pub ctl_ext: Option<PathBuf>,
 }
 
@@ -246,6 +250,14 @@ pub struct App {
     pending_restore: Option<(Vec<TabState>, Option<usize>)>,
     focus_pending: bool,
     terminal_focused: bool,
+    /// Split view: the tabs in the panes and which pane has focus.
+    split: Split,
+    /// Persisted split waiting for the restored tabs (applied once they all exist).
+    restore_split: Option<deck_core::config::SplitState>,
+    /// Restored tabs by their index in the persisted tab list.
+    restore_uids: HashMap<usize, u64>,
+    /// Panes reserved for launches still on their way (split-from-sidebar, restarts).
+    pane_claims: Vec<PaneClaim>,
     scroll_to_active: bool,
     refresh_until: Option<Instant>,
 
@@ -295,13 +307,14 @@ pub struct App {
     frame_count: u32,
     frame_mark: Instant,
     repaint_causes: HashMap<String, u32>,
-    // Wave 4: native Agent Hub.
+    // Wave 4: agents dashboard.
     agents: AgentsWatcher,
     /// Last target handed to the agents watcher.
     agents_target: Option<AgentsTarget>,
     agents_view: AgentsView,
-    hub_open: bool,
-    hub: HubState,
+    dash: DashState,
+    dash_index: agents::DashIndex,
+    fleet: FleetWatcher,
     popup: Option<PopupState>,
     // Wave 6: session tree.
     tree: Option<tree::TreeUi>,
@@ -438,6 +451,10 @@ impl App {
         };
         let pending_restore = (!backends.is_empty() && !restore_tabs.is_empty())
             .then_some((restore_tabs, restore_active));
+        let restore_split = pending_restore.as_ref().and_then(|_| match &launch_folder {
+            Some(dir) => cfg.folder_tabs.get(dir).and_then(|f| f.split.clone()),
+            None => cfg.split.clone(),
+        });
         let shot = cli.screenshot.map(|path| ShotPlan {
             path,
             after: Duration::from_secs_f64(cli.screenshot_after),
@@ -487,6 +504,10 @@ impl App {
             scope_gen: 0,
             start_dir,
             pending_restore,
+            split: Split::default(),
+            restore_split,
+            restore_uids: HashMap::new(),
+            pane_claims: Vec::new(),
             focus_pending: true,
             terminal_focused: false,
             scroll_to_active: false,
@@ -532,8 +553,12 @@ impl App {
             }),
             agents_target: None,
             agents_view: AgentsView::default(),
-            hub_open: false,
-            hub: HubState::default(),
+            dash: DashState::default(),
+            dash_index: agents::DashIndex::default(),
+            fleet: FleetWatcher::spawn({
+                let ctx = cc.egui_ctx.clone();
+                move || ctx.request_repaint()
+            }),
             popup: None,
             tree: None,
             usage,
@@ -576,17 +601,32 @@ impl App {
         self.tabs.iter().map(Tab::uid).collect()
     }
 
+    /// Focus tab `i`; the agents dashboard (if shown) gives way to it.
     fn activate(&mut self, i: usize) {
+        if i < self.tabs.len() {
+            self.close_dashboard();
+        }
+        self.activate_keeping_dashboard(i);
+    }
+
+    /// [`Self::activate`] for callers that keep the dashboard on screen.
+    fn activate_keeping_dashboard(&mut self, i: usize) {
         if i < self.tabs.len() {
             if i != self.active
                 && let Some(prev) = self.tabs.get_mut(self.active).and_then(Tab::term_mut)
             {
                 prev.term.set_focused(false);
             }
-            if let Some(t) = self.tabs[i].term_mut() {
+            // Only a tab that is drawn has been seen; the dashboard hides every terminal.
+            if !self.dash.open
+                && let Some(t) = self.tabs[i].term_mut()
+            {
                 t.bell = false;
             }
             self.active = i;
+            if let Some(uid) = self.tabs[i].pane_uid() {
+                self.split.show(uid);
+            }
             self.activation_seq += 1;
             self.focus_pending = true;
             self.scroll_to_active = true;
@@ -806,6 +846,8 @@ impl App {
         }
         let len_before = self.tabs.len();
         let tab = self.tabs.remove(i); // dropping the Terminal detaches; tmux keeps running
+        let focused_pane = self.split.focused_uid();
+        let pane_uid = tab.pane_uid().filter(|u| self.split.slot_of(*u).is_some());
         if remember
             && let Tab::Terminal(t) = &tab
             && t.role == TabRole::Session
@@ -817,8 +859,34 @@ impl App {
                 title: t.title(&self.labels).to_owned(),
             });
         }
+        let launch = match &tab {
+            Tab::Terminal(t) => (t.session_path.clone(), t.mux_name.clone()),
+            _ => (None, None),
+        };
         drop(tab);
         self.active = tabs::active_after_close(self.active, i, len_before);
+        if let Some(uid) = pane_uid {
+            if remember {
+                // The pane goes with its tab; focus moves to the pane that remains.
+                self.split.remove_uid(uid);
+                if focused_pane == Some(uid)
+                    && let Some(next) = self.split.focused_uid().and_then(|u| self.tab_index(u))
+                {
+                    self.active = next;
+                }
+            } else if self.split.is_split() {
+                // A restart or move follows: the replacement takes exactly this pane.
+                if let Some(ticket) = self.split.reserve_slot_of(uid) {
+                    self.pane_claims.push(PaneClaim {
+                        session_path: launch.0,
+                        mux_name: launch.1,
+                        ticket,
+                    });
+                }
+            } else {
+                self.split.vacate(uid);
+            }
+        }
         self.activation_seq += 1;
         if let Some(t) = self.tabs.get_mut(self.active).and_then(Tab::term_mut) {
             t.bell = false;
@@ -914,6 +982,7 @@ impl App {
                 role: TabRole::Session,
                 post: Post::Restore {
                     active: Some(i) == active,
+                    index: i,
                 },
                 focus: Focus::Always,
             });
@@ -1210,13 +1279,14 @@ impl App {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         self.palette_shortcuts(ctx);
-        let hub_available = self.active_session_tab();
+        self.split_shortcuts(ctx);
+        let session_tab = self.active_session_tab();
         // Most specific first (egui ignores extra Shift/Alt when matching).
-        let tree_key = (hub_available || self.tree.is_some()) && self.tree_shortcut(ctx);
+        let tree_key = (session_tab || self.tree.is_some()) && self.tree_shortcut(ctx);
         let usage_key = self.usage_shortcut(ctx);
         let changes_key =
             self.changes_available() && ctx.input_mut(|i| i.consume_key(ctrl_shift, Key::G));
-        let (reopen, prev, next, bigger, smaller, reset, hub) = ctx.input_mut(|i| {
+        let (reopen, prev, next, bigger, smaller, reset, dashboard) = ctx.input_mut(|i| {
             (
                 i.consume_key(ctrl_shift, Key::T),
                 i.consume_key(Modifiers::COMMAND, Key::PageUp),
@@ -1224,14 +1294,16 @@ impl App {
                 i.consume_key(ctrl_shift, Key::Plus) | i.consume_key(ctrl_shift, Key::Equals),
                 i.consume_key(ctrl_shift, Key::Minus),
                 i.consume_key(ctrl_shift, Key::Num0),
-                hub_available && i.consume_key(ctrl_shift, Key::A),
+                i.consume_key(ctrl_shift, Key::A),
             )
         });
         if self.consume_popup_escape(ctx) {
             self.close_agent_popup();
         }
-        if hub {
-            self.toggle_agent_hub();
+        if self.consume_dashboard_escape(ctx) {
+            self.close_dashboard();
+        } else if dashboard {
+            self.toggle_dashboard(false);
         }
         if changes_key {
             self.toggle_changes_panel();
@@ -1308,6 +1380,12 @@ impl App {
                 active: self.active,
                 scroll_to_active: self.scroll_to_active,
                 modal_open: self.modal_open(),
+                dashboard: self.dash.open,
+                shown: if self.split_shown() {
+                    self.split.slots()
+                } else {
+                    &[]
+                },
                 menu: MenuEnv {
                     groups: groups.as_deref().map_or(&[][..], Vec::as_slice),
                     omp_available: self.omp.is_some(),
@@ -1353,6 +1431,7 @@ impl App {
             BarAction::FontLarger => self.set_font_size(self.cfg.font_size + 1.0),
             BarAction::FontSmaller => self.set_font_size(self.cfg.font_size - 1.0),
             BarAction::OpenUsage => self.open_usage(),
+            BarAction::OpenAgents => self.toggle_dashboard(false),
             BarAction::FontReset => self.set_font_size(DEFAULT_FONT),
             BarAction::SetTheme(t) => self.set_theme(t),
             BarAction::SetNativeDecorations(v) => self.set_native_decorations(v),
@@ -1492,6 +1571,8 @@ impl App {
             SidebarAction::ActivateTab(i) => self.activate(i),
             SidebarAction::CloseTab(i) => self.request_close(i),
             SidebarAction::KillTab(i) => self.kill_tab(i),
+            SidebarAction::SplitTab { index, side } => self.split_tab(index, side),
+            SidebarAction::SplitOpen { entry, side } => self.split_session(&entry, side),
             SidebarAction::BackupProject(dir) => self.open_backup_dialog(dir),
             SidebarAction::RestoreProject(dir) => self.open_restore(Some(dir)),
             SidebarAction::NewWorktree(dir) => self.open_new_worktree(dir),
@@ -1503,6 +1584,10 @@ impl App {
     }
 
     fn show_central(&mut self, ui: &mut egui::Ui) {
+        if self.dash.open {
+            self.show_dashboard(ui);
+            return;
+        }
         let pal = Palette::of_ui(ui);
         match self.tabs.get(self.active) {
             None => {
@@ -1599,6 +1684,7 @@ impl App {
                     }
                 }
             }
+            Some(Tab::Terminal(_)) if self.split_shown() => self.show_split(ui),
             Some(Tab::Terminal(_)) => self.show_terminal(ui),
         }
     }
@@ -1619,6 +1705,7 @@ impl App {
             let surrender = ctx.options(|o| o.input_options.surrender_focus_on);
             ctx.options_mut(|o| o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never);
             let out = TerminalView::new(&mut tab.term)
+                .id_salt(tab.uid)
                 .font_size(self.cfg.font_size)
                 .show(ui);
             ctx.options_mut(|o| o.input_options.surrender_focus_on = surrender);
@@ -1731,6 +1818,7 @@ impl App {
             // The settings page is never persisted; `active_tab` indexes the persisted list.
             let mut active_tab = None;
             let mut open_tabs = Vec::new();
+            let mut persisted: Vec<u64> = Vec::new();
             for (i, tab) in self.tabs.iter().enumerate() {
                 let Tab::Terminal(t) = tab else {
                     continue;
@@ -1751,8 +1839,17 @@ impl App {
                     session_path: t.session_path.clone(),
                     title: t.title(&self.labels).to_owned(),
                 });
+                persisted.push(t.uid);
             }
             let active_tab = active_tab.or_else(|| (!open_tabs.is_empty()).then_some(0));
+            let split = if open_tabs.is_empty() {
+                None
+            } else if self.restore_split.is_some() {
+                // Restore still running: the stored layout stays as it was.
+                self.restore_split.clone()
+            } else {
+                self.split.to_state(&persisted)
+            };
             match &self.launch_folder {
                 Some(dir) if open_tabs.is_empty() => {
                     cfg.folder_tabs.remove(dir);
@@ -1763,12 +1860,14 @@ impl App {
                         FolderTabs {
                             open_tabs,
                             active_tab,
+                            split,
                         },
                     );
                 }
                 None => {
                     cfg.open_tabs = open_tabs;
                     cfg.active_tab = active_tab;
+                    cfg.split = split;
                 }
             }
         }
@@ -2498,6 +2597,7 @@ impl App {
             refocus,
         }) = tab.map(|b| *b)
         {
+            self.retarget_pane_claim(&src, t.session_path.clone(), t.mux_name.clone());
             let argv = self.with_omp_program(tabs::omp_argv(t.session_path.as_deref()));
             self.spawn_tab_post(SpawnReq {
                 mux_name: t.mux_name,
@@ -2619,19 +2719,35 @@ impl eframe::App for App {
         let snap = latest.unwrap_or_default();
         self.refresh_sessions_cache();
 
-        // Only the visible terminal repaints promptly on output; the others coalesce.
+        // Panes follow the tab list; then only the tabs on screen repaint promptly on output
+        // (the others coalesce).
+        self.reconcile_panes();
+        let split_on = self.split_shown();
+        // The dashboard covers the terminal area: no tab is on screen (still polled below).
+        let dash_open = self.dash.open;
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Tab::Terminal(t) = tab {
-                t.term.set_visible(i == self.active);
+                let shown = !dash_open
+                    && if split_on {
+                        self.split.slot_of(t.uid).is_some()
+                    } else {
+                        i == self.active
+                    };
+                t.term.set_visible(shown);
             }
         }
-        // Hidden tabs still need title/bell/exit tracking.
+        // Tabs off screen still need title/bell/exit tracking.
         for (i, tab) in self.tabs.iter_mut().enumerate() {
-            if i != self.active
-                && let Tab::Terminal(t) = tab
-                && t.term.poll().bell
-            {
-                t.bell = true;
+            if let Tab::Terminal(t) = tab {
+                let shown = !dash_open
+                    && if split_on {
+                        self.split.slot_of(t.uid).is_some()
+                    } else {
+                        i == self.active
+                    };
+                if !shown && t.term.poll().bell {
+                    t.bell = true;
+                }
             }
         }
 
@@ -2643,6 +2759,7 @@ impl eframe::App for App {
             && self.dialog.is_none()
             && !self.sync.modal_open()
             && self.popup.is_none()
+            && !self.dash.open
             && self.tree.is_none()
             && !self.usage_open
             && self.palette.is_none()
@@ -2661,10 +2778,10 @@ impl eframe::App for App {
         self.drive_notifications(&ctx, frame);
         self.sync_tick(&ctx);
         self.drive_agents();
+        self.drive_dashboard();
         self.drive_changes(&ctx);
         self.show_status_bar(ui);
         self.show_sidebar(ui, &snap);
-        self.show_agent_hub(ui);
         self.show_changes_panel(ui);
         self.show_central(ui);
         self.show_agent_popup(&ctx);

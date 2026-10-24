@@ -112,6 +112,14 @@ impl Tab {
         self.term().map(|t| t.uid)
     }
 
+    /// The uid of a terminal tab that may sit in a pane: only session tabs do (update and
+    /// installer tabs and the settings page always take the full width).
+    pub fn pane_uid(&self) -> Option<u64> {
+        self.term()
+            .filter(|t| t.role == TabRole::Session)
+            .map(|t| t.uid)
+    }
+
     pub fn is_settings(&self) -> bool {
         matches!(self, Tab::Settings)
     }
@@ -402,6 +410,10 @@ pub struct TabBarInput<'a> {
     pub menu: MenuEnv<'a>,
     /// An overlay owns the pointer: no hover tooltips on the strip.
     pub modal_open: bool,
+    /// The tabs shown in the panes of a split (empty when not split): marked in the strip.
+    pub shown: &'a [Option<u64>],
+    /// The agents dashboard covers the terminals: no tab counts as seen.
+    pub dashboard: bool,
 }
 
 /// Height of a tab's hit area (the full bar height); the pill is painted inset.
@@ -479,8 +491,9 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     let pal = Palette::of_ui(ui);
     let title = tab.label(input.labels);
     let active = i == input.active;
+    let shown = tab.uid().is_some_and(|u| input.shown.contains(&Some(u)));
     let term = tab.term();
-    let status = tab.status(active);
+    let status = tab.status((active || shown) && !input.dashboard);
 
     let text_color = if active { pal.text_strong } else { pal.text };
     let mut job = egui::text::LayoutJob::simple_singleline(
@@ -554,6 +567,15 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
                     pal.accent_b.gamma_multiply(sel),
                 );
             }
+        }
+        if shown && !active {
+            // Visible in another pane of the split: a faint plate and a dim accent line.
+            p.rect_filled(pill, radius, pal.surface.gamma_multiply(0.55));
+            let line = egui::Rect::from_min_max(
+                pos2(pill.left() + 12.0, pill.bottom() - 2.0),
+                pos2(pill.right() - 12.0, pill.bottom()),
+            );
+            p.rect_filled(line, 1, pal.accent.gamma_multiply(0.5));
         }
         if status == TabStatus::Attention {
             paint_attention_pill(p, pal, pill, radius);

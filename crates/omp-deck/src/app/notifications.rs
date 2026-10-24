@@ -49,10 +49,11 @@ impl App {
         }
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         let now = Instant::now();
+        let visible = self.visible_uids();
         let cfg = &self.cfg.notify;
         let mut live = HashSet::new();
         let mut due = Vec::new();
-        for (i, tab) in self.tabs.iter().enumerate() {
+        for tab in &self.tabs {
             let Tab::Terminal(t) = tab else { continue };
             if t.role != TabRole::Session {
                 continue;
@@ -62,7 +63,7 @@ impl App {
             let seen = Sighting {
                 status: TabStatus::of(code, Activity::from_title(t.term.title()), false),
                 exit_code: code,
-                active: i == self.active,
+                visible: visible.contains(&t.uid),
             };
             if let Some(event) = self.notify.tracker.observe(t.uid, now, seen, focused, cfg) {
                 let project = t.cwd.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -83,8 +84,7 @@ impl App {
             }
             self.notify.notifier.show(req);
         }
-        let active = self.tabs.get(self.active).and_then(Tab::uid);
-        if let Some(uid) = self.notify.tracker.take_seen(active, focused) {
+        for uid in self.notify.tracker.take_seen(&visible, focused) {
             self.notify.notifier.close(Some(uid));
         }
         if self.notify.tracker.any_busy() {

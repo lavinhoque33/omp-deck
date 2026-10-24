@@ -489,3 +489,52 @@ fn server_survives_deletion_of_the_first_sessions_folder() {
     );
     assert!(tmux.alive_sessions().contains("omp-second"));
 }
+
+/// `Tmux::pane_titles` reads the OSC 2 titles of every session's active pane in one pass; titles
+/// with spaces and non-ASCII text arrive intact (tmux strips tabs itself), and a session whose pane set none is
+/// absent from the map.
+#[test]
+fn pane_titles_report_each_sessions_active_pane_title() {
+    if !tmux_available() {
+        eprintln!("tmux not installed; skipping pane_titles test");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let socket = format!("omp-deck-test-{}-titles", std::process::id());
+    let tmux = Tmux::with_socket("tmux", socket, dir.path().join("cfg/tmux.conf"));
+    let _server = Server { tmux: tmux.clone() };
+    assert!(tmux.pane_titles().is_empty(), "no server → empty");
+    tmux.ensure_config().unwrap();
+
+    let start = |name: &str, script: &str| {
+        let argv = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let spec = tmux.attach_or_create(name, dir.path(), &argv);
+        let mut args = spec.args.clone();
+        let at = args.iter().position(|a| a == "new-session").unwrap() + 1;
+        args.insert(at, "-d".to_string());
+        let out = Command::new(&spec.program).args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    start(
+        "omp-ta",
+        "printf '\\033]2;π Working: my task\\twith tab\\007'; sleep 30",
+    );
+    start("omp-tb", "printf '\\033]2;second\\007'; sleep 30");
+    start("omp-tc", "sleep 30");
+
+    // A pane's title is the hostname until its program's OSC 2 arrives.
+    wait_for("both titles", || {
+        let t = tmux.pane_titles();
+        t.get("omp-tb").is_some_and(|t| t == "second")
+            && t.get("omp-ta").is_some_and(|t| t.starts_with('π'))
+    });
+    let titles = tmux.pane_titles();
+    // tmux itself drops the tab from a title (control characters are stripped).
+    assert_eq!(titles["omp-ta"], "π Working: my taskwith tab");
+    assert_eq!(titles["omp-tb"], "second");
+    assert_ne!(titles.get("omp-tc").map(String::as_str), Some("second"));
+}

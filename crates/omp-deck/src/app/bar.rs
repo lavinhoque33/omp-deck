@@ -149,22 +149,26 @@ impl App {
         let now = Instant::now();
         // While a dialog or menu is up the terminal may still own the keyboard: Enter/Esc meant for the
         // dialog must not reach omp. (Set first: an injector poll below replaces the deadline.)
-        if (self.confirm.is_some()
-            || self.folder_dialog.is_some()
+        if self.confirm.is_some()
             || self.folder_dialog.is_some()
             || self.wt.dialog.is_some()
             || self.popup.is_some()
             || self.tree.is_some()
             || self.usage_open
             || self.palette.is_some()
-            || egui::Popup::is_any_open(ctx))
-            && let Some(t) = self.tabs.get(self.active).and_then(Tab::term)
+            || egui::Popup::is_any_open(ctx)
         {
-            t.term.hold_input_until(now + MODAL_HOLD);
+            let visible = self.visible_uids();
+            for t in self.tabs.iter().filter_map(Tab::term) {
+                if visible.contains(&t.uid) {
+                    t.term.hold_input_until(now + MODAL_HOLD);
+                }
+            }
         }
         let mut prompts = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         let mut lost: Vec<(u64, String)> = Vec::new();
+        let mut delivered: Vec<(u64, bool)> = Vec::new();
         let mut wake: Option<Duration> = None;
         for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
             if !tab.injector.is_busy() {
@@ -178,11 +182,13 @@ impl App {
             let activity = Activity::from_title(tab.term.title());
             let term = &tab.term;
             let screen = || term.screen_text();
+            let paste = |t: &str| term.paste_bytes(t);
             let poll = tab.injector.poll(&Env {
                 now,
                 activity,
                 last_ctrl_c: term.last_ctrl_c(),
                 screen: &screen,
+                paste: &paste,
             });
             // The hold comes first so no user key can slip in between our bytes.
             if let Some(h) = poll.hold_for {
@@ -193,6 +199,16 @@ impl App {
                     Write::Bytes(bytes) => term.write(&bytes),
                     Write::Key(key, mods) => term.send_key(key, mods),
                 }
+            }
+            for label in &poll.completed {
+                if let Some(send) = crate::review::submit_of(label) {
+                    delivered.push((tab.uid, send));
+                }
+            }
+            for label in &poll.no_paste {
+                notes.push(format!(
+                    "{label} refused: omp has not enabled bracketed paste"
+                ));
             }
             if let Some(c) = poll.confirm {
                 prompts.push((tab.uid, c));
@@ -262,6 +278,9 @@ impl App {
         }
         for (uid, label) in lost {
             self.injection_lost(uid, &label);
+        }
+        for (uid, send) in delivered {
+            self.review_delivered(uid, send);
         }
         self.finish_deferred_closes(ctx);
     }
@@ -363,7 +382,7 @@ impl App {
             actions: self.action_ctx(tab),
             agents: statusbar::AgentsChip {
                 counts: self.agents_view.counts,
-                open: self.hub_open,
+                open: self.dash.open,
             },
         };
         let actions = statusbar::show(ui, &self.bar_view, &mut self.picker, &input);
@@ -420,7 +439,7 @@ impl App {
             }
             BarAction::CopyPath(p) => self.copy_text(&p, "path"),
             BarAction::OpenUrl(u) => self.open_external(u),
-            BarAction::ToggleAgentHub => self.toggle_agent_hub(),
+            BarAction::ToggleAgents => self.toggle_dashboard(true),
             BarAction::ToggleChanges => self.toggle_changes_panel(),
             BarAction::OpenTree => self.open_tree_active(),
             BarAction::OpenUsage => self.open_usage(),

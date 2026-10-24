@@ -9,11 +9,12 @@ use std::time::{Duration, SystemTime};
 use crate::icons::Icon;
 use crate::icons::{
     ICON_ARCHIVE_RESTORE, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CHEVRONS_DOWN_UP,
-    ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_STOP, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_COPY,
-    ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS, ICON_FOLDER, ICON_FOLDER_GIT_2,
-    ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_GIT_BRANCH_PLUS, ICON_GIT_MERGE,
-    ICON_KEY_ROUND, ICON_LIST_TREE, ICON_PLAY, ICON_PLUS, ICON_POWER, ICON_REFRESH_CW,
-    ICON_ROTATE_CCW, ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL, ICON_TRASH_2, ICON_X,
+    ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_STOP, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_COLUMNS_2,
+    ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS, ICON_FOLDER,
+    ICON_FOLDER_GIT_2, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_GIT_BRANCH_PLUS,
+    ICON_GIT_MERGE, ICON_KEY_ROUND, ICON_LIST_TREE, ICON_PLAY, ICON_PLUS, ICON_POWER,
+    ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_ROWS_2, ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL,
+    ICON_TRASH_2, ICON_X,
 };
 use deck_core::config::RemovedWorktree;
 use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot};
@@ -26,6 +27,7 @@ use egui::{
 };
 
 use crate::folder_scope;
+use crate::panes::Side;
 use crate::running::RunningSnapshot;
 use crate::scope_bar::{self, ScopeAction, ScopeInput, ScopeState};
 use crate::tabs::{self, Tab, TabStatus};
@@ -150,6 +152,16 @@ pub enum SidebarAction {
     CancelFinish(PathBuf),
     /// Ask before removing the worktree (clean and merged only).
     RemoveWorktree(Worktree),
+    /// Open the tab at this strip index in a new pane beside the focused one.
+    SplitTab {
+        index: usize,
+        side: Side,
+    },
+    /// Open the session (a tab is opened if needed) in a new pane beside the focused one.
+    SplitOpen {
+        entry: SessionEntry,
+        side: Side,
+    },
 }
 
 /// The "Google Drive" menu entries: hidden without credentials, disabled with a reason while
@@ -1622,7 +1634,7 @@ fn session_row(
     }
     let env = input.menu_env();
     theme::context_menu(&resp, 230.0, |ui| {
-        session_menu(ui, entry, running, &env, out)
+        session_menu(ui, entry, running, true, &env, out)
     });
     resp.on_hover_ui(|ui| {
         ui.label(entry.label());
@@ -1757,6 +1769,9 @@ pub fn tab_menu(ui: &mut Ui, i: usize, tab: &Tab, env: &MenuEnv<'_>, out: &mut S
         out.actions.push(SidebarAction::CloseTab(i));
         ui.close();
     }
+    if tab.pane_uid().is_some() {
+        split_items(ui, out, |side| SidebarAction::SplitTab { index: i, side });
+    }
     let Some(t) = tab.term() else {
         return;
     };
@@ -1771,7 +1786,21 @@ pub fn tab_menu(ui: &mut Ui, i: usize, tab: &Tab, env: &MenuEnv<'_>, out: &mut S
     }
     if let Some(entry) = entry {
         ui.separator();
-        session_menu(ui, entry, running, env, out);
+        session_menu(ui, entry, running, false, env, out);
+    }
+}
+
+/// "Open in split right/down" for the menu's target.
+fn split_items(ui: &mut Ui, out: &mut SidebarOutput, action: impl Fn(Side) -> SidebarAction) {
+    for (side, icon, label) in [
+        (Side::Right, ICON_COLUMNS_2, "Open in split right"),
+        (Side::Down, ICON_ROWS_2, "Open in split down"),
+    ] {
+        if menu_item(ui, icon, label, None, true, false).clicked() {
+            out.actions.push(action(side));
+            out.interacted = true;
+            ui.close();
+        }
     }
 }
 
@@ -1779,6 +1808,7 @@ fn session_menu(
     ui: &mut Ui,
     entry: &SessionEntry,
     running: bool,
+    split: bool,
     env: &MenuEnv<'_>,
     out: &mut SidebarOutput,
 ) {
@@ -1790,6 +1820,12 @@ fn session_menu(
         out.actions.push(SidebarAction::Open(entry.clone()));
         out.interacted = true;
         ui.close();
+    }
+    if split {
+        split_items(ui, out, |side| SidebarAction::SplitOpen {
+            entry: entry.clone(),
+            side,
+        });
     }
     if menu_item(ui, ICON_LIST_TREE, "Session tree…", None, true, false).clicked() {
         out.actions.push(SidebarAction::Tree(entry.clone()));

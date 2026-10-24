@@ -27,15 +27,6 @@ pub enum Bucket {
     Parked,
 }
 
-pub const BUCKETS: [Bucket; 6] = [
-    Bucket::Running,
-    Bucket::Done,
-    Bucket::Failed,
-    Bucket::Aborted,
-    Bucket::Interrupted,
-    Bucket::Parked,
-];
-
 impl Bucket {
     pub fn of(status: AgentStatus, parked: bool) -> Bucket {
         if parked {
@@ -49,17 +40,6 @@ impl Bucket {
             AgentStatus::Interrupted => Bucket::Interrupted,
         }
     }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Bucket::Running => status_label(AgentStatus::Running),
-            Bucket::Done => status_label(AgentStatus::Done),
-            Bucket::Failed => status_label(AgentStatus::Failed),
-            Bucket::Aborted => status_label(AgentStatus::Aborted),
-            Bucket::Interrupted => status_label(AgentStatus::Interrupted),
-            Bucket::Parked => "parked",
-        }
-    }
 }
 
 pub fn status_label(s: AgentStatus) -> &'static str {
@@ -70,10 +50,6 @@ pub fn status_label(s: AgentStatus) -> &'static str {
         AgentStatus::Aborted => "aborted",
         AgentStatus::Interrupted => "interrupted",
     }
-}
-
-fn bit(b: Bucket) -> u8 {
-    1 << BUCKETS.iter().position(|&x| x == b).unwrap_or(0)
 }
 
 /// Agents per bucket.
@@ -104,83 +80,17 @@ impl Counts {
         c
     }
 
-    pub fn get(&self, b: Bucket) -> usize {
-        match b {
-            Bucket::Running => self.running,
-            Bucket::Done => self.done,
-            Bucket::Failed => self.failed,
-            Bucket::Aborted => self.aborted,
-            Bucket::Interrupted => self.interrupted,
-            Bucket::Parked => self.parked,
-        }
-    }
-
     pub fn total(&self) -> usize {
         self.running + self.done + self.failed + self.aborted + self.interrupted + self.parked
     }
 }
 
-/// Which statuses the roster shows; empty = all.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct StatusFilter(u8);
-
-impl StatusFilter {
-    pub fn toggle(&mut self, b: Bucket) {
-        self.0 ^= bit(b);
-    }
-
-    pub fn contains(self, b: Bucket) -> bool {
-        self.0 & bit(b) != 0
-    }
-
-    pub fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    fn admits(self, b: Bucket) -> bool {
-        self.is_empty() || self.contains(b)
-    }
-}
-
-/// What the roster is narrowed by.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Filter {
-    pub query: String,
-    pub status: StatusFilter,
-    pub tree: bool,
-}
-
-impl Filter {
-    pub fn is_active(&self) -> bool {
-        !self.query.trim().is_empty() || !self.status.is_empty()
-    }
-}
-
-/// Indices into `agents` in display order. `search[i]` is the lowercase haystack of agent `i`
-/// (id, agent type, model, task gist, full task). Tree mode keeps snapshot order (parent before child) and, while a
-/// filter is active, also the ancestors of every match so context stays visible; collapsed
-/// subtrees are hidden when no filter is active. Flat mode lists matches only: running first,
-/// then most recent activity. `parked(i)`: omp reports agent `i` as parked.
-pub fn visible(
-    agents: &[AgentSummary],
-    search: &[String],
-    filter: &Filter,
-    collapsed: &HashSet<String>,
-    parked: impl Fn(usize) -> bool,
-) -> Vec<usize> {
-    let query = filter.query.trim().to_lowercase();
-    let tokens: Vec<&str> = query.split_whitespace().collect();
-    let matches = |i: usize| {
-        filter
-            .status
-            .admits(Bucket::of(agents[i].status, parked(i)))
-            && search
-                .get(i)
-                .is_some_and(|h| tokens.iter().all(|t| h.contains(t)))
-    };
-    let hits: Vec<bool> = (0..agents.len()).map(matches).collect();
-    if !filter.tree {
-        let mut out: Vec<usize> = (0..agents.len()).filter(|&i| hits[i]).collect();
+/// Indices into `agents` in display order. Tree mode keeps snapshot order (parent before child)
+/// and hides collapsed subtrees. Flat mode lists everything: running first, then most recent
+/// activity.
+pub fn visible(agents: &[AgentSummary], tree: bool, collapsed: &HashSet<String>) -> Vec<usize> {
+    if !tree {
+        let mut out: Vec<usize> = (0..agents.len()).collect();
         out.sort_by_key(|&i| {
             let a = &agents[i];
             (
@@ -201,31 +111,9 @@ pub fn visible(
             .as_deref()
             .and_then(|p| by_id.get(p).copied())
     };
-    let filtering = filter.is_active();
-    let mut keep = hits.clone();
-    if filtering {
-        for i in 0..agents.len() {
-            if !hits[i] {
-                continue;
-            }
-            let mut cur = parent(i);
-            let mut guard = agents.len();
-            while let Some(p) = cur {
-                if keep[p] && !hits[p] || guard == 0 {
-                    break;
-                }
-                keep[p] = true;
-                guard -= 1;
-                cur = parent(p);
-            }
-        }
-    } else {
-        keep.fill(true);
-    }
     (0..agents.len())
-        .filter(|&i| keep[i])
         .filter(|&i| {
-            if filtering || collapsed.is_empty() {
+            if collapsed.is_empty() {
                 return true;
             }
             let mut cur = parent(i);
@@ -428,10 +316,6 @@ pub struct AgentsView {
 }
 
 impl AgentsView {
-    pub fn snapshot(&self) -> Option<&Arc<AgentsSnapshot>> {
-        self.snap.as_ref()
-    }
-
     pub fn agents(&self) -> &[AgentSummary] {
         self.snap.as_ref().map_or(&[], |s| s.agents.as_slice())
     }
@@ -626,67 +510,42 @@ mod tests {
     }
 
     #[test]
-    fn tree_without_filter_keeps_snapshot_order_and_honours_collapse() {
-        let (a, s) = fixture();
-        let f = Filter {
-            tree: true,
-            ..Filter::default()
-        };
-        let all = visible(&a, &s, &f, &HashSet::new(), |_| false);
+    fn tree_keeps_snapshot_order_and_honours_collapse() {
+        let (a, _) = fixture();
+        let all = visible(&a, true, &HashSet::new());
         assert_eq!(
             ids(&a, &all),
             ["Beta", "Beta.Leaf", "Alpha", "Alpha.Kid", "Alpha.Kid.Deep"]
         );
         let collapsed: HashSet<String> = ["Alpha".to_owned()].into();
-        let v = visible(&a, &s, &f, &collapsed, |_| false);
+        let v = visible(&a, true, &collapsed);
         assert_eq!(ids(&a, &v), ["Beta", "Beta.Leaf", "Alpha"]);
     }
 
     #[test]
-    fn tree_filter_keeps_ancestors_of_matches_and_ignores_collapse() {
-        let (a, s) = fixture();
-        let f = Filter {
-            query: "deep".to_owned(),
-            tree: true,
-            ..Filter::default()
-        };
-        let collapsed: HashSet<String> = ["Alpha".to_owned()].into();
-        let v = visible(&a, &s, &f, &collapsed, |_| false);
-        assert_eq!(ids(&a, &v), ["Alpha", "Alpha.Kid", "Alpha.Kid.Deep"]);
+    fn tree_hides_collapsed_subtrees_only() {
+        let (a, _) = fixture();
+        let collapsed: HashSet<String> = ["Alpha.Kid".to_owned()].into();
+        let v = visible(&a, true, &collapsed);
+        assert_eq!(ids(&a, &v), ["Beta", "Beta.Leaf", "Alpha", "Alpha.Kid"]);
     }
 
     #[test]
-    fn flat_lists_running_first_then_recent_and_filters_by_status() {
-        let (a, s) = fixture();
-        let flat = Filter::default();
-        let v = visible(&a, &s, &flat, &HashSet::new(), |_| false);
+    fn flat_lists_running_first_then_recent() {
+        let (a, _) = fixture();
+        let v = visible(&a, false, &HashSet::new());
         assert_eq!(
             ids(&a, &v),
             ["Beta", "Beta.Leaf", "Alpha.Kid.Deep", "Alpha.Kid", "Alpha"]
         );
-        let mut failed = Filter::default();
-        failed.status.toggle(Bucket::Failed);
-        failed.status.toggle(Bucket::Aborted);
-        let v = visible(&a, &s, &failed, &HashSet::new(), |_| false);
-        assert_eq!(ids(&a, &v), ["Beta.Leaf", "Alpha.Kid.Deep"]);
-        failed.status.toggle(Bucket::Failed);
-        assert!(!failed.status.contains(Bucket::Failed));
-    }
-
-    #[test]
-    fn query_tokens_all_must_match() {
-        let (a, s) = fixture();
-        let f = Filter {
-            query: "ALPHA kid".to_owned(),
-            ..Filter::default()
-        };
-        let v = visible(&a, &s, &f, &HashSet::new(), |_| false);
-        assert_eq!(ids(&a, &v), ["Alpha.Kid.Deep", "Alpha.Kid"]);
+        // Collapsing does not apply to the flat list.
+        let collapsed: HashSet<String> = ["Alpha".to_owned()].into();
+        assert_eq!(visible(&a, false, &collapsed).len(), 5);
     }
 
     #[test]
     fn parked_agents_form_their_own_bucket() {
-        let (a, s) = fixture();
+        let (a, _) = fixture();
         // The two done agents: only the first is parked by omp.
         let done: Vec<usize> = (0..a.len())
             .filter(|&i| a[i].status == AgentStatus::Done)
@@ -695,13 +554,6 @@ mod tests {
         let c = Counts::of(&a, parked);
         assert_eq!((c.done, c.parked), (1, 1));
         assert_eq!(c.total(), a.len());
-        let mut f = Filter::default();
-        f.status.toggle(Bucket::Parked);
-        assert_eq!(visible(&a, &s, &f, &HashSet::new(), parked), vec![done[0]]);
-        let mut f = Filter::default();
-        f.status.toggle(Bucket::Done);
-        let v = visible(&a, &s, &f, &HashSet::new(), parked);
-        assert!(v.contains(&done[1]) && !v.contains(&done[0]));
     }
 
     #[test]
@@ -782,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn search_matches_model_and_full_task_text() {
+    fn search_text_has_model_and_full_task_text() {
         let mut a = agent("X", None, AgentStatus::Done, 1);
         a.task = "Refactor the Frobnicator module".to_owned();
         let snap = Arc::new(AgentsSnapshot {
@@ -791,16 +643,10 @@ mod tests {
         });
         let mut v = AgentsView::default();
         v.update(Some(&snap), None, SystemTime::UNIX_EPOCH);
-        let q = |text: &str| {
-            let f = Filter {
-                query: text.to_owned(),
-                ..Filter::default()
-            };
-            visible(v.agents(), &v.search, &f, &HashSet::new(), |_| false).len()
-        };
-        assert_eq!(q("frobnicator"), 1);
-        assert_eq!(q("sonnet"), 1);
-        assert_eq!(q("nonexistent"), 0);
+        assert_eq!(v.search.len(), 1);
+        assert!(v.search[0].contains("frobnicator"));
+        assert!(v.search[0].contains("sonnet"));
+        assert!(v.search[0].starts_with("x "), "id first");
     }
 
     fn live_agent(id: &str, status: LiveStatus, activity: Option<&str>) -> LiveAgent {

@@ -182,6 +182,23 @@ impl Tmux {
         })
     }
 
+    /// Session name → title of its active pane (the `#T` the pane's program set), one
+    /// `list-panes -a` for every session. Each line is `name<TAB>active<TAB>title`: the title is
+    /// last, so a tab inside it would survive; session names never contain a tab (tmux rewrites
+    /// it) and tmux strips control characters from titles, so a title cannot span lines. Empty
+    /// titles are omitted; no server or any failure → empty map.
+    pub fn pane_titles(&self) -> HashMap<String, String> {
+        let format =
+            "#{session_name}\t#{?#{&&:#{pane_active},#{window_active}},1,0}\t#{pane_title}";
+        let Ok(out) = self.run(&["list-panes", "-a", "-F", format]) else {
+            return HashMap::new();
+        };
+        if !out.status.success() {
+            return HashMap::new();
+        }
+        parse_pane_titles(&String::from_utf8_lossy(&out.stdout))
+    }
+
     pub fn has_session(&self, name: &str) -> bool {
         // `=` forces exact-name matching instead of prefix matching.
         self.run(&["has-session", "-t", &format!("={name}")])
@@ -264,6 +281,17 @@ impl Tmux {
         }
         result
     }
+}
+
+/// Parses `pane_titles` output; only active-pane lines with a non-empty title count.
+fn parse_pane_titles(text: &str) -> HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let (name, active, title) = (parts.next()?, parts.next()?, parts.next()?);
+            (active == "1" && !title.is_empty()).then(|| (name.to_owned(), title.to_owned()))
+        })
+        .collect()
 }
 
 pub(crate) fn is_top_level_session(p: &Path, root: &Path, canon_root: Option<&Path>) -> bool {

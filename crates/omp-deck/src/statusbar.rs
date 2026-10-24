@@ -451,7 +451,7 @@ pub enum BarAction {
     AskRename,
     CopyPath(String),
     OpenUrl(String),
-    ToggleAgentHub,
+    ToggleAgents,
     OpenTree,
     OpenUsage,
     ToggleChanges,
@@ -474,7 +474,7 @@ pub struct BarInput<'a> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AgentsChip {
     pub counts: Counts,
-    /// The hub panel is open.
+    /// The agents dashboard is open.
     pub open: bool,
 }
 
@@ -1053,13 +1053,13 @@ enum Glyph {
     Icon(crate::icons::Icon),
 }
 
-/// `⟳ 2 · ✓ 5 · ✕ 1` — live counts of the active session's subagents; click toggles the hub.
+/// `⟳ 2 · ✓ 5 · ✕ 1` — live counts of the active session's subagents; click toggles the dashboard.
 fn agents_chip(ui: &mut Ui, v: &AgentsChip, out: &mut Vec<BarAction>) {
     let pal = Palette::of_ui(ui);
     let c = v.counts;
     let total = c.total();
     // The action row lays out right → left and `horizontal` inherits that: contents are emitted
-    // in reverse reading order (last count first, number before its glyph, hub icon last).
+    // in reverse reading order (last count first, number before its glyph, dashboard icon last).
     let r = chip(ui, "agents", Sense::click(), |ui| {
         let lit = v.open || c.running > 0;
         let icon_color = if lit {
@@ -1116,7 +1116,7 @@ fn agents_chip(ui: &mut Ui, v: &AgentsChip, out: &mut Vec<BarAction>) {
     let r = r
         .on_hover_cursor(CursorIcon::PointingHand)
         .on_hover_ui(|ui| {
-            ui.label(RichText::new("Agent Hub  (Ctrl+Shift+A)").strong());
+            ui.label(RichText::new("Agents dashboard  (Ctrl+Shift+A)").strong());
             if total == 0 {
                 ui.label("No subagents in this session yet");
             } else {
@@ -1136,7 +1136,7 @@ fn agents_chip(ui: &mut Ui, v: &AgentsChip, out: &mut Vec<BarAction>) {
             }
         });
     if r.clicked() {
-        out.push(BarAction::ToggleAgentHub);
+        out.push(BarAction::ToggleAgents);
     }
 }
 
@@ -1146,7 +1146,7 @@ fn actions_row(ui: &mut Ui, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
     let c = &input.actions;
     ui.spacing_mut().item_spacing.x = 3.0;
 
-    // Added right → left: the Agents chip sits at the far right, under the hub panel.
+    // Added right → left: the Agents chip sits at the far right, under the dashboard.
     agents_chip(ui, &input.agents, out);
     ui.add_space(6.0);
 

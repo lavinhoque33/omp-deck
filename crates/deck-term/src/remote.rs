@@ -249,7 +249,7 @@ pub(crate) fn start(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -264,7 +264,7 @@ mod tests {
 
     /// What the terminal sent to the fake host.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    enum Sent {
+    pub(crate) enum Sent {
         Input(Vec<u8>),
         Resize(u16, u16, u16, u16),
         Palette([[u8; 3]; 19]),
@@ -272,7 +272,7 @@ mod tests {
         Detach,
     }
 
-    type Log = Arc<Mutex<Vec<Sent>>>;
+    pub(crate) type Log = Arc<Mutex<Vec<Sent>>>;
 
     /// In-memory host: events come from the test, everything sent is logged.
     struct Fake {
@@ -325,7 +325,7 @@ mod tests {
         }
     }
 
-    fn connect() -> (Terminal, Sender<RemoteEvent>, Log) {
+    pub(crate) fn connect() -> (Terminal, Sender<RemoteEvent>, Log) {
         let (host, events) = mpsc::channel();
         let log = Log::default();
         let fake = Fake {
@@ -580,5 +580,40 @@ mod tests {
         until(&mut t, "sync timeout", |t| {
             t.screen_text().lines[0] == "pending"
         });
+    }
+
+    #[test]
+    fn paste_bytes_follow_bracketed_paste_and_key_rules() {
+        let (mut t, host, _log) = connect();
+        assert_eq!(t.paste_bytes("hi"), None, "?2004 off");
+
+        output(&host, b"\x1b[?2004h");
+        until(&mut t, "?2004", |t| {
+            t.mode().contains(TermMode::BRACKETED_PASTE)
+        });
+        assert_eq!(
+            t.paste_bytes("one\ntwo\r\nthree").as_deref(),
+            Some(&b"\x1b[200~one\ntwo\r\nthree\x1b[201~"[..])
+        );
+        // An embedded end marker cannot close the bracket early.
+        assert_eq!(
+            t.paste_bytes("a\x1b[201~b").as_deref(),
+            Some(&b"\x1b[200~ab\x1b[201~"[..])
+        );
+        assert_eq!(t.paste_bytes("").as_deref(), Some(&b""[..]));
+
+        // win32-input-mode: ConPTY's paste filter (newlines to CR, ESC dropped), bracketed.
+        output(&host, b"\x1b[?9001h");
+        until(&mut t, "win32 mode", |t| t.key_rules() == KeyRules::Win32);
+        assert_eq!(
+            t.paste_bytes("a\nb\x1b[201~c").as_deref(),
+            Some(&b"\x1b[200~a\rb[201~c\x1b[201~"[..])
+        );
+
+        output(&host, b"\x1b[?2004l");
+        until(&mut t, "?2004 off", |t| {
+            !t.mode().contains(TermMode::BRACKETED_PASTE)
+        });
+        assert_eq!(t.paste_bytes("a\nb"), None);
     }
 }

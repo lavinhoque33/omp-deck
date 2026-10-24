@@ -94,6 +94,8 @@ pub struct AppConfig {
     pub palette_recent: Vec<String>,
     /// Width of the changes panel in points (0 = default).
     pub changes_panel_width: f32,
+    /// Split-view layout of the global tab set (`panes` index into `open_tabs`).
+    pub split: Option<SplitState>,
 }
 
 /// Most palette commands remembered in [`AppConfig::palette_recent`].
@@ -162,6 +164,7 @@ impl Default for AppConfig {
             palette_recent: Vec::new(),
             changes_panel_width: 0.0,
             removed_worktrees: BTreeMap::new(),
+            split: None,
         }
     }
 }
@@ -275,6 +278,31 @@ pub struct TabState {
 pub struct FolderTabs {
     pub open_tabs: Vec<TabState>,
     pub active_tab: Option<usize>,
+    /// Split-view layout of this folder's tabs (`panes` index into `open_tabs`).
+    pub split: Option<SplitState>,
+}
+
+/// Pane arrangement of the split view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitLayout {
+    #[default]
+    Single,
+    Columns2,
+    Rows2,
+    Columns3,
+    Grid4,
+}
+
+/// Persisted split view: one slot per pane, each an index into the persisted `open_tabs`
+/// (`None` = empty slot); dangling indices are dropped on restore.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SplitState {
+    pub layout: SplitLayout,
+    pub panes: Vec<Option<usize>>,
+    pub focused: usize,
+    pub ratios: Vec<f32>,
 }
 
 impl AppConfig {
@@ -533,12 +561,46 @@ mod tests {
             FolderTabs {
                 open_tabs: cfg.open_tabs.clone(),
                 active_tab: Some(0),
+                split: None,
             },
         );
         cfg.folder_scope = Some("/home/u/x".into());
         cfg.model_provider_filter = Some("openai".into());
         cfg.save_to(&path).unwrap();
         assert_eq!(AppConfig::load_from(&path), cfg);
+    }
+
+    #[test]
+    fn split_state_roundtrips_and_old_state_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        fs::write(
+            &p,
+            br#"{"open_tabs": [], "folder_tabs": {"/w": {"open_tabs": []}}}"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load_from(&p);
+        assert_eq!(cfg.split, None);
+        assert_eq!(cfg.folder_tabs[Path::new("/w")].split, None);
+
+        let state = SplitState {
+            layout: SplitLayout::Grid4,
+            panes: vec![Some(0), None, Some(2), Some(1)],
+            focused: 2,
+            ratios: vec![0.4, 0.6],
+        };
+        let mut cfg = sample();
+        cfg.split = Some(state.clone());
+        cfg.folder_tabs.insert(
+            "/w".into(),
+            FolderTabs {
+                split: Some(state),
+                ..FolderTabs::default()
+            },
+        );
+        cfg.save_to(&p).unwrap();
+        assert!(fs::read_to_string(&p).unwrap().contains("\"grid4\""));
+        assert_eq!(AppConfig::load_from(&p), cfg);
     }
 
     #[test]

@@ -126,6 +126,24 @@ impl HostMux {
             started: UNIX_EPOCH + Duration::from_millis(info.child_started_unix_ms),
         })
     }
+
+    /// Titles reported by the live sessions' daemons.
+    fn titles(&self) -> HashMap<String, String> {
+        let names = self.ns.list();
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    scope.spawn(|| self.ns.info(name).ok()?.title.filter(|t| !t.is_empty()))
+                })
+                .collect();
+            names
+                .iter()
+                .zip(jobs)
+                .filter_map(|(name, job)| Some((name.clone(), job.join().ok()??)))
+                .collect()
+        })
+    }
 }
 
 /// `value` when it is a test name, `omp-deck-test-` plus `[A-Za-z0-9_-]+`, at most 40 bytes; otherwise (unset,
@@ -254,6 +272,16 @@ impl Mux {
         match self {
             Mux::Tmux(t) => t.pane(name),
             Mux::Host(h) => h.pane(name),
+        }
+    }
+
+    /// Session name → current terminal title of every live session that has one: tmux asks its
+    /// server once (active pane); the host asks each session's daemon (`info`, concurrently, so
+    /// one stuck daemon costs one control timeout, not one per session). Failures → no entry.
+    pub fn pane_titles(&self) -> HashMap<String, String> {
+        match self {
+            Mux::Tmux(t) => t.pane_titles(),
+            Mux::Host(h) => h.titles(),
         }
     }
 }

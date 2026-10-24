@@ -1,6 +1,7 @@
 //! `TerminalView`: the egui widget wiring keyboard, mouse, focus, IME and resize to a
 //! [`Terminal`], and painting it via `render`.
 
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::Scroll;
@@ -77,6 +78,9 @@ impl ViewState {
 pub struct TerminalView<'a> {
     term: &'a mut Terminal,
     font_size: f32,
+    /// Hash of [`Self::id_salt`]: the interaction id comes from it instead of the layout's
+    /// automatic (draw-order dependent) id.
+    id_salt: Option<u64>,
 }
 
 pub struct TerminalResponse {
@@ -255,6 +259,7 @@ impl<'a> TerminalView<'a> {
         TerminalView {
             term,
             font_size: 14.0,
+            id_salt: None,
         }
     }
 
@@ -263,8 +268,23 @@ impl<'a> TerminalView<'a> {
         self
     }
 
+    /// Derives the widget's interaction id from `salt` (unique among the views of one id
+    /// scope, e.g. a tab uid), so several views drawn in one frame keep their own focus,
+    /// pointer and drag state whatever order they are drawn in. Without it the id is the
+    /// layout's automatic one.
+    pub fn id_salt(mut self, salt: impl Hash) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        salt.hash(&mut hasher);
+        self.id_salt = Some(hasher.finish());
+        self
+    }
+
     pub fn show(self, ui: &mut Ui) -> TerminalResponse {
-        let TerminalView { term, font_size } = self;
+        let TerminalView {
+            term,
+            font_size,
+            id_salt,
+        } = self;
         let events = term.poll();
         let ctx = ui.ctx().clone();
         let ppp = ctx.pixels_per_point();
@@ -279,7 +299,14 @@ impl<'a> TerminalView<'a> {
         };
 
         let sense = Sense::click_and_drag().union(Sense::focusable_noninteractive());
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), sense);
+        let (rect, response) = match id_salt {
+            None => ui.allocate_exact_size(ui.available_size(), sense),
+            Some(salt) => {
+                let (_, rect) = ui.allocate_space(ui.available_size());
+                let id = ui.make_persistent_id(("deck_term::TerminalView", salt));
+                (rect, ui.interact(rect, id, sense))
+            }
+        };
         let origin = pos2(
             (rect.min.x * ppp).round() / ppp,
             (rect.min.y * ppp).round() / ppp,
@@ -442,12 +469,9 @@ fn after_input(term: &mut Terminal) {
 }
 
 fn paste(term: &mut Terminal, text: Option<String>, mode: TermMode) {
-    if let Some(text) = text.filter(|t| !t.is_empty()) {
-        let bytes = if term.key_rules() == KeyRules::Win32 {
-            input::encode_paste_win32(&text, mode)
-        } else {
-            input::encode_paste(&text, mode)
-        };
+    let Some(text) = text else { return };
+    let bytes = term.paste_encoding(&text, mode);
+    if !bytes.is_empty() {
         term.write(&bytes);
         after_input(term);
     }
@@ -481,6 +505,27 @@ impl Terminal {
         let text = self.clipboard().get_text();
         let mode = self.mode();
         paste(self, text, mode);
+    }
+
+    /// The exact bytes the widget's own paste sends for `text` under the current modes
+    /// (bracketed; filtered like ConPTY's paste while the child speaks win32-input-mode);
+    /// `None` while the application has not enabled bracketed paste (?2004). Empty text
+    /// sends nothing (`Some` of no bytes).
+    pub fn paste_bytes(&self, text: &str) -> Option<Vec<u8>> {
+        let mode = self.mode();
+        mode.contains(TermMode::BRACKETED_PASTE)
+            .then(|| self.paste_encoding(text, mode))
+    }
+
+    /// Paste encoding shared by every paste path: the active key rules pick the encoder.
+    fn paste_encoding(&self, text: &str, mode: TermMode) -> Vec<u8> {
+        if text.is_empty() {
+            Vec::new()
+        } else if self.key_rules() == KeyRules::Win32 {
+            input::encode_paste_win32(text, mode)
+        } else {
+            input::encode_paste(text, mode)
+        }
     }
 
     /// Link (OSC 8 target or plain URL) under the last right click.
@@ -925,5 +970,109 @@ fn handle_pointer(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{Context, RawInput, UiBuilder, vec2};
+
+    use super::*;
+    use crate::remote::tests::connect;
+
+    const LEFT: Pos2 = pos2(100.0, 100.0);
+    const RIGHT: Pos2 = pos2(500.0, 100.0);
+
+    /// Two side-by-side views in one frame (`a` left, `b` right), drawn in the given order.
+    struct Split {
+        ctx: Context,
+        time: f64,
+        salted: bool,
+    }
+
+    impl Split {
+        fn frame(&mut self, events: Vec<Event>, a: &mut Terminal, b: &mut Terminal, b_first: bool) {
+            self.time += 0.1;
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 400.0))),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let salted = self.salted;
+            let output = self.ctx.run_ui(input, |ui| {
+                let full = ui.max_rect();
+                let left = Rect::from_min_max(full.min, pos2(full.center().x, full.max.y));
+                let right = Rect::from_min_max(pos2(full.center().x, full.min.y), full.max);
+                let mut draw = |term: &mut Terminal, rect: Rect, uid: u64| {
+                    let mut child = ui.new_child(UiBuilder::new().max_rect(rect));
+                    let view = TerminalView::new(term);
+                    let view = if salted { view.id_salt(uid) } else { view };
+                    view.show(&mut child);
+                };
+                if b_first {
+                    draw(b, right, 2);
+                    draw(a, left, 1);
+                } else {
+                    draw(a, left, 1);
+                    draw(b, right, 2);
+                }
+            });
+            output.drop_without_applying_deltas();
+        }
+
+        /// Press and release the primary button at `pos` over two frames.
+        fn click(&mut self, pos: Pos2, a: &mut Terminal, b: &mut Terminal, b_first: bool) {
+            let button = |pressed| Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            self.frame(vec![Event::PointerMoved(pos), button(true)], a, b, b_first);
+            self.frame(vec![button(false)], a, b, b_first);
+        }
+    }
+
+    fn split(salted: bool) -> Split {
+        Split {
+            ctx: Context::default(),
+            time: 0.0,
+            salted,
+        }
+    }
+
+    #[test]
+    fn salted_views_keep_their_focus_whatever_the_draw_order() {
+        let (mut a, _ha, _la) = connect();
+        let (mut b, _hb, _lb) = connect();
+        let mut s = split(true);
+        s.frame(Vec::new(), &mut a, &mut b, false);
+        s.click(LEFT, &mut a, &mut b, false);
+        for b_first in [true, false, true, true, false] {
+            s.frame(Vec::new(), &mut a, &mut b, b_first);
+            assert!(a.view.focused && !b.view.focused, "b_first={b_first}");
+        }
+        // Clicking the other view moves focus there, drawn in either order.
+        s.click(RIGHT, &mut a, &mut b, true);
+        for b_first in [false, true, false] {
+            s.frame(Vec::new(), &mut a, &mut b, b_first);
+            assert!(b.view.focused && !a.view.focused, "b_first={b_first}");
+        }
+    }
+
+    #[test]
+    fn unsalted_view_ids_follow_draw_order() {
+        // The case the salt exists for: automatic ids belong to the draw slot, so swapping
+        // the order hands the focus to the other terminal.
+        let (mut a, _ha, _la) = connect();
+        let (mut b, _hb, _lb) = connect();
+        let mut s = split(false);
+        s.frame(Vec::new(), &mut a, &mut b, false);
+        s.click(LEFT, &mut a, &mut b, false);
+        s.frame(Vec::new(), &mut a, &mut b, false);
+        assert!(a.view.focused && !b.view.focused);
+        s.frame(Vec::new(), &mut a, &mut b, true);
+        assert!(b.view.focused && !a.view.focused);
     }
 }

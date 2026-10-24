@@ -632,7 +632,7 @@ pub fn git_info(cwd: &Path) -> Option<GitInfo> {
     git_info_cancellable(cwd, None)
 }
 
-fn git_info_cancellable(cwd: &Path, cancel: Option<&AtomicBool>) -> Option<GitInfo> {
+pub(crate) fn git_info_cancellable(cwd: &Path, cancel: Option<&AtomicBool>) -> Option<GitInfo> {
     let mut cmd = Command::new("git");
     // --no-optional-locks: never contend with omp's own git tools for the index lock.
     cmd.args(["--no-optional-locks", "-C"])

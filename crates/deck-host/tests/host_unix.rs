@@ -39,6 +39,19 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[test]
+fn info_reports_the_osc_title_set_by_the_session() {
+    let ns = TestNs::new();
+    let mut c = Client::create(&ns, &shell("ttl"), 80, 24);
+    assert_eq!(ns.0.info("ttl").unwrap().title, None);
+    c.type_line("printf '\\033]2;my title\\twith é\\007'; echo done-title");
+    c.wait_output("done-title");
+    assert_eq!(
+        ns.0.info("ttl").unwrap().title.as_deref(),
+        Some("my titlewith é") // the parser drops the control character
+    );
+}
+
+#[test]
 fn input_round_trip_detach_and_reattach_with_same_screen_and_cursor() {
     let ns = TestNs::new();
     let mut c = Client::create(&ns, &shell("rt"), 80, 24);

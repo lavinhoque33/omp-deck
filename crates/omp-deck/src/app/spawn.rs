@@ -14,6 +14,7 @@ use deck_term::{TermOptions, Terminal};
 use super::{App, AppEvent, CopyPending, Injector, Tab, TabRole, TermTab, term_theme};
 use crate::host_remote::HostRemote;
 use crate::omp_worker;
+use crate::panes::Split;
 use crate::tabs::Anchor;
 
 /// What to do with the tab once it exists.
@@ -29,6 +30,8 @@ pub(super) enum Post {
     /// A restored tab; `active` = it was the focused one.
     Restore {
         active: bool,
+        /// Index in the persisted tab list (what a persisted split refers to).
+        index: usize,
     },
     /// The tab takes the strip position next to its former neighbours (a restart, a moved
     /// session).
@@ -468,6 +471,25 @@ impl App {
                 at = want;
             }
         }
+        // A pane left empty (a restart, a pane opened without a tab) takes the new session tab.
+        if let Some(uid) = self.tabs[at].pane_uid() {
+            let (path, name) = (
+                self.tabs[at]
+                    .session_path()
+                    .map(std::path::Path::to_path_buf),
+                self.tabs[at].mux_name().map(str::to_owned),
+            );
+            // The launch's own pane when one was reserved for it (and still exists), else the
+            // first empty pane; with none empty the tab is shown like any opened tab.
+            match self.take_pane_claim(path.as_deref(), name.as_deref()) {
+                Some(ticket) => {
+                    self.split.fill_reserved(ticket, uid);
+                }
+                None => {
+                    self.split.fill_vacated(uid);
+                }
+            }
+        }
         if focus.grants(claim, self.activation_seq) {
             let before = self.activation_seq;
             self.activate(at);
@@ -482,7 +504,8 @@ impl App {
         self.sync_ctl_keep();
         match post {
             Post::None => {}
-            Post::Restore { active } => {
+            Post::Restore { active, index } => {
+                self.restore_uids.insert(index, uid);
                 if active {
                     self.restore_focus = Some(uid);
                 }
@@ -518,18 +541,26 @@ impl App {
     }
 
     fn finish_restore(&mut self) {
+        let uids = std::mem::take(&mut self.restore_uids);
+        let state = self.restore_split.take();
         if self.tabs.is_empty() {
             return;
         }
-        let at = self
+        let mut at = self
             .restore_focus
             .take()
-            .and_then(|uid| {
-                self.tabs
-                    .iter()
-                    .position(|t| matches!(t, Tab::Terminal(x) if x.uid == uid))
-            })
+            .and_then(|uid| self.tab_index(uid))
             .unwrap_or(self.tabs.len() - 1);
+        if let Some(state) = state {
+            let split = Split::from_state(&state, |i| uids.get(&i).copied());
+            if split.is_split() {
+                // The focused pane's tab is the active one.
+                if let Some(i) = split.focused_uid().and_then(|u| self.tab_index(u)) {
+                    at = i;
+                }
+                self.split = split;
+            }
+        }
         self.activate(at);
     }
 }

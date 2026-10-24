@@ -258,6 +258,10 @@ fn head_to_cursor(
     cont_ok: impl Fn(&str) -> bool,
     cont_cells: usize,
 ) -> Option<usize> {
+    // omp draws an empty line of a multi-paragraph draft as a bare empty row (no indent). That is
+    // only trusted while the cursor sits on a row with text, so an overlay's blank rows with the
+    // cursor on one of them never read as a composer.
+    let typing = !line(s, r).trim().is_empty();
     let mut i = r;
     loop {
         let l = line(s, i);
@@ -265,7 +269,8 @@ fn head_to_cursor(
             return Some(i);
         }
         let blank_cursor = i == r && l.trim().is_empty() && s.cursor_col == cont_cells;
-        if i == 0 || r - i >= SCAN || !(cont_ok(l) || blank_cursor) {
+        let blank_gap = typing && i < r && l.trim().is_empty();
+        if i == 0 || r - i >= SCAN || !(cont_ok(l) || blank_cursor || blank_gap) {
             return None;
         }
         i -= 1;
@@ -519,6 +524,37 @@ mod tests {
             inspect(&st(l, 8, 4)),
             Composer::Draft("line one ↵ >".to_owned())
         );
+    }
+
+    /// An inserted multi-paragraph review (omp 18.12.6 `band`, as shown by a real tab): the blank
+    /// line of the draft is a bare empty row without the `   ` indent.
+    #[test]
+    fn band_draft_with_a_blank_paragraph_break_is_a_draft() {
+        let l = with(
+            SPLASH,
+            &[
+                BAND_STATUS,
+                "╰─ Review comments on my uncommitted changes. Paths are relative to the repository",
+                "   root. Line numbers refer to the file after the change.",
+                "",
+                "   1. General",
+                "   general note one",
+            ],
+            &[],
+        );
+        assert_eq!(
+            inspect(&st(l.clone(), 11, 20)),
+            Composer::Draft(
+                "Review comments on my uncommitted changes. Paths are relative to the repository ↵ \
+                 root. Line numbers refer to the file after the change. ↵ 1. General ↵ \
+                 general note one"
+                    .to_owned()
+            )
+        );
+        // A blank row with the cursor on it is not a draft: an overlay's blank rows stay Missing.
+        let mut l = with(SPLASH, &[BAND_STATUS, "╰─", "", "", ""], &[]);
+        l.push("╭─ Switch Model ──────────────╮".to_owned());
+        assert_eq!(inspect(&st(l, 10, 3)), Composer::Missing);
     }
 
     #[test]

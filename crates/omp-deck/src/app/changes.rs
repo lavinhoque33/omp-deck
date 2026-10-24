@@ -12,7 +12,9 @@ use crate::changes_view::{
     self, ChangesAction, DiffModel, DiffPane, FileKey, LoadState, ShownDiff, ViewState,
 };
 use crate::confirm::Confirm;
+use crate::inject::Job;
 use crate::omp_worker;
+use crate::review;
 use crate::tabs::{Tab, TabRole};
 use crate::theme::Palette;
 
@@ -54,6 +56,33 @@ pub(super) struct PendingWrite {
     files: Vec<ChangedFile>,
 }
 
+/// A review handed to a tab's injector: which comments leave the review once it is delivered.
+struct PendingReview {
+    uid: u64,
+    root: PathBuf,
+    ids: Vec<u64>,
+    send: bool,
+}
+
+/// Review hand-offs in flight, at most one per tab (a tab's injector refuses a second review
+/// while one runs). Each completion clears exactly the comments of its own hand-off.
+#[derive(Default)]
+struct PendingReviews(Vec<PendingReview>);
+
+impl PendingReviews {
+    /// Records a hand-off; an older one of the same tab (it was refused or dropped) is replaced.
+    fn start(&mut self, p: PendingReview) {
+        self.0.retain(|q| q.uid != p.uid);
+        self.0.push(p);
+    }
+
+    /// The hand-off of tab `uid` that just completed.
+    fn take(&mut self, uid: u64, send: bool) -> Option<PendingReview> {
+        let i = self.0.iter().position(|p| p.uid == uid && p.send == send)?;
+        Some(self.0.swap_remove(i))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ChangesUi {
     pub(super) open: bool,
@@ -69,6 +98,8 @@ pub(super) struct ChangesUi {
     list_again: bool,
     last_started: Option<Instant>,
     diff_generation: u64,
+    /// The review job in flight (cleared when the injector reports it done).
+    pending_reviews: PendingReviews,
 }
 
 impl ChangesUi {
@@ -150,13 +181,14 @@ pub(super) fn confirm_for(kind: WriteKind, files: &[ChangedFile]) -> Confirm {
 }
 
 impl App {
-    /// Ctrl+Shift+G, the git chip, the palette: show or hide the panel (exclusive with the hub).
+    /// Ctrl+Shift+G, the git chip, the palette: show or hide the panel (it replaces the agents
+    /// dashboard, which would hide it).
     pub(super) fn toggle_changes_panel(&mut self) {
         if self.changes.open {
             self.changes.open = false;
         } else {
             self.changes.open = true;
-            self.hub_open = false;
+            self.close_dashboard();
             // The next frame re-reads the repository at once.
             self.changes.last_started = None;
         }
@@ -451,11 +483,91 @@ impl App {
                 }
             }
             ChangesAction::Refresh => self.changes_refresh_now(),
+            ChangesAction::InsertReview => self.hand_review(false),
+            ChangesAction::SendReview => self.hand_review(true),
             ChangesAction::Close => {
                 self.changes.open = false;
                 self.focus_pending = true;
             }
         }
+    }
+
+    /// **Insert into omp** / **Send**: queues the review on the panel's tab (looked up again now).
+    /// The review is cleared only when the injector reports the job done ([`Self::review_delivered`]);
+    /// every refusal (omp busy, a dialog open, draft declined, no bracketed paste) keeps it.
+    fn hand_review(&mut self, send: bool) {
+        let (Some(uid), Some(root)) = (self.changes.uid, self.changes.view.root.clone()) else {
+            return;
+        };
+        let comments = self
+            .changes
+            .view
+            .reviews
+            .of(&root)
+            .map(|r| r.comments().to_vec())
+            .unwrap_or_default();
+        let text = match review::build_prompt(&comments) {
+            Ok(t) => t,
+            Err(e) => {
+                self.toasts.error(&self.ctx, e.to_string());
+                return;
+            }
+        };
+        let label = if send {
+            review::SEND_LABEL
+        } else {
+            review::INSERT_LABEL
+        };
+        let refusal = match self
+            .tabs
+            .iter_mut()
+            .filter_map(Tab::term_mut)
+            .find(|t| t.uid == uid)
+        {
+            None => Some("The session tab was closed; nothing was sent"),
+            Some(t) if t.term.is_exited() => Some("omp has exited in this tab; nothing was sent"),
+            Some(t) if t.term.paste_bytes("x").is_none() => {
+                Some("omp has not enabled bracketed paste yet; try again in a moment")
+            }
+            Some(t) if t.injector.is_busy() => {
+                Some("omp is still handling another command; try again in a moment")
+            }
+            Some(t) => {
+                t.injector.push(Job::text(label, &text, send));
+                None
+            }
+        };
+        if let Some(why) = refusal {
+            self.toasts.error(&self.ctx, why);
+            return;
+        }
+        self.changes.pending_reviews.start(PendingReview {
+            uid,
+            root,
+            ids: comments.iter().map(|c| c.id).collect(),
+            send,
+        });
+        self.ctx.request_repaint();
+    }
+
+    /// The injector finished a review job on tab `uid`: those comments are in omp's hands now.
+    pub(super) fn review_delivered(&mut self, uid: u64, send: bool) {
+        let Some(p) = self.changes.pending_reviews.take(uid, send) else {
+            return;
+        };
+        let n = p.ids.len();
+        self.changes.view.reviews.of_mut(&p.root).remove_all(&p.ids);
+        let what = if n == 1 {
+            "1 review comment".to_owned()
+        } else {
+            format!("{n} review comments")
+        };
+        let msg = if send {
+            format!("Sent {what} to omp")
+        } else {
+            format!("Inserted {what} into omp's composer")
+        };
+        self.toasts.success(&self.ctx, msg);
     }
 
     /// Open a folder with the desktop's file manager off the UI thread.
@@ -473,7 +585,7 @@ impl App {
     }
 
     pub(super) fn show_changes_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.changes.open || !self.changes_available() {
+        if !self.changes.open || !self.changes_available() || self.dash.open {
             return;
         }
         let pal = Palette::of_ui(ui);
@@ -489,6 +601,11 @@ impl App {
                     .inner_margin(Margin::symmetric(12, 12)),
             )
             .show(ui, |ui| changes_view::show(ui, &mut self.changes.view));
+        // A comment editor owns the keyboard: the terminal must not take it back while the user
+        // types (every other place that asks for terminal focus runs before this, or on a click).
+        if self.changes.view.editor.as_ref().is_some_and(|e| e.active) {
+            self.focus_pending = false;
+        }
         for a in shown.inner {
             self.apply_changes_action(a);
         }
@@ -544,6 +661,30 @@ mod tests {
             "an in-flight listing is now stale"
         );
         assert!(ch.diff_generation > diff);
+    }
+
+    #[test]
+    fn each_tabs_review_handoff_completes_on_its_own() {
+        let p = |uid, root: &str, ids: Vec<u64>| PendingReview {
+            uid,
+            root: PathBuf::from(root),
+            ids,
+            send: true,
+        };
+        let mut pending = PendingReviews::default();
+        pending.start(p(1, "/a", vec![1, 2]));
+        pending.start(p(2, "/b", vec![7]));
+        // Tab 2's hand-off did not overwrite tab 1's.
+        let done = pending.take(1, true).unwrap();
+        assert_eq!((done.root, done.ids), (PathBuf::from("/a"), vec![1, 2]));
+        assert!(pending.take(1, true).is_none(), "already completed");
+        assert!(pending.take(2, false).is_none(), "other kind of job");
+        assert_eq!(pending.take(2, true).unwrap().ids, vec![7]);
+        // A retry on the same tab replaces its refused predecessor.
+        pending.start(p(3, "/c", vec![1]));
+        pending.start(p(3, "/c", vec![1, 2]));
+        assert_eq!(pending.take(3, true).unwrap().ids, vec![1, 2]);
+        assert!(pending.take(3, true).is_none());
     }
 
     #[test]

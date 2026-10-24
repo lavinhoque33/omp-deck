@@ -46,8 +46,8 @@ impl Kind {
 pub struct Sighting {
     pub status: TabStatus,
     pub exit_code: Option<i32>,
-    /// The tab is the active one in the strip.
-    pub active: bool,
+    /// The tab is shown in a pane (the active tab, or any pane of a split).
+    pub visible: bool,
 }
 
 struct Memory {
@@ -120,7 +120,7 @@ impl Tracker {
             }),
             _ => None,
         };
-        event.filter(|e| wanted(cfg, *e, window_focused, seen.active))
+        event.filter(|e| wanted(cfg, *e, window_focused, seen.visible))
     }
 
     /// A notification for `uid` was sent.
@@ -134,10 +134,16 @@ impl Tracker {
     }
 
     /// The tab whose notification should be withdrawn now: the user looks at it (window focused,
-    /// tab active).
-    pub fn take_seen(&mut self, active: Option<u64>, window_focused: bool) -> Option<u64> {
-        let uid = active.filter(|_| window_focused)?;
-        self.shown.remove(&uid).then_some(uid)
+    /// tabs shown in a pane).
+    pub fn take_seen(&mut self, visible: &[u64], window_focused: bool) -> Vec<u64> {
+        if !window_focused {
+            return Vec::new();
+        }
+        visible
+            .iter()
+            .copied()
+            .filter(|uid| self.shown.remove(uid))
+            .collect()
     }
 
     /// Forget tabs that no longer exist; returns those that still had a notification up.
@@ -189,7 +195,7 @@ mod tests {
                 TabStatus::Exited { clean } => Some(if clean { 0 } else { 2 }),
                 _ => None,
             },
-            active,
+            visible: active,
         }
     }
 
@@ -432,11 +438,23 @@ mod tests {
     fn activating_the_tab_withdraws_its_notification_only_when_the_window_is_focused() {
         let mut t = Tracker::default();
         t.shown(4);
-        assert_eq!(t.take_seen(Some(4), false), None, "window away");
-        assert_eq!(t.take_seen(Some(5), true), None, "other tab");
-        assert_eq!(t.take_seen(None, true), None);
-        assert_eq!(t.take_seen(Some(4), true), Some(4));
-        assert_eq!(t.take_seen(Some(4), true), None, "withdrawn once");
+        assert!(t.take_seen(&[4], false).is_empty(), "window away");
+        assert!(t.take_seen(&[5], true).is_empty(), "other tab");
+        assert!(t.take_seen(&[], true).is_empty());
+        assert_eq!(t.take_seen(&[4], true), vec![4]);
+        assert!(t.take_seen(&[4], true).is_empty(), "withdrawn once");
+    }
+
+    #[test]
+    fn every_visible_pane_counts_as_looked_at() {
+        let mut t = Tracker::default();
+        t.shown(4);
+        t.shown(6);
+        t.shown(9);
+        let mut seen = t.take_seen(&[4, 9], true);
+        seen.sort_unstable();
+        assert_eq!(seen, vec![4, 9]);
+        assert_eq!(t.take_seen(&[6], true), vec![6]);
     }
 
     #[test]
@@ -444,7 +462,7 @@ mod tests {
         let mut t = Tracker::default();
         t.shown(4);
         t.gone(4);
-        assert_eq!(t.take_seen(Some(4), true), None);
+        assert!(t.take_seen(&[4], true).is_empty());
     }
 
     #[test]

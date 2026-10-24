@@ -1,6 +1,7 @@
-//! The native Agent Hub side panel: aggregate header, search, status filters, tree/flat roster of
-//! subagent cards. Cards are painted directly and culled to the viewport; their heights are a
-//! pure function of the data, so the scroll range is exact without measuring.
+//! Subagent rows of the agents dashboard: the tree/flat roster of one session's subagent cards.
+//! Cards are painted directly and culled to the viewport; their heights are a pure function of
+//! the data (the gist galleys are measured once per snapshot and width), so the card height of
+//! an expanded session is exact without measuring while painting.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -8,22 +9,21 @@ use std::sync::Arc;
 use crate::icons::Icon;
 use crate::icons::{
     ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_PAUSE,
-    ICON_CIRCLE_STOP, ICON_LIST, ICON_LIST_TREE, ICON_MOON_STAR, ICON_NETWORK, ICON_PLAY,
-    ICON_REFRESH_CW, ICON_SEARCH, ICON_SQUARE, ICON_TRIANGLE_ALERT, ICON_X,
+    ICON_CIRCLE_STOP, ICON_MOON_STAR, ICON_PLAY, ICON_REFRESH_CW, ICON_SQUARE, ICON_TRIANGLE_ALERT,
 };
 use deck_core::agents::{AgentStatus, AgentSummary};
 use deck_core::ctl::LiveStatus;
 use egui::Galley;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Align2, Color32, CursorIcon, FontFamily, FontId, Frame, Id, Margin, Rect, RichText, ScrollArea,
-    Sense, Sides, Stroke, StrokeKind, TextEdit, Ui, pos2, vec2,
+    Align2, Color32, CursorIcon, FontFamily, FontId, Rect, Sense, Stroke, StrokeKind, Ui, pos2,
+    vec2,
 };
 
-use crate::agent_ctl::{self, CtlView, Link, Restart};
-use crate::agent_model::{self, AgentsView, BUCKETS, Bucket, CardView, Filter, status_label};
+use crate::agent_ctl::{self, CtlView};
+use crate::agent_model::{self, AgentsView, CardView, status_label};
 use crate::theme::{self, Palette};
-use crate::widgets::{Spin, empty_state, icon_text, paint_icon};
+use crate::widgets::{Spin, paint_icon};
 
 const CARD_PAD: f32 = 11.0;
 const CARD_GAP: f32 = 6.0;
@@ -37,29 +37,6 @@ pub fn status_color(pal: &Palette, s: AgentStatus) -> Color32 {
         AgentStatus::Failed => pal.danger,
         AgentStatus::Aborted => pal.warn,
         AgentStatus::Interrupted => theme::mix(pal.warn, pal.weak, 0.45),
-    }
-}
-
-fn bucket_icon(b: Bucket) -> Icon {
-    match b {
-        Bucket::Running => status_icon(AgentStatus::Running),
-        Bucket::Done => status_icon(AgentStatus::Done),
-        Bucket::Failed => status_icon(AgentStatus::Failed),
-        Bucket::Aborted => status_icon(AgentStatus::Aborted),
-        Bucket::Interrupted => status_icon(AgentStatus::Interrupted),
-        Bucket::Parked => ICON_CIRCLE_PAUSE,
-    }
-}
-
-/// Chip colour of a bucket; parked agents use the same hue as their card state.
-fn bucket_color(pal: &Palette, b: Bucket) -> Color32 {
-    match b {
-        Bucket::Running => status_color(pal, AgentStatus::Running),
-        Bucket::Done => status_color(pal, AgentStatus::Done),
-        Bucket::Failed => status_color(pal, AgentStatus::Failed),
-        Bucket::Aborted => status_color(pal, AgentStatus::Aborted),
-        Bucket::Interrupted => status_color(pal, AgentStatus::Interrupted),
-        Bucket::Parked => theme::mix(pal.weak, pal.accent, 0.4),
     }
 }
 
@@ -105,325 +82,138 @@ pub fn shown(pal: &Palette, status: AgentStatus, live: Option<LiveStatus>) -> Sh
     }
 }
 
-/// Panel state owned by the app.
-pub struct HubState {
-    pub filter: Filter,
+/// Per-session state of the rows: collapsed groups and the cached geometry.
+#[derive(Default)]
+pub struct RowsState {
     collapsed: HashSet<String>,
     collapsed_gen: u64,
     order: Vec<usize>,
-    order_key: Option<(u64, Filter, u64)>,
+    order_key: Option<(u64, bool, u64)>,
     offsets: Vec<f32>,
     /// Measured gist galleys by snapshot index; valid for `gist_key`.
     gists: Vec<Option<Arc<Galley>>>,
     gist_key: Option<(u64, i32, bool, bool)>,
+    /// Height of all rows as last prepared.
+    total: f32,
 }
 
-impl Default for HubState {
-    fn default() -> Self {
-        HubState {
-            filter: Filter {
-                tree: true,
-                ..Filter::default()
-            },
-            collapsed: HashSet::new(),
-            collapsed_gen: 0,
-            order: Vec::new(),
-            order_key: None,
-            offsets: Vec::new(),
-            gists: Vec::new(),
-            gist_key: None,
-        }
-    }
-}
-
-impl HubState {
-    /// Forget the per-session view state (query, status filter, collapsed groups); the tree/flat
-    /// choice is a preference and stays.
-    pub fn reset(&mut self) {
-        let tree = self.filter.tree;
-        *self = HubState::default();
-        self.filter.tree = tree;
-    }
-
-    /// Visible agent indices (into the view's snapshot) in display order.
-    pub fn order(&self) -> &[usize] {
-        &self.order
-    }
-
-    fn refresh_order(&mut self, view: &AgentsView) {
-        let key = (view.version, self.filter.clone(), self.collapsed_gen);
-        if self.order_key.as_ref() == Some(&key) {
-            return;
-        }
-        self.order = agent_model::visible(
-            view.agents(),
-            &view.search,
-            &self.filter,
-            &self.collapsed,
-            |i| {
-                view.cards
-                    .get(i)
-                    .is_some_and(|c| c.live == Some(LiveStatus::Parked))
-            },
+impl RowsState {
+    /// Orders the rows for `view` and measures them for a list `width` wide; returns the total
+    /// height. Cached per (snapshot, width, mode, theme), so calling it every frame is cheap.
+    pub fn prepare(&mut self, ui: &Ui, view: &AgentsView, width: f32, tree: bool) -> f32 {
+        let pal = Palette::of_ui(ui);
+        let agents = view.agents();
+        let key = (view.version, tree, self.collapsed_gen);
+        let gist_key = (
+            view.base_version,
+            width.round() as i32,
+            tree,
+            ui.visuals().dark_mode,
         );
-        self.order_key = Some(key);
-    }
-
-    /// Recompute the order for the current view (the popup navigates it too).
-    pub fn sync(&mut self, view: &AgentsView) {
-        self.refresh_order(view);
+        if self.order_key == Some(key) && self.gist_key == Some(gist_key) {
+            return self.total;
+        }
+        if self.order_key != Some(key) {
+            self.order = agent_model::visible(agents, tree, &self.collapsed);
+            self.order_key = Some(key);
+        }
+        if self.gist_key != Some(gist_key) {
+            self.gists.clear();
+            self.gists.resize(agents.len(), None);
+            self.gist_key = Some(gist_key);
+        }
+        self.offsets.clear();
+        self.offsets.push(0.0);
+        let mut y = 0.0;
+        for k in 0..self.order.len() {
+            let i = self.order[k];
+            let gist = &view.cards[i].gist;
+            if !gist.is_empty() && self.gists[i].is_none() {
+                let depth = if tree { agents[i].depth.min(6) } else { 0 };
+                self.gists[i] = Some(layout_gist(ui, pal, gist, gist_wrap_width(width, depth)));
+            }
+            y += card_height(&agents[i], self.gists[i].as_ref()) + CARD_GAP;
+            self.offsets.push(y);
+        }
+        self.total = y;
+        y
     }
 }
 
-pub enum HubAction {
+pub enum RowAction {
     Open(String),
-    Close,
     /// Ask to kill this agent (the app confirms first).
     Kill(String),
     Revive(String),
-    /// Ask to restart the session with live control (the app confirms first).
-    Restart,
 }
 
-pub struct HubInput<'a> {
+pub struct RowsInput<'a> {
     pub view: &'a AgentsView,
-    /// The active tab has a session file to watch.
-    pub has_session: bool,
+    pub tree: bool,
     /// Agent whose popup is open (highlighted).
     pub selected: Option<&'a str>,
     pub ctl: &'a CtlView<'a>,
 }
 
-/// Draws the panel contents.
-pub fn show(ui: &mut Ui, st: &mut HubState, input: &HubInput<'_>) -> Vec<HubAction> {
-    let pal = Palette::of_ui(ui);
-    let mut out = Vec::new();
-    st.refresh_order(input.view);
+/// Paints the rows prepared by [`RowsState::prepare`] for the same `width` and mode, `width` wide
+/// at the cursor of `ui`; only the rows near the clip rect are drawn.
+pub fn rows(
+    ui: &mut Ui,
+    st: &mut RowsState,
+    input: &RowsInput<'_>,
+    width: f32,
+    out: &mut Vec<RowAction>,
+) {
     let view = input.view;
-
-    // Title row.
-    Sides::new().height(30.0).show(
-        ui,
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(icon_text(ICON_NETWORK, 20.0, pal.glyph));
-            ui.label(theme::strong("Agents").size(16.0).color(pal.text_strong));
-            let total = view.counts.total();
-            if total > 0 {
-                pill(ui, &total.to_string(), pal.weak, pal.raised);
-            }
-            link_badge(ui, input.ctl.link);
-        },
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            if small_button(ui, ICON_X, "Close the hub (Ctrl+Shift+A)", false).clicked() {
-                out.push(HubAction::Close);
-            }
-            ui.add_space(4.0);
-            if small_button(
-                ui,
-                ICON_LIST,
-                "Flat list: running first, newest activity",
-                !st.filter.tree,
-            )
-            .clicked()
-            {
-                st.filter.tree = false;
-            }
-            if small_button(ui, ICON_LIST_TREE, "Tree: who spawned whom", st.filter.tree).clicked()
-            {
-                st.filter.tree = true;
-            }
-        },
-    );
-    ui.add_space(8.0);
-
-    if !input.has_session {
-        empty_state(
-            ui,
-            ICON_NETWORK,
-            pal.accent,
-            "No session in this tab",
-            "Open or start an omp session to see the agents it spawns.",
+    let agents = view.agents();
+    let n = st.order.len();
+    if st.offsets.len() != n + 1 {
+        return;
+    }
+    let tree = input.tree;
+    let (area, _) = ui.allocate_exact_size(vec2(width, st.total), Sense::hover());
+    let clip = ui.clip_rect();
+    let lo = clip.min.y - area.min.y - OVERSCAN;
+    let hi = clip.max.y - area.min.y + OVERSCAN;
+    let first = st.offsets[1..].partition_point(|&o| o <= lo).min(n);
+    let end = st.offsets[..n].partition_point(|&o| o < hi).max(first);
+    let mut toggled = None;
+    for r in first..end {
+        let i = st.order[r];
+        let (Some(a), Some(c)) = (agents.get(i), view.cards.get(i)) else {
+            continue;
+        };
+        let row = Rect::from_min_size(
+            pos2(area.min.x, area.min.y + st.offsets[r]),
+            vec2(width, st.offsets[r + 1] - st.offsets[r]),
         );
-        return out;
-    }
-    link_note(ui, input.ctl, &mut out);
-
-    let total = view.counts.total();
-    if total > 0 {
-        // Aggregate = filter chips.
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-            for s in BUCKETS {
-                let n = view.counts.get(s);
-                let on = st.filter.status.contains(s);
-                if n == 0 && !on {
-                    continue;
-                }
-                if status_chip(ui, s, n, on).clicked() {
-                    st.filter.status.toggle(s);
-                }
-            }
-        });
-        ui.add_space(4.0);
-        ui.label(RichText::new(&view.totals).size(11.5).color(pal.weak));
-        ui.add_space(8.0);
-        search_box(ui, st);
-        ui.add_space(10.0);
-    }
-
-    match view.snapshot() {
-        None => {
-            ui.add_space(24.0);
-            ui.vertical_centered(|ui| {
-                ui.add(Spin::new(22.0, pal.accent));
-                ui.add_space(6.0);
-                ui.label(RichText::new("Looking for agents…").color(pal.weak));
-            });
-        }
-        Some(_) if total == 0 => empty_state(
+        let depth = if tree { a.depth.min(6) } else { 0 };
+        let opts = CardOpts {
+            tree_depth: tree.then_some(depth),
+            selected: input.selected == Some(a.id.as_str()),
+            act: card_act(input.ctl, a, c),
+        };
+        match card(
             ui,
-            ICON_NETWORK,
-            pal.accent,
-            "No subagents yet",
-            "Agents this session spawns with the task tool show up here, live.",
-        ),
-        Some(_) if st.order.is_empty() => {
-            empty_state(
-                ui,
-                ICON_SEARCH,
-                pal.weak,
-                "Nothing matches",
-                "Try another search or clear the status filters.",
-            );
-            ui.add_space(8.0);
-            ui.vertical_centered(|ui| {
-                if ui.button("Clear filters").clicked() {
-                    st.filter.query.clear();
-                    st.filter.status = agent_model::StatusFilter::default();
-                }
-            });
+            row,
+            a,
+            c,
+            st.gists.get(i).and_then(Option::as_ref),
+            opts,
+        ) {
+            CardClick::Open => out.push(RowAction::Open(a.id.clone())),
+            CardClick::ToggleChildren => toggled = Some(a.id.clone()),
+            CardClick::Act(CardAct::Kill) => out.push(RowAction::Kill(a.id.clone())),
+            CardClick::Act(CardAct::Revive) => out.push(RowAction::Revive(a.id.clone())),
+            CardClick::None => {}
         }
-        Some(_) => roster(ui, st, input, &mut out),
     }
-    out
-}
-
-fn search_box(ui: &mut Ui, st: &mut HubState) {
-    let pal = Palette::of_ui(ui);
-    let id = Id::unique("agent-hub-search");
-    let focused = ui.memory(|m| m.has_focus(id));
-    ui.add(
-        TextEdit::singleline(&mut st.filter.query)
-            .id(id)
-            .prefix(icon_text(ICON_SEARCH, 16.0, pal.weak))
-            .hint_text("Search id, agent, task…")
-            .align(Align2::LEFT_CENTER)
-            .min_size(vec2(0.0, 32.0))
-            .desired_width(ui.available_width())
-            .margin(Margin::symmetric(10, 6))
-            .frame(
-                Frame::new()
-                    .fill(pal.surface)
-                    .corner_radius(theme::rad(8, 10))
-                    .stroke(Stroke::new(
-                        1.0,
-                        if focused { pal.accent } else { pal.stroke },
-                    )),
-            ),
-    );
-}
-
-fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
-    let g = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), crate::theme::font(11.5), fg);
-    let (rect, _) = ui.allocate_exact_size(vec2(g.size().x + 14.0, 18.0), Sense::hover());
-    ui.painter().rect_filled(rect, 9, bg);
-    ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
-}
-
-fn small_button(ui: &mut Ui, icon: Icon, tip: &str, on: bool) -> egui::Response {
-    let pal = Palette::of_ui(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
-    let hov = ui
-        .ctx()
-        .animate_bool_with_time(resp.id.with("hov"), resp.hovered() || on, 0.1);
-    let p = ui.painter();
-    p.rect_filled(
-        rect,
-        theme::rad(6, 8),
-        if on {
-            theme::accent_fill(pal, 0.28)
-        } else {
-            pal.raised.gamma_multiply(0.85 * hov)
-        },
-    );
-    paint_icon(
-        p,
-        rect.center(),
-        Align2::CENTER_CENTER,
-        icon,
-        17.0,
-        if on {
-            pal.text_strong
-        } else {
-            theme::mix(pal.weak, pal.text_strong, hov)
-        },
-    );
-    resp.on_hover_text(tip)
-        .on_hover_cursor(CursorIcon::PointingHand)
-}
-
-fn status_chip(ui: &mut Ui, b: Bucket, n: usize, on: bool) -> egui::Response {
-    let pal = Palette::of_ui(ui);
-    let color = bucket_color(pal, b);
-    let text = format!("{n} {}", b.label());
-    let g = ui.painter().layout_no_wrap(
-        text,
-        crate::theme::font(12.0),
-        if on { pal.text_strong } else { pal.text },
-    );
-    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 38.0, 24.0), Sense::click());
-    let hov = resp.hovered();
-    let p = ui.painter();
-    p.rect_filled(
-        rect,
-        12,
-        if on {
-            color.gamma_multiply(0.22)
-        } else if hov {
-            pal.raised
-        } else {
-            pal.surface
-        },
-    );
-    p.rect_stroke(
-        rect,
-        12,
-        Stroke::new(1.0, if on { color } else { pal.stroke }),
-        StrokeKind::Inside,
-    );
-    paint_icon(
-        p,
-        pos2(rect.left() + 14.0, rect.center().y),
-        Align2::CENTER_CENTER,
-        bucket_icon(b),
-        14.0,
-        color,
-    );
-    p.galley(
-        pos2(rect.left() + 26.0, rect.center().y - g.size().y / 2.0),
-        g,
-        pal.text,
-    );
-    resp.on_hover_text(if on {
-        "Click to stop filtering by this status"
-    } else {
-        "Click to show only this status"
-    })
-    .on_hover_cursor(CursorIcon::PointingHand)
+    if let Some(id) = toggled {
+        if !st.collapsed.remove(&id) {
+            st.collapsed.insert(id);
+        }
+        st.collapsed_gen += 1;
+    }
 }
 
 // ------------------------------------------------------------------ roster
@@ -474,86 +264,6 @@ fn card_height(a: &AgentSummary, gist: Option<&Arc<Galley>>) -> f32 {
         h += 20.0;
     }
     h
-}
-
-fn roster(ui: &mut Ui, st: &mut HubState, input: &HubInput<'_>, out: &mut Vec<HubAction>) {
-    let pal = Palette::of_ui(ui);
-    let view = input.view;
-    let agents = view.agents();
-    let width = ui.available_width();
-    let tree = st.filter.tree;
-    // Gist galleys are measured once per (snapshot, panel width, layout mode, theme).
-    let gist_key = (
-        view.base_version,
-        width.round() as i32,
-        tree,
-        ui.visuals().dark_mode,
-    );
-    if st.gist_key != Some(gist_key) {
-        st.gists.clear();
-        st.gists.resize(agents.len(), None);
-        st.gist_key = Some(gist_key);
-    }
-    // Row geometry from the measured galleys.
-    st.offsets.clear();
-    st.offsets.push(0.0);
-    let mut y = 0.0;
-    for k in 0..st.order.len() {
-        let i = st.order[k];
-        let gist = &view.cards[i].gist;
-        if !gist.is_empty() && st.gists[i].is_none() {
-            let depth = if tree { agents[i].depth.min(6) } else { 0 };
-            st.gists[i] = Some(layout_gist(ui, pal, gist, gist_wrap_width(width, depth)));
-        }
-        y += card_height(&agents[i], st.gists[i].as_ref()) + CARD_GAP;
-        st.offsets.push(y);
-    }
-    let total = y;
-    let n = st.order.len();
-    let mut toggled = None;
-    ScrollArea::vertical()
-        .id_salt("agent-hub-roster")
-        .auto_shrink([false, false])
-        .show_viewport(ui, |ui, viewport| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let lo = viewport.min.y - OVERSCAN;
-            let hi = viewport.max.y + OVERSCAN;
-            let first = st.offsets[1..].partition_point(|&o| o <= lo).min(n);
-            let end = st.offsets[..n].partition_point(|&o| o < hi).max(first);
-            ui.add_space(st.offsets[first]);
-            for r in first..end {
-                let i = st.order[r];
-                let h = st.offsets[r + 1] - st.offsets[r];
-                let a = &agents[i];
-                let c = &view.cards[i];
-                let depth = if tree { a.depth.min(6) } else { 0 };
-                let (row, _) = ui.allocate_exact_size(vec2(width, h), Sense::hover());
-                if !ui.is_rect_visible(row) {
-                    continue;
-                }
-                let sel = input.selected == Some(a.id.as_str());
-                let tree_depth = tree.then_some(depth);
-                let opts = CardOpts {
-                    tree_depth,
-                    selected: sel,
-                    act: card_act(input.ctl, a, c),
-                };
-                match card(ui, row, a, c, st.gists[i].as_ref(), opts) {
-                    CardClick::Open => out.push(HubAction::Open(a.id.clone())),
-                    CardClick::ToggleChildren => toggled = Some(a.id.clone()),
-                    CardClick::Act(CardAct::Kill) => out.push(HubAction::Kill(a.id.clone())),
-                    CardClick::Act(CardAct::Revive) => out.push(HubAction::Revive(a.id.clone())),
-                    CardClick::None => {}
-                }
-            }
-            ui.add_space((total - st.offsets[end]).max(0.0));
-        });
-    if let Some(id) = toggled {
-        if !st.collapsed.remove(&id) {
-            st.collapsed.insert(id);
-        }
-        st.collapsed_gen += 1;
-    }
 }
 
 enum CardClick {
@@ -921,98 +631,4 @@ fn card(
         click = CardClick::Open;
     }
     click
-}
-
-/// Small state pill next to the title: `Live`, `Connecting`, `Read-only`.
-fn link_badge(ui: &mut Ui, link: Link) {
-    let pal = Palette::of_ui(ui);
-    let (text, col, tip) = match link {
-        Link::Live => (
-            "Live",
-            pal.ok,
-            "Connected to omp: kill, chat and revive are available",
-        ),
-        Link::Connecting => (
-            "Connecting",
-            pal.accent,
-            "Waiting for omp's control extension to come up…",
-        ),
-        Link::ReadOnly => (
-            "Read-only",
-            pal.warn,
-            "No live control: statuses are inferred from session files",
-        ),
-        Link::Lost => (
-            "Disconnected",
-            pal.warn,
-            "The connection to omp's control extension was lost; statuses are inferred from session files",
-        ),
-        Link::Ended => (
-            "Ended",
-            pal.weak,
-            "This session is no longer running; statuses are inferred from session files",
-        ),
-    };
-    let g = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), crate::theme::font(11.5), col);
-    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 26.0, 18.0), Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(rect, 9, col.gamma_multiply(0.16));
-    p.circle_filled(pos2(rect.left() + 10.0, rect.center().y), 3.0, col);
-    p.galley(
-        pos2(rect.left() + 18.0, rect.center().y - g.size().y / 2.0),
-        g,
-        col,
-    );
-    resp.on_hover_text(tip);
-}
-
-/// Why the hub is read-only, and the way out for tabs that can be restarted.
-fn link_note(ui: &mut Ui, ctl: &CtlView<'_>, out: &mut Vec<HubAction>) {
-    let note = match ctl.link {
-        Link::ReadOnly => {
-            "Statuses come from session files. This tab was started without live \
-             control, so agents cannot be killed, messaged or revived from here."
-        }
-        Link::Lost => {
-            "Statuses come from session files. Live control disconnected; it returns by \
-             itself if omp opens its control socket again."
-        }
-        Link::Ended => {
-            "Statuses come from session files. This session is no longer running (omp \
-             exited or its session backend went away)."
-        }
-        Link::Live | Link::Connecting => return,
-    };
-    let pal = Palette::of_ui(ui);
-    Frame::new()
-        .fill(theme::mix(pal.surface, pal.warn, 0.07))
-        .stroke(Stroke::new(1.0, pal.warn.gamma_multiply(0.35)))
-        .corner_radius(theme::rad(8, 10))
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(note).size(11.5).color(pal.weak));
-            if ctl.restart != Restart::Hidden {
-                ui.add_space(6.0);
-                let ready = ctl.restart == Restart::Ready;
-                let resp = ui.add_enabled(
-                    ready,
-                    egui::Button::new("Restart session with live control"),
-                );
-                let resp = if ready {
-                    resp.on_hover_text(
-                        "Stops this omp process and resumes the same session here, \
-                         with the control extension loaded",
-                    )
-                } else {
-                    resp.on_disabled_hover_text("omp is busy: restart once it is idle")
-                };
-                if resp.clicked() {
-                    out.push(HubAction::Restart);
-                }
-            }
-        });
-    ui.add_space(8.0);
 }

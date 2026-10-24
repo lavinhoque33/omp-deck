@@ -448,6 +448,7 @@ impl Shared {
             attached: core.client.is_some(),
             cols: core.size.cols,
             rows: core.size.rows,
+            title: core.scanner.state().title.clone(),
         }
     }
 }

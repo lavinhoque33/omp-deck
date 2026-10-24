@@ -1658,3 +1658,126 @@ Facts + user decisions: `docs/notes/wave14.md`. New workspace deps (root `Cargo.
   worktree rows gate on the sidebar group or `GitInfo.worktree_of` and resolve the real root at run time.
   `install.ps1` stamps `System.AppUserModel.ID` on `OmpDeck.lnk`; the release workflow's installer round trip
   asserts it.
+
+## Wave 15: split view, agents dashboard, review comments
+
+User decisions (2026-10-24): panes show existing tabs (tab = session stays true); the dashboard covers open tabs
+plus every running session without a tab; it is a full view over the terminal area that replaces the right-hand
+Agent Hub panel (no side panel any more); review comments offer both **Insert into omp** and **Send**.
+Recon facts with file:line evidence: `docs/notes/wave15.md`.
+
+### deck-host (owned by the deck-core implementer this wave)
+- `protocol::HostInfo` gains `title: Option<String>` (`#[serde(default)]`; old daemons → `None`), filled by the
+  daemon from its headless snapshot's current OSC 0/2 title. No protocol version bump (additive field).
+
+### deck-core
+- `Mux::pane_titles(&self) -> HashMap<String, String>`: session name → current pane title for every live session
+  of that backend in one pass (tmux: a single `list-panes -a -F '#{session_name}<TAB>#{pane_title}'` on the
+  dedicated socket, active pane only; host: `info` per live session, `title` field). Never blocks longer than the
+  existing alive query timeouts; errors → empty map.
+- `pub mod fleet` (new; pattern of `status::StatusWatcher` / `agents::AgentsWatcher`: one background thread,
+  generation counter, Condvar wake, publish-on-change `Arc`, `on_update` callback):
+  - `FleetTarget { session: PathBuf, cwd: PathBuf, owner_alive: bool }`.
+  - `FleetWatcher::spawn(on_update) -> FleetWatcher`; `set_targets(Vec<FleetTarget>)` (empty = idle, drops all
+    readers); `latest() -> Option<Arc<FleetSnapshot>>`.
+  - Per target it keeps one incremental `status::SessionStatsReader` and one `agents::AgentsScanner`
+    (dropped when the target goes); per distinct cwd one `git_info` (dedup by cwd). Cadence: stats + agents every
+    1 s while any agent of that session runs, else 3 s; git every 5 s. First pass of a huge file must not delay
+    other sessions' updates by more than one cycle (process targets round-robin; publish after each target).
+  - `FleetSnapshot { sessions: Vec<FleetSession> }` in target order; `FleetSession { session: PathBuf, model:
+    Option<String>, thinking: Option<String>, context_tokens: Option<u64>, input_tokens: u64, output_tokens: u64,
+    cost: f64, last_reply: Option<String> /* ≤ 400 chars, whitespace collapsed */, last_turn_failed: bool,
+    agents: Vec<AgentSummary>, git: Option<GitInfo> }` (reuse the existing types; field names may follow them).
+- No writes anywhere; real sessions root read-only as always.
+
+### deck-term
+- `TerminalView::id_salt(impl Hash) -> Self`: the widget's interaction id derives from the salt (stable per tab
+  uid), so several views in one frame keep their own focus/drag state regardless of draw order.
+- `Terminal::paste_bytes(&self, text: &str) -> Option<Vec<u8>>`: the exact bytes the widget's own paste would
+  send for `text` under the current modes (bracketed `encode_paste` or win32-input-mode `encode_paste_win32`),
+  `None` when the application has not enabled bracketed paste (?2004). Pure apart from reading modes.
+
+### omp-deck — split view
+- Layouts: Single, Two columns, Two rows, Three columns, Grid 2×2. `App.active` stays "the tab in the focused
+  pane", so everything already bound to the active tab (status bar, Changes panel, ctl link, model picker,
+  palette, session tree) follows pane focus. New state: `panes: Vec<Option<u64 /*tab uid*/>>` (one per slot),
+  `focused_pane`, divider ratios. Invariant: a tab is shown in at most one pane; `panes[focused_pane]` is the
+  active tab whenever the active tab is a terminal tab.
+- Each visible pane renders its tab via `TerminalView::id_salt(uid)` in its own rect (with the same
+  `surrender_focus_on` override), `set_visible(true)`; every non-drawn terminal tab is polled by the hidden loop.
+  Focus reclaim / `focus_pending` target the focused pane. Click in a pane focuses it. Thin pane header when
+  split: status glyph, title, close-pane (×, removes the pane, the tab stays open); focused pane gets the accent
+  border. Draggable dividers.
+- Tab strip: clicking a tab visible in a pane focuses that pane; otherwise the tab replaces the focused pane's tab.
+  Tabs visible in a pane get a subtle marker. Tab/"Open tabs"/session context menus: "Open in split right",
+  "Open in split down" (adds a pane; at 4 panes replaces the least recently focused non-focused pane).
+  Palette: Split right/down, Grid, Unsplit (keep focused pane), Focus next/previous pane. Keyboard: focus pane
+  left/right/up/down with Ctrl+Alt+Arrow — implementer verifies in omp's source (`~/PersProject/oh-my-pi`) that
+  omp does not bind these and reports; Ctrl+PgUp/PgDn keep cycling tabs (into the focused pane).
+- Closing/detaching a tab shown in a pane removes that pane (layout shrinks; 1 left → Single). Settings/update/
+  install tabs never enter a pane; activating one shows it full width and the split comes back on the next
+  terminal tab activation.
+- Per-tab rules switch from "active" to "visible": bell suppression, notification `Sighting.active` and
+  `take_seen` (a visible pane counts as looked at), the modal input hold (all visible panes).
+- Persistence: `AppConfig.split: Option<SplitState { layout, panes: Vec<Option<usize> /*index into the persisted
+  open_tabs*/>, focused: usize, ratios: Vec<f32> }>` and the same in `FolderTabs` (`serde(default)`); restored
+  after tab restore; dangling indices dropped.
+
+### omp-deck — agents dashboard (replaces the right-hand Agent Hub panel)
+- Ctrl+Shift+A (no longer needs an active session tab), status-bar Agents chip (opens with the active session's
+  card expanded), palette, ⋯ menu: toggle a full view over the terminal area (panes not drawn while it is open;
+  Esc / Ctrl+Shift+A closes). Changes panel hidden while it is shown.
+- Cards = open session tabs + sessions held by a live backend session without a tab (`RunningMonitor`), driven
+  by `FleetWatcher` only while the dashboard is open. Card: title, project (`~`-abbreviated, worktree branch),
+  status (open tab: `TabStatus`; no tab: `Activity::from_title` of `Mux::pane_titles`, else "Running"),
+  model + thinking, context meter % (window from `ModelsCache`; live ctl context for the active tab), cost,
+  ↑in ↓out tokens, changed files (staged/unstaged/untracked from `GitInfo`), last reply snippet (3 lines),
+  subagents summary (running/total) expandable into the existing subagent card rows (tree/flat). Responsive grid;
+  search (title, project, id prefix, subagent id/task) and status filter (All / Needs attention / Busy / Idle);
+  order: attention, busy, then most recent activity.
+- Click card → focus/open the session (existing `open_session`/`activate`, into the focused pane) and close the
+  dashboard. Click a subagent → transcript popup (existing). Kill/Revive/Chat stay available when that session's
+  tab is the active one with live control (activate it first if it is open); for a session without a tab the
+  popup is read-only with "Open session for live control".
+- The old right-panel hub UI is removed (dead code deleted); its subagent card renderer and view model are reused.
+
+### omp-deck — review comments (Changes panel)
+- Diff rows become clickable: hover shows a "+" in the gutter; click opens an inline multi-line comment editor
+  under the row; Shift+click extends to a line range in the same file and side. Comments: `{ path (repo-relative),
+  side (new for added/context, old for deleted), lines start..=end, quoted lines (≤ 12, "…" beyond), body }`, kept
+  in memory per repo root (not persisted), survive refreshes, listed in a "Review (N)" section with edit/delete
+  and inline markers on matching rows. A general comment (no line) is allowed.
+- Prompt text: a short header, then numbered items `path:start[-end]` + quoted lines (`> `) + body, paths relative
+  to the repository root (header says so). Cap 32 KiB → refuse with a clear message.
+- `inject::Payload::Text { text, submit: bool }`: text keeps `\n`/`\t`, strips every other C0/C1 control (incl.
+  ESC) and is written with `Terminal::paste_bytes` (refused when `None`). `submit=false` (**Insert into omp**):
+  Requires::Any except exited, no draft confirm, no clear, no Esc/Enter — pasted at omp's cursor. `submit=true`
+  (**Send**): Requires::Idle, existing draft confirm + Ctrl+C clear, paste, Esc, Enter; abort rules as Slash.
+  Target = the panel's tab uid, re-resolved at click time. Success clears the review (toast); refusal keeps it.
+
+### Wave 15 as built (supersedes the sketch above where they differ)
+- deck-core: `SplitLayout { Single, Columns2, Rows2, Columns3, Grid4 }` + `SplitState` on `AppConfig.split` and
+  `FolderTabs.split`. `Mux::pane_titles`: tmux `list-panes -a` with the title as the last field (tmux/alacritty
+  strip tabs from titles); host queries daemons concurrently. `fleet`: `FleetSnapshot { sessions:
+  Vec<Arc<FleetSession>> }` (an unchanged session is the same `Arc` across snapshots), `FleetSession.agents:
+  Arc<Vec<AgentSummary>>`; git runs on its own thread (a slow git never delays session updates) with a cancel flag
+  set by `set_targets`/`Drop`; snapshots are built only on a visible change; a session appears after its first read.
+- deck-term: salted views take their id from `make_persistent_id(("deck_term::TerminalView", hash))`; salts must be
+  unique within the parent scope. `paste_bytes` returns `Some(vec![])` for empty text; the widget's own paste paths
+  share the same encoder selection.
+- Split view: panes hold tab uids (no index shifting); a split without a spare tab leaves an empty pane that the next
+  opened session fills; focus never moves to an empty or reserved pane (clicking one releases egui focus).
+  Launches into a pane carry a reservation ticket (`PaneClaim`, keyed by session path / mux name) so they fill
+  exactly their pane; a full grid replaces the least recently focused non-reserved pane. Closing a tab also drops
+  empty panes. Ctrl+Alt+Arrow verified unbound in omp (`pi-natives/src/keys.rs` exact modifier match; omp binds only
+  `alt+arrow` and `ctrl+alt+]`); desktops may still grab it.
+- Dashboard: `dashboard.rs` + `dashboard_model.rs`, glue in `app/agents.rs`; `agent_hub.rs` is now only the
+  embeddable subagent rows. Tab-less sessions map to files via the backend snapshot or their canonical `omp-<id>`
+  name. Rebuilds are driven by an allocation-free signature (age bucket, scan generation, running/fleet `Arc`
+  pointers, models generation, live context, per-tab facts). Bells are cleared only when a terminal is drawn.
+  Entry points: Ctrl+Shift+A, status-bar Agents chip (expands the active card), palette, title-bar app menu.
+- Review comments: `review.rs` (model + prompt builder), injector `Payload::Text` gets its bytes at write time via
+  `Env::paste` (the injector stays pure; `None` → refused, `Poll::no_paste`); completions reported in
+  `Poll::completed`; pending hand-offs tracked per tab uid. Editor: Ctrl+Enter saves, Esc cancels; while it takes
+  input it cancels `focus_pending`. The Review section shows for every ready repository (also a clean tree); the
+  file list is sized to its rows (≤ 45 %), the file/diff divider is fixed.

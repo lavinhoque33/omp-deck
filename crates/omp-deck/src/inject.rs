@@ -10,6 +10,12 @@
 //! single key. Stop is `Esc`, then — only if omp still works after 650 ms — one more `Esc`.
 //! Jobs of one tab are strictly serialized with a pause between them.
 //!
+//! Text jobs (review comments): the paste bytes come from [`Env::paste`] (the terminal's own mode-aware
+//! encoding, evaluated at write time so the pure state machine never guesses the modes); `None` →
+//! the job is refused ([`Poll::no_paste`]). Insert (`submit=false`) pastes at omp's cursor and
+//! ends there; Send (`submit=true`) follows the slash sequence with the text as the paste.
+//! [`Poll::completed`] names the jobs that reached their last step.
+//!
 //! Keys (Ctrl+C, Esc, Enter, hotkeys) are [`Write::Key`] strokes that the terminal encodes like
 //! the user's own key press (`deck_term::Terminal::send_key`), never raw bytes: in
 //! win32-input-mode ConPTY keeps a trailing raw `ESC` as the start of a sequence and merges it
@@ -65,6 +71,8 @@ pub enum Payload {
     Key(Key, Mods),
     /// `Esc`, and a second `Esc` after [`STOP_RETRY`] if the turn still runs.
     Stop,
+    /// Review comments and other multi-line text, written with `Terminal::paste_bytes`.
+    Text { text: String, submit: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +100,14 @@ pub fn sanitize_line(s: &str) -> String {
     out.trim().to_owned()
 }
 
+/// Multi-line text for a bracketed paste: newlines and tabs stay, every other C0/C1 control
+/// (ESC, CR, DEL, NEL …) is dropped so nothing in it can end the paste early or act as a key.
+pub fn sanitize_text(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect()
+}
+
 impl Job {
     /// The text is sanitized with [`sanitize_line`], whatever the caller built it from.
     pub fn slash(label: impl Into<String>, text: &str, requires: Requires) -> Job {
@@ -99,6 +115,24 @@ impl Job {
             label: label.into(),
             payload: Payload::Slash(sanitize_line(text)),
             requires,
+        }
+    }
+
+    /// A multi-line text pasted into omp's composer (`submit=false`: **Insert**, any activity,
+    /// keeps a draft, never sends; `submit=true`: **Send**, idle only, the draft is confirmed and
+    /// cleared first, then Esc + Enter). The text is sanitized with [`sanitize_text`].
+    pub fn text(label: impl Into<String>, text: &str, submit: bool) -> Job {
+        Job {
+            label: label.into(),
+            payload: Payload::Text {
+                text: sanitize_text(text),
+                submit,
+            },
+            requires: if submit {
+                Requires::Idle
+            } else {
+                Requires::Any
+            },
         }
     }
 
@@ -128,6 +162,10 @@ pub struct Env<'a> {
     pub last_ctrl_c: Option<Instant>,
     /// The visible grid; only inspected when a slash job starts.
     pub screen: &'a dyn Fn() -> ScreenText,
+    /// The exact bytes the terminal's own paste sends for a text under its current modes
+    /// (`deck_term::Terminal::paste_bytes`); `None` when omp has not enabled bracketed paste.
+    /// Only [`Payload::Text`] jobs use it.
+    pub paste: &'a dyn Fn(&str) -> Option<Vec<u8>>,
 }
 
 /// One piece of input for the tab's terminal.
@@ -158,6 +196,10 @@ pub struct Poll {
     pub dialog_open: Vec<String>,
     /// Jobs abandoned after they started because omp stopped being idle.
     pub aborted: Vec<String>,
+    /// Jobs that ran to their last step (every byte of them was handed out).
+    pub completed: Vec<String>,
+    /// Text jobs dropped because omp has not enabled bracketed paste (`Env::paste` was `None`).
+    pub no_paste: Vec<String>,
     /// Drop the user's keyboard/paste input to the terminal for this long from now: bytes were
     /// written, or a job with written bytes still waits for its next step.
     pub hold_for: Option<Duration>,
@@ -283,7 +325,9 @@ impl Injector {
                 }
                 Step::Blocked => break,
                 Step::Done => {
-                    self.active = None;
+                    if let Some(a) = self.active.take() {
+                        out.completed.push(a.job.label);
+                    }
                     self.ready_at = Some(env.now + BETWEEN_JOBS);
                 }
                 Step::Dropped => {
@@ -388,26 +432,54 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             Step::Done
         }
         (Payload::Stop, _) => Step::Done,
-        (Payload::Slash(_), Stage::Start) => match composer::inspect(&(env.screen)()) {
-            Composer::Missing => {
+        (Payload::Slash(_) | Payload::Text { submit: true, .. }, Stage::Start) => {
+            if let Payload::Text { text, .. } = &a.job.payload
+                && (env.paste)(text).is_none()
+            {
+                out.no_paste.push(a.job.label.clone());
+                return Step::Dropped;
+            }
+            match composer::inspect(&(env.screen)()) {
+                Composer::Missing => {
+                    out.dialog_open.push(a.job.label.clone());
+                    Step::Dropped
+                }
+                Composer::Draft(draft) => {
+                    out.confirm = Some(Confirm {
+                        label: a.job.label.clone(),
+                        draft,
+                    });
+                    a.stage = Stage::AwaitConfirm;
+                    Step::Blocked
+                }
+                Composer::Empty => {
+                    a.stage = Stage::Cleared(now);
+                    Step::Continue
+                }
+            }
+        }
+        (
+            Payload::Text {
+                submit: false,
+                text,
+            },
+            Stage::Start,
+        ) => {
+            // Insert: pasted at omp's cursor; a draft stays, nothing is cleared, nothing submitted.
+            let Some(bytes) = (env.paste)(text) else {
+                out.no_paste.push(a.job.label.clone());
+                return Step::Dropped;
+            };
+            if matches!(composer::inspect(&(env.screen)()), Composer::Missing) {
                 out.dialog_open.push(a.job.label.clone());
-                Step::Dropped
+                return Step::Dropped;
             }
-            Composer::Draft(draft) => {
-                out.confirm = Some(Confirm {
-                    label: a.job.label.clone(),
-                    draft,
-                });
-                a.stage = Stage::AwaitConfirm;
-                Step::Blocked
-            }
-            Composer::Empty => {
-                a.stage = Stage::Cleared(now);
-                Step::Continue
-            }
-        },
-        (Payload::Slash(_), Stage::AwaitConfirm) => Step::Blocked,
-        (Payload::Slash(_), Stage::ClearPending) => {
+            write(a, out, Write::Bytes(bytes));
+            Step::Done
+        }
+        (Payload::Text { submit: false, .. }, _) => Step::Done,
+        (Payload::Slash(_) | Payload::Text { .. }, Stage::AwaitConfirm) => Step::Blocked,
+        (Payload::Slash(_) | Payload::Text { .. }, Stage::ClearPending) => {
             let last = [*ctrl_c, env.last_ctrl_c].into_iter().flatten().max();
             match last {
                 Some(t) if now < t + CTRL_C_GAP => wait_until(t + CTRL_C_GAP),
@@ -431,7 +503,19 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             a.stage = Stage::Pasted(now + AFTER_PASTE);
             wait_until(now + AFTER_PASTE)
         }
-        (Payload::Slash(_), Stage::Pasted(until)) => {
+        (Payload::Text { text, .. }, Stage::Cleared(until)) => {
+            if now < *until {
+                return wait_until(*until);
+            }
+            // The terminal's modes changed since the start: nothing was sent yet for this paste.
+            let Some(bytes) = (env.paste)(text) else {
+                return Step::Aborted;
+            };
+            write(a, out, Write::Bytes(bytes));
+            a.stage = Stage::Pasted(now + AFTER_PASTE);
+            wait_until(now + AFTER_PASTE)
+        }
+        (Payload::Slash(_) | Payload::Text { .. }, Stage::Pasted(until)) => {
             if now < *until {
                 return wait_until(*until);
             }
@@ -444,7 +528,7 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             }
             Step::Continue
         }
-        (Payload::Slash(_), Stage::Escaped(until)) => {
+        (Payload::Slash(_) | Payload::Text { .. }, Stage::Escaped(until)) => {
             if now < *until {
                 return wait_until(*until);
             }
@@ -498,6 +582,7 @@ mod tests {
         base: Instant,
         screen: ScreenText,
         activity: Activity,
+        paste_ok: bool,
         last_ctrl_c: Option<Instant>,
     }
 
@@ -508,6 +593,7 @@ mod tests {
                 screen: rail(""),
                 activity: Activity::Idle,
                 last_ctrl_c: None,
+                paste_ok: true,
             }
         }
         fn poll(&self, inj: &mut Injector, ms: u64) -> Poll {
@@ -518,6 +604,10 @@ mod tests {
                 activity: self.activity,
                 last_ctrl_c: self.last_ctrl_c,
                 screen: &f,
+                paste: &|t| {
+                    self.paste_ok
+                        .then(|| [PASTE_START, t.as_bytes(), PASTE_END].concat())
+                },
             })
         }
     }
@@ -886,5 +976,141 @@ mod tests {
         assert_eq!(sanitize_line("  a \n\n b\u{85}c\u{1b}d "), "a b cd");
         assert_eq!(sanitize_line("\u{1b}\u{7f}"), "");
         assert_eq!(sanitize_line("naïve → ok"), "naïve → ok");
+    }
+
+    // ---- Payload::Text (review comments)
+
+    const REVIEW: &str = "Review:\n1. a.rs:3\n> x\nfix\tthis";
+
+    #[test]
+    fn text_is_sanitized_keeping_newlines_and_tabs() {
+        let job = Job::text("Send review", "a\nb\tc\u{1b}[201~\r\n\u{7f}d\u{85}e", true);
+        assert_eq!(
+            job.payload,
+            Payload::Text {
+                text: "a\nb\tc[201~\nde".to_owned(),
+                submit: true
+            }
+        );
+        assert_eq!(job.requires, Requires::Idle);
+        assert_eq!(Job::text("Insert", "x", false).requires, Requires::Any);
+    }
+
+    #[test]
+    fn insert_pastes_once_without_clearing_confirming_or_submitting() {
+        let mut fx = Fixture::new();
+        fx.screen = rail("half-written draft");
+        fx.activity = Activity::Busy;
+        let mut inj = Injector::default();
+        inj.push(Job::text("Insert review", REVIEW, false));
+        let p = fx.poll(&mut inj, 0);
+        assert_eq!(p.confirm, None);
+        assert_eq!(p.writes, vec![paste(REVIEW)]);
+        assert_eq!(p.completed, vec!["Insert review".to_owned()]);
+        assert!(!inj.is_busy());
+    }
+
+    #[test]
+    fn insert_is_refused_without_a_composer_and_costs_no_bytes() {
+        let mut fx = Fixture::new();
+        fx.screen = overlay();
+        let mut inj = Injector::default();
+        inj.push(Job::text("Insert review", REVIEW, false));
+        let p = fx.poll(&mut inj, 0);
+        assert_eq!(p.dialog_open, vec!["Insert review".to_owned()]);
+        assert!(p.writes.is_empty() && p.completed.is_empty());
+    }
+
+    #[test]
+    fn text_without_bracketed_paste_is_refused_with_a_note() {
+        for submit in [false, true] {
+            let mut fx = Fixture::new();
+            fx.paste_ok = false;
+            let mut inj = Injector::default();
+            inj.push(Job::text("Review", REVIEW, submit));
+            let p = fx.poll(&mut inj, 0);
+            assert_eq!(p.no_paste, vec!["Review".to_owned()], "submit={submit}");
+            assert!(p.writes.is_empty() && !inj.is_busy());
+        }
+    }
+
+    #[test]
+    fn send_pastes_escapes_then_enters_and_reports_completion() {
+        let fx = Fixture::new();
+        let mut inj = Injector::default();
+        inj.push(Job::text("Send review", REVIEW, true));
+        let w = drain(&fx, &mut inj);
+        assert_eq!(
+            w,
+            vec![(0, paste(REVIEW)), (150, ESC_KEY), (300, ENTER_KEY)]
+        );
+        let mut inj = Injector::default();
+        inj.push(Job::text("Send review", REVIEW, true));
+        let done: Vec<String> = (0..40)
+            .flat_map(|i| fx.poll(&mut inj, i * 10).completed)
+            .collect();
+        assert_eq!(done, vec!["Send review".to_owned()]);
+    }
+
+    #[test]
+    fn send_needs_idle() {
+        for activity in [Activity::Busy, Activity::Attention, Activity::Unknown] {
+            let mut fx = Fixture::new();
+            fx.activity = activity;
+            let mut inj = Injector::default();
+            inj.push(Job::text("Send review", REVIEW, true));
+            let p = fx.poll(&mut inj, 0);
+            assert_eq!(
+                p.refused,
+                vec![("Send review".to_owned(), Requires::Idle)],
+                "{activity:?}"
+            );
+            assert!(p.writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn send_confirms_a_draft_then_clears_it_with_ctrl_c_before_pasting() {
+        let mut fx = Fixture::new();
+        fx.screen = rail("unsent words");
+        let mut inj = Injector::default();
+        inj.push(Job::text("Send review", REVIEW, true));
+        let p = fx.poll(&mut inj, 0);
+        assert_eq!(p.confirm.map(|c| c.draft), Some("unsent words".to_owned()));
+        assert!(p.writes.is_empty());
+        inj.answer(true);
+        let mut writes = Vec::new();
+        for t in (0..2_000).step_by(10) {
+            for w in fx.poll(&mut inj, t).writes {
+                writes.push(w);
+            }
+        }
+        assert_eq!(writes, vec![CTRL_C_KEY, paste(REVIEW), ESC_KEY, ENTER_KEY]);
+    }
+
+    #[test]
+    fn declining_the_draft_confirmation_drops_the_send() {
+        let mut fx = Fixture::new();
+        fx.screen = rail("unsent words");
+        let mut inj = Injector::default();
+        inj.push(Job::text("Send review", REVIEW, true));
+        fx.poll(&mut inj, 0);
+        inj.answer(false);
+        assert!(!inj.is_busy());
+        let p = fx.poll(&mut inj, 100);
+        assert!(p.writes.is_empty() && p.completed.is_empty());
+    }
+
+    #[test]
+    fn send_is_abandoned_when_omp_starts_working_mid_sequence() {
+        let mut fx = Fixture::new();
+        let mut inj = Injector::default();
+        inj.push(Job::text("Send review", REVIEW, true));
+        let p = fx.poll(&mut inj, 0);
+        assert_eq!(p.writes, vec![paste(REVIEW)]);
+        fx.activity = Activity::Busy;
+        let p = fx.poll(&mut inj, 200);
+        assert_eq!(p.aborted, vec!["Send review".to_owned()]);
+        assert!(p.writes.is_empty() && p.completed.is_empty());
     }
 }

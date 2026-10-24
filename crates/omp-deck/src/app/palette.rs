@@ -342,6 +342,50 @@ impl App {
             ICON_CHEVRON_LEFT,
             need(self.tabs.len() > 1, "Only one tab is open"),
         );
+        let split_ok = need(session_tab.is_some(), "Open a session tab first");
+        let in_split = need(self.split_shown(), "No split is open");
+        add(
+            "split.right",
+            "Split: Split right",
+            None,
+            ICON_COLUMNS_2,
+            split_ok,
+        );
+        add(
+            "split.down",
+            "Split: Split down",
+            None,
+            ICON_ROWS_2,
+            split_ok,
+        );
+        add(
+            "split.grid",
+            "Split: Grid (2×2)",
+            None,
+            ICON_GRID_2X2,
+            split_ok,
+        );
+        add(
+            "split.unsplit",
+            "Split: Unsplit (keep focused pane)",
+            None,
+            ICON_SQUARE,
+            in_split,
+        );
+        add(
+            "pane.next",
+            "Split: Focus next pane",
+            None,
+            ICON_CHEVRON_RIGHT,
+            in_split,
+        );
+        add(
+            "pane.prev",
+            "Split: Focus previous pane",
+            None,
+            ICON_CHEVRON_LEFT,
+            in_split,
+        );
 
         // Sessions of the active tab.
         add(
@@ -706,11 +750,11 @@ impl App {
             None,
         );
         add(
-            "view.hub",
-            "View: Agent hub",
+            "view.dashboard",
+            "View: Agents dashboard",
             Some("Ctrl+Shift+A"),
             ICON_NETWORK,
-            need(self.active_session_tab(), NEED_SESSION),
+            None,
         );
         add(
             "view.changes",
@@ -1040,6 +1084,10 @@ impl App {
             "tab.kill" => self.kill_tab(active),
             "tab.next" => self.activate(tabs::wrap_index(active, self.tabs.len(), 1)),
             "tab.prev" => self.activate(tabs::wrap_index(active, self.tabs.len(), -1)),
+            "split.right" | "split.down" | "split.grid" | "split.unsplit" | "pane.next"
+            | "pane.prev" => {
+                self.run_split_command(id);
+            }
             "session.new" => {
                 if let Some(cwd) = cwd {
                     self.new_session(cwd);
@@ -1169,7 +1217,7 @@ impl App {
                 }
             }
             "view.usage" => self.toggle_usage(),
-            "view.hub" => self.toggle_agent_hub(),
+            "view.dashboard" => self.toggle_dashboard(false),
             "view.changes" => self.toggle_changes_panel(),
             "view.switcher" => self.open_palette(Mode::Switcher),
             "app.settings" => self.open_settings(),

@@ -53,9 +53,13 @@ pub enum PopupAction {
         agent: String,
         text: String,
     },
+    /// Open (or focus) the tab of the inspected agent's session for live control.
+    OpenSession,
 }
 
 pub struct PopupState {
+    /// The session file whose subagent this is.
+    pub session: PathBuf,
     pub agent_id: String,
     pub tab: PopupTab,
     watcher: TranscriptWatcher,
@@ -75,12 +79,18 @@ pub struct PopupState {
 
 impl PopupState {
     /// Opens the inspector for `agent`; the transcript watcher starts here.
-    pub fn new(ctx: &egui::Context, agent: &AgentSummary, tab: PopupTab) -> PopupState {
+    pub fn new(
+        ctx: &egui::Context,
+        session: PathBuf,
+        agent: &AgentSummary,
+        tab: PopupTab,
+    ) -> PopupState {
         let repaint = {
             let ctx = ctx.clone();
             move || ctx.request_repaint()
         };
         PopupState {
+            session,
             agent_id: agent.id.clone(),
             tab,
             watcher: TranscriptWatcher::spawn(agent.path.clone(), repaint),
@@ -103,6 +113,9 @@ pub struct PopupInput<'a> {
     pub index: usize,
     /// The hub's visible order (prev/next walk it).
     pub order: &'a [usize],
+    /// The session has no live control from here (no tab, or not the active one): the popup
+    /// is read-only and offers to open the session.
+    pub needs_open: bool,
     pub ctl: &'a CtlView<'a>,
 }
 
@@ -608,6 +621,10 @@ fn composer_panel(
     live: Option<LiveStatus>,
     out: &mut Vec<PopupAction>,
 ) {
+    if input.needs_open {
+        open_session_panel(ui, out);
+        return;
+    }
     let pal = Palette::of_ui(ui);
     let ctl = input.ctl;
     egui::Panel::bottom(Id::unique(("agent-popup-composer", &a.id)))
@@ -753,6 +770,53 @@ fn composer_panel(
                     text,
                 });
             }
+        });
+}
+
+/// Footer of a read-only popup: the way to live control.
+fn open_session_panel(ui: &mut Ui, out: &mut Vec<PopupAction>) {
+    let pal = Palette::of_ui(ui);
+    egui::Panel::bottom(Id::unique("agent-popup-open-session"))
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(
+            Frame::NONE
+                .fill(pal.surface)
+                .inner_margin(Margin {
+                    left: 18,
+                    right: 14,
+                    top: 10,
+                    bottom: 12,
+                })
+                .corner_radius(egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: theme::popup_radius(),
+                    se: theme::popup_radius(),
+                }),
+        )
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(
+                        "Read-only: this session has no tab here, so its agents cannot be \
+                         killed, revived or messaged.",
+                    )
+                    .size(12.0)
+                    .color(pal.weak),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("Open session for live control")
+                        .on_hover_text(
+                            "Attach a tab to this session; chat, kill and revive work there",
+                        )
+                        .clicked()
+                    {
+                        out.push(PopupAction::OpenSession);
+                    }
+                });
+            });
         });
 }
 

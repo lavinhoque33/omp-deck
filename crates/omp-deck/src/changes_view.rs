@@ -17,8 +17,10 @@ use egui::{
 
 use crate::icons::{
     ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_COPY, ICON_FOLDER_OPEN, ICON_GIT_BRANCH,
-    ICON_MINUS, ICON_PLUS, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_TRASH_2, ICON_X, Icon,
+    ICON_MINUS, ICON_PENCIL, ICON_PLUS, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_TRASH_2, ICON_X,
+    Icon,
 };
+use crate::review::{Comment, Loc, MAX_QUOTE_LINES, Review, Reviews, Side, Span};
 use crate::theme::{self, Palette};
 use crate::widgets::{icon_text, paint_icon};
 
@@ -335,6 +337,60 @@ impl DiffModel {
         &self.text
     }
 
+    /// Side and line number of a row a comment can point at: added/context rows on the new
+    /// side, deleted rows on the old one; headers and unnumbered (conflict) rows are not.
+    pub fn commentable(&self, i: usize) -> Option<(Side, u32)> {
+        let r = self.rows.get(i)?;
+        match r.kind {
+            RowKind::Add | RowKind::Context => r.new.map(|n| (Side::New, n)),
+            RowKind::Del => r.old.map(|n| (Side::Old, n)),
+            _ => None,
+        }
+    }
+
+    /// Whether row `i` is the row of `line` on `side`.
+    pub fn is_row(&self, i: usize, side: Side, line: u32) -> bool {
+        self.commentable(i) == Some((side, line))
+    }
+
+    pub fn find_row(&self, side: Side, line: u32) -> Option<usize> {
+        (0..self.rows.len()).find(|&i| self.is_row(i, side, line))
+    }
+
+    /// The lines between rows `a` and `b` (either order) on their common side, with their quoted
+    /// text. `None` when a row cannot be commented or the rows are on different sides. Rows of the
+    /// other side in between (a deleted line inside a new-side range) are not part of it.
+    pub fn select(&self, a: usize, b: usize) -> Option<Span> {
+        let (side, _) = self.commentable(a)?;
+        if self.commentable(b)?.0 != side {
+            return None;
+        }
+        let (mut start, mut end, mut count) = (None, 0, 0usize);
+        let mut quote = Vec::new();
+        for r in a.min(b)..=a.max(b) {
+            let Some((s, line)) = self.commentable(r) else {
+                continue;
+            };
+            if s != side {
+                continue;
+            }
+            start.get_or_insert(line);
+            end = line;
+            count += 1;
+            if quote.len() < MAX_QUOTE_LINES {
+                let text = self.text_of(&self.rows[r]);
+                quote.push(text.get(1..).unwrap_or("").to_owned());
+            }
+        }
+        Some(Span {
+            side,
+            start: start?,
+            end,
+            quote,
+            more: count > MAX_QUOTE_LINES,
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -457,6 +513,44 @@ pub enum DiffPane {
     Failed(String),
 }
 
+/// A comment being written (or an existing one being edited).
+pub struct Editor {
+    pub kind: EditKind,
+    pub draft: String,
+    /// Ask the text edit for keyboard focus until it has it.
+    focus: bool,
+    /// Scroll the editor into view once (a diff row editor opened near the edge).
+    reveal: bool,
+    /// The text edit takes (or is about to take) keyboard input this frame.
+    pub active: bool,
+}
+
+impl Editor {
+    pub fn new(kind: EditKind) -> Editor {
+        Editor {
+            kind,
+            draft: String::new(),
+            focus: true,
+            reveal: true,
+            active: true,
+        }
+    }
+}
+
+pub enum EditKind {
+    /// A new comment under a diff row; `at_row` is the row of the range's last line, `anchor_row`
+    /// the row the range started at.
+    Line {
+        loc: Loc,
+        at_row: usize,
+        anchor_row: usize,
+    },
+    /// A new general comment (edited in the Review section).
+    General,
+    /// The body of comment `id` (edited in the Review section).
+    Existing(u64),
+}
+
 pub struct ViewState {
     pub load: LoadState,
     pub root: Option<PathBuf>,
@@ -470,6 +564,14 @@ pub struct ViewState {
     pub busy: Option<String>,
     /// The last write's failure.
     pub notice: Option<String>,
+    /// Review comments per repository root; they outlive refreshes, file and tab switches.
+    pub reviews: Reviews,
+    /// The comment being written or edited (one at a time).
+    pub editor: Option<Editor>,
+    /// Row of the last plain click in the shown diff: where a Shift+click range starts.
+    pub anchor: Option<usize>,
+    /// The "Review (N)" list is expanded.
+    pub review_open: bool,
 }
 
 impl Default for ViewState {
@@ -485,6 +587,10 @@ impl Default for ViewState {
             collapsed: HashSet::new(),
             busy: None,
             notice: None,
+            reviews: Reviews::default(),
+            editor: None,
+            anchor: None,
+            review_open: true,
         }
     }
 }
@@ -518,6 +624,8 @@ impl ViewState {
         self.groups.clear();
         self.selected = None;
         self.diff = DiffPane::Idle;
+        self.editor = None;
+        self.anchor = None;
     }
 
     pub fn selected_file(&self) -> Option<&ChangedFile> {
@@ -540,6 +648,10 @@ pub enum ChangesAction {
     CopyPath(usize),
     CopyDiff,
     Refresh,
+    /// Paste the review into omp's composer (keeps a draft, never submits).
+    InsertReview,
+    /// Clear the composer, paste the review and submit it.
+    SendReview,
     Close,
 }
 
@@ -597,6 +709,9 @@ pub fn show(ui: &mut Ui, st: &mut ViewState) -> Vec<ChangesAction> {
     let mut out = Vec::new();
     let ready = st.load == LoadState::Ready;
     let idle = st.busy.is_none();
+    if let Some(ed) = st.editor.as_mut() {
+        ed.active = false;
+    }
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
@@ -642,6 +757,9 @@ pub fn show(ui: &mut Ui, st: &mut ViewState) -> Vec<ChangesAction> {
         });
     }
     ui.add_space(4.0);
+    // The panel's height below the header: the Review list is sized from it, not from what is
+    // left once the other regions took theirs.
+    let total = ui.available_height();
 
     match st.load.clone() {
         LoadState::NoTab => message(ui, "Open a session tab to review its changes."),
@@ -657,9 +775,11 @@ pub fn show(ui: &mut Ui, st: &mut ViewState) -> Vec<ChangesAction> {
             ui.label(RichText::new(e).small().color(pal.weak));
         }
         LoadState::Ready if st.files.is_empty() => {
+            // Comments of this repository stay reachable when the tree is clean.
+            show_review(ui, st, &mut out, total);
             message(ui, "Working tree clean — nothing to review.");
         }
-        LoadState::Ready => show_ready(ui, st, &mut out),
+        LoadState::Ready => show_ready(ui, st, &mut out, total),
     }
     out
 }
@@ -672,19 +792,20 @@ fn message(ui: &mut Ui, text: &str) {
     });
 }
 
-fn show_ready(ui: &mut Ui, st: &mut ViewState, out: &mut Vec<ChangesAction>) {
-    let max = (ui.available_height() - 120.0).max(96.0);
-    // The list starts with ~40% of the panel (the divider is draggable); the size is remembered
-    // per panel, so it must not depend on how many files the first listing had.
-    let want = (ui.available_height() * 0.4).max(96.0);
+fn show_ready(ui: &mut Ui, st: &mut ViewState, out: &mut Vec<ChangesAction>, total: f32) {
+    let share = (ui.available_height() - 120.0).max(96.0);
+    // The file list is as tall as its rows, at most 45% of the panel (it scrolls beyond that);
+    // a remembered divider position would keep a stale size when files come and go.
+    let content = list_rows(st) as f32 * FILE_ROW_H + 6.0;
+    let height = content.min(share * 0.45).max(FILE_ROW_H * 2.0);
     let enabled = st.busy.is_none();
     egui::Panel::top("changes-files")
-        .resizable(true)
-        .default_size(want.min(max))
-        .size_range(64.0..=max)
+        .resizable(false)
+        .exact_size(height)
         .frame(egui::Frame::NONE)
         .show_separator_line(true)
         .show(ui, |ui| show_files(ui, st, out, enabled));
+    show_review(ui, st, out, total);
     show_diff_pane(ui, st, out);
 }
 
@@ -1053,21 +1174,116 @@ fn show_diff_pane(ui: &mut Ui, st: &mut ViewState, _out: &mut Vec<ChangesAction>
                             .color(pal.warn),
                     );
                 }
-                show_rows(ui, &mut d.model);
+                if let Some(root) = st.root.as_deref() {
+                    let cx = DiffCtx {
+                        key: &d.key,
+                        review: st.reviews.of_mut(root),
+                        editor: &mut st.editor,
+                        anchor: &mut st.anchor,
+                    };
+                    show_rows(ui, &mut d.model, cx);
+                }
             }
         }
     }
 }
 
-/// Paints the visible rows only; wide lines scroll horizontally.
-fn show_rows(ui: &mut Ui, model: &mut DiffModel) {
+/// Height of the inline comment editor in pixels (rounded up to whole diff rows).
+const EDITOR_H: f32 = 136.0;
+/// Left margin of a diff row: the hover "+" and the comment marker live here.
+const MARGIN_W: f32 = 20.0;
+
+/// The review state `show_rows` reads and changes.
+struct DiffCtx<'a> {
+    key: &'a FileKey,
+    review: &'a mut Review,
+    editor: &'a mut Option<Editor>,
+    anchor: &'a mut Option<usize>,
+}
+
+/// Row index of the open line editor in this diff, when it belongs to this file and its line is
+/// still there (a refresh may have moved the row). Otherwise the editor is dropped.
+fn placed_editor(model: &DiffModel, key: &FileKey, editor: &mut Option<Editor>) -> Option<usize> {
+    let Some(Editor {
+        kind: EditKind::Line { loc, at_row, .. },
+        ..
+    }) = editor
+    else {
+        return None;
+    };
+    let (side, line) = (loc.span.side, loc.span.end);
+    let found = if loc.path != key.path {
+        None
+    } else if model.is_row(*at_row, side, line) {
+        Some(*at_row)
+    } else {
+        model.find_row(side, line)
+    };
+    match found {
+        Some(r) => {
+            *at_row = r;
+            Some(r)
+        }
+        None => {
+            *editor = None;
+            None
+        }
+    }
+}
+
+/// A click on row `i` (Shift: extend from the anchor, same file and side).
+fn open_line_editor(model: &DiffModel, cx: &mut DiffCtx<'_>, i: usize, shift: bool) {
+    let from = if shift {
+        match cx.editor {
+            Some(Editor {
+                kind: EditKind::Line {
+                    loc, anchor_row, ..
+                },
+                ..
+            }) if loc.path == cx.key.path => Some(*anchor_row),
+            _ => *cx.anchor,
+        }
+    } else {
+        None
+    };
+    let ranged = from.and_then(|a| model.select(a, i).map(|s| (a, s)));
+    let Some((anchor_row, span)) = ranged.or_else(|| model.select(i, i).map(|s| (i, s))) else {
+        return;
+    };
+    *cx.anchor = Some(anchor_row);
+    // Moving the editor to another row keeps what was typed.
+    let draft = match cx.editor.take() {
+        Some(Editor {
+            kind: EditKind::Line { .. },
+            draft,
+            ..
+        }) => draft,
+        _ => String::new(),
+    };
+    let mut ed = Editor::new(EditKind::Line {
+        loc: Loc {
+            path: cx.key.path.clone(),
+            section: cx.key.section,
+            span,
+        },
+        at_row: i.max(anchor_row),
+        anchor_row,
+    });
+    ed.draft = draft;
+    *cx.editor = Some(ed);
+}
+
+/// Paints the visible rows only; wide lines scroll horizontally. A click on a numbered row opens
+/// the comment editor under it: the editor takes `slots` virtual rows after its row, so the
+/// virtualised row list keeps its uniform row height.
+fn show_rows(ui: &mut Ui, model: &mut DiffModel, mut cx: DiffCtx<'_>) {
     let pal = Palette::of_ui(ui);
     let font = TextStyle::Monospace.resolve(ui.style());
     let (glyph, row_h) = ui
         .ctx()
         .fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
     let row_h = row_h.ceil() + 2.0;
-    let content_w = (model.gutter_cols() + 1 + model.max_cols) as f32 * glyph + 16.0;
+    let content_w = (model.gutter_cols() + 1 + model.max_cols) as f32 * glyph + 16.0 + MARGIN_W;
     let key = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1077,28 +1293,486 @@ fn show_rows(ui: &mut Ui, model: &mut DiffModel) {
         theme::neutral().hash(&mut h);
         h.finish() | 1
     };
+    let placed = placed_editor(model, cx.key, cx.editor);
+    let slots = if placed.is_some() {
+        (EDITOR_H / row_h).ceil() as usize
+    } else {
+        0
+    };
+    let at = placed.map_or(0, |r| r + 1);
+    let selected = match cx.editor {
+        Some(Editor {
+            kind: EditKind::Line { loc, .. },
+            ..
+        }) => Some((loc.span.side, loc.span.start, loc.span.end)),
+        _ => None,
+    };
     ui.spacing_mut().item_spacing.y = 0.0;
     let n = model.rows.len();
+    let mut click: Option<(usize, bool)> = None;
+    let mut outcome = EditorOutcome::None;
     ScrollArea::both()
         .id_salt("changes-diff")
         .auto_shrink([false, false])
-        .show_rows(ui, row_h, n, |ui, range| {
+        .show_rows(ui, row_h, n + slots, |ui, range| {
             ui.set_min_width(content_w);
             let width = ui.clip_rect().width().max(content_w);
-            for i in range {
-                let (rect, _) = ui.allocate_exact_size(vec2(width, row_h), Sense::hover());
+            let y0 = ui.next_widget_position().y;
+            for l in range.clone() {
+                if l >= at && l < at + slots {
+                    ui.allocate_exact_size(vec2(width, row_h), Sense::hover());
+                    continue;
+                }
+                let i = if l >= at + slots { l - slots } else { l };
+                let commentable = model.commentable(i);
+                let (rect, resp) = ui.allocate_exact_size(
+                    vec2(width, row_h),
+                    if commentable.is_some() {
+                        Sense::click()
+                    } else {
+                        Sense::hover()
+                    },
+                );
                 let kind = model.rows[i].kind;
                 if let Some(bg) = row_bg(kind, pal) {
                     ui.painter().rect_filled(rect, 0, bg);
                 }
+                if let (Some((side, line)), Some((s, a, b))) = (commentable, selected)
+                    && side == s
+                    && (a..=b).contains(&line)
+                {
+                    ui.painter()
+                        .rect_filled(rect, 0, theme::accent_fill(pal, 0.22));
+                }
                 let galley = model.galley(ui.painter(), i, &font, pal, key);
                 ui.painter().galley(
-                    pos2(rect.left() + 6.0, rect.center().y - galley.size().y / 2.0),
+                    pos2(
+                        rect.left() + 6.0 + MARGIN_W,
+                        rect.center().y - galley.size().y / 2.0,
+                    ),
                     galley,
                     pal.text,
                 );
+                let Some((side, line)) = commentable else {
+                    continue;
+                };
+                let marks = |c: &&Comment| {
+                    c.loc
+                        .as_ref()
+                        .is_some_and(|lc| lc.path == cx.key.path && lc.span.contains(side, line))
+                };
+                let n_marks = cx.review.comments().iter().filter(marks).count();
+                let spot = pos2(rect.left() + MARGIN_W / 2.0 + 2.0, rect.center().y);
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    paint_icon(
+                        ui.painter(),
+                        spot,
+                        Align2::CENTER_CENTER,
+                        ICON_PLUS,
+                        14.0,
+                        pal.accent,
+                    );
+                } else if n_marks > 0 {
+                    ui.painter().circle_filled(spot, 3.5, pal.accent);
+                }
+                if resp.clicked() {
+                    click = Some((i, ui.input(|s| s.modifiers.shift)));
+                }
+                if n_marks > 0 {
+                    let review = &*cx.review;
+                    resp.on_hover_ui(|ui| {
+                        ui.set_max_width(340.0);
+                        for c in review.comments().iter().filter(marks) {
+                            ui.label(c.body.as_str());
+                        }
+                    });
+                }
+            }
+            if slots > 0 {
+                let clip = ui.clip_rect();
+                let top = y0 + (at as f32 - range.start as f32) * row_h;
+                let rect = Rect::from_min_size(
+                    pos2(clip.left() + 4.0, top + 2.0),
+                    vec2((clip.width() - 8.0).max(240.0), slots as f32 * row_h - 4.0),
+                );
+                if let Some(ed) = cx.editor.as_mut() {
+                    if ed.reveal {
+                        // Just opened under a row at the edge of the view: scroll it into sight.
+                        ed.reveal = false;
+                        ui.scroll_to_rect(rect, None);
+                    }
+                    if range.start < at + slots && range.end > at {
+                        let title = editor_title(ed);
+                        outcome = ui
+                            .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                                comment_editor(ui, ed, &title, 60.0)
+                            })
+                            .inner;
+                    }
+                }
             }
         });
+    finish_editor(cx.editor, cx.review, outcome);
+    if let Some((i, shift)) = click {
+        open_line_editor(model, &mut cx, i, shift);
+    }
+}
+
+fn editor_title(ed: &Editor) -> String {
+    match &ed.kind {
+        EditKind::Line { loc, .. } => format!(
+            "Comment on {}:{}{}",
+            loc.path,
+            loc.span.label(),
+            if loc.span.side == Side::Old {
+                " (removed)"
+            } else {
+                ""
+            }
+        ),
+        EditKind::General => "General comment".to_owned(),
+        EditKind::Existing(_) => "Edit comment".to_owned(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorOutcome {
+    None,
+    Save,
+    Cancel,
+}
+
+/// The multi-line comment editor. Keeps keyboard focus once it has it (it asks again every frame
+/// until the text edit really holds it, as the terminal may grab it back on the frames right after
+/// a click), turns Esc into Cancel and Ctrl+Enter into Save, and records in `ed.active` whether it
+/// takes text input this frame, so the app does not give the keyboard back to the terminal.
+fn comment_editor(ui: &mut Ui, ed: &mut Editor, title: &str, text_h: f32) -> EditorOutcome {
+    let pal = Palette::of_ui(ui);
+    let id = ui.make_persistent_id("review-editor-text");
+    let mut outcome = EditorOutcome::None;
+    if ui.memory(|m| m.has_focus(id)) {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            outcome = EditorOutcome::Cancel;
+        } else if !ed.draft.trim().is_empty()
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter))
+        {
+            outcome = EditorOutcome::Save;
+        }
+    }
+    egui::Frame::new()
+        .fill(theme::mix(pal.panel, pal.accent, 0.10))
+        .stroke(egui::Stroke::new(1.0, pal.accent))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).small().color(pal.weak));
+            egui::ScrollArea::vertical()
+                .id_salt("review-editor-scroll")
+                .max_height(text_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    let r = ui.add(
+                        egui::TextEdit::multiline(&mut ed.draft)
+                            .id(id)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY)
+                            .lock_focus(true)
+                            .hint_text("Write a comment (Ctrl+Enter saves, Esc cancels)"),
+                    );
+                    // Esc must reach us instead of dropping focus.
+                    ui.memory_mut(|m| {
+                        m.set_focus_lock_filter(
+                            id,
+                            egui::EventFilter {
+                                tab: true,
+                                horizontal_arrows: true,
+                                vertical_arrows: true,
+                                escape: true,
+                            },
+                        );
+                    });
+                    if ed.focus {
+                        r.request_focus();
+                        if r.has_focus() {
+                            ed.focus = false;
+                        }
+                    }
+                    ed.active = ed.focus || r.has_focus();
+                });
+            ui.horizontal(|ui| {
+                let save = ui.add_enabled(
+                    !ed.draft.trim().is_empty(),
+                    egui::Button::new(RichText::new("Save comment").color(theme::on_accent(pal)))
+                        .fill(pal.accent),
+                );
+                if save.clicked() {
+                    outcome = EditorOutcome::Save;
+                }
+                if ui.button("Cancel").clicked() {
+                    outcome = EditorOutcome::Cancel;
+                }
+            });
+        });
+    outcome
+}
+
+/// Applies what the editor answered: a save adds/updates the comment and closes it.
+fn finish_editor(editor: &mut Option<Editor>, review: &mut Review, outcome: EditorOutcome) {
+    match outcome {
+        EditorOutcome::None => {}
+        EditorOutcome::Cancel => *editor = None,
+        EditorOutcome::Save => {
+            let Some(ed) = editor.take() else {
+                return;
+            };
+            let saved = match &ed.kind {
+                EditKind::Line { loc, .. } => review.add(Some(loc.clone()), &ed.draft).is_some(),
+                EditKind::General => review.add(None, &ed.draft).is_some(),
+                EditKind::Existing(id) => review.set_body(*id, &ed.draft),
+            };
+            if !saved {
+                *editor = Some(ed);
+            }
+        }
+    }
+}
+
+/// The "Review (N)" section under the file list: comments with edit/delete, general comment,
+/// and the two ways to hand the review to omp.
+fn show_review(ui: &mut Ui, st: &mut ViewState, out: &mut Vec<ChangesAction>, total: f32) {
+    let pal = Palette::of_ui(ui);
+    let ViewState {
+        root,
+        reviews,
+        editor,
+        review_open,
+        files,
+        groups,
+        busy,
+        ..
+    } = st;
+    let Some(root) = root.as_deref() else {
+        return;
+    };
+    let review = reviews.of_mut(root);
+    let n = review.len();
+    let mut goto: Option<FileKey> = None;
+    let mut delete: Option<u64> = None;
+    let mut edit: Option<u64> = None;
+    let mut outcome = EditorOutcome::None;
+    egui::Panel::bottom("changes-review")
+        .resizable(false)
+        .frame(egui::Frame::NONE)
+        .show_separator_line(true)
+        .show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let chevron = if *review_open {
+                    ICON_CHEVRON_DOWN
+                } else {
+                    ICON_CHEVRON_RIGHT
+                };
+                let a = ui.add(
+                    egui::Label::new(icon_text(chevron, 14.0, pal.weak)).sense(Sense::click()),
+                );
+                let b = ui.add(
+                    egui::Label::new(
+                        theme::strong(format!("Review ({n})"))
+                            .size(13.0)
+                            .color(pal.text_strong),
+                    )
+                    .sense(Sense::click()),
+                );
+                if a.clicked() || b.clicked() {
+                    *review_open = !*review_open;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let general = ui
+                        .add(egui::Button::new(
+                            RichText::new("+ General comment").small(),
+                        ))
+                        .on_hover_text("A comment that is not about a line");
+                    if general.clicked() {
+                        *review_open = true;
+                        *editor = Some(Editor::new(EditKind::General));
+                    }
+                });
+            });
+            // Written in a region of its own (not the scrolling list), so it is always whole.
+            let editing_here = matches!(
+                editor,
+                Some(Editor {
+                    kind: EditKind::General | EditKind::Existing(_),
+                    ..
+                })
+            );
+            if editing_here && let Some(ed) = editor.as_mut() {
+                let title = editor_title(ed);
+                outcome = comment_editor(ui, ed, &title, 90.0);
+            }
+            if *review_open && n > 0 {
+                // ~4 items of the panel's total height; less while an editor takes room.
+                let share = if editing_here { 0.2 } else { 0.45 };
+                egui::ScrollArea::vertical()
+                    .id_salt("review-list")
+                    .max_height((total * share).clamp(96.0, 300.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for c in review.comments() {
+                            ui.add_space(2.0);
+                            egui::Frame::new()
+                                .fill(theme::mix(pal.panel, pal.text, 0.05))
+                                .corner_radius(6)
+                                .inner_margin(egui::Margin::symmetric(8, 5))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    review_item(
+                                        ui,
+                                        c,
+                                        (files, groups),
+                                        (&mut goto, &mut delete, &mut edit),
+                                    );
+                                });
+                        }
+                    });
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let ok = n > 0 && busy.is_none();
+                if ui
+                    .add_enabled(ok, egui::Button::new("Insert into omp"))
+                    .on_hover_text(
+                        "Paste the review into omp's composer at the cursor, without sending it",
+                    )
+                    .clicked()
+                {
+                    out.push(ChangesAction::InsertReview);
+                }
+                if ui
+                    .add_enabled(
+                        ok,
+                        egui::Button::new(RichText::new("Send").color(theme::on_accent(pal)))
+                            .fill(pal.accent),
+                    )
+                    .on_hover_text(
+                        "Replace the composer's text with the review and send it (omp must be idle)",
+                    )
+                    .clicked()
+                {
+                    out.push(ChangesAction::SendReview);
+                }
+            });
+            ui.add_space(4.0);
+        });
+    if let Some(id) = delete {
+        review.remove(id);
+        if matches!(editor, Some(Editor { kind: EditKind::Existing(e), .. }) if *e == id) {
+            *editor = None;
+        }
+    }
+    if let Some(id) = edit
+        && let Some(c) = review.get(id)
+    {
+        let mut ed = Editor::new(EditKind::Existing(id));
+        ed.draft.clone_from(&c.body);
+        *editor = Some(ed);
+        *review_open = true;
+    }
+    finish_editor(editor, review, outcome);
+    if let Some(key) = goto {
+        out.push(ChangesAction::Select(key));
+    }
+}
+
+/// One comment of the list: where it points, its quote, the body (or its editor).
+fn review_item(
+    ui: &mut Ui,
+    c: &Comment,
+    listing: (&[ChangedFile], &[Group]),
+    (goto, delete, edit): (&mut Option<FileKey>, &mut Option<u64>, &mut Option<u64>),
+) {
+    let pal = Palette::of_ui(ui);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        match &c.loc {
+            Some(l) => {
+                let key = FileKey {
+                    path: l.path.clone(),
+                    section: l.section,
+                };
+                let here = find(listing.1, listing.0, &key).is_some();
+                let text = format!(
+                    "{}:{}{}",
+                    l.path,
+                    l.span.label(),
+                    if l.span.side == Side::Old {
+                        " (removed)"
+                    } else {
+                        ""
+                    }
+                );
+                let r = ui.add(
+                    egui::Label::new(RichText::new(text).small().strong().color(if here {
+                        pal.text_strong
+                    } else {
+                        pal.weak
+                    }))
+                    .truncate()
+                    .sense(if here {
+                        Sense::click()
+                    } else {
+                        Sense::hover()
+                    }),
+                );
+                if here {
+                    if r.on_hover_text("Show this file's diff")
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        *goto = Some(key);
+                    }
+                } else {
+                    r.on_hover_text("This file is no longer in the changes");
+                }
+            }
+            None => {
+                ui.label(
+                    RichText::new("General")
+                        .small()
+                        .strong()
+                        .color(pal.text_strong),
+                );
+            }
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if header_button(ui, ICON_TRASH_2, "Delete comment", true) {
+                *delete = Some(c.id);
+            }
+            if header_button(ui, ICON_PENCIL, "Edit comment", true) {
+                *edit = Some(c.id);
+            }
+        });
+    });
+    if let Some(l) = &c.loc {
+        for q in l.span.quote.iter().take(1) {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("> {q}"))
+                        .small()
+                        .monospace()
+                        .color(pal.weak),
+                )
+                .truncate(),
+            );
+        }
+        if l.span.quote.len() > 1 || l.span.more {
+            ui.label(RichText::new("> …").small().monospace().color(pal.weak));
+        }
+    }
+    ui.label(RichText::new(c.body.as_str()).color(pal.text));
 }
 
 #[cfg(test)]
@@ -1354,5 +2028,86 @@ mod tests {
         assert_eq!(letter(&f, Section::Changes), 'D');
         assert_eq!(letter(&f, Section::Untracked), '?');
         assert_eq!(letter(&f, Section::Conflicted), '!');
+    }
+
+    fn diff_text() -> String {
+        "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -3,4 +3,4 @@ fn x()\n ctx\n-old\n+new\n+newer\n tail\n"
+            .to_owned()
+    }
+
+    #[test]
+    fn rows_belong_to_the_side_their_line_number_refers_to() {
+        let m = DiffModel::parse(diff_text());
+        // rows: 0 diff, 1 hunk, 2 ctx(3/3), 3 -old(4), 4 +new(4), 5 +newer(5), 6 tail(5/6)
+        assert_eq!(m.commentable(0), None);
+        assert_eq!(m.commentable(1), None);
+        assert_eq!(m.commentable(2), Some((Side::New, 3)));
+        assert_eq!(m.commentable(3), Some((Side::Old, 4)));
+        assert_eq!(m.commentable(4), Some((Side::New, 4)));
+        assert_eq!(m.commentable(6), Some((Side::New, 6)));
+        assert_eq!(m.find_row(Side::Old, 4), Some(3));
+        assert_eq!(m.find_row(Side::New, 4), Some(4));
+        assert!(m.is_row(5, Side::New, 5) && !m.is_row(5, Side::Old, 5));
+    }
+
+    #[test]
+    fn a_range_stays_on_one_side_and_skips_the_other_sides_rows() {
+        let m = DiffModel::parse(diff_text());
+        let s = m.select(4, 5).unwrap();
+        assert_eq!((s.side, s.start, s.end), (Side::New, 4, 5));
+        assert_eq!(s.quote, ["new", "newer"]);
+        // The deleted row inside the range is not part of a new-side range.
+        let s = m.select(6, 2).unwrap();
+        assert_eq!((s.side, s.start, s.end), (Side::New, 3, 6));
+        assert_eq!(s.quote, ["ctx", "new", "newer", "tail"]);
+        // Old side: just the deleted line.
+        let s = m.select(3, 3).unwrap();
+        assert_eq!((s.side, s.start, s.end), (Side::Old, 4, 4));
+        assert_eq!(s.quote, ["old"]);
+        // Across sides, or onto a hunk/meta row: no range.
+        assert_eq!(m.select(3, 4), None);
+        assert_eq!(m.select(2, 1), None);
+        assert_eq!(m.select(0, 2), None);
+    }
+
+    #[test]
+    fn long_ranges_quote_twelve_lines_and_say_there_is_more() {
+        let mut text = String::from("@@ -0,0 +1,20 @@\n");
+        for i in 0..20 {
+            text.push_str(&format!("+line {i}\n"));
+        }
+        let m = DiffModel::parse(text);
+        let s = m.select(1, 20).unwrap();
+        assert_eq!((s.start, s.end), (1, 20));
+        assert_eq!(s.quote.len(), crate::review::MAX_QUOTE_LINES);
+        assert_eq!(s.quote[11], "line 11");
+        assert!(s.more);
+        assert!(!m.select(1, 12).unwrap().more);
+    }
+
+    #[test]
+    fn combined_conflict_rows_cannot_be_commented() {
+        let m =
+            DiffModel::parse("diff --cc f\n@@@ -1,2 -1,2 +1,4 @@@\n  a\n++<<<<<<< x\n".to_owned());
+        assert!((0..m.rows().len()).all(|i| m.commentable(i).is_none()));
+    }
+
+    #[test]
+    fn comments_survive_refreshes_and_file_switches_but_the_open_editor_does_not() {
+        let mut st = ViewState::default();
+        st.apply_listing(Some(listing(vec![file("a", None, None, true, false)])));
+        let root = st.root.clone().unwrap();
+        st.reviews.of_mut(&root).add(None, "keep me").unwrap();
+        st.editor = Some(Editor::new(EditKind::General));
+        st.apply_listing(Some(listing(vec![file("a", None, None, true, false)])));
+        st.selected = Some(FileKey {
+            path: "a".into(),
+            section: Section::Untracked,
+        });
+        assert_eq!(st.reviews.of(&root).map(Review::len), Some(1));
+        assert!(st.editor.is_some());
+        st.clear_listing();
+        assert!(st.editor.is_none());
+        assert_eq!(st.reviews.of(&root).map(Review::len), Some(1));
     }
 }

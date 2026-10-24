@@ -5,6 +5,7 @@ pub mod agents;
 pub mod changes;
 pub mod config;
 pub mod ctl;
+pub mod fleet;
 pub mod gdrive;
 pub(crate) mod git;
 pub mod mux;

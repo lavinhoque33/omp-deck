@@ -30,7 +30,14 @@ host), so closing a tab or the whole app leaves omp running.
   auto-compact buffer, per-tool schema sizes) for tabs running with live control.
 - **Usage**: omp's `/usage` as a native view (Ctrl+Shift+U or the status-bar usage chip): remaining quota
   per provider and window with reset times, a year of activity as a heatmap, and top models by cost.
-- **Agent hub and session tree**: browse subagent transcripts and the session tree, fork or navigate from a node.
+- **Agents dashboard** (Ctrl+Shift+A or the status-bar Agents chip): one card per open tab and per session still
+  running in the background, with its state (working, needs input, idle, ended), model, context use, cost,
+  tokens, changed files and last reply; expand a card to see its subagents and open their transcripts. Search and
+  filter by state; click a card to jump to that session.
+- **Split view**: show two to four tabs side by side, stacked or in a grid (tab or sidebar menu "Open in split
+  right / down", or the command palette); each pane is a full terminal, Ctrl+Alt+Arrow moves between panes, and
+  the status bar follows the focused pane. The layout is restored on the next start.
+- **Session tree**: browse the session tree, fork or navigate from a node.
 - **omp updates and settings**: update check badge, update actions, and a searchable editor for every `omp config` key.
 - **Google Drive backup**: sign in with Google and back up your omp config (settings, models,
   custom agents, skills, …) and prompt history to a private Drive app folder, automatically when it
@@ -50,7 +57,9 @@ host), so closing a tab or the whole app leaves omp running.
   turned off in Settings → OmpDeck → Notifications.
 - **Changes panel** (Ctrl+Shift+G, or click the git chip in the status bar): the active tab's git changes,
   grouped into conflicted, staged, changed and untracked files, with a diff view, stage / unstage, discard,
-  delete untracked files (both confirmed first) and copy the whole diff.
+  delete untracked files (both confirmed first) and copy the whole diff. Click a diff line (Shift+click for a
+  range) to leave a review comment; **Insert into omp** puts all comments with file and line references into
+  omp's input for you to edit, **Send** submits them when omp is idle.
 - **Command palette** (Ctrl+Shift+K) runs any OmpDeck action by typing part of its name: menus, session
   and project actions, model and thinking switches, settings pages. The **quick switcher** (Ctrl+Shift+E)
   jumps to an open tab, a session or a project.
@@ -177,7 +186,8 @@ The default session store is `$PI_CODING_AGENT_DIR/sessions` if set, otherwise `
 | Ctrl+Shift+E | Quick switcher: open tabs, sessions, projects |
 | Ctrl+Shift+G | Changes panel |
 | Ctrl+PgUp / Ctrl+PgDn | Previous / next tab |
-| Ctrl+Shift+A | Agent hub |
+| Ctrl+Shift+A | Agents dashboard |
+| Ctrl+Alt+Arrow | Move focus between split panes |
 | Ctrl+Shift+B | Session tree |
 | Ctrl+Shift+= / - / 0 | Font larger / smaller / reset |
 | Ctrl+Shift+C | Copy terminal selection |

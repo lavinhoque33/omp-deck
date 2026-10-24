@@ -63,6 +63,8 @@ pub enum BarAction {
     Reopen,
     Refresh,
     OpenUsage,
+    /// Show or hide the agents dashboard.
+    OpenAgents,
     FontLarger,
     FontSmaller,
     FontReset,
@@ -480,6 +482,18 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
         .clicked()
         {
             pick(ui, &mut action, BarAction::OpenUsage);
+        }
+        if menu_item(
+            ui,
+            crate::icons::ICON_NETWORK,
+            "Agents dashboard",
+            Some("Ctrl+Shift+A"),
+            true,
+            false,
+        )
+        .clicked()
+        {
+            pick(ui, &mut action, BarAction::OpenAgents);
         }
         if let Some(o) = &input.omp {
             let checking = *o.state == UpdateState::Checking;
