@@ -84,7 +84,7 @@ public static class OmpDeckShortcutAumid
 
     static void Check(int hr, string what)
     {
-        if (hr < 0) throw new COMException(what + " failed", hr);
+        if (hr < 0) throw new COMException(what + " failed: HRESULT 0x" + hr.ToString("X8"), hr);
     }
 
     public static void Set(string path, string appId)
@@ -92,7 +92,8 @@ public static class OmpDeckShortcutAumid
         object link = new CShellLink();
         try
         {
-            ((IPersistFile)link).Load(path, 0);
+            // STGM_READWRITE: a link loaded with STGM_READ (0) hands out a read-only property store.
+            ((IPersistFile)link).Load(path, 2);
             var store = (IPropertyStore)link;
             var key = new PropertyKey { fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5 };
             // InitPropVariantFromString is an inline helper in propvarutil.h, not a propsys.dll export:
