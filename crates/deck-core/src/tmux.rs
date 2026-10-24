@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::config_dir;
 use crate::mux::{LaunchSpec, OMP_ENV, Pane, effective_cwd, terminal_env};
@@ -13,6 +13,10 @@ use crate::platform;
 use crate::status::breadcrumb_key_for_tty;
 
 pub const APP_SOCKET: &str = "omp-deck";
+
+/// How long [`Tmux::kill`] waits for detached clients to leave, and how often it looks.
+const KILL_DETACH_WAIT: Duration = Duration::from_secs(2);
+const KILL_DETACH_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TmuxError {
@@ -181,8 +185,27 @@ impl Tmux {
             .is_ok_and(|o| o.status.success())
     }
 
+    /// Ends session `name`. Its clients are detached first and given time to go away: tmux (3.7c,
+    /// `tty-keys.c:1014`, still unguarded on master) runs `window_update_focus(c->session->curw
+    /// ->window)` for a focus-in report (`ESC [ I`) still readable on the tty of a client whose
+    /// `c->session` is NULL, and `kill-session` NULLs that for every attached client. The server
+    /// then segfaults and every other session on the socket dies with it. A detached client keeps
+    /// its session pointer until it is gone (`server_client_detach` records `exit_session`;
+    /// only `server_client_lost` clears it), so waiting for the client list to empty first closes
+    /// the window. OmpDeck tabs report focus changes constantly, e.g. while the stop dialog is open.
     pub fn kill(&self, name: &str) -> Result<(), TmuxError> {
-        let out = self.run(&["kill-session", "-t", &format!("={name}")])?;
+        let target = format!("={name}");
+        // Failure (no such session, no server) is reported by `kill-session` below.
+        if self
+            .run(&["detach-client", "-s", &target])
+            .is_ok_and(|o| o.status.success())
+        {
+            let deadline = Instant::now() + KILL_DETACH_WAIT;
+            while self.has_clients(&target) && Instant::now() < deadline {
+                std::thread::sleep(KILL_DETACH_POLL);
+            }
+        }
+        let out = self.run(&["kill-session", "-t", &target])?;
         if out.status.success() {
             Ok(())
         } else {
@@ -191,6 +214,12 @@ impl Tmux {
                 stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
             })
         }
+    }
+
+    /// True while any client is attached to `target` (`=name`). Unknown session: false.
+    fn has_clients(&self, target: &str) -> bool {
+        self.run(&["list-clients", "-t", target, "-F", "#{client_pid}"])
+            .is_ok_and(|o| o.status.success() && !o.stdout.iter().all(u8::is_ascii_whitespace))
     }
 
     /// See contract: maps each live session to the top-level session `.jsonl` files (direct

@@ -319,3 +319,118 @@ fn generated_config_sources_cleanly_twice() {
     });
     assert_eq!(fs::read_to_string(&out_file).unwrap(), "kitty 1 1\n");
 }
+
+/// tmux (3.7c, `tty-keys.c:1014`) dereferences `c->session->curw` when a client whose session
+/// was destroyed still has focus-in (`ESC [ I`) bytes in its tty buffer: the whole server
+/// segfaults and takes every other session down. `Tmux::kill` must detach the clients first.
+#[cfg(unix)]
+#[test]
+fn killing_a_session_whose_client_reports_focus_does_not_crash_the_server() {
+    use std::io::Write;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    if !tmux_available() {
+        eprintln!("tmux not installed; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let socket = format!("omp-deck-test-{}-focus", std::process::id());
+    let tmux = Tmux::with_socket("tmux", socket, dir.path().join("cfg/tmux.conf"));
+    let _server = Server { tmux: tmux.clone() };
+    let conf = tmux.ensure_config().unwrap();
+
+    for name in ["omp-a", "omp-b"] {
+        let argv = vec!["sleep".to_string(), "60".to_string()];
+        let spec = tmux.attach_or_create(name, dir.path(), &argv);
+        let mut args = spec.args.clone();
+        let at = args.iter().position(|a| a == "new-session").unwrap() + 1;
+        args.insert(at, "-d".to_string());
+        let out = Command::new(&spec.program).args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A real tmux client attached to A through a PTY, so the server reads that tty.
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: valid out-pointers; null name/termios/winsize are allowed.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // SAFETY: both fds are fresh and owned here.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let mut client = Command::new("tmux");
+    client
+        .args(["-L", tmux.socket(), "-f"])
+        .arg(&conf)
+        .args(["attach-session", "-t", "=omp-a"])
+        .env("TERM", "xterm-256color")
+        .env_remove("TMUX")
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave);
+    // SAFETY: only async-signal-safe calls (setsid, ioctl) between fork and exec.
+    unsafe {
+        client.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut client = client.spawn().unwrap();
+
+    let attached = || {
+        Command::new("tmux")
+            .args(["-L", tmux.socket(), "list-clients", "-t", "=omp-a"])
+            .output()
+            .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
+    };
+    let end = Instant::now() + Duration::from_secs(5);
+    while !attached() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(attached(), "the client never attached");
+
+    // The app's focus reports while its Stop dialog is open: a steady stream of focus in/out.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let mut tty = fs::File::from(master);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if tty.write_all(b"\x1b[I\x1b[O").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        })
+    };
+
+    let result = tmux.kill("omp-a");
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+    let _ = writer.join();
+    let _ = client.kill();
+    let _ = client.wait();
+
+    result.unwrap();
+    let alive = tmux.alive_sessions();
+    assert!(
+        alive.contains("omp-b"),
+        "the server died with the killed session: alive = {alive:?}"
+    );
+    assert!(!alive.contains("omp-a"), "{alive:?}");
+}
