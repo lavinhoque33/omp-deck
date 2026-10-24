@@ -464,7 +464,7 @@ pub fn show(
     ui.add_space(theme::dens(6.0, 8.0));
 
     let field_h = theme::dens(28.0, 36.0);
-    let neutral = theme::neutral();
+    let neutral = theme::flat();
     ui.allocate_ui_with_layout(
         vec2(ui.available_width(), field_h),
         egui::Layout::right_to_left(egui::Align::Center),
@@ -495,7 +495,7 @@ pub fn show(
                     .frame(
                         Frame::new()
                             .fill(if neutral { pal.bg } else { pal.surface })
-                            .corner_radius(if neutral { 8 } else { 11 })
+                            .corner_radius(if neutral { theme::ui_rad(8) } else { 11 })
                             .stroke(Stroke::new(
                                 1.0,
                                 if focused { pal.accent } else { pal.stroke },
@@ -909,7 +909,7 @@ fn refresh_button(ui: &mut Ui, spinning: bool) -> egui::Response {
         .ctx()
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
     let p = ui.painter();
-    let neutral = theme::neutral();
+    let neutral = theme::flat();
     p.rect_filled(
         rect,
         if neutral { 8 } else { 10 },
@@ -1061,7 +1061,7 @@ fn group_header(
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         let (name, hint) = header_text(spec);
-        if theme::neutral() {
+        if theme::flat() {
             paint_header_neutral(p, pal, spec, (&name, &hint), &geom, open_t, &hover);
         } else {
             paint_header_neon(p, pal, spec, (&name, &hint), &geom, open_t, &hover);
@@ -1158,7 +1158,7 @@ fn paint_header_extras(p: &egui::Painter, pal: &Palette, geom: &HeaderGeom, hove
     if let Some(r) = geom.wt
         && hover.hov > 0.01
     {
-        if theme::neutral() {
+        if theme::flat() {
             p.rect_filled(r, 6, pal.raised.gamma_multiply(hover.hov * hover.wt));
         } else {
             p.rect_filled(
@@ -1172,7 +1172,7 @@ fn paint_header_extras(p: &egui::Painter, pal: &Palette, geom: &HeaderGeom, hove
             r.center(),
             Align2::CENTER_CENTER,
             ICON_GIT_BRANCH_PLUS,
-            if theme::neutral() { 15.0 } else { 17.0 },
+            if theme::flat() { 15.0 } else { 17.0 },
             theme::mix(pal.weak, pal.text_strong, hover.wt).gamma_multiply(hover.hov),
         );
     }
@@ -1318,7 +1318,7 @@ fn paint_header_neutral(
 fn paint_header_chrome(p: &egui::Painter, pal: &Palette, rect: Rect, open_t: f32, hov: f32) {
     let color = theme::mix(pal.weak, pal.text_strong, hov);
     if hov > 0.01 {
-        let radius = if theme::neutral() { 6 } else { 9 };
+        let radius = if theme::flat() { 6 } else { 9 };
         p.rect(
             rect,
             radius,
@@ -1327,7 +1327,7 @@ fn paint_header_chrome(p: &egui::Painter, pal: &Palette, rect: Rect, open_t: f32
             StrokeKind::Inside,
         );
     }
-    if theme::neutral() {
+    if theme::flat() {
         let chev = if open_t > 0.5 {
             ICON_CHEVRON_DOWN
         } else {
@@ -1371,14 +1371,14 @@ fn open_tabs_section(ui: &mut Ui, input: &SidebarInput<'_>, out: &mut SidebarOut
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         paint_header_chrome(p, pal, rect, open_t, hov);
-        let x = rect.left() + if theme::neutral() { 26.0 } else { 28.0 };
+        let x = rect.left() + if theme::flat() { 26.0 } else { 28.0 };
         let y = rect.center().y;
-        let size = if theme::neutral() { 13.0 } else { 14.0 };
+        let size = if theme::flat() { 13.0 } else { 14.0 };
         p.text(
             pos2(x, y),
             Align2::LEFT_CENTER,
             "Open tabs",
-            theme::font(size),
+            theme::label_font(size),
             pal.text_strong,
         );
         // Count, plus how many wait for input (the section may be collapsed).
@@ -1393,7 +1393,7 @@ fn open_tabs_section(ui: &mut Ui, input: &SidebarInput<'_>, out: &mut SidebarOut
             pos2(right, y),
             Align2::RIGHT_CENTER,
             input.tabs.len().to_string(),
-            theme::font(size - 2.0),
+            theme::label_font(size - 2.0),
             pal.weak,
         );
         right = count.left() - 10.0;
@@ -1441,7 +1441,7 @@ fn open_tab_row(
         .term()
         .and_then(|t| t.cwd.file_name())
         .and_then(|n| n.to_str());
-    let neutral = theme::neutral();
+    let neutral = theme::flat();
 
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h()), Sense::click());
     let close_rect =
@@ -1573,7 +1573,7 @@ fn session_row(
     if ui.is_rect_visible(rect) {
         let pill = rect.shrink2(vec2(2.0, 0.0));
         let p = ui.painter();
-        if theme::neutral() {
+        if theme::flat() {
             paint_row_neutral(
                 p,
                 pal,
@@ -1624,7 +1624,7 @@ fn session_row(
         }
     }
     let dot = pos2(
-        rect.left() + 2.0 + if theme::neutral() { 15.0 } else { 19.0 },
+        rect.left() + 2.0 + if theme::flat() { 15.0 } else { 19.0 },
         rect.center().y,
     );
     if busy {
@@ -1695,8 +1695,9 @@ fn paint_row_neutral(
 /// active row); selection: Neutral raised fill + 2 px accent edge, Neon accent-tinted card with a
 /// gradient edge.
 fn paint_row_bg(p: &egui::Painter, pal: &Palette, pill: Rect, (hov, sel): (f32, f32)) {
-    let neutral = theme::neutral();
-    let radius = if neutral { 6 } else { 10 };
+    let neutral = theme::flat();
+    let lk = theme::look();
+    let radius = if neutral { theme::ui_rad(6) } else { 10 };
     p.rect_filled(
         pill,
         radius,
@@ -1704,12 +1705,33 @@ fn paint_row_bg(p: &egui::Painter, pal: &Palette, pill: Rect, (hov, sel): (f32, 
     );
     if sel > 0.01 {
         if neutral {
-            p.rect_filled(pill, radius, pal.raised.gamma_multiply(sel));
-            let bar = Rect::from_center_size(
-                pos2(pill.left() + 1.0, pill.center().y),
-                vec2(2.0, 14.0 * sel),
-            );
-            p.rect_filled(bar, 1, pal.accent);
+            if lk.sel == theme::Sel::Tint {
+                p.rect(
+                    pill,
+                    radius,
+                    theme::skin::alpha(pal.accent, (28.0 * sel) as u8),
+                    Stroke::new(1.0, theme::skin::alpha(pal.accent, (110.0 * sel) as u8)),
+                    StrokeKind::Inside,
+                );
+            } else {
+                p.rect_filled(pill, radius, pal.raised.gamma_multiply(sel));
+                let bar = Rect::from_center_size(
+                    pos2(pill.left() + 1.0, pill.center().y),
+                    vec2(2.0, 14.0 * sel),
+                );
+                if lk.sel == theme::Sel::GradBar {
+                    theme::skin::gradient_card(
+                        p,
+                        egui::Id::unique("row-bar"),
+                        bar,
+                        1.0,
+                        (pal.accent_a, pal.accent_b),
+                        theme::skin::Dir::Down,
+                    );
+                } else {
+                    p.rect_filled(bar, 1, pal.accent);
+                }
+            }
         } else {
             p.rect(
                 pill,
@@ -1733,10 +1755,15 @@ fn paint_row_bg(p: &egui::Painter, pal: &Palette, pill: Rect, (hov, sel): (f32, 
         }
     }
     if hov > 0.01 {
+        let w = if lk.card.hover == theme::Hover::Hard {
+            2.0
+        } else {
+            1.0
+        };
         p.rect_stroke(
             pill,
             radius,
-            Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(hov)),
+            Stroke::new(w, theme::hover_stroke(pal).gamma_multiply(hov)),
             StrokeKind::Inside,
         );
     }

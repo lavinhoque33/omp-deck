@@ -22,6 +22,7 @@ use crate::dashboard_model::{Card, CardKey, CardSrc, Extra, Status};
 use crate::running::RunningSnapshot;
 use crate::statusfmt::short_model_name;
 use crate::tabs::{ClosedTab, Tab, TabRole};
+use crate::theme::{self, Palette};
 use crate::toast::ToastKind;
 
 /// What the dashboard knows about a session file from the sidebar's scan.
@@ -425,9 +426,10 @@ impl App {
                 .as_ref()
                 .map(|p| (p.session.as_path(), p.agent_id.as_str())),
         };
-        let actions = egui::CentralPanel::no_frame()
-            .show(ui, |ui| dashboard::show(ui, &mut self.dash, &input))
-            .inner;
+        let actions = theme::skin::central(ui, Palette::of_ui(ui), false, |ui| {
+            dashboard::show(ui, &mut self.dash, &input)
+        })
+        .inner;
         for a in actions {
             match a {
                 DashAction::Close => self.close_dashboard(),

@@ -27,5 +27,5 @@ pub use crate::core::{ScreenText, TermOptions, Terminal, TerminalEvents};
 pub use crate::fonts::{FontReport, install_fonts};
 pub use crate::out::wait_detached;
 pub use crate::remote::{Remote, RemoteEvent, RemoteRx, RemoteTx};
-pub use crate::theme::TermTheme;
+pub use crate::theme::{TermColors, TermTheme};
 pub use crate::widget::{TerminalResponse, TerminalView};

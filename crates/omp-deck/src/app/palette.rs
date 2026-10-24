@@ -824,29 +824,29 @@ impl App {
             "Theme: Dark",
             None,
             ICON_MOON,
-            need(cfg.theme != Theme::Dark, "Already active"),
+            need(!cfg.dark(), "Already active"),
         );
         add(
             "theme.light",
             "Theme: Light",
             None,
             ICON_SUN,
-            need(cfg.theme != Theme::Light, "Already active"),
+            crate::theme::dark_only_reason(cfg.style)
+                .or_else(|| need(cfg.theme != Theme::Light, "Already active")),
         );
-        add(
-            "style.neutral",
-            "Style: Neutral",
-            None,
-            ICON_SQUARE,
-            need(cfg.style != UiStyle::Neutral, "Already active"),
-        );
-        add(
-            "style.neon",
-            "Style: Midnight neon",
-            None,
-            ICON_SPARKLES,
-            need(cfg.style != UiStyle::Neon, "Already active"),
-        );
+        for style in UiStyle::ALL {
+            add(
+                &format!("style.{}", style.key()),
+                &format!("Style: {}", style.label()),
+                None,
+                if style == UiStyle::Neutral {
+                    ICON_SQUARE
+                } else {
+                    ICON_SPARKLES
+                },
+                need(cfg.style != style, "Already active"),
+            );
+        }
         add(
             "density.compact",
             "Density: Compact",
@@ -1234,8 +1234,14 @@ impl App {
             "font.reset" => self.set_font_size(DEFAULT_FONT),
             "theme.dark" => self.set_theme(Theme::Dark),
             "theme.light" => self.set_theme(Theme::Light),
-            "style.neutral" => self.set_style(UiStyle::Neutral),
-            "style.neon" => self.set_style(UiStyle::Neon),
+            other if other.starts_with("style.") => {
+                if let Some(style) = UiStyle::ALL
+                    .into_iter()
+                    .find(|s| other.strip_prefix("style.") == Some(s.key()))
+                {
+                    self.set_style(style);
+                }
+            }
             "density.compact" => self.set_density(Density::Compact),
             "density.comfortable" => self.set_density(Density::Comfortable),
             "window.native_titlebar" => self.set_native_decorations(!self.cfg.native_decorations),

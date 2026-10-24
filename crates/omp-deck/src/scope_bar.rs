@@ -81,7 +81,7 @@ pub fn chip(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState) -> Vec<
 
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        let neutral = theme::neutral();
+        let neutral = theme::flat();
         let (fill, stroke) = match input.scope {
             Some(_) if neutral => (
                 theme::mix(pal.surface, pal.raised, hov),
@@ -98,7 +98,7 @@ pub fn chip(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState) -> Vec<
         };
         p.rect(
             rect,
-            if neutral { 8 } else { 11 },
+            if neutral { theme::ui_rad(8) } else { 11 },
             fill,
             Stroke::new(1.0, stroke),
             StrokeKind::Inside,

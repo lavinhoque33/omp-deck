@@ -41,6 +41,20 @@ fn parse_config(bytes: &[u8]) -> Result<AppConfig, serde_json::Error> {
         {
             map.insert("drive_backup_interval".into(), "Off".into());
         }
+        if !map.contains_key("style_rev") {
+            let light = map.get("theme").and_then(|t| t.as_str()) == Some("Light");
+            let neutral_or_absent = map
+                .get("style")
+                .is_none_or(|s| s.as_str() == Some("Neutral"));
+            if neutral_or_absent {
+                // A light-theme user keeps Neutral (Blueprint is dark-only).
+                map.insert(
+                    "style".into(),
+                    if light { "Neutral" } else { "Blueprint" }.into(),
+                );
+            }
+            map.insert("style_rev".into(), STYLE_REV.into());
+        }
     }
     serde_json::from_value(value)
 }
@@ -55,6 +69,8 @@ pub struct AppConfig {
     pub open_tabs: Vec<TabState>,
     pub active_tab: Option<usize>,
     pub style: UiStyle,
+    /// Style-set version this file was written with (see [`STYLE_REV`]).
+    pub style_rev: u32,
     pub density: Density,
     /// false → OmpDeck draws its own title bar; true → the window manager's frame.
     pub native_decorations: bool,
@@ -145,6 +161,7 @@ impl Default for AppConfig {
             open_tabs: Vec::new(),
             active_tab: None,
             style: UiStyle::default(),
+            style_rev: STYLE_REV,
             density: Density::default(),
             native_decorations: false,
             check_updates: true,
@@ -166,6 +183,13 @@ impl Default for AppConfig {
             removed_worktrees: BTreeMap::new(),
             split: None,
         }
+    }
+}
+
+impl AppConfig {
+    /// Whether to render dark: the `Dark` theme, or any dark-only style regardless of theme.
+    pub fn dark(&self) -> bool {
+        self.theme == Theme::Dark || self.style.dark_only()
     }
 }
 
@@ -246,12 +270,107 @@ pub enum Theme {
     Light,
 }
 
+/// Version of the style set; configs saved before it existed are migrated in `parse_config`.
+pub const STYLE_REV: u32 = 1;
+
 /// Visual style axis (second to light/dark `Theme`).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum UiStyle {
-    #[default]
     Neutral,
     Neon,
+    ZincContrast,
+    LayeredDepth,
+    TealSignal,
+    SlateInk,
+    MonoWire,
+    GraphiteIslands,
+    Aurora,
+    ObsidianGlass,
+    #[default]
+    Blueprint,
+    Ember,
+    IndigoNight,
+    Phosphor,
+    NeoBrutal,
+    RoseNoir,
+    Spotlight,
+    TwoToneFrame,
+}
+
+impl UiStyle {
+    /// Every style in picker order (Blueprint, Neutral, Neon, then the gallery).
+    pub const ALL: [UiStyle; 18] = [
+        UiStyle::Blueprint,
+        UiStyle::Neutral,
+        UiStyle::Neon,
+        UiStyle::ZincContrast,
+        UiStyle::LayeredDepth,
+        UiStyle::TealSignal,
+        UiStyle::SlateInk,
+        UiStyle::MonoWire,
+        UiStyle::GraphiteIslands,
+        UiStyle::Aurora,
+        UiStyle::ObsidianGlass,
+        UiStyle::Ember,
+        UiStyle::IndigoNight,
+        UiStyle::Phosphor,
+        UiStyle::NeoBrutal,
+        UiStyle::RoseNoir,
+        UiStyle::Spotlight,
+        UiStyle::TwoToneFrame,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UiStyle::Neutral => "Neutral",
+            UiStyle::Neon => "Neon",
+            UiStyle::ZincContrast => "Zinc Contrast",
+            UiStyle::LayeredDepth => "Layered Depth",
+            UiStyle::TealSignal => "Teal Signal",
+            UiStyle::SlateInk => "Slate Ink",
+            UiStyle::MonoWire => "Mono Wire",
+            UiStyle::GraphiteIslands => "Graphite Islands",
+            UiStyle::Aurora => "Aurora",
+            UiStyle::ObsidianGlass => "Obsidian Glass",
+            UiStyle::Blueprint => "Blueprint",
+            UiStyle::Ember => "Ember",
+            UiStyle::IndigoNight => "Indigo Night",
+            UiStyle::Phosphor => "Phosphor",
+            UiStyle::NeoBrutal => "Neo-Brutal",
+            UiStyle::RoseNoir => "Rosé Noir",
+            UiStyle::Spotlight => "Spotlight",
+            UiStyle::TwoToneFrame => "Two-Tone Frame",
+        }
+    }
+
+    /// Stable snake_case identifier.
+    pub fn key(self) -> &'static str {
+        match self {
+            UiStyle::Neutral => "neutral",
+            UiStyle::Neon => "neon",
+            UiStyle::ZincContrast => "zinc_contrast",
+            UiStyle::LayeredDepth => "layered_depth",
+            UiStyle::TealSignal => "teal_signal",
+            UiStyle::SlateInk => "slate_ink",
+            UiStyle::MonoWire => "mono_wire",
+            UiStyle::GraphiteIslands => "graphite_islands",
+            UiStyle::Aurora => "aurora",
+            UiStyle::ObsidianGlass => "obsidian_glass",
+            UiStyle::Blueprint => "blueprint",
+            UiStyle::Ember => "ember",
+            UiStyle::IndigoNight => "indigo_night",
+            UiStyle::Phosphor => "phosphor",
+            UiStyle::NeoBrutal => "neo_brutal",
+            UiStyle::RoseNoir => "rose_noir",
+            UiStyle::Spotlight => "spotlight",
+            UiStyle::TwoToneFrame => "two_tone_frame",
+        }
+    }
+
+    /// Styles that only exist as dark palettes (the light/dark `Theme` is ignored).
+    pub fn dark_only(self) -> bool {
+        !matches!(self, UiStyle::Neutral | UiStyle::Neon)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -671,6 +790,63 @@ mod tests {
             AppConfig::load_from(&p).drive_backup_interval,
             SyncInterval::Off
         );
+    }
+
+    fn load_str(json: &str) -> AppConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        fs::write(&p, json).unwrap();
+        AppConfig::load_from(&p)
+    }
+
+    #[test]
+    fn legacy_style_migrates_to_blueprint_only_for_dark_neutral() {
+        let c = load_str(r#"{"theme": "Dark", "style": "Neutral"}"#);
+        assert_eq!((c.style, c.style_rev), (UiStyle::Blueprint, STYLE_REV));
+        let c = load_str("{}");
+        assert_eq!((c.style, c.style_rev), (UiStyle::Blueprint, STYLE_REV));
+        let c = load_str(r#"{"theme": "Light", "style": "Neutral"}"#);
+        assert_eq!((c.style, c.style_rev), (UiStyle::Neutral, STYLE_REV));
+        let c = load_str(r#"{"theme": "Light"}"#);
+        assert_eq!(c.style, UiStyle::Neutral);
+        assert!(!c.dark());
+        let c = load_str(r#"{"style": "Neon"}"#);
+        assert_eq!(c.style, UiStyle::Neon);
+    }
+
+    #[test]
+    fn explicit_neutral_with_style_rev_sticks() {
+        let c = load_str(r#"{"style": "Neutral", "style_rev": 1}"#);
+        assert_eq!(c.style, UiStyle::Neutral);
+    }
+
+    #[test]
+    fn every_style_roundtrips_and_is_unique() {
+        assert_eq!(UiStyle::ALL.len(), 18);
+        let mut keys = std::collections::BTreeSet::new();
+        for (i, s) in UiStyle::ALL.iter().enumerate() {
+            assert!(!UiStyle::ALL[..i].contains(s));
+            assert!(keys.insert(s.key()));
+            let json = serde_json::to_string(s).unwrap();
+            assert_eq!(serde_json::from_str::<UiStyle>(&json).unwrap(), *s);
+            let c = load_str(&format!(r#"{{"style": {json}, "style_rev": 1}}"#));
+            assert_eq!(c.style, *s);
+        }
+        assert_eq!(UiStyle::ALL[0], UiStyle::Blueprint);
+    }
+
+    #[test]
+    fn dark_prefers_dark_only_styles_over_light_theme() {
+        let mut c = AppConfig {
+            theme: Theme::Light,
+            style: UiStyle::Aurora,
+            ..AppConfig::default()
+        };
+        assert!(c.dark());
+        c.style = UiStyle::Neutral;
+        assert!(!c.dark());
+        c.theme = Theme::Dark;
+        assert!(c.dark());
     }
 
     #[test]

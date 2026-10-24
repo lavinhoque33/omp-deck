@@ -20,7 +20,7 @@ use egui::{
 };
 
 use crate::sidebar::{self, MenuEnv, SidebarAction, SidebarOutput};
-use crate::theme::{self, Palette};
+use crate::theme::{self, Palette, skin};
 use crate::widgets::paint_icon;
 
 /// What a terminal tab runs.
@@ -422,7 +422,7 @@ pub fn tab_hit_h() -> f32 {
 }
 
 fn pill_inset_y() -> f32 {
-    if theme::neutral() { 3.0 } else { 4.0 }
+    if theme::flat() { 3.0 } else { 4.0 }
 }
 const MAX_TEXT_W: f32 = 170.0;
 const CLOSE_W: f32 = 20.0;
@@ -524,22 +524,38 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         // Hover / active pill.
-        let neutral = theme::neutral();
-        let radius = if neutral { 6 } else { 10 };
-        p.rect_filled(
-            pill,
-            radius,
-            theme::hover_fill(pal).gamma_multiply(0.8 * hov * (1.0 - sel)),
-        );
-        if hov > 0.01 {
-            p.rect_stroke(
+        let neutral = theme::flat();
+        let gallery = theme::is_gallery();
+        let radius = if gallery {
+            theme::look().tab_r
+        } else if neutral {
+            6
+        } else {
+            10
+        };
+        if gallery {
+            let tab_pill = if skin::tab_joins_canvas() {
+                egui::Rect::from_min_max(pill.min, pos2(pill.max.x, rect.bottom()))
+            } else {
+                pill
+            };
+            skin::paint_tab(p, tab_pill, pal, skin::TabState { hov, sel });
+        } else {
+            p.rect_filled(
                 pill,
                 radius,
-                Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(hov)),
-                StrokeKind::Inside,
+                theme::hover_fill(pal).gamma_multiply(0.8 * hov * (1.0 - sel)),
             );
+            if hov > 0.01 {
+                p.rect_stroke(
+                    pill,
+                    radius,
+                    Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(hov)),
+                    StrokeKind::Inside,
+                );
+            }
         }
-        if sel > 0.01 {
+        if sel > 0.01 && !gallery {
             p.rect(
                 pill,
                 radius,

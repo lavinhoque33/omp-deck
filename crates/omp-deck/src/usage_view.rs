@@ -161,7 +161,7 @@ fn header(ui: &mut Ui, input: &ViewInput<'_>, out: &mut Vec<UsageAction>) {
             ui.painter().rect_filled(
                 rect,
                 theme::rad(8, 10),
-                if theme::neutral() {
+                if theme::flat() {
                     pal.surface
                 } else {
                     pal.accent.gamma_multiply(0.18)
@@ -241,7 +241,7 @@ fn tab_chip(ui: &mut Ui, label: &str, on: bool) -> egui::Response {
         p.rect_filled(
             rect,
             r,
-            if theme::neutral() {
+            if theme::flat() {
                 pal.raised
             } else {
                 pal.accent.gamma_multiply(0.22)
@@ -294,7 +294,7 @@ fn pick<'a>(t: Option<&'a Tile>, none: &'a str) -> (&'a str, &'a str) {
 
 fn card_frame(pal: &Palette) -> Frame {
     Frame::NONE
-        .fill(if theme::neutral() {
+        .fill(if theme::flat() {
             pal.panel
         } else {
             pal.surface.gamma_multiply(0.75)
@@ -401,11 +401,7 @@ fn sparkline(ui: &mut Ui, data: &[f64], size: egui::Vec2) {
             )
         })
         .collect();
-    let line = if theme::neutral() {
-        pal.glyph
-    } else {
-        pal.accent
-    };
+    let line = if theme::flat() { pal.glyph } else { pal.accent };
     ui.painter()
         .add(egui::Shape::line(pts, Stroke::new(1.5, line)));
 }
@@ -731,7 +727,7 @@ fn level_color(pal: &Palette, level: u8) -> Color32 {
         );
     }
     let t = f32::from(level.min(4)) / 4.0;
-    let top = if theme::neutral() {
+    let top = if theme::flat() {
         pal.accent
     } else {
         theme::mix(pal.accent_a, pal.accent_b, t)
@@ -1075,7 +1071,7 @@ fn models_table(ui: &mut Ui, rows: &[ModelRow]) {
             p.rect_filled(
                 bar,
                 1,
-                if theme::neutral() {
+                if theme::flat() {
                     pal.glyph.gamma_multiply(0.45)
                 } else {
                     pal.accent.gamma_multiply(0.55)

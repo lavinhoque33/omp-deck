@@ -5,7 +5,7 @@
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
-/// Which built-in palette a terminal uses.
+/// Which palette a terminal uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TermTheme {
     #[default]
@@ -15,6 +15,41 @@ pub enum TermTheme {
     NeutralDark,
     /// White paper, zinc text, ANSI tuned for contrast on white.
     NeutralLight,
+    /// App-supplied base colors over the [`TermTheme::NeutralDark`] ANSI table.
+    Custom(TermColors),
+}
+
+/// Base colors of a [`TermTheme::Custom`] palette, as `[r, g, b]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermColors {
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub cursor: [u8; 3],
+    pub selection_bg: [u8; 3],
+}
+
+/// ANSI 0..=15 of [`TermTheme::NeutralDark`], shared by [`TermTheme::Custom`].
+const NEUTRAL_DARK_ANSI: [Rgb; 16] = [
+    rgb(0x18181b),
+    rgb(0xf87171),
+    rgb(0x4ade80),
+    rgb(0xfacc15),
+    rgb(0x60a5fa),
+    rgb(0xc084fc),
+    rgb(0x22d3ee),
+    rgb(0xd4d4d8),
+    rgb(0x52525b),
+    rgb(0xfca5a5),
+    rgb(0x86efac),
+    rgb(0xfde047),
+    rgb(0x93c5fd),
+    rgb(0xd8b4fe),
+    rgb(0x67e8f9),
+    rgb(0xfafafa),
+];
+
+const fn from_bytes([r, g, b]: [u8; 3]) -> Rgb {
+    Rgb { r, g, b }
 }
 
 const fn rgb(hex: u32) -> Rgb {
@@ -95,24 +130,7 @@ impl Palette {
                 cursor: rgb(0xfafafa),
                 // Teal-900: the accent hue, dark enough that every ANSI foreground stays legible.
                 selection_bg: rgb(0x134e4a),
-                ansi: [
-                    rgb(0x18181b),
-                    rgb(0xf87171),
-                    rgb(0x4ade80),
-                    rgb(0xfacc15),
-                    rgb(0x60a5fa),
-                    rgb(0xc084fc),
-                    rgb(0x22d3ee),
-                    rgb(0xd4d4d8),
-                    rgb(0x52525b),
-                    rgb(0xfca5a5),
-                    rgb(0x86efac),
-                    rgb(0xfde047),
-                    rgb(0x93c5fd),
-                    rgb(0xd8b4fe),
-                    rgb(0x67e8f9),
-                    rgb(0xfafafa),
-                ],
+                ansi: NEUTRAL_DARK_ANSI,
             },
             // Normal colors are tailwind 600/700 (>= 4.5:1 on white where the hue allows);
             // brights are one step lighter (500/600) so they stay distinct yet readable.
@@ -140,6 +158,13 @@ impl Palette {
                     rgb(0x0891b2),
                     rgb(0xd4d4d8),
                 ],
+            },
+            TermTheme::Custom(c) => Palette {
+                foreground: from_bytes(c.foreground),
+                background: from_bytes(c.background),
+                cursor: from_bytes(c.cursor),
+                selection_bg: from_bytes(c.selection_bg),
+                ansi: NEUTRAL_DARK_ANSI,
             },
         }
     }
@@ -325,5 +350,39 @@ mod tests {
         let dark = Palette::for_theme(TermTheme::NeutralDark);
         let faint = resolve(Color::Spec(rgb(0xffffff)), &colors, &dark, true);
         assert_eq!(faint, rgb(0xadadae));
+    }
+
+    #[test]
+    fn custom_answers_with_its_colors_and_neutral_ansi() {
+        let custom = TermColors {
+            foreground: [1, 2, 3],
+            background: [4, 5, 6],
+            cursor: [7, 8, 9],
+            selection_bg: [10, 11, 12],
+        };
+        let p = Palette::for_theme(TermTheme::Custom(custom));
+        let colors = Colors::default();
+        // OSC 11 / 10 / 12 replies.
+        let bg = NamedColor::Background as usize;
+        assert_eq!(indexed(&colors, &p, bg), Rgb { r: 4, g: 5, b: 6 });
+        let fg = NamedColor::Foreground as usize;
+        assert_eq!(indexed(&colors, &p, fg), Rgb { r: 1, g: 2, b: 3 });
+        let cur = NamedColor::Cursor as usize;
+        assert_eq!(indexed(&colors, &p, cur), Rgb { r: 7, g: 8, b: 9 });
+        assert_eq!(
+            p.selection_bg,
+            Rgb {
+                r: 10,
+                g: 11,
+                b: 12
+            }
+        );
+        // ANSI (OSC 4) comes from NeutralDark.
+        let neutral = Palette::for_theme(TermTheme::NeutralDark);
+        assert_eq!(p.ansi, neutral.ansi);
+        // Host palette layout: ANSI 0..=15, foreground, background, cursor.
+        let host = p.host_colors();
+        assert_eq!(host[..16], neutral.host_colors()[..16]);
+        assert_eq!(host[16..], [[1, 2, 3], [4, 5, 6], [7, 8, 9]]);
     }
 }

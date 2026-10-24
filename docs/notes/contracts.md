@@ -1781,3 +1781,78 @@ Recon facts with file:line evidence: `docs/notes/wave15.md`.
   `Poll::completed`; pending hand-offs tracked per tab uid. Editor: Ctrl+Enter saves, Esc cancels; while it takes
   input it cancels `focus_pending`. The Review section shows for every ready repository (also a clean tree); the
   file list is sized to its rows (≤ 45 %), the file/diff divider is fixed.
+
+## Wave 16: theme gallery (16 dark styles, Blueprint default)
+
+Design + decisions: `docs/notes/wave16.md`; exact values: `docs/notes/theme-mockups.html`.
+
+### deck-core (`config.rs`)
+
+```rust
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum UiStyle {
+    Neutral, Neon,
+    ZincContrast, LayeredDepth, TealSignal, SlateInk, MonoWire, GraphiteIslands,
+    Aurora, ObsidianGlass, #[default] Blueprint, Ember, IndigoNight, Phosphor,
+    NeoBrutal, RoseNoir, Spotlight, TwoToneFrame,
+}
+impl UiStyle {
+    /// Gallery / palette order: Blueprint first, then Neutral, Neon, then mockups 1–16 minus Blueprint.
+    pub const ALL: [UiStyle; 18];
+    pub fn label(self) -> &'static str;   // "Blueprint", "Zinc Contrast", "Rosé Noir", …
+    pub fn key(self) -> &'static str;     // "blueprint", "zinc_contrast", … (palette ids `style.<key>`)
+    pub fn dark_only(self) -> bool;       // every style except Neutral and Neon
+}
+pub const STYLE_REV: u32 = 1;
+pub struct AppConfig { …, pub style_rev: u32 /* default STYLE_REV */, … }
+impl AppConfig {
+    /// Effective dark mode: `theme == Dark || style.dark_only()`.
+    pub fn dark(&self) -> bool;
+}
+```
+
+Serde names are the variant names (`"Blueprint"`, `"RoseNoir"`, …). `parse_config` migration: when the JSON has
+no `style_rev`, a `style` of `"Neutral"` or absent becomes `"Blueprint"` unless `theme` is `"Light"`; then
+`style_rev` = `STYLE_REV`. Unknown style strings keep failing the parse as today (no silent fallback beyond the
+existing behavior).
+
+### deck-term (`theme.rs`, re-exported from the crate root)
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermColors { pub foreground: [u8; 3], pub background: [u8; 3], pub cursor: [u8; 3], pub selection_bg: [u8; 3] }
+pub enum TermTheme { Dark, Light, NeutralDark, NeutralLight, Custom(TermColors) }
+```
+
+`Palette::for_theme(Custom(c))` = those four colors + Neutral dark's 16 ANSI colors. Everything that already takes
+a `TermTheme` (spawn options, `set_theme`, host color push, OSC 10/11/4 answers) works unchanged with `Custom`.
+
+### omp-deck
+
+- `theme::apply(ctx, style, density, dark)` builds per-style palettes + a per-style structural look; `dark` is
+  `AppConfig::dark()`. `theme::neutral()` is replaced by `theme::flat()` (true for every style but Neon).
+- `term_theme(theme, style)`: Neutral/Neon unchanged; new styles → `TermTheme::Custom` (canvas bg, text, text_strong,
+  mix(bg, accent, 0.35)).
+- Settings → Appearance: Style gallery (18 tiles); Light disabled with "<Style> is dark-only" for dark-only styles;
+  same gating in the title-bar menu and the command palette (`theme.light`). Palette: `style.<key>` per style
+  (replaces `style.neutral` / `style.neon`).
+
+### Wave 16 as built
+
+- deck-core: as specified. Extra migration rule: a legacy file with `theme: "Light"` and no `style` gets
+  `style: "Neutral"` written explicitly (otherwise serde's new default Blueprint, dark-only, would silently turn a
+  light-mode user dark).
+- deck-term: as specified; the NeutralDark ANSI table is one private `NEUTRAL_DARK_ANSI` shared by `NeutralDark`
+  and `Custom`.
+- omp-deck: `theme.rs` keeps the egui style build + shared helpers; new submodules `theme/palettes.rs` (one palette
+  per style), `theme/look.rs` (`Look`: per-style structure knobs: regions, card frame, hover/active effects,
+  canvas, tabs, selection, accordion kind/chevron/rail/segment bar, fonts), `theme/skin.rs` (window regions,
+  canvas decorations with cached meshes, card/tab/row painters) and `theme/acc.rs` (accordion geometry +
+  painting). Accessors: `theme::style()`, `look()`, `look_of(style)`, `palette(style, dark)`, `is_gallery()`
+  (one of the 16 new styles), `flat()`, `label_font(size)` (mono for Blueprint labels), `ui_rad(base)`.
+- Central panels go through `skin::central()` (all 5 call sites: terminal, split, dashboard, Settings, empty
+  state) so region decorations paint everywhere; it turns egui's scroll fade off only inside gallery styles'
+  filled central panel (Neutral/Neon unchanged, pixel-identical to v0.10.1). Cached meshes are keyed per style.
+- Known differences from the mockups: Graphite Islands' title bar is flush (not inset into the backdrop frame);
+  egui has one weight per font, so Neo-Brutal's heavy titles are approximated; glows are mesh gradients, not CSS
+  blur.

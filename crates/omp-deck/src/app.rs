@@ -380,6 +380,18 @@ fn term_theme(t: Theme, style: UiStyle) -> TermTheme {
         (UiStyle::Neutral, Theme::Light) => TermTheme::NeutralLight,
         (UiStyle::Neon, Theme::Dark) => TermTheme::Dark,
         (UiStyle::Neon, Theme::Light) => TermTheme::Light,
+        // Gallery styles are dark-only; the terminal follows the style's canvas colours.
+        (style, _) => {
+            let p = theme::palette(style, true);
+            let rgb = |c: egui::Color32| [c.r(), c.g(), c.b()];
+            let sel = theme::mix(p.bg, p.accent, 0.35);
+            TermTheme::Custom(deck_term::TermColors {
+                foreground: rgb(p.text),
+                background: rgb(p.bg),
+                cursor: rgb(p.text_strong),
+                selection_bg: rgb(sel),
+            })
+        }
     }
 }
 
@@ -407,7 +419,7 @@ impl App {
             cfg.font_size = DEFAULT_FONT;
         }
         cfg.font_size = cfg.font_size.clamp(MIN_FONT, MAX_FONT);
-        theme::apply(&ctx, cfg.style, cfg.density, cfg.theme == Theme::Dark);
+        theme::apply(&ctx, cfg.style, cfg.density, cfg.dark());
 
         let root = match &cli.sessions_root {
             Some(p) => SessionsRoot::at(p.clone()),
@@ -1040,12 +1052,7 @@ impl App {
 
     /// Re-applies theme × style × density to egui and every open terminal.
     fn restyle(&mut self) {
-        theme::apply(
-            &self.ctx,
-            self.cfg.style,
-            self.cfg.density,
-            self.cfg.theme == Theme::Dark,
-        );
+        theme::apply(&self.ctx, self.cfg.style, self.cfg.density, self.cfg.dark());
         let tt = term_theme(self.cfg.theme, self.cfg.style);
         for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
             tab.term.set_theme(tt);
@@ -1400,7 +1407,12 @@ impl App {
             settings_active: self.tabs.get(self.active).is_some_and(Tab::is_settings),
             can_reopen: !self.closed.is_empty(),
             font_size: self.cfg.font_size,
-            theme: self.cfg.theme,
+            theme: if self.cfg.dark() {
+                Theme::Dark
+            } else {
+                Theme::Light
+            },
+            dark_only: theme::dark_only_reason(self.cfg.style),
             native_decorations: self.cfg.native_decorations,
             strip: titlebar::StripInput {
                 title: active
@@ -1518,22 +1530,28 @@ impl App {
             finishing: &self.wt.finishing,
             removed: &self.cfg.removed_worktrees,
         };
+        let margin = if theme::compact() {
+            Margin::symmetric(8, 8)
+        } else {
+            Margin::symmetric(10, 12)
+        };
         let panel = egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(self.cfg.sidebar_width)
             .size_range(220.0..=600.0)
-            .frame(
-                Frame::NONE
-                    .fill(pal.panel)
-                    .inner_margin(if theme::compact() {
-                        Margin::symmetric(8, 8)
-                    } else {
-                        Margin::symmetric(10, 12)
-                    }),
-            )
+            .show_separator_line(theme::skin::panel_separator_line())
+            .frame(theme::skin::sidebar_frame(pal, margin))
             .show(ui, |ui| {
                 sidebar::show(ui, &input, &mut self.filter, &mut self.sidebar_cache)
             });
+        if theme::look().region == theme::Region::Fade {
+            theme::skin::paint_edge(
+                ui.painter(),
+                panel.response.rect,
+                theme::skin::Edge::Right,
+                pal,
+            );
+        }
         let width = panel.response.rect.width();
         if (width - self.cfg.sidebar_width).abs() > 1.0 {
             self.cfg.sidebar_width = width;
@@ -1593,9 +1611,8 @@ impl App {
             None => {
                 self.terminal_focused = false;
                 let omp_missing = self.omp.is_none();
-                let install = egui::CentralPanel::no_frame()
-                    .show(ui, |ui| {
-                        ui.painter().rect_filled(ui.max_rect(), 0, pal.bg);
+                let install = theme::skin::central(ui, pal, false, |ui| {
+                        theme::skin::paint_canvas(ui.painter(), ui.max_rect(), pal);
                         ui.add_space((ui.available_height() / 2.0 - 90.0).max(20.0));
                         if !omp_missing {
                             empty_state(
@@ -1651,9 +1668,10 @@ impl App {
                         unavailable: self.notify.unavailable.as_deref(),
                     },
                 };
-                let actions = egui::CentralPanel::no_frame()
-                    .show(ui, |ui| settings_page::show(ui, &mut self.settings, &input))
-                    .inner;
+                let actions = theme::skin::central(ui, pal, false, |ui| {
+                    settings_page::show(ui, &mut self.settings, &input)
+                })
+                .inner;
                 for a in actions {
                     match a {
                         SettingsAction::FontSize(s) => self.set_font_size(s),
@@ -1692,7 +1710,8 @@ impl App {
     fn show_terminal(&mut self, ui: &mut egui::Ui) {
         let mut open_url = None;
         let mut copy_link = None;
-        egui::CentralPanel::no_frame().show(ui, |ui| {
+        let pal = Palette::of_ui(ui);
+        theme::skin::central(ui, pal, true, |ui| {
             let Some(Tab::Terminal(tab)) = self.tabs.get_mut(self.active) else {
                 return;
             };
@@ -2770,6 +2789,7 @@ impl eframe::App for App {
         }
 
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        theme::skin::paint_backdrop(ui.painter(), ui.max_rect(), Palette::of_ui(ui));
         self.show_bar(ui, maximized);
         self.show_banners(ui);
         self.drive_status(&ctx);

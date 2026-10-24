@@ -563,7 +563,7 @@ fn option_row(ui: &mut Ui, text: &str, selected: bool) -> bool {
         p.rect_filled(
             rect,
             theme::rad(6, 7),
-            if theme::neutral() {
+            if theme::flat() {
                 pal.raised
             } else {
                 pal.accent.gamma_multiply(0.16)
@@ -639,7 +639,7 @@ pub fn show(
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .frame(
             egui::Frame::popup(&ctx.global_style())
-                .fill(if theme::neutral() {
+                .fill(if theme::flat() {
                     ctx.global_style().visuals.window_fill
                 } else {
                     Palette::of_ctx(&ctx).raised
@@ -838,11 +838,7 @@ fn header_row(ui: &mut Ui, label: &str, icon: Option<Icon>) {
             Align2::LEFT_BOTTOM,
             icon,
             14.0,
-            if theme::neutral() {
-                pal.warn
-            } else {
-                pal.accent
-            },
+            if theme::flat() { pal.warn } else { pal.accent },
         );
         x += 19.0;
     }
@@ -919,12 +915,12 @@ fn model_row(
     let p = ui.painter();
     let inner = rect.shrink2(vec2(0.0, 1.0));
     if current {
-        let fill = if theme::neutral() {
+        let fill = if theme::flat() {
             pal.raised
         } else {
             pal.accent.gamma_multiply(0.16)
         };
-        p.rect_filled(inner, if theme::neutral() { 6 } else { 8 }, fill);
+        p.rect_filled(inner, if theme::flat() { 6 } else { 8 }, fill);
     } else if hov > 0.0 {
         p.rect_filled(inner, 8, pal.surface.gamma_multiply(hov));
     }
@@ -985,11 +981,7 @@ fn model_row(
             p,
             &m.provider,
             crate::theme::font(10.0),
-            if theme::neutral() {
-                pal.text
-            } else {
-                pal.accent
-            },
+            if theme::flat() { pal.text } else { pal.accent },
             (limit - name_x - 10.0).min(120.0),
         );
         let tag =
@@ -997,7 +989,7 @@ fn model_row(
         p.rect_filled(
             tag,
             theme::rad(5, 7),
-            if theme::neutral() {
+            if theme::flat() {
                 pal.raised
             } else {
                 pal.accent.gamma_multiply(0.16)
@@ -1028,20 +1020,12 @@ fn model_row(
             Align2::CENTER_CENTER,
             ICON_STAR,
             19.0 + 2.0 * sh,
-            if theme::neutral() {
-                pal.warn
-            } else {
-                pal.accent
-            },
+            if theme::flat() { pal.warn } else { pal.accent },
         );
     } else {
         let color = theme::mix(
             pal.weak.gamma_multiply(0.7),
-            if theme::neutral() {
-                pal.warn
-            } else {
-                pal.accent
-            },
+            if theme::flat() { pal.warn } else { pal.accent },
             sh,
         );
         p.add(egui::Shape::closed_line(
@@ -1089,7 +1073,7 @@ fn pills(ui: &mut Ui, options: &[String], selected: Option<&str>) -> Option<Stri
             let p = ui.painter();
             let (fill, fg, stroke) = if on {
                 (
-                    if theme::neutral() {
+                    if theme::flat() {
                         pal.raised
                     } else {
                         pal.accent.gamma_multiply(0.30)

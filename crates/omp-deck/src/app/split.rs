@@ -374,7 +374,7 @@ impl App {
     pub(super) fn show_split(&mut self, ui: &mut Ui) {
         let pal = Palette::of_ui(ui);
         let mut frame = Requests::default();
-        egui::CentralPanel::no_frame().show(ui, |ui| {
+        theme::skin::central(ui, pal, true, |ui| {
             let area = ui.max_rect();
             let rects = panes::pane_rects(self.split.layout(), area, self.split.ratios());
             let ctx = ui.ctx().clone();

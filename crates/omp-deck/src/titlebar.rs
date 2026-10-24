@@ -40,6 +40,8 @@ pub struct BarInput<'a> {
     pub can_reopen: bool,
     pub font_size: f32,
     pub theme: Theme,
+    /// Why the Light theme is unavailable (the style only exists in dark).
+    pub dark_only: Option<&'static str>,
     pub native_decorations: bool,
     pub strip: StripInput<'a>,
     pub omp: Option<OmpBar<'a>>,
@@ -281,11 +283,15 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
             let rect = ui.max_rect();
             let p = ui.painter();
             theme::paint_bar(p, rect, pal);
-            p.hline(
-                rect.x_range(),
-                rect.bottom() - 0.5,
-                Stroke::new(1.0, pal.stroke),
-            );
+            if theme::is_gallery() {
+                theme::skin::paint_edge(p, rect, theme::skin::Edge::Bottom, pal);
+            } else {
+                p.hline(
+                    rect.x_range(),
+                    rect.bottom() - 0.5,
+                    Stroke::new(1.0, pal.stroke),
+                );
+            }
 
             // The window drags from empty bar space only (tabs and buttons win hit-testing).
             if input.csd {
@@ -405,7 +411,7 @@ fn logo(ui: &mut egui::Ui, pal: &Palette, compact: bool) {
     };
     let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
     let p = ui.painter();
-    if theme::neutral() {
+    if theme::flat() {
         p.rect(
             rect,
             radius as u8 - 1,
@@ -562,7 +568,14 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
             Theme::Dark => (ICON_SUN, "Light theme", Theme::Light),
             Theme::Light => (ICON_MOON, "Dark theme", Theme::Dark),
         };
-        if menu_item(ui, icon, label, None, true, false).clicked() {
+        let blocked = input.dark_only.filter(|_| target == Theme::Light);
+        let item = menu_item(ui, icon, label, None, blocked.is_none(), false);
+        let item = if let Some(why) = blocked {
+            item.on_disabled_hover_text(why)
+        } else {
+            item
+        };
+        if item.clicked() {
             pick(ui, &mut action, BarAction::SetTheme(target));
         }
         let state = if input.native_decorations {
@@ -606,7 +619,7 @@ fn update_badge(ui: &mut egui::Ui, label: &str, tip: &str) -> egui::Response {
         .ctx()
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
     let p = ui.painter();
-    let (fg, label_fg) = if theme::neutral() {
+    let (fg, label_fg) = if theme::flat() {
         // Flat accent-outlined chip: the one deliberate accent in the bar.
         p.rect(
             rect,

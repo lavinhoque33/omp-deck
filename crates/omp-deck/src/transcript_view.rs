@@ -322,7 +322,7 @@ fn section_heading(ui: &mut Ui, h: markup::Heading<'_>, first: bool) {
         .text_styles
         .get(&egui::TextStyle::Body)
         .map_or(13.0, |f| f.size);
-    let major = if theme::neutral() {
+    let major = if theme::flat() {
         pal.text_strong
     } else {
         pal.accent_b
@@ -605,7 +605,7 @@ impl TranscriptView {
                 } else {
                     (
                         pal.surface.gamma_multiply(0.9),
-                        if theme::neutral() {
+                        if theme::flat() {
                             pal.stroke
                         } else {
                             pal.accent.gamma_multiply(0.7)
@@ -713,7 +713,7 @@ impl TranscriptView {
                     ("You", ICON_USER)
                 };
                 let preview = markup::preview(text, PREVIEW);
-                let user_c = if theme::neutral() {
+                let user_c = if theme::flat() {
                     pal.weak
                 } else {
                     pal.accent_a
@@ -760,7 +760,7 @@ impl TranscriptView {
                 }
             }
             TranscriptItem::Assistant { text, model, .. } => {
-                let asst_c = if theme::neutral() {
+                let asst_c = if theme::flat() {
                     pal.stroke
                 } else {
                     pal.accent_b
@@ -770,7 +770,7 @@ impl TranscriptView {
                         caption(
                             ui,
                             "Assistant",
-                            if theme::neutral() {
+                            if theme::flat() {
                                 pal.weak
                             } else {
                                 pal.accent_b

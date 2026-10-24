@@ -136,7 +136,7 @@ impl Toasts {
                         let (icon, color) = match t.kind {
                             ToastKind::Info => (
                                 ICON_INFO,
-                                if theme::neutral() { pal.glyph } else { pal.accent_b },
+                                if theme::flat() { pal.glyph } else { pal.accent_b },
                             ),
                             ToastKind::Success => (ICON_CIRCLE_CHECK, pal.ok),
                             ToastKind::Error => (ICON_CIRCLE_ALERT, pal.danger),
@@ -144,7 +144,7 @@ impl Toasts {
                         ui.scope(|ui| {
                             ui.set_opacity(a);
                             Frame::popup(ui.style())
-                                .fill(if theme::neutral() {
+                                .fill(if theme::flat() {
                                     ui.style().visuals.window_fill
                                 } else {
                                     theme::mix(pal.raised, color, 0.06)
@@ -214,7 +214,7 @@ impl Toasts {
                                                             theme::strong(&act.label)
                                                                 .color(pal.text_strong),
                                                         )
-                                                        .fill(if theme::neutral() {
+                                                        .fill(if theme::flat() {
                                                             pal.surface
                                                         } else {
                                                             color.gamma_multiply(0.25)

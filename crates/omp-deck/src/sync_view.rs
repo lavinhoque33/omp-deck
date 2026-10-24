@@ -360,7 +360,7 @@ fn project_row(
     Frame::NONE
         .fill(
             pal.surface
-                .gamma_multiply(if theme::neutral() { 0.6 } else { 0.9 }),
+                .gamma_multiply(if theme::flat() { 0.6 } else { 0.9 }),
         )
         .stroke(Stroke::new(1.0, pal.stroke))
         .corner_radius(theme::rad(6, 12))

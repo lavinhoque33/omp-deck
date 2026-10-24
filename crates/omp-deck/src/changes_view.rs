@@ -1290,7 +1290,7 @@ fn show_rows(ui: &mut Ui, model: &mut DiffModel, mut cx: DiffCtx<'_>) {
         font.size.to_bits().hash(&mut h);
         ui.visuals().dark_mode.hash(&mut h);
         ui.ctx().pixels_per_point().to_bits().hash(&mut h);
-        theme::neutral().hash(&mut h);
+        theme::flat().hash(&mut h);
         h.finish() | 1
     };
     let placed = placed_editor(model, cx.key, cx.editor);

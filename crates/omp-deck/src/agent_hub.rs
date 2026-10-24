@@ -15,10 +15,7 @@ use deck_core::agents::{AgentStatus, AgentSummary};
 use deck_core::ctl::LiveStatus;
 use egui::Galley;
 use egui::text::{LayoutJob, TextFormat};
-use egui::{
-    Align2, Color32, CursorIcon, FontFamily, FontId, Rect, Sense, Stroke, StrokeKind, Ui, pos2,
-    vec2,
-};
+use egui::{Align2, Color32, CursorIcon, FontFamily, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 
 use crate::agent_ctl::{self, CtlView};
 use crate::agent_model::{self, AgentsView, CardView, status_label};
@@ -26,7 +23,10 @@ use crate::theme::{self, Palette};
 use crate::widgets::{Spin, paint_icon};
 
 const CARD_PAD: f32 = 11.0;
-const CARD_GAP: f32 = 6.0;
+/// Space between two rows (none where rows are separated by rules).
+fn card_gap() -> f32 {
+    theme::acc::row_gap()
+}
 const INDENT: f32 = 14.0;
 const OVERSCAN: f32 = 300.0;
 
@@ -132,7 +132,7 @@ impl RowsState {
                 let depth = if tree { agents[i].depth.min(6) } else { 0 };
                 self.gists[i] = Some(layout_gist(ui, pal, gist, gist_wrap_width(width, depth)));
             }
-            y += card_height(&agents[i], self.gists[i].as_ref()) + CARD_GAP;
+            y += card_height(&agents[i], self.gists[i].as_ref()) + card_gap();
             self.offsets.push(y);
         }
         self.total = y;
@@ -317,7 +317,7 @@ fn card(
     let color = sh.color;
     let rect = Rect::from_min_max(
         pos2(row.left() + depth as f32 * INDENT, row.top()),
-        pos2(row.right() - 2.0, row.bottom() - CARD_GAP),
+        pos2(row.right() - 2.0, row.bottom() - card_gap()),
     );
     let id = ui.scope_id().with(("agent-card", &a.id));
     let resp = ui.interact(rect, id, Sense::click());
@@ -353,16 +353,7 @@ fn card(
     } else {
         tint
     };
-    let card_r = theme::rad(8, 11);
-    p.rect_filled(rect, card_r, fill);
-    let border = if selected {
-        pal.accent
-    } else if hovered {
-        theme::hover_stroke(pal)
-    } else {
-        pal.stroke
-    };
-    p.rect_stroke(rect, card_r, Stroke::new(1.0, border), StrokeKind::Inside);
+    theme::acc::paint_sub(&p, id, pal, rect, hovered, selected, fill);
     p.rect_filled(
         Rect::from_min_max(
             pos2(rect.left() + 1.0, rect.top() + 10.0),
@@ -408,7 +399,7 @@ fn card(
             r,
             9,
             pal.raised
-                .gamma_multiply(if theme::neutral() { 1.0 } else { 0.8 }),
+                .gamma_multiply(if theme::flat() { 1.0 } else { 0.8 }),
         );
         p.galley(
             pos2(r.left() + 7.0, mid - g.size().y / 2.0),
@@ -442,11 +433,7 @@ fn card(
         ),
         (
             a.agent.as_deref(),
-            if theme::neutral() {
-                pal.text
-            } else {
-                pal.accent
-            },
+            if theme::flat() { pal.text } else { pal.accent },
         ),
         (a.advisor.then_some("advisor"), pal.warn),
     ];
@@ -458,7 +445,7 @@ fn card(
             break;
         }
         let r = Rect::from_min_size(pos2(x, mid - 8.0), vec2(w, 16.0));
-        let badge_fill = if theme::neutral() && col == pal.text {
+        let badge_fill = if theme::flat() && col == pal.text {
             pal.raised
         } else {
             col.gamma_multiply(0.16)

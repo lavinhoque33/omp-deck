@@ -43,7 +43,7 @@ pub fn show_dialog_labeled(
         .backdrop_color(theme::backdrop(ctx.global_style().visuals.dark_mode))
         .frame(
             Frame::popup(&ctx.global_style())
-                .fill(if theme::neutral() {
+                .fill(if theme::flat() {
                     ctx.global_style().visuals.window_fill
                 } else {
                     pal.raised
@@ -66,8 +66,8 @@ pub fn show_dialog_labeled(
                     let (fill, fg) = if d.danger {
                         (
                             pal.danger
-                                .gamma_multiply(if theme::neutral() { 1.0 } else { 0.85 }),
-                            if theme::neutral() {
+                                .gamma_multiply(if theme::flat() { 1.0 } else { 0.85 }),
+                            if theme::flat() {
                                 theme::ink_on(pal.danger)
                             } else {
                                 egui::Color32::WHITE

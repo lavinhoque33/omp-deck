@@ -36,8 +36,9 @@ use crate::icons::{
 use crate::statusbar::level_color;
 use crate::statusfmt::ContextLevel;
 use crate::tabs::paint_status;
-use crate::theme::{self, Palette};
+use crate::theme::{self, Palette, acc, skin};
 use crate::widgets::{Spin, empty_state, icon_text, paint_icon};
+use deck_core::config::UiStyle;
 
 /// Cards this far outside the viewport are still painted (smooth scrolling).
 const OVERSCAN: f32 = 240.0;
@@ -260,7 +261,7 @@ pub fn show(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>) -> Vec<DashA
     let pal = Palette::of_ui(ui);
     let mut out = Vec::new();
     st.sync_order();
-    ui.painter().rect_filled(ui.max_rect(), 0, pal.bg);
+    theme::skin::paint_canvas(ui.painter(), ui.max_rect(), pal);
     Frame::NONE
         .inner_margin(Margin::symmetric(18, 14))
         .show(ui, |ui| {
@@ -305,7 +306,28 @@ fn header(ui: &mut Ui, st: &mut DashState, out: &mut Vec<DashAction>) {
         |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.label(icon_text(ICON_NETWORK, 20.0, pal.glyph));
-            ui.label(theme::strong("Agents").size(17.0).color(pal.text_strong));
+            if theme::style() == UiStyle::Phosphor {
+                ui.label(
+                    RichText::new("> ")
+                        .font(theme::label_font(17.0))
+                        .color(pal.accent),
+                );
+                ui.add_space(-8.0);
+                ui.label(
+                    RichText::new("agents")
+                        .font(theme::label_font(17.0))
+                        .color(pal.text_strong),
+                );
+            } else if theme::look().mono_labels {
+                ui.label(
+                    RichText::new("AGENTS")
+                        .font(theme::label_font(15.0))
+                        .extra_letter_spacing(1.6)
+                        .color(pal.text_strong),
+                );
+            } else {
+                ui.label(theme::strong("Agents").size(17.0).color(pal.text_strong));
+            }
             if !st.cards.is_empty() {
                 pill(ui, &st.cards.len().to_string(), pal.weak, pal.raised);
             }
@@ -378,7 +400,7 @@ fn search_box(ui: &mut Ui, st: &mut DashState) {
             .frame(
                 Frame::new()
                     .fill(pal.surface)
-                    .corner_radius(theme::rad(8, 10))
+                    .corner_radius(theme::ui_rad(theme::rad(8, 10)))
                     .stroke(Stroke::new(
                         1.0,
                         if focused { pal.accent } else { pal.stroke },
@@ -388,11 +410,12 @@ fn search_box(ui: &mut Ui, st: &mut DashState) {
 }
 
 fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
+    let pal = Palette::of_ui(ui);
     let g = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), theme::font(11.5), fg);
+        .layout_no_wrap(text.to_owned(), theme::label_font(11.5), fg);
     let (rect, _) = ui.allocate_exact_size(vec2(g.size().x + 14.0, 18.0), Sense::hover());
-    ui.painter().rect_filled(rect, 9, bg);
+    skin::paint_chip(ui.painter(), rect, theme::ui_rad(9), pal, bg);
     ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
 }
 
@@ -428,6 +451,11 @@ fn small_button(ui: &mut Ui, icon: Icon, tip: &str, on: bool) -> egui::Response 
         .on_hover_cursor(CursorIcon::PointingHand)
 }
 
+/// Background of a filter pill that carries a gradient border.
+fn mix_fill(pal: &Palette) -> Color32 {
+    theme::mix(pal.surface, pal.accent, 0.1)
+}
+
 fn filter_chip(ui: &mut Ui, label: &str, n: usize, on: bool) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let color = if on { pal.accent } else { pal.weak };
@@ -438,23 +466,31 @@ fn filter_chip(ui: &mut Ui, label: &str, n: usize, on: bool) -> egui::Response {
     );
     let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 24.0, 28.0), Sense::click());
     let p = ui.painter();
-    p.rect_filled(
-        rect,
-        14,
+    let radius = theme::ui_rad(14);
+    let fill = if on {
+        color.gamma_multiply(0.2)
+    } else if resp.hovered() {
+        pal.hover_bg
+    } else {
+        pal.surface
+    };
+    let stroke = Stroke::new(
+        1.0,
         if on {
-            color.gamma_multiply(0.2)
+            color
         } else if resp.hovered() {
-            pal.raised
+            pal.hover_line
         } else {
-            pal.surface
+            pal.stroke
         },
     );
-    p.rect_stroke(
-        rect,
-        14,
-        Stroke::new(1.0, if on { color } else { pal.stroke }),
-        StrokeKind::Inside,
-    );
+    if on && theme::look().grad_accent {
+        skin::gradient_outline(p, resp.id, rect, f32::from(radius), pal, mix_fill(pal));
+    } else {
+        p.rect_filled(rect, radius, fill);
+        p.rect_stroke(rect, radius, stroke, StrokeKind::Inside);
+    }
+    skin::paint_field_highlight(p, rect, f32::from(radius));
     p.galley(
         pos2(rect.left() + 12.0, rect.center().y - g.size().y / 2.0),
         g,
@@ -498,7 +534,8 @@ fn grid(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>, out: &mut Vec<Da
             let width = ui.available_width();
             let cols = columns(width);
             let card_w = (width - GAP * (cols - 1) as f32) / cols as f32;
-            let inner_w = width - 2.0 * PAD;
+            let g = acc::geo(PAD);
+            let inner_w = width - g.rows_l - g.rows_r;
             let note = link_note_text(input.ctl_active.link);
             // Geometry: recomputed only when something it depends on changed.
             let epoch = sessions
@@ -513,6 +550,7 @@ fn grid(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>, out: &mut Vec<Da
                 tree,
                 note.is_some(),
                 ui.visuals().dark_mode,
+                theme::style().key(),
             ));
             if *grid_key != Some(key) {
                 let items: Vec<Item> = order
@@ -523,6 +561,9 @@ fn grid(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>, out: &mut Vec<Da
                         let has_agents = sa.as_ref().is_some_and(|s| s.view.counts.total() > 0);
                         let open = has_agents && expanded.contains(&card.key);
                         let mut height = card_height(card.shape(has_agents));
+                        if has_agents {
+                            height += (g.h - ROW_AGENTS) + (g.foot - PAD);
+                        }
                         if open && let Some(sa) = sa {
                             let rows_h = sa.rows.prepare(ui, &sa.view, inner_w, tree);
                             let note_h = if card.active && note.is_some() {
@@ -530,7 +571,7 @@ fn grid(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>, out: &mut Vec<Da
                             } else {
                                 0.0
                             };
-                            height += SECTION_GAP + note_h + rows_h + PAD;
+                            height += g.pad_top + note_h + rows_h + g.pad_bottom;
                         }
                         Item { height, wide: open }
                     })
@@ -607,7 +648,13 @@ fn status_color(pal: &Palette, s: Status) -> Color32 {
 
 /// One line of text cut with an ellipsis at `max_w`.
 fn line(p: &Painter, text: &str, size: f32, color: Color32, max_w: f32) -> Arc<Galley> {
-    let mut job = LayoutJob::simple_singleline(text.to_owned(), theme::font(size), color);
+    // Chips and paths are mono where the style sets its labels in mono; titles are not.
+    let font = if size < 13.0 {
+        theme::label_font(size)
+    } else {
+        theme::font(size)
+    };
+    let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
     job.wrap.max_width = max_w.max(8.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -617,10 +664,16 @@ fn line(p: &Painter, text: &str, size: f32, color: Color32, max_w: f32) -> Arc<G
 
 /// A rounded chip with `text` ending at `right`; returns its left edge.
 fn chip_right(p: &Painter, right: f32, cy: f32, text: &str, fg: Color32, bg: Color32) -> f32 {
-    let g = p.layout_no_wrap(text.to_owned(), theme::font(11.0), fg);
+    let g = p.layout_no_wrap(text.to_owned(), theme::label_font(11.0), fg);
     let w = g.size().x + 14.0;
     let r = Rect::from_min_size(pos2(right - w, cy - 9.0), vec2(w, 18.0));
-    p.rect_filled(r, 9, bg);
+    let radius = theme::ui_rad(9);
+    if theme::style() == UiStyle::Phosphor {
+        // Phosphor outlines its badges in the badge colour.
+        p.rect_stroke(r, radius, Stroke::new(1.0, fg), StrokeKind::Inside);
+    } else {
+        p.rect_filled(r, radius, bg);
+    }
     p.galley(pos2(r.left() + 7.0, cy - g.size().y / 2.0), g, fg);
     r.left()
 }
@@ -635,47 +688,89 @@ fn paint_card(
     out: &mut Vec<DashAction>,
 ) -> Option<CardKey> {
     let pal = Palette::of_ui(ui);
-    let rect = c.rect;
     let id = Id::unique(("dashboard-card", &card.key));
-    let resp = ui.interact(rect, id, Sense::click());
+    let resp = ui.interact(c.rect, id, Sense::click());
     let hovered = resp.hovered();
-    let color = status_color(pal, card.status);
-    let p = ui.painter_at(rect.expand(2.0));
-
-    let tint = match card.status {
-        Status::Attention => theme::mix(pal.surface, pal.warn, 0.07),
-        Status::Busy => theme::accent_wash(pal.surface, pal.accent_b, 0.05),
-        Status::Exited { clean: false } => theme::mix(pal.surface, pal.danger, 0.07),
-        _ => pal.surface,
-    };
-    let radius = theme::rad(10, 12);
-    p.rect_filled(
-        rect,
-        radius,
-        if hovered {
-            theme::mix(tint, pal.raised, 0.6)
-        } else {
-            tint
-        },
-    );
-    let border = if card.active {
-        pal.accent
-    } else if card.status == Status::Attention {
-        pal.warn.gamma_multiply(0.7)
-    } else if hovered {
-        theme::hover_stroke(pal)
+    let lk = theme::look();
+    // Neo-Brutal lifts a hovered card by one pixel up and left (its hard shadow grows).
+    let rect = if hovered && lk.card.hover == theme::Hover::Hard {
+        c.rect.translate(vec2(-1.0, -1.0))
     } else {
-        pal.stroke
+        c.rect
     };
-    p.rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
-    p.rect_filled(
-        Rect::from_min_max(
-            pos2(rect.left() + 1.0, rect.top() + 12.0),
-            pos2(rect.left() + 4.0, rect.bottom() - 12.0),
-        ),
-        2,
-        color,
+    let color = status_color(pal, card.status);
+    let mut p = ui.painter_at(rect.expand(2.0));
+    let st = skin::CardState {
+        hovered,
+        active: card.active,
+        attention: card.status == Status::Attention,
+    };
+    // Everything of the card, backdrop included, takes the idle opacity.
+    let mut back = ui.painter().clone();
+    back.set_opacity(skin::card_opacity(st));
+    p.set_opacity(skin::card_opacity(st));
+    let tint = match card.status {
+        Status::Attention => Some(theme::mix(pal.surface, pal.warn, 0.07)),
+        Status::Busy => Some(theme::accent_wash(pal.surface, pal.accent_b, 0.05)),
+        Status::Exited { clean: false } => Some(theme::mix(pal.surface, pal.danger, 0.07)),
+        _ => None,
+    };
+    // Neutral and Neon paint their legacy flat card; the gallery styles go through the skin.
+    if theme::is_gallery() {
+        if card.active {
+            skin::paint_spot(&back, rect, pal);
+        }
+        skin::paint_card(&back, id, rect, pal, st, tint);
+        skin::paint_card_band(
+            &back,
+            rect,
+            PAD + ROW_HEAD + ROW_PROJECT + SECTION_GAP,
+            pal,
+            hovered,
+        );
+    } else {
+        let tint = tint.unwrap_or(pal.surface);
+        p.rect_filled(
+            rect,
+            theme::rad(10, 12),
+            if hovered {
+                theme::mix(tint, pal.raised, 0.6)
+            } else {
+                tint
+            },
+        );
+        let border = if card.active {
+            pal.accent
+        } else if card.status == Status::Attention {
+            pal.warn.gamma_multiply(0.7)
+        } else if hovered {
+            theme::hover_stroke(pal)
+        } else {
+            pal.stroke
+        };
+        p.rect_stroke(
+            rect,
+            theme::rad(10, 12),
+            Stroke::new(1.0, border),
+            StrokeKind::Inside,
+        );
+    }
+    let stripe = Rect::from_min_max(
+        pos2(rect.left() + 1.0, rect.top() + 12.0),
+        pos2(rect.left() + 4.0, rect.bottom() - 12.0),
     );
+    if lk.grad_accent {
+        skin::gradient_card(
+            &p,
+            id.with("stripe"),
+            stripe,
+            2.0,
+            (color, color.gamma_multiply(0.3)),
+            skin::Dir::Down,
+        );
+    } else {
+        p.rect_filled(stripe, 2, color);
+    }
 
     let left = rect.left() + PAD + 4.0;
     let right = rect.right() - PAD;
@@ -730,7 +825,7 @@ fn paint_card(
     );
     let mut limit = right;
     if !card.age.is_empty() {
-        let g = p.layout_no_wrap(card.age.clone(), theme::font(11.5), pal.weak);
+        let g = p.layout_no_wrap(card.age.clone(), theme::label_font(11.5), pal.weak);
         limit = right - g.size().x - 10.0;
         p.galley(pos2(right - g.size().x, cy - g.size().y / 2.0), g, pal.weak);
     }
@@ -743,7 +838,7 @@ fn paint_card(
         let g = line(&p, branch, 11.5, pal.text, (right - left) * 0.4);
         let w = g.size().x + 26.0;
         let r = Rect::from_min_size(pos2(limit - w, cy - 9.0), vec2(w, 18.0));
-        p.rect_filled(r, 9, pal.raised.gamma_multiply(0.8));
+        skin::paint_chip(&p, r, theme::ui_rad(9), pal, pal.raised.gamma_multiply(0.8));
         paint_icon(
             &p,
             pos2(r.left() + 12.0, cy),
@@ -768,12 +863,18 @@ fn paint_card(
             let g = line(&p, &m.model, 11.5, pal.text, (right - left) * 0.5);
             let w = g.size().x + 14.0;
             let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(w, 20.0));
-            p.rect_filled(r, 10, pal.raised.gamma_multiply(0.9));
+            skin::paint_chip(
+                &p,
+                r,
+                theme::ui_rad(10),
+                pal,
+                pal.raised.gamma_multiply(0.9),
+            );
             p.galley(pos2(x + 7.0, cy - g.size().y / 2.0), g, pal.text);
             x += w + 6.0;
         }
         if let Some(t) = &m.thinking {
-            let g = p.layout_no_wrap(t.clone(), theme::font(11.0), pal.weak);
+            let g = p.layout_no_wrap(t.clone(), theme::label_font(11.0), pal.weak);
             paint_icon(
                 &p,
                 pos2(x + 7.0, cy),
@@ -792,7 +893,11 @@ fn paint_card(
             pal.text,
         );
         if m.failed {
-            let g = p.layout_no_wrap("last turn failed".to_owned(), theme::font(11.0), pal.danger);
+            let g = p.layout_no_wrap(
+                "last turn failed".to_owned(),
+                theme::label_font(11.0),
+                pal.danger,
+            );
             p.galley(
                 pos2(right - cost_w - 10.0 - g.size().x, cy - g.size().y / 2.0),
                 g,
@@ -811,24 +916,36 @@ fn paint_card(
                 let col = level_color(pal, ctx.level);
                 if let Some(f) = ctx.frac {
                     let w = (bar_w * f).max(if f > 0.0 { 3.0 } else { 0.0 });
-                    p.rect_filled(Rect::from_min_size(bar.min, vec2(w, 6.0)), 3, col);
+                    let fill = Rect::from_min_size(bar.min, vec2(w, 6.0));
+                    if theme::look().grad_accent {
+                        skin::gradient_card(
+                            &p,
+                            id.with("meter"),
+                            fill,
+                            3.0,
+                            (pal.accent_a, pal.accent_b),
+                            skin::Dir::Right,
+                        );
+                    } else {
+                        p.rect_filled(fill, 3, col);
+                    }
                 }
                 let hot = ctx.level.is_some_and(|l| l != ContextLevel::Normal);
                 let g = p.layout_no_wrap(
                     ctx.label.clone(),
-                    theme::font(11.5),
+                    theme::label_font(11.5),
                     if hot { col } else { pal.text },
                 );
                 p.galley(pos2(bar.right() + 8.0, cy - g.size().y / 2.0), g, pal.text);
             }
             None => {
-                let g = p.layout_no_wrap("context ?".to_owned(), theme::font(11.5), pal.weak);
+                let g = p.layout_no_wrap("context ?".to_owned(), theme::label_font(11.5), pal.weak);
                 p.galley(pos2(bar.right() + 8.0, cy - g.size().y / 2.0), g, pal.weak);
             }
         }
         let toks = p.layout_no_wrap(
             format!("↑{}  ↓{}", m.input, m.output),
-            theme::font(11.5),
+            theme::label_font(11.5),
             pal.weak,
         );
         p.galley(
@@ -851,7 +968,7 @@ fn paint_card(
                 13.0,
                 pal.ok,
             );
-            let g = p.layout_no_wrap("no changes".to_owned(), theme::font(11.5), pal.weak);
+            let g = p.layout_no_wrap("no changes".to_owned(), theme::label_font(11.5), pal.weak);
             p.galley(pos2(left + 18.0, cy - g.size().y / 2.0), g, pal.weak);
         } else {
             let mut job = LayoutJob::default();
@@ -865,7 +982,7 @@ fn paint_card(
                         &format!("{n} {what}   "),
                         0.0,
                         egui::TextFormat {
-                            font_id: theme::font(11.5),
+                            font_id: theme::label_font(11.5),
                             color: col,
                             ..egui::TextFormat::default()
                         },
@@ -911,30 +1028,66 @@ fn paint_card(
     {
         y += SECTION_GAP;
         let counts = sa.view.counts;
-        let row = Rect::from_min_size(pos2(left - 4.0, y), vec2(right - left + 4.0, ROW_AGENTS));
-        let r = ui.interact(row, id.with("agents"), Sense::click());
-        if r.hovered() || c.open {
-            p.rect_filled(
-                row,
-                8,
-                pal.raised
-                    .gamma_multiply(if r.hovered() { 0.9 } else { 0.5 }),
+        let g = acc::geo(PAD);
+        let lk = theme::look().acc;
+        let header = if g.edge {
+            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), g.h))
+        } else {
+            Rect::from_min_max(
+                pos2(rect.left() + g.box_l, y),
+                pos2(rect.right() - g.box_r, y + g.h),
+            )
+        };
+        let r = ui.interact(header, id.with("agents"), Sense::click());
+        let pill_w = if lk.kind == theme::Acc::Pill {
+            230.0
+        } else {
+            header.width()
+        };
+        let slots = if lk.kind == theme::Acc::Row {
+            if r.hovered() || c.open {
+                p.rect_filled(
+                    header,
+                    theme::ui_rad(8),
+                    pal.raised
+                        .gamma_multiply(if r.hovered() { 0.9 } else { 0.5 }),
+                );
+            }
+            let cy = header.center().y;
+            paint_icon(
+                &p,
+                pos2(header.left() + 12.0, cy),
+                Align2::CENTER_CENTER,
+                if c.open {
+                    ICON_CHEVRON_DOWN
+                } else {
+                    ICON_CHEVRON_RIGHT
+                },
+                15.0,
+                pal.weak,
             );
-        }
-        let cy = row.center().y;
-        paint_icon(
-            &p,
-            pos2(row.left() + 12.0, cy),
-            Align2::CENTER_CENTER,
-            if c.open {
-                ICON_CHEVRON_DOWN
-            } else {
-                ICON_CHEVRON_RIGHT
-            },
-            15.0,
-            pal.weak,
-        );
-        let mut x = row.left() + 26.0;
+            acc::Slots {
+                text_x: header.left() + 26.0,
+                right: header.right(),
+            }
+        } else {
+            acc::paint_back(
+                &back,
+                id.with("acc"),
+                pal,
+                &acc::Frame {
+                    card: rect,
+                    header,
+                    bottom: rect.bottom() - g.foot,
+                    open: c.open,
+                    hovered: r.hovered(),
+                    card_hovered: hovered,
+                    pill_w,
+                },
+            )
+        };
+        let cy = header.center().y;
+        let mut x = slots.text_x;
         if counts.running > 0 {
             Spin::new(14.0, pal.accent_b).paint_at(ui, pos2(x + 7.0, cy));
             x += 20.0;
@@ -946,19 +1099,64 @@ fn paint_card(
         } else {
             format!("{} subagents", counts.total())
         };
-        let g = p.layout_no_wrap(summary, theme::font(12.0), pal.text);
-        let mut rx = x + g.size().x + 12.0;
-        p.galley(pos2(x, cy - g.size().y / 2.0), g, pal.text);
+        let ink = if theme::style() == UiStyle::Phosphor {
+            pal.accent
+        } else if lk.strong {
+            pal.text_strong
+        } else {
+            pal.text
+        };
+        let galley = if lk.mono_header {
+            let mut job = LayoutJob::default();
+            job.append(
+                &summary.to_uppercase(),
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::new(10.5, egui::FontFamily::Monospace),
+                    color: ink,
+                    extra_letter_spacing: 0.8,
+                    ..egui::TextFormat::default()
+                },
+            );
+            p.layout_job(job)
+        } else {
+            p.layout_no_wrap(summary, theme::font(12.0), ink)
+        };
+        let mut rx = x + galley.size().x + 12.0;
+        p.galley(pos2(x, cy - galley.size().y / 2.0), galley, ink);
         for (n, col, what) in [
             (counts.failed, pal.danger, "failed"),
             (counts.aborted + counts.interrupted, pal.warn, "stopped"),
         ] {
             if n > 0 {
-                let g = p.layout_no_wrap(format!("{n} {what}"), theme::font(11.5), col);
+                let g = p.layout_no_wrap(format!("{n} {what}"), theme::label_font(11.5), col);
                 let w = g.size().x;
                 p.galley(pos2(rx, cy - g.size().y / 2.0), g, col);
                 rx += w + 10.0;
             }
+        }
+        if lk.kind != theme::Acc::Row {
+            let hint = p.layout_no_wrap(
+                if c.open { "Hide" } else { "Show" }.to_owned(),
+                theme::label_font(11.5),
+                pal.weak,
+            );
+            let hx = slots.right - hint.size().x;
+            let mut fill_end = hx - 8.0;
+            if lk.segbar {
+                let segs = [
+                    (counts.running, pal.accent),
+                    (counts.done, pal.ok),
+                    (counts.failed, pal.danger),
+                    (counts.aborted + counts.interrupted, pal.warn),
+                    (counts.parked, pal.weak),
+                ];
+                let bar = Rect::from_min_size(pos2(hx - 8.0 - 64.0, cy - 3.0), vec2(64.0, 6.0));
+                acc::paint_segbar(&p, bar, &segs);
+                fill_end = bar.left() - 8.0;
+            }
+            acc::paint_dashed_fill(&p, pal, header, rx + 4.0, fill_end);
+            p.galley(pos2(hx, cy - hint.size().y / 2.0), hint, pal.weak);
         }
         if r.on_hover_cursor(CursorIcon::PointingHand)
             .on_hover_text(if c.open {
@@ -970,21 +1168,34 @@ fn paint_card(
         {
             toggled = Some(card.key.clone());
         }
-        y += ROW_AGENTS;
+        y += g.h;
 
         if c.open {
-            y += SECTION_GAP;
+            y += g.pad_top;
             if let Some(text) = c.note {
-                let r = Rect::from_min_size(pos2(left - 4.0, y), vec2(right - left + 4.0, NOTE_H));
+                let r = Rect::from_min_size(
+                    pos2(rect.left() + g.rows_l, y),
+                    vec2(rect.width() - g.rows_l - g.rows_r, NOTE_H),
+                );
                 if note_strip(ui, r, text, c.ctl) {
                     out.push(DashAction::Restart);
                 }
                 y += NOTE_H + SECTION_GAP;
             }
             let inner = Rect::from_min_max(
-                pos2(rect.left() + PAD, y),
-                pos2(rect.right() - PAD, rect.bottom() - PAD),
+                pos2(rect.left() + g.rows_l, y),
+                pos2(rect.right() - g.rows_r, rect.bottom() - g.foot),
             );
+            if lk.rail != theme::Rail::None {
+                acc::paint_rail(
+                    &back,
+                    id.with("rail"),
+                    pal,
+                    rect.left() + PAD + 12.0,
+                    y,
+                    rect.bottom() - g.foot - g.pad_bottom,
+                );
+            }
             let session = card.session.clone().unwrap_or_default();
             let selected = c
                 .popup

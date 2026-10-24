@@ -390,11 +390,7 @@ fn header_rows(
             chip_text(
                 ui,
                 &format!("thinking · {t}"),
-                if theme::neutral() {
-                    pal.text
-                } else {
-                    pal.accent
-                },
+                if theme::flat() { pal.text } else { pal.accent },
                 theme::accent_fill(pal, 0.14),
             );
         }

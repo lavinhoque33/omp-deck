@@ -226,8 +226,8 @@ pub fn step_row(current: Option<usize>, delta: isize, len: usize) -> Option<usiz
 
 fn class_color(pal: &Palette, class: RowClass) -> Color32 {
     match class {
-        RowClass::User if theme::neutral() => pal.text_strong,
-        RowClass::Assistant if theme::neutral() => pal.text,
+        RowClass::User if theme::flat() => pal.text_strong,
+        RowClass::Assistant if theme::flat() => pal.text,
         RowClass::User => pal.accent_b,
         RowClass::Assistant => pal.accent,
         RowClass::Tool => pal.weak,
@@ -633,7 +633,7 @@ fn header(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<
             ui.painter().rect_filled(
                 rect,
                 theme::rad(8, 10),
-                if theme::neutral() {
+                if theme::flat() {
                     pal.surface
                 } else {
                     pal.accent.gamma_multiply(0.18)
@@ -749,7 +749,7 @@ fn chip(ui: &mut Ui, label: &str, tip: &str, on: bool) -> egui::Response {
     let p = ui.painter();
     let r = theme::rad(8, 14);
     if on {
-        let fill = if theme::neutral() {
+        let fill = if theme::flat() {
             pal.raised
         } else {
             pal.accent.gamma_multiply(0.22)
@@ -761,7 +761,7 @@ fn chip(ui: &mut Ui, label: &str, tip: &str, on: bool) -> egui::Response {
             Stroke::new(
                 1.0,
                 pal.accent
-                    .gamma_multiply(if theme::neutral() { 0.8 } else { 0.7 }),
+                    .gamma_multiply(if theme::flat() { 0.8 } else { 0.7 }),
             ),
             StrokeKind::Inside,
         );
@@ -1098,7 +1098,7 @@ fn current_button(ui: &mut Ui, st: &mut TreeState, tree: &SessionTree, list: Rec
     let resp = ui.interact(rect, Id::unique("tree-current"), Sense::click());
     let hov = resp.hovered();
     let p = ui.painter();
-    if !theme::neutral() {
+    if !theme::flat() {
         p.rect_filled(
             rect.translate(vec2(0.0, 2.0)),
             15,
@@ -1239,7 +1239,7 @@ fn paint_band(
     let inner = u.rect.shrink2(vec2(8.0, 2.0));
     let r = theme::rad(8, 10);
     if row.is_leaf {
-        let fill = if theme::neutral() {
+        let fill = if theme::flat() {
             pal.surface
         } else {
             pal.accent.gamma_multiply(0.11)
@@ -1250,7 +1250,7 @@ fn paint_band(
         p.rect_filled(inner, r, pal.raised.gamma_multiply(0.55));
     }
     if selected {
-        let fill = if theme::neutral() {
+        let fill = if theme::flat() {
             pal.raised
         } else {
             pal.accent.gamma_multiply(0.16)
@@ -1343,7 +1343,7 @@ fn edge(p: &Painter, a: Pos2, b: Pos2, stroke: Stroke) {
 
 fn paint_node(p: &Painter, pal: &Palette, row: &Row, c: Pos2, fork_point: bool) {
     let base = pal.bar;
-    if row.is_leaf && !theme::neutral() {
+    if row.is_leaf && !theme::flat() {
         p.circle_filled(c, 15.0, pal.accent.gamma_multiply(0.14));
         p.circle_filled(c, 10.5, pal.accent.gamma_multiply(0.26));
     }
@@ -1439,7 +1439,7 @@ fn paint_content(
             cy,
             &txt,
             Some(ICON_LIST_TREE),
-            PillStyle::Soft(if theme::neutral() {
+            PillStyle::Soft(if theme::flat() {
                 pal.text
             } else {
                 pal.accent_b

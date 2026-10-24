@@ -372,7 +372,7 @@ impl PaletteState {
             .area(Modal::default_area(self.id).anchor(Align2::CENTER_TOP, vec2(0.0, 72.0)))
             .frame(
                 Frame::popup(&ctx.global_style())
-                    .fill(if theme::neutral() {
+                    .fill(if theme::flat() {
                         ctx.global_style().visuals.window_fill
                     } else {
                         pal.raised

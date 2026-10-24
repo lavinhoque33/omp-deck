@@ -7,14 +7,15 @@ use crate::icons::{
     ICON_BRAIN, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CLOUD, ICON_CPU, ICON_FOLD_VERTICAL,
     ICON_FOLDER, ICON_KEYBOARD, ICON_LIST_CHECKS, ICON_LIST_TREE, ICON_MOON, ICON_NEWSPAPER,
     ICON_PALETTE, ICON_REFRESH_CW, ICON_SEARCH, ICON_SEARCH_X, ICON_SETTINGS_2,
-    ICON_SLIDERS_HORIZONTAL, ICON_SPARKLES, ICON_SQUARE, ICON_SUN, ICON_TERMINAL,
-    ICON_TRIANGLE_ALERT, ICON_WRENCH,
+    ICON_SLIDERS_HORIZONTAL, ICON_SPARKLES, ICON_SUN, ICON_TERMINAL, ICON_TRIANGLE_ALERT,
+    ICON_WRENCH,
 };
 use deck_core::config::{Density, Theme, UiStyle};
 use deck_core::mux::BackendChoice;
 use deck_core::omp::{Setting, SettingsCatalog};
 use egui::{
-    Align2, Color32, CursorIcon, Frame, Margin, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
+    Align2, Color32, CursorIcon, FontId, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind,
+    Ui, Vec2, pos2, vec2,
 };
 use serde_json::Value;
 
@@ -242,8 +243,8 @@ pub fn show(
         });
 
     egui::CentralPanel::no_frame().show(ui, |ui| {
+        theme::skin::paint_canvas(ui.painter(), ui.max_rect(), pal);
         Frame::NONE
-            .fill(pal.bg)
             .inner_margin(Margin::symmetric(32, 24))
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
@@ -389,7 +390,7 @@ fn nav_item(
     badge: Option<(&str, bool)>,
 ) -> egui::Response {
     let pal = Palette::of_ui(ui);
-    let neutral = theme::neutral();
+    let neutral = theme::flat();
     let (rect, resp) = ui.allocate_exact_size(
         vec2(ui.available_width(), theme::dens(30.0, 36.0)),
         Sense::click(),
@@ -771,36 +772,32 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
             },
         );
         ui.add_space(4.0);
-        setting_row(ui, "Theme", "Chrome and terminal palette", |ui| {
-            let mut idx = usize::from(input.theme == Theme::Light);
-            if segmented(ui, &mut idx, &[(ICON_MOON, "Dark"), (ICON_SUN, "Light")]) {
-                actions.push(SettingsAction::Theme(if idx == 0 {
-                    Theme::Dark
-                } else {
-                    Theme::Light
-                }));
-            }
-        });
-        ui.add_space(4.0);
+        let dark_only = input.style.dark_only();
         setting_row(
             ui,
-            "Style",
-            "Neutral is flat and quiet; Midnight neon keeps the violet glow",
+            "Theme",
+            if dark_only {
+                "Chrome and terminal palette (this style is dark-only)"
+            } else {
+                "Chrome and terminal palette"
+            },
             |ui| {
-                let mut idx = usize::from(input.style == UiStyle::Neon);
-                if segmented(
-                    ui,
-                    &mut idx,
-                    &[(ICON_SQUARE, "Neutral"), (ICON_SPARKLES, "Midnight neon")],
-                ) {
-                    actions.push(SettingsAction::Style(if idx == 0 {
-                        UiStyle::Neutral
-                    } else {
-                        UiStyle::Neon
-                    }));
-                }
+                ui.add_enabled_ui(!dark_only, |ui| {
+                    let mut idx = usize::from(input.theme == Theme::Light && !dark_only);
+                    if segmented(ui, &mut idx, &[(ICON_MOON, "Dark"), (ICON_SUN, "Light")]) {
+                        actions.push(SettingsAction::Theme(if idx == 0 {
+                            Theme::Dark
+                        } else {
+                            Theme::Light
+                        }));
+                    }
+                })
+                .response
+                .on_disabled_hover_text(format!("{} is dark-only", input.style.label()));
             },
         );
+        ui.add_space(8.0);
+        style_gallery(ui, input.style, actions);
         ui.add_space(4.0);
         setting_row(
             ui,
@@ -948,4 +945,198 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
                 .map(SettingsAction::Drive),
         );
     });
+}
+
+/// Width and height of one style tile's preview.
+const TILE: Vec2 = vec2(148.0, 88.0);
+
+/// Picker of every UI style: a miniature of its window (sidebar, canvas, a card, the accent) plus
+/// its name. The active tile carries an accent ring; hover lifts the outline.
+fn style_gallery(ui: &mut Ui, current: UiStyle, actions: &mut Vec<SettingsAction>) {
+    let pal = Palette::of_ui(ui);
+    ui.label(theme::strong("Style").color(pal.text_strong));
+    ui.label(
+        RichText::new("Pick the look of the whole app; every style has its own colours and shapes")
+            .color(pal.weak)
+            .size(12.0),
+    );
+    ui.add_space(8.0);
+    let gap = 12.0;
+    let label_h = 22.0;
+    let cols = (((ui.available_width() + gap) / (TILE.x + gap)) as usize).max(1);
+    for row in UiStyle::ALL.chunks(cols) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for style in row {
+                let (rect, resp) =
+                    ui.allocate_exact_size(vec2(TILE.x, TILE.y + label_h), Sense::click());
+                let selected = *style == current;
+                let preview = Rect::from_min_size(rect.min, TILE);
+                paint_style_preview(ui.painter(), preview, *style);
+                let ring = if selected {
+                    Stroke::new(2.0, pal.accent)
+                } else if resp.hovered() {
+                    Stroke::new(2.0, theme::hover_stroke(pal))
+                } else {
+                    Stroke::new(1.0, pal.stroke)
+                };
+                ui.painter()
+                    .rect_stroke(preview, 8, ring, egui::StrokeKind::Outside);
+                let label_pos = pos2(preview.left() + 2.0, preview.bottom() + 5.0);
+                ui.painter().text(
+                    label_pos,
+                    Align2::LEFT_TOP,
+                    style.label(),
+                    FontId::new(12.5, theme::ui_family()),
+                    if selected { pal.text_strong } else { pal.text },
+                );
+                if resp.on_hover_text(style.label()).clicked() && !selected {
+                    actions.push(SettingsAction::Style(*style));
+                }
+            }
+        });
+        ui.add_space(6.0);
+    }
+}
+
+/// The miniature of `style`: window, sidebar, canvas, one card and the accent.
+fn paint_style_preview(painter: &egui::Painter, rect: Rect, style: UiStyle) {
+    use crate::theme::{CardShadow, Region};
+    let p = theme::palette(style, true);
+    let look = theme::look_of(style);
+    painter.rect_filled(rect, 8, p.window);
+    let inner = rect.shrink(4.0);
+    let side_w = inner.width() * 0.26;
+    let (side, canvas, r) = match look.region {
+        Region::Islands => {
+            let side = Rect::from_min_size(inner.min, vec2(side_w - 2.0, inner.height()));
+            let canvas = Rect::from_min_max(pos2(side.right() + 4.0, inner.top()), inner.max);
+            (side, canvas, 6)
+        }
+        _ => {
+            let side = Rect::from_min_size(inner.min, vec2(side_w, inner.height()));
+            let canvas = Rect::from_min_max(pos2(side.right(), inner.top()), inner.max);
+            (side, canvas, 3)
+        }
+    };
+    let rounded = |rect: Rect, radius: u8| {
+        painter.rect_filled(rect, radius, p.panel);
+    };
+    match look.region {
+        Region::Islands => {
+            rounded(side, r);
+            painter.rect_stroke(
+                side,
+                r,
+                Stroke::new(1.0, p.separator),
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_filled(canvas, r, p.bg);
+            painter.rect_stroke(
+                canvas,
+                r,
+                Stroke::new(1.0, p.separator),
+                egui::StrokeKind::Inside,
+            );
+        }
+        Region::Frame => {
+            painter.rect_filled(side, 0, p.window);
+            painter.rect_filled(
+                canvas,
+                egui::CornerRadius {
+                    nw: 6,
+                    ne: 0,
+                    sw: 0,
+                    se: 3,
+                },
+                p.bg,
+            );
+        }
+        _ => {
+            painter.rect_filled(
+                side,
+                egui::CornerRadius {
+                    nw: 3,
+                    ne: 0,
+                    sw: 3,
+                    se: 0,
+                },
+                p.panel,
+            );
+            painter.rect_filled(
+                canvas,
+                egui::CornerRadius {
+                    nw: 0,
+                    ne: 3,
+                    sw: 0,
+                    se: 3,
+                },
+                p.bg,
+            );
+            painter.vline(side.right(), side.y_range(), Stroke::new(1.0, p.separator));
+        }
+    }
+    // Sidebar rows; the first is the selected one.
+    for i in 0..3 {
+        let row = Rect::from_min_size(
+            pos2(side.left() + 5.0, side.top() + 8.0 + i as f32 * 11.0),
+            vec2(side.width() - 10.0, 7.0),
+        );
+        if i == 0 {
+            painter.rect_filled(row, 2, p.raised);
+            painter.rect_filled(
+                Rect::from_min_size(row.min, vec2(2.0, row.height())),
+                1,
+                p.accent,
+            );
+        } else {
+            painter.rect_filled(row, 2, theme::mix(p.panel, p.text, 0.12));
+        }
+    }
+    // A card with a status line and the accent chip.
+    let card = Rect::from_min_size(
+        pos2(canvas.left() + 8.0, canvas.top() + 9.0),
+        vec2(canvas.width() - 16.0, 36.0),
+    );
+    let cr = look.card.radius.min(8);
+    if look.card.shadow == CardShadow::Hard {
+        painter.rect_filled(card.translate(vec2(3.0, 3.0)), cr, egui::Color32::BLACK);
+    }
+    painter.rect_filled(card, cr, p.surface);
+    painter.rect_stroke(
+        card,
+        cr,
+        Stroke::new(look.card.border_w.clamp(1.0, 2.0), p.stroke),
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_filled(
+        Rect::from_min_size(card.min + vec2(6.0, 7.0), vec2(card.width() * 0.5, 4.0)),
+        2,
+        p.text_strong,
+    );
+    painter.rect_filled(
+        Rect::from_min_size(card.min + vec2(6.0, 15.0), vec2(card.width() * 0.7, 3.0)),
+        1,
+        p.weak,
+    );
+    painter.rect_filled(
+        Rect::from_min_size(card.min + vec2(6.0, 24.0), vec2(card.width() * 0.3, 5.0)),
+        2,
+        p.accent,
+    );
+    painter.circle_filled(card.right_top() + vec2(-8.0, 8.0), 2.5, p.ok);
+    // Second, dimmer card.
+    let card2 = Rect::from_min_size(
+        card.left_bottom() + vec2(0.0, 6.0),
+        vec2(card.width(), 14.0),
+    );
+    if card2.bottom() < canvas.bottom() - 2.0 {
+        painter.rect_filled(card2, cr.min(4), p.surface);
+        painter.rect_stroke(
+            card2,
+            cr.min(4),
+            Stroke::new(1.0, p.stroke),
+            egui::StrokeKind::Inside,
+        );
+    }
 }

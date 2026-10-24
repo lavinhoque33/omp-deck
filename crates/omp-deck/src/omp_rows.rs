@@ -558,7 +558,7 @@ pub fn note_banner(ui: &mut Ui, text: &str) {
     let pal = Palette::of_ui(ui);
     Frame::NONE
         .fill(theme::accent_wash(pal.surface, pal.accent_b, 0.07))
-        .stroke(if theme::neutral() {
+        .stroke(if theme::flat() {
             Stroke::new(1.0, pal.stroke)
         } else {
             Stroke::new(1.0, pal.accent_b.gamma_multiply(0.28))
@@ -572,7 +572,7 @@ pub fn note_banner(ui: &mut Ui, text: &str) {
                 ui.label(icon_text(
                     ICON_INFO,
                     18.0,
-                    if theme::neutral() {
+                    if theme::flat() {
                         pal.glyph
                     } else {
                         pal.accent_b
@@ -602,14 +602,14 @@ pub fn skeleton(ui: &mut Ui) {
     };
     for _ in 0..3 {
         Frame::NONE
-            .fill(if theme::neutral() {
+            .fill(if theme::flat() {
                 pal.panel
             } else {
                 pal.surface.gamma_multiply(0.75)
             })
             .stroke(Stroke::new(1.0, pal.stroke))
             .corner_radius(theme::rad(8, 14))
-            .inner_margin(if theme::neutral() {
+            .inner_margin(if theme::flat() {
                 Margin::symmetric(16, 12)
             } else {
                 Margin::symmetric(20, 16)

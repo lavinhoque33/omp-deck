@@ -1,8 +1,14 @@
 //! Chrome theme: palettes, egui `Style`/`Visuals` and the small painting helpers shared by every
-//! chrome widget. Two looks (`UiStyle::Neutral`, flat zinc greys with a teal accent, and
-//! `UiStyle::Neon`, "Midnight neon") × two themes (dark/light) × two densities.
+//! chrome widget. Eighteen styles (`UiStyle`): Neutral (flat zinc greys, teal accent), Neon
+//! ("Midnight neon") and sixteen dark-only gallery styles, each a palette plus a structural
+//! [`Look`]; × two themes (dark/light, Neutral and Neon only) × two densities.
 //!
 //! The terminal grid keeps its own colors (`deck_term::TermTheme`); this only styles the chrome.
+
+pub mod acc;
+mod look;
+mod palettes;
+pub mod skin;
 
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -15,123 +21,42 @@ use egui::{
     Shadow, Stroke, Style, TextStyle, Theme, ThemePreference, Ui, Vec2, vec2,
 };
 
-/// Colour tokens for one theme variant.
-#[derive(Clone, Copy, Debug)]
-pub struct Palette {
-    /// Terminal surround / deepest layer.
-    pub bg: Color32,
-    /// Sidebar and page background.
-    pub panel: Color32,
-    /// Title/tab bar.
-    pub bar: Color32,
-    /// Cards, inputs.
-    pub surface: Color32,
-    /// Hover fill, popups' highlighted row.
-    pub raised: Color32,
-    pub stroke: Color32,
-    pub text: Color32,
-    pub text_strong: Color32,
-    pub weak: Color32,
-    /// Decorative icon colour (menu/row icons): accent in Neon, a quiet grey in Neutral.
-    pub glyph: Color32,
-    /// Gradient start (violet); equals `accent` in Neutral.
-    pub accent_a: Color32,
-    /// Gradient end (cyan); equals `accent` in Neutral.
-    pub accent_b: Color32,
-    /// Solid accent for strokes, selection, focus.
-    pub accent: Color32,
-    pub ok: Color32,
-    pub warn: Color32,
-    pub danger: Color32,
-}
-
-const fn rgb(hex: u32) -> Color32 {
-    Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
-}
-
-const DARK: Palette = Palette {
-    bg: Color32::from_rgb(8, 11, 22),
-    panel: Color32::from_rgb(12, 16, 31),
-    bar: Color32::from_rgb(14, 19, 37),
-    surface: Color32::from_rgb(20, 27, 49),
-    raised: Color32::from_rgb(30, 39, 70),
-    stroke: Color32::from_rgb(36, 46, 78),
-    text: Color32::from_rgb(212, 220, 240),
-    text_strong: Color32::from_rgb(244, 247, 255),
-    weak: Color32::from_rgb(125, 137, 172),
-    glyph: Color32::from_rgb(124, 108, 255),
-    accent_a: Color32::from_rgb(139, 92, 246),
-    accent_b: Color32::from_rgb(34, 211, 238),
-    accent: Color32::from_rgb(124, 108, 255),
-    ok: Color32::from_rgb(52, 211, 153),
-    warn: Color32::from_rgb(251, 191, 36),
-    danger: Color32::from_rgb(248, 113, 113),
+pub use look::{
+    Acc, Active, Border, Canvas, CardShadow, ChevInk, Hover, Look, Rail, Region, Sel, SubBorder,
+    TabKind, Tone,
 };
+pub use palettes::Palette;
 
-const LIGHT: Palette = Palette {
-    bg: Color32::from_rgb(244, 246, 252),
-    panel: Color32::from_rgb(236, 239, 248),
-    bar: Color32::from_rgb(228, 232, 245),
-    surface: Color32::from_rgb(252, 253, 255),
-    raised: Color32::from_rgb(222, 227, 244),
-    stroke: Color32::from_rgb(207, 213, 233),
-    text: Color32::from_rgb(38, 46, 78),
-    text_strong: Color32::from_rgb(14, 19, 46),
-    weak: Color32::from_rgb(106, 116, 148),
-    glyph: Color32::from_rgb(110, 84, 240),
-    accent_a: Color32::from_rgb(124, 77, 235),
-    accent_b: Color32::from_rgb(8, 163, 200),
-    accent: Color32::from_rgb(110, 84, 240),
-    ok: Color32::from_rgb(16, 160, 110),
-    warn: Color32::from_rgb(200, 130, 0),
-    danger: Color32::from_rgb(214, 54, 54),
-};
+use palettes::rgb;
 
-const NEUTRAL_DARK: Palette = Palette {
-    bg: rgb(0x0b0b0d),
-    panel: rgb(0x0f0f11),
-    bar: rgb(0x0f0f11),
-    surface: rgb(0x18181b),
-    raised: rgb(0x26262b),
-    // Hairlines must stay visible on the near-black panels (sidebar | tabs | cards).
-    stroke: rgb(0x34343a),
-    text: rgb(0xd4d4d8),
-    text_strong: rgb(0xfafafa),
-    weak: rgb(0x71717a),
-    glyph: rgb(0xa1a1aa),
-    accent_a: rgb(0x2dd4bf),
-    accent_b: rgb(0x2dd4bf),
-    accent: rgb(0x2dd4bf),
-    ok: rgb(0x4ade80),
-    warn: rgb(0xfbbf24),
-    danger: rgb(0xf87171),
-};
-
-const NEUTRAL_LIGHT: Palette = Palette {
-    bg: rgb(0xffffff),
-    panel: rgb(0xfafafa),
-    bar: rgb(0xfafafa),
-    surface: rgb(0xf4f4f5),
-    raised: rgb(0xe4e4e7),
-    stroke: rgb(0xe4e4e7),
-    text: rgb(0x3f3f46),
-    text_strong: rgb(0x09090b),
-    weak: rgb(0x71717a),
-    glyph: rgb(0x71717a),
-    accent_a: rgb(0x0d9488),
-    accent_b: rgb(0x0d9488),
-    accent: rgb(0x0d9488),
-    ok: rgb(0x16a34a),
-    warn: rgb(0xca8a04),
-    danger: rgb(0xdc2626),
-};
-
+/// Index into [`UiStyle::ALL`] of the active style.
 static STYLE: AtomicU8 = AtomicU8::new(0);
 static COMPACT: AtomicU8 = AtomicU8::new(1);
 
-/// Whether the Neutral look is active (flat, hairlines, teal accent, Geist).
-pub fn neutral() -> bool {
-    STYLE.load(Ordering::Relaxed) == 0
+/// The structure of every style, in [`UiStyle::ALL`] order.
+static LOOKS: LazyLock<[Look; 18]> = LazyLock::new(|| UiStyle::ALL.map(look::look_of));
+
+/// The active style.
+pub fn style() -> UiStyle {
+    UiStyle::ALL
+        .get(usize::from(STYLE.load(Ordering::Relaxed)))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Structure of the active style.
+pub fn look() -> &'static Look {
+    &LOOKS[usize::from(STYLE.load(Ordering::Relaxed)).min(LOOKS.len() - 1)]
+}
+
+/// Structure of `style` (for previews of styles that are not active).
+pub fn look_of(style: UiStyle) -> Look {
+    look::look_of(style)
+}
+
+/// Whether a flat-family look is active: every style but Neon (flat, hairlines, Geist).
+pub fn flat() -> bool {
+    style() != UiStyle::Neon
 }
 
 /// Whether the Compact density is active.
@@ -148,11 +73,14 @@ pub fn dens(compact_px: f32, comfortable_px: f32) -> f32 {
     }
 }
 
-/// Family of the chrome's proportional text: Geist in Neutral, the system UI font in Neon.
+/// Family of the chrome's proportional text: Geist in the flat styles, the system UI font in
+/// Neon, the monospace family for the whole chrome in Phosphor.
 pub fn ui_family() -> FontFamily {
     static NEUTRAL_NAMED: LazyLock<FontFamily> =
         LazyLock::new(|| FontFamily::Name(crate::ui_fonts::NEUTRAL_FAMILY.into()));
-    if neutral() {
+    if look().mono_ui {
+        FontFamily::Monospace
+    } else if flat() {
         NEUTRAL_NAMED.clone()
     } else {
         FontFamily::Proportional
@@ -164,14 +92,60 @@ pub fn font(size: f32) -> FontId {
     FontId::new(size, ui_family())
 }
 
+/// Font of labels, badges, meters, paths and ids: monospace where the style sets labels in mono
+/// (Blueprint, Phosphor), else the UI font.
+pub fn label_font(size: f32) -> FontId {
+    if look().mono_labels {
+        FontId::new(size, FontFamily::Monospace)
+    } else {
+        font(size)
+    }
+}
+
+/// Radius of rows, chips, fields and pills for a `base` radius of the flat look: the style's
+/// own radius where it is tighter (Blueprint 3, Phosphor 2), unchanged elsewhere.
+pub fn ui_rad(base: u8) -> u8 {
+    let r = look().ui_r;
+    if r >= 8 { base } else { base.min(r) }
+}
+
+/// Why the Light theme is unavailable for the dark-only `style` (`None` for Neutral and Neon).
+pub fn dark_only_reason(style: UiStyle) -> Option<&'static str> {
+    Some(match style {
+        UiStyle::Neutral | UiStyle::Neon => return None,
+        UiStyle::ZincContrast => "Zinc Contrast is dark-only",
+        UiStyle::LayeredDepth => "Layered Depth is dark-only",
+        UiStyle::TealSignal => "Teal Signal is dark-only",
+        UiStyle::SlateInk => "Slate Ink is dark-only",
+        UiStyle::MonoWire => "Mono Wire is dark-only",
+        UiStyle::GraphiteIslands => "Graphite Islands is dark-only",
+        UiStyle::Aurora => "Aurora is dark-only",
+        UiStyle::ObsidianGlass => "Obsidian Glass is dark-only",
+        UiStyle::Blueprint => "Blueprint is dark-only",
+        UiStyle::Ember => "Ember is dark-only",
+        UiStyle::IndigoNight => "Indigo Night is dark-only",
+        UiStyle::Phosphor => "Phosphor is dark-only",
+        UiStyle::NeoBrutal => "Neo-Brutal is dark-only",
+        UiStyle::RoseNoir => "Rosé Noir is dark-only",
+        UiStyle::Spotlight => "Spotlight is dark-only",
+        UiStyle::TwoToneFrame => "Two-Tone Frame is dark-only",
+    })
+}
+
+/// Whether the active style is one of the sixteen gallery styles (not Neutral or Neon).
+pub fn is_gallery() -> bool {
+    !matches!(style(), UiStyle::Neutral | UiStyle::Neon)
+}
+
+/// Palette of `style` regardless of the active one (previews, terminal colours).
+pub fn palette(style: UiStyle, dark: bool) -> &'static Palette {
+    palettes::of(style, dark)
+}
+
 impl Palette {
+    /// Palette of the active style; `dark` only matters for Neutral and Neon.
     pub fn of(dark: bool) -> &'static Palette {
-        match (neutral(), dark) {
-            (true, true) => &NEUTRAL_DARK,
-            (true, false) => &NEUTRAL_LIGHT,
-            (false, true) => &DARK,
-            (false, false) => &LIGHT,
-        }
+        palettes::of(style(), dark)
     }
 
     pub fn of_ui(ui: &Ui) -> &'static Palette {
@@ -184,33 +158,36 @@ impl Palette {
 }
 
 /// Applies style × density × theme: rebuilds both egui style slots and selects the variant.
+/// `dark` is `AppConfig::dark()` (always true for dark-only styles).
 pub fn apply(ctx: &Context, style: UiStyle, density: Density, dark: bool) {
-    STYLE.store(u8::from(style == UiStyle::Neon), Ordering::Relaxed);
+    let idx = UiStyle::ALL.iter().position(|s| *s == style).unwrap_or(0);
+    STYLE.store(idx as u8, Ordering::Relaxed);
     COMPACT.store(u8::from(density == Density::Compact), Ordering::Relaxed);
-    let neutral = style == UiStyle::Neutral;
-    let (pd, pl) = if neutral {
-        (&NEUTRAL_DARK, &NEUTRAL_LIGHT)
-    } else {
-        (&DARK, &LIGHT)
-    };
-    ctx.style_mut_of(Theme::Dark, |s| build(s, pd, true, neutral, density));
-    ctx.style_mut_of(Theme::Light, |s| build(s, pl, false, neutral, density));
-    ctx.set_theme(if dark {
+    let flat = style != UiStyle::Neon;
+    let look = look::look_of(style);
+    let (pd, pl) = (palettes::of(style, true), palettes::of(style, false));
+    ctx.style_mut_of(Theme::Dark, |s| build(s, pd, true, flat, density, &look));
+    ctx.style_mut_of(Theme::Light, |s| build(s, pl, false, flat, density, &look));
+    ctx.set_theme(if dark || style.dark_only() {
         ThemePreference::Dark
     } else {
         ThemePreference::Light
     });
 }
 
-fn build(style: &mut Style, p: &Palette, dark: bool, neutral: bool, density: Density) {
+fn build(style: &mut Style, p: &Palette, dark: bool, neutral: bool, density: Density, look: &Look) {
     let compact = density == Density::Compact;
-    let family = if neutral {
+    let family = if look.mono_ui {
+        FontFamily::Monospace
+    } else if neutral {
         FontFamily::Name(crate::ui_fonts::NEUTRAL_FAMILY.into())
     } else {
         FontFamily::Proportional
     };
     let prop = |size| FontId::new(size, family.clone());
-    let (body, small, section, title, heading) = if neutral {
+    let (body, small, section, title, heading) = if look.mono_ui {
+        (11.5, 10.5, 10.0, 12.5, 16.0)
+    } else if neutral {
         (13.0, 12.0, 10.5, 14.0, 18.0)
     } else {
         (14.0, 12.0, 11.5, 15.0, 22.0)
@@ -282,9 +259,9 @@ fn build(style: &mut Style, p: &Palette, dark: bool, neutral: bool, density: Den
     }
     v.slider_trailing_fill = true;
     v.handle_shape = HandleShape::Circle;
-    v.window_corner_radius = CornerRadius::same(if neutral { 10 } else { 14 });
-    v.menu_corner_radius = CornerRadius::same(10);
-    v.window_stroke = Stroke::new(1.0, p.stroke);
+    v.window_corner_radius = CornerRadius::same(if neutral { popup_radius_of(look) } else { 14 });
+    v.menu_corner_radius = CornerRadius::same(popup_radius_of(look).min(10));
+    v.window_stroke = Stroke::new(look.card.border_w.min(2.0), p.stroke);
     let shadow = |dy: i8, blur: u8, a: u8| Shadow {
         offset: [0, dy],
         blur,
@@ -299,36 +276,37 @@ fn build(style: &mut Style, p: &Palette, dark: bool, neutral: bool, density: Den
         v.popup_shadow = shadow(6, 22, 130);
     }
 
-    let r = CornerRadius::same(8);
+    let r = CornerRadius::same(if neutral { 8.min(look.ui_r) } else { 8 });
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = p.panel;
     w.noninteractive.weak_bg_fill = p.panel;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, p.stroke);
+    w.noninteractive.bg_stroke = Stroke::new(look.sep_w, p.separator);
     w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
     w.noninteractive.corner_radius = r;
 
     if neutral {
         let hover_stroke = hover_stroke(p);
+        let bw = look.card.border_w.min(2.0);
         let (rest, hover) = if dark {
-            (p.surface, p.raised)
+            (p.surface, p.hover_bg)
         } else {
             (p.bg, p.surface)
         };
         w.inactive.bg_fill = rest;
         w.inactive.weak_bg_fill = rest;
-        w.inactive.bg_stroke = Stroke::new(1.0, p.stroke);
+        w.inactive.bg_stroke = Stroke::new(bw, p.stroke);
         w.inactive.fg_stroke = Stroke::new(1.0, p.text);
         w.hovered.bg_fill = hover;
         w.hovered.weak_bg_fill = hover;
-        w.hovered.bg_stroke = Stroke::new(1.0, hover_stroke);
+        w.hovered.bg_stroke = Stroke::new(bw, hover_stroke);
         w.hovered.fg_stroke = Stroke::new(1.0, p.text_strong);
         w.active.bg_fill = p.raised;
         w.active.weak_bg_fill = p.raised;
-        w.active.bg_stroke = Stroke::new(1.0, p.accent);
+        w.active.bg_stroke = Stroke::new(bw, p.accent);
         w.active.fg_stroke = Stroke::new(1.0, p.text_strong);
         w.open.bg_fill = p.raised;
         w.open.weak_bg_fill = p.raised;
-        w.open.bg_stroke = Stroke::new(1.0, p.stroke);
+        w.open.bg_stroke = Stroke::new(bw, p.stroke);
         w.open.fg_stroke = Stroke::new(1.0, p.text);
     } else {
         w.inactive.bg_fill = p.raised;
@@ -423,7 +401,7 @@ pub fn dropup_menu<R>(
 
 /// Semi-bold text via the UI font's `wght` axis (no-op for fixed-weight fallbacks).
 pub fn strong(text: impl Into<String>) -> RichText {
-    RichText::new(text).variation("wght", if neutral() { 600.0 } else { 640.0 })
+    RichText::new(text).variation("wght", if flat() { 600.0 } else { 640.0 })
 }
 
 /// Small uppercase caption used above groups (tracked out in Neutral).
@@ -431,7 +409,12 @@ pub fn section_caption(text: &str, color: Color32) -> RichText {
     let t = RichText::new(text.to_uppercase())
         .text_style(TextStyle::Name("Section".into()))
         .color(color);
-    if neutral() {
+    let t = if look().mono_labels {
+        t.family(FontFamily::Monospace)
+    } else {
+        t
+    };
+    if flat() {
         t.variation("wght", 500.0).extra_letter_spacing(0.9)
     } else {
         t.variation("wght", 700.0)
@@ -460,7 +443,7 @@ pub fn markdown_style(style: &mut Style, p: &Palette) {
 
 /// Bar background at horizontal position `t` (0..=1): the Neon violet→cyan wash, flat in Neutral.
 pub fn bar_tint(p: &Palette, t: f32) -> Color32 {
-    if neutral() {
+    if flat() {
         p.bar
     } else {
         mix(
@@ -473,7 +456,7 @@ pub fn bar_tint(p: &Palette, t: f32) -> Color32 {
 
 /// Fills `rect` with the bar background.
 pub fn paint_bar(painter: &Painter, rect: Rect, p: &Palette) {
-    if neutral() {
+    if flat() {
         painter.rect_filled(rect, 0, p.bar);
     } else {
         gradient_rect(painter, rect, bar_tint(p, 0.0), bar_tint(p, 1.0), true);
@@ -482,21 +465,17 @@ pub fn paint_bar(painter: &Painter, rect: Rect, p: &Palette) {
 
 /// Hover / quiet-selection fill for list rows and ghost buttons.
 pub fn hover_fill(p: &Palette) -> Color32 {
-    p.raised
+    p.hover_bg
 }
 
 /// Outline of a hovered row, tab, card or button: clearly brighter than the resting hairline.
 pub fn hover_stroke(p: &Palette) -> Color32 {
-    if neutral() {
-        mix(p.stroke, p.text, 0.4)
-    } else {
-        p.accent.gamma_multiply(0.6)
-    }
+    p.hover_line
 }
 
 /// Fill of an active / selected control: the raised surface in Neutral, an `alpha` accent wash in Neon.
 pub fn accent_fill(p: &Palette, neon_alpha: f32) -> Color32 {
-    if neutral() {
+    if flat() {
         p.raised
     } else {
         p.accent.gamma_multiply(neon_alpha)
@@ -519,19 +498,26 @@ pub fn on_accent(p: &Palette) -> Color32 {
     ink_on(p.accent)
 }
 
-/// `neutral_px` in Neutral, `neon_px` in Neon (corner radii that differ between the looks).
+/// `neutral_px` in the flat styles, `neon_px` in Neon (corner radii that differ between the looks).
 pub fn rad(neutral_px: u8, neon_px: u8) -> u8 {
-    if neutral() { neutral_px } else { neon_px }
+    if flat() { ui_rad(neutral_px) } else { neon_px }
 }
 
-/// Corner radius of popups, popovers and dialogs: 10 in Neutral, 16 in Neon.
+/// Popup radius of a style's look: its card radius where tighter than 10 (Blueprint 3, Phosphor 2,
+/// Neo-Brutal 6), else 10.
+fn popup_radius_of(look: &Look) -> u8 {
+    look.card.radius.clamp(3, 10)
+}
+
+/// Corner radius of popups, popovers and dialogs: 10 in the flat styles (tighter in Blueprint,
+/// Phosphor and Neo-Brutal), 16 in Neon.
 pub fn popup_radius() -> u8 {
-    rad(10, 16)
+    if flat() { popup_radius_of(look()) } else { 16 }
 }
 
 /// Border of a floating surface: the plain hairline in Neutral, an accent wash in Neon.
 pub fn popup_stroke(p: &Palette) -> Stroke {
-    if neutral() {
+    if flat() {
         Stroke::new(1.0, p.stroke)
     } else {
         Stroke::new(1.0, p.accent.gamma_multiply(0.45))
@@ -540,7 +526,7 @@ pub fn popup_stroke(p: &Palette) -> Stroke {
 
 /// Border of a status-coloured card (toast, banner): hairline in Neutral, `color` wash in Neon.
 pub fn status_stroke(p: &Palette, color: Color32, neon_alpha: f32) -> Stroke {
-    if neutral() {
+    if flat() {
         Stroke::new(1.0, p.stroke)
     } else {
         Stroke::new(1.0, color.gamma_multiply(neon_alpha))
@@ -549,16 +535,12 @@ pub fn status_stroke(p: &Palette, color: Color32, neon_alpha: f32) -> Stroke {
 
 /// `base` washed toward the accent by `t` in Neon; untouched in Neutral (flat, no accent fills).
 pub fn accent_wash(base: Color32, accent: Color32, t: f32) -> Color32 {
-    if neutral() {
-        base
-    } else {
-        mix(base, accent, t)
-    }
+    if flat() { base } else { mix(base, accent, t) }
 }
 
 /// Dimming layer behind modal dialogs and popups.
 pub fn backdrop(dark: bool) -> Color32 {
-    Color32::from_black_alpha(match (neutral(), dark) {
+    Color32::from_black_alpha(match (flat(), dark) {
         (true, true) => 140,
         (true, false) => 60,
         (false, true) => 150,
@@ -568,11 +550,7 @@ pub fn backdrop(dark: bool) -> Color32 {
 
 /// Shadow under modal dialogs and large popups (soft and short in Neutral).
 pub fn modal_shadow(dark: bool) -> Shadow {
-    let (dy, blur, a) = if neutral() {
-        (10, 32, 150)
-    } else {
-        (20, 48, 180)
-    };
+    let (dy, blur, a) = if flat() { (10, 32, 150) } else { (20, 48, 180) };
     Shadow {
         offset: [0, dy],
         blur,
@@ -631,7 +609,7 @@ pub fn gradient_rounded(painter: &Painter, rect: Rect, radius: f32, a: Color32, 
 
 /// Status dot (with a soft glow in Neon, flat in Neutral); `pulse` in 0..=1 sets the halo strength.
 pub fn glow_dot(painter: &Painter, center: Pos2, radius: f32, color: Color32, pulse: f32) {
-    if neutral() {
+    if flat() {
         painter.circle_filled(center, radius, color);
         return;
     }
@@ -656,28 +634,36 @@ pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 
 #[cfg(test)]
 mod tests {
+    use super::palettes::{NEUTRAL_DARK, NEUTRAL_LIGHT};
     use super::*;
-
-    const VARIANTS: [(&Palette, bool, bool); 4] = [
-        (&DARK, true, false),
-        (&LIGHT, false, false),
-        (&NEUTRAL_DARK, true, true),
-        (&NEUTRAL_LIGHT, false, true),
-    ];
 
     /// Menus hover with `widgets.hovered.weak_bg_fill` on top of `window_fill`; if they match,
     /// the highlighted item is invisible (egui-style.md §1.2).
     #[test]
     fn menu_hover_is_distinguishable_in_all_variants() {
-        for (pal, dark, neutral) in VARIANTS {
-            for density in [Density::Compact, Density::Comfortable] {
-                let mut style = Style::default();
-                build(&mut style, pal, dark, neutral, density);
-                assert_ne!(
-                    style.visuals.window_fill, style.visuals.widgets.hovered.weak_bg_fill,
-                    "dark={dark} neutral={neutral}"
-                );
-                assert_eq!(style.visuals.dark_mode, dark);
+        for ui_style in UiStyle::ALL {
+            for dark in [true, false] {
+                if !dark && ui_style.dark_only() {
+                    continue;
+                }
+                let pal = palettes::of(ui_style, dark);
+                let look = look::look_of(ui_style);
+                for density in [Density::Compact, Density::Comfortable] {
+                    let mut style = Style::default();
+                    build(
+                        &mut style,
+                        pal,
+                        dark,
+                        ui_style != UiStyle::Neon,
+                        density,
+                        &look,
+                    );
+                    assert_ne!(
+                        style.visuals.window_fill, style.visuals.widgets.hovered.weak_bg_fill,
+                        "{ui_style:?} dark={dark}"
+                    );
+                    assert_eq!(style.visuals.dark_mode, dark);
+                }
             }
         }
     }
@@ -708,9 +694,48 @@ mod tests {
     fn compact_is_tighter_than_comfortable() {
         let mut c = Style::default();
         let mut f = Style::default();
-        build(&mut c, &NEUTRAL_DARK, true, true, Density::Compact);
-        build(&mut f, &NEUTRAL_DARK, true, true, Density::Comfortable);
+        let look = look::look_of(UiStyle::Neutral);
+        build(&mut c, &NEUTRAL_DARK, true, true, Density::Compact, &look);
+        build(
+            &mut f,
+            &NEUTRAL_DARK,
+            true,
+            true,
+            Density::Comfortable,
+            &look,
+        );
         assert!(c.spacing.interact_size.y < f.spacing.interact_size.y);
         assert!(c.spacing.item_spacing.y < f.spacing.item_spacing.y);
+    }
+
+    #[test]
+    fn dark_only_styles_ignore_the_requested_theme() {
+        for style in UiStyle::ALL.into_iter().filter(|s| s.dark_only()) {
+            assert_eq!(
+                palettes::of(style, true).bg,
+                palettes::of(style, false).bg,
+                "{style:?}"
+            );
+            assert!(dark_only_reason(style).is_some(), "{style:?}");
+        }
+        for style in UiStyle::ALL.into_iter().filter(|s| !s.dark_only()) {
+            assert!(dark_only_reason(style).is_none(), "{style:?}");
+        }
+    }
+
+    #[test]
+    fn hover_is_visible_in_every_style() {
+        for style in UiStyle::ALL {
+            for dark in [true, false] {
+                if !dark && style.dark_only() {
+                    continue;
+                }
+                let p = palettes::of(style, dark);
+                assert_ne!(p.hover_line, p.stroke, "{style:?} dark={dark}");
+                assert_ne!(p.hover_line, p.surface, "{style:?} dark={dark}");
+                assert_ne!(p.hover_bg, p.panel, "{style:?} dark={dark}");
+                assert_ne!(p.raised, p.surface, "{style:?} dark={dark}");
+            }
+        }
     }
 }

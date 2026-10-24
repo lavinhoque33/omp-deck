@@ -67,8 +67,11 @@ host), so closing a tab or the whole app leaves omp running.
   shows a title-bar badge; **Update and restart** downloads, verifies and installs the new version, then
   restarts OmpDeck with your tabs re-attached. See [below](#updating-ompdeck).
 - **Per-folder mode**: scope the sidebar to a single project folder.
-- **Appearance**: a flat, neutral default look (Geist font, lucide icons, compact spacing) or the
-  "Midnight neon" style, each in dark and light, plus a Comfortable density option (Settings → OmpDeck).
+- **Appearance**: 18 styles in a Settings gallery. The default is **Blueprint** (dot-grid canvas, square cards
+  with a double rule, cyan accent, monospace labels). The other 15 dark styles are Zinc Contrast, Layered Depth,
+  Teal Signal, Slate Ink, Mono Wire, Graphite Islands, Aurora, Obsidian Glass, Ember, Indigo Night, Phosphor,
+  Neo-Brutal, Rosé Noir, Spotlight and Two-Tone Frame; the flat Neutral look and "Midnight neon" also come in
+  light. The terminal colors follow the style, and a Comfortable density option is available (Settings → OmpDeck).
   Integrated title bar (or native decorations), persisted window geometry and open tabs.
 
 OmpDeck never writes to the omp session store directly; changes go through omp's own CLI.

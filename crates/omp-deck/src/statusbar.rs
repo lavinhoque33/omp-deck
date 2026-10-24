@@ -519,11 +519,15 @@ pub fn show(
             );
         });
     let r = panel.response.rect;
-    ui.painter().hline(
-        r.x_range(),
-        r.top() + 0.5,
-        Stroke::new(1.0, pal.stroke.gamma_multiply(0.9)),
-    );
+    if theme::is_gallery() {
+        theme::skin::paint_edge(ui.painter(), r, theme::skin::Edge::Top, pal);
+    } else {
+        ui.painter().hline(
+            r.x_range(),
+            r.top() + 0.5,
+            Stroke::new(1.0, pal.stroke.gamma_multiply(0.9)),
+        );
+    }
     out
 }
 
@@ -732,7 +736,7 @@ fn text(s: &str, size: f32, color: Color32) -> egui::Label {
 }
 
 fn chip_radius() -> u8 {
-    if theme::neutral() { 6 } else { 10 }
+    if theme::flat() { 6 } else { 10 }
 }
 
 /// A rounded segment with a hover plate; `add` lays out its contents on one line. The response

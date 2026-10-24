@@ -40,11 +40,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, on: bool) -> Response
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered() || on, 0.1);
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        let (radius, size) = if theme::neutral() {
-            (6, 16.0)
-        } else {
-            (9, 19.0)
-        };
+        let (radius, size) = if theme::flat() { (6, 16.0) } else { (9, 19.0) };
         p.rect_filled(
             rect,
             radius,
@@ -81,7 +77,7 @@ pub fn win_button(ui: &mut Ui, icon: Icon, tooltip: &str, danger: bool) -> Respo
         };
         p.rect_filled(
             rect,
-            if theme::neutral() { 6 } else { 9 },
+            if theme::flat() { 6 } else { 9 },
             fill.gamma_multiply(hov),
         );
         let fg = if danger && hov > 0.5 {
@@ -89,7 +85,7 @@ pub fn win_button(ui: &mut Ui, icon: Icon, tooltip: &str, danger: bool) -> Respo
         } else {
             theme::mix(pal.weak, pal.text_strong, hov)
         };
-        let size = if theme::neutral() { 15.0 } else { 17.0 };
+        let size = if theme::flat() { 15.0 } else { 17.0 };
         paint_icon(p, rect.center(), Align2::CENTER_CENTER, icon, size, fg);
     }
     resp.on_hover_text(tooltip)
@@ -98,7 +94,7 @@ pub fn win_button(ui: &mut Ui, icon: Icon, tooltip: &str, danger: bool) -> Respo
 /// Animated switch. Returns the response with `changed()` set on toggle.
 pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
     let pal = Palette::of_ui(ui);
-    let neutral = theme::neutral();
+    let neutral = theme::flat();
     let size = if neutral {
         vec2(34.0, 20.0)
     } else {
@@ -169,7 +165,7 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
 /// Segmented control; returns true when the selection changed.
 pub fn segmented(ui: &mut Ui, selected: &mut usize, options: &[(Icon, &str)]) -> bool {
     let pal = Palette::of_ui(ui);
-    let neutral = theme::neutral();
+    let neutral = theme::flat();
     let font = crate::theme::font(if neutral { 13.0 } else { 13.5 });
     let icon_w = 16.0;
     let pad = if neutral { 10.0 } else { 12.0 };
@@ -278,7 +274,7 @@ pub fn segmented(ui: &mut Ui, selected: &mut usize, options: &[(Icon, &str)]) ->
 /// Titled card (rounded surface with caption).
 pub fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
     let pal = Palette::of_ui(ui);
-    let neutral = theme::neutral();
+    let neutral = theme::flat();
     Frame::NONE
         .fill(if neutral {
             pal.panel
@@ -325,7 +321,7 @@ pub fn empty_state(ui: &mut Ui, icon: Icon, color: Color32, title: &str, sub: &s
     let pal = Palette::of_ui(ui);
     ui.add_space(28.0);
     ui.vertical_centered(|ui| {
-        if theme::neutral() {
+        if theme::flat() {
             let (rect, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
             let p = ui.painter();
             p.rect(
@@ -395,7 +391,7 @@ pub fn menu_item(
         (pal.glyph, pal.text)
     };
     let mut btn = Button::new((
-        icon_text(icon, if theme::neutral() { 15.5 } else { 17.0 }, ic),
+        icon_text(icon, if theme::flat() { 15.5 } else { 17.0 }, ic),
         RichText::new(label).color(fg),
     ));
     if let Some(s) = shortcut {
