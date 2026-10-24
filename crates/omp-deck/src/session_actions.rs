@@ -4,6 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use deck_term::input::{Key, Mods};
+
 use crate::inject::{Job, Requires, sanitize_line};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +170,9 @@ pub fn compact_label(mode: &CompactMode) -> &'static str {
     }
 }
 
+/// omp's plan-mode hotkey is Alt+Shift+P.
+const ALT_SHIFT: Mods = Mods::new(true, true, false);
+
 /// The composer/hotkey injection behind an action; `None` for actions that run elsewhere.
 pub fn job(action: &Action) -> Option<Job> {
     Some(match action {
@@ -203,10 +208,10 @@ pub fn job(action: &Action) -> Option<Job> {
             Job::slash("Rename", &format!("/rename {t}"), Requires::Any)
         }
         Action::AutoName => Job::slash("Auto-name", "/rename", Requires::Any),
-        Action::PlanMode => Job::keys("Plan mode", b"\x1bP", Requires::Any),
-        Action::AgentHub => Job::keys("omp's Agent Hub", b"\x1ba", Requires::Any),
+        Action::PlanMode => Job::key("Plan mode", Key::Char('p'), ALT_SHIFT, Requires::Any),
+        Action::AgentHub => Job::key("omp's Agent Hub", Key::Char('a'), Mods::ALT, Requires::Any),
         Action::Context => Job::slash("Context", "/context", Requires::Any),
-        Action::Retry => Job::keys("Retry", b"\x1b[15~", Requires::Idle),
+        Action::Retry => Job::key("Retry", Key::F(5), Mods::NONE, Requires::Idle),
         Action::Stop => Job::stop(),
         Action::Fork | Action::CopyLast | Action::ExportHtml => return None,
     })
@@ -386,14 +391,21 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_jobs_carry_the_documented_bytes() {
+    fn hotkey_jobs_carry_the_documented_keys() {
         let keys = |a: Action| match job(&a).map(|j| (j.payload, j.requires)) {
-            Some((Payload::Keys(b), r)) => (b, r),
-            other => panic!("not keys: {other:?}"),
+            Some((Payload::Key(k, m), r)) => (k, m, r),
+            other => panic!("not a key: {other:?}"),
         };
-        assert_eq!(keys(Action::PlanMode), (b"\x1bP".to_vec(), Requires::Any));
-        assert_eq!(keys(Action::AgentHub), (b"\x1ba".to_vec(), Requires::Any));
-        assert_eq!(keys(Action::Retry), (b"\x1b[15~".to_vec(), Requires::Idle));
+        // omp-actions.md §7: Alt+Shift+P (`ESC P`), Alt+A (`ESC a`), F5 (`ESC[15~`).
+        assert_eq!(
+            keys(Action::PlanMode),
+            (Key::Char('p'), ALT_SHIFT, Requires::Any)
+        );
+        assert_eq!(
+            keys(Action::AgentHub),
+            (Key::Char('a'), Mods::ALT, Requires::Any)
+        );
+        assert_eq!(keys(Action::Retry), (Key::F(5), Mods::NONE, Requires::Idle));
         assert_eq!(
             job(&Action::Stop),
             Some(Job::stop()),

@@ -151,6 +151,16 @@ Harness: python `pty.fork()` → `tmux -L omp-deck-test-act -f docs/notes/tmux.c
    Detect "composer non-empty" from OmpDeck's own alacritty grid (last composer row after `╰─`) or just always send the clear.
 8. **Overlay already open** (picker/hub): injected text goes to the overlay's search box; Esc closes it. Before injecting, check the grid for a bordered overlay or accept that the button press is ignored.
 9. **Direct hotkeys need no composer handling and work with text in the composer and mid-stream** (V via outer PTY/tmux): `Alt+Shift+P` = `ESC P` (`\x1bP`) toggled plan mode; `Alt+P` = `ESC p` opened the temp model picker; `Alt+A` = `ESC a` opened the hub. (tmux `extended-keys` csi-u mode from tmux.conf didn't interfere; if OmpDeck's encoder emits kitty/CSI-u (`ESC[112;3u` style) form instead, omp's key parser also understands it [UNVERIFIED].) Remember users can remap in `keybindings.json`.
+10. **Keys are injected as key strokes, never raw bytes** (`inject::Write::Key` → `deck_term::Terminal::send_key` →
+   `input::encode_stroke`: press + release encoded exactly like the user's own key under the active protocol). Bytes per
+   protocol: tmux Esc = `ESC O [`, Enter = `\r`, Ctrl+C = `0x03`, Alt+Shift+P = `ESC P`, Alt+A = `ESC a`, F5 = `ESC[15~`;
+   win32-input-mode = `CSI Vk;Sc;Uc;Kd;Cs;Rc _` down/up records wrapped in modifier records; kitty = CSI-u (+release with
+   event types). Only the bracketed paste stays raw bytes. Reason (Windows bug, source-verified in microsoft/terminal
+   `src/terminal/parser/stateMachine.cpp` `ProcessString` + `InputStateMachineEngine.cpp`): once ConPTY has decoded any
+   win32-input-mode record (i.e. the user typed anything in the tab), it caches a trailing lone `ESC` of a write as the
+   start of a sequence instead of flushing it, so the old raw `0x1b` … 150 ms … `\r` merged into `ESC \r` = Alt+Enter
+   (an edit in omp): `/switch` stayed in the composer and the following `/effort` hit the draft confirm. Raw `ESC P`
+   (DCS entry) and Stop's lone `ESC` had the same problem.
 
 ### Idle / busy detection from outside (verified)
 * **Title OSC 0** `π <glyph> <label>`; `label` = session title (or cwd basename). Glyph: `>` idle; braille spinner `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` ~every 100 ms while working (V: `π ⠼ Test Title X`); `!` = attention (source: `v_t()` in terminal-title; not triggered in my tests) [UNVERIFIED trigger]; `:` when reduced-motion. tmux forwards it (`set-titles on`, `#T`), `#{pane_title}` gives it. Style depends on setting `terminalTitle*` (pulse/dots/line variants exist).

@@ -28,7 +28,7 @@ use crate::sync_view::{
     self, BackupAnswer, BackupDialog, Cells, CloudProject, LastView, ListState, ManagerAction,
     ManagerDialog, ManagerStep, OmpCell, PathAnswer, PathPrompt, PathPurpose, PlanView, ProgView,
     ReportView, RestoreAction, RestoreDialog, RowView, SessionItem, SessionsAnswer, SessionsCell,
-    SessionsDialog, Step, SyncAction, SyncPage, TargetStatus, VersionRow,
+    SessionsDialog, SessionsTarget, Step, SyncAction, SyncPage, TargetStatus, VersionRow,
 };
 use crate::transfer;
 use crate::tree_layout::clock;
@@ -320,8 +320,30 @@ fn cells_of(sizes: Option<&Result<ProjectSizes, String>>, excluded: &BTreeSet<St
     }
 }
 
-/// No opted-out sessions (a folder that is not in the Sync table).
-static NO_IDS: BTreeSet<String> = BTreeSet::new();
+/// The chooser rows of `sizes`: checked = backed up, so every id in `excluded` is off.
+fn session_items(sizes: &ProjectSizes, excluded: &BTreeSet<String>) -> Vec<SessionItem> {
+    let now = SystemTime::now();
+    sizes
+        .session_list
+        .iter()
+        .map(|s| {
+            let age = format_age(now, s.modified);
+            SessionItem {
+                id: s.id.clone(),
+                title: clip(&s.title, 80),
+                haystack: format!("{} {}", s.title, s.id).to_lowercase(),
+                age: if age == "now" {
+                    "just now".to_owned()
+                } else {
+                    format!("{age} ago")
+                },
+                size: human_size(s.bytes),
+                bytes: s.bytes,
+                on: !excluded.contains(&s.id),
+            }
+        })
+        .collect()
+}
 
 /// What a backup of `path` can include right now, given the user's switches and exclusions.
 fn usable_parts(want: Parts, sizes: &ProjectSizes, excluded: &BTreeSet<String>) -> Parts {
@@ -403,15 +425,15 @@ impl App {
     }
 
     /// Measures, then backs up `path` with whichever of `want` exists, leaving out the sessions
-    /// the Sync row opted out (a folder that is not in the table has none).
-    fn start_project_backup(&mut self, path: PathBuf, want: Parts, auto: bool) -> bool {
+    /// in `excluded` (the Sync row's opt-outs, or the sidebar dialog's one-off choice).
+    fn start_project_backup(
+        &mut self,
+        path: PathBuf,
+        want: Parts,
+        auto: bool,
+        excluded: BTreeSet<String>,
+    ) -> bool {
         let root = self.root.clone();
-        let excluded = self
-            .cfg
-            .project_sync
-            .iter()
-            .find(|r| r.path == path)
-            .map_or_else(BTreeSet::new, |r| r.excluded_sessions.clone());
         let kind = Kind::Backup { path: path.clone() };
         self.lane_job(kind, move |service, cancel, report| {
             let result = measure(&root, &path)
@@ -503,7 +525,8 @@ impl App {
                 (None, _) => false,
             };
             if want.any() && usable {
-                self.start_project_backup(path, want, true);
+                let excluded = row.map_or_else(BTreeSet::new, |r| r.excluded_sessions.clone());
+                self.start_project_backup(path, want, true, excluded);
             }
             ctx.request_repaint();
             return;
@@ -644,7 +667,8 @@ impl App {
                             sessions: r.sessions,
                         },
                     );
-                    if !self.start_project_backup(path, want, false) {
+                    let excluded = r.excluded_sessions.clone();
+                    if !self.start_project_backup(path, want, false, excluded) {
                         self.toasts.info(
                             &self.ctx,
                             "Another project job is running; try again in a moment.",
@@ -951,6 +975,7 @@ impl App {
             omp: row.is_none_or(|r| r.omp),
             sessions: row.is_none_or(|r| r.sessions),
             keep: true,
+            excluded_ids: row.map_or_else(BTreeSet::new, |r| r.excluded_sessions.clone()),
             excluded: 0,
             path: path.clone(),
         });
@@ -962,13 +987,7 @@ impl App {
         let Some(d) = &mut self.sync.backup else {
             return;
         };
-        let excluded = self
-            .cfg
-            .project_sync
-            .iter()
-            .find(|r| r.path == d.path)
-            .map_or(&NO_IDS, |r| &r.excluded_sessions);
-        let cells = cells_of(self.sync.sizes.get(&d.path), excluded);
+        let cells = cells_of(self.sync.sizes.get(&d.path), &d.excluded_ids);
         d.excluded = match cells.sessions {
             SessionsCell::Ready {
                 count, included, ..
@@ -981,6 +1000,7 @@ impl App {
                 self.sync.backup = None;
                 self.focus_pending = true;
             }
+            BackupAnswer::ChooseSessions => self.open_backup_sessions_dialog(),
             BackupAnswer::Run => {
                 let Some(d) = self.sync.backup.take() else {
                     return;
@@ -995,20 +1015,21 @@ impl App {
                         Some(r) => {
                             r.omp = d.omp;
                             r.sessions = d.sessions;
+                            r.excluded_sessions = d.excluded_ids.clone();
                         }
                         None => {
                             self.cfg.project_sync.push(SyncRow {
                                 path: d.path.clone(),
                                 omp: d.omp,
                                 sessions: d.sessions,
-                                excluded_sessions: BTreeSet::new(),
+                                excluded_sessions: d.excluded_ids.clone(),
                             });
-                            self.refresh_cells(&d.path);
                         }
                     }
                     self.dirty = true;
+                    self.refresh_cells(&d.path);
                 }
-                if !self.start_project_backup(d.path, want, false) {
+                if !self.start_project_backup(d.path, want, false, d.excluded_ids) {
                     self.toasts.info(
                         &self.ctx,
                         "Another project job is running; try again in a moment.",
@@ -1474,31 +1495,27 @@ impl App {
         let Some(Ok(sizes)) = self.sync.sizes.get(&row.path) else {
             return;
         };
-        let now = SystemTime::now();
-        let items = sizes
-            .session_list
-            .iter()
-            .map(|s| {
-                let age = format_age(now, s.modified);
-                SessionItem {
-                    id: s.id.clone(),
-                    title: clip(&s.title, 80),
-                    haystack: format!("{} {}", s.title, s.id).to_lowercase(),
-                    age: if age == "now" {
-                        "just now".to_owned()
-                    } else {
-                        format!("{age} ago")
-                    },
-                    size: human_size(s.bytes),
-                    bytes: s.bytes,
-                    on: !row.excluded_sessions.contains(&s.id),
-                }
-            })
-            .collect();
         self.sync.sessions = Some(SessionsDialog::new(
             row.path.clone(),
             abbreviate_home(&row.path),
-            items,
+            session_items(sizes, &row.excluded_sessions),
+            SessionsTarget::Row,
+        ));
+    }
+
+    /// The chooser for the open sidebar backup dialog, toggles from its own exclusion set.
+    fn open_backup_sessions_dialog(&mut self) {
+        let Some(b) = &self.sync.backup else {
+            return;
+        };
+        let Some(Ok(sizes)) = self.sync.sizes.get(&b.path) else {
+            return;
+        };
+        self.sync.sessions = Some(SessionsDialog::new(
+            b.path.clone(),
+            b.display.clone(),
+            session_items(sizes, &b.excluded_ids),
+            SessionsTarget::Backup,
         ));
     }
 
@@ -1518,13 +1535,23 @@ impl App {
                 };
                 self.focus_pending = true;
                 let excluded = d.excluded_ids();
-                if let Some(row) = self.cfg.project_sync.iter_mut().find(|r| r.path == d.path)
-                    && row.excluded_sessions != excluded
-                {
-                    row.excluded_sessions = excluded;
-                    self.dirty = true;
+                match d.target {
+                    SessionsTarget::Row => {
+                        if let Some(row) =
+                            self.cfg.project_sync.iter_mut().find(|r| r.path == d.path)
+                            && row.excluded_sessions != excluded
+                        {
+                            row.excluded_sessions = excluded;
+                            self.dirty = true;
+                        }
+                        self.refresh_cells(&d.path);
+                    }
+                    SessionsTarget::Backup => {
+                        if let Some(b) = self.sync.backup.as_mut().filter(|b| b.path == d.path) {
+                            b.excluded_ids = excluded;
+                        }
+                    }
                 }
-                self.refresh_cells(&d.path);
             }
         }
     }
@@ -1896,6 +1923,21 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn chooser_rows_start_with_the_dialog_set_off_and_excluding_all_leaves_nothing_usable() {
+        let s = sizes(OmpDir::Missing, 2);
+        let excluded: BTreeSet<String> = ["s1".to_owned()].into();
+        let on: Vec<bool> = session_items(&s, &excluded).iter().map(|i| i.on).collect();
+        assert_eq!(on, [true, false]);
+        let all: BTreeSet<String> = ["s0".to_owned(), "s1".to_owned()].into();
+        let want = Parts {
+            omp: true,
+            sessions: true,
+        };
+        assert!(usable_parts(want, &s, &BTreeSet::new()).any());
+        assert!(!usable_parts(want, &s, &all).any());
     }
 
     #[test]

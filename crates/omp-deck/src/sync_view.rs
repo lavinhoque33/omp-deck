@@ -635,7 +635,9 @@ pub struct BackupDialog {
     pub omp: bool,
     pub sessions: bool,
     pub keep: bool,
-    /// Sessions the row for this folder leaves out (0 when the folder is not in the Sync table).
+    /// Sessions this backup leaves out; local to the dialog (seeded from the folder's Sync row).
+    pub excluded_ids: std::collections::BTreeSet<String>,
+    /// How many of the folder's sessions `excluded_ids` leaves out (derived each frame).
     pub excluded: usize,
 }
 
@@ -643,6 +645,8 @@ pub enum BackupAnswer {
     Open,
     Cancel,
     Run,
+    /// Open the session chooser for this backup (the dialog stays open).
+    ChooseSessions,
 }
 
 /// "Back up to Google Drive": both parts with their sizes, "Keep this folder in Sync", Back up now.
@@ -653,6 +657,7 @@ pub fn backup_dialog(
     busy: bool,
 ) -> BackupAnswer {
     let pal = Palette::of_ctx(ctx);
+    let mut choose = false;
     let any = (d.omp && cells.omp_usable()) || (d.sessions && cells.sessions_usable());
     let answer = show_dialog(
         ctx,
@@ -699,13 +704,23 @@ pub fn backup_dialog(
                         d.sessions = on;
                     },
                 );
+                if ui
+                    .add_enabled(
+                        cells.sessions_choosable() && !busy,
+                        Button::new(RichText::new("Choose…").small()),
+                    )
+                    .on_hover_text("Pick which sessions are backed up (new ones are included)")
+                    .clicked()
+                {
+                    choose = true;
+                }
             });
             if d.excluded > 0 {
                 ui.add_space(4.0);
                 weak_note(
                     ui,
                     &format!(
-                        "{} session{} excluded on the Sync page",
+                        "{} session{} left out",
                         d.excluded,
                         if d.excluded == 1 { "" } else { "s" }
                     ),
@@ -725,6 +740,9 @@ pub fn backup_dialog(
             }
         },
     );
+    if choose && answer.is_none() {
+        return BackupAnswer::ChooseSessions;
+    }
     match answer {
         Some(true) => BackupAnswer::Run,
         Some(false) => BackupAnswer::Cancel,
@@ -1324,10 +1342,20 @@ pub struct SessionItem {
     pub on: bool,
 }
 
+/// Whose exclusion set the chooser edits on Save.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SessionsTarget {
+    /// The folder's row in the Sync table.
+    Row,
+    /// The open sidebar backup dialog (this one backup only).
+    Backup,
+}
+
 pub struct SessionsDialog {
     pub path: std::path::PathBuf,
     pub display: String,
     pub items: Vec<SessionItem>,
+    pub target: SessionsTarget,
     filter: String,
     focus_filter: bool,
 }
@@ -1339,11 +1367,17 @@ pub enum SessionsAnswer {
 }
 
 impl SessionsDialog {
-    pub fn new(path: std::path::PathBuf, display: String, items: Vec<SessionItem>) -> Self {
+    pub fn new(
+        path: std::path::PathBuf,
+        display: String,
+        items: Vec<SessionItem>,
+        target: SessionsTarget,
+    ) -> Self {
         SessionsDialog {
             path,
             display,
             items,
+            target,
             filter: String::new(),
             focus_filter: true,
         }
@@ -1839,6 +1873,7 @@ mod tests {
                 item("b", "Write docs", 20, false),
                 item("c", "Fix lexer", 30, true),
             ],
+            SessionsTarget::Row,
         );
         assert_eq!(d.excluded_ids().into_iter().collect::<Vec<_>>(), ["b"]);
         assert_eq!(d.selected(), (2, 40));
@@ -2049,6 +2084,7 @@ mod render_tests {
             omp: true,
             sessions: true,
             keep: true,
+            excluded_ids: ["a".to_owned(), "b".to_owned()].into(),
             excluded: 2,
         };
         let mut p = PathPrompt::new(PathPurpose::Add);

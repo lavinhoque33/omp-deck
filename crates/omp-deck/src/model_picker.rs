@@ -254,6 +254,20 @@ impl Pending {
         model_ok && level_ok
     }
 
+    /// `next` sent while `self` is still unconfirmed: an `/effort` keeps the queued `/switch`'s
+    /// model (omp applies both, in order), so the chip and the confirmation expect that model
+    /// at the new level; a `/switch` replaces everything.
+    pub fn then(self, next: Pending) -> Pending {
+        match next.selector {
+            Some(_) => next,
+            None => Pending {
+                selector: self.selector,
+                level: next.level.or(self.level),
+                since: next.since,
+            },
+        }
+    }
+
     pub fn timed_out(&self, now: Instant, limit: Duration) -> bool {
         now.duration_since(self.since) >= limit
     }
@@ -1275,5 +1289,28 @@ mod tests {
         assert!(!p.timed_out(now + Duration::from_secs(7), SWITCH_TIMEOUT));
         assert!(p.timed_out(now + SWITCH_TIMEOUT, SWITCH_TIMEOUT));
         assert!(p.timed_out(now + FRESH_TIMEOUT, FRESH_TIMEOUT));
+    }
+
+    #[test]
+    fn effort_queued_behind_an_unconfirmed_switch_keeps_its_model() {
+        let p = |selector: Option<&str>, level: Option<&str>| Pending {
+            selector: selector.map(str::to_owned),
+            level: level.map(str::to_owned),
+            since: Instant::now(),
+        };
+        // `/switch opus` then `/effort medium`: omp ends on opus at medium.
+        let merged = p(Some("a/opus"), None).then(p(None, Some("medium")));
+        assert_eq!(
+            (merged.selector.as_deref(), merged.level.as_deref()),
+            (Some("a/opus"), Some("medium"))
+        );
+        assert!(merged.confirmed_by(Some("a/opus"), Some("medium"), None));
+        assert!(!merged.confirmed_by(Some("a/sonnet"), Some("medium"), None));
+        // A later `/switch` replaces the earlier one, level included.
+        let replaced = p(Some("a/opus"), Some("high")).then(p(Some("a/sonnet"), None));
+        assert_eq!(
+            (replaced.selector.as_deref(), replaced.level),
+            (Some("a/sonnet"), None)
+        );
     }
 }

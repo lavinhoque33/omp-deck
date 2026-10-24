@@ -11,7 +11,7 @@ use egui::{TextEdit, Ui};
 
 use super::{App, AppEvent, PendingConfirm};
 use crate::confirm::{self, Confirm, Dialog};
-use crate::inject::{Env, Job, Requires};
+use crate::inject::{Env, Job, Requires, Write};
 use crate::model_picker::{self, FRESH_TIMEOUT, Pending, PickerAction, SWITCH_TIMEOUT};
 use crate::session_actions::{self, Action, ActionCtx, CompactMode};
 use crate::statusbar::{self, BarAction, BarInput};
@@ -184,8 +184,11 @@ impl App {
             if let Some(h) = poll.hold_for {
                 term.hold_input_until(now + h);
             }
-            for w in &poll.writes {
-                term.write(w);
+            for w in poll.writes {
+                match w {
+                    Write::Bytes(bytes) => term.write(&bytes),
+                    Write::Key(key, mods) => term.send_key(key, mods),
+                }
             }
             if let Some(c) = poll.confirm {
                 prompts.push((tab.uid, c));
@@ -414,17 +417,23 @@ impl App {
         });
     }
 
-    /// The model the active session runs as far as the deck knows: an assumed switch's model
-    /// while the bar can only show omp's defaults (the same rule as the model chip).
+    /// The model the active session runs as far as the deck knows: an unconfirmed switch's
+    /// model (omp applies it before anything queued now), else an assumed switch's model while
+    /// the bar can only show omp's defaults (the same rule as the model chip).
     fn current_model(&self) -> Option<String> {
         let v = &self.bar_view;
-        let assumed = match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) if v.model_selector.is_none() || v.model_is_default => {
-                t.assumed_switch.as_ref().and_then(|a| a.selector.clone())
-            }
+        let tab = match self.tabs.get(self.active) {
+            Some(Tab::Terminal(t)) => Some(t),
             _ => None,
         };
-        assumed.or_else(|| v.model_selector.clone())
+        let pending = tab
+            .and_then(|t| t.pending_switch.as_ref())
+            .and_then(|p| p.selector.clone());
+        let assumed = tab
+            .filter(|_| v.model_selector.is_none() || v.model_is_default)
+            .and_then(|t| t.assumed_switch.as_ref())
+            .and_then(|a| a.selector.clone());
+        pending.or(assumed).or_else(|| v.model_selector.clone())
     }
 
     /// Send `/switch` or `/effort` to the active tab and show the optimistic state.
@@ -441,10 +450,14 @@ impl App {
         }
         tab.injector
             .push(Job::slash(MODEL_SWITCH, &change.command, Requires::Any));
-        tab.pending_switch = Some(Pending {
+        let next = Pending {
             selector: change.selector,
             level: change.level,
             since: Instant::now(),
+        };
+        tab.pending_switch = Some(match tab.pending_switch.take() {
+            Some(prev) => prev.then(next),
+            None => next,
         });
         self.ctx.request_repaint();
     }

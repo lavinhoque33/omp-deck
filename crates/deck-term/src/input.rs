@@ -1038,6 +1038,32 @@ pub fn encode_win32_modifiers(from: Mods, to: Mods) -> Vec<u8> {
     out
 }
 
+/// One complete synthetic key stroke (press, then release) exactly as the same key typed by
+/// the user is encoded, for keys an app injects (no text: Uc/escape forms derive from the key).
+/// Releases only produce bytes where the protocol reports them (kitty event types, win32 key-up
+/// records). In win32-input-mode the modifier key records go around the stroke, starting and
+/// ending at `seen`, the modifier state the child last saw, so its view stays unchanged.
+pub fn encode_stroke(key: Key, mods: Mods, mode: TermMode, rules: KeyRules, seen: Mods) -> Vec<u8> {
+    let win32 = rules == KeyRules::Win32;
+    let mut out = Vec::new();
+    if win32 {
+        out.extend(encode_win32_modifiers(seen, mods));
+    }
+    for action in [KeyAction::Press, KeyAction::Release] {
+        let input = KeyInput {
+            key,
+            mods,
+            text: None,
+            action,
+        };
+        out.extend(encode_key(&input, mode, rules));
+    }
+    if win32 {
+        out.extend(encode_win32_modifiers(mods, seen));
+    }
+    out
+}
+
 /// Paste in win32-input-mode, as Windows Terminal's `ControlCore::PasteText`: `\n` and `\r\n`
 /// become `\r`; C0/C1 controls (and DEL) other than HT, LF, CR are removed; bracketed when the
 /// app enabled ?2004 (the filter already removed every ESC, so no end marker survives).
@@ -1922,6 +1948,71 @@ mod tests {
         assert_eq!(
             w32(Key::ArrowUp, Mods::SHIFT, None, KeyAction::Press),
             b"\x1b[38;0;0;1;272;1_"
+        );
+    }
+
+    #[test]
+    fn injected_strokes_match_typed_keys() {
+        let stroke = |k, m, mode, rules| encode_stroke(k, m, mode, rules, Mods::NONE);
+        // win32-input-mode: never a raw ESC/CR (ConPTY would hold a trailing ESC and merge it
+        // with the next write); down + up records like a real key.
+        assert_eq!(
+            stroke(Key::Escape, Mods::NONE, LEGACY, KeyRules::Win32),
+            [rec(0x1B, 27, true, 0), rec(0x1B, 27, false, 0)].concat()
+        );
+        assert_eq!(
+            stroke(Key::Enter, Mods::NONE, LEGACY, KeyRules::Win32),
+            [rec(0x0D, 13, true, 0), rec(0x0D, 13, false, 0)].concat()
+        );
+        // Modifier records around the key, back to the state the child saw.
+        let c = LEFT_CTRL_PRESSED;
+        assert_eq!(
+            stroke(Key::Char('c'), Mods::CTRL, LEGACY, KeyRules::Win32),
+            [
+                rec(VK_CONTROL, 0, true, c),
+                rec(0x43, 3, true, c),
+                rec(0x43, 3, false, c),
+                rec(VK_CONTROL, 0, false, 0),
+            ]
+            .concat()
+        );
+        let s = SHIFT_PRESSED;
+        assert_eq!(
+            encode_stroke(
+                Key::Escape,
+                Mods::NONE,
+                LEGACY,
+                KeyRules::Win32,
+                Mods::SHIFT
+            ),
+            [
+                rec(VK_SHIFT, 0, false, 0),
+                rec(0x1B, 27, true, 0),
+                rec(0x1B, 27, false, 0),
+                rec(VK_SHIFT, 0, true, s),
+            ]
+            .concat()
+        );
+        // tmux: Esc in the application-escape form, no release bytes.
+        assert_eq!(
+            stroke(Key::Escape, Mods::NONE, LEGACY, KeyRules::Tmux),
+            b"\x1bO["
+        );
+        assert_eq!(
+            stroke(Key::Enter, Mods::NONE, LEGACY, KeyRules::Tmux),
+            b"\r"
+        );
+        // omp's hotkeys: Alt+Shift+P, Alt+A, F5.
+        let alt_shift = Mods::new(true, true, false);
+        for rules in [KeyRules::Legacy, KeyRules::Tmux] {
+            assert_eq!(stroke(Key::Char('p'), alt_shift, LEGACY, rules), b"\x1bP");
+            assert_eq!(stroke(Key::Char('a'), Mods::ALT, LEGACY, rules), b"\x1ba");
+            assert_eq!(stroke(Key::F(5), Mods::NONE, LEGACY, rules), b"\x1b[15~");
+        }
+        // kitty with event types: the release is reported too.
+        assert_eq!(
+            stroke(Key::Escape, Mods::NONE, kitty(0b11), KeyRules::Tmux),
+            b"\x1b[27u\x1b[27;1:3u"
         );
     }
 

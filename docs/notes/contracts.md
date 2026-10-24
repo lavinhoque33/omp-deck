@@ -545,13 +545,15 @@ impl StatusWatcher {
 - Model dropdown: models from `Omp::models()` (cached; refresh button), searchable, grouped by provider,
   current marked; thinking-level selector limited to `off`, `auto` + the model's levels.
   Apply with `/switch <selector>[:level]` and `/effort <level>` injection.
-- Injection (omp-actions.md §3.7): per-tab serialized queue driven by frame time (never sleeps on
-  the UI thread): if the cursor line holds a draft → confirm modal (it will be cleared) → `0x03`
+- Injection (omp-actions.md §3.7/§3.10): per-tab serialized queue driven by frame time (never sleeps on
+  the UI thread): if the cursor line holds a draft → confirm modal (it will be cleared) → Ctrl+C
   (respect `last_ctrl_c` ≥ 650 ms) → wait 650 ms → `ESC[200~<cmd>ESC[201~` → 150 ms →
-  (idle only) `ESC` → 150 ms → `\r`. Idle-only actions are disabled while busy.
+  (idle only) Esc → 150 ms → Enter. Idle-only actions are disabled while busy. Every key (Ctrl+C,
+  Esc, Enter, hotkeys) goes through `Terminal::send_key`, never as raw bytes (ConPTY merges a raw
+  trailing `ESC` with the next write once win32-input-mode is in use); only the paste is raw.
 - Actions: Handoff (idle, optional focus modal), Compact (idle; soft/snapcompact/focus variants),
   Fork to new tab (`fork_argv(path, cwd)` + copy-pending linking), Rename (`/rename <title>`; auto-name),
-  Plan mode toggle (`ESC P`), Agent hub (`ESC a`), Context (`/context`), Retry (F5, shown when
+  Plan mode toggle (Alt+Shift+P), Agent hub (Alt+A), Context (`/context`), Retry (F5, shown when
   `last_turn_failed`), Stop turn (Esc, busy only), Copy last response (clipboard), Export HTML
   (`omp --export <jsonl>` with cwd = `$XDG_CACHE_HOME/omp-deck/exports`, then xdg-open).
 - The tab's `session_path` follows `SessionStatus.session` (keeps sidebar mapping right after /new, /fork).
@@ -568,6 +570,10 @@ impl Terminal {
     /// (mouse wheel/selection unaffected; focus reports unaffected). `write()` is never held.
     /// Used by injectors so the user cannot interleave Enter / Ctrl+C into an injection.
     pub fn hold_input_until(&self, until: Instant);
+    /// One synthetic key stroke (press + release) encoded like the user's own key under the
+    /// child's current protocol (`input::encode_stroke`; win32 modifier records restored to what
+    /// the child last saw). Never held; counts as Ctrl+C for `last_ctrl_c`.
+    pub fn send_key(&self, key: input::Key, mods: input::Mods);
 }
 ```
 - Focus reports: a click on app chrome (status bar, menus, dialogs) while a terminal tab is active must

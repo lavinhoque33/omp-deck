@@ -489,6 +489,29 @@ impl Terminal {
     }
 }
 
+impl Terminal {
+    /// Injects one complete key stroke encoded exactly as the same key typed by the user under
+    /// the child's current key protocol (kitty CSI-u, win32-input-mode records, tmux,
+    /// modifyOtherKeys, legacy), see [`input::encode_stroke`]. Sent at once like
+    /// [`Self::write`], never held. Apps must inject keys this way, not as raw VT bytes: once
+    /// the outer side has spoken win32-input-mode, ConPTY keeps a trailing raw `ESC` as the
+    /// start of a sequence and merges it with the next write (`ESC` + `\r` = Alt+Enter).
+    pub fn send_key(&self, key: Key, mods: Mods) {
+        let bytes = input::encode_stroke(
+            key,
+            mods,
+            self.mode(),
+            self.key_rules(),
+            self.view.win32_mods,
+        );
+        self.write(&bytes);
+        // Kitty CSI-u and win32 records encode Ctrl+C without a 0x03 byte; omp still sees it.
+        if key == Key::Char('c') && mods == Mods::CTRL {
+            self.note_ctrl_c();
+        }
+    }
+}
+
 /// Link under viewport cell (`row`, `col`): its OSC 8 target, else a plain URL in the text.
 fn link_at(term: &Terminal, row: usize, col: usize) -> Option<String> {
     let t = term.term.lock();

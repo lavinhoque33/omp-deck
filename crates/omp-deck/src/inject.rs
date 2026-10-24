@@ -5,10 +5,16 @@
 //! sleeps and never touches the PTY itself, so the whole protocol is testable with a fake clock.
 //!
 //! Slash command sequence: (the cursor must be in omp's composer; a draft there → confirm →
-//! `0x03`, ≥ 650 ms after the last Ctrl+C, then wait 650 ms) → bracketed paste of the command →
-//! 150 ms → (idle only) `Esc` to close an autocomplete popup → 150 ms → `\r`. Direct hotkeys are a
-//! single write. Stop is `Esc`, then — only if omp still works after 650 ms — one more `Esc`.
+//! Ctrl+C, ≥ 650 ms after the last Ctrl+C, then wait 650 ms) → bracketed paste of the command →
+//! 150 ms → (idle only) `Esc` to close an autocomplete popup → 150 ms → Enter. Direct hotkeys are a
+//! single key. Stop is `Esc`, then — only if omp still works after 650 ms — one more `Esc`.
 //! Jobs of one tab are strictly serialized with a pause between them.
+//!
+//! Keys (Ctrl+C, Esc, Enter, hotkeys) are [`Write::Key`] strokes that the terminal encodes like
+//! the user's own key press (`deck_term::Terminal::send_key`), never raw bytes: in
+//! win32-input-mode ConPTY keeps a trailing raw `ESC` as the start of a sequence and merges it
+//! with the next write, so a raw `ESC` … `\r` reached omp as Alt+Enter and left the command
+//! unsent in the composer.
 //!
 //! Safety rules: a job that started while omp was idle is abandoned (no further bytes) as soon as
 //! omp is no longer idle, so a turn that begins mid-sequence is never interrupted by our `Esc` or
@@ -19,6 +25,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use deck_term::ScreenText;
+use deck_term::input::{Key, Mods};
 
 use crate::composer::{self, Composer};
 use crate::statusfmt::Activity;
@@ -36,8 +43,6 @@ const BETWEEN_JOBS: Duration = Duration::from_millis(300);
 /// User input stays dropped this long after the last injected byte.
 pub const HOLD_TAIL: Duration = Duration::from_millis(150);
 
-const CTRL_C: u8 = 0x03;
-const ESC: u8 = 0x1b;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -56,8 +61,8 @@ pub enum Requires {
 pub enum Payload {
     /// A slash command typed through the composer (single line, no control characters).
     Slash(String),
-    /// Raw bytes (hotkeys such as `ESC P`); no composer handling needed.
-    Keys(Vec<u8>),
+    /// One key stroke (hotkeys such as Alt+Shift+P); no composer handling needed.
+    Key(Key, Mods),
     /// `Esc`, and a second `Esc` after [`STOP_RETRY`] if the turn still runs.
     Stop,
 }
@@ -97,10 +102,10 @@ impl Job {
         }
     }
 
-    pub fn keys(label: impl Into<String>, bytes: &[u8], requires: Requires) -> Job {
+    pub fn key(label: impl Into<String>, key: Key, mods: Mods, requires: Requires) -> Job {
         Job {
             label: label.into(),
-            payload: Payload::Keys(bytes.to_vec()),
+            payload: Payload::Key(key, mods),
             requires,
         }
     }
@@ -125,11 +130,24 @@ pub struct Env<'a> {
     pub screen: &'a dyn Fn() -> ScreenText,
 }
 
+/// One piece of input for the tab's terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Write {
+    /// Raw bytes (the bracketed paste of a slash command).
+    Bytes(Vec<u8>),
+    /// A key stroke, to be encoded like the user's own key (`deck_term::Terminal::send_key`).
+    Key(Key, Mods),
+}
+
+const ESC_KEY: Write = Write::Key(Key::Escape, Mods::NONE);
+const ENTER_KEY: Write = Write::Key(Key::Enter, Mods::NONE);
+const CTRL_C_KEY: Write = Write::Key(Key::Char('c'), Mods::CTRL);
+
 /// What the caller must do after a poll.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Poll {
-    /// Chunks to write to the PTY, in order.
-    pub writes: Vec<Vec<u8>>,
+    /// Input for the terminal, in order.
+    pub writes: Vec<Write>,
     /// Poll again no later than this from now (`None` = nothing pending).
     pub wake_in: Option<Duration>,
     /// The composer holds an unsent draft: ask the user, then call [`Injector::answer`].
@@ -336,9 +354,9 @@ enum Step {
     Aborted,
 }
 
-fn write(a: &mut Active, out: &mut Poll, bytes: Vec<u8>) {
+fn write(a: &mut Active, out: &mut Poll, w: Write) {
     a.wrote = true;
-    out.writes.push(bytes);
+    out.writes.push(w);
 }
 
 fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut Poll) -> Step {
@@ -348,14 +366,14 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
         return Step::Aborted;
     }
     match (&a.job.payload, &a.stage) {
-        (Payload::Keys(bytes), Stage::Start) => {
-            let bytes = bytes.clone();
-            write(a, out, bytes);
+        (Payload::Key(key, mods), Stage::Start) => {
+            let w = Write::Key(*key, *mods);
+            write(a, out, w);
             Step::Done
         }
-        (Payload::Keys(_), _) => Step::Done,
+        (Payload::Key(..), _) => Step::Done,
         (Payload::Stop, Stage::Start) => {
-            write(a, out, vec![ESC]);
+            write(a, out, ESC_KEY);
             a.stage = Stage::Escaped(now + STOP_RETRY);
             wait_until(now + STOP_RETRY)
         }
@@ -365,7 +383,7 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             }
             // Never two Esc within 500 ms; by now the first one was ≥ 650 ms ago.
             if env.activity.is_busy() {
-                write(a, out, vec![ESC]);
+                write(a, out, ESC_KEY);
             }
             Step::Done
         }
@@ -394,7 +412,7 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             match last {
                 Some(t) if now < t + CTRL_C_GAP => wait_until(t + CTRL_C_GAP),
                 _ => {
-                    write(a, out, vec![CTRL_C]);
+                    write(a, out, CTRL_C_KEY);
                     *ctrl_c = Some(now);
                     a.stage = Stage::Cleared(now + AFTER_CLEAR);
                     wait_until(now + AFTER_CLEAR)
@@ -409,7 +427,7 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             buf.extend_from_slice(PASTE_START);
             buf.extend_from_slice(text.as_bytes());
             buf.extend_from_slice(PASTE_END);
-            write(a, out, buf);
+            write(a, out, Write::Bytes(buf));
             a.stage = Stage::Pasted(now + AFTER_PASTE);
             wait_until(now + AFTER_PASTE)
         }
@@ -418,7 +436,7 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
                 return wait_until(*until);
             }
             if env.activity == Activity::Idle {
-                write(a, out, vec![ESC]);
+                write(a, out, ESC_KEY);
                 a.stage = Stage::Escaped(now + AFTER_ESC);
             } else {
                 // Esc would interrupt a turn; busy-capable commands run without the popup step.
@@ -430,7 +448,7 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             if now < *until {
                 return wait_until(*until);
             }
-            write(a, out, vec![b'\r']);
+            write(a, out, ENTER_KEY);
             Step::Done
         }
     }
@@ -439,6 +457,16 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALT_SHIFT: Mods = Mods::new(true, true, false);
+
+    fn paste(text: &str) -> Write {
+        Write::Bytes([PASTE_START, text.as_bytes(), PASTE_END].concat())
+    }
+
+    fn plan_job(label: &str) -> Job {
+        Job::key(label, Key::Char('p'), ALT_SHIFT, Requires::Any)
+    }
 
     /// Rail composer with `row` text, cursor at its end, as captured on omp 18.12.5.
     fn rail(row: &str) -> ScreenText {
@@ -494,7 +522,7 @@ mod tests {
         }
     }
 
-    fn drain(fx: &Fixture, inj: &mut Injector) -> Vec<(u64, Vec<u8>)> {
+    fn drain(fx: &Fixture, inj: &mut Injector) -> Vec<(u64, Write)> {
         let mut writes = Vec::new();
         let mut t = 0;
         while inj.is_busy() && t < 10_000 {
@@ -515,11 +543,7 @@ mod tests {
         let w = drain(&fx, &mut inj);
         assert_eq!(
             w,
-            vec![
-                (0, b"\x1b[200~/context\x1b[201~".to_vec()),
-                (150, vec![0x1b]),
-                (300, vec![b'\r']),
-            ]
+            vec![(0, paste("/context")), (150, ESC_KEY), (300, ENTER_KEY),]
         );
     }
 
@@ -531,10 +555,7 @@ mod tests {
         inj.push(Job::slash("Switch", "/effort low", Requires::Any));
         let w = drain(&fx, &mut inj);
         let bytes: Vec<_> = w.iter().map(|(_, b)| b.clone()).collect();
-        assert_eq!(
-            bytes,
-            vec![b"\x1b[200~/effort low\x1b[201~".to_vec(), vec![b'\r']]
-        );
+        assert_eq!(bytes, vec![paste("/effort low"), ENTER_KEY]);
         assert_eq!(w[1].0, 150);
     }
 
@@ -546,7 +567,7 @@ mod tests {
             let mut inj = Injector::default();
             inj.push(Job::slash("Context", "/context", Requires::Any));
             let w = drain(&fx, &mut inj);
-            assert!(w.iter().all(|(_, b)| b != &vec![0x1b]), "{activity:?}");
+            assert!(w.iter().all(|(_, b)| b != &ESC_KEY), "{activity:?}");
             assert_eq!(w.len(), 2);
         }
     }
@@ -574,11 +595,11 @@ mod tests {
         assert!(fx.poll(&mut inj, 5_000).writes.is_empty());
         inj.answer(true);
         let p = fx.poll(&mut inj, 5_000);
-        assert_eq!(p.writes, vec![vec![0x03]]);
+        assert_eq!(p.writes, vec![CTRL_C_KEY]);
         assert_eq!(p.wake_in, Some(Duration::from_millis(650)));
         assert!(fx.poll(&mut inj, 5_649).writes.is_empty());
         let p = fx.poll(&mut inj, 5_650);
-        assert_eq!(p.writes, vec![b"\x1b[200~/compact soft\x1b[201~".to_vec()]);
+        assert_eq!(p.writes, vec![paste("/compact soft")]);
     }
 
     #[test]
@@ -613,11 +634,11 @@ mod tests {
         fx.screen = overlay();
         let mut inj = Injector::default();
         inj.push(Job::slash("Compact", "/compact", Requires::Idle));
-        inj.push(Job::keys("Plan mode", b"\x1bP", Requires::Any));
+        inj.push(plan_job("Plan mode"));
         let p = fx.poll(&mut inj, 0);
         assert_eq!(p.dialog_open, vec!["Compact".to_owned()]);
         // The refusal costs no pause: the hotkey runs in the same poll.
-        assert_eq!(p.writes, vec![b"\x1bP".to_vec()]);
+        assert_eq!(p.writes, vec![Write::Key(Key::Char('p'), ALT_SHIFT)]);
     }
 
     #[test]
@@ -633,7 +654,7 @@ mod tests {
         assert!(p.writes.is_empty());
         assert_eq!(p.wake_in, Some(Duration::from_millis(550)));
         let p = fx.poll(&mut inj, 750);
-        assert_eq!(p.writes, vec![vec![0x03]]);
+        assert_eq!(p.writes, vec![CTRL_C_KEY]);
     }
 
     #[test]
@@ -662,7 +683,7 @@ mod tests {
         assert_eq!(p.refused, vec![("Stop".to_owned(), Requires::Busy)]);
         fx.activity = Activity::Busy;
         inj.push(Job::stop());
-        assert_eq!(fx.poll(&mut inj, 1_000).writes, vec![vec![0x1b]]);
+        assert_eq!(fx.poll(&mut inj, 1_000).writes, vec![ESC_KEY]);
     }
 
     #[test]
@@ -687,7 +708,7 @@ mod tests {
         let mut inj = Injector::default();
         inj.push(Job::slash("Context", "/context", Requires::Any));
         fx.poll(&mut inj, 0);
-        assert_eq!(fx.poll(&mut inj, 150).writes, vec![vec![0x1b]]);
+        assert_eq!(fx.poll(&mut inj, 150).writes, vec![ESC_KEY]);
         fx.activity = Activity::Attention;
         let p = fx.poll(&mut inj, 300);
         assert!(p.writes.is_empty());
@@ -706,23 +727,26 @@ mod tests {
         assert!(p.aborted.is_empty());
         assert_eq!(
             p.writes,
-            vec![vec![0x1b]],
+            vec![ESC_KEY],
             "idle now, so the popup Esc is safe"
         );
-        assert_eq!(fx.poll(&mut inj, 300).writes, vec![vec![b'\r']]);
+        assert_eq!(fx.poll(&mut inj, 300).writes, vec![ENTER_KEY]);
     }
 
     #[test]
     fn jobs_are_serialized_with_a_pause() {
         let fx = Fixture::new();
         let mut inj = Injector::default();
-        inj.push(Job::keys("Plan", b"\x1bP", Requires::Any));
-        inj.push(Job::keys("Hub", b"\x1ba", Requires::Any));
+        inj.push(plan_job("Plan"));
+        inj.push(Job::key("Hub", Key::Char('a'), Mods::ALT, Requires::Any));
         let p = fx.poll(&mut inj, 0);
-        assert_eq!(p.writes, vec![b"\x1bP".to_vec()]);
+        assert_eq!(p.writes, vec![Write::Key(Key::Char('p'), ALT_SHIFT)]);
         assert_eq!(p.wake_in, Some(Duration::from_millis(300)));
         assert!(fx.poll(&mut inj, 299).writes.is_empty());
-        assert_eq!(fx.poll(&mut inj, 300).writes, vec![b"\x1ba".to_vec()]);
+        assert_eq!(
+            fx.poll(&mut inj, 300).writes,
+            vec![Write::Key(Key::Char('a'), Mods::ALT)]
+        );
     }
 
     #[test]
@@ -732,10 +756,10 @@ mod tests {
         let mut inj = Injector::default();
         inj.push(Job::stop());
         let p = fx.poll(&mut inj, 0);
-        assert_eq!(p.writes, vec![vec![0x1b]]);
+        assert_eq!(p.writes, vec![ESC_KEY]);
         assert_eq!(p.wake_in, Some(Duration::from_millis(650)));
         assert!(fx.poll(&mut inj, 649).writes.is_empty());
-        assert_eq!(fx.poll(&mut inj, 650).writes, vec![vec![0x1b]]);
+        assert_eq!(fx.poll(&mut inj, 650).writes, vec![ESC_KEY]);
 
         // The first Esc worked: no second one.
         let mut fx = Fixture::new();
@@ -755,7 +779,7 @@ mod tests {
         fx.activity = Activity::Busy;
         let mut inj = Injector::default();
         inj.push(Job::stop());
-        inj.push(Job::keys("Plan", b"\x1bP", Requires::Any));
+        inj.push(plan_job("Plan"));
         let w = drain(&fx, &mut inj);
         assert_eq!(w.len(), 3);
         let gap = |a: usize, b: usize| w[b].0 - w[a].0;
@@ -765,7 +789,7 @@ mod tests {
         let mut inj = Injector::default();
         inj.push(Job::slash("Context", "/context", Requires::Any));
         let w = drain(&fx, &mut inj);
-        assert_eq!(w[1].1, vec![0x1b]);
+        assert_eq!(w[1].1, ESC_KEY);
         assert!(w[2].0 - w[1].0 >= 100);
     }
 
@@ -781,7 +805,7 @@ mod tests {
         let p = fx.poll(&mut inj, 150);
         assert_eq!(p.hold_for, Some(Duration::from_millis(300)));
         let p = fx.poll(&mut inj, 300);
-        assert_eq!(p.writes, vec![vec![b'\r']]);
+        assert_eq!(p.writes, vec![ENTER_KEY]);
         assert_eq!(p.hold_for, Some(HOLD_TAIL));
         assert_eq!(fx.poll(&mut inj, 310).hold_for, None);
     }
@@ -804,17 +828,17 @@ mod tests {
         let fx = Fixture::new();
         let mut inj = Injector::default();
         inj.push(Job::slash("Context", "/context", Requires::Any));
-        inj.push(Job::keys("Plan", b"\x1bP", Requires::Any));
+        inj.push(plan_job("Plan"));
         assert!(inj.drop_unstarted(), "nothing written yet");
         assert!(!inj.is_busy());
 
         inj.push(Job::slash("Context", "/context", Requires::Any));
-        inj.push(Job::keys("Plan", b"\x1bP", Requires::Any));
+        inj.push(plan_job("Plan"));
         fx.poll(&mut inj, 0); // paste written
         assert!(!inj.drop_unstarted(), "mid-job: wait for the boundary");
         // The queued hotkey is gone; the running job finishes, then the injector is idle.
         let w = drain(&fx, &mut inj);
-        assert_eq!(w.last().map(|(_, b)| b.clone()), Some(vec![b'\r']));
+        assert_eq!(w.last().map(|(_, b)| b.clone()), Some(ENTER_KEY));
         assert!(inj.drop_unstarted());
     }
 
@@ -827,7 +851,7 @@ mod tests {
         let Some((at, last)) = w.last().cloned() else {
             panic!("no writes");
         };
-        assert_eq!(last, vec![b'\r']);
+        assert_eq!(last, ENTER_KEY);
         let t = |ms: u64| fx.base + Duration::from_millis(ms);
         assert!(!inj.can_close(t(at)), "the Enter was just written");
         assert!(!inj.can_close(t(at + 149)));
@@ -849,7 +873,9 @@ mod tests {
         let mut inj = Injector::default();
         inj.push(job);
         let w = drain(&fx, &mut inj);
-        let pasted = &w[0].1;
+        let Write::Bytes(pasted) = &w[0].1 else {
+            panic!("the paste comes first: {w:?}");
+        };
         assert!(pasted.starts_with(PASTE_START) && pasted.ends_with(PASTE_END));
         let inner = &pasted[PASTE_START.len()..pasted.len() - PASTE_END.len()];
         assert!(inner.iter().all(|b| *b >= 0x20 && *b != 0x7f), "{inner:?}");
