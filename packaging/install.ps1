@@ -79,9 +79,6 @@ public static class OmpDeckShortcutAumid
     [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
     class CShellLink { }
 
-    [DllImport("propsys.dll", CharSet = CharSet.Unicode)]
-    static extern int InitPropVariantFromString(string value, out PropVariant variant);
-
     [DllImport("ole32.dll")]
     static extern int PropVariantClear(ref PropVariant variant);
 
@@ -98,8 +95,9 @@ public static class OmpDeckShortcutAumid
             ((IPersistFile)link).Load(path, 0);
             var store = (IPropertyStore)link;
             var key = new PropertyKey { fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5 };
-            PropVariant value;
-            Check(InitPropVariantFromString(appId, out value), "InitPropVariantFromString");
+            // InitPropVariantFromString is an inline helper in propvarutil.h, not a propsys.dll export:
+            // build the VT_LPWSTR variant directly (PropVariantClear frees the CoTaskMem string).
+            var value = new PropVariant { vt = 31, p = Marshal.StringToCoTaskMemUni(appId) };
             try
             {
                 Check(store.SetValue(ref key, ref value), "IPropertyStore.SetValue");
