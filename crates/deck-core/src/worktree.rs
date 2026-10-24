@@ -782,7 +782,11 @@ mod tests {
 
     #[test]
     fn managed_base_precedence() {
-        let home = Path::new("/home/u");
+        let home = Path::new(if cfg!(windows) {
+            r"C:\Users\u"
+        } else {
+            "/home/u"
+        });
         let b = |env, setting| managed_base_from(env, setting, home);
         assert_eq!(b(None, None), home.join(".omp").join("wt"));
         assert_eq!(b(None, Some("~/trees")), home.join("trees"));

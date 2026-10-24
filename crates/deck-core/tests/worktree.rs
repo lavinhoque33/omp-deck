@@ -54,6 +54,12 @@ struct Fixture {
 fn fixture() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap();
+    // Windows canonical paths are verbatim (`\\?\C:\…`), which git can't create worktrees under;
+    // git itself reports the plain drive form.
+    let root = match root.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(plain) if !plain.starts_with("UNC\\") => PathBuf::from(plain),
+        _ => root,
+    };
     let repo = root.join("repo");
     fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
