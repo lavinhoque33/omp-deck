@@ -637,7 +637,15 @@ mod tests {
             std::fs::create_dir(&p).unwrap();
             std::fs::write(p.join("x.part"), b"1").unwrap();
             let when = std::time::SystemTime::now() - Duration::from_secs(age_days * 86_400);
-            std::fs::File::open(&p).unwrap().set_modified(when).unwrap();
+            let mut open = std::fs::OpenOptions::new();
+            open.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // Directories open only with FILE_FLAG_BACKUP_SEMANTICS; setting times needs write.
+                open.write(true).custom_flags(0x0200_0000);
+            }
+            open.open(&p).unwrap().set_modified(when).unwrap();
             p
         };
         let old = mk("omp-deck-update-OLD", 3);

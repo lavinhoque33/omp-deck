@@ -603,11 +603,12 @@ fn verify_root(root: &Path) -> Result<(), ChangesError> {
     if !out.ok() {
         return Err(ChangesError::RootChanged);
     }
-    let top = String::from_utf8_lossy(&out.stdout);
-    if native(top.trim_end_matches(['\n', '\r'])) == root {
-        Ok(())
-    } else {
-        Err(ChangesError::RootChanged)
+    let top = native(String::from_utf8_lossy(&out.stdout).trim_end_matches(['\n', '\r']));
+    // Compare by identity, not spelling: git prints the long, `/`-separated form, while the
+    // caller's root may be a Windows 8.3 short path, differently cased, or reached via a symlink.
+    match (std::fs::canonicalize(&top), std::fs::canonicalize(root)) {
+        (Ok(a), Ok(b)) if a == b => Ok(()),
+        _ => Err(ChangesError::RootChanged),
     }
 }
 
