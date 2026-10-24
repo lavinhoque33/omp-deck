@@ -486,6 +486,24 @@ impl App {
 
     // ---------------------------------------------------------------- per frame
 
+    /// Takes row `i` off the project backup list (backups already in the cloud stay).
+    fn remove_sync_row(&mut self, i: usize) {
+        if i < self.cfg.project_sync.len() {
+            let row = self.cfg.project_sync.remove(i);
+            self.sync.sizes.remove(&row.path);
+            self.sync.cells.remove(&row.path);
+            self.sync.errors.remove(&row.path);
+            self.dirty = true;
+        }
+    }
+
+    /// The list row of `path`, if any, is removed (its folder is gone).
+    pub(super) fn drop_sync_row(&mut self, path: &Path) {
+        if let Some(i) = self.cfg.project_sync.iter().position(|r| r.path == path) {
+            self.remove_sync_row(i);
+        }
+    }
+
     /// Per frame: load the local state once, start the automatic pass when it is due.
     pub(super) fn sync_tick(&mut self, ctx: &egui::Context) {
         self.sync.was_visible = std::mem::take(&mut self.sync.seen);
@@ -637,15 +655,7 @@ impl App {
             SyncAction::Drive(a) => self.apply_drive_action(a),
             SyncAction::Add => self.pick_folder(Pick::Add),
             SyncAction::Change(i) => self.pick_folder(Pick::Change(i)),
-            SyncAction::Remove(i) => {
-                if i < self.cfg.project_sync.len() {
-                    let row = self.cfg.project_sync.remove(i);
-                    self.sync.sizes.remove(&row.path);
-                    self.sync.cells.remove(&row.path);
-                    self.sync.errors.remove(&row.path);
-                    self.dirty = true;
-                }
-            }
+            SyncAction::Remove(i) => self.remove_sync_row(i),
             SyncAction::SetOmp(i, on) => {
                 if let Some(r) = self.cfg.project_sync.get_mut(i) {
                     r.omp = on;

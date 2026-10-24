@@ -162,6 +162,8 @@ pub struct ProjectGroup {
     pub cwd: PathBuf,
     pub display: String,
     pub sessions: Vec<SessionEntry>,
+    /// Set when `cwd` lies in a linked git worktree (resolved at scan time, filesystem only).
+    pub worktree: Option<crate::worktree::Worktree>,
 }
 
 /// `/home/u/x` → `~/x` (`~\x` on Windows); `$HOME` itself → `~`; anything else unchanged.
@@ -371,6 +373,7 @@ impl Scanner {
                 });
                 ProjectGroup {
                     display: abbreviate_home(&cwd),
+                    worktree: crate::worktree::resolve(&cwd),
                     cwd,
                     sessions,
                 }

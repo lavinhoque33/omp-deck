@@ -13,3 +13,4 @@ pub mod status;
 pub mod tmux;
 pub mod tree;
 pub mod usage;
+pub mod worktree;

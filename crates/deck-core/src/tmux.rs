@@ -132,7 +132,10 @@ impl Tmux {
         LaunchSpec {
             program: "env".into(),
             args,
-            cwd,
+            // The tmux server inherits its first client's process cwd; a pane folder that is later
+            // deleted (a removed worktree) must not become the cwd of every future pane. The pane
+            // folder travels only in `-c`.
+            cwd: platform::root_dir(),
             env: terminal_env(),
         }
     }

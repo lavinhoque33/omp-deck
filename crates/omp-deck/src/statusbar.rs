@@ -9,9 +9,9 @@ use std::sync::Arc;
 use crate::icons::ICON_GAUGE;
 use crate::icons::{
     ICON_CHART_PIE, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_STOP,
-    ICON_COPY, ICON_DOWNLOAD, ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_GIT_BRANCH,
-    ICON_GIT_FORK, ICON_HANDSHAKE, ICON_LIST_TREE, ICON_MAP, ICON_NETWORK, ICON_PENCIL,
-    ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE, ICON_TERMINAL,
+    ICON_COPY, ICON_DOWNLOAD, ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_FOLDER_GIT_2,
+    ICON_GIT_BRANCH, ICON_GIT_FORK, ICON_HANDSHAKE, ICON_LIST_TREE, ICON_MAP, ICON_NETWORK,
+    ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE, ICON_TERMINAL,
 };
 use deck_core::ctl::{ContextBreakdown, LiveModel};
 use deck_core::omp::ModelInfo;
@@ -60,6 +60,8 @@ pub struct GitView {
     pub untracked: String,
     pub tooltip: String,
     pub pr: Option<(String, String)>,
+    /// The cwd is a linked worktree of this primary checkout.
+    pub worktree_of: Option<std::path::PathBuf>,
 }
 
 /// Everything the bar shows, formatted. Rebuilt when the snapshot or the model catalog changes.
@@ -322,6 +324,9 @@ fn git_view(g: &GitInfo) -> GitView {
         }
     };
     let mut parts = vec![format!("Branch {}", g.branch)];
+    if let Some(primary) = &g.worktree_of {
+        parts.push(format!("Worktree of {}", primary.display()));
+    }
     if g.ahead > 0 || g.behind > 0 {
         parts.push(format!("{} ahead, {} behind upstream", g.ahead, g.behind));
     }
@@ -334,7 +339,7 @@ fn git_view(g: &GitInfo) -> GitView {
             parts.push(format!("{n} {what}"));
         }
     }
-    if parts.len() == 1 {
+    if parts.len() == 1 + usize::from(g.worktree_of.is_some()) {
         parts.push("Working tree clean".to_owned());
     }
     GitView {
@@ -349,6 +354,7 @@ fn git_view(g: &GitInfo) -> GitView {
             .pr
             .as_ref()
             .map(|p| (format!("#{}", p.number), p.url.clone())),
+        worktree_of: g.worktree_of.clone(),
     }
 }
 
@@ -948,7 +954,11 @@ fn git_chip(ui: &mut Ui, g: &GitView, out: &mut Vec<BarAction>) {
     let pal = Palette::of_ui(ui);
     let r = chip(ui, "git", Sense::hover(), |ui| {
         ui.label(icon_text(
-            ICON_GIT_BRANCH,
+            if g.worktree_of.is_some() {
+                ICON_FOLDER_GIT_2
+            } else {
+                ICON_GIT_BRANCH
+            },
             18.0,
             if g.dirty { pal.warn } else { pal.ok },
         ));
@@ -1377,6 +1387,7 @@ fn bar_button(
 mod tests {
     use super::*;
     use deck_core::status::PrInfo;
+    use std::path::PathBuf;
 
     fn catalog() -> ModelsCache {
         let mut c = ModelsCache::default();
@@ -1419,6 +1430,7 @@ mod tests {
                     number: 12,
                     url: "https://example.com/pr/12".into(),
                 }),
+                worktree_of: None,
             }),
             ..SessionStatus::default()
         }
@@ -1449,6 +1461,22 @@ mod tests {
         );
         assert!(g.dirty);
         assert!(v.path_full.ends_with("proj"));
+    }
+
+    #[test]
+    fn worktree_chip_names_the_primary_and_keeps_the_clean_note() {
+        let g = GitInfo {
+            branch: "wt/x".into(),
+            worktree_of: Some(PathBuf::from("/work/repo")),
+            ..GitInfo::default()
+        };
+        let v = git_view(&g);
+        assert_eq!(v.worktree_of.as_deref(), Some(Path::new("/work/repo")));
+        assert_eq!(
+            v.tooltip,
+            "Branch wt/x\nWorktree of /work/repo\nWorking tree clean"
+        );
+        assert_eq!(git_view(&GitInfo::default()).worktree_of, None);
     }
 
     #[test]

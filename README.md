@@ -40,6 +40,10 @@ host), so closing a tab or the whole app leaves omp running.
   Drive app folder (Settings → Sync, or right-click a project in the sidebar), and restore them into any
   folder on any machine; restored sessions are added alongside the existing ones. See
   [below](#project-sync).
+- **Worktree sessions**: run several agents on one repository in parallel, each in its own git worktree
+  and branch: start a session in a new worktree, move a running session into one, finish it (the agent
+  merges following the project's own rules) and let OmpDeck remove it once it is merged. See
+  [below](#worktree-sessions).
 - **Per-folder mode**: scope the sidebar to a single project folder.
 - **Appearance**: a flat, neutral default look (Geist font, lucide icons, compact spacing) or the
   "Midnight neon" style, each in dark and light, plus a Comfortable density option (Settings → OmpDeck).
@@ -244,6 +248,30 @@ versions selectable. Pick the folder to restore into (it is created if missing) 
 tick the ones to remove and **Delete permanently…**. The restore dialog also has a delete button per
 version. Deleted backups are removed from Drive at once (they do not go to the Drive trash) and cannot be
 recovered.
+
+## Worktree sessions
+
+Right-click a project (or use the button next to its **+**) → **New session in worktree…**: name a branch
+(prefilled `wt/<date>-<time>`), pick the branch or commit to start from, and a folder (default: omp's
+worktree folder, `~/.omp/wt/<branch>-<repo>`; `OMP_WORKTREE_DIR` or omp's `worktree.base` setting move it).
+OmpDeck creates it through `omp worktree add` and opens a tab running omp there. New worktrees are clean
+checkouts: gitignored files such as `.env`, `target/` or `node_modules/` are not copied, so the first build
+in a worktree starts from scratch.
+
+**Move to new worktree…** on a running session types omp's `/wt <branch>` once omp is idle: the session,
+with its uncommitted changes, moves into a new worktree and the tab follows it.
+
+Worktree sessions are listed under their repository with the branch name (also those created by omp's own
+`/wt` and PR checkouts), and the status bar's git chip shows which repository a worktree belongs to.
+
+**Finish worktree** (on a worktree in the sidebar) asks that worktree's omp session to commit its work and
+merge the branch into the branch it started from. The agent follows the project's own rules (`AGENTS.md`
+and the like): if they don't allow committing or merging on its own, it asks you in the chat first. Once
+the branch is merged and nothing uncommitted is left, OmpDeck stops only that worktree's tabs, removes the
+worktree and deletes the merged branch. **Remove worktree…** does the same on demand. Both refuse when
+work would be lost (uncommitted changes, commits not in the base branch); OmpDeck never force-removes a
+worktree or force-deletes a branch. Sessions of removed worktrees stay in the sidebar under their
+repository, marked "(removed)", and resume in the repository's folder.
 
 ## Uninstall
 

@@ -434,3 +434,58 @@ fn killing_a_session_whose_client_reports_focus_does_not_crash_the_server() {
     );
     assert!(!alive.contains("omp-a"), "{alive:?}");
 }
+
+/// The tmux server inherits its first client's process cwd. When that client was launched for a
+/// worktree that is later removed, the server must not be stranded in the deleted directory
+/// (new panes would die at once with `process.cwd failed`).
+#[cfg(target_os = "linux")]
+#[test]
+fn server_survives_deletion_of_the_first_sessions_folder() {
+    if !tmux_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tmux = Tmux::with_socket(
+        "tmux",
+        format!("omp-deck-test-{}-gone", std::process::id()),
+        dir.path().join("t.conf"),
+    );
+    let _server = Server { tmux: tmux.clone() };
+    tmux.ensure_config().unwrap();
+
+    let doomed = dir.path().join("doomed");
+    let other = dir.path().join("other");
+    fs::create_dir(&doomed).unwrap();
+    fs::create_dir(&other).unwrap();
+    let start = |name: &str, cwd: &Path| {
+        let argv = vec!["sleep".to_string(), "30".to_string()];
+        let spec = tmux.attach_or_create(name, cwd, &argv);
+        let mut args = spec.args.clone();
+        let at = args.iter().position(|a| a == "new-session").unwrap() + 1;
+        args.insert(at, "-d".to_string());
+        Command::new(&spec.program)
+            .args(&args)
+            .current_dir(&spec.cwd)
+            .output()
+            .unwrap()
+    };
+    assert!(start("omp-first", &doomed).status.success());
+    fs::remove_dir_all(&doomed).unwrap();
+
+    let out = start("omp-second", &other);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pid = Command::new("tmux")
+        .args(["-L", tmux.socket(), "display-message", "-p", "#{pid}"])
+        .output()
+        .unwrap();
+    let pid = String::from_utf8_lossy(&pid.stdout).trim().to_owned();
+    assert!(
+        fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|p| p.exists()),
+        "server cwd must still exist"
+    );
+    assert!(tmux.alive_sessions().contains("omp-second"));
+}

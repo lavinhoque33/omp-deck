@@ -18,6 +18,7 @@ use crate::statusbar::{self, BarAction, BarInput};
 use crate::statusfmt::Activity;
 use crate::tabs::{Tab, TabRole};
 use crate::toast::ToastKind;
+use crate::worktree_ui::{FINISH_LABEL, MOVE_LABEL};
 
 /// Label of the injection job behind the model/thinking dropdown.
 const MODEL_SWITCH: &str = "Model switch";
@@ -150,7 +151,8 @@ impl App {
         // dialog must not reach omp. (Set first: an injector poll below replaces the deadline.)
         if (self.confirm.is_some()
             || self.folder_dialog.is_some()
-            || self.dialog.is_some()
+            || self.folder_dialog.is_some()
+            || self.wt.dialog.is_some()
             || self.popup.is_some()
             || self.tree.is_some()
             || self.usage_open
@@ -161,6 +163,7 @@ impl App {
         }
         let mut prompts = Vec::new();
         let mut notes: Vec<String> = Vec::new();
+        let mut lost: Vec<(u64, String)> = Vec::new();
         let mut wake: Option<Duration> = None;
         for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
             if !tab.injector.is_busy() {
@@ -201,17 +204,28 @@ impl App {
             if dropped {
                 tab.pending_switch = None;
             }
-            for (label, why) in poll.refused {
+            for (label, _) in &poll.refused {
+                if label == FINISH_LABEL || label == MOVE_LABEL {
+                    lost.push((tab.uid, label.clone()));
+                }
+            }
+            for label in poll.dialog_open.iter().chain(&poll.aborted) {
+                if label == FINISH_LABEL || label == MOVE_LABEL {
+                    lost.push((tab.uid, label.clone()));
+                }
+            }
+            // The finish prompt retries by itself; only its final failure is announced.
+            for (label, why) in poll.refused.into_iter().filter(|(l, _)| l != FINISH_LABEL) {
                 if why == Requires::Idle {
                     notes.push(format!(
                         "{label} needs omp to be idle — try again when it finishes"
                     ));
                 }
             }
-            if !poll.dialog_open.is_empty() {
+            if poll.dialog_open.iter().any(|l| l != FINISH_LABEL) {
                 notes.push("Close omp's open dialog first".to_owned());
             }
-            for label in poll.aborted {
+            for label in poll.aborted.into_iter().filter(|l| l != FINISH_LABEL) {
                 notes.push(format!(
                     "{label} cancelled: omp started working — check the composer"
                 ));
@@ -244,6 +258,9 @@ impl App {
         }
         for note in notes {
             self.toasts.info(&self.ctx, note);
+        }
+        for (uid, label) in lost {
+            self.injection_lost(uid, &label);
         }
         self.finish_deferred_closes(ctx);
     }

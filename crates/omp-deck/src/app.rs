@@ -24,6 +24,7 @@ use deck_core::sessions::{
     ProjectGroup, SessionEntry, SessionWatcher, SessionsRoot, abbreviate_home, find_fork,
 };
 use deck_core::status::{StatusTarget, StatusWatcher};
+use deck_core::worktree::Worktree;
 use deck_term::{Clipboard, TermTheme, TerminalView};
 use egui::{Frame, Key, Margin, Modifiers, RichText};
 use serde_json::Value;
@@ -69,8 +70,10 @@ mod project_sync;
 mod spawn;
 mod tree;
 mod usage;
+mod worktree;
 
 use spawn::{Focus, Post, SpawnReq};
+use worktree::{WtEvent, WtUi};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -137,6 +140,8 @@ enum AppEvent {
     Drive(drive::DriveEvent),
     /// A project sync worker finished.
     Sync(project_sync::SyncEvent),
+    /// A git worktree worker finished.
+    Worktree(WtEvent),
 }
 
 /// A modal question awaiting the user's answer, with what to do on "yes".
@@ -175,6 +180,15 @@ enum PendingConfirm {
     DeleteSession(SessionEntry),
     /// Restore a downloaded Google Drive backup over the local omp config.
     RestoreBackup(Box<deck_core::gdrive::PreparedRestore>),
+    /// Remove a clean, merged worktree (and its branch) after stopping the tabs inside it.
+    RemoveWorktree {
+        wt: Worktree,
+        base: String,
+    },
+    /// Drop the project-backup row of a worktree that no longer exists.
+    DropSyncRow {
+        path: PathBuf,
+    },
 }
 
 /// What a sidebar restart was asked about.
@@ -239,6 +253,8 @@ pub struct App {
     next_copy_id: u64,
     sidebar_cache: SidebarCache,
     folder_dialog: Option<FolderDialog>,
+    /// Git worktree sessions (dialogs, finishing, relocation).
+    wt: WtUi,
     home: Option<PathBuf>,
     /// kdialog or zenity exists, so the folder dialog can offer "Browse…".
     picker_available: bool,
@@ -476,6 +492,7 @@ impl App {
             next_copy_id: 0,
             sidebar_cache: SidebarCache::default(),
             folder_dialog: None,
+            wt: WtUi::new(),
             home: dirs::home_dir(),
             picker_available: transfer::picker_available(),
             status,
@@ -609,9 +626,16 @@ impl App {
     }
 
     fn open_session(&mut self, entry: &SessionEntry) {
+        // A removed worktree's folder is gone: omp relocates its session to the launch folder, so
+        // that is the primary checkout, not whatever the missing folder resolves to.
+        let cwd = self
+            .cfg
+            .removed_worktrees
+            .get(&entry.cwd)
+            .map_or_else(|| entry.cwd.clone(), |r| r.primary.clone());
         self.open_resolved(ClosedTab {
             mux_name: Some(session_name_for(&entry.id)),
-            cwd: entry.cwd.clone(),
+            cwd,
             session_path: Some(entry.path.clone()),
             title: entry.label().to_owned(),
         });
@@ -1228,6 +1252,7 @@ impl App {
                 AppEvent::Usage(u) => self.on_usage_event(u),
                 AppEvent::Drive(ev) => self.on_drive_event(ev),
                 AppEvent::Sync(ev) => self.on_sync_event(ev),
+                AppEvent::Worktree(ev) => self.on_wt_event(ev),
             }
         }
     }
@@ -1237,6 +1262,13 @@ impl App {
     fn show_bar(&mut self, ui: &mut egui::Ui, maximized: bool) {
         let active = self.tabs.get(self.active);
         let groups = self.watcher.latest();
+        let live_tabs: Vec<&Path> = self
+            .tabs
+            .iter()
+            .filter_map(Tab::term)
+            .filter(|t| !t.term.is_exited())
+            .filter_map(|t| t.session_path.as_deref())
+            .collect();
         let input = BarInput {
             tabs: TabBarInput {
                 tabs: &self.tabs,
@@ -1249,6 +1281,7 @@ impl App {
                     can_stop: !self.backends.is_empty(),
                     busy: &self.moving,
                     drive: self.drive_menu(),
+                    live_tabs: &live_tabs,
                 },
             },
             csd: !self.cfg.native_decorations,
@@ -1368,6 +1401,8 @@ impl App {
             active_tab: self.active,
             tab_activity: &tab_activity,
             drive: self.drive_menu(),
+            finishing: &self.wt.finishing,
+            removed: &self.cfg.removed_worktrees,
         };
         let panel = egui::Panel::left("sidebar")
             .resizable(true)
@@ -1424,6 +1459,11 @@ impl App {
             SidebarAction::KillTab(i) => self.kill_tab(i),
             SidebarAction::BackupProject(dir) => self.open_backup_dialog(dir),
             SidebarAction::RestoreProject(dir) => self.open_restore(Some(dir)),
+            SidebarAction::NewWorktree(dir) => self.open_new_worktree(dir),
+            SidebarAction::MoveToWorktree(entry) => self.open_move_to_worktree(&entry),
+            SidebarAction::FinishWorktree(wt) => self.request_finish(wt),
+            SidebarAction::CancelFinish(path) => self.cancel_finish(&path),
+            SidebarAction::RemoveWorktree(wt) => self.request_remove(wt),
         }
     }
 
@@ -1571,6 +1611,7 @@ impl App {
         self.confirm.is_some()
             || self.dialog.is_some()
             || self.folder_dialog.is_some()
+            || self.wt.dialog.is_some()
             || self.drive.modal_open()
             || self.sync.modal_open()
     }
@@ -1614,6 +1655,8 @@ impl App {
             }
             PendingConfirm::RestartSession(target) => self.execute_restart_session(target),
             PendingConfirm::DeleteSession(entry) => self.execute_delete(entry),
+            PendingConfirm::RemoveWorktree { wt, base } => self.execute_remove(wt, base),
+            PendingConfirm::DropSyncRow { path } => self.drop_sync_row(&path),
             PendingConfirm::ClearDraft { .. } | PendingConfirm::RestoreBackup(_) => {}
         }
     }
@@ -1886,6 +1929,7 @@ impl App {
             OmpEvent::Catalog(result) => {
                 if let Ok(catalog) = &result {
                     self.omp_defaults = defaults_from_catalog(catalog);
+                    self.wt.base_setting = crate::omp_settings::worktree_base_from_catalog(catalog);
                 }
                 let env = std::env::var("PI_CODING_AGENT_DIR").ok();
                 let dir = config_dir_display(env.as_deref(), self.home.as_deref());
@@ -2551,6 +2595,7 @@ impl eframe::App for App {
         // an open menu, a modal) legitimately holds it.
         if self.confirm.is_none()
             && self.folder_dialog.is_none()
+            && self.wt.dialog.is_none()
             && self.dialog.is_none()
             && !self.sync.modal_open()
             && self.popup.is_none()
@@ -2582,6 +2627,8 @@ impl eframe::App for App {
         self.show_confirm(&ctx);
         self.show_action_dialog(&ctx);
         self.show_folder_dialog(&ctx);
+        self.show_worktree_dialog(&ctx);
+        self.drive_worktrees(&ctx);
         self.check_update_tabs();
         self.pump_update_queue();
         self.drive_copies(&ctx);

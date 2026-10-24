@@ -720,6 +720,15 @@ impl Omp {
         &self.program
     }
 
+    /// Value configured through [`Omp::with_env`] (the last one wins).
+    pub(crate) fn env_value(&self, key: &str) -> Option<&OsString> {
+        self.env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == std::ffi::OsStr::new(key))
+            .map(|(_, v)| v)
+    }
+
     pub(crate) fn command(&self, args: &[&std::ffi::OsStr]) -> Command {
         let mut c = Command::new(&self.program);
         c.args(args)

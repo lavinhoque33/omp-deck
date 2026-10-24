@@ -367,6 +367,7 @@ mod tests {
                 first_prompt: None,
                 modified,
             }],
+            worktree: None,
         }
     }
 

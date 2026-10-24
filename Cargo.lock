@@ -522,7 +522,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "deck-core"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "deck-host",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "deck-host"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "alacritty_terminal",
  "dirs",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "deck-term"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "alacritty_terminal",
  "arboard",
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "omp-deck"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "deck-core",

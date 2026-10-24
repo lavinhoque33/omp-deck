@@ -616,6 +616,8 @@ pub struct GitInfo {
     pub untracked: u32,
     /// Filled by [`StatusWatcher`] only.
     pub pr: Option<PrInfo>,
+    /// Primary checkout root when the cwd is a linked git worktree.
+    pub worktree_of: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -639,7 +641,9 @@ fn git_info_cancellable(cwd: &Path, cancel: Option<&AtomicBool>) -> Option<GitIn
         .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0");
     let out = run_capture(cmd, GIT_TIMEOUT, cancel)?;
-    parse_git_status_v2(&String::from_utf8_lossy(&out))
+    let mut info = parse_git_status_v2(&String::from_utf8_lossy(&out))?;
+    info.worktree_of = crate::worktree::resolve(cwd).map(|w| w.primary);
+    Some(info)
 }
 
 /// Parses `git status --porcelain=v2 --branch`. Counts follow omp's rule (omp-status.md §2b):

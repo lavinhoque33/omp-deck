@@ -1,7 +1,8 @@
 //! Session sidebar: grouped, filterable list of persisted omp sessions (rounded cards, glowing
 //! running dots, animated hover/selection, right-click menus).
 
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -9,12 +10,14 @@ use crate::icons::Icon;
 use crate::icons::{
     ICON_ARCHIVE_RESTORE, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CHEVRONS_DOWN_UP,
     ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_STOP, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_COPY,
-    ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS, ICON_FOLDER, ICON_FOLDER_OPEN,
-    ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_KEY_ROUND, ICON_LIST_TREE, ICON_PLAY, ICON_PLUS,
-    ICON_POWER, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL,
-    ICON_TRASH_2, ICON_X,
+    ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS, ICON_FOLDER, ICON_FOLDER_GIT_2,
+    ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_GIT_BRANCH_PLUS, ICON_GIT_MERGE,
+    ICON_KEY_ROUND, ICON_LIST_TREE, ICON_PLAY, ICON_PLUS, ICON_POWER, ICON_REFRESH_CW,
+    ICON_ROTATE_CCW, ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL, ICON_TRASH_2, ICON_X,
 };
+use deck_core::config::RemovedWorktree;
 use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot};
+use deck_core::worktree::Worktree;
 use egui::collapsing_header::CollapsingState;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
@@ -29,6 +32,7 @@ use crate::tabs::{self, Tab, TabStatus};
 use crate::theme::{self, Palette};
 use crate::transfer::{self, TransferKind};
 use crate::widgets::{empty_state, icon_text, menu_item, paint_icon};
+use crate::worktree_ui::{self, Family, Finishing, Head};
 
 /// "now", "5m", "3h", "2d", "4w", "2y".
 pub fn format_age(now: SystemTime, modified: SystemTime) -> String {
@@ -63,6 +67,11 @@ pub fn matches_filter(query_lower: &str, group: &ProjectGroup, entry: &SessionEn
             .as_deref()
             .is_some_and(|t| t.to_lowercase().contains(query_lower))
         || group.display.to_lowercase().contains(query_lower)
+        || group
+            .worktree
+            .as_ref()
+            .and_then(|w| w.branch.as_deref())
+            .is_some_and(|b| b.to_lowercase().contains(query_lower))
         || entry
             .cwd
             .to_string_lossy()
@@ -131,6 +140,16 @@ pub enum SidebarAction {
     BackupProject(PathBuf),
     /// Restore a backup of this project folder from Google Drive (opens the restore dialog).
     RestoreProject(PathBuf),
+    /// Ask for a branch and create a worktree of the project in this folder, then open a tab in it.
+    NewWorktree(PathBuf),
+    /// Ask for a branch and move this session (open in a tab) into a new worktree.
+    MoveToWorktree(SessionEntry),
+    /// Send the worktree's session the finish prompt and remove the worktree once it is merged.
+    FinishWorktree(Worktree),
+    /// Stop waiting for the worktree (by folder) to finish.
+    CancelFinish(PathBuf),
+    /// Ask before removing the worktree (clean and merged only).
+    RemoveWorktree(Worktree),
 }
 
 /// The "Google Drive" menu entries: hidden without credentials, disabled with a reason while
@@ -188,6 +207,10 @@ pub struct SidebarInput<'a> {
     pub tab_activity: &'a HashMap<&'a Path, TabStatus>,
     /// Google Drive project sync entries of the context menus.
     pub drive: DriveMenu,
+    /// Worktrees (by folder) that were sent the finish prompt and are being waited for.
+    pub finishing: &'a HashMap<PathBuf, Finishing>,
+    /// Worktrees OmpDeck removed: their sessions nest under the primary, marked as removed.
+    pub removed: &'a BTreeMap<PathBuf, RemovedWorktree>,
 }
 
 /// Which project groups are open. A group is open while filtering, else by its user override,
@@ -199,26 +222,30 @@ pub struct SidebarInput<'a> {
 pub struct Expansion {
     overrides: HashMap<PathBuf, bool>,
     active: Option<PathBuf>,
+    /// The repository the active group is a worktree of: it opens with its child.
+    active_parent: Option<PathBuf>,
 }
 
 impl Expansion {
     fn is_open(&self, cwd: &Path, filtering: bool) -> bool {
         filtering
-            || self
-                .overrides
-                .get(cwd)
-                .copied()
-                .unwrap_or(self.active.as_deref() == Some(cwd))
+            || self.overrides.get(cwd).copied().unwrap_or(
+                self.active.as_deref() == Some(cwd) || self.active_parent.as_deref() == Some(cwd),
+            )
     }
 
-    /// Notes the group of the active tab (`None`: the tab has no group, keep the previous one).
-    fn on_activation(&mut self, group: Option<&Path>) {
+    /// Notes the group of the active tab and the repository it is a worktree of (`None`: the
+    /// tab has no group, keep the previous one).
+    fn on_activation(&mut self, group: Option<&Path>, parent: Option<&Path>) {
         let Some(g) = group else { return };
         if self.active.as_deref() != Some(g) {
-            if self.overrides.get(g) == Some(&false) {
-                self.overrides.remove(g);
+            for p in std::iter::once(g).chain(parent) {
+                if self.overrides.get(p) == Some(&false) {
+                    self.overrides.remove(p);
+                }
             }
             self.active = Some(g.to_path_buf());
+            self.active_parent = parent.map(Path::to_path_buf);
         }
     }
 
@@ -226,10 +253,9 @@ impl Expansion {
         self.overrides.insert(cwd.to_path_buf(), open);
     }
 
-    fn set_all(&mut self, groups: &[ProjectGroup], open: bool) {
+    fn set_all<'a>(&mut self, cwds: impl Iterator<Item = &'a Path>, open: bool) {
         self.overrides.clear();
-        self.overrides
-            .extend(groups.iter().map(|g| (g.cwd.clone(), open)));
+        self.overrides.extend(cwds.map(|c| (c.to_path_buf(), open)));
     }
 }
 
@@ -264,7 +290,7 @@ impl ActiveGroupCache {
         groups: &'a [ProjectGroup],
         active_path: Option<&Path>,
         active_cwd: Option<&Path>,
-    ) -> Option<&'a Path> {
+    ) -> Option<&'a ProjectGroup> {
         let fresh = self.key.as_ref().is_some_and(|(s, p, c)| {
             *s == stamp && p.as_deref() == active_path && c.as_deref() == active_cwd
         });
@@ -276,9 +302,7 @@ impl ActiveGroupCache {
                 active_cwd.map(Path::to_path_buf),
             ));
         }
-        self.group
-            .and_then(|i| groups.get(i))
-            .map(|g| g.cwd.as_path())
+        self.group.and_then(|i| groups.get(i))
     }
 }
 
@@ -345,6 +369,33 @@ impl AgeCache {
     }
 }
 
+/// The nesting of worktree groups, valid for one `(data stamp, scope)`.
+#[derive(Default)]
+struct LayoutCache {
+    key: Option<((u64, usize), Option<PathBuf>, usize)>,
+    families: Vec<Family>,
+}
+
+impl LayoutCache {
+    fn sync(
+        &mut self,
+        stamp: (u64, usize),
+        scope: Option<&Path>,
+        groups: &[ProjectGroup],
+        removed: &BTreeMap<PathBuf, RemovedWorktree>,
+    ) -> &[Family] {
+        let fresh = self
+            .key
+            .as_ref()
+            .is_some_and(|(s, sc, n)| *s == stamp && sc.as_deref() == scope && *n == removed.len());
+        if !fresh {
+            self.families = worktree_ui::layout(groups, scope, removed);
+            self.key = Some((stamp, scope.map(Path::to_path_buf), removed.len()));
+        }
+        &self.families
+    }
+}
+
 /// Work the sidebar would otherwise redo every frame.
 #[derive(Default)]
 pub struct SidebarCache {
@@ -352,6 +403,7 @@ pub struct SidebarCache {
     ages: AgeCache,
     active_group: ActiveGroupCache,
     expansion: Expansion,
+    layout: LayoutCache,
     pub scope_ui: ScopeState,
 }
 
@@ -507,12 +559,19 @@ pub fn show(
         ages,
         active_group: active_cache,
         expansion,
+        layout: layout_cache,
         ..
     } = cache;
     let stamp = (input.generation, groups.as_ptr() as usize);
     let active_group = active_cache.get(stamp, groups, input.active_path, input.active_cwd);
-    expansion.on_activation(active_group);
+    expansion.on_activation(
+        active_group.map(|g| g.cwd.as_path()),
+        active_group
+            .and_then(|g| g.worktree.as_ref())
+            .map(|w| w.primary.as_path()),
+    );
     let visible = filter_cache.sync(stamp, &query, groups);
+    let families = layout_cache.sync(stamp, input.scope, groups, input.removed);
     let age_key = (
         stamp,
         input
@@ -521,105 +580,33 @@ pub fn show(
             .map_or(0, |d| d.as_secs())
             / AGE_BUCKET_SECS,
     );
+    let pass = Pass {
+        input,
+        groups,
+        families,
+        visible,
+        filtering,
+        age_key,
+    };
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            for (gi, group) in groups.iter().enumerate() {
-                if input
-                    .scope
-                    .is_some_and(|s| !folder_scope::contains(s, &group.cwd))
-                {
-                    continue;
-                }
-                // Unfiltered: borrow the group's own list; filtered: the cached indices.
-                let idx: Option<&[u32]> = filtering.then(|| visible[gi].as_slice());
-                let row_count = idx.map_or(group.sessions.len(), <[u32]>::len);
-                if row_count == 0 {
-                    continue;
-                }
-                any_shown = true;
-                let open = expansion.is_open(&group.cwd, filtering);
-
-                let pid = ui.make_persistent_id(("project", &group.cwd));
-                let mut state = CollapsingState::load_with_default_open(ui.ctx(), pid, true);
-                state.set_open(open);
-                let open_t = state.openness(ui.ctx());
-                let hdr = group_header(ui, group, row_count, open_t, &mut out);
-                let mut menu_collapse = None;
-                crate::theme::context_menu(&hdr.resp, 236.0, |ui| {
-                    if menu_item(ui, ICON_PLUS, "New session here", None, true, false).clicked() {
-                        out.actions.push(SidebarAction::New(group.cwd.clone()));
-                        out.interacted = true;
-                        ui.close();
-                    }
-                    let focused = input.scope == Some(group.cwd.as_path());
-                    if menu_item(ui, ICON_FOCUS, "Focus this folder", None, !focused, false)
-                        .on_hover_text("Show only the sessions of this folder")
-                        .clicked()
-                    {
-                        out.actions
-                            .push(SidebarAction::SetScope(Some(group.cwd.clone())));
-                        out.interacted = true;
-                        ui.close();
-                    }
-                    if menu_item(ui, ICON_FOLDER_OPEN, "Open folder", None, true, false).clicked() {
-                        out.actions
-                            .push(SidebarAction::OpenFolder(group.cwd.clone()));
-                        ui.close();
-                    }
-                    if menu_item(ui, ICON_COPY, "Copy path", None, true, false).clicked() {
-                        out.actions.push(SidebarAction::CopyText {
-                            text: group.cwd.to_string_lossy().into_owned(),
-                            what: "project path",
-                        });
-                        ui.close();
-                    }
-                    drive_items(ui, input.drive, &group.cwd, true, &mut out);
-                    ui.separator();
-                    if menu_item(ui, ICON_CHEVRONS_DOWN_UP, "Collapse all", None, true, false)
-                        .clicked()
-                    {
-                        menu_collapse = Some(true);
-                        ui.close();
-                    }
-                    if menu_item(ui, ICON_CHEVRONS_UP_DOWN, "Expand all", None, true, false)
-                        .clicked()
-                    {
-                        menu_collapse = Some(false);
-                        ui.close();
-                    }
-                });
-                if let Some(collapse) = menu_collapse {
-                    expansion.set_all(groups, !collapse);
-                    state.set_open(filtering || !collapse);
-                }
-                if hdr.toggle && !filtering {
-                    expansion.set(&group.cwd, !open);
-                    out.interacted = true;
-                    state.set_open(!open);
-                }
-                state.store(ui.ctx());
-                state.show_body_unindented(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    for k in 0..row_count {
-                        let entry = match idx {
-                            Some(ix) => ix.get(k).and_then(|&i| group.sessions.get(i as usize)),
-                            None => group.sessions.get(k),
-                        };
-                        let Some(entry) = entry else {
-                            continue;
-                        };
-                        let selected = input.active_path == Some(entry.path.as_path());
-                        let running = input.running.is_running(&entry.id, &entry.path)
-                            || input.open_paths.contains(&entry.path.as_path());
-                        let age = ages.get(age_key, input.now, entry);
-                        session_row(ui, entry, age, running, selected, input, &mut out);
-                    }
-                    ui.add_space(2.0);
-                });
-                ui.add_space(4.0);
+            for family in families {
+                let group = family.group(groups);
+                let gi = match family.head {
+                    Head::Group(i) => Some(i),
+                    Head::Synthetic(_) => None,
+                };
+                any_shown |= show_group(
+                    ui,
+                    &pass,
+                    (group, gi),
+                    &family.children,
+                    (expansion, ages),
+                    &mut out,
+                );
             }
             if !any_shown {
                 if filtering {
@@ -639,6 +626,244 @@ pub fn show(
             }
         });
     out
+}
+
+/// What every group of one frame needs.
+struct Pass<'a> {
+    input: &'a SidebarInput<'a>,
+    groups: &'a [ProjectGroup],
+    families: &'a [Family],
+    /// Filtered row indices per group (only with a query).
+    visible: &'a [Vec<u32>],
+    filtering: bool,
+    age_key: ((u64, usize), u64),
+}
+
+impl Pass<'_> {
+    /// The rows of group `gi` to show: the filtered indices (`None` = all) and their number.
+    fn rows(&self, gi: Option<usize>) -> (Option<&[u32]>, usize) {
+        let Some(gi) = gi else { return (None, 0) };
+        let idx = self
+            .filtering
+            .then(|| self.visible.get(gi).map_or(&[][..], Vec::as_slice));
+        (
+            idx,
+            idx.map_or(self.groups[gi].sessions.len(), <[u32]>::len),
+        )
+    }
+}
+
+/// One project group with its worktree groups nested below; false when nothing of it shows.
+fn show_group(
+    ui: &mut Ui,
+    pass: &Pass<'_>,
+    (group, gi): (&ProjectGroup, Option<usize>),
+    children: &[usize],
+    (expansion, ages): (&mut Expansion, &mut AgeCache),
+    out: &mut SidebarOutput,
+) -> bool {
+    let input = pass.input;
+    let (idx, own_rows) = pass.rows(gi);
+    let child_rows: usize = children.iter().map(|&c| pass.rows(Some(c)).1).sum();
+    let bare_parent = gi.is_none() && !pass.filtering && !children.is_empty();
+    if own_rows + child_rows == 0 && !bare_parent {
+        return false;
+    }
+    let removed = (group.worktree.is_none() && gi.is_some())
+        .then(|| input.removed.get(&group.cwd))
+        .flatten();
+    let look = match (&group.worktree, gi) {
+        (Some(w), _) => Look::Worktree {
+            finishing: input.finishing.contains_key(&w.path),
+        },
+        (None, None) => Look::Synthetic,
+        (None, Some(_)) if removed.is_some() => Look::Removed,
+        (None, Some(_)) => Look::Project,
+    };
+    let open = expansion.is_open(&group.cwd, pass.filtering);
+
+    let pid = ui.make_persistent_id(("project", &group.cwd));
+    let mut state = CollapsingState::load_with_default_open(ui.ctx(), pid, true);
+    state.set_open(open);
+    let open_t = state.openness(ui.ctx());
+    let hdr = group_header(
+        ui,
+        &HeaderSpec {
+            group,
+            look,
+            removed,
+            shown: own_rows + child_rows,
+            wt_button: input.omp_available && group.worktree.is_none() && look != Look::Removed,
+        },
+        open_t,
+        out,
+    );
+    let mut menu_collapse = None;
+    crate::theme::context_menu(&hdr.resp, 236.0, |ui| {
+        if menu_item(ui, ICON_PLUS, "New session here", None, true, false).clicked() {
+            let target = removed.map_or(&group.cwd, |r| &r.primary);
+            out.actions.push(SidebarAction::New(target.clone()));
+            out.interacted = true;
+            ui.close();
+        }
+        match (&group.worktree, look) {
+            (Some(w), Look::Worktree { finishing }) => worktree_items(ui, input, w, finishing, out),
+            _ if input.omp_available
+                && look != Look::Removed
+                && menu_item(
+                    ui,
+                    ICON_GIT_BRANCH_PLUS,
+                    "New session in worktree…",
+                    None,
+                    true,
+                    false,
+                )
+                .on_hover_text("Create a git worktree on a new branch and start a session in it")
+                .clicked() =>
+            {
+                out.actions
+                    .push(SidebarAction::NewWorktree(group.cwd.clone()));
+                out.interacted = true;
+                ui.close();
+            }
+            _ => {}
+        }
+        let focused = input.scope == Some(group.cwd.as_path());
+        if menu_item(ui, ICON_FOCUS, "Focus this folder", None, !focused, false)
+            .on_hover_text("Show only the sessions of this folder")
+            .clicked()
+        {
+            out.actions
+                .push(SidebarAction::SetScope(Some(group.cwd.clone())));
+            out.interacted = true;
+            ui.close();
+        }
+        if menu_item(ui, ICON_FOLDER_OPEN, "Open folder", None, true, false).clicked() {
+            out.actions
+                .push(SidebarAction::OpenFolder(group.cwd.clone()));
+            ui.close();
+        }
+        if menu_item(ui, ICON_COPY, "Copy path", None, true, false).clicked() {
+            out.actions.push(SidebarAction::CopyText {
+                text: group.cwd.to_string_lossy().into_owned(),
+                what: "project path",
+            });
+            ui.close();
+        }
+        drive_items(ui, input.drive, &group.cwd, true, out);
+        ui.separator();
+        if menu_item(ui, ICON_CHEVRONS_DOWN_UP, "Collapse all", None, true, false).clicked() {
+            menu_collapse = Some(true);
+            ui.close();
+        }
+        if menu_item(ui, ICON_CHEVRONS_UP_DOWN, "Expand all", None, true, false).clicked() {
+            menu_collapse = Some(false);
+            ui.close();
+        }
+    });
+    if let Some(collapse) = menu_collapse {
+        expansion.set_all(
+            pass.families
+                .iter()
+                .flat_map(|f| {
+                    std::iter::once(f.group(pass.groups))
+                        .chain(f.children.iter().map(|&c| &pass.groups[c]))
+                })
+                .map(|g| g.cwd.as_path()),
+            !collapse,
+        );
+        state.set_open(pass.filtering || !collapse);
+    }
+    if hdr.toggle && !pass.filtering {
+        expansion.set(&group.cwd, !open);
+        out.interacted = true;
+        state.set_open(!open);
+    }
+    state.store(ui.ctx());
+    state.show_body_unindented(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        if let Some(gi) = gi {
+            for k in 0..own_rows {
+                let entry = match idx {
+                    Some(ix) => ix
+                        .get(k)
+                        .and_then(|&i| pass.groups[gi].sessions.get(i as usize)),
+                    None => pass.groups[gi].sessions.get(k),
+                };
+                let Some(entry) = entry else {
+                    continue;
+                };
+                let selected = input.active_path == Some(entry.path.as_path());
+                let running = input.running.is_running(&entry.id, &entry.path)
+                    || input.open_paths.contains(&entry.path.as_path());
+                let age = ages.get(pass.age_key, input.now, entry);
+                session_row(ui, entry, age, running, selected, input, out);
+            }
+        }
+        if !children.is_empty() {
+            let indent = ui.spacing().indent;
+            ui.spacing_mut().indent = 10.0;
+            ui.indent(("worktrees", &group.cwd), |ui| {
+                for &c in children {
+                    show_group(
+                        ui,
+                        pass,
+                        (&pass.groups[c], Some(c)),
+                        &[],
+                        (&mut *expansion, &mut *ages),
+                        out,
+                    );
+                }
+            });
+            ui.spacing_mut().indent = indent;
+        }
+        ui.add_space(2.0);
+    });
+    ui.add_space(4.0);
+    true
+}
+
+/// "Finish worktree" / "Cancel finishing" and "Remove worktree…" in a worktree header's menu.
+fn worktree_items(
+    ui: &mut Ui,
+    input: &SidebarInput<'_>,
+    w: &Worktree,
+    finishing: bool,
+    out: &mut SidebarOutput,
+) {
+    if finishing {
+        if menu_item(ui, ICON_X, "Cancel finishing", None, true, false)
+            .on_hover_text("Stop waiting for the agent; the worktree stays")
+            .clicked()
+        {
+            out.actions.push(SidebarAction::CancelFinish(w.path.clone()));
+            ui.close();
+        }
+    } else if menu_item(
+        ui,
+        ICON_GIT_MERGE,
+        "Finish worktree",
+        None,
+        input.omp_available,
+        false,
+    )
+    .on_hover_text(
+        "Ask the session's agent to commit and merge the branch; the worktree is removed once it is merged and clean",
+    )
+    .clicked()
+    {
+        out.actions.push(SidebarAction::FinishWorktree(w.clone()));
+        out.interacted = true;
+        ui.close();
+    }
+    if menu_item(ui, ICON_TRASH_2, "Remove worktree…", None, true, true)
+        .on_hover_text("Remove the folder and its branch when everything is committed and merged")
+        .clicked()
+    {
+        out.actions.push(SidebarAction::RemoveWorktree(w.clone()));
+        ui.close();
+    }
+    ui.separator();
 }
 
 /// Nothing under the scope yet: say so (the button above the list starts the first session).
@@ -699,198 +924,348 @@ fn refresh_button(ui: &mut Ui, spinning: bool) -> egui::Response {
 
 struct HeaderResult {
     resp: egui::Response,
-    /// The header body (not the "+") was clicked.
+    /// The header body (not a button) was clicked.
     toggle: bool,
+}
+
+/// How a project header presents itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Look {
+    Project,
+    /// The group of a worktree OmpDeck removed (nested under its primary, muted).
+    Removed,
+    /// A repository that has worktree sessions but none of its own.
+    Synthetic,
+    Worktree {
+        finishing: bool,
+    },
+}
+
+struct HeaderSpec<'a> {
+    group: &'a ProjectGroup,
+    look: Look,
+    removed: Option<&'a RemovedWorktree>,
+    shown: usize,
+    /// Offer the hover button that starts a session in a new worktree.
+    wt_button: bool,
+}
+
+/// The header's name and its faint hint: branch and folder for a worktree, else folder name and
+/// parent path.
+fn header_text<'a>(spec: &'a HeaderSpec<'_>) -> (Cow<'a, str>, Cow<'a, str>) {
+    let group = spec.group;
+    if let Some(r) = spec.removed {
+        return (
+            Cow::Owned(worktree_ui::removed_label(&group.cwd, r)),
+            Cow::Owned(folder_scope::folder_name(&group.cwd)),
+        );
+    }
+    match (&group.worktree, spec.look) {
+        (Some(w), Look::Worktree { .. }) => (
+            Cow::Owned(worktree_ui::worktree_label(w)),
+            Cow::Owned(folder_scope::folder_name(&group.cwd)),
+        ),
+        _ => {
+            let (parent, name) = split_display(&group.display);
+            (Cow::Borrowed(name), Cow::Borrowed(parent))
+        }
+    }
+}
+
+fn header_icon(look: Look, open_t: f32) -> Icon {
+    match look {
+        Look::Worktree { .. } | Look::Removed => ICON_FOLDER_GIT_2,
+        _ if open_t > 0.5 => ICON_FOLDER_OPEN,
+        _ => ICON_FOLDER,
+    }
+}
+
+/// Where a header puts its parts.
+struct HeaderGeom {
+    rect: Rect,
+    plus: Rect,
+    wt: Option<Rect>,
+    badge: Option<Rect>,
+}
+
+impl HeaderGeom {
+    /// Width at the right of the name taken by buttons and the badge.
+    fn reserved(&self, base: f32) -> f32 {
+        base + if self.wt.is_some() { 28.0 } else { 0.0 }
+            + if self.badge.is_some() { 84.0 } else { 0.0 }
+    }
+}
+
+/// Hover animation of a header and its buttons (0..=1).
+struct HeaderHover {
+    hov: f32,
+    plus: f32,
+    wt: f32,
 }
 
 fn group_header(
     ui: &mut Ui,
-    group: &ProjectGroup,
-    shown: usize,
+    spec: &HeaderSpec<'_>,
     open_t: f32,
     out: &mut SidebarOutput,
 ) -> HeaderResult {
     let pal = Palette::of_ui(ui);
+    let group = spec.group;
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), header_h()), Sense::click());
     let plus_rect =
         Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(24.0, 24.0));
     let plus = ui.interact(plus_rect, resp.id.with("new"), Sense::click());
-    let hov_raw = resp.hovered() || plus.hovered() || resp.context_menu_opened();
-    let hov = ui
-        .ctx()
-        .animate_bool_with_time(resp.id.with("hov"), hov_raw, 0.1);
-    let plus_hov = ui
-        .ctx()
-        .animate_bool_with_time(plus.id.with("hov"), plus.hovered(), 0.1);
+    let wt_rect = plus_rect.translate(vec2(-28.0, 0.0));
+    let wt_btn = spec
+        .wt_button
+        .then(|| ui.interact(wt_rect, resp.id.with("new-wt"), Sense::click()));
+    let badge_rect = matches!(spec.look, Look::Worktree { finishing: true }).then(|| {
+        Rect::from_center_size(
+            pos2(plus_rect.left() - 44.0, rect.center().y),
+            vec2(76.0, 18.0),
+        )
+    });
+    let badge_btn = badge_rect.map(|r| ui.interact(r, resp.id.with("finishing"), Sense::click()));
+    let over = |r: &Option<egui::Response>| r.as_ref().is_some_and(egui::Response::hovered);
+    let hov_raw = resp.hovered()
+        || plus.hovered()
+        || over(&wt_btn)
+        || over(&badge_btn)
+        || resp.context_menu_opened();
+    let ctx = ui.ctx().clone();
+    let hover = HeaderHover {
+        hov: ctx.animate_bool_with_time(resp.id.with("hov"), hov_raw, 0.1),
+        plus: ctx.animate_bool_with_time(plus.id.with("hov"), plus.hovered(), 0.1),
+        wt: ctx.animate_bool_with_time(resp.id.with("wt-hov"), over(&wt_btn), 0.1),
+    };
+    let geom = HeaderGeom {
+        rect,
+        plus: plus_rect,
+        wt: wt_btn.as_ref().map(|_| wt_rect),
+        badge: badge_rect,
+    };
 
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
+        let (name, hint) = header_text(spec);
         if theme::neutral() {
-            paint_header_neutral(
-                p,
-                pal,
-                rect,
-                plus_rect,
-                group,
-                shown,
-                open_t,
-                (hov, plus_hov),
-            );
+            paint_header_neutral(p, pal, spec, (&name, &hint), &geom, open_t, &hover);
         } else {
-            paint_header_chrome(p, pal, rect, open_t, hov);
-            let folder = if open_t > 0.5 {
-                ICON_FOLDER_OPEN
-            } else {
-                ICON_FOLDER
-            };
-            paint_icon(
-                p,
-                pos2(rect.left() + 34.0, rect.center().y),
-                Align2::CENTER_CENTER,
-                folder,
-                18.0,
-                pal.accent,
-            );
-
-            let (parent, name) = split_display(&group.display);
-            let mut job = LayoutJob::default();
-            job.append(
-                name,
-                0.0,
-                TextFormat {
-                    font_id: crate::theme::font(14.0),
-                    color: pal.text_strong,
-                    ..Default::default()
-                },
-            );
-            if !parent.is_empty() {
-                job.append(
-                    &format!("  {parent}"),
-                    0.0,
-                    TextFormat {
-                        font_id: crate::theme::font(11.5),
-                        color: pal.weak,
-                        ..Default::default()
-                    },
-                );
-            }
-            job.wrap.max_width = (rect.width() - 46.0 - 40.0).max(10.0);
-            job.wrap.max_rows = 1;
-            job.wrap.break_anywhere = true;
-            let galley = p.layout_job(job);
-            p.galley(
-                pos2(rect.left() + 48.0, rect.center().y - galley.size().y / 2.0),
-                galley,
-                pal.text,
-            );
-
-            // Count chip crossfades into the "+" button on hover.
-            let count = shown.to_string();
-            let g = p.layout_no_wrap(
-                count,
-                crate::theme::font(11.5),
-                pal.weak.gamma_multiply(1.0 - hov),
-            );
-            let chip = Rect::from_center_size(
-                pos2(rect.right() - 16.0, rect.center().y),
-                vec2((g.size().x + 12.0).max(22.0), 18.0),
-            );
-            p.rect_filled(chip, 9, pal.surface.gamma_multiply(1.0 - hov));
-            p.galley(chip.center() - g.size() / 2.0, g, pal.weak);
-            if hov > 0.01 {
-                p.rect_filled(
-                    plus_rect,
-                    8,
-                    theme::mix(pal.raised, pal.accent, plus_hov * 0.5).gamma_multiply(hov),
-                );
-                paint_icon(
-                    p,
-                    plus_rect.center(),
-                    Align2::CENTER_CENTER,
-                    ICON_PLUS,
-                    17.0,
-                    theme::mix(pal.weak, pal.text_strong, plus_hov).gamma_multiply(hov),
-                );
-            }
+            paint_header_neon(p, pal, spec, (&name, &hint), &geom, open_t, &hover);
         }
+        paint_header_extras(p, pal, &geom, &hover);
     }
     let resp = resp
         .on_hover_cursor(CursorIcon::PointingHand)
         .on_hover_ui(|ui| {
             ui.label(group.cwd.display().to_string());
+            if let Some(w) = &group.worktree {
+                ui.weak(format!("Worktree of {}", w.primary.display()));
+            }
         });
-    if plus.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    for (btn, tip) in [
+        (&Some(plus.clone()), "New omp session in this project"),
+        (&wt_btn, "New session in a new git worktree"),
+        (
+            &badge_btn,
+            "Waiting for the agent to finish — click to stop waiting",
+        ),
+    ] {
+        if let Some(b) = btn {
+            if b.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            let _ = b.clone().on_hover_text(tip);
+        }
     }
-    let _ = plus
-        .clone()
-        .on_hover_text("New omp session in this project");
+    let none = HeaderResult {
+        resp: resp.clone(),
+        toggle: false,
+    };
     if plus.clicked() {
         out.actions.push(SidebarAction::New(group.cwd.clone()));
         out.interacted = true;
-        return HeaderResult {
-            resp,
-            toggle: false,
-        };
+        return none;
     }
-    let toggle = resp.clicked() && !plus.hovered();
+    if wt_btn.as_ref().is_some_and(egui::Response::clicked) {
+        out.actions
+            .push(SidebarAction::NewWorktree(group.cwd.clone()));
+        out.interacted = true;
+        return none;
+    }
+    if badge_btn.as_ref().is_some_and(egui::Response::clicked) {
+        if let Some(w) = &group.worktree {
+            out.actions
+                .push(SidebarAction::CancelFinish(w.path.clone()));
+        }
+        out.interacted = true;
+        return none;
+    }
+    let toggle = resp.clicked() && !over(&wt_btn) && !over(&badge_btn) && !plus.hovered();
     HeaderResult { resp, toggle }
 }
 
-/// Neutral header: chevron, folder glyph, medium name + faint parent path, plain count that turns
-/// into the "+" on hover. No fills except the hover wash.
-#[allow(clippy::too_many_arguments)]
-fn paint_header_neutral(
-    p: &egui::Painter,
+/// Name (medium) and hint (faint) on one line, cut at `max_width`.
+fn header_job(
     pal: &Palette,
-    rect: Rect,
-    plus_rect: Rect,
-    group: &ProjectGroup,
-    shown: usize,
-    open_t: f32,
-    (hov, plus_hov): (f32, f32),
-) {
-    paint_header_chrome(p, pal, rect, open_t, hov);
-    let y = rect.center().y;
-    let folder = if open_t > 0.5 {
-        ICON_FOLDER_OPEN
-    } else {
-        ICON_FOLDER
-    };
-    paint_icon(
-        p,
-        pos2(rect.left() + 31.0, y),
-        Align2::CENTER_CENTER,
-        folder,
-        15.0,
-        theme::mix(pal.glyph, pal.text_strong, open_t * 0.5),
-    );
-    let (parent, name) = split_display(&group.display);
+    muted: bool,
+    (name, hint): (&str, &str),
+    (name_px, hint_px): (f32, f32),
+    max_width: f32,
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.append(
         name,
         0.0,
         TextFormat {
-            font_id: crate::theme::font(13.0),
-            color: pal.text_strong,
+            font_id: crate::theme::font(name_px),
+            color: if muted { pal.weak } else { pal.text_strong },
             ..Default::default()
         },
     );
-    if !parent.is_empty() {
+    if !hint.is_empty() {
         job.append(
-            &format!("  {parent}"),
+            &format!("  {hint}"),
             0.0,
             TextFormat {
-                font_id: crate::theme::font(11.0),
+                font_id: crate::theme::font(hint_px),
                 color: pal.weak,
                 ..Default::default()
             },
         );
     }
-    job.wrap.max_width = (rect.width() - 44.0 - 40.0).max(10.0);
+    job.wrap.max_width = max_width.max(10.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
+    job
+}
+
+/// The hover button for a worktree session and the "finishing" badge.
+fn paint_header_extras(p: &egui::Painter, pal: &Palette, geom: &HeaderGeom, hover: &HeaderHover) {
+    if let Some(r) = geom.wt
+        && hover.hov > 0.01
+    {
+        if theme::neutral() {
+            p.rect_filled(r, 6, pal.raised.gamma_multiply(hover.hov * hover.wt));
+        } else {
+            p.rect_filled(
+                r,
+                8,
+                theme::mix(pal.raised, pal.accent, hover.wt * 0.5).gamma_multiply(hover.hov),
+            );
+        }
+        paint_icon(
+            p,
+            r.center(),
+            Align2::CENTER_CENTER,
+            ICON_GIT_BRANCH_PLUS,
+            if theme::neutral() { 15.0 } else { 17.0 },
+            theme::mix(pal.weak, pal.text_strong, hover.wt).gamma_multiply(hover.hov),
+        );
+    }
+    if let Some(r) = geom.badge {
+        p.rect_filled(r, 9, pal.accent.gamma_multiply(0.16 + 0.1 * hover.hov));
+        p.text(
+            r.center(),
+            Align2::CENTER_CENTER,
+            "Finishing…",
+            crate::theme::font(11.0),
+            pal.accent,
+        );
+    }
+}
+
+/// Neon header: folder glyph, name + parent path, count chip that crossfades into the "+".
+fn paint_header_neon(
+    p: &egui::Painter,
+    pal: &Palette,
+    spec: &HeaderSpec<'_>,
+    text: (&str, &str),
+    geom: &HeaderGeom,
+    open_t: f32,
+    hover: &HeaderHover,
+) {
+    let rect = geom.rect;
+    paint_header_chrome(p, pal, rect, open_t, hover.hov);
+    paint_icon(
+        p,
+        pos2(rect.left() + 34.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        header_icon(spec.look, open_t),
+        18.0,
+        pal.accent,
+    );
+    let job = header_job(
+        pal,
+        spec.look == Look::Removed,
+        text,
+        (14.0, 11.5),
+        rect.width() - 46.0 - geom.reserved(40.0),
+    );
+    let galley = p.layout_job(job);
+    p.galley(
+        pos2(rect.left() + 48.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        pal.text,
+    );
+    let g = p.layout_no_wrap(
+        spec.shown.to_string(),
+        crate::theme::font(11.5),
+        pal.weak.gamma_multiply(1.0 - hover.hov),
+    );
+    let chip = Rect::from_center_size(
+        pos2(rect.right() - 16.0, rect.center().y),
+        vec2((g.size().x + 12.0).max(22.0), 18.0),
+    );
+    p.rect_filled(chip, 9, pal.surface.gamma_multiply(1.0 - hover.hov));
+    p.galley(chip.center() - g.size() / 2.0, g, pal.weak);
+    if hover.hov > 0.01 {
+        p.rect_filled(
+            geom.plus,
+            8,
+            theme::mix(pal.raised, pal.accent, hover.plus * 0.5).gamma_multiply(hover.hov),
+        );
+        paint_icon(
+            p,
+            geom.plus.center(),
+            Align2::CENTER_CENTER,
+            ICON_PLUS,
+            17.0,
+            theme::mix(pal.weak, pal.text_strong, hover.plus).gamma_multiply(hover.hov),
+        );
+    }
+}
+
+/// Neutral header: chevron, folder glyph, medium name + faint hint, plain count that turns
+/// into the "+" on hover. No fills except the hover wash.
+fn paint_header_neutral(
+    p: &egui::Painter,
+    pal: &Palette,
+    spec: &HeaderSpec<'_>,
+    text: (&str, &str),
+    geom: &HeaderGeom,
+    open_t: f32,
+    hover: &HeaderHover,
+) {
+    let rect = geom.rect;
+    paint_header_chrome(p, pal, rect, open_t, hover.hov);
+    let y = rect.center().y;
+    paint_icon(
+        p,
+        pos2(rect.left() + 31.0, y),
+        Align2::CENTER_CENTER,
+        header_icon(spec.look, open_t),
+        15.0,
+        theme::mix(pal.glyph, pal.text_strong, open_t * 0.5),
+    );
+    let job = header_job(
+        pal,
+        spec.look == Look::Removed,
+        text,
+        (13.0, 11.0),
+        rect.width() - 44.0 - geom.reserved(40.0),
+    );
     let galley = p.layout_job(job);
     p.galley(
         pos2(rect.left() + 46.0, y - galley.size().y / 2.0),
@@ -898,9 +1273,9 @@ fn paint_header_neutral(
         pal.text,
     );
     let count = p.layout_no_wrap(
-        shown.to_string(),
+        spec.shown.to_string(),
         crate::theme::font(11.0),
-        pal.weak.gamma_multiply(1.0 - hov),
+        pal.weak.gamma_multiply(1.0 - hover.hov),
     );
     p.galley(
         pos2(
@@ -910,15 +1285,19 @@ fn paint_header_neutral(
         count,
         pal.weak,
     );
-    if hov > 0.01 {
-        p.rect_filled(plus_rect, 6, pal.raised.gamma_multiply(hov * plus_hov));
+    if hover.hov > 0.01 {
+        p.rect_filled(
+            geom.plus,
+            6,
+            pal.raised.gamma_multiply(hover.hov * hover.plus),
+        );
         paint_icon(
             p,
-            plus_rect.center(),
+            geom.plus.center(),
             Align2::CENTER_CENTER,
             ICON_PLUS,
             15.0,
-            theme::mix(pal.weak, pal.text_strong, plus_hov).gamma_multiply(hov),
+            theme::mix(pal.weak, pal.text_strong, hover.plus).gamma_multiply(hover.hov),
         );
     }
 }
@@ -1345,6 +1724,8 @@ pub struct MenuEnv<'a> {
     /// Session files with a move/copy/delete in flight.
     pub busy: &'a HashSet<PathBuf>,
     pub drive: DriveMenu,
+    /// Session files open in a live tab (a move to a worktree types into that tab).
+    pub live_tabs: &'a [&'a Path],
 }
 
 impl MenuEnv<'_> {
@@ -1364,6 +1745,7 @@ impl SidebarInput<'_> {
             can_stop: self.can_stop,
             busy: self.busy,
             drive: self.drive,
+            live_tabs: self.open_paths,
         }
     }
 }
@@ -1472,6 +1854,34 @@ fn session_menu(
     }
     if env.omp_available {
         ui.separator();
+        let live = env.live_tabs.contains(&entry.path.as_path());
+        let linked = env
+            .groups
+            .iter()
+            .any(|g| g.cwd == entry.cwd && g.worktree.is_some());
+        let mut item = menu_item(
+            ui,
+            ICON_GIT_BRANCH_PLUS,
+            "Move to new worktree…",
+            None,
+            live && !linked,
+            false,
+        );
+        item = if linked {
+            item.on_disabled_hover_text("This session already runs in a worktree")
+        } else if !live {
+            item.on_disabled_hover_text("Open the session in a tab first")
+        } else {
+            item.on_hover_text(
+                "Carry this session and its uncommitted changes to a new git worktree",
+            )
+        };
+        if item.clicked() {
+            out.actions
+                .push(SidebarAction::MoveToWorktree(entry.clone()));
+            out.interacted = true;
+            ui.close();
+        }
         let idle = !env.busy.contains(&entry.path);
         for (kind, icon, label) in [
             (TransferKind::Copy, ICON_FILES, "Copy to project"),
@@ -1652,6 +2062,7 @@ mod tests {
             cwd: e.cwd.clone(),
             display: "~/proj".into(),
             sessions: vec![e.clone()],
+            worktree: None,
         }
     }
 
@@ -1663,6 +2074,7 @@ mod tests {
             cwd: a.cwd.clone(),
             display: "~/proj".into(),
             sessions: vec![a, b],
+            worktree: None,
         }];
         let mut cache = FilterCache::default();
         let stamp = (1, groups.as_ptr() as usize);
@@ -1750,6 +2162,7 @@ mod tests {
                     modified: SystemTime::UNIX_EPOCH,
                 })
                 .collect(),
+            worktree: None,
         }
     }
 
@@ -1771,7 +2184,7 @@ mod tests {
         let active = group_at(&groups, "/b/b1.jsonl");
         assert_eq!(active, Some(Path::new("/b")));
         let mut ex = Expansion::default();
-        ex.on_activation(active);
+        ex.on_activation(active, None);
         assert_eq!(open_set(&ex, &groups), [false, true, false]);
     }
 
@@ -1796,11 +2209,11 @@ mod tests {
             proj("/c", &["c1"]),
         ];
         let mut ex = Expansion::default();
-        ex.on_activation(group_at(&groups, "/a/a1.jsonl"));
+        ex.on_activation(group_at(&groups, "/a/a1.jsonl"), None);
         ex.set(Path::new("/c"), true); // user opens /c by hand
         assert_eq!(open_set(&ex, &groups), [true, false, true]);
-        ex.on_activation(group_at(&groups, "/c/c1.jsonl"));
-        ex.on_activation(group_at(&groups, "/b/b1.jsonl"));
+        ex.on_activation(group_at(&groups, "/c/c1.jsonl"), None);
+        ex.on_activation(group_at(&groups, "/b/b1.jsonl"), None);
         assert_eq!(open_set(&ex, &groups), [false, true, true]);
     }
 
@@ -1809,13 +2222,13 @@ mod tests {
         let groups = [proj("/a", &["a1"]), proj("/b", &["b1"])];
         let mut ex = Expansion::default();
         let a = group_at(&groups, "/a/a1.jsonl");
-        ex.on_activation(a);
+        ex.on_activation(a, None);
         ex.set(Path::new("/a"), false);
-        ex.on_activation(a); // re-click the active tab: stays collapsed
+        ex.on_activation(a, None); // re-click the active tab: stays collapsed
         assert_eq!(open_set(&ex, &groups), [false, false]);
-        ex.on_activation(group_at(&groups, "/b/b1.jsonl"));
+        ex.on_activation(group_at(&groups, "/b/b1.jsonl"), None);
         ex.set(Path::new("/a"), false);
-        ex.on_activation(a); // group changed back: reopens
+        ex.on_activation(a, None); // group changed back: reopens
         assert_eq!(open_set(&ex, &groups), [true, false]);
     }
 
@@ -1823,9 +2236,19 @@ mod tests {
     fn a_tab_without_group_keeps_the_previous_group_open() {
         let groups = [proj("/a", &["a1"]), proj("/b", &["b1"])];
         let mut ex = Expansion::default();
-        ex.on_activation(group_at(&groups, "/b/b1.jsonl"));
-        ex.on_activation(None); // Settings tab
+        ex.on_activation(group_at(&groups, "/b/b1.jsonl"), None);
+        ex.on_activation(None, None); // Settings tab
         assert_eq!(open_set(&ex, &groups), [false, true]);
+    }
+
+    #[test]
+    fn activating_a_worktree_opens_it_and_its_repository() {
+        let mut ex = Expansion::default();
+        ex.set(Path::new("/repo"), false);
+        ex.on_activation(Some(Path::new("/wt/a")), Some(Path::new("/repo")));
+        assert!(ex.is_open(Path::new("/wt/a"), false));
+        assert!(ex.is_open(Path::new("/repo"), false));
+        assert!(!ex.is_open(Path::new("/other"), false));
     }
 
     #[test]
@@ -1834,10 +2257,15 @@ mod tests {
         let mut cache = ActiveGroupCache::default();
         let stamp = (1, groups.as_ptr() as usize);
         let b = Some(Path::new("/b/b1.jsonl"));
-        assert_eq!(cache.get(stamp, &groups, b, None), Some(Path::new("/b")));
+        assert_eq!(
+            cache.get(stamp, &groups, b, None).map(|g| g.cwd.as_path()),
+            Some(Path::new("/b"))
+        );
         assert_eq!(cache.group, Some(1));
         assert_eq!(
-            cache.get(stamp, &groups, Some(Path::new("/a/a1.jsonl")), None),
+            cache
+                .get(stamp, &groups, Some(Path::new("/a/a1.jsonl")), None)
+                .map(|g| g.cwd.as_path()),
             Some(Path::new("/a"))
         );
     }
@@ -1846,11 +2274,11 @@ mod tests {
     fn filtering_shows_everything_and_collapse_expand_all_set_overrides() {
         let groups = [proj("/a", &["a1"]), proj("/b", &["b1"])];
         let mut ex = Expansion::default();
-        ex.on_activation(Some(Path::new("/a")));
+        ex.on_activation(Some(Path::new("/a")), None);
         assert!(groups.iter().all(|g| ex.is_open(&g.cwd, true)));
-        ex.set_all(&groups, false);
+        ex.set_all(groups.iter().map(|g| g.cwd.as_path()), false);
         assert_eq!(open_set(&ex, &groups), [false, false]);
-        ex.set_all(&groups, true);
+        ex.set_all(groups.iter().map(|g| g.cwd.as_path()), true);
         assert_eq!(open_set(&ex, &groups), [true, true]);
     }
 }

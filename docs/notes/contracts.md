@@ -1429,3 +1429,109 @@ payloads raw (`Input`, `Output`, `Snapshot` chunks), control payloads JSON (unkn
   `TermOptions.kitty_keyboard`, `KeyRules::Win32`, `encode_win32_key`, `encode_win32_modifiers`,
   `encode_paste_win32`; `Terminal::spawn`/`SpawnSpec` are `cfg(unix)`. After `detach()`/`kill()` the Remote's
   `recv` must return `Closed`/error promptly.
+
+## Wave 13: git worktree sessions
+
+Facts + user decisions: `docs/notes/worktrees.md` (authoritative for behavior). omp never gets a worktree flag;
+OmpDeck composes `omp worktree add` + plain `omp`, omp's `/wt`, and git. OmpDeck never writes `~/.omp/**` itself
+(`omp worktree add` creates the dir under the managed base).
+
+### deck-core
+- New module `worktree` (pub; no GUI deps; all git/omp runs blocking — callers use workers):
+  - `pub struct Worktree { pub path: PathBuf /* worktree root */, pub primary: PathBuf /* main checkout root */,
+    pub branch: Option<String> /* None = detached */ }` (Clone, Debug, PartialEq, Eq).
+  - `pub fn resolve(dir: &Path) -> Option<Worktree>`: filesystem only, no process (cheap enough for the scanner):
+    walk up from `dir` (bounded) to the first `.git`; a **file** `gitdir: <x>` (relative to the file's dir allowed)
+    → read `<x>/commondir` (relative to `<x>`) → common dir; primary = parent of a common dir named `.git`
+    (bare/other layouts → None); branch from `<x>/HEAD` (`ref: refs/heads/<b>`). A `.git` directory → None.
+  - `pub fn managed_base(setting: Option<&str>) -> PathBuf`: `OMP_WORKTREE_DIR` (absolute or `~`) > `setting`
+    (absolute or `~`) > `<home>/.omp/wt` (same precedence as omp's `getWorktreesDir`; relative values ignored).
+  - `pub fn slug(branch: &str) -> String` (path-safe, lowercase-free-preserving: `[A-Za-z0-9._-]`, others → `-`,
+    collapsed, trimmed, ≤ 60 bytes, never empty/`.`/`..`).
+  - `pub fn default_location(base: &Path, primary: &Path, branch: &str) -> PathBuf`:
+    `<base>/<slug(branch)>-<slug(primary file name)>`, then `-2`, `-3`, … while the path exists.
+  - `pub struct RepoInfo { pub root: PathBuf /* toplevel of dir */, pub primary: PathBuf, pub current_branch:
+    Option<String>, pub branches: Vec<String> /* local first, then remote-tracking `origin/x`; no HEAD aliases */,
+    pub has_commits: bool }`; `pub fn repo_info(dir: &Path) -> Result<RepoInfo, WorktreeError>`
+    (`NotARepo` typed error when outside git).
+  - `pub fn check_branch_name(repo: &Path, name: &str) -> Result<(), WorktreeError>` (`git check-ref-format
+    --branch`, plus "already exists" check).
+  - `pub fn create(omp: &Omp, repo: &Path, branch: &str, base_ref: &str, dest: &Path) -> Result<(), WorktreeError>`:
+    `omp worktree add -q -C <repo> -b <branch> <dest> <base_ref>` via the bounded/tree-killing runner (120 s),
+    with `PI_CONFIG_FILES=<overlay>` where the overlay (written under OmpDeck's data dir, not `~/.omp`) sets
+    `worktree.clone: false` so ignored files are never copied (user decision: clean checkout). Verify the overlay
+    key format and that `omp worktree add` honours it (v18.12.6 source + sandbox: the "clone fell back" warning
+    must disappear). Errors carry omp's stderr.
+  - `pub struct WorktreeStatus { pub branch: Option<String>, pub dirty: bool /* staged|unstaged|untracked,
+    ignored excluded */, pub merged: bool /* branch tip is an ancestor of base */, pub ahead: u32 /* commits not
+    in base */ }`; `pub fn status(wt: &Worktree, base: &str) -> Result<WorktreeStatus, WorktreeError>`.
+  - `pub fn infer_base(wt: &Worktree) -> Option<String>`: the primary checkout's current branch, else the remote
+    default branch (`origin/HEAD` target), else None.
+  - `pub enum Unsafe { Dirty, NotMerged { ahead: u32 }, Detached, Missing }`;
+    `pub fn remove(wt: &Worktree, base: &str, delete_branch: bool) -> Result<(), WorktreeError>`: re-checks
+    status first and returns `WorktreeError::Unsafe(Vec<Unsafe>)` without touching anything when not clean+merged;
+    then `git -C <primary> worktree remove <path>` (never `--force`) and, if asked, `git -C <primary> branch -d
+    <branch>` (never `-D`). `remove_unchecked` must not exist.
+  - `WorktreeError` (thiserror): `NotARepo`, `Git { command, stderr }`, `Omp { stderr }`, `Unsafe(Vec<Unsafe>)`,
+    `Io`, `Timeout`.
+- `sessions::ProjectGroup` gains `pub worktree: Option<worktree::Worktree>` (from `resolve(cwd)` at scan time;
+  every constructor updated).
+- `status::GitInfo` gains `pub worktree_of: Option<PathBuf>` (primary root when the cwd is a linked worktree).
+- `config::AppConfig` gains `pub worktree_bases: BTreeMap<PathBuf, String>` (worktree path → base branch
+  recorded by OmpDeck at create / move time; serde default; pruned on removal).
+
+### omp-deck
+- Sidebar: groups with `worktree: Some(w)` nest under the group whose cwd == `w.primary` (a synthetic, session-less
+  parent header is shown when the primary has no sessions); child header shows the branch (fallback: folder
+  name); parent sort key = newest of itself and children; expanding follows the active tab (parent + child);
+  filter matches children; per-folder scope includes worktrees whose primary is in scope.
+- Project header menu (non-worktree groups): "New session in worktree…" → dialog (branch name prefilled
+  `wt/<yyyymmdd-hhmm>`, base ref dropdown from `repo_info` defaulting to the current branch, location defaulting
+  to `default_location(managed_base(omp worktree.base setting), primary, branch)` + Browse/edit, inline
+  validation via `check_branch_name` on a worker) → worker `worktree::create` → record `worktree_bases` → open a
+  tab running plain `omp` in the worktree (same path as "New session here").
+- Running-tab / session-row menu: "Move to new worktree…" (tab running, not already a linked worktree): branch
+  dialog → record base (tab's current branch) → `Job::slash("Move to worktree", "/wt <branch>",
+  Requires::Idle)`; the tab follows omp's relocation.
+- Worktree group header menu: "Finish worktree" and "Remove worktree…" (+ existing items).
+  - Finish: target = the worktree's running tab (else open its newest session in a tab first); inject
+    `Job::slash("Finish worktree", <finish prompt>, Requires::Idle)`. Prompt (one line) tells the agent: commit
+    its work on `<branch>`, merge it into `<base>` in the main checkout at `<primary>` (e.g. `git -C <primary>
+    merge <branch>`), follow this project's rules on committing/merging and ask the user first if they don't
+    allow doing it unprompted, don't delete the worktree or branch (OmpDeck does), report the result.
+    Mark the worktree "finishing" (chip/badge on its header + cancel). On every busy→idle transition of that tab
+    while finishing: worker `status`; clean+merged → stop **only** the tabs whose cwd is inside the worktree
+    (`Backends::stop` per tab), `worktree::remove(.., delete_branch: true)`, toast; otherwise keep waiting
+    (one info toast with the reason the first time). Finishing state is in-memory only.
+  - Remove…: confirm dialog listing branch/base/status; refuses with the reasons from `Unsafe`; stops only that
+    worktree's tabs first.
+  - After any removal: drop `worktree_bases`, `folder_tabs`, `recent_folders` entries for the path; if a Drive
+    project-sync row exists for it, ask whether to drop the row (cloud backups untouched).
+- Status bar git chip: worktree icon + tooltip "Worktree of <primary>" when `worktree_of` is set.
+- Housekeeping: whenever a tab's `session_path` changes (breadcrumb/`/proc` follow), set `tab.cwd` to the scanned
+  entry's header cwd (or the breadcrumb cwd) so restore/reopen/sync use the relocated folder.
+- (Wave 13 follow-up) `config::AppConfig.removed_worktrees: BTreeMap<PathBuf, RemovedWorktree>` +
+  `RemovedWorktree { primary: PathBuf, branch: Option<String> }`: recorded by omp-deck on every worktree it removes;
+  the sidebar nests groups whose cwd is a key and no longer exists under the primary as "<branch> (removed)", and
+  resuming such a session launches with the primary as cwd (omp relocates it there). Entries whose primary is gone
+  are pruned.
+
+### Wave 13 as built (supersedes the sketch above where they differ)
+- `worktree::remove(wt, base, delete_branch) -> Result<Removed, WorktreeError>`, `Removed { branch_deleted: bool,
+  branch_note: Option<String> }`: verifies clean + tip ancestor of `base`, `git worktree remove -- <path>` (no
+  force), then `git update-ref -d refs/heads/<b> <verified tip>` (+ best-effort `branch.<b>` config removal) —
+  works when `base` isn't checked out (`branch -d` would refuse); a moved branch is kept with a note (partial
+  success, not an error). A clean detached HEAD already in base is removable; missing dir → `Unsafe([Missing])`;
+  `status` rejects a base that is empty, starts with `-`, or doesn't resolve. Paths are lexically normalized.
+- `create` reads `PI_CONFIG_FILES` and the data dir from the `Omp` command env first (sandboxable), rejects an
+  option-like base and a relative dest before running omp.
+- `Tmux::attach_or_create` returns `LaunchSpec.cwd = platform::root_dir()`; the pane dir only travels as `-c`
+  (the tmux server inherits its first client's cwd; a removed worktree stranded it).
+- omp-deck removal: a worker classifies tabs (`worktree_ui::classify`) by live cwd (breadcrumb when fresh for the
+  pane / matching session, else launch cwd for direct tabs; canonical paths, Windows case-insensitive, component
+  prefix); the UI stops exactly those, a second worker re-classifies, refuses if one still runs inside, then
+  removes. A direct tab with unknown live cwd launched in the primary blocks removal (named in the message).
+- Finish: merge target computed on a worker from `git worktree list --porcelain` (primary on base → merge there;
+  base in another worktree → merge there; base checked out nowhere → merge base into the worktree and
+  `push . HEAD:refs/heads/<base>`); all values single-quoted + code-spanned; injection retried every 1.5 s until
+  `FINISH_TAB_TIMEOUT`; exited tabs are replaced by a resumed session.

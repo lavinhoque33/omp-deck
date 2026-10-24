@@ -47,6 +47,8 @@ mod usage_fmt;
 mod usage_state;
 mod usage_view;
 mod widgets;
+mod worktree_dialog;
+mod worktree_ui;
 
 use anyhow::anyhow;
 use deck_core::config::{AppConfig, config_dir};

@@ -78,6 +78,19 @@ pub struct AppConfig {
     pub project_sync_interval: SyncInterval,
     /// Which session backend new tabs use (live sessions keep theirs until closed).
     pub session_backend: BackendChoice,
+    /// Worktree path → base branch recorded when OmpDeck created / moved a session into it;
+    /// pruned when the worktree is removed.
+    pub worktree_bases: BTreeMap<PathBuf, String>,
+    /// Worktrees OmpDeck removed, keyed by their former path (so their sessions can be grouped
+    /// under the primary repo).
+    pub removed_worktrees: BTreeMap<PathBuf, RemovedWorktree>,
+}
+
+/// What is remembered about a removed worktree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RemovedWorktree {
+    pub primary: PathBuf,
+    pub branch: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -102,6 +115,8 @@ impl Default for AppConfig {
             project_sync: Vec::new(),
             project_sync_interval: SyncInterval::default(),
             session_backend: BackendChoice::default(),
+            worktree_bases: BTreeMap::new(),
+            removed_worktrees: BTreeMap::new(),
         }
     }
 }
@@ -324,6 +339,26 @@ mod tests {
         assert_eq!(cfg.sidebar_width, 250.0);
         assert!(!cfg.native_decorations);
         assert!(cfg.check_updates);
+    }
+
+    #[test]
+    fn worktree_bases_default_empty_and_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, r#"{"font_size": 12.0}"#).unwrap();
+        let old = AppConfig::load_from(&path);
+        assert!(old.worktree_bases.is_empty() && old.removed_worktrees.is_empty());
+        let mut cfg = AppConfig::default();
+        cfg.worktree_bases.insert("/wt/a".into(), "main".into());
+        cfg.removed_worktrees.insert(
+            "/wt/b".into(),
+            RemovedWorktree {
+                primary: "/repo".into(),
+                branch: Some("b".into()),
+            },
+        );
+        cfg.save_to(&path).unwrap();
+        assert_eq!(AppConfig::load_from(&path), cfg);
     }
 
     #[test]

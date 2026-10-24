@@ -1,0 +1,735 @@
+//! The "New session in worktree…" and "Move to new worktree…" dialogs: form state, the checks that
+//! run on a worker (branch name, destination folder) and the form itself.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use deck_core::worktree::{self, RepoInfo, WorktreeError};
+use egui::{Id, RichText, TextEdit, Ui, vec2};
+
+use crate::confirm::{Dialog as Chrome, show_dialog};
+use crate::icons::{ICON_FOLDER_OPEN, ICON_TRIANGLE_ALERT};
+use crate::theme::Palette;
+use crate::widgets::icon_text;
+use crate::worktree_ui::{base_to_record, branch_stamp};
+
+/// Typing is checked this long after the last key stroke (each check runs git).
+const DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// What the dialog was opened for.
+pub enum Kind {
+    /// A new tab in a new worktree of the repository containing `dir`.
+    New { dir: PathBuf },
+    /// Move the session of tab `uid` (its cwd is `dir`) into a new worktree.
+    Move {
+        uid: u64,
+        dir: PathBuf,
+        title: String,
+    },
+}
+
+enum Repo {
+    Loading,
+    Ready(Box<RepoInfo>),
+    Failed(String),
+}
+
+/// A verdict that a worker produces.
+enum Check<T> {
+    Idle,
+    Pending,
+    Ok(T),
+    Bad(String),
+}
+
+/// Where the worktree folder comes from.
+pub enum Loc {
+    /// The default under omp's managed base (follows the branch name).
+    Auto { base_setting: Option<String> },
+    /// What the user typed.
+    Typed { text: String, home: Option<PathBuf> },
+    /// No folder (moves are placed by omp).
+    None,
+}
+
+/// A check for a worker.
+pub struct CheckReq {
+    pub generation: u64,
+    dir: PathBuf,
+    primary: PathBuf,
+    branch: String,
+    loc: Loc,
+}
+
+/// Its answer.
+pub struct CheckRes {
+    pub generation: u64,
+    branch: Result<(), String>,
+    location: Option<Result<PathBuf, String>>,
+    /// The text of the computed default location.
+    auto_text: Option<String>,
+}
+
+/// One line for a failure (git's own stderr says it best).
+pub fn brief(e: &WorktreeError) -> String {
+    match e {
+        WorktreeError::Git { stderr, .. } | WorktreeError::Omp { stderr } if !stderr.is_empty() => {
+            stderr.lines().next().unwrap_or(stderr).trim().to_owned()
+        }
+        WorktreeError::NotARepo => "This folder is not a git repository".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+impl CheckReq {
+    /// Blocking (git, filesystem): call from a worker.
+    pub fn run(self) -> CheckRes {
+        let branch = if self.branch.trim().is_empty() {
+            Err("Enter a branch name".to_owned())
+        } else {
+            worktree::check_branch_name(&self.dir, &self.branch).map_err(|e| brief(&e))
+        };
+        let (location, auto_text) = match self.loc {
+            Loc::None => (None, None),
+            Loc::Auto { base_setting } => {
+                let leaf = if self.branch.trim().is_empty() {
+                    "worktree"
+                } else {
+                    self.branch.trim()
+                };
+                let dest = worktree::default_location(
+                    &worktree::managed_base(base_setting.as_deref()),
+                    &self.primary,
+                    leaf,
+                );
+                let text = dest.to_string_lossy().into_owned();
+                (Some(check_destination(&dest).map(|()| dest)), Some(text))
+            }
+            Loc::Typed { text, home } => (
+                Some(
+                    crate::transfer::lexical_dest(&text, home.as_deref()).and_then(|p| {
+                        check_destination(&p)?;
+                        Ok(p)
+                    }),
+                ),
+                None,
+            ),
+        };
+        CheckRes {
+            generation: self.generation,
+            branch,
+            location,
+            auto_text,
+        }
+    }
+}
+
+/// `omp worktree add` needs a destination that is absent (below a folder) or empty.
+pub fn check_destination(dest: &Path) -> Result<(), String> {
+    match std::fs::metadata(dest) {
+        Ok(m) if !m.is_dir() => Err("A file is in the way".to_owned()),
+        Ok(_) => match std::fs::read_dir(dest).map(|mut it| it.next().is_none()) {
+            Ok(true) => Ok(()),
+            Ok(_) => Err("That folder is not empty".to_owned()),
+            Err(e) => Err(format!("Cannot read that folder: {e}")),
+        },
+        Err(e) => match dest.ancestors().skip(1).find(|a| a.exists()) {
+            Some(a) if !a.is_dir() => Err(format!("{} is not a folder", a.display())),
+            Some(_) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Some(_) => Err(format!("Cannot use that location: {e}")),
+            None => Err("That location does not exist".to_owned()),
+        },
+    }
+}
+
+/// What the dialog decided on confirm.
+pub enum Plan {
+    New {
+        /// Working tree root the worktree is made from (`omp worktree add -C`).
+        repo: PathBuf,
+        branch: String,
+        base_ref: String,
+        /// The branch to remember as the merge target (`None`: inferred later).
+        record_base: Option<String>,
+        dest: PathBuf,
+    },
+    Move {
+        uid: u64,
+        branch: String,
+        /// The branch the session is on now: the merge target.
+        base: Option<String>,
+    },
+}
+
+pub enum Outcome {
+    Open,
+    Cancel,
+    Confirm(Plan),
+    Browse,
+}
+
+pub struct WorktreeDialog {
+    pub kind: Kind,
+    repo: Repo,
+    branch: String,
+    base_ref: String,
+    location: String,
+    /// The location follows the branch name until the user edits or browses it.
+    loc_auto: bool,
+    branch_v: Check<()>,
+    loc_v: Check<PathBuf>,
+    /// Bumped with every edit; stale worker answers are dropped.
+    generation: u64,
+    needs_check: bool,
+    edited_at: Instant,
+    pub browsing: bool,
+    focus_first: bool,
+}
+
+impl WorktreeDialog {
+    pub fn new(kind: Kind, now_unix: u64) -> WorktreeDialog {
+        WorktreeDialog {
+            kind,
+            repo: Repo::Loading,
+            branch: branch_stamp(now_unix),
+            base_ref: String::new(),
+            location: String::new(),
+            loc_auto: true,
+            branch_v: Check::Idle,
+            loc_v: Check::Idle,
+            generation: 0,
+            needs_check: false,
+            edited_at: Instant::now(),
+            browsing: false,
+            focus_first: true,
+        }
+    }
+
+    /// The directory whose repository the worktree is made from.
+    pub fn dir(&self) -> &Path {
+        match &self.kind {
+            Kind::New { dir } | Kind::Move { dir, .. } => dir,
+        }
+    }
+
+    fn is_move(&self) -> bool {
+        matches!(self.kind, Kind::Move { .. })
+    }
+
+    /// The repository facts arrived.
+    pub fn on_repo(&mut self, result: Result<RepoInfo, WorktreeError>) {
+        match result {
+            Ok(info) => {
+                self.base_ref = info
+                    .current_branch
+                    .clone()
+                    .unwrap_or_else(|| "HEAD".to_owned());
+                self.repo = Repo::Ready(Box::new(info));
+                self.edited();
+            }
+            Err(e) => self.repo = Repo::Failed(brief(&e)),
+        }
+    }
+
+    fn edited(&mut self) {
+        self.generation += 1;
+        self.needs_check = true;
+        self.edited_at = Instant::now();
+        self.branch_v = Check::Pending;
+        if !self.is_move() {
+            self.loc_v = Check::Pending;
+        }
+    }
+
+    /// The check to run on a worker now, if one is due (the repository is known and typing paused).
+    pub fn take_check(
+        &mut self,
+        base_setting: Option<&str>,
+        home: Option<&Path>,
+    ) -> Option<CheckReq> {
+        let Repo::Ready(info) = &self.repo else {
+            return None;
+        };
+        if !self.needs_check || self.edited_at.elapsed() < DEBOUNCE {
+            return None;
+        }
+        self.needs_check = false;
+        let loc = match (&self.kind, self.loc_auto) {
+            (Kind::Move { .. }, _) => Loc::None,
+            (_, true) => Loc::Auto {
+                base_setting: base_setting.map(str::to_owned),
+            },
+            (_, false) => Loc::Typed {
+                text: self.location.clone(),
+                home: home.map(Path::to_path_buf),
+            },
+        };
+        Some(CheckReq {
+            generation: self.generation,
+            dir: self.dir().to_path_buf(),
+            primary: info.primary.clone(),
+            branch: self.branch.trim().to_owned(),
+            loc,
+        })
+    }
+
+    /// When the next check is due (to repaint then).
+    pub fn check_due_in(&self) -> Option<Duration> {
+        (self.needs_check && matches!(self.repo, Repo::Ready(_)))
+            .then(|| DEBOUNCE.saturating_sub(self.edited_at.elapsed()))
+    }
+
+    /// A worker's answer; ignored unless it answers the latest edit.
+    pub fn apply(&mut self, res: CheckRes) {
+        if res.generation != self.generation {
+            return;
+        }
+        self.branch_v = match res.branch {
+            Ok(()) => Check::Ok(()),
+            Err(e) => Check::Bad(e),
+        };
+        if let Some(text) = res.auto_text
+            && self.loc_auto
+        {
+            self.location = text;
+        }
+        if let Some(loc) = res.location {
+            self.loc_v = match loc {
+                Ok(p) => Check::Ok(p),
+                Err(e) => Check::Bad(e),
+            };
+        }
+    }
+
+    /// Where the native folder dialog opens.
+    pub fn start_dir(&self, home: Option<&Path>) -> PathBuf {
+        match &self.loc_v {
+            Check::Ok(p) => p.parent().map(Path::to_path_buf),
+            _ => None,
+        }
+        .or_else(|| home.map(Path::to_path_buf))
+        .unwrap_or_else(deck_core::platform::home_or_root)
+    }
+
+    /// The user picked a folder to create the worktree in.
+    pub fn picked(&mut self, parent: &Path) {
+        let primary = match &self.repo {
+            Repo::Ready(i) => i.primary.clone(),
+            _ => self.dir().to_path_buf(),
+        };
+        let leaf = format!(
+            "{}-{}",
+            worktree::slug(self.branch.trim()),
+            worktree::slug(
+                &primary
+                    .file_name()
+                    .map_or_else(|| "repo".to_owned(), |n| n.to_string_lossy().into_owned())
+            )
+        );
+        self.location = parent.join(leaf).to_string_lossy().into_owned();
+        self.loc_auto = false;
+        self.edited();
+    }
+
+    fn confirmable(&self) -> bool {
+        let Repo::Ready(info) = &self.repo else {
+            return false;
+        };
+        info.has_commits
+            && matches!(self.branch_v, Check::Ok(()))
+            && (self.is_move() || matches!(self.loc_v, Check::Ok(_)))
+    }
+
+    fn plan(&self) -> Option<Plan> {
+        if !self.confirmable() {
+            return None;
+        }
+        let Repo::Ready(info) = &self.repo else {
+            return None;
+        };
+        let branch = self.branch.trim().to_owned();
+        match (&self.kind, &self.loc_v) {
+            (Kind::Move { uid, .. }, _) => Some(Plan::Move {
+                uid: *uid,
+                branch,
+                base: info.current_branch.clone(),
+            }),
+            (Kind::New { .. }, Check::Ok(dest)) => Some(Plan::New {
+                repo: info.root.clone(),
+                record_base: base_to_record(&self.base_ref, &info.branches),
+                base_ref: self.base_ref.clone(),
+                branch,
+                dest: dest.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context, has_picker: bool) -> Outcome {
+        let pal = Palette::of_ctx(ctx);
+        let mut outcome = Outcome::Open;
+        let (title, label) = match &self.kind {
+            Kind::New { .. } => ("New session in worktree", "Create"),
+            Kind::Move { .. } => ("Move to a new worktree", "Move"),
+        };
+        let enabled = self.confirmable();
+        let mut branch_edited = false;
+        let mut loc_edited = false;
+        let answer = show_dialog(
+            ctx,
+            &Chrome {
+                id: "worktree",
+                title,
+                width: 480.0,
+                confirm_label: label,
+                confirm_enabled: enabled,
+                danger: false,
+                enter_confirms: true,
+            },
+            |ui: &mut Ui| {
+                self.intro(ui, pal);
+                match &self.repo {
+                    Repo::Loading => {
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.add(crate::widgets::Spin::new(16.0, pal.accent));
+                            ui.label(RichText::new("Reading the repository…").color(pal.weak));
+                        });
+                        return;
+                    }
+                    Repo::Failed(msg) => {
+                        ui.add_space(10.0);
+                        problem(ui, pal, msg);
+                        return;
+                    }
+                    Repo::Ready(info) if !info.has_commits => {
+                        ui.add_space(10.0);
+                        problem(
+                            ui,
+                            pal,
+                            "This repository has no commits yet — make one first, git cannot branch from nothing.",
+                        );
+                        return;
+                    }
+                    Repo::Ready(_) => {}
+                }
+                ui.add_space(12.0);
+                ui.label(RichText::new("Branch").color(pal.weak));
+                let resp = ui.add(
+                    TextEdit::singleline(&mut self.branch)
+                        .id(Id::unique("omp-deck-worktree-branch"))
+                        .hint_text("wt/my-feature")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(10, 8)),
+                );
+                if self.focus_first {
+                    resp.request_focus();
+                    self.focus_first = false;
+                }
+                branch_edited = resp.changed();
+                verdict(ui, pal, &self.branch_v, "Checking the name…");
+                if self.is_move() {
+                    self.move_details(ui, pal);
+                    return;
+                }
+                ui.add_space(10.0);
+                ui.label(RichText::new("Based on").color(pal.weak));
+                self.base_picker(ui);
+                ui.add_space(10.0);
+                ui.label(RichText::new("Folder").color(pal.weak));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let browse_w = if has_picker { 108.0 } else { 0.0 };
+                    let resp = ui.add(
+                        TextEdit::singleline(&mut self.location)
+                            .id(Id::unique("omp-deck-worktree-folder"))
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(ui.available_width() - browse_w - 8.0)
+                            .margin(egui::Margin::symmetric(10, 8)),
+                    );
+                    loc_edited = resp.changed();
+                    if has_picker {
+                        let text = if self.browsing {
+                            "Waiting…"
+                        } else {
+                            "Browse…"
+                        };
+                        let btn = egui::Button::new((
+                            icon_text(ICON_FOLDER_OPEN, 17.0, pal.glyph),
+                            RichText::new(text),
+                        ))
+                        .min_size(vec2(browse_w, 34.0));
+                        if ui
+                            .add_enabled(!self.browsing, btn)
+                            .on_hover_text("Choose the folder to create the worktree in")
+                            .clicked()
+                        {
+                            outcome = Outcome::Browse;
+                        }
+                    }
+                });
+                verdict(ui, pal, &self.loc_v, "Checking the folder…");
+            },
+        );
+        if branch_edited {
+            self.edited();
+        }
+        if loc_edited {
+            self.loc_auto = false;
+            self.edited();
+        }
+        match answer {
+            Some(true) => self.plan().map_or(Outcome::Open, Outcome::Confirm),
+            Some(false) => Outcome::Cancel,
+            None => outcome,
+        }
+    }
+
+    fn intro(&self, ui: &mut Ui, pal: &Palette) {
+        let text = match &self.kind {
+            Kind::New { dir } => format!(
+                "Creates a git worktree of “{}” on a new branch and starts an omp session in it. The worktree is a clean checkout.",
+                crate::folder_scope::folder_name(dir)
+            ),
+            Kind::Move { title, .. } => format!(
+                "Moves “{title}” into a new worktree: omp creates it, carries your uncommitted changes along and the session continues there."
+            ),
+        };
+        ui.add(
+            egui::Label::new(RichText::new(text).color(pal.weak))
+                .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+    }
+
+    fn move_details(&self, ui: &mut Ui, pal: &Palette) {
+        let Repo::Ready(info) = &self.repo else {
+            return;
+        };
+        ui.add_space(8.0);
+        let text = match &info.current_branch {
+            Some(b) => format!("Based on the current branch “{b}”, which is also where it is merged back."),
+            None => "The repository is on a detached HEAD: OmpDeck will look for the merge target when you finish the worktree.".to_owned(),
+        };
+        ui.add(
+            egui::Label::new(RichText::new(text).small().color(pal.weak))
+                .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+    }
+
+    fn base_picker(&mut self, ui: &mut Ui) {
+        let Repo::Ready(info) = &self.repo else {
+            return;
+        };
+        egui::ComboBox::from_id_salt("omp-deck-worktree-base")
+            .selected_text(self.base_ref.as_str())
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        if info.current_branch.is_none() {
+                            ui.selectable_value(&mut self.base_ref, "HEAD".to_owned(), "HEAD");
+                        }
+                        for b in &info.branches {
+                            ui.selectable_value(&mut self.base_ref, b.clone(), b);
+                        }
+                    });
+            });
+    }
+}
+
+fn problem(ui: &mut Ui, pal: &Palette, msg: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(icon_text(ICON_TRIANGLE_ALERT, 16.0, pal.danger));
+        ui.label(RichText::new(msg).small().color(pal.danger));
+    });
+}
+
+fn verdict<T>(ui: &mut Ui, pal: &Palette, check: &Check<T>, pending: &str) {
+    match check {
+        Check::Bad(msg) => {
+            ui.add_space(4.0);
+            problem(ui, pal, msg);
+        }
+        Check::Pending => {
+            ui.add_space(4.0);
+            ui.label(RichText::new(pending).small().color(pal.weak));
+        }
+        Check::Idle | Check::Ok(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(has_commits: bool) -> RepoInfo {
+        RepoInfo {
+            root: PathBuf::from("/p/repo"),
+            primary: PathBuf::from("/p/repo"),
+            current_branch: Some("main".into()),
+            branches: vec!["main".into(), "dev".into(), "origin/main".into()],
+            has_commits,
+        }
+    }
+
+    fn new_dialog() -> WorktreeDialog {
+        WorktreeDialog::new(
+            Kind::New {
+                dir: PathBuf::from("/p/repo"),
+            },
+            0,
+        )
+    }
+
+    #[test]
+    fn the_branch_is_prefilled_and_checks_wait_for_the_repository_and_the_typing_pause() {
+        let mut d = new_dialog();
+        assert_eq!(d.branch, "wt/19700101-0000");
+        assert!(
+            d.take_check(None, None).is_none(),
+            "repository not read yet"
+        );
+        d.on_repo(Ok(info(true)));
+        assert_eq!(d.base_ref, "main");
+        assert!(d.take_check(None, None).is_none(), "typing pause not over");
+        d.edited_at -= DEBOUNCE;
+        let req = d.take_check(None, None).expect("due");
+        assert_eq!(req.branch, "wt/19700101-0000");
+        assert!(matches!(req.loc, Loc::Auto { .. }));
+        assert!(d.take_check(None, None).is_none(), "one check per edit");
+    }
+
+    #[test]
+    fn stale_answers_cannot_unlock_the_dialog() {
+        let mut d = new_dialog();
+        d.on_repo(Ok(info(true)));
+        d.edited_at -= DEBOUNCE;
+        let first = d.take_check(None, None).expect("check");
+        d.edited(); // the user kept typing
+        let answer = |generation, location: &str| CheckRes {
+            generation,
+            branch: Ok(()),
+            location: Some(Ok(PathBuf::from(location))),
+            auto_text: Some(location.to_owned()),
+        };
+        d.apply(answer(first.generation, "/wt/old"));
+        assert!(!d.confirmable());
+        assert!(d.location.is_empty());
+        d.apply(answer(d.generation, "/wt/new"));
+        assert!(d.confirmable());
+        assert_eq!(d.location, "/wt/new");
+    }
+
+    #[test]
+    fn a_typed_folder_stops_following_the_branch_and_is_what_gets_created() {
+        let mut d = new_dialog();
+        d.on_repo(Ok(info(true)));
+        d.location = "/typed/here".into();
+        d.loc_auto = false;
+        d.edited();
+        d.edited_at -= DEBOUNCE;
+        let req = d
+            .take_check(None, Some(Path::new("/home/u")))
+            .expect("check");
+        assert!(matches!(&req.loc, Loc::Typed { text, .. } if text == "/typed/here"));
+        d.apply(CheckRes {
+            generation: req.generation,
+            branch: Ok(()),
+            location: Some(Ok(PathBuf::from("/typed/here"))),
+            auto_text: Some("/auto/ignored".into()),
+        });
+        assert_eq!(
+            d.location, "/typed/here",
+            "an auto text never overwrites the user's"
+        );
+        let Some(Plan::New {
+            dest,
+            base_ref,
+            record_base,
+            ..
+        }) = d.plan()
+        else {
+            panic!("plan");
+        };
+        assert_eq!(dest, Path::new("/typed/here"));
+        assert_eq!(
+            (base_ref.as_str(), record_base.as_deref()),
+            ("main", Some("main"))
+        );
+    }
+
+    #[test]
+    fn a_bad_name_or_a_repository_without_commits_blocks_confirmation() {
+        let mut d = new_dialog();
+        d.on_repo(Ok(info(true)));
+        d.apply(CheckRes {
+            generation: d.generation,
+            branch: Err("branch 'x' already exists".into()),
+            location: Some(Ok(PathBuf::from("/wt/x"))),
+            auto_text: None,
+        });
+        assert!(d.plan().is_none());
+
+        let mut empty = new_dialog();
+        empty.on_repo(Ok(info(false)));
+        empty.apply(CheckRes {
+            generation: empty.generation,
+            branch: Ok(()),
+            location: Some(Ok(PathBuf::from("/wt/x"))),
+            auto_text: None,
+        });
+        assert!(empty.plan().is_none());
+    }
+
+    #[test]
+    fn a_move_needs_no_folder_and_merges_back_into_the_current_branch() {
+        let mut d = WorktreeDialog::new(
+            Kind::Move {
+                uid: 7,
+                dir: PathBuf::from("/p/repo"),
+                title: "t".into(),
+            },
+            0,
+        );
+        d.on_repo(Ok(info(true)));
+        d.edited_at -= DEBOUNCE;
+        let req = d.take_check(None, None).expect("check");
+        assert!(matches!(req.loc, Loc::None));
+        d.apply(CheckRes {
+            generation: req.generation,
+            branch: Ok(()),
+            location: None,
+            auto_text: None,
+        });
+        let Some(Plan::Move { uid, branch, base }) = d.plan() else {
+            panic!("plan");
+        };
+        assert_eq!(
+            (uid, branch.as_str(), base.as_deref()),
+            (7, "wt/19700101-0000", Some("main"))
+        );
+    }
+
+    #[test]
+    fn destination_must_be_absent_or_empty() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path();
+        assert_eq!(check_destination(&dir.join("new/deep")), Ok(()));
+        assert_eq!(check_destination(dir), Ok(()), "an empty folder is fine");
+        std::fs::write(dir.join("f"), b"x").expect("file");
+        assert!(check_destination(dir).unwrap_err().contains("not empty"));
+        assert!(
+            check_destination(&dir.join("f"))
+                .unwrap_err()
+                .contains("file")
+        );
+        assert!(
+            check_destination(&dir.join("f/sub"))
+                .unwrap_err()
+                .contains("not a folder")
+        );
+    }
+}
