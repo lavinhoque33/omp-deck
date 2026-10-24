@@ -6,7 +6,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Client, TestNs, env, wait_until};
+use common::{Client, TestNs, env, wait_until, wait_until_for};
 use deck_host::{Error, HostEvent, SessionSpec};
 
 fn spec(name: &str, program: &str, args: &[&str]) -> SessionSpec {
@@ -95,9 +95,12 @@ fn kill_terminates_the_job_tree() {
     let ns = TestNs::new();
     let pid_file = env().root.join(format!("gpid-{}", std::process::id()));
     let _ = std::fs::remove_file(&pid_file);
+    // The PID is written to a temporary file and renamed, so a reader never sees a partial
+    // number.
     let script = format!(
         "$p = Start-Process -PassThru -NoNewWindow ping -ArgumentList '-n','1000','127.0.0.1'; \
-         Set-Content -Path '{}' -Value $p.Id; Wait-Process -Id $p.Id",
+         Set-Content -Path '{0}.tmp' -Value $p.Id; Move-Item -Force '{0}.tmp' '{0}'; \
+         Wait-Process -Id $p.Id",
         pid_file.display()
     );
     deck_host::start(
@@ -105,14 +108,40 @@ fn kill_terminates_the_job_tree() {
         &spec(
             "k",
             "powershell.exe",
-            &["-NoProfile", "-NonInteractive", "-Command", &script],
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ],
         ),
         80,
         24,
     )
     .unwrap();
-    wait_until("grandchild pid", || {
-        std::fs::read_to_string(&pid_file).is_ok_and(|s| !s.trim().is_empty())
+    // A cold Windows PowerShell start (assembly loading, Defender scans) on a loaded runner
+    // running the other tests in parallel can take well over the default 10 s, so this step
+    // gets its own budget. If PowerShell ends without reporting (e.g. a script error) the
+    // test fails at once with the session's final screen instead of waiting out the budget.
+    let shell_pid = ns.0.info("k").unwrap().child_pid;
+    let mut polls = 0u32;
+    wait_until_for("grandchild pid", Duration::from_secs(90), || {
+        if std::fs::metadata(&pid_file).is_ok() {
+            return true;
+        }
+        polls += 1;
+        // `tasklist` is slow: check the shell about once a second.
+        if polls.is_multiple_of(50)
+            && !pid_alive(shell_pid)
+            && std::fs::metadata(&pid_file).is_err()
+        {
+            let screen = deck_host::peek(&ns.0, "k", 100)
+                .map(|(_, snap)| String::from_utf8_lossy(&snap).into_owned())
+                .unwrap_or_default();
+            panic!("PowerShell exited without reporting the grandchild pid; screen:\n{screen}");
+        }
+        false
     });
     let grandchild: u32 = std::fs::read_to_string(&pid_file)
         .unwrap()

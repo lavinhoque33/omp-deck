@@ -262,8 +262,14 @@ pub fn screen_text(term: &Term<VoidListener>) -> String {
         .join("\n")
 }
 
-pub fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + WAIT;
+pub fn wait_until(what: &str, f: impl FnMut() -> bool) {
+    wait_until_for(what, WAIT, f);
+}
+
+/// [`wait_until`] with an explicit deadline, for steps whose duration depends on the host
+/// (e.g. a cold PowerShell start on a loaded CI runner).
+pub fn wait_until_for(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
     while !f() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(20));
