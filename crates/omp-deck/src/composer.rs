@@ -65,6 +65,18 @@ pub fn inspect(screen: &ScreenText) -> Composer {
     }
 }
 
+/// The screen rows below the composer — omp's autocomplete popup while it is open, else the status
+/// line and whatever omp draws under the editor — without trailing blank rows; `None` without a
+/// composer. The injector compares them to see the popup open and close.
+pub fn rows_below(screen: &ScreenText) -> Option<Vec<String>> {
+    let last = find(screen)?.rows.last()?.row;
+    let mut rows = screen.lines.get(last + 1..).unwrap_or_default().to_vec();
+    while rows.last().is_some_and(|r| r.trim().is_empty()) {
+        rows.pop();
+    }
+    Some(rows)
+}
+
 /// omp's empty-composer hint is `<key> <label>` (bundle `composer-hints.ts`, captured on 18.12.5 for
 /// `rail` and `band`: `⇧⇥ to change thinking effort`), drawn right-aligned on the cursor row.
 const HINT_LABELS: [&str; 2] = ["to change thinking effort", "to see "];

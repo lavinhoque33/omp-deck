@@ -218,6 +218,7 @@ impl App {
                 .dialog_open
                 .iter()
                 .chain(&poll.aborted)
+                .chain(&poll.stalled)
                 .any(|l| l == MODEL_SWITCH);
             if dropped {
                 tab.pending_switch = None;
@@ -227,7 +228,12 @@ impl App {
                     lost.push((tab.uid, label.clone()));
                 }
             }
-            for label in poll.dialog_open.iter().chain(&poll.aborted) {
+            for label in poll
+                .dialog_open
+                .iter()
+                .chain(&poll.aborted)
+                .chain(&poll.stalled)
+            {
                 if label == FINISH_LABEL || label == MOVE_LABEL {
                     lost.push((tab.uid, label.clone()));
                 }
@@ -246,6 +252,11 @@ impl App {
             for label in poll.aborted.into_iter().filter(|l| l != FINISH_LABEL) {
                 notes.push(format!(
                     "{label} cancelled: omp started working — check the composer"
+                ));
+            }
+            for label in poll.stalled.into_iter().filter(|l| l != FINISH_LABEL) {
+                notes.push(format!(
+                    "{label} cancelled: omp did not show it in time — check the composer"
                 ));
             }
             if let Some(d) = poll.wake_in {

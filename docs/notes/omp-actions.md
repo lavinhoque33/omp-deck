@@ -140,15 +140,20 @@ Harness: python `pty.fork()` → `tmux -L omp-deck-test-act -f docs/notes/tmux.c
 4. **Slash commands mid-stream:** execute immediately, not queued (V: `/plan` toggled, `/switch` and `/rename` applied; `/handoff` printed the "Wait for the current response…" warning; `/compact` aborted the stream (see §1)).
 5. **Bracketed paste of a command works** (V): `ESC[200~/dirs ESC[201~` then `\r` (even in the *same* write `ESC[200~/dirs ESC[201~\r`, V) executes it. A newline *inside* the paste does not submit (V: it stays in the composer). Plain typed bytes `/dirs\r` also work (V). Paste is preferable (no per-char key handling).
 6. **PITFALL – autocomplete popup eats Enter:** typing `/…` opens a popup; when the typed text is a complete command name, Enter ran it (V for `/compact /plan /dirs /fork /new /model /effort /context /jobs /tools /goal`). But for **path arguments** (`/move /tmp/x`, `/add-dir`) the popup lists `proj2/`; the first Enter **applies the completion** (V: composer became `/move /tmp/ompact/proj2/`) and only a 2nd Enter submits (V). A trailing space did not close it (V). Reliable sequence **when idle**: `paste → ~150 ms → Esc (closes popup) → Enter` (V on `/move`, `/dirs`). Don't use Esc when busy (item 2); mid-stream-capable commands (`/switch`, `/effort`, `/rename`, `/plan`) worked with plain `paste + Enter` in tests (V) — `/switch` args can also show a model popup, so prefer §6's hotkey-free fallback: verify afterwards via `state`/title/jsonl.
-7. **Recommended injector (per tab, serialized, ≥300 ms between actions):**
+7. **Injector as built (`crates/omp-deck/src/inject.rs`; per tab, serialized, ≥300 ms between actions).** Every step after
+   the clear waits for omp's screen (OmpDeck's own grid), never a fixed delay:
    ```
-   idle? (title glyph '>' / state.isStreaming==false)   # else refuse or use a mid-stream-safe command
-   if composer may be non-empty: 0x03 ; wait 650 ms      # one C-c only; guard vs. last C-c
-   ESC[200~<command>ESC[201~ ; wait 150 ms
-   (idle only, only if arg is a path/model id) 0x1b ; wait 150 ms
-   0x0d
+   idle? (title glyph '>')                               # else refuse, or run a mid-stream-safe command without Esc
+   composer draft → confirm → 0x03 (guard vs. last C-c); ≥ 650 ms, then until the composer reads empty (≤ 3 s)
+   baseline = rows below the empty composer
+   ESC[200~<command>ESC[201~ ; until the composer shows it (≤ 3 s) and the rows below hold still 150 ms
+   rows below == baseline → 0x0d                          # no popup: no Esc at all
+   else (idle only) Esc ; ≥ 150 ms, then until the rows below change (popup closed; ≤ 2 s, else give up) → 0x0d
    ```
-   Detect "composer non-empty" from OmpDeck's own alacritty grid (last composer row after `╰─`) or just always send the clear.
+   A step omp never shows in time abandons the job without Enter (`Poll::stalled`, toast "… check the composer").
+   Measured (omp 18.12.6 in tmux): the pasted text renders ~230 ms after the paste, the popup ~16 ms later; after Esc
+   the popup closes in ~62 ms. After a Ctrl+C the old popup stays on screen (stale); Enter with that popup open applies
+   the top (exact) completion and submits.
 8. **Overlay already open** (picker/hub): injected text goes to the overlay's search box; Esc closes it. Before injecting, check the grid for a bordered overlay or accept that the button press is ignored.
 9. **Direct hotkeys need no composer handling and work with text in the composer and mid-stream** (V via outer PTY/tmux): `Alt+Shift+P` = `ESC P` (`\x1bP`) toggled plan mode; `Alt+P` = `ESC p` opened the temp model picker; `Alt+A` = `ESC a` opened the hub. (tmux `extended-keys` csi-u mode from tmux.conf didn't interfere; if OmpDeck's encoder emits kitty/CSI-u (`ESC[112;3u` style) form instead, omp's key parser also understands it [UNVERIFIED].) Remember users can remap in `keybindings.json`.
 10. **Keys are injected as key strokes, never raw bytes** (`inject::Write::Key` → `deck_term::Terminal::send_key` →
@@ -161,6 +166,13 @@ Harness: python `pty.fork()` → `tmux -L omp-deck-test-act -f docs/notes/tmux.c
    start of a sequence instead of flushing it, so the old raw `0x1b` … 150 ms … `\r` merged into `ESC \r` = Alt+Enter
    (an edit in omp): `/switch` stayed in the composer and the following `/effort` hit the draft confirm. Raw `ESC P`
    (DCS entry) and Stop's lone `ESC` had the same problem.
+11. **Esc + Enter merge anywhere upstream = Alt+Enter (Linux too, 0.14.0):** omp's `StdinBuffer` (`packages/tui/src/
+   stdin-buffer.ts`, 75 ms escape timeout) reads `ESC` followed by `\r` within 75 ms — or in one read — as Alt+Enter:
+   a newline under the still-open popup, command unsent (the user's screen: `▎ /switch …`, an empty `▎` row, popup).
+   tmux forwards a lone Esc as `\x1b` and keeps the gap, but any stall (tmux server, OmpDeck's PTY thread, ConPTY)
+   delivers the queued bytes together: V with Esc→Enter gaps of 5/30 ms (stuck) vs 100/150 ms (ok), `\x1bO[\r` in one
+   write (stuck), and a SIGSTOP of the test tmux server for 400 ms right at the old timed Esc (stuck). Hence item 7's
+   screen-verified Enter.
 
 ### Idle / busy detection from outside (verified)
 * **Title OSC 0** `π <glyph> <label>`; `label` = session title (or cwd basename). Glyph: `>` idle; braille spinner `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` ~every 100 ms while working (V: `π ⠼ Test Title X`); `!` = attention (source: `v_t()` in terminal-title; not triggered in my tests) [UNVERIFIED trigger]; `:` when reduced-motion. tmux forwards it (`set-titles on`, `#T`), `#{pane_title}` gives it. Style depends on setting `terminalTitle*` (pulse/dots/line variants exist).
