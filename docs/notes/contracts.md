@@ -2193,3 +2193,82 @@ omp-deck (hub):
 - Known, unchanged: an omp started outside OmpDeck that has not written yet holds no lease, so it is neither shown as
   running nor protected from delete (omp's own lease behaviour). Sizes use binary units labelled KB/MB (app-wide).
 - Column widths: `col_alloc::allocate` (pure) sizes fixed columns to their widest cached cell, title gets the rest (min 160), drop order Created → Model → idle RAM → empty Status → …; Size and Cost never dropped. Model shown compact (`compact_model`, full name in tooltip).
+- **Hidden-window fix** (post-0.14.0): notification observation no longer depends on painting. `App::logic` (eframe 0.37,
+  runs on every tick incl. the logic-only ticks while the window is minimized or on another desktop) polls all terminal
+  tabs (`poll_tabs`) and runs `drive_notifications`; `App::ui` does neither. Before: a turn that ended while the window was
+  hidden was first seen on return with the window focused and the tab shown, so `tracker::wanted` dropped (and consumed) it.
+  The focused-and-shown gate itself is unchanged (by design: no inbox entry or pop-up for a tab the user is looking at).
+
+## Wave 20: bell while viewing + settings subpages
+
+### Bell even when the tab is in view (setting, default on)
+- deck-core `NotifyConfig` gains `while_viewing: bool` (default `true`; absent in old configs ⇒ `true`; serialized).
+  Meaning: the in-app inbox (bell) also records events of a tab the user is looking at (window focused **and** tab
+  shown in a pane). Per-event toggles still gate everything. The tab's bell dot is never set for a tab in view. A desktop
+  pop-up for it follows the normal rule `desktop_wanted(cfg, focused)`: default (`only_when_unfocused` on) none; with
+  "Only when OmpDeck is not focused" off it pops up too and is held until its inbox entry goes (look away and back, next
+  turn, dismiss, Clear all).
+- `notify::tracker::wanted(cfg, event, window_focused, visible) = toggle && (cfg.while_viewing || !(window_focused &&
+  visible))`. `app/notifications.rs`: `record_notification` learns whether the tab is being looked at (`looking =
+  focused && visible`): `looking` ⇒ inbox entry only (no `t.bell`, no `notifier.show`); not looking ⇒ as today. The
+  classifier's "only if the user still is not looking" check becomes `!cfg.while_viewing && looking`.
+- Inbox lifetime of an entry recorded while looking (`Entry.armed = false`; entries recorded while not looking are
+  `armed = true`, today's behaviour): it stays while the user keeps looking; each frame `Inbox::sync_viewing(visible,
+  focused)` sets `armed = true` for entries whose tab is not looked at, and removes entries that are looked at **and**
+  armed (i.e. the user looked away and came back) and withdraws their desktop notification as today.
+  `Inbox::turn_started(tab)` removes the tab's entry when it is not armed (the next turn began, the entry is stale);
+  call it when a tab's status becomes Busy. Manual ✕ / click / Clear all / tab close work as before.
+  Unit tests: record-while-looking survives `sync_viewing(looking)`, is removed after a look-away + look-back, and by
+  `turn_started`; armed entries behave exactly as before.
+- Settings → OmpDeck → Notifications: new section caption "Bell" with toggle **"Also when I'm looking at the tab"**,
+  sub "Adds the bell entry even for the tab in view in a focused window. It stays until you look away and back, the
+  next turn starts, or you dismiss it. Desktop pop-ups for it follow "Only when OmpDeck is not focused"." `NotifyAction::WhileViewing(bool)`.
+  Palette command "Notifications: Also when viewing: Turn on/off" next to the existing notify commands.
+- Bell popover (`notify_panel.rs`): a gear icon button (lucide settings icon already used by the title bar, tooltip
+  "Notification settings") in the header, left of "Clear all" ⇒ `PanelAction::Settings`: closes the popover and opens the
+  settings page on OmpDeck → Notifications.
+
+### Settings: OmpDeck is a group of subpages
+- The single long "OmpDeck" page (`settings_page.rs::ompdeck_section`) is split into subpages shown one at a time, each
+  with its own title + one-line subtitle, scroll reset on page change (existing `view_key` mechanism):
+  **General** (Sessions backend + Window), **Appearance** (font size, theme, style gallery, density),
+  **Notifications**, **Updates** (OmpDeck self-update card + omp update card), **Backup** (Google Drive).
+  Left nav: an "OmpDeck" group header with these five items (selected item highlighted like today's nav items), then the
+  existing "Project sync" item, then omp's catalog tabs as today. Replace the `usize` selection encoding by an enum
+  (`OmpDeck(OmpDeckPage)`, `Sync`, `Omp(i)`); `SettingsState::show_ompdeck()` keeps meaning "OmpDeck → General",
+  new `show_ompdeck_page(OmpDeckPage)`. Deep links: bell gear → Notifications; title-bar OmpDeck/omp update badge and
+  any "update" entry → Updates; Google Drive entry points (palette/menus/toasts) → Backup; palette gains one
+  "Settings: <page>" command per subpage. Searching omp settings behaves as today.
+- Nothing else about settings content changes (labels, actions, `SettingsAction`s stay).
+
+### Acceptance
+- Unit: tracker `wanted` table incl. `while_viewing`; inbox semantics above; deck-core: old config without the field
+  loads `while_viewing == true` and round-trips.
+- Smoke (fake-omp harness `~/.cache/nf`, X11 + openbox is enough): focused window + shown tab, turn ends ⇒ badge `1`,
+  no desktop Notify; staying in the tab keeps it; switching to another tab and back (or defocus/refocus) removes it;
+  next turn starting removes it; setting off ⇒ previous behaviour (no entry). Bell gear opens Settings → Notifications.
+  Screenshots of every settings subpage; each shows only its own cards.
+
+### Wave 20 as built
+- Settings: selection is `Entry { OmpDeck(OmpDeckPage), Sync, Omp(i) }`; `OmpDeckPage` = General, Appearance, Notifications,
+  Updates, Backup (label, subtitle, icon, palette slug). `SettingsState::show_ompdeck_page(page)` replaces `show_ompdeck()`;
+  `App::open_settings_page(page)` focuses the Settings tab on a page. `view_key` = `Option<(Option<Entry>, String)>`
+  (`None` while searching). Palette: `settings.ompdeck.<slug>` ("Settings: OmpDeck — <page>") and `notify.while_viewing`.
+  No update/Drive entry point opened Settings before (badges are popovers, Drive commands act directly), so only the bell
+  gear and the palette navigate to a subpage.
+- Bell: `Entry.armed` (`false` via `Entry::while_looking()`), `Inbox::sync_viewing(visible, focused)` per frame (replaces
+  `remove_viewed`; window defocus counts as looking away), `Inbox::turn_started(tab)` on the Idle→Busy transition
+  (`Tracker::is_busy`), `record_notification(uid, kind, looking)`: looking ⇒ inbox only (no bell dot, no pop-up);
+  `PanelAction::Settings` = gear in the popover header. Smoke (X11 + openbox + fake omp + private D-Bus): focused+shown turn
+  end ⇒ badge 1 and no Notify; stays while looking; removed after switching tab and back or when the next turn starts;
+  toggle off ⇒ old behaviour.
+
+### Wave 20b: pop-up for the tab in view
+- `record_notification(uid, kind, looking)`: `looking` ⇒ inbox entry (no bell dot) and a desktop pop-up exactly when
+  `desktop_wanted(cfg, focused)` (i.e. only with "Only when OmpDeck is not focused" off). `Tracker.held` = pop-ups sent
+  while looking; `take_seen` skips them, so looking does not withdraw them. Any inbox removal through
+  `Inbox::sync_viewing` (returns the removed tabs) or `turn_started` also closes the tab's notification and calls
+  `tracker.gone`, so entry and pop-up go together. Smoke (X11 + openbox, fake notification server): only_when_unfocused
+  off ⇒ Notify, no Close while looking, `CLOSE` after switching tab and back and when the next turn starts; defaults ⇒ no
+  Notify; unfocused window ⇒ Notify; Desktop pop-ups off ⇒ none. Not driven: dismissing a held pop-up from the bell panel
+  (same `close` + `gone` path as before).

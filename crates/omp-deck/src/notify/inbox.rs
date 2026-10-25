@@ -1,6 +1,7 @@
 //! The notification inbox: what happened in tabs the user was not looking at. One entry per tab
 //! (a newer event replaces it and moves it to the top); entries leave when the tab is viewed or
-//! closed, by their own ✕ or by "Clear all". Not persisted.
+//! closed, by their own ✕ or by "Clear all" (one recorded while looking leaves later, see
+//! [`Entry::armed`]). Not persisted.
 
 use std::collections::HashSet;
 use std::time::SystemTime;
@@ -49,6 +50,9 @@ pub struct Entry {
     /// [`Kind::what`], plus omp's error message on a second line.
     pub body: String,
     pub at: SystemTime,
+    /// False for an entry recorded while the user looked at the tab: it stays until they look
+    /// away (which arms it) and back, or the next turn starts.
+    pub armed: bool,
 }
 
 impl Entry {
@@ -67,7 +71,14 @@ impl Entry {
             project: project.to_owned(),
             body,
             at,
+            armed: true,
         }
+    }
+
+    /// Marks the entry as recorded while the user was looking at the tab.
+    pub fn while_looking(mut self) -> Entry {
+        self.armed = false;
+        self
     }
 }
 
@@ -95,11 +106,33 @@ impl Inbox {
         self.entries.len() != before
     }
 
-    /// The user looks at these tabs now.
-    pub fn remove_viewed(&mut self, visible: &[u64]) {
-        if !visible.is_empty() {
-            self.entries.retain(|e| !visible.contains(&e.tab));
+    /// Per frame: entries of tabs the user does not look at become armed; armed entries of tabs
+    /// the user looks at now (window focused, tab in `visible`) are removed. Returns the tabs
+    /// whose entry went.
+    pub fn sync_viewing(&mut self, visible: &[u64], window_focused: bool) -> Vec<u64> {
+        for e in &mut self.entries {
+            if !(window_focused && visible.contains(&e.tab)) {
+                e.armed = true;
+            }
         }
+        let mut removed = Vec::new();
+        if window_focused && !visible.is_empty() {
+            self.entries.retain(|e| {
+                let go = e.armed && visible.contains(&e.tab);
+                if go {
+                    removed.push(e.tab);
+                }
+                !go
+            });
+        }
+        removed
+    }
+
+    /// The tab's next turn began: its entry recorded while looking is stale. Whether it went.
+    pub fn turn_started(&mut self, tab: u64) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.tab != tab || e.armed);
+        self.entries.len() != before
     }
 
     /// Forgets the entries of tabs that no longer exist.
@@ -150,7 +183,7 @@ mod tests {
         for t in 1..=5 {
             i.record(entry(t, Kind::Finished));
         }
-        i.remove_viewed(&[2, 9]);
+        i.sync_viewing(&[2, 9], true);
         assert_eq!(i.entries().len(), 4);
         i.retain_live(&[1, 3, 4].into_iter().collect());
         assert_eq!(i.entries().len(), 3);
@@ -158,6 +191,65 @@ mod tests {
         assert!(!i.remove(3));
         i.clear();
         assert!(i.entries().is_empty());
+    }
+
+    #[test]
+    fn an_entry_recorded_while_looking_stays_until_the_user_looks_away_and_back() {
+        let mut i = Inbox::default();
+        i.record(entry(1, Kind::Finished).while_looking());
+        i.record(entry(2, Kind::Finished));
+        i.sync_viewing(&[1, 2], true);
+        assert_eq!(i.entries().len(), 1, "the armed entry of a viewed tab goes");
+        assert_eq!(
+            i.entries()[0].tab,
+            1,
+            "the one recorded while looking stays"
+        );
+        i.sync_viewing(&[1], true);
+        assert_eq!(i.entries().len(), 1, "still looking");
+        i.sync_viewing(&[2], true);
+        assert_eq!(
+            i.entries().len(),
+            1,
+            "tab 1 is out of view: armed, not removed yet"
+        );
+        i.sync_viewing(&[1], true);
+        assert!(i.entries().is_empty(), "looked away and back");
+    }
+
+    #[test]
+    fn losing_window_focus_counts_as_looking_away() {
+        let mut i = Inbox::default();
+        i.record(entry(1, Kind::Finished).while_looking());
+        i.sync_viewing(&[1], false);
+        assert_eq!(i.entries().len(), 1);
+        i.sync_viewing(&[1], true);
+        assert!(i.entries().is_empty());
+    }
+
+    #[test]
+    fn sync_viewing_reports_the_tabs_whose_entry_went() {
+        let mut i = Inbox::default();
+        i.record(entry(1, Kind::Finished).while_looking());
+        i.record(entry(2, Kind::Finished));
+        assert_eq!(i.sync_viewing(&[1, 2], true), vec![2]);
+        assert!(i.sync_viewing(&[1], true).is_empty(), "still looking");
+        assert!(
+            i.sync_viewing(&[2], true).is_empty(),
+            "armed by looking away"
+        );
+        assert_eq!(i.sync_viewing(&[1], true), vec![1]);
+    }
+
+    #[test]
+    fn the_next_turn_removes_only_an_entry_recorded_while_looking() {
+        let mut i = Inbox::default();
+        i.record(entry(1, Kind::Finished).while_looking());
+        i.record(entry(2, Kind::Finished));
+        assert!(i.turn_started(1));
+        assert!(!i.turn_started(1));
+        assert!(!i.turn_started(2), "an armed entry is kept");
+        assert_eq!(i.entries().len(), 1);
     }
 
     #[test]

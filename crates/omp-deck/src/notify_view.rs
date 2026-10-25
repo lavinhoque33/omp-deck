@@ -14,6 +14,7 @@ pub enum NotifyAction {
     Attention(bool),
     Exited(bool),
     OnlyWhenUnfocused(bool),
+    WhileViewing(bool),
     /// Show a notification now.
     Test,
 }
@@ -73,6 +74,16 @@ pub fn card_ui(ui: &mut Ui, input: &NotifyInput<'_>) -> Vec<NotifyAction> {
             NotifyAction::Exited,
         );
         ui.add_space(10.0);
+        ui.label(theme::section_caption("Bell", pal.weak));
+        ui.add_space(4.0);
+        row(
+            ui,
+            "Also when I'm looking at the tab",
+            "Adds the bell entry for the tab in view in a focused window. It stays until you look away and back, the next turn starts, or you dismiss it. Its desktop pop-up follows \"Only when OmpDeck is not focused\".",
+            cfg.while_viewing,
+            NotifyAction::WhileViewing,
+        );
+        ui.add_space(10.0);
         ui.label(theme::section_caption("Desktop pop-ups", pal.weak));
         ui.add_space(4.0);
         row(
@@ -87,7 +98,7 @@ pub fn card_ui(ui: &mut Ui, input: &NotifyInput<'_>) -> Vec<NotifyAction> {
             row(
                 ui,
                 "Only when OmpDeck is not focused",
-                "Off: background tabs also pop up while the window has focus",
+                "Off: tabs also pop up while the window has focus, including the tab you are looking at",
                 cfg.only_when_unfocused,
                 NotifyAction::OnlyWhenUnfocused,
             );

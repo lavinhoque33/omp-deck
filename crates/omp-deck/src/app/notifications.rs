@@ -14,11 +14,12 @@ use crate::notify::tracker::{self, Event, Sighting, Ticket, Tracker};
 use crate::notify::{Notifier, Request, Signal};
 use crate::notify_panel::{self, PanelAction};
 use crate::notify_view::NotifyAction;
+use crate::settings_page::OmpDeckPage;
 use crate::statusfmt::Activity;
 use crate::tabs::{Tab, TabRole, TabStatus};
 
-/// While a tab is busy the app repaints at least this often, so the end of its turn is seen even
-/// when the window is in the background.
+/// While a tab is busy the app ticks at least this often (`App::logic` keeps running while the
+/// window is hidden), so the end of its turn is seen even when no frame is painted.
 const BUSY_WATCH: Duration = Duration::from_secs(1);
 
 pub(super) struct NotifyUi {
@@ -58,8 +59,8 @@ impl NotifyUi {
 }
 
 impl App {
-    /// Per frame: watch the tabs, send due notifications, withdraw the ones the user caught up on,
-    /// and act on clicks.
+    /// Per tick (from `App::logic`, so also while the window is minimized or on another
+    /// desktop): watch the tabs, send due notifications, withdraw the ones the user caught up on,
     pub(super) fn drive_notifications(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if !self.notify.window_attached {
             self.notify.window_attached = true;
@@ -83,8 +84,16 @@ impl App {
                 exit_code: code,
                 visible: visible.contains(&t.uid),
             };
+            let was_busy = self.notify.tracker.is_busy(t.uid);
             if let Some(event) = self.notify.tracker.observe(t.uid, now, seen, focused, cfg) {
                 fired.push((t.uid, event));
+            }
+            if !was_busy
+                && self.notify.tracker.is_busy(t.uid)
+                && self.notify.inbox.turn_started(t.uid)
+            {
+                self.notify.notifier.close(Some(t.uid));
+                self.notify.tracker.gone(t.uid);
             }
         }
         for uid in self.notify.tracker.retain(&live) {
@@ -92,11 +101,12 @@ impl App {
         }
         self.notify.inbox.retain_live(&live);
         for (uid, event) in fired {
+            let looking = focused && visible.contains(&uid);
             match event {
                 Event::TurnFinished => self.classify_finished_turn(uid),
-                Event::Attention => self.record_notification(uid, Kind::Attention, focused),
+                Event::Attention => self.record_notification(uid, Kind::Attention, looking),
                 Event::Exited { code } => {
-                    self.record_notification(uid, Kind::Exited { code }, focused);
+                    self.record_notification(uid, Kind::Exited { code }, looking);
                 }
             }
         }
@@ -110,17 +120,19 @@ impl App {
                 .find_map(|t| t.term().filter(|t| t.uid == uid))
                 .map(|t| t.session_path.as_deref());
             let current = session.is_some_and(|s| self.notify.tracker.is_current(&done.ticket, s));
-            // And only if the user still is not looking at the tab.
-            let viewed = focused && visible.contains(&uid);
+            // And only if the user still is not looking at the tab (unless the bell also wants
+            // the tab in view).
+            let looking = focused && visible.contains(&uid);
             if let Some(kind) = done.kind
                 && current
-                && !viewed
+                && !(looking && !self.cfg.notify.while_viewing)
             {
-                self.record_notification(uid, kind, focused);
+                self.record_notification(uid, kind, looking);
             }
         }
-        if focused {
-            self.notify.inbox.remove_viewed(&visible);
+        for uid in self.notify.inbox.sync_viewing(&visible, focused) {
+            self.notify.notifier.close(Some(uid));
+            self.notify.tracker.gone(uid);
         }
         for uid in self.notify.tracker.take_seen(&visible, focused) {
             self.notify.notifier.close(Some(uid));
@@ -161,14 +173,19 @@ impl App {
             });
         if let Err(e) = spawned {
             log::warn!("cannot start the turn classifier: {e}");
-            let focused = self.ctx.input(|i| i.viewport().focused.unwrap_or(true));
-            self.record_notification(uid, Kind::Finished, focused);
+            let visible = self.visible_uids();
+            let looking =
+                self.ctx.input(|i| i.viewport().focused.unwrap_or(true)) && visible.contains(&uid);
+            self.record_notification(uid, Kind::Finished, looking);
         }
     }
 
-    /// Puts the event in the inbox, sets the bell marker for turn ends, and shows a desktop
-    /// pop-up when the settings and the window's focus allow it.
-    fn record_notification(&mut self, uid: u64, kind: Kind, focused: bool) {
+    /// Puts the event in the inbox and sets the bell marker for turn ends of a tab the user is not
+    /// looking at (`looking`: window focused and the tab shown). A desktop pop-up follows
+    /// [`tracker::desktop_wanted`], also for a tab in view; that one stays with its inbox entry.
+    /// Whether the inbox entry is recorded at all for a tab in view is decided by the caller
+    /// (`while_viewing`).
+    fn record_notification(&mut self, uid: u64, kind: Kind, looking: bool) {
         let Some(tab) = self.tabs.iter_mut().find(|t| t.uid() == Some(uid)) else {
             return;
         };
@@ -180,15 +197,19 @@ impl App {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_owned();
-        if matches!(kind, Kind::Finished | Kind::Error(_)) {
+        if !looking && matches!(kind, Kind::Finished | Kind::Error(_)) {
             t.bell = true;
         }
         let (pop_title, body) = tracker::describe(&kind, &title, &project);
-        self.notify
-            .inbox
-            .record(Entry::new(uid, kind, &title, &project, SystemTime::now()));
+        let entry = Entry::new(uid, kind, &title, &project, SystemTime::now());
+        self.notify.inbox.record(if looking {
+            entry.while_looking()
+        } else {
+            entry
+        });
+        let focused = self.ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if tracker::desktop_wanted(&self.cfg.notify, focused) {
-            self.notify.tracker.shown(uid);
+            self.notify.tracker.shown(uid, looking);
             self.notify.notifier.show(Request {
                 tab: Some(uid),
                 title: pop_title,
@@ -264,6 +285,7 @@ impl App {
             NotifyAction::Attention(v) => cfg.attention = v,
             NotifyAction::Exited(v) => cfg.exited = v,
             NotifyAction::OnlyWhenUnfocused(v) => cfg.only_when_unfocused = v,
+            NotifyAction::WhileViewing(v) => cfg.while_viewing = v,
             NotifyAction::Test => {
                 self.send_test_notification();
                 return;
@@ -288,6 +310,9 @@ impl App {
                 self.notify.inbox.remove(uid);
                 self.notify.notifier.close(Some(uid));
                 self.notify.tracker.gone(uid);
+            }
+            PanelAction::Settings => {
+                self.open_settings_page(OmpDeckPage::Notifications);
             }
             PanelAction::ClearAll => {
                 let tabs: Vec<u64> = self.notify.inbox.entries().iter().map(|e| e.tab).collect();

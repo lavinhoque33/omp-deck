@@ -17,6 +17,7 @@ use crate::model_picker;
 use crate::notify_view::NotifyAction;
 use crate::palette::{Item, Mode, Outcome, PaletteState, Target};
 use crate::session_actions::{self, Action, ActionCtx, Availability, CompactMode, Kind};
+use crate::settings_page::OmpDeckPage;
 use crate::sidebar::{DriveMenu, SidebarAction, resume_command};
 use crate::sync_view::SyncAction;
 use crate::tabs::{self, Tab, TabRole};
@@ -786,13 +787,15 @@ impl App {
             ICON_SETTINGS,
             None,
         );
-        add(
-            "settings.ompdeck",
-            "Settings: OmpDeck",
-            None,
-            ICON_SLIDERS_HORIZONTAL,
-            None,
-        );
+        for page in OmpDeckPage::ALL {
+            add(
+                &format!("settings.ompdeck.{}", page.slug()),
+                &format!("Settings: OmpDeck — {}", page.label()),
+                None,
+                page.icon(),
+                None,
+            );
+        }
         add("settings.sync", "Settings: Sync", None, ICON_CLOUD, None);
         for (id, label) in self.settings.omp_pages() {
             add(
@@ -1007,6 +1010,20 @@ impl App {
             None,
             ICON_BELL,
             need(n.desktop, "Desktop pop-ups are off"),
+        );
+        add(
+            "notify.while_viewing",
+            &format!(
+                "Notifications: Also when viewing: {}",
+                if n.while_viewing {
+                    "Turn off"
+                } else {
+                    "Turn on"
+                }
+            ),
+            None,
+            ICON_BELL,
+            None,
         );
         add(
             "notify.test",
@@ -1236,13 +1253,17 @@ impl App {
             "view.changes" => self.toggle_changes_panel(),
             "view.switcher" => self.open_palette(Mode::Switcher),
             "app.settings" => self.open_settings(),
-            "settings.ompdeck" => {
-                self.open_settings();
-                self.settings.show_ompdeck();
-            }
             "settings.sync" => {
                 self.open_settings();
                 self.settings.show_sync();
+            }
+            id if id.starts_with("settings.ompdeck.") => {
+                if let Some(page) = OmpDeckPage::ALL
+                    .into_iter()
+                    .find(|p| id == format!("settings.ompdeck.{}", p.slug()))
+                {
+                    self.open_settings_page(page);
+                }
             }
             "font.larger" => self.set_font_size(self.cfg.font_size + 1.0),
             "font.smaller" => self.set_font_size(self.cfg.font_size - 1.0),
@@ -1285,6 +1306,9 @@ impl App {
             "notify.unfocused" => self.apply_notify_action(NotifyAction::OnlyWhenUnfocused(
                 !self.cfg.notify.only_when_unfocused,
             )),
+            "notify.while_viewing" => {
+                self.apply_notify_action(NotifyAction::WhileViewing(!self.cfg.notify.while_viewing))
+            }
             "notify.test" => self.send_test_notification(),
             "drive.backup_now" => self.apply_drive_action(DriveAction::BackupNow),
             "drive.restore" => self.apply_drive_action(DriveAction::OpenRestore),

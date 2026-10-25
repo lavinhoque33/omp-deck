@@ -10,12 +10,13 @@ use egui::{
 };
 
 use crate::icons::{
-    ICON_BELL, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_POWER, ICON_X, Icon,
+    ICON_BELL, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_POWER, ICON_SETTINGS,
+    ICON_X, Icon,
 };
 use crate::notify::inbox::{Entry, Kind};
 use crate::sidebar::format_age;
 use crate::theme::{self, Palette};
-use crate::widgets::{icon_text, paint_icon};
+use crate::widgets::{icon_button, icon_text, paint_icon};
 
 const BELL_ID: &str = "notify-bell";
 /// Popover width.
@@ -33,6 +34,8 @@ pub enum PanelAction {
     /// Activate the tab, raise the window, drop the entry.
     Open(u64),
     Dismiss(u64),
+    /// Close the popover and open Settings → OmpDeck → Notifications.
+    Settings,
     ClearAll,
 }
 
@@ -139,6 +142,10 @@ fn popover(ui: &mut Ui, input: &PanelInput<'_>) -> Option<PanelAction> {
             );
             if clear.clicked() {
                 action = Some(PanelAction::ClearAll);
+            }
+            if icon_button(ui, ICON_SETTINGS, "Notification settings", false).clicked() {
+                action = Some(PanelAction::Settings);
+                ui.close();
             }
         });
     });

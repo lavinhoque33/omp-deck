@@ -4,11 +4,11 @@
 
 use crate::icons::Icon;
 use crate::icons::{
-    ICON_BRAIN, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CLOUD, ICON_CPU, ICON_FOLD_VERTICAL,
-    ICON_FOLDER, ICON_KEYBOARD, ICON_LIST_CHECKS, ICON_LIST_TREE, ICON_MOON, ICON_NEWSPAPER,
-    ICON_PALETTE, ICON_REFRESH_CW, ICON_SEARCH, ICON_SEARCH_X, ICON_SETTINGS_2,
-    ICON_SLIDERS_HORIZONTAL, ICON_SPARKLES, ICON_SUN, ICON_TERMINAL, ICON_TRIANGLE_ALERT,
-    ICON_WRENCH,
+    ICON_BELL, ICON_BRAIN, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CIRCLE_ARROW_UP,
+    ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_CPU, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_KEYBOARD,
+    ICON_LIST_CHECKS, ICON_LIST_TREE, ICON_MOON, ICON_NEWSPAPER, ICON_PALETTE, ICON_REFRESH_CW,
+    ICON_SEARCH, ICON_SEARCH_X, ICON_SETTINGS_2, ICON_SLIDERS_HORIZONTAL, ICON_SPARKLES, ICON_SUN,
+    ICON_TERMINAL, ICON_TRIANGLE_ALERT, ICON_WRENCH,
 };
 use deck_core::config::{Density, Theme, UiStyle};
 use deck_core::mux::BackendChoice;
@@ -33,11 +33,81 @@ use crate::widgets::{
     card, empty_state, icon_button, icon_text, paint_icon, segmented, setting_row, toggle,
 };
 
-/// Nav entry for OmpDeck's own preferences.
-const OMPDECK_ENTRY: usize = 0;
-/// Nav entry for project sync (right under OmpDeck); omp's catalog tabs follow at `2 + i`.
-const SYNC_ENTRY: usize = 1;
-const OMP_TABS_FROM: usize = 2;
+/// One page of the settings area: an OmpDeck subpage, project sync, or omp's catalog tab `i`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Entry {
+    OmpDeck(OmpDeckPage),
+    Sync,
+    Omp(usize),
+}
+
+impl Default for Entry {
+    fn default() -> Self {
+        Self::OmpDeck(OmpDeckPage::General)
+    }
+}
+
+/// The subpages of Settings → OmpDeck, in nav order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OmpDeckPage {
+    General,
+    Appearance,
+    Notifications,
+    Updates,
+    Backup,
+}
+
+impl OmpDeckPage {
+    pub const ALL: [Self; 5] = [
+        Self::General,
+        Self::Appearance,
+        Self::Notifications,
+        Self::Updates,
+        Self::Backup,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Appearance => "Appearance",
+            Self::Notifications => "Notifications",
+            Self::Updates => "Updates",
+            Self::Backup => "Backup",
+        }
+    }
+
+    /// Stable id part of the palette command.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Appearance => "appearance",
+            Self::Notifications => "notifications",
+            Self::Updates => "updates",
+            Self::Backup => "backup",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Self::General => "Where sessions run and how the window behaves",
+            Self::Appearance => "Font size, theme, style and density of this app",
+            Self::Notifications => "What the bell and desktop pop-ups tell you about your sessions",
+            Self::Updates => "Keep OmpDeck and omp up to date",
+            Self::Backup => "Back up your omp configuration to Google Drive",
+        }
+    }
+
+    pub fn icon(self) -> Icon {
+        match self {
+            Self::General => ICON_SLIDERS_HORIZONTAL,
+            Self::Appearance => ICON_PALETTE,
+            Self::Notifications => ICON_BELL,
+            Self::Updates => ICON_CIRCLE_ARROW_UP,
+            Self::Backup => ICON_CLOUD_UPLOAD,
+        }
+    }
+}
+
 const CONTENT_MAX_W: f32 = 760.0;
 
 enum Modal {
@@ -59,10 +129,9 @@ struct OmpPane {
 
 #[derive(Default)]
 pub struct SettingsState {
-    /// 0 = OmpDeck, 1 = Sync, `2 + i` = omp tab `i`.
-    selected: usize,
-    /// (selected category or search marker, search query) last shown; used to reset scroll.
-    view_key: Option<(usize, String)>,
+    selected: Entry,
+    /// (selected page or `None` while searching, search query) last shown; used to reset scroll.
+    view_key: Option<(Option<Entry>, String)>,
     omp: OmpPane,
 }
 
@@ -81,15 +150,15 @@ impl SettingsState {
         }
     }
 
-    /// Show OmpDeck's own preferences page.
-    pub fn show_ompdeck(&mut self) {
-        self.selected = OMPDECK_ENTRY;
+    /// Show one OmpDeck subpage.
+    pub fn show_ompdeck_page(&mut self, page: OmpDeckPage) {
+        self.selected = Entry::OmpDeck(page);
         self.omp.query.clear();
     }
 
     /// Show the project sync page.
     pub fn show_sync(&mut self) {
-        self.selected = SYNC_ENTRY;
+        self.selected = Entry::Sync;
         self.omp.query.clear();
     }
 
@@ -113,7 +182,7 @@ impl SettingsState {
         else {
             return false;
         };
-        self.selected = OMP_TABS_FROM + i;
+        self.selected = Entry::Omp(i);
         self.omp.query.clear();
         true
     }
@@ -254,9 +323,9 @@ pub fn show(
                 }
                 // Scroll resets to the top whenever the category or the search query changes.
                 let view_key = if searching {
-                    (usize::MAX, state.omp.query.trim().to_owned())
+                    (None, state.omp.query.trim().to_owned())
                 } else {
-                    (state.selected, String::new())
+                    (Some(state.selected), String::new())
                 };
                 let mut scroll = egui::ScrollArea::vertical()
                     .id_salt("settings-content")
@@ -269,19 +338,19 @@ pub fn show(
                     ui.set_max_width(ui.available_width().min(CONTENT_MAX_W));
                     if searching {
                         omp_view(ui, &mut state.omp, View::Search, &mut actions);
-                    } else if state.selected == OMPDECK_ENTRY {
-                        ompdeck_section(ui, input, &mut actions);
-                    } else if state.selected == SYNC_ENTRY {
-                        actions.extend(
-                            sync_view::page(ui, &input.sync)
-                                .into_iter()
-                                .map(SettingsAction::Sync),
-                        );
-                    } else if !input.omp_found {
-                        not_found_card(ui, &mut actions);
                     } else {
-                        let tab = state.selected - OMP_TABS_FROM;
-                        omp_view(ui, &mut state.omp, View::Tab(tab), &mut actions);
+                        match state.selected {
+                            Entry::OmpDeck(page) => ompdeck_page(ui, page, input, &mut actions),
+                            Entry::Sync => actions.extend(
+                                sync_view::page(ui, &input.sync)
+                                    .into_iter()
+                                    .map(SettingsAction::Sync),
+                            ),
+                            Entry::Omp(_) if !input.omp_found => not_found_card(ui, &mut actions),
+                            Entry::Omp(tab) => {
+                                omp_view(ui, &mut state.omp, View::Tab(tab), &mut actions);
+                            }
+                        }
                     }
                 });
             });
@@ -302,29 +371,32 @@ fn ensure_hits(pane: &mut OmpPane) {
 
 fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, searching: bool) {
     let pal = Palette::of_ui(ui);
-    if nav_item(
-        ui,
-        ICON_SLIDERS_HORIZONTAL,
-        "OmpDeck",
-        state.selected == OMPDECK_ENTRY && !searching,
-        None,
-    )
-    .clicked()
-    {
-        state.selected = OMPDECK_ENTRY;
-        state.omp.query.clear();
+    ui.label(theme::section_caption("OmpDeck", pal.weak));
+    ui.add_space(4.0);
+    for page in OmpDeckPage::ALL {
+        if nav_item(
+            ui,
+            page.icon(),
+            page.label(),
+            state.selected == Entry::OmpDeck(page) && !searching,
+            None,
+        )
+        .clicked()
+        {
+            state.show_ompdeck_page(page);
+        }
     }
+    ui.add_space(8.0);
     if nav_item(
         ui,
         ICON_CLOUD,
         "Sync",
-        state.selected == SYNC_ENTRY && !searching,
+        state.selected == Entry::Sync && !searching,
         None,
     )
     .clicked()
     {
-        state.selected = SYNC_ENTRY;
-        state.omp.query.clear();
+        state.show_sync();
     }
     ui.add_space(12.0);
     ui.label(theme::section_caption("omp", pal.weak));
@@ -340,7 +412,7 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
                     }
                     None => Some((tab.rows.len().to_string(), false)),
                 };
-                let selected = !searching && state.selected == i + OMP_TABS_FROM;
+                let selected = !searching && state.selected == Entry::Omp(i);
                 if nav_item(
                     ui,
                     tab_icon(&tab.id),
@@ -350,7 +422,7 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
                 )
                 .clicked()
                 {
-                    state.selected = i + OMP_TABS_FROM;
+                    state.selected = Entry::Omp(i);
                     state.omp.query.clear();
                 }
             }
@@ -370,12 +442,12 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
                 ui,
                 icon,
                 label,
-                state.selected >= OMP_TABS_FROM && !searching,
+                matches!(state.selected, Entry::Omp(_)) && !searching,
                 None,
             )
             .clicked()
             {
-                state.selected = OMP_TABS_FROM;
+                state.selected = Entry::Omp(0);
                 state.omp.query.clear();
             }
         }
@@ -734,15 +806,36 @@ fn load_error_card(ui: &mut Ui, err: &str, actions: &mut Vec<SettingsAction>, lo
 
 // ------------------------------------------------------------------ OmpDeck's own preferences
 
-fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<SettingsAction>) {
+/// One OmpDeck subpage: its title and one-line subtitle, then only its own cards.
+fn ompdeck_page(
+    ui: &mut Ui,
+    page: OmpDeckPage,
+    input: &SettingsInput<'_>,
+    actions: &mut Vec<SettingsAction>,
+) {
     let pal = Palette::of_ui(ui);
-    ui.label(theme::strong("OmpDeck").size(22.0).color(pal.text_strong));
     ui.label(
-        RichText::new("Appearance, window behaviour, updates and backups of this app")
-            .color(pal.weak),
+        theme::strong(page.label())
+            .size(22.0)
+            .color(pal.text_strong),
     );
+    ui.label(RichText::new(page.subtitle()).color(pal.weak));
     ui.add_space(16.0);
+    match page {
+        OmpDeckPage::General => general_cards(ui, input, actions),
+        OmpDeckPage::Appearance => appearance_cards(ui, input, actions),
+        OmpDeckPage::Notifications => actions.extend(
+            notify_view::card_ui(ui, &input.notify)
+                .into_iter()
+                .map(SettingsAction::Notify),
+        ),
+        OmpDeckPage::Updates => updates_cards(ui, input, actions),
+        OmpDeckPage::Backup => backup_card(ui, input, actions),
+    }
+}
 
+fn appearance_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<SettingsAction>) {
+    let pal = Palette::of_ui(ui);
     card(ui, "Appearance", |ui| {
         setting_row(
             ui,
@@ -822,7 +915,10 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
             },
         );
     });
+}
 
+fn general_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<SettingsAction>) {
+    let pal = Palette::of_ui(ui);
     card(ui, "Sessions", |ui| {
         if cfg!(windows) {
             setting_row(
@@ -888,12 +984,10 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
             },
         );
     });
+}
 
-    actions.extend(
-        notify_view::card_ui(ui, &input.notify)
-            .into_iter()
-            .map(SettingsAction::Notify),
-    );
+fn updates_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<SettingsAction>) {
+    let pal = Palette::of_ui(ui);
     actions.extend(
         crate::app_update::settings_card(ui, &input.app_update)
             .into_iter()
@@ -937,7 +1031,9 @@ fn ompdeck_section(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Set
             }
         });
     });
+}
 
+fn backup_card(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<SettingsAction>) {
     card(ui, "Google Drive backup", |ui| {
         actions.extend(
             drive_view::card(ui, &input.drive)

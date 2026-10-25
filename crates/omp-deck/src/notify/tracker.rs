@@ -76,17 +76,20 @@ pub struct Tracker {
     tabs: HashMap<u64, Memory>,
     /// Tabs with a notification still on screen.
     shown: HashSet<u64>,
+    /// Of those, the ones sent while the user looked at the tab: [`Tracker::take_seen`] leaves
+    /// them alone, their inbox entry's removal withdraws them (see `Inbox::sync_viewing`).
+    held: HashSet<u64>,
 }
 
-/// Whether `event` belongs in the inbox: its toggle is on and the user is not already looking at
-/// the tab (window focused and the tab shown in a pane).
+/// Whether `event` belongs in the inbox: its toggle is on and either the user may be told while
+/// looking at the tab (`while_viewing`) or is not looking (window focused, tab shown in a pane).
 pub fn wanted(cfg: &NotifyConfig, event: Event, window_focused: bool, visible: bool) -> bool {
     let toggle = match event {
         Event::TurnFinished => cfg.turn_finished,
         Event::Attention => cfg.attention,
         Event::Exited { .. } => cfg.exited,
     };
-    toggle && !(window_focused && visible)
+    toggle && (cfg.while_viewing || !(window_focused && visible))
 }
 
 /// Whether a recorded event also gets a desktop pop-up.
@@ -141,14 +144,26 @@ impl Tracker {
         event.filter(|e| wanted(cfg, *e, window_focused, seen.visible))
     }
 
-    /// A notification for `uid` was sent.
-    pub fn shown(&mut self, uid: u64) {
+    /// Whether the tab was last seen busy (a turn is running).
+    pub fn is_busy(&self, uid: u64) -> bool {
+        self.tabs.get(&uid).is_some_and(|m| m.kind == Kind::Busy)
+    }
+
+    /// A notification for `uid` was sent; `while_looking` when the user was looking at the tab,
+    /// which keeps it up until it is withdrawn with the tab's inbox entry.
+    pub fn shown(&mut self, uid: u64, while_looking: bool) {
         self.shown.insert(uid);
+        if while_looking {
+            self.held.insert(uid);
+        } else {
+            self.held.remove(&uid);
+        }
     }
 
     /// The notification for `uid` is gone (dismissed, expired, clicked).
     pub fn gone(&mut self, uid: u64) {
         self.shown.remove(&uid);
+        self.held.remove(&uid);
     }
 
     /// How long the busy stretch lasted that `uid`'s latest busy → other transition ended.
@@ -178,7 +193,7 @@ impl Tracker {
     }
 
     /// The tab whose notification should be withdrawn now: the user looks at it (window focused,
-    /// tabs shown in a pane).
+    /// tabs shown in a pane). Notifications sent while looking are not taken.
     pub fn take_seen(&mut self, visible: &[u64], window_focused: bool) -> Vec<u64> {
         if !window_focused {
             return Vec::new();
@@ -186,7 +201,7 @@ impl Tracker {
         visible
             .iter()
             .copied()
-            .filter(|uid| self.shown.remove(uid))
+            .filter(|uid| !self.held.contains(uid) && self.shown.remove(uid))
             .collect()
     }
 
@@ -201,6 +216,7 @@ impl Tracker {
             .collect();
         for u in &stale {
             self.shown.remove(u);
+            self.held.remove(u);
         }
         stale
     }
@@ -425,7 +441,10 @@ mod tests {
 
     #[test]
     fn the_inbox_records_everything_the_user_is_not_looking_at() {
-        let cfg = NotifyConfig::default();
+        let cfg = NotifyConfig {
+            while_viewing: false,
+            ..NotifyConfig::default()
+        };
         assert!(cfg.only_when_unfocused);
         assert_eq!(
             run(IDLE, 10, true, false, &cfg),
@@ -442,6 +461,23 @@ mod tests {
             Some(Event::TurnFinished),
             "window away, shown tab"
         );
+    }
+
+    #[test]
+    fn while_viewing_also_records_the_tab_in_view_but_toggles_still_gate() {
+        let mut cfg = NotifyConfig::default();
+        assert!(cfg.while_viewing);
+        for (focused, visible) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert!(wanted(&cfg, Event::TurnFinished, focused, visible));
+        }
+        cfg.turn_finished = false;
+        assert!(!wanted(&cfg, Event::TurnFinished, true, true));
+        cfg.turn_finished = true;
+        cfg.while_viewing = false;
+        assert!(!wanted(&cfg, Event::TurnFinished, true, true));
+        for (focused, visible) in [(true, false), (false, true), (false, false)] {
+            assert!(wanted(&cfg, Event::TurnFinished, focused, visible));
+        }
     }
 
     #[test]
@@ -492,7 +528,10 @@ mod tests {
 
     #[test]
     fn a_transition_while_the_user_looks_is_consumed() {
-        let cfg = NotifyConfig::default();
+        let cfg = NotifyConfig {
+            while_viewing: false,
+            ..NotifyConfig::default()
+        };
         let mut t = Tracker::default();
         let t0 = Instant::now();
         t.observe(1, t0, seen(BUSY, true), true, &cfg);
@@ -529,7 +568,7 @@ mod tests {
     #[test]
     fn activating_the_tab_withdraws_its_notification_only_when_the_window_is_focused() {
         let mut t = Tracker::default();
-        t.shown(4);
+        t.shown(4, false);
         assert!(t.take_seen(&[4], false).is_empty(), "window away");
         assert!(t.take_seen(&[5], true).is_empty(), "other tab");
         assert!(t.take_seen(&[], true).is_empty());
@@ -540,9 +579,9 @@ mod tests {
     #[test]
     fn every_visible_pane_counts_as_looked_at() {
         let mut t = Tracker::default();
-        t.shown(4);
-        t.shown(6);
-        t.shown(9);
+        t.shown(4, false);
+        t.shown(6, false);
+        t.shown(9, false);
         let mut seen = t.take_seen(&[4, 9], true);
         seen.sort_unstable();
         assert_eq!(seen, vec![4, 9]);
@@ -552,9 +591,25 @@ mod tests {
     #[test]
     fn a_dismissed_notification_is_not_withdrawn_again() {
         let mut t = Tracker::default();
-        t.shown(4);
+        t.shown(4, false);
         t.gone(4);
         assert!(t.take_seen(&[4], true).is_empty());
+    }
+
+    #[test]
+    fn a_notification_sent_while_looking_is_not_withdrawn_by_looking() {
+        let mut t = Tracker::default();
+        t.shown(4, true);
+        assert!(t.take_seen(&[4], true).is_empty());
+        assert!(t.take_seen(&[4], true).is_empty(), "still held");
+        // a later one for a tab not in view is an ordinary notification again
+        t.shown(4, false);
+        assert_eq!(t.take_seen(&[4], true), vec![4]);
+        // gone releases the hold
+        t.shown(4, true);
+        t.gone(4);
+        t.shown(4, false);
+        assert_eq!(t.take_seen(&[4], true), vec![4]);
     }
 
     #[test]
@@ -564,7 +619,7 @@ mod tests {
         let t0 = Instant::now();
         t.observe(1, t0, seen(BUSY, false), false, &cfg);
         t.observe(2, t0, seen(IDLE, false), false, &cfg);
-        t.shown(1);
+        t.shown(1, false);
         let live: HashSet<u64> = [2].into_iter().collect();
         assert_eq!(t.retain(&live), vec![1]);
         assert!(!t.any_busy());

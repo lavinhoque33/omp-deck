@@ -132,6 +132,8 @@ pub struct NotifyConfig {
     pub exited: bool,
     /// `false` also notifies for background tabs while the window has focus.
     pub only_when_unfocused: bool,
+    /// The in-app inbox (title-bar bell) also records events for the tab being looked at.
+    pub while_viewing: bool,
 }
 
 impl Default for NotifyConfig {
@@ -142,6 +144,7 @@ impl Default for NotifyConfig {
             attention: true,
             exited: true,
             only_when_unfocused: true,
+            while_viewing: true,
         }
     }
 }
@@ -811,6 +814,26 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains(r#""desktop":false"#), "{json}");
         assert!(!json.contains(r#""enabled""#), "{json}");
+    }
+
+    #[test]
+    fn notify_while_viewing_defaults_true_and_round_trips_false() {
+        assert!(
+            load_str(r#"{"notify": {"desktop": false}}"#)
+                .notify
+                .while_viewing
+        );
+        assert!(
+            load_str(r#"{"notify": {"enabled": false}}"#)
+                .notify
+                .while_viewing
+        );
+        let c = load_str(r#"{"notify": {"while_viewing": false}}"#);
+        assert!(!c.notify.while_viewing);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains(r#""while_viewing":false"#), "{json}");
+        let back: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(!back.notify.while_viewing);
     }
 
     fn load_str(json: &str) -> AppConfig {

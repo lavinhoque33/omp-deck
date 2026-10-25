@@ -869,6 +869,12 @@ impl App {
         }
     }
 
+    /// Focus the settings page on one OmpDeck subpage.
+    fn open_settings_page(&mut self, page: settings_page::OmpDeckPage) {
+        self.open_settings();
+        self.settings.show_ompdeck_page(page);
+    }
+
     fn close_tab(&mut self, i: usize, remember: bool) {
         if i >= self.tabs.len() {
             return;
@@ -2710,6 +2716,27 @@ impl App {
 }
 
 impl App {
+    /// Drains every terminal's events so titles, exit state and bells stay current whether or
+    /// not a frame is painted (the widget's own poll only runs while it is drawn).
+    fn poll_tabs(&mut self) {
+        let split_on = self.split_shown();
+        let dash_open = self.dash.open;
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if let Tab::Terminal(t) = tab {
+                let shown = !dash_open
+                    && if split_on {
+                        self.split.slot_of(t.uid).is_some()
+                    } else {
+                        i == self.active
+                    };
+                // A shown tab's bell is moot; the others show the marker.
+                if t.term.poll().bell && !shown {
+                    t.bell = true;
+                }
+            }
+        }
+    }
+
     /// One debug line per second with the frame rate and what requested the repaints
     /// (repaint-storm diagnosis: `RUST_LOG=omp_deck::frames=debug`).
     fn count_frame(&mut self, ctx: &egui::Context) {
@@ -2749,7 +2776,14 @@ impl eframe::App for App {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    /// Runs every tick, also while the window is minimized or on another desktop (when eframe
+    /// skips `ui`): terminal polling and the notification rules must not depend on painting.
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.poll_tabs();
+        self.drive_notifications(ctx, frame);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !self.fonts_finalized {
             self.fonts_finalized = true;
@@ -2769,7 +2803,7 @@ impl eframe::App for App {
         self.refresh_sessions_cache();
 
         // Panes follow the tab list; then only the tabs on screen repaint promptly on output
-        // (the others coalesce).
+        // (the others coalesce). Polling for title/bell/exit happens in `logic`.
         self.reconcile_panes();
         let split_on = self.split_shown();
         // The dashboard covers the terminal area: no tab is on screen (still polled below).
@@ -2783,20 +2817,6 @@ impl eframe::App for App {
                         i == self.active
                     };
                 t.term.set_visible(shown);
-            }
-        }
-        // Tabs off screen still need title/bell/exit tracking.
-        for (i, tab) in self.tabs.iter_mut().enumerate() {
-            if let Tab::Terminal(t) = tab {
-                let shown = !dash_open
-                    && if split_on {
-                        self.split.slot_of(t.uid).is_some()
-                    } else {
-                        i == self.active
-                    };
-                if !shown && t.term.poll().bell {
-                    t.bell = true;
-                }
             }
         }
 
@@ -2826,7 +2846,6 @@ impl eframe::App for App {
         self.drive_status(&ctx);
         self.drive_usage(&ctx);
         self.drive_tick(&ctx);
-        self.drive_notifications(&ctx, frame);
         self.sync_tick(&ctx);
         self.drive_agents();
         self.drive_dashboard();
