@@ -1,4 +1,5 @@
-//! Per-project backups: a project folder's `<folder>/.omp` directory and its omp sessions, kept on
+//! Per-project backups: a project folder's `<folder>/.omp` directory, its omp "sharpshooter"
+//! memory bank (`docs/notes/sharpshooter-memory.md`) and its omp sessions, kept on
 //! Drive as one `.tar.gz` per backup (see `docs/notes/contracts.md`, "Wave 10", and
 //! `docs/notes/project-sync.md`). Independent of the config backup in the sibling modules: own
 //! file prefix, own Drive query, own local state file, own retention.
@@ -55,11 +56,14 @@ pub struct Parts {
     pub omp: bool,
     /// The project's omp sessions.
     pub sessions: bool,
+    /// The project's omp "sharpshooter" memory bank (see [`crate::sharpshooter`]).
+    #[serde(default)]
+    pub memory: bool,
 }
 
 impl Parts {
     pub fn any(self) -> bool {
-        self.omp || self.sessions
+        self.omp || self.sessions || self.memory
     }
 }
 
@@ -77,6 +81,15 @@ pub enum OmpDir {
     Symlink,
 }
 
+/// The project's sharpshooter memory bank as found on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryBank {
+    /// The bank folder is absent, or none of its three files is a non-empty regular file.
+    Missing,
+    /// Non-empty regular memory files.
+    Present { files: u64, bytes: u64 },
+}
+
 /// One session of a project as the Sync page lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionSize {
@@ -91,6 +104,10 @@ pub struct SessionSize {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectSizes {
     pub omp: OmpDir,
+    /// The project's memory bank.
+    pub memory: MemoryBank,
+    /// Where that bank is (or would be), for tooltips.
+    pub memory_dir: PathBuf,
     /// Sessions whose header `cwd` is the project.
     pub sessions: u64,
     /// Their jsonl files plus artifacts.
@@ -101,14 +118,15 @@ pub struct ProjectSizes {
 
 /// Blocking (worker). Sessions = the `sessions::scan(root)` group whose `cwd` equals `project`.
 pub fn measure(root: &SessionsRoot, project: &Path) -> io::Result<ProjectSizes> {
-    let both = Parts {
+    let all = Parts {
         omp: true,
         sessions: true,
+        memory: true,
     };
     let snap = Snapshot::take(
         root,
         project,
-        both,
+        all,
         &BTreeSet::new(),
         dirs::home_dir().as_deref(),
     )?;
@@ -135,6 +153,8 @@ pub enum Stage {
     Verifying,
     /// Writing `.omp` files (items = files).
     RestoringOmp,
+    /// Writing the memory files (items = files).
+    RestoringMemory,
     /// `omp session unpack` per session (items = sessions).
     RestoringSessions,
 }
@@ -176,6 +196,7 @@ pub struct ProjectBackup {
     /// The folder's name.
     pub name: String,
     pub omp_bytes: Option<u64>,
+    pub memory_bytes: Option<u64>,
     pub sessions: Option<u64>,
     pub session_bytes: Option<u64>,
 }
@@ -196,6 +217,7 @@ impl ProjectBackup {
             path: prop("path").unwrap_or_default(),
             name,
             omp_bytes: num("omp"),
+            memory_bytes: num("mem"),
             sessions: num("sess"),
             session_bytes: num("sessb"),
             file,
@@ -241,6 +263,17 @@ pub struct ProjectRestorePlan {
     /// Files that will NOT be written, `<path>: <reason>`: a symlink on the way or as the file
     /// itself, or a file where the backup has a folder (and the other way round).
     pub omp_skipped: Vec<String>,
+    /// The target's memory bank folder (`bank_dir` of `target`).
+    pub memory_dir: PathBuf,
+    /// The bank already has a non-empty memory file.
+    pub memory_exists: bool,
+    /// Memory file names (not paths) that will replace an existing non-empty file.
+    pub memory_overwritten: Vec<String>,
+    /// Memory file names that are new here.
+    pub memory_added: Vec<String>,
+    /// Memory files that will NOT be written, `<name>: <reason>`: a symlinked bank folder or
+    /// file, or something else in the way.
+    pub memory_skipped: Vec<String>,
     pub sessions: Vec<SessionPlan>,
 }
 
@@ -264,6 +297,16 @@ pub struct ProjectRestoreReport {
     pub safety_dir: Option<PathBuf>,
     /// `.omp` files not written because of a symlink or a file/folder clash, `<path>: <reason>`.
     pub omp_skipped: Vec<String>,
+    /// Memory files written (new or replaced).
+    pub memory_written: usize,
+    /// Of those, the ones that replaced an existing non-empty file (copied to `safety_dir`
+    /// under `memory/` first).
+    pub memory_overwritten: usize,
+    /// Memory files not written (symlinks, something in the way), `<name>: <reason>`.
+    pub memory_skipped: Vec<String>,
+    /// Why the memory part was not (fully) restored: omp holds the bank's lock, or a write
+    /// failed. The other parts are unaffected.
+    pub memory_error: Option<String>,
     /// The session files omp created.
     pub sessions_added: Vec<PathBuf>,
     /// (title or id, reason)
@@ -290,11 +333,20 @@ struct Manifest {
     name: String,
     fingerprint: String,
     omp: Option<OmpManifest>,
+    /// Absent in backups made before the Memory part existed.
+    #[serde(default)]
+    memory: Option<MemoryManifest>,
     sessions: Option<SessionsManifest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct OmpManifest {
+    files: Vec<ManifestFile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MemoryManifest {
+    /// `path` is the file name (one of [`crate::sharpshooter::MEMORY_FILES`]).
     files: Vec<ManifestFile>,
 }
 
@@ -706,6 +758,7 @@ impl Service {
         props.insert("path".to_owned(), path_prop(&path_text));
         for (key, value) in [
             ("omp", packed.omp_bytes),
+            ("mem", packed.memory_bytes),
             ("sess", packed.sessions),
             ("sessb", packed.session_bytes),
         ] {
@@ -745,6 +798,9 @@ impl Service {
         if parts.sessions {
             skipped.extend(snap.session_notes.iter().cloned());
         }
+        if parts.memory {
+            skipped.extend(snap.memory_skipped.iter().cloned());
+        }
         skipped.extend(packed.excluded.iter().cloned());
         for what in &skipped {
             log::warn!("project backup of {}: left out {what}", project.display());
@@ -778,6 +834,7 @@ impl Service {
             path: props.remove("path").unwrap_or_default(),
             name: props.remove("name").unwrap_or_default(),
             omp_bytes: packed.omp_bytes,
+            memory_bytes: packed.memory_bytes,
             sessions: packed.sessions,
             session_bytes: packed.session_bytes,
         };
@@ -883,6 +940,9 @@ impl Service {
         if parts.omp && manifest.omp.is_none() {
             return Err(invalid("this backup has no .omp directory"));
         }
+        if parts.memory && manifest.memory.is_none() {
+            return Err(invalid("this backup has no omp memory"));
+        }
         if parts.sessions && manifest.sessions.is_none() {
             return Err(invalid("this backup has no sessions"));
         }
@@ -898,8 +958,11 @@ impl Service {
     }
 
     /// Writes a prepared restore: `.omp` files (overwritten ones copied to a safety directory
-    /// first, nothing deleted, nothing written through symlinks), then every session through
-    /// `omp session unpack` against the sessions store the restore was prepared for. `omp` may
+    /// first, nothing deleted, nothing written through symlinks), then the memory files into the
+    /// target's bank (under omp's consolidation lock, same safety directory under `memory/`; a
+    /// held lock is [`ProjectRestoreReport::memory_error`] and the other parts go on), then every
+    /// session through `omp session unpack` against the sessions store the restore was prepared
+    /// for. `omp` may
     /// be `None` only when no sessions are restored. A session that fails is reported in
     /// [`ProjectRestoreReport::sessions_failed`]; the rest continue. A cancel after the first
     /// write returns `Ok` with [`ProjectRestoreReport::cancelled`] set and what was done.

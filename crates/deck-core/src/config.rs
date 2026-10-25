@@ -201,6 +201,9 @@ pub struct SyncRow {
     pub omp: bool,
     /// The project's omp sessions.
     pub sessions: bool,
+    /// The project's omp "sharpshooter" memory bank (off for new rows).
+    #[serde(default)]
+    pub memory: bool,
     /// Session ids opted out of the backup; every other session (including ones created later) is
     /// backed up.
     #[serde(default)]
@@ -736,6 +739,7 @@ mod tests {
             path: "/home/u/x".into(),
             omp: true,
             sessions: false,
+            memory: true,
             excluded_sessions: ["a".to_owned(), "b".to_owned()].into(),
         }];
         cfg.project_sync_interval = SyncInterval::Daily;
@@ -754,6 +758,10 @@ mod tests {
         .unwrap();
         let cfg = AppConfig::load_from(&p);
         assert!(cfg.project_sync[0].excluded_sessions.is_empty());
+        assert!(
+            !cfg.project_sync[0].memory,
+            "rows saved before Memory existed keep it off"
+        );
     }
 
     #[test]

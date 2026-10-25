@@ -1,6 +1,7 @@
 //! Builds the project archive, streaming into a file in the cache directory.
 //!
-//! Members: `omp/<rel>`, `sessions/<id>/session.jsonl`, `sessions/<id>/artifacts/<rel>`,
+//! Members: `omp/<rel>`, `memory/<name>`, `sessions/<id>/session.jsonl`,
+//! `sessions/<id>/artifacts/<rel>`,
 //! `blobs/<hex>` (shared sessions' blobs, once each), then `manifest.json` last. Every jsonl is
 //! cut at its last newline (a running omp appends to it while we read), and the sha256 of each
 //! member is computed while it streams into the archive.
@@ -18,8 +19,8 @@ use sha2::{Digest, Sha256};
 
 use super::snapshot::{FileRef, SessionSnap, Snapshot};
 use super::{
-    BlobManifest, FORMAT, ItemManifest, KIND, MAX_MEMBER, Manifest, Meter, OmpManifest, Progress,
-    Pump, SessionsManifest, Stage, job_io,
+    BlobManifest, FORMAT, ItemManifest, KIND, MAX_MEMBER, Manifest, MemoryManifest, Meter,
+    OmpManifest, Progress, Pump, SessionsManifest, Stage, job_io,
 };
 use crate::gdrive::archive::{ManifestFile, hex};
 use crate::gdrive::{Error, Result, rfc3339};
@@ -41,6 +42,7 @@ pub(super) struct Packed {
     /// Size of the archive file.
     pub len: u64,
     pub omp_bytes: Option<u64>,
+    pub memory_bytes: Option<u64>,
     pub sessions: Option<u64>,
     pub session_bytes: Option<u64>,
     /// Sessions left out, `session “<title>”: <reason>`.
@@ -79,13 +81,19 @@ pub(super) fn pack(
     } else {
         &[]
     };
+    let memory_files: &[FileRef] = if snap.memory_included() {
+        &snap.memory_files
+    } else {
+        &[]
+    };
     let total: u64 = omp_files.iter().map(|f| f.len).sum::<u64>()
+        + memory_files.iter().map(|f| f.len).sum::<u64>()
         + planned
             .iter()
             .map(|p| p.cut + p.artifacts.iter().map(|(_, c)| c).sum::<u64>())
             .sum::<u64>()
         + blob_sizes.values().sum::<u64>();
-    if omp_files.is_empty() && planned.is_empty() {
+    if omp_files.is_empty() && memory_files.is_empty() && planned.is_empty() {
         return Err(Error::NothingToBackUp(meta.project.display().to_string()));
     }
 
@@ -115,6 +123,24 @@ pub(super) fn pack(
             }
             omp_bytes = Some(omp_files.iter().map(|f| f.len).sum());
             omp_manifest = Some(OmpManifest { files });
+        }
+
+        let mut memory_manifest = None;
+        let mut memory_bytes = None;
+        if !memory_files.is_empty() {
+            let mut files = Vec::with_capacity(memory_files.len());
+            for f in memory_files {
+                files.push(append_file(
+                    &mut tar,
+                    &format!("memory/{}", f.rel),
+                    f,
+                    f.len,
+                    now,
+                    &mut pump,
+                )?);
+            }
+            memory_bytes = Some(memory_files.iter().map(|f| f.len).sum());
+            memory_manifest = Some(MemoryManifest { files });
         }
 
         let mut sessions_manifest = None;
@@ -203,6 +229,7 @@ pub(super) fn pack(
             name,
             fingerprint: snap.fingerprint().to_owned(),
             omp: omp_manifest,
+            memory: memory_manifest,
             sessions: sessions_manifest,
         };
         let json = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
@@ -218,6 +245,7 @@ pub(super) fn pack(
         Ok(Packed {
             len: file.metadata()?.len(),
             omp_bytes,
+            memory_bytes,
             sessions,
             session_bytes,
             excluded: Vec::new(),

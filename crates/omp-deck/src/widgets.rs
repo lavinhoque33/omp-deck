@@ -91,15 +91,20 @@ pub fn win_button(ui: &mut Ui, icon: Icon, tooltip: &str, danger: bool) -> Respo
     resp.on_hover_text(tooltip)
 }
 
+/// Size of the switch drawn by [`toggle`].
+pub fn toggle_size(_ui: &Ui) -> egui::Vec2 {
+    if theme::flat() {
+        vec2(34.0, 20.0)
+    } else {
+        vec2(42.0, 24.0)
+    }
+}
+
 /// Animated switch. Returns the response with `changed()` set on toggle.
 pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
     let pal = Palette::of_ui(ui);
     let neutral = theme::flat();
-    let size = if neutral {
-        vec2(34.0, 20.0)
-    } else {
-        vec2(42.0, 24.0)
-    };
+    let size = toggle_size(ui);
     let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
     if resp.clicked() {
         *on = !*on;

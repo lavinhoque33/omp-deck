@@ -156,6 +156,20 @@ pub fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_encoded_bytes()
 }
 
+// ---- named cross-process locks -----------------------------------------------------------------
+
+/// A held cross-process lock; released when dropped (or when the process exits).
+#[derive(Debug)]
+pub struct NamedLock(#[allow(dead_code)] imp::Held);
+
+/// Tries once, without blocking, to take the lock called `name` the way omp's file locks do:
+/// Linux binds an abstract Unix datagram socket called `name`, Windows creates the mutex
+/// `Global\<name>`, other Unix systems `flock` the file at `path` (created 0600, with its
+/// parent folders). `Ok(None)` = someone else holds it.
+pub fn try_named_lock(name: &str, path: &Path) -> io::Result<Option<NamedLock>> {
+    Ok(imp::try_named_lock(name, path)?.map(NamedLock))
+}
+
 // ---- killable process trees --------------------------------------------------------------------
 
 /// A [`Command`] whose whole process tree can be killed: it leads its own process group (Unix) or

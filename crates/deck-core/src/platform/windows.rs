@@ -388,3 +388,30 @@ pub fn reveal_os(file: &Path) -> io::Result<()> {
         .wait()?;
     Ok(())
 }
+
+/// What keeps a [`super::NamedLock`] held: the handle of the named mutex.
+pub type Held = OwnedHandle;
+
+pub fn try_named_lock(name: &str, _path: &Path) -> io::Result<Option<Held>> {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, SetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let wide: Vec<u16> = format!(r"Global\{name}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: resets the calling thread's last-error value so the read below is this call's.
+    unsafe { SetLastError(0) };
+    // SAFETY: the attributes pointer is null and `wide` is a live NUL-terminated UTF-16 string.
+    let raw = unsafe { CreateMutexW(ptr::null(), 0, wide.as_ptr()) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `CreateMutexW` returned a fresh handle that only this value owns; it is closed
+    // exactly once, on every path (a losing contender drops it right away).
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: reads the last-error value `CreateMutexW` just set; nothing ran in between.
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        return Ok(None);
+    }
+    Ok(Some(handle))
+}

@@ -11,6 +11,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
@@ -24,6 +25,7 @@ use crate::gdrive::archive::{ManifestFile, PROJECT_SAFETY_PREFIX, hex, prune_saf
 use crate::gdrive::{Error, KEEP_SAFETY_COPIES, Result, compact_stamp, io_err, unix_now};
 use crate::omp::{MoveKind, Omp};
 use crate::platform;
+use crate::sharpshooter::{self, MEMORY_FILES};
 
 /// Unpacked-size cap while reading an archive (a guard against decompression bombs).
 const MAX_UNPACKED: u64 = 64 << 30;
@@ -36,6 +38,7 @@ const HEADER_SEARCH: usize = 1 << 20;
 enum Member {
     Manifest,
     Omp,
+    Memory,
     Jsonl,
     Artifact,
     Blob,
@@ -47,6 +50,7 @@ fn parse_member(path: &str) -> Result<Member> {
     let member = match parts.as_slice() {
         ["manifest.json"] => Member::Manifest,
         ["omp", _, ..] => Member::Omp,
+        ["memory", name] if MEMORY_FILES.contains(name) => Member::Memory,
         ["sessions", id, "session.jsonl"] if valid_id(id) => Member::Jsonl,
         ["sessions", id, "artifacts", _, ..] if valid_id(id) => Member::Artifact,
         ["blobs", name] if is_sha256(name) => Member::Blob,
@@ -207,6 +211,11 @@ fn check_manifest(m: &Manifest, seen: &BTreeMap<String, (u64, String)>) -> Resul
             list(format!("omp/{}", f.path), f.size, &f.sha256)?;
         }
     }
+    if let Some(memory) = &m.memory {
+        for f in &memory.files {
+            list(format!("memory/{}", f.path), f.size, &f.sha256)?;
+        }
+    }
     if let Some(sessions) = &m.sessions {
         let blob_names: BTreeSet<&str> = sessions.blobs.iter().map(|b| b.sha256.as_str()).collect();
         for b in &sessions.blobs {
@@ -365,6 +374,23 @@ pub(super) fn plan(
         plan.omp_added.sort();
         plan.omp_skipped.sort();
     }
+    if parts.memory
+        && let Some(memory) = &m.memory
+    {
+        let bank = sharpshooter::bank_dir(root, target);
+        plan.memory_exists = bank_has_memory(&bank);
+        for f in &memory.files {
+            match memory_dest(&bank, &f.path) {
+                MemDest::Add => plan.memory_added.push(f.path.clone()),
+                MemDest::Replace => plan.memory_overwritten.push(f.path.clone()),
+                MemDest::Blocked(why) => plan.memory_skipped.push(format!("{}: {why}", f.path)),
+            }
+        }
+        plan.memory_added.sort();
+        plan.memory_overwritten.sort();
+        plan.memory_skipped.sort();
+        plan.memory_dir = bank;
+    }
     if parts.sessions
         && let Some(sessions) = &m.sessions
     {
@@ -431,6 +457,12 @@ pub(super) fn apply(
     if cancel.load(Ordering::Relaxed) {
         return Err(Error::Cancelled);
     }
+    let memory_files = p
+        .manifest
+        .memory
+        .as_ref()
+        .filter(|_| p.parts.memory)
+        .map(|m| &m.files);
     if omp_files.is_some() {
         // Things may have changed since the plan was made.
         omp_root_exists(target)?;
@@ -454,6 +486,25 @@ pub(super) fn apply(
                 return Ok(report);
             }
             Err(e) => return Err(e),
+        }
+    }
+    if let Some(files) = memory_files {
+        match restore_memory(
+            files,
+            &unpacked,
+            &p.plan.memory_dir,
+            safety_root,
+            cancel,
+            progress,
+            &mut report,
+        ) {
+            Ok(()) => {}
+            Err(Error::Cancelled) => {
+                report.cancelled = true;
+                return Ok(report);
+            }
+            // The memory is an extra: a failure here is reported, `.omp` and sessions go on.
+            Err(e) => report.memory_error = Some(e.to_string()),
         }
     }
     if let (Some(sessions), Some(omp)) = (sessions, omp) {
@@ -537,6 +588,146 @@ fn restore_omp(
     }
     report.omp_written = written;
     report.omp_overwritten = overwritten;
+    Ok(())
+}
+
+/// How long a restore waits for omp's consolidation lock on the bank (shortened in this crate's
+/// tests, which hold the lock on purpose).
+const MEMORY_LOCK_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(1500)
+} else {
+    Duration::from_secs(10)
+};
+/// [`ProjectRestoreReport::memory_error`] while omp holds the bank's lock.
+const MEMORY_LOCKED: &str = "omp is updating this folder's memory right now; try again in a moment";
+
+/// What restoring one memory file into the bank would do.
+#[derive(Debug, PartialEq, Eq)]
+enum MemDest {
+    /// Nothing non-empty there (a new file, or an empty one omp left behind).
+    Add,
+    /// A non-empty regular file: replaced, after a safety copy.
+    Replace,
+    /// Not written; why (a symlink in the way, a folder where the file goes, ...).
+    Blocked(String),
+}
+
+/// Looks at `<bank>/<name>` without following links.
+fn memory_dest(bank: &Path, name: &str) -> MemDest {
+    match fs::symlink_metadata(bank) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return MemDest::Blocked("the memory folder is a symbolic link".to_owned());
+        }
+        Ok(m) if !m.is_dir() => {
+            return MemDest::Blocked("a file is where the memory folder goes".to_owned());
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return MemDest::Add,
+        Err(e) => return MemDest::Blocked(format!("cannot inspect the memory folder ({e})")),
+    }
+    match check_dest(bank, name) {
+        Dest::Free => MemDest::Add,
+        // Unreadable metadata → assume content: the safety copy is cheap.
+        Dest::File if fs::metadata(bank.join(name)).is_ok_and(|m| m.len() == 0) => MemDest::Add,
+        Dest::File => MemDest::Replace,
+        Dest::Blocked(why) => MemDest::Blocked(why),
+    }
+}
+
+/// The bank folder holds a non-empty memory file (what omp would lose to a restore).
+fn bank_has_memory(bank: &Path) -> bool {
+    fs::symlink_metadata(bank).is_ok_and(|m| m.is_dir())
+        && MEMORY_FILES.iter().any(|name| {
+            fs::symlink_metadata(bank.join(name)).is_ok_and(|m| m.is_file() && m.len() > 0)
+        })
+}
+
+/// Writes the memory files into `bank` while holding omp's consolidation lock (omp renames its
+/// own output over these files, computed from what it read earlier, so unlocked writes could be
+/// silently undone). Overwritten files are copied to `<safety>/memory/<name>` first; nothing is
+/// deleted; `state.json` and `queue/` are never touched. A held lock is
+/// [`ProjectRestoreReport::memory_error`], not an `Err`.
+fn restore_memory(
+    files: &[ManifestFile],
+    unpacked: &Path,
+    bank: &Path,
+    safety_root: &Path,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(Progress) + Sync),
+    report: &mut ProjectRestoreReport,
+) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(Error::Cancelled);
+    }
+    // Polled, not one long wait, so a cancel is honored while omp holds the lock.
+    let deadline = Instant::now() + MEMORY_LOCK_WAIT;
+    let held = loop {
+        if let Some(held) = sharpshooter::lock_bank(bank, Duration::ZERO)
+            .map_err(io_err("cannot lock the memory folder", bank))?
+        {
+            break Some(held);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+    };
+    let Some(_held) = held else {
+        report.memory_error = Some(MEMORY_LOCKED.to_owned());
+        return Ok(());
+    };
+    // Looked at again under the lock: omp may have written since the plan was made.
+    let dests: Vec<MemDest> = files.iter().map(|f| memory_dest(bank, &f.path)).collect();
+    if dests.iter().any(|d| !matches!(d, MemDest::Blocked(_))) {
+        fs::create_dir_all(bank).map_err(io_err("cannot create", bank))?;
+    }
+    let replaced: Vec<&ManifestFile> = files
+        .iter()
+        .zip(&dests)
+        .filter(|(_, d)| **d == MemDest::Replace)
+        .map(|(f, _)| f)
+        .collect();
+    if !replaced.is_empty() {
+        let safety = match report.safety_dir.clone() {
+            Some(dir) => dir,
+            None => {
+                let dir = safety_dir(safety_root, unix_now());
+                platform::create_private_dir_all(&dir).map_err(io_err("cannot create", &dir))?;
+                prune_safety(safety_root, KEEP_SAFETY_COPIES, true);
+                report.safety_dir = Some(dir.clone());
+                dir
+            }
+        };
+        let copies = safety.join("memory");
+        fs::create_dir_all(&copies).map_err(io_err("cannot create", &copies))?;
+        for f in replaced {
+            // A regular file (checked above), so `copy` cannot follow a link.
+            let from = bank.join(&f.path);
+            fs::copy(&from, copies.join(&f.path)).map_err(io_err("cannot copy", &from))?;
+        }
+    }
+    let mut pump = Pump::new(cancel, progress, Stage::RestoringMemory, files.len() as u64);
+    for (f, dest) in files.iter().zip(&dests) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        match dest {
+            MemDest::Blocked(why) => report.memory_skipped.push(format!("{}: {why}", f.path)),
+            MemDest::Add | MemDest::Replace => {
+                install(
+                    &unpacked.join("memory").join(&f.path),
+                    &bank.join(&f.path),
+                    f.mode,
+                )?;
+                report.memory_written += 1;
+                report.memory_overwritten += usize::from(*dest == MemDest::Replace);
+            }
+        }
+        pump.item()?;
+    }
     Ok(())
 }
 

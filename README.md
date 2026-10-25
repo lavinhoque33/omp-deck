@@ -43,10 +43,10 @@ host), so closing a tab or the whole app leaves omp running.
   custom agents, skills, …) and prompt history to a private Drive app folder, automatically when it
   changes or on demand, and restore it on any machine (Settings → OmpDeck). See
   [below](#google-drive-backup).
-- **Project sync**: back up chosen project folders' `.omp` folder and omp sessions to the same private
-  Drive app folder (Settings → Sync, or right-click a project in the sidebar), and restore them into any
-  folder on any machine; restored sessions are added alongside the existing ones. See
-  [below](#project-sync).
+- **Project sync**: back up chosen project folders' `.omp` folder, omp sessions and omp's project memory
+  to the same private Drive app folder (Settings → Sync, or right-click a project in the sidebar), and
+  restore them into any folder on any machine; restored sessions are added alongside the existing ones.
+  See [below](#project-sync).
 - **Worktree sessions**: run several agents on one repository in parallel, each in its own git worktree
   and branch: start a session in a new worktree, move a running session into one, finish it (the agent
   merges following the project's own rules) and let OmpDeck remove it once it is merged. See
@@ -254,8 +254,8 @@ Google OAuth credentials show the card as "not available in this build". Maintai
 ## Project sync
 
 Settings → **Sync** is a separate workflow from the config backup above and uses the same Google
-sign-in. Each row of the **Projects** table is a folder (**Add folder…**, **Change…**) with two
-switches, each showing how much it would upload. A newly added folder starts with both switches off and
+sign-in. Each row of the **Projects** table is a folder (**Add folder…**, **Change…**) with three
+switches, each showing how much it would upload. A newly added folder starts with all switches off and
 nothing is uploaded until you pick what to keep and click **Back up now**:
 
 - **.omp folder**: the project's `<folder>/.omp` (project `AGENTS.md`, rules, skills, commands, agents,
@@ -266,6 +266,9 @@ nothing is uploaded until you pick what to keep and click **Back up now**:
   transcripts and referenced images. Sessions that are being written are saved up to their last complete
   line. **Choose…** opens the session list: untick the sessions to leave out. Sessions created later are
   backed up automatically.
+- **Memory**: omp's learned project memory (the "sharpshooter" decisions: `architecture.md`, `product.md`,
+  `style.md`), which omp keeps in its own folder (`~/.omp/agent/memories/sharpshooter/<project>-<hash>/`),
+  not in the project. Offered once omp has written memory for the folder.
 
 **Back up now** uploads one row at once. **Back up listed projects automatically** (Off, every 10 or 30
 minutes, every hour, every 6 hours (default), every day) uploads only rows whose files or session choices
@@ -276,13 +279,19 @@ sidebar → **Back up to Google Drive…** for a one-off backup, optionally addi
 
 **Restore…** (on the Sync page, or **Restore from Google Drive…** in the sidebar menu, which restores
 into that project's folder) lists project backups by project and machine, newest first, with older
-versions selectable. Pick the folder to restore into (it is created if missing) and **.omp folder** and/or
-**Sessions**. OmpDeck downloads and verifies the backup, then shows what will change before writing:
+versions selectable. Pick the folder to restore into (it is created if missing) and **.omp folder**,
+**Sessions** and/or **Memory**. OmpDeck downloads and verifies the backup, then shows what will change before writing:
 
 - **.omp**: files from the backup are written into `<folder>/.omp`. If the folder already has a `.omp`,
   you are warned which files will be overwritten; on Restore they are replaced (the old versions are
   copied to `~/.local/share/omp-deck/restore-safety/project-<time>/`, last 5 kept). Files the backup lacks
   are kept. OmpDeck never writes through symlinks; such files are skipped and listed.
+- **Memory**: the files are written into omp's memory folder for the folder you restore into (the name is
+  derived from that folder's path, so memory follows the project to a new location or machine). If omp
+  already has memory for that folder, you are warned which files will be overwritten; the old versions are
+  copied to the same restore-safety folder first. omp's pending, not-yet-merged notes are not backed up.
+  OmpDeck waits for omp to finish merging memory for that folder; if omp is still busy after 10 s the
+  memory is left untouched and the summary says so.
 - **Sessions**: each session is added through `omp session unpack --cwd <folder>`, so omp moves it to the
   new folder and tells the agent where it now lives. Existing sessions are never replaced or removed; a
   session that already exists on this machine is added as a copy with a new id. Restoring sessions needs

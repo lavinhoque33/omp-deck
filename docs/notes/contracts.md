@@ -1856,3 +1856,82 @@ a `TermTheme` (spawn options, `set_theme`, host color push, OSC 10/11/4 answers)
 - Known differences from the mockups: Graphite Islands' title bar is flush (not inset into the backdrop frame);
   egui has one weight per font, so Neo-Brutal's heavy titles are approximated; glows are mesh gradients, not CSS
   blur.
+
+## Wave 17: sharpshooter project memory in project sync
+
+Facts: `docs/notes/sharpshooter-memory.md` (layout, bank id = Wyhash/base36, XDG rule, consolidation lock). A third
+project-sync part next to `.omp` and Sessions; the config backup is unchanged. **User-approved store exception**:
+restore writes the three memory files directly into omp's memories dir (no omp command can import memory).
+
+### deck_core::sharpshooter (new module, no GUI deps)
+
+```rust
+pub const MEMORY_FILES: [&str; 3] = ["architecture.md", "product.md", "style.md"];
+/// Zig std.hash.Wyhash, seed 0 (= Bun.hash). Pinned by vectors generated with bun.
+pub fn wyhash(bytes: &[u8]) -> u64;
+/// omp's `sharpshooterBankId(cwd)`: lexical path.resolve of `project`, sanitize/limit, `<name>-<base36 hash>`.
+/// Hashes the platform path string (UTF-8; non-UTF-8 → lossy). `project` is absolute.
+pub fn bank_id(project: &Path) -> String;
+/// `<memories dir>/sharpshooter` for the agent dir that holds `root` (XDG state rule from the facts).
+pub fn root_dir(root: &SessionsRoot) -> PathBuf;
+pub fn bank_dir(root: &SessionsRoot, project: &Path) -> PathBuf;   // root_dir / bank_id
+/// omp's consolidation lock for a bank (`<bank>/consolidate.lock`; Linux abstract socket, Windows Global mutex,
+/// other Unix flock). Retries every 100 ms up to `wait`; `Ok(None)` = still held by omp. Released on drop.
+pub fn lock_bank(bank: &Path, wait: Duration) -> io::Result<Option<BankLock>>;
+pub struct BankLock { /* platform handle */ }
+```
+
+### deck_core::config
+- `SyncRow` gains `#[serde(default)] pub memory: bool` (new rows: off, per Wave 11).
+
+### deck_core::gdrive::project
+- `Parts` gains `#[serde(default)] pub memory: bool`; `any()` includes it.
+- `pub enum MemoryBank { Missing, Present { files: u64, bytes: u64 } }` (Missing = bank dir absent or all three
+  files missing/empty/non-regular). `ProjectSizes` gains `pub memory: MemoryBank` and `pub memory_dir: PathBuf`
+  (the bank path, for tooltips).
+- Snapshot: when `parts.memory`, the non-empty regular files among `MEMORY_FILES` in `bank_dir(root, project)`
+  (symlinks never followed: a symlinked bank dir or file → `skipped` entry `memory/<file>: <reason>`). Members
+  `memory/<file>`; manifest `memory: Option<MemoryManifest { files: Vec<ManifestFile> }>` (`#[serde(default)]`,
+  old backups = None). Fingerprint: the memory flag and memory files are hashed **only when `parts.memory`**, so
+  fingerprints of rows without memory are unchanged. Selected parts with nothing present → `NothingToBackUp` as
+  today. appProperties `mem` = memory bytes; `ProjectBackup.memory_bytes: Option<u64>`.
+- Prepare: archive validation accepts the `memory/` prefix (only the three names); `parts.memory` without a memory
+  part in the backup → `InvalidBackup`. Plan gains `memory_dir: PathBuf` (bank of `target`), `memory_exists: bool`
+  (bank has any non-empty memory file), `memory_overwritten: Vec<String>`, `memory_added: Vec<String>` (file names),
+  `memory_skipped: Vec<String>` (symlinked bank dir/file, `<name>: <reason>`).
+- Apply (order: `.omp`, memory, sessions): `Stage::RestoringMemory` (items = files). Take `lock_bank(memory_dir,
+  10 s)`; still held → memory not written, `report.memory_error = Some("omp is updating this folder's memory right
+  now; try again in a moment")`, other parts continue. Else create the bank dir (parents too), safety-copy each
+  overwritten file into the same project safety dir under `memory/<name>`, write atomically (temp in the bank dir
+  + rename), never through symlinks (re-checked), never delete, never touch `state.json`/`queue/`. Report gains
+  `memory_written: usize`, `memory_overwritten: usize`, `memory_skipped: Vec<String>`, `memory_error: Option<String>`.
+- Backups containing `memory/` members are not restorable by older OmpDeck builds (their member check rejects the
+  prefix); backups without the part stay readable by them.
+
+### omp-deck
+- Sync page row: third switch **Memory** + `N files · size` (tooltip: bank path); disabled with "No omp memory for
+  this folder yet" when `MemoryBank::Missing`. Sidebar backup dialog: same third switch. Auto pass / "nothing
+  selected" logic uses `Parts::any()`.
+- Restore dialog: **Memory** checkbox when the backup has it (`memory_bytes.is_some()`). Confirm step: when
+  `memory_exists && !memory_overwritten.is_empty()` a danger warning "This folder already has omp memory: N files
+  will be overwritten (copies saved first)" listing the names; else "N memory files will be added". Skipped entries
+  listed like `.omp`'s.
+- Result toast/summary includes memory written/overwritten, skipped, and `memory_error`. Manage-cloud-backups and
+  restore version rows show the memory part/size where parts are shown.
+
+### Wave 17 as built
+
+- `deck_core::platform::{NamedLock, try_named_lock}` hold the OS lock (Linux abstract socket, Windows `Global\`
+  mutex, other Unix flock, which also creates the bank folder). Lock interop proven on Linux both ways against omp's
+  installed `pi_natives` `FileLock.tryAcquire`.
+- `resolve` on Windows strips `\\?\`/`\\?\UNC\` first, resolves drive-relative inputs with `std::path::absolute`,
+  keeps drive-letter case; a UNC share root is `\\server\share\` with basename `share` (bun vectors under
+  `cfg(windows)`). The XDG default-agent-dir comparison normalizes both sides.
+- The memory restore waits for the lock in 100 ms zero-wait retries (10 s) and checks cancel between them; a cancel
+  there yields `Ok(report { cancelled: true })`. A failure writing memory other than the lock is also routed to
+  `memory_error` so `.omp`/sessions still finish. An empty existing file counts as "added" (no safety copy);
+  identical non-empty content is listed as overwritten (mirrors `.omp`).
+- Symlinks are checked from the bank dir down (bank, files); omp's own memories root may be a symlink (e.g. `~/.omp`
+  on another disk) and is followed, as omp does.
+- UI: `sync_view::part_cell` lays each switch/label/size cell out once (galleys reused) and wraps only between
+  cells; the Projects row and the sidebar backup dialog share it.

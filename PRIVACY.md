@@ -16,8 +16,9 @@ OmpDeck uses this access only to upload, list, download and delete its own backu
 - **omp settings backup** (Settings → OmpDeck): configuration, custom models and agents, other omp
   config files, and prompt history.
 - **Project sync** (Settings → Sync), only for the folders you add there and only the parts you switch
-  on: a project's `.omp` folder (which can contain project settings and secrets you keep there) and
-  that project's omp session transcripts, including their attachments.
+  on: a project's `.omp` folder (which can contain project settings and secrets you keep there),
+  that project's omp session transcripts, including their attachments, and omp's learned memory for
+  that project.
 
 Logins and API credentials of omp itself are never backed up. Backups go straight from your computer
 to your Google Drive; they are not sent anywhere else, and nobody other than you can access them.

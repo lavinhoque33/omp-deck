@@ -666,7 +666,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "deck-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
  "deck-host",
@@ -685,12 +685,13 @@ dependencies = [
  "thiserror 2.0.21",
  "ureq",
  "windows-sys 0.61.2",
+ "xxhash-rust",
  "zip",
 ]
 
 [[package]]
 name = "deck-host"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "alacritty_terminal",
  "dirs",
@@ -707,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "deck-term"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "alacritty_terminal",
  "arboard",
@@ -2445,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "omp-deck"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "deck-core",
@@ -4620,6 +4621,12 @@ name = "xml-rs"
 version = "0.8.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yeslogic-fontconfig-sys"

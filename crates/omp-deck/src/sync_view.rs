@@ -51,10 +51,24 @@ pub enum SessionsCell {
     Failed(String),
 }
 
+/// What measuring a project's omp memory bank found.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MemoryCell {
+    Loading,
+    Missing,
+    /// `text` is "size · N files"; `dir` is the bank folder (tooltip).
+    Present {
+        text: String,
+        dir: String,
+    },
+    Failed(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cells {
     pub omp: OmpCell,
     pub sessions: SessionsCell,
+    pub memory: MemoryCell,
 }
 
 impl Cells {
@@ -70,6 +84,10 @@ impl Cells {
     /// The folder has sessions to choose from.
     pub fn sessions_choosable(&self) -> bool {
         matches!(self.sessions, SessionsCell::Ready { count, .. } if count > 0)
+    }
+
+    pub fn memory_usable(&self) -> bool {
+        matches!(self.memory, MemoryCell::Present { .. })
     }
 
     fn omp_text(&self) -> (String, Option<&'static str>) {
@@ -116,6 +134,21 @@ impl Cells {
             SessionsCell::Failed(e) => (
                 format!("unreadable: {e}"),
                 Some("The sessions could not be read"),
+            ),
+        }
+    }
+
+    fn memory_text(&self) -> (String, Option<&str>) {
+        match &self.memory {
+            MemoryCell::Loading => ("measuring…".into(), None),
+            MemoryCell::Missing => (
+                "no memory".into(),
+                Some("No omp memory for this folder yet"),
+            ),
+            MemoryCell::Present { text, dir } => (text.clone(), Some(dir.as_str())),
+            MemoryCell::Failed(e) => (
+                format!("unreadable: {e}"),
+                Some("The size could not be read"),
             ),
         }
     }
@@ -181,6 +214,7 @@ pub struct RowView {
     pub full: String,
     pub omp_on: bool,
     pub sessions_on: bool,
+    pub memory_on: bool,
     pub cells: Cells,
     pub last: LastView,
     /// This row's job is running.
@@ -207,6 +241,7 @@ pub enum SyncAction {
     Remove(usize),
     SetOmp(usize, bool),
     SetSessions(usize, bool),
+    SetMemory(usize, bool),
     BackUp(usize),
     SetInterval(SyncInterval),
     OpenRestore,
@@ -264,7 +299,9 @@ pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
     let mut actions = vec![SyncAction::Visible];
     ui.label(theme::strong("Sync").size(22.0).color(pal.text_strong));
     ui.label(
-        RichText::new("Back up a project's .omp folder and its omp sessions to Google Drive")
+        RichText::new(
+            "Back up a project's .omp folder, its omp sessions and omp's project memory to Google Drive",
+        )
             .color(pal.weak),
     );
     ui.add_space(16.0);
@@ -396,13 +433,14 @@ fn project_row(
                         }
                         None => {
                             let any = (row.omp_on && row.cells.omp_usable())
-                                || (row.sessions_on && row.cells.sessions_usable());
+                                || (row.sessions_on && row.cells.sessions_usable())
+                                || (row.memory_on && row.cells.memory_usable());
                             let resp = button(ui, idle && any, ICON_CLOUD_UPLOAD, "Back up now");
                             if resp.clicked() {
                                 actions.push(SyncAction::BackUp(i));
                             }
                             resp.on_disabled_hover_text(if idle {
-                                "Turn on .omp or Sessions first"
+                                "Turn on .omp, Sessions or Memory first"
                             } else {
                                 why_not
                             });
@@ -428,29 +466,47 @@ fn project_row(
                         actions.push(SyncAction::SetOmp(i, on));
                     },
                 );
-                ui.add_space(14.0);
                 let (s_text, s_why) = row.cells.sessions_text();
-                part_switch(
+                let sessions_choose = row.cells.sessions_choosable() && row.busy.is_none();
+                let mut choose = false;
+                let flipped = part_cell(
                     ui,
                     "Sessions",
                     row.sessions_on,
                     row.cells.sessions_usable(),
                     &s_text,
                     s_why,
-                    |on| {
-                        actions.push(SyncAction::SetSessions(i, on));
+                    Some(small_button_width(ui, "Choose…")),
+                    |ui| {
+                        choose = ui
+                            .add_enabled(
+                                sessions_choose,
+                                Button::new(RichText::new("Choose…").small()),
+                            )
+                            .on_hover_text(
+                                "Pick which sessions are backed up (new ones are included)",
+                            )
+                            .clicked();
                     },
                 );
-                if ui
-                    .add_enabled(
-                        row.cells.sessions_choosable() && row.busy.is_none(),
-                        Button::new(RichText::new("Choose…").small()),
-                    )
-                    .on_hover_text("Pick which sessions are backed up (new ones are included)")
-                    .clicked()
-                {
+                if let Some(on) = flipped {
+                    actions.push(SyncAction::SetSessions(i, on));
+                }
+                if choose {
                     actions.push(SyncAction::ChooseSessions(i));
                 }
+                let (m_text, m_why) = row.cells.memory_text();
+                part_switch(
+                    ui,
+                    "Memory",
+                    row.memory_on,
+                    row.cells.memory_usable(),
+                    &m_text,
+                    m_why,
+                    |on| {
+                        actions.push(SyncAction::SetMemory(i, on));
+                    },
+                );
             });
             ui.add_space(2.0);
             match &row.last {
@@ -517,18 +573,88 @@ fn part_switch(
     why: Option<&str>,
     mut changed: impl FnMut(bool),
 ) {
+    if let Some(v) = part_cell(ui, label, on, usable, size, why, None, |_| {}) {
+        changed(v);
+    }
+}
+
+/// Width of a small button labelled `text`.
+fn small_button_width(ui: &Ui, text: &'static str) -> f32 {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let key = egui::Id::unique((
+        "small_button_text_w",
+        text,
+        font.size.to_bits(),
+        ui.ctx().pixels_per_point().to_bits(),
+    ));
+    let text_w = match ui.data(|d| d.get_temp::<f32>(key)) {
+        Some(w) => w,
+        None => {
+            let w = ui
+                .painter()
+                .layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE)
+                .size()
+                .x;
+            ui.data_mut(|d| d.insert_temp(key, w));
+            w
+        }
+    };
+    text_w + 2.0 * ui.spacing().button_padding.x
+}
+
+/// A part cell (`[switch] label size` plus an optional trailing widget of known width) that is
+/// never split: when it does not fit on the current line of a wrapped row, the whole cell moves
+/// to the next line; its labels never wrap internally.
+#[allow(clippy::too_many_arguments)]
+fn part_cell(
+    ui: &mut Ui,
+    label: &str,
+    on: bool,
+    usable: bool,
+    size: &str,
+    why: Option<&str>,
+    trailing_width: Option<f32>,
+    trailing: impl FnOnce(&mut Ui),
+) -> Option<bool> {
     let pal = Palette::of_ui(ui);
+    let gap = ui.spacing().item_spacing.x;
+    let layout = |ui: &Ui, text: RichText| {
+        egui::WidgetText::from(text).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Body,
+        )
+    };
+    let label_galley = layout(ui, RichText::new(label).color(pal.text));
+    let size_galley = layout(ui, RichText::new(size).small().color(pal.weak));
+    let mut width = crate::widgets::toggle_size(ui).x
+        + gap
+        + label_galley.size().x
+        + gap
+        + size_galley.size().x;
+    if let Some(w) = trailing_width {
+        width += gap + w;
+    }
+    let at_start = ui.cursor().min.x <= ui.max_rect().min.x + 0.5;
+    if !at_start {
+        if width + 14.0 + gap > ui.available_size_before_wrap().x {
+            ui.end_row();
+        } else {
+            ui.add_space(14.0);
+        }
+    }
     let mut shown = on;
     let resp = ui.add_enabled_ui(usable, |ui| toggle(ui, &mut shown)).inner;
-    if resp.changed() {
-        changed(shown);
-    }
-    ui.label(RichText::new(label).color(pal.text));
-    let sz = ui.label(RichText::new(size).small().color(pal.weak));
+    let flipped = resp.changed().then_some(shown);
+    ui.add(egui::Label::new(label_galley).wrap_mode(egui::TextWrapMode::Extend));
+    let sz = ui.add(egui::Label::new(size_galley).wrap_mode(egui::TextWrapMode::Extend));
     if let Some(why) = why {
         resp.on_disabled_hover_text(why);
         sz.on_hover_text(why);
     }
+    trailing(ui);
+    flipped
 }
 
 // ------------------------------------------------------------------ typed-path prompt
@@ -634,6 +760,7 @@ pub struct BackupDialog {
     pub display: String,
     pub omp: bool,
     pub sessions: bool,
+    pub memory: bool,
     pub keep: bool,
     /// Sessions this backup leaves out; local to the dialog (seeded from the folder's Sync row).
     pub excluded_ids: std::collections::BTreeSet<String>,
@@ -658,7 +785,9 @@ pub fn backup_dialog(
 ) -> BackupAnswer {
     let pal = Palette::of_ctx(ctx);
     let mut choose = false;
-    let any = (d.omp && cells.omp_usable()) || (d.sessions && cells.sessions_usable());
+    let any = (d.omp && cells.omp_usable())
+        || (d.sessions && cells.sessions_usable())
+        || (d.memory && cells.memory_usable());
     let answer = show_dialog(
         ctx,
         &Dialog {
@@ -693,27 +822,45 @@ pub fn backup_dialog(
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 let (t, why) = cells.sessions_text();
-                part_switch(
+                let flipped = part_cell(
                     ui,
                     "Sessions",
                     d.sessions,
                     cells.sessions_usable(),
                     &t,
                     why,
-                    |on| {
-                        d.sessions = on;
+                    Some(small_button_width(ui, "Choose…")),
+                    |ui| {
+                        if ui
+                            .add_enabled(
+                                cells.sessions_choosable() && !busy,
+                                Button::new(RichText::new("Choose…").small()),
+                            )
+                            .on_hover_text(
+                                "Pick which sessions are backed up (new ones are included)",
+                            )
+                            .clicked()
+                        {
+                            choose = true;
+                        }
                     },
                 );
-                if ui
-                    .add_enabled(
-                        cells.sessions_choosable() && !busy,
-                        Button::new(RichText::new("Choose…").small()),
-                    )
-                    .on_hover_text("Pick which sessions are backed up (new ones are included)")
-                    .clicked()
-                {
-                    choose = true;
+                if let Some(on) = flipped {
+                    d.sessions = on;
                 }
+            });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let (t, why) = cells.memory_text();
+                part_switch(
+                    ui,
+                    "Memory",
+                    d.memory,
+                    cells.memory_usable(),
+                    &t,
+                    why,
+                    |on| d.memory = on,
+                );
             });
             if d.excluded > 0 {
                 ui.add_space(4.0);
@@ -763,6 +910,7 @@ pub struct VersionRow {
     pub bytes: u64,
     pub has_omp: bool,
     pub has_sessions: bool,
+    pub has_memory: bool,
 }
 
 /// A project on Drive: every version of one (host, path).
@@ -799,6 +947,13 @@ pub struct PlanView {
     pub omp_added: usize,
     /// ".omp files that will NOT be written" ("<path>: <reason>").
     pub omp_skipped: Vec<String>,
+    /// The target already has omp memory files.
+    pub memory_exists: bool,
+    /// Names of the memory files that will be overwritten.
+    pub memory_overwritten: Vec<String>,
+    pub memory_added: usize,
+    /// Memory files that will NOT be written ("<name>: <reason>").
+    pub memory_skipped: Vec<String>,
     /// Sessions that cannot be restored ("<title>: <reason>").
     pub session_problems: Vec<String>,
     /// `Some((sessions, with a new id))` when sessions are restored.
@@ -808,7 +963,15 @@ pub struct PlanView {
 
 impl PlanView {
     pub fn danger(&self) -> bool {
+        self.omp_danger() || self.memory_danger()
+    }
+
+    fn omp_danger(&self) -> bool {
         self.omp_exists && self.omp_overwritten_total > 0
+    }
+
+    fn memory_danger(&self) -> bool {
+        self.memory_exists && !self.memory_overwritten.is_empty()
     }
 }
 
@@ -817,6 +980,10 @@ pub struct ReportView {
     pub failures: Vec<(String, String)>,
     /// ".omp files that were not written" ("<path>: <reason>").
     pub notes: Vec<String>,
+    /// Memory files that were not written ("<name>: <reason>").
+    pub memory_notes: Vec<String>,
+    /// Why memory was not restored at all (the other parts were).
+    pub memory_error: Option<String>,
 }
 
 pub enum Step {
@@ -839,6 +1006,7 @@ pub struct RestoreDialog {
     pub target_status: TargetStatus,
     pub omp: bool,
     pub sessions: bool,
+    pub memory: bool,
     /// omp was found (sessions are restored through it).
     pub omp_available: bool,
     pub picker: bool,
@@ -866,6 +1034,7 @@ impl RestoreDialog {
             target_status: TargetStatus::Unknown,
             omp: false,
             sessions: false,
+            memory: false,
             omp_available,
             picker,
             picking: false,
@@ -886,7 +1055,7 @@ impl RestoreDialog {
     pub fn can_continue(&self, lane_busy: bool) -> bool {
         !lane_busy
             && self.version().is_some()
-            && (self.omp || self.sessions)
+            && (self.omp || self.sessions || self.memory)
             && !self.target.trim().is_empty()
     }
 }
@@ -983,6 +1152,31 @@ pub fn restore_dialog(
                             );
                         }
                     });
+                }
+                if let Some(e) = &r.memory_error {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(icon_text(ICON_TRIANGLE_ALERT, 16.0, pal.warn));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Memory was not restored: {e}"))
+                                    .color(pal.warn),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Wrap),
+                        );
+                    });
+                }
+                if !r.memory_notes.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("These memory files were not written:").color(pal.warn));
+                    for n in &r.memory_notes {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("• {n}")).small().color(pal.text),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Wrap),
+                        );
+                    }
                 }
             }
         },
@@ -1168,9 +1362,9 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
         );
     }
     ui.add_space(10.0);
-    let (has_omp, has_sessions) = d
-        .version()
-        .map_or((false, false), |v| (v.has_omp, v.has_sessions));
+    let (has_omp, has_sessions, has_memory) = d.version().map_or((false, false, false), |v| {
+        (v.has_omp, v.has_sessions, v.has_memory)
+    });
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 16.0;
         ui.add_enabled(has_omp, egui::Checkbox::new(&mut d.omp, ".omp folder"));
@@ -1181,6 +1375,7 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
         if has_sessions && !d.omp_available {
             sess.on_disabled_hover_text("omp was not found: sessions are restored through it");
         }
+        ui.add_enabled(has_memory, egui::Checkbox::new(&mut d.memory, "Memory"));
     });
     if has_sessions && !d.omp_available {
         weak_note(
@@ -1207,52 +1402,25 @@ fn confirm_body(ui: &mut Ui, plan: &PlanView) {
                 .color(pal.weak),
         );
     }
-    if plan.danger() {
-        ui.add_space(8.0);
-        Frame::NONE
-            .fill(pal.danger.gamma_multiply(0.12))
-            .stroke(Stroke::new(1.0, pal.danger.gamma_multiply(0.6)))
-            .corner_radius(theme::rad(6, 10))
-            .inner_margin(Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(icon_text(ICON_TRIANGLE_ALERT, 16.0, pal.danger));
-                    ui.label(
-                        theme::strong(format!(
-                            "{} file{} in the existing .omp will be overwritten",
-                            plan.omp_overwritten_total,
-                            if plan.omp_overwritten_total == 1 {
-                                ""
-                            } else {
-                                "s"
-                            }
-                        ))
-                        .color(pal.danger),
-                    );
-                });
-                for rel in &plan.omp_overwritten {
-                    ui.label(RichText::new(format!("• {rel}")).small().color(pal.text));
+    if plan.omp_danger() {
+        overwrite_warning(
+            ui,
+            &format!(
+                "{} file{} in the existing .omp will be overwritten",
+                plan.omp_overwritten_total,
+                if plan.omp_overwritten_total == 1 {
+                    ""
+                } else {
+                    "s"
                 }
-                let more = plan
-                    .omp_overwritten_total
-                    .saturating_sub(plan.omp_overwritten.len());
-                if more > 0 {
-                    ui.label(
-                        RichText::new(format!("… and {more} more"))
-                            .small()
-                            .color(pal.weak),
-                    );
-                }
-                ui.label(
-                    RichText::new(format!(
-                        "Other files are kept. Overwritten files are first copied to {}.",
-                        plan.safety
-                    ))
-                    .small()
-                    .color(pal.weak),
-                );
-            });
+            ),
+            &plan.omp_overwritten,
+            plan.omp_overwritten_total,
+            &format!(
+                "Other files are kept. Overwritten files are first copied to {}.",
+                plan.safety
+            ),
+        );
     } else if plan.omp_added > 0 {
         ui.add_space(6.0);
         wrap(
@@ -1265,7 +1433,7 @@ fn confirm_body(ui: &mut Ui, plan: &PlanView) {
             .color(pal.text),
         );
     }
-    if plan.danger() && plan.omp_added > 0 {
+    if plan.omp_danger() && plan.omp_added > 0 {
         ui.add_space(4.0);
         wrap(
             ui,
@@ -1274,6 +1442,30 @@ fn confirm_body(ui: &mut Ui, plan: &PlanView) {
                 plan.omp_added
             ))
             .small()
+            .color(pal.text),
+        );
+    }
+    if plan.memory_danger() {
+        let n = plan.memory_overwritten.len();
+        overwrite_warning(
+            ui,
+            &format!(
+                "This folder already has omp memory: {n} file{} will be overwritten (copies saved first)",
+                if n == 1 { "" } else { "s" }
+            ),
+            &plan.memory_overwritten,
+            n,
+            &format!("Overwritten files are first copied to {}.", plan.safety),
+        );
+    } else if plan.memory_added > 0 {
+        ui.add_space(6.0);
+        wrap(
+            ui,
+            RichText::new(format!(
+                "{} memory file{} will be added.",
+                plan.memory_added,
+                if plan.memory_added == 1 { "" } else { "s" }
+            ))
             .color(pal.text),
         );
     }
@@ -1297,9 +1489,47 @@ fn confirm_body(ui: &mut Ui, plan: &PlanView) {
     );
     warn_list(
         ui,
+        "Memory files that will NOT be written:",
+        &plan.memory_skipped,
+    );
+    warn_list(
+        ui,
         "Sessions that cannot be restored:",
         &plan.session_problems,
     );
+}
+
+/// The danger box of the confirm step: `title`, the first `names`, "… and N more" up to `total`, `note`.
+fn overwrite_warning(ui: &mut Ui, title: &str, names: &[String], total: usize, note: &str) {
+    let pal = Palette::of_ui(ui);
+    ui.add_space(8.0);
+    Frame::NONE
+        .fill(pal.danger.gamma_multiply(0.12))
+        .stroke(Stroke::new(1.0, pal.danger.gamma_multiply(0.6)))
+        .corner_radius(theme::rad(6, 10))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(icon_text(ICON_TRIANGLE_ALERT, 16.0, pal.danger));
+                ui.add(
+                    egui::Label::new(theme::strong(title).color(pal.danger))
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                );
+            });
+            for rel in names {
+                ui.label(RichText::new(format!("• {rel}")).small().color(pal.text));
+            }
+            let more = total.saturating_sub(names.len());
+            if more > 0 {
+                ui.label(
+                    RichText::new(format!("… and {more} more"))
+                        .small()
+                        .color(pal.weak),
+                );
+            }
+            ui.label(RichText::new(note).small().color(pal.weak));
+        });
 }
 
 fn warn_list(ui: &mut Ui, title: &str, items: &[String]) {
@@ -1838,6 +2068,10 @@ mod tests {
             omp_overwritten: Vec::new(),
             omp_added: 0,
             omp_skipped: Vec::new(),
+            memory_exists: false,
+            memory_overwritten: Vec::new(),
+            memory_added: 0,
+            memory_skipped: Vec::new(),
             session_problems: Vec::new(),
             sessions: None,
             safety: String::new(),
@@ -1849,6 +2083,18 @@ mod tests {
         assert!(plan(true, 2).danger());
         assert!(!plan(true, 0).danger());
         assert!(!plan(false, 0).danger());
+    }
+
+    #[test]
+    fn overwriting_existing_memory_is_dangerous_only_with_overlap() {
+        let mut p = plan(false, 0);
+        assert!(!p.danger());
+        p.memory_exists = true;
+        assert!(!p.danger(), "nothing overlaps");
+        p.memory_overwritten = vec!["product.md".into()];
+        assert!(p.danger());
+        p.memory_exists = false;
+        assert!(!p.danger());
     }
 
     fn item(id: &str, title: &str, bytes: u64, on: bool) -> SessionItem {
@@ -1895,6 +2141,7 @@ mod tests {
             bytes,
             has_omp: true,
             has_sessions: false,
+            has_memory: false,
         }
     }
 
@@ -1946,6 +2193,7 @@ mod tests {
                 bytes: 0,
                 has_omp: true,
                 has_sessions: false,
+                has_memory: false,
             }],
         }]);
         d.sel = Some((0, 0));
@@ -1988,6 +2236,10 @@ mod render_tests {
                 included: 2,
                 text: "2 sessions · 3 KB".into(),
             },
+            memory: MemoryCell::Present {
+                text: "1 KB · 2 files".into(),
+                dir: "/mem/bank".into(),
+            },
         }
     }
 
@@ -1998,6 +2250,7 @@ mod render_tests {
             full: "/home/u/app".into(),
             omp_on: true,
             sessions_on: true,
+            memory_on: true,
             cells: cells(),
             last: LastView::Failed("offline".into()),
             busy: Some(ProgView {
@@ -2039,6 +2292,7 @@ mod render_tests {
                 bytes: 1024,
                 has_omp: true,
                 has_sessions: true,
+                has_memory: true,
             }],
         }]);
         d.sel = Some((0, 0));
@@ -2053,6 +2307,9 @@ mod render_tests {
             Step::Confirm(PlanView {
                 omp_overwritten: vec!["a.md".into()],
                 omp_overwritten_total: 5,
+                memory_exists: true,
+                memory_overwritten: vec!["product.md".into()],
+                memory_skipped: vec!["style.md: symlink".into()],
                 sessions: Some((2, 1)),
                 ..super::tests::plan_for_render()
             }),
@@ -2061,6 +2318,8 @@ mod render_tests {
                 summary: "done".into(),
                 failures: vec![("t".into(), "why".into())],
                 notes: vec!["a.md: symlink".into()],
+                memory_notes: vec!["style.md: symlink".into()],
+                memory_error: Some("omp is busy".into()),
             }),
         ];
         for step in steps {
@@ -2082,6 +2341,7 @@ mod render_tests {
             path: "/w/app".into(),
             display: "~/app".into(),
             omp: true,
+            memory: true,
             sessions: true,
             keep: true,
             excluded_ids: ["a".to_owned(), "b".to_owned()].into(),

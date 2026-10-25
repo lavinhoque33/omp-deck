@@ -1,5 +1,6 @@
-//! What a project consists of, found with metadata only: the `.omp` files, the sessions of the
-//! folder with their artifacts, and the fingerprint over their (path, length, mtime).
+//! What a project consists of, found with metadata only: the `.omp` files, the omp memory bank
+//! files, the sessions of the folder with their artifacts, and the fingerprint over their
+//! (path, length, mtime).
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
@@ -9,10 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use super::{OmpDir, Parts, ProjectSizes, SessionSize, same_path};
+use super::{MemoryBank, OmpDir, Parts, ProjectSizes, SessionSize, same_path};
 use crate::gdrive::archive::hex;
 use crate::platform;
 use crate::sessions::{self, SessionsRoot};
+use crate::sharpshooter::{self, MEMORY_FILES};
 
 /// Deepest nesting (path components below `.omp` / the artifacts directory) that is followed.
 const MAX_DEPTH: usize = 16;
@@ -45,6 +47,13 @@ pub(super) struct Snapshot {
     parts: Parts,
     pub omp: OmpDir,
     pub omp_files: Vec<FileRef>,
+    pub memory: MemoryBank,
+    /// The bank folder of the project (it may not exist).
+    pub memory_dir: PathBuf,
+    /// Non-empty regular memory files (`rel` = the file name).
+    pub memory_files: Vec<FileRef>,
+    /// Memory files left out (`memory/<name>: <reason>`).
+    pub memory_skipped: Vec<String>,
     pub sessions: Vec<SessionSnap>,
     /// `<agent>/blobs`.
     pub blob_dir: PathBuf,
@@ -93,6 +102,8 @@ impl Snapshot {
                 Err(e) => return Err(e),
             }
         };
+        let memory_dir = sharpshooter::bank_dir(root, project);
+        let (memory, memory_files, memory_skipped) = take_memory(&memory_dir);
         let mut session_notes = Vec::new();
         let mut matched = BTreeSet::new();
         let sessions = if parts.sessions {
@@ -104,6 +115,10 @@ impl Snapshot {
             parts,
             omp,
             omp_files,
+            memory,
+            memory_dir,
+            memory_files,
+            memory_skipped,
             sessions,
             blob_dir: root.agent_dir().join("blobs"),
             skipped,
@@ -127,9 +142,13 @@ impl Snapshot {
         self.parts.sessions && !self.sessions.is_empty()
     }
 
+    pub(super) fn memory_included(&self) -> bool {
+        self.parts.memory && !self.memory_files.is_empty()
+    }
+
     /// Nothing of the requested parts exists.
     pub(super) fn is_empty(&self) -> bool {
-        !self.omp_included() && !self.sessions_included()
+        !self.omp_included() && !self.memory_included() && !self.sessions_included()
     }
 
     /// Totals over the sessions in the snapshot (take it with no exclusions to measure a
@@ -148,6 +167,8 @@ impl Snapshot {
         session_list.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
         ProjectSizes {
             omp: self.omp,
+            memory: self.memory,
+            memory_dir: self.memory_dir.clone(),
             sessions: session_list.len() as u64,
             session_bytes: session_list.iter().map(|s| s.bytes).sum(),
             session_list,
@@ -169,6 +190,18 @@ impl Snapshot {
             &u8::from(self.parts.omp).to_string(),
             &u8::from(self.parts.sessions).to_string(),
         ]);
+        // Only when selected: fingerprints of rows without Memory stay what they always were.
+        if self.parts.memory {
+            line(&["memory"]);
+            for f in &self.memory_files {
+                line(&[
+                    "memory",
+                    &f.rel,
+                    &f.len.to_string(),
+                    &f.mtime_ns.to_string(),
+                ]);
+            }
+        }
         if self.parts.sessions {
             for id in &self.excluded {
                 line(&["excluded", id]);
@@ -319,6 +352,59 @@ fn file_ref(path: &Path, rel: String) -> Option<FileRef> {
     })
 }
 
+/// The memory bank folder at `bank`, looked at without following links: its non-empty regular
+/// memory files (the only ones omp reads), and the entries that are left out with a reason
+/// (`memory/<name>: <reason>`). A symlinked bank folder is not followed: all three names are
+/// reported.
+fn take_memory(bank: &Path) -> (MemoryBank, Vec<FileRef>, Vec<String>) {
+    match fs::symlink_metadata(bank) {
+        Ok(m) if m.file_type().is_symlink() => {
+            let skipped = MEMORY_FILES
+                .iter()
+                .map(|n| format!("memory/{n}: the memory folder is a symbolic link, not backed up"))
+                .collect();
+            return (MemoryBank::Missing, Vec::new(), skipped);
+        }
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return (MemoryBank::Missing, Vec::new(), Vec::new()),
+        Err(e) => {
+            if e.kind() != io::ErrorKind::NotFound {
+                log::warn!("cannot read {}: {e}", bank.display());
+            }
+            return (MemoryBank::Missing, Vec::new(), Vec::new());
+        }
+    }
+    let (mut files, mut skipped) = (Vec::new(), Vec::new());
+    for name in MEMORY_FILES {
+        let path = bank.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                skipped.push(format!("memory/{name}: symbolic link, not backed up"));
+            }
+            Ok(m) if m.is_file() => {
+                // An empty file is "no memory for this category", nothing to keep.
+                match file_ref(&path, name.to_owned()) {
+                    Some(f) if f.len > 0 => files.push(f),
+                    Some(_) => {}
+                    None => skipped.push(format!("memory/{name}: cannot be read")),
+                }
+            }
+            Ok(_) => skipped.push(format!("memory/{name}: not a regular file")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => skipped.push(format!("memory/{name}: cannot be read ({e})")),
+        }
+    }
+    let memory = if files.is_empty() {
+        MemoryBank::Missing
+    } else {
+        MemoryBank::Present {
+            files: files.len() as u64,
+            bytes: files.iter().map(|f| f.len).sum(),
+        }
+    };
+    (memory, files, skipped)
+}
+
 /// Regular files below `dir` in name order. `skip_vcs`: leave out `node_modules` and `.git`.
 /// A failing top-level directory is an error when `top`; deeper failures are skipped. Everything
 /// that is left out for a reason the user may care about (not `node_modules`/`.git`) is
@@ -406,6 +492,7 @@ mod tests {
     const BOTH: Parts = Parts {
         omp: true,
         sessions: true,
+        memory: false,
     };
 
     fn write(path: &Path, text: &str) {
@@ -538,11 +625,167 @@ mod tests {
         let omp_only = Parts {
             omp: true,
             sessions: false,
+            memory: false,
         };
         let first = fp(omp_only);
         assert_eq!(fp(omp_only), first);
         assert_ne!(fp(BOTH), first, "the part flags are part of the identity");
         write(&proj.join(".omp/AGENTS.md"), "longer");
         assert_ne!(fp(omp_only), first);
+    }
+
+    fn stamp(path: &Path) {
+        // A multiple of 100 ns: every platform's file times can hold it exactly.
+        let t = UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_700);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    /// Every install stores the fingerprint of its last backup to decide "unchanged". A row
+    /// without Memory must hash exactly what it hashed before the Memory part existed, or all
+    /// of them would re-upload once. The expected values are sha256 over the pre-Memory format
+    /// (header line, then `omp` / `session` / `artifact` lines with name, length, mtime ns),
+    /// computed independently of this code and checked against the old code's output.
+    #[test]
+    fn fingerprints_of_rows_without_memory_are_byte_identical_to_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let agent = tmp.path().join("agent");
+        let root = SessionsRoot::at(agent.join("sessions"));
+        for (rel, text) in [(".omp/AGENTS.md", "rules"), (".omp/rules/r.md", "r")] {
+            write(&proj.join(rel), text);
+            stamp(&proj.join(rel));
+        }
+        // The jsonl is padded to 600 bytes so its length does not depend on the temp path.
+        let jsonl = agent
+            .join("sessions/enc")
+            .join("2026-01-01T00-00-00-000Z_s1.jsonl");
+        let mut text = format!(
+            "{{\"type\":\"session\",\"id\":\"s1\",\"cwd\":{}}}\n\
+             {{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n{{}}",
+            serde_json::to_string(&proj.display().to_string()).unwrap()
+        );
+        assert!(text.len() < 599, "temp path too long for the fixture");
+        text.push_str(&" ".repeat(599 - text.len()));
+        text.push('\n');
+        write(&jsonl, &text);
+        stamp(&jsonl);
+        let art = jsonl.with_extension("").join("a.txt");
+        write(&art, "art");
+        stamp(&art);
+
+        let fp = |omp, sessions| {
+            let parts = Parts {
+                omp,
+                sessions,
+                memory: false,
+            };
+            Snapshot::take(&root, &proj, parts, &BTreeSet::new(), None)
+                .unwrap()
+                .fingerprint()
+                .to_owned()
+        };
+        assert_eq!(
+            fp(true, false),
+            "f2a6f85b635c6b9bbfea9b96687070d1379654c1a1d09bb247d2279753490129"
+        );
+        assert_eq!(
+            fp(false, true),
+            "5d4f1eca073b6d263d2b2f731f0b4d8a0410209c2ca1a6601037e2f95222e4fd"
+        );
+        assert_eq!(
+            fp(true, true),
+            "580dc83fbabe17ec4046b27f298ad63eaf5a18c224abffd52e9e9cd7544cb327"
+        );
+
+        // With Memory selected the fingerprint is a different one, and it follows the memory
+        // files (metadata only) but not memory files that are not selected.
+        let bank = sharpshooter::bank_dir(&root, &proj);
+        let with = |memory| {
+            let parts = Parts {
+                omp: true,
+                sessions: true,
+                memory,
+            };
+            Snapshot::take(&root, &proj, parts, &BTreeSet::new(), None)
+                .unwrap()
+                .fingerprint()
+                .to_owned()
+        };
+        let off = with(false);
+        assert_eq!(off, fp(true, true));
+        write(&bank.join("style.md"), "one");
+        assert_eq!(with(false), off, "memory files do not matter while off");
+        let on = with(true);
+        assert_ne!(on, off);
+        write(&bank.join("style.md"), "longer");
+        assert_ne!(with(true), on);
+    }
+
+    #[test]
+    fn memory_files_are_the_non_empty_regular_ones_and_links_are_never_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let root = SessionsRoot::at(tmp.path().join("agent/sessions"));
+        let bank = sharpshooter::bank_dir(&root, &proj);
+        let memory =
+            |parts: Parts| Snapshot::take(&root, &proj, parts, &BTreeSet::new(), None).unwrap();
+        let only = Parts {
+            omp: false,
+            sessions: false,
+            memory: true,
+        };
+
+        // No bank at all.
+        let snap = memory(only);
+        assert_eq!(snap.memory, MemoryBank::Missing);
+        assert_eq!(snap.memory_dir, bank);
+        assert!(snap.is_empty() && snap.memory_skipped.is_empty());
+
+        // Empty files are "no memory for that category"; queue/state files are not memory.
+        write(&bank.join("architecture.md"), "");
+        write(&bank.join("product.md"), "12345");
+        write(&bank.join("state.json"), "{}");
+        write(&bank.join("queue/s/1.json"), "{}");
+        let snap = memory(only);
+        assert_eq!(snap.memory, MemoryBank::Present { files: 1, bytes: 5 });
+        let rels: Vec<&str> = snap.memory_files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, ["product.md"]);
+        assert!(snap.memory_included() && !snap.is_empty());
+        // Not selected → sized (for the Sync page) but not part of the backup.
+        let unselected = memory(Parts::default());
+        assert_eq!(unselected.memory, snap.memory);
+        assert!(!unselected.memory_included() && unselected.is_empty());
+        assert_eq!(unselected.sizes().memory_dir, bank);
+
+        #[cfg(unix)]
+        {
+            // A symlinked memory file is listed, not followed.
+            let outside = tmp.path().join("outside.md");
+            fs::write(&outside, "secret").unwrap();
+            symlink(&outside, bank.join("style.md")).unwrap();
+            let snap = memory(only);
+            assert_eq!(snap.memory_files.len(), 1);
+            assert_eq!(
+                snap.memory_skipped,
+                ["memory/style.md: symbolic link, not backed up"]
+            );
+
+            // A symlinked bank folder is not followed at all.
+            let real = tmp.path().join("real-bank");
+            write(&real.join("product.md"), "12345");
+            fs::remove_dir_all(&bank).unwrap();
+            symlink(&real, &bank).unwrap();
+            let snap = memory(only);
+            assert!(snap.memory_files.is_empty() && snap.is_empty());
+            assert_eq!(snap.memory, MemoryBank::Missing);
+            assert_eq!(snap.memory_skipped.len(), 3);
+            assert!(snap.memory_skipped[0].starts_with("memory/architecture.md: "));
+        }
     }
 }

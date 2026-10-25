@@ -13,9 +13,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use deck_core::config::{SyncInterval, SyncRow};
 use deck_core::gdrive::{
-    Error, OmpDir, Parts, PreparedProjectRestore, Progress, ProjectBackup, ProjectBackupOutcome,
-    ProjectRestoreReport, ProjectSizes, ProjectSyncState, Service, Stage, hostname, measure,
-    path_id,
+    Error, MemoryBank, OmpDir, Parts, PreparedProjectRestore, Progress, ProjectBackup,
+    ProjectBackupOutcome, ProjectRestoreReport, ProjectSizes, ProjectSyncState, Service, Stage,
+    hostname, measure, path_id,
 };
 use deck_core::sessions::abbreviate_home;
 
@@ -26,9 +26,10 @@ use crate::omp_worker;
 use crate::sidebar::{DriveMenu, format_age};
 use crate::sync_view::{
     self, BackupAnswer, BackupDialog, Cells, CloudProject, LastView, ListState, ManagerAction,
-    ManagerDialog, ManagerStep, OmpCell, PathAnswer, PathPrompt, PathPurpose, PlanView, ProgView,
-    ReportView, RestoreAction, RestoreDialog, RowView, SessionItem, SessionsAnswer, SessionsCell,
-    SessionsDialog, SessionsTarget, Step, SyncAction, SyncPage, TargetStatus, VersionRow,
+    ManagerDialog, ManagerStep, MemoryCell, OmpCell, PathAnswer, PathPrompt, PathPurpose, PlanView,
+    ProgView, ReportView, RestoreAction, RestoreDialog, RowView, SessionItem, SessionsAnswer,
+    SessionsCell, SessionsDialog, SessionsTarget, Step, SyncAction, SyncPage, TargetStatus,
+    VersionRow,
 };
 use crate::transfer;
 use crate::tree_layout::clock;
@@ -76,6 +77,7 @@ impl Shared {
             Stage::Verifying => "Verifying",
             Stage::RestoringOmp => "Restoring .omp",
             Stage::RestoringSessions => "Restoring sessions",
+            Stage::RestoringMemory => "Restoring memory",
         };
         *self.prog.lock().unwrap_or_else(PoisonError::into_inner) = Some(Prog {
             label,
@@ -271,6 +273,7 @@ fn loading_cells() -> Cells {
     Cells {
         omp: OmpCell::Loading,
         sessions: SessionsCell::Loading,
+        memory: MemoryCell::Loading,
     }
 }
 
@@ -282,11 +285,19 @@ fn cells_of(sizes: Option<&Result<ProjectSizes, String>>, excluded: &BTreeSet<St
         Some(Err(e)) => Cells {
             omp: OmpCell::Failed(e.clone()),
             sessions: SessionsCell::Failed(e.clone()),
+            memory: MemoryCell::Failed(e.clone()),
         },
         Some(Ok(s)) => {
             let (included, bytes) = included_sessions(s, excluded);
             let plural = |n: u64| if n == 1 { "" } else { "s" };
             Cells {
+                memory: match &s.memory {
+                    MemoryBank::Missing => MemoryCell::Missing,
+                    MemoryBank::Present { files, bytes } => MemoryCell::Present {
+                        text: format!("{} · {files} file{}", human_size(*bytes), plural(*files)),
+                        dir: s.memory_dir.display().to_string(),
+                    },
+                },
                 omp: match &s.omp {
                     OmpDir::Missing => OmpCell::Missing,
                     OmpDir::Global => OmpCell::Global,
@@ -345,11 +356,31 @@ fn session_items(sizes: &ProjectSizes, excluded: &BTreeSet<String>) -> Vec<Sessi
         .collect()
 }
 
+/// "memory: 2 files written (1 overwritten)" for the restore summary; `None` when nothing was written.
+fn memory_summary(written: usize, overwritten: usize) -> Option<String> {
+    (written > 0).then(|| {
+        format!(
+            "memory: {written} file{} written ({overwritten} overwritten)",
+            if written == 1 { "" } else { "s" },
+        )
+    })
+}
+
+/// A Sync row's switches as backup parts.
+fn parts_of(row: &SyncRow) -> Parts {
+    Parts {
+        omp: row.omp,
+        sessions: row.sessions,
+        memory: row.memory,
+    }
+}
+
 /// What a backup of `path` can include right now, given the user's switches and exclusions.
 fn usable_parts(want: Parts, sizes: &ProjectSizes, excluded: &BTreeSet<String>) -> Parts {
     Parts {
         omp: want.omp && matches!(sizes.omp, OmpDir::Present { .. }),
         sessions: want.sessions && included_sessions(sizes, excluded).0 > 0,
+        memory: want.memory && matches!(sizes.memory, MemoryBank::Present { .. }),
     }
 }
 
@@ -418,10 +449,7 @@ impl App {
             .project_sync
             .iter()
             .find(|r| r.path == path)
-            .map_or(Parts::default(), |r| Parts {
-                omp: r.omp,
-                sessions: r.sessions,
-            })
+            .map_or(Parts::default(), parts_of)
     }
 
     /// Measures, then backs up `path` with whichever of `want` exists, leaving out the sessions
@@ -536,7 +564,7 @@ impl App {
         if let Some(path) = self.sync.pass.pop_front() {
             let want = self.row_parts(&path);
             let row = self.cfg.project_sync.iter().find(|r| r.path == path);
-            // Measured and nothing usable (no .omp, every session opted out): skip quietly.
+            // Measured and nothing usable (nothing present, every session opted out): skip quietly.
             let usable = match (row, self.sync.sizes.get(&path)) {
                 (Some(r), Some(Ok(s))) => usable_parts(want, s, &r.excluded_sessions).any(),
                 (Some(_), _) => true,
@@ -562,7 +590,7 @@ impl App {
                 .cfg
                 .project_sync
                 .iter()
-                .filter(|r| r.omp || r.sessions)
+                .filter(|r| parts_of(r).any())
                 .map(|r| r.path.clone())
                 .collect();
             self.sync.pass_failure_shown = false;
@@ -616,6 +644,7 @@ impl App {
                     full: r.path.display().to_string(),
                     omp_on: r.omp,
                     sessions_on: r.sessions,
+                    memory_on: r.memory,
                     cells: self
                         .sync
                         .cells
@@ -668,15 +697,15 @@ impl App {
                     self.dirty = true;
                 }
             }
+            SyncAction::SetMemory(i, on) => {
+                if let Some(r) = self.cfg.project_sync.get_mut(i) {
+                    r.memory = on;
+                    self.dirty = true;
+                }
+            }
             SyncAction::BackUp(i) => {
                 if let Some(r) = self.cfg.project_sync.get(i) {
-                    let (path, want) = (
-                        r.path.clone(),
-                        Parts {
-                            omp: r.omp,
-                            sessions: r.sessions,
-                        },
-                    );
+                    let (path, want) = (r.path.clone(), parts_of(r));
                     let excluded = r.excluded_sessions.clone();
                     if !self.start_project_backup(path, want, false, excluded) {
                         self.toasts.info(
@@ -746,6 +775,7 @@ impl App {
                 path: path.clone(),
                 omp: false,
                 sessions: false,
+                memory: false,
                 excluded_sessions: BTreeSet::new(),
             }),
             PathPurpose::Change(i) => {
@@ -984,6 +1014,7 @@ impl App {
             display: abbreviate_home(&path),
             omp: row.is_none_or(|r| r.omp),
             sessions: row.is_none_or(|r| r.sessions),
+            memory: row.is_none_or(|r| r.memory),
             keep: true,
             excluded_ids: row.map_or_else(BTreeSet::new, |r| r.excluded_sessions.clone()),
             excluded: 0,
@@ -1019,12 +1050,14 @@ impl App {
                 let want = Parts {
                     omp: d.omp,
                     sessions: d.sessions,
+                    memory: d.memory,
                 };
                 if d.keep {
                     match self.cfg.project_sync.iter_mut().find(|r| r.path == d.path) {
                         Some(r) => {
                             r.omp = d.omp;
                             r.sessions = d.sessions;
+                            r.memory = d.memory;
                             r.excluded_sessions = d.excluded_ids.clone();
                         }
                         None => {
@@ -1032,6 +1065,7 @@ impl App {
                                 path: d.path.clone(),
                                 omp: d.omp,
                                 sessions: d.sessions,
+                                memory: d.memory,
                                 excluded_sessions: d.excluded_ids.clone(),
                             });
                         }
@@ -1149,12 +1183,13 @@ impl App {
         r.dlg.sel = Some((p, v));
         r.dlg.error = None;
         let omp_ok = r.dlg.omp_available;
-        let (has_omp, has_sessions) = r
-            .dlg
-            .version()
-            .map_or((false, false), |v| (v.has_omp, v.has_sessions));
+        let (has_omp, has_sessions, has_memory) =
+            r.dlg.version().map_or((false, false, false), |v| {
+                (v.has_omp, v.has_sessions, v.has_memory)
+            });
         r.dlg.omp = has_omp;
         r.dlg.sessions = has_sessions && omp_ok;
+        r.dlg.memory = has_memory;
         // Offer the original folder when it exists here.
         if !r.dlg.target_fixed && !r.target_touched {
             r.dlg.target.clear();
@@ -1274,6 +1309,7 @@ impl App {
         let parts = Parts {
             omp: r.dlg.omp,
             sessions: r.dlg.sessions,
+            memory: r.dlg.memory,
         };
         let root = self.root.clone();
         let started = self.lane_job(Kind::Preparing, move |service, cancel, report| {
@@ -1326,6 +1362,10 @@ impl App {
                         .collect(),
                     omp_added: plan.omp_added.len(),
                     omp_skipped: plan.omp_skipped.clone(),
+                    memory_exists: plan.memory_exists,
+                    memory_overwritten: plan.memory_overwritten.clone(),
+                    memory_added: plan.memory_added.len(),
+                    memory_skipped: plan.memory_skipped.clone(),
                     session_problems: plan
                         .sessions
                         .iter()
@@ -1380,6 +1420,10 @@ impl App {
                         report.omp_overwritten
                     ));
                 }
+                parts.extend(memory_summary(
+                    report.memory_written,
+                    report.memory_overwritten,
+                ));
                 let added = report.sessions_added.len();
                 if report.cancelled && total > 0 {
                     parts.push(format!("{added} of {total} sessions added"));
@@ -1404,7 +1448,10 @@ impl App {
                     );
                 }
                 self.refresh_sessions();
-                let details = !report.sessions_failed.is_empty() || !report.omp_skipped.is_empty();
+                let details = !report.sessions_failed.is_empty()
+                    || !report.omp_skipped.is_empty()
+                    || !report.memory_skipped.is_empty()
+                    || report.memory_error.is_some();
                 if !details {
                     if report.cancelled {
                         self.toasts.info(&self.ctx, summary);
@@ -1418,16 +1465,19 @@ impl App {
                         summary,
                         failures: report.sessions_failed,
                         notes: report.omp_skipped,
+                        memory_notes: report.memory_skipped,
+                        memory_error: report.memory_error,
                     });
                 } else {
-                    self.toasts.error(
-                        &self.ctx,
-                        format!(
-                            "{summary} {} session(s) could not be restored, {} file(s) not written.",
-                            report.sessions_failed.len(),
-                            report.omp_skipped.len()
-                        ),
+                    let mut text = format!(
+                        "{summary} {} session(s) could not be restored, {} file(s) not written.",
+                        report.sessions_failed.len(),
+                        report.omp_skipped.len() + report.memory_skipped.len()
                     );
+                    if let Some(e) = &report.memory_error {
+                        text += &format!(" Memory was not restored: {e}.");
+                    }
+                    self.toasts.error(&self.ctx, text);
                 }
             }
             Err(e) => {
@@ -1754,6 +1804,7 @@ impl App {
                             // Back to the state of a freshly opened dialog with nothing picked.
                             r.dlg.omp = false;
                             r.dlg.sessions = false;
+                            r.dlg.memory = false;
                             r.dlg.error = None;
                             if !r.dlg.target_fixed && !r.target_touched {
                                 r.dlg.target.clear();
@@ -1873,6 +1924,9 @@ fn version_row(index: usize, b: &ProjectBackup) -> VersionRow {
             human_size(b.session_bytes.unwrap_or(0))
         ));
     }
+    if let Some(bytes) = b.memory_bytes {
+        parts.push(format!("memory {}", human_size(bytes)));
+    }
     VersionRow {
         backup: index,
         when: b
@@ -1883,6 +1937,7 @@ fn version_row(index: usize, b: &ProjectBackup) -> VersionRow {
         bytes: b.file.size,
         has_omp: b.omp_bytes.is_some(),
         has_sessions: b.sessions.is_some(),
+        has_memory: b.memory_bytes.is_some(),
     }
 }
 
@@ -1916,12 +1971,15 @@ mod tests {
             omp_bytes: omp,
             sessions: sess,
             session_bytes: sess.map(|_| 2048),
+            memory_bytes: None,
         }
     }
 
     fn sizes(omp: OmpDir, sessions: u64) -> ProjectSizes {
         ProjectSizes {
             omp,
+            memory: MemoryBank::Present { files: 2, bytes: 3 },
+            memory_dir: "/mem/bank".into(),
             sessions,
             session_bytes: 4096,
             session_list: (0..sessions)
@@ -1945,6 +2003,7 @@ mod tests {
         let want = Parts {
             omp: true,
             sessions: true,
+            memory: false,
         };
         assert!(usable_parts(want, &s, &BTreeSet::new()).any());
         assert!(!usable_parts(want, &s, &all).any());
@@ -1994,6 +2053,7 @@ mod tests {
         let want = Parts {
             omp: true,
             sessions: true,
+            memory: true,
         };
         let none = BTreeSet::new();
         let both = usable_parts(
@@ -2007,15 +2067,39 @@ mod tests {
             no_omp,
             Parts {
                 omp: false,
-                sessions: true
+                sessions: true,
+                memory: true,
             }
         );
-        let global = usable_parts(want, &sizes(OmpDir::Global, 0), &none);
+        let no_memory = usable_parts(
+            want,
+            &ProjectSizes {
+                memory: MemoryBank::Missing,
+                ..sizes(OmpDir::Present { files: 1, bytes: 1 }, 2)
+            },
+            &none,
+        );
+        assert_eq!(
+            no_memory,
+            Parts {
+                memory: false,
+                ..want
+            }
+        );
+        let global = usable_parts(
+            want,
+            &ProjectSizes {
+                memory: MemoryBank::Missing,
+                ..sizes(OmpDir::Global, 0)
+            },
+            &none,
+        );
         assert!(!global.any());
         let switched_off = usable_parts(
             Parts {
                 omp: false,
                 sessions: true,
+                memory: false,
             },
             &sizes(OmpDir::Present { files: 1, bytes: 1 }, 1),
             &none,
@@ -2024,9 +2108,43 @@ mod tests {
             switched_off,
             Parts {
                 omp: false,
-                sessions: true
+                sessions: true,
+                memory: false,
             }
         );
+    }
+
+    #[test]
+    fn memory_part_flows_from_the_row_and_into_summaries() {
+        let row = SyncRow {
+            path: "/w/app".into(),
+            omp: false,
+            sessions: false,
+            memory: true,
+            excluded_sessions: BTreeSet::new(),
+        };
+        assert_eq!(
+            parts_of(&row),
+            Parts {
+                omp: false,
+                sessions: false,
+                memory: true,
+            }
+        );
+        assert_eq!(memory_summary(0, 0), None);
+        assert_eq!(
+            memory_summary(1, 0).as_deref(),
+            Some("memory: 1 file written (0 overwritten)")
+        );
+        assert_eq!(
+            memory_summary(3, 2).as_deref(),
+            Some("memory: 3 files written (2 overwritten)")
+        );
+        let mut b = backup("a", "p", "2026-10-22T10:00:00Z", None, None);
+        b.memory_bytes = Some(2048);
+        let v = version_row(0, &b);
+        assert_eq!(v.summary, "memory 2.0 KB");
+        assert!(v.has_memory && !v.has_omp);
     }
 
     #[test]
@@ -2049,7 +2167,14 @@ mod tests {
                 text: "1 session · 4.0 KB".into()
             }
         );
-        assert!(c.omp_usable() && c.sessions_usable());
+        assert_eq!(
+            c.memory,
+            MemoryCell::Present {
+                text: "3 B · 2 files".into(),
+                dir: "/mem/bank".into()
+            }
+        );
+        assert!(c.omp_usable() && c.sessions_usable() && c.memory_usable());
         let none = Ok(sizes(OmpDir::Global, 0));
         let c = cells_of(Some(&none), &BTreeSet::new());
         assert!(!c.omp_usable() && !c.sessions_usable());
@@ -2069,12 +2194,14 @@ mod tests {
         let want = Parts {
             omp: true,
             sessions: true,
+            memory: false,
         };
         assert_eq!(
             usable_parts(want, &sizes(OmpDir::Symlink, 1), &BTreeSet::new()),
             Parts {
                 omp: false,
-                sessions: true
+                sessions: true,
+                memory: false,
             }
         );
     }
@@ -2099,6 +2226,7 @@ mod tests {
         let want = Parts {
             omp: false,
             sessions: true,
+            memory: false,
         };
         let s = sizes(OmpDir::Missing, 4);
         assert!(usable_parts(want, &s, &some).sessions);

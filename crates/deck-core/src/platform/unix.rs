@@ -228,3 +228,48 @@ pub fn reveal_os(file: &Path) -> io::Result<()> {
             .as_os_str(),
     )
 }
+
+/// What keeps a [`super::NamedLock`] held: the bound abstract socket.
+#[cfg(target_os = "linux")]
+pub type Held = std::os::unix::net::UnixDatagram;
+/// What keeps a [`super::NamedLock`] held: the file whose open description owns the `flock`.
+#[cfg(not(target_os = "linux"))]
+pub type Held = File;
+
+#[cfg(target_os = "linux")]
+pub fn try_named_lock(name: &str, _path: &Path) -> io::Result<Option<Held>> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    let address = SocketAddr::from_abstract_name(name.as_bytes())?;
+    match UnixDatagram::bind_addr(&address) {
+        Ok(socket) => Ok(Some(socket)),
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn try_named_lock(_name: &str, path: &Path) -> io::Result<Option<Held>> {
+    use std::os::fd::AsRawFd;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    // SAFETY: `file` owns a live descriptor for the duration of the call; a non-blocking
+    // `flock` only changes the advisory lock attached to that open file description.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let e = io::Error::last_os_error();
+    if e.kind() == io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(e)
+    }
+}

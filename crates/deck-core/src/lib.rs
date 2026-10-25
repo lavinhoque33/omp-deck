@@ -13,6 +13,7 @@ pub mod omp;
 pub mod platform;
 pub mod selfupdate;
 pub mod sessions;
+pub mod sharpshooter;
 pub mod status;
 pub mod tmux;
 pub mod tree;

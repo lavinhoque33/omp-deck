@@ -982,18 +982,27 @@ mod project_sync {
     use crate::gdrive::archive::hex;
     use crate::omp::Omp;
     use crate::sessions::{self, SessionsRoot};
+    use crate::sharpshooter;
 
     const BOTH: Parts = Parts {
         omp: true,
         sessions: true,
+        memory: false,
     };
     const OMP: Parts = Parts {
         omp: true,
         sessions: false,
+        memory: false,
     };
     const SESSIONS: Parts = Parts {
         omp: false,
         sessions: true,
+        memory: false,
+    };
+    const MEMORY: Parts = Parts {
+        omp: false,
+        sessions: false,
+        memory: true,
     };
     const USER: &str = r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"hi","timestamp":1}}"#;
     const ASSISTANT: &str = r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":2}"#;
@@ -1588,6 +1597,7 @@ mod project_sync {
         let both = Parts {
             omp: true,
             sessions: true,
+            memory: false,
         };
         let out = backup_without(&w, &proj, both, &all, true)
             .unwrap()
@@ -2797,6 +2807,7 @@ mod project_sync {
         let parts = Parts {
             omp: !files.is_empty(),
             sessions: !ids.is_empty(),
+            memory: false,
         };
         w.backup(&proj, parts, false).unwrap().unwrap();
         let backup = w.service.list_projects().unwrap().remove(0);
@@ -2914,6 +2925,7 @@ mod project_sync {
         let both = Parts {
             omp: true,
             sessions: true,
+            memory: false,
         };
 
         // Between the two sessions: the first is kept in the report.
@@ -2963,5 +2975,568 @@ mod project_sync {
             .unwrap_err();
         assert_eq!(err.to_string(), "cancelled");
         assert!(!target.exists());
+    }
+
+    // ------------------------------------------------------------ sharpshooter memory
+
+    const OMP_MEMORY: Parts = Parts {
+        omp: true,
+        sessions: false,
+        memory: true,
+    };
+
+    /// The bank omp keeps for `project` in the store of `w`.
+    fn bank(w: &World, project: &Path) -> PathBuf {
+        sharpshooter::bank_dir(&w.root, project)
+    }
+
+    fn seed(dir: &Path, files: &[(&str, &str)]) {
+        for (name, text) in files {
+            write(&dir.join(name), text);
+        }
+    }
+
+    fn newest(w: &World) -> ProjectBackup {
+        w.service.list_projects().unwrap().remove(0)
+    }
+
+    fn apply(w: &World, prepared: PreparedProjectRestore) -> ProjectRestoreReport {
+        w.service
+            .apply_project_restore(prepared, None, &AtomicBool::new(false), &quiet)
+            .unwrap()
+    }
+
+    #[test]
+    fn memory_round_trips_into_the_bank_of_a_different_folder() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let source = bank(&w, &proj);
+        seed(
+            &source,
+            &[
+                ("architecture.md", "arch\n"),
+                ("product.md", "prod\n"),
+                ("style.md", ""),
+                ("state.json", "{\"v\":1}"),
+                ("queue/s1/1.json", "{}"),
+            ],
+        );
+
+        let sizes = measure(&w.root, &proj).unwrap();
+        assert_eq!(
+            sizes.memory,
+            MemoryBank::Present {
+                files: 2,
+                bytes: 10
+            }
+        );
+        assert_eq!(sizes.memory_dir, source);
+
+        let out = w.backup(&proj, MEMORY, false).unwrap().expect("uploads");
+        assert_eq!(out.backup.memory_bytes, Some(10));
+        assert_eq!(out.backup.omp_bytes, None);
+        assert_eq!(out.backup.file.props["mem"], "10");
+        assert!(out.skipped.is_empty());
+        let archive = only_archive(&w);
+        let parts = members(&archive);
+        let names: Vec<&str> = parts.iter().map(|m| m.0.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "memory/architecture.md",
+                "memory/product.md",
+                "manifest.json"
+            ],
+            "empty files, state.json and queue/ are not memory"
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(&parts[2].1).unwrap();
+        assert_eq!(manifest["memory"]["files"].as_array().unwrap().len(), 2);
+        assert!(manifest["omp"].is_null() && manifest["sessions"].is_null());
+
+        // Same selection, nothing changed → skipped. Without the part there is nothing to save.
+        assert!(w.backup(&proj, MEMORY, false).unwrap().is_none());
+        assert!(matches!(
+            w.backup(&proj, OMP, false),
+            Err(Error::NothingToBackUp(_))
+        ));
+
+        // Restore into another folder: the files land in THAT folder's bank, not the source's.
+        let backup = newest(&w);
+        assert_eq!(backup.memory_bytes, Some(10));
+        let target = w.tmp.path().join("elsewhere/target");
+        let target_bank = bank(&w, &target);
+        assert_ne!(target_bank, source);
+        let prepared = w.prepare(&backup, &target, MEMORY, &w.root).unwrap();
+        let plan = &prepared.plan;
+        assert_eq!(plan.memory_dir, target_bank);
+        assert!(!plan.memory_exists && plan.create_target);
+        assert_eq!(plan.memory_added, ["architecture.md", "product.md"]);
+        assert!(plan.memory_overwritten.is_empty() && plan.memory_skipped.is_empty());
+        assert!(!target_bank.exists(), "prepare touches nothing");
+        let report = apply(&w, prepared);
+        assert_eq!((report.memory_written, report.memory_overwritten), (2, 0));
+        assert!(report.memory_error.is_none() && report.memory_skipped.is_empty());
+        assert!(report.safety_dir.is_none() && !report.cancelled);
+        assert_eq!(read(&target_bank.join("architecture.md")), "arch\n");
+        assert_eq!(read(&target_bank.join("product.md")), "prod\n");
+        for absent in ["style.md", "state.json", "queue"] {
+            assert!(!target_bank.join(absent).exists(), "{absent}");
+        }
+        assert_eq!(
+            read(&source.join("product.md")),
+            "prod\n",
+            "source untouched"
+        );
+
+        // A restore prepared for another store writes under that store's memories folder.
+        let other = SessionsRoot::at(w.tmp.path().join("other-agent/sessions"));
+        let prepared = w.prepare(&backup, &target, MEMORY, &other).unwrap();
+        assert_eq!(
+            prepared.plan.memory_dir,
+            sharpshooter::bank_dir(&other, &target)
+        );
+        assert!(
+            prepared
+                .plan
+                .memory_dir
+                .starts_with(w.tmp.path().join("other-agent/memories/sharpshooter"))
+        );
+        assert!(!prepared.plan.memory_exists);
+
+        // Editing a memory file is a change.
+        write(&source.join("style.md"), "now has content\n");
+        assert!(w.backup(&proj, MEMORY, false).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_bank_without_non_empty_memory_files_is_nothing_to_back_up() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        assert!(matches!(
+            w.backup(&proj, MEMORY, true),
+            Err(Error::NothingToBackUp(_))
+        ));
+        seed(
+            &bank(&w, &proj),
+            &[("architecture.md", ""), ("state.json", "{}")],
+        );
+        assert!(matches!(
+            w.backup(&proj, MEMORY, true),
+            Err(Error::NothingToBackUp(_))
+        ));
+        assert_eq!(measure(&w.root, &proj).unwrap().memory, MemoryBank::Missing);
+        assert!(w.mock.lock().unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn restoring_over_an_existing_bank_copies_replaced_files_first_and_keeps_the_rest() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        write(&proj.join(".omp/AGENTS.md"), "remote rules\n");
+        seed(
+            &bank(&w, &proj),
+            &[
+                ("architecture.md", "new arch\n"),
+                ("product.md", "new prod\n"),
+            ],
+        );
+        w.backup(&proj, OMP_MEMORY, false).unwrap().unwrap();
+        let backup = newest(&w);
+
+        let target = w.tmp.path().join("target");
+        write(&target.join(".omp/AGENTS.md"), "local rules\n");
+        let tb = bank(&w, &target);
+        let state = "{\"v\":1,\"lastConsolidatedAt\":5}";
+        seed(
+            &tb,
+            &[
+                ("architecture.md", "old arch\n"),
+                ("product.md", ""),
+                ("style.md", "my style\n"),
+                ("state.json", state),
+                ("queue/s1/1.json", "{\"q\":1}"),
+            ],
+        );
+        let prepared = w.prepare(&backup, &target, OMP_MEMORY, &w.root).unwrap();
+        let plan = &prepared.plan;
+        assert!(plan.memory_exists);
+        assert_eq!(plan.memory_overwritten, ["architecture.md"]);
+        assert_eq!(
+            plan.memory_added,
+            ["product.md"],
+            "an empty file has nothing to lose"
+        );
+
+        let stages = Mutex::new(Vec::new());
+        let record = |p: Progress| {
+            let mut s = stages.lock().unwrap();
+            if s.last() != Some(&p.stage) {
+                s.push(p.stage);
+            }
+        };
+        let report = w
+            .service
+            .apply_project_restore(prepared, None, &AtomicBool::new(false), &record)
+            .unwrap();
+        assert_eq!((report.omp_written, report.omp_overwritten), (1, 1));
+        assert_eq!((report.memory_written, report.memory_overwritten), (2, 1));
+        assert!(report.memory_error.is_none());
+        let stages = stages.into_inner().unwrap();
+        let at = |s: Stage| stages.iter().position(|x| *x == s).unwrap();
+        assert!(
+            at(Stage::RestoringOmp) < at(Stage::RestoringMemory),
+            "{stages:?}"
+        );
+
+        // One safety directory holds both parts' previous files.
+        let safety = report.safety_dir.expect("something was overwritten");
+        assert_eq!(read(&safety.join("AGENTS.md")), "local rules\n");
+        assert_eq!(read(&safety.join("memory/architecture.md")), "old arch\n");
+        assert!(!safety.join("memory/product.md").exists());
+
+        assert_eq!(read(&tb.join("architecture.md")), "new arch\n");
+        assert_eq!(read(&tb.join("product.md")), "new prod\n");
+        assert_eq!(read(&tb.join("style.md")), "my style\n", "never deleted");
+        assert_eq!(read(&tb.join("state.json")), state);
+        assert_eq!(read(&tb.join("queue/s1/1.json")), "{\"q\":1}");
+        let temps = fs::read_dir(&tb)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .count();
+        assert_eq!(temps, 0, "no temp files are left in omp's bank");
+    }
+
+    #[test]
+    fn a_memory_only_restore_makes_its_own_safety_copy() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        seed(&bank(&w, &proj), &[("style.md", "remote style\n")]);
+        w.backup(&proj, MEMORY, false).unwrap().unwrap();
+        let target = w.tmp.path().join("target");
+        let tb = bank(&w, &target);
+        seed(&tb, &[("style.md", "local style\n")]);
+        let prepared = w.prepare(&newest(&w), &target, MEMORY, &w.root).unwrap();
+        let report = apply(&w, prepared);
+        let safety = report.safety_dir.unwrap();
+        assert!(safety.starts_with(w.tmp.path().join("safety")));
+        assert_eq!(read(&safety.join("memory/style.md")), "local style\n");
+        assert_eq!(read(&tb.join("style.md")), "remote style\n");
+    }
+
+    /// Two files, restored while omp holds the lock, then once it lets go.
+    #[test]
+    fn a_held_bank_lock_leaves_the_memory_alone_and_a_released_one_is_waited_for() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        write(&proj.join(".omp/AGENTS.md"), "rules\n");
+        seed(&bank(&w, &proj), &[("architecture.md", "remote\n")]);
+        w.backup(&proj, OMP_MEMORY, false).unwrap().unwrap();
+        let backup = newest(&w);
+
+        let target = w.tmp.path().join("target");
+        let tb = bank(&w, &target);
+        seed(&tb, &[("architecture.md", "local\n")]);
+        let held = sharpshooter::lock_bank(&tb, Duration::ZERO)
+            .unwrap()
+            .expect("free");
+        let prepared = w.prepare(&backup, &target, OMP_MEMORY, &w.root).unwrap();
+        let report = apply(&w, prepared);
+        assert_eq!(
+            report.memory_error.as_deref(),
+            Some("omp is updating this folder's memory right now; try again in a moment")
+        );
+        assert_eq!((report.memory_written, report.memory_overwritten), (0, 0));
+        assert!(report.safety_dir.is_none() && !report.cancelled);
+        assert_eq!(read(&tb.join("architecture.md")), "local\n", "untouched");
+        assert_eq!(report.omp_written, 1, ".omp is restored regardless");
+        assert_eq!(read(&target.join(".omp/AGENTS.md")), "rules\n");
+
+        // omp finishes while we wait: the restore gets the lock and writes.
+        let prepared = w.prepare(&backup, &target, OMP_MEMORY, &w.root).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        let report = apply(&w, prepared);
+        releaser.join().unwrap();
+        assert!(report.memory_error.is_none(), "{:?}", report.memory_error);
+        assert_eq!((report.memory_written, report.memory_overwritten), (1, 1));
+        assert_eq!(read(&tb.join("architecture.md")), "remote\n");
+        let safety = report.safety_dir.unwrap();
+        assert_eq!(read(&safety.join("memory/architecture.md")), "local\n");
+    }
+
+    /// Cancelling while omp holds the lock ends the restore as cancelled, not as "omp is busy".
+    #[test]
+    fn cancelling_while_waiting_for_the_bank_lock_is_a_cancel() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        seed(&bank(&w, &proj), &[("architecture.md", "remote\n")]);
+        w.backup(&proj, MEMORY, false).unwrap().unwrap();
+        let target = w.tmp.path().join("target");
+        let tb = bank(&w, &target);
+        seed(&tb, &[("architecture.md", "local\n")]);
+        let _held = sharpshooter::lock_bank(&tb, Duration::ZERO)
+            .unwrap()
+            .expect("free");
+        let prepared = w.prepare(&newest(&w), &target, MEMORY, &w.root).unwrap();
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let report = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(250));
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            w.service
+                .apply_project_restore(prepared, None, &cancel, &quiet)
+                .unwrap()
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(1400),
+            "did not wait out the lock"
+        );
+        assert!(report.cancelled);
+        assert!(report.memory_error.is_none(), "{:?}", report.memory_error);
+        assert_eq!((report.memory_written, report.memory_overwritten), (0, 0));
+        assert!(report.safety_dir.is_none());
+        assert_eq!(read(&tb.join("architecture.md")), "local\n", "untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_bank_lock_does_not_stop_the_sessions() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        session(&w.agent, "s1", &proj, "");
+        seed(&bank(&w, &proj), &[("architecture.md", "remote\n")]);
+        let all = Parts {
+            omp: false,
+            sessions: true,
+            memory: true,
+        };
+        w.backup(&proj, all, false).unwrap().unwrap();
+        let target = w.tmp.path().join("target");
+        let tb = bank(&w, &target);
+        let _held = sharpshooter::lock_bank(&tb, Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        let omp = fake_omp(w.tmp.path(), "ok.sh", OK_OMP);
+        let prepared = w.prepare(&newest(&w), &target, all, &w.root).unwrap();
+        let report = w
+            .service
+            .apply_project_restore(prepared, Some(&omp), &AtomicBool::new(false), &quiet)
+            .unwrap();
+        assert!(report.memory_error.is_some() && report.memory_written == 0);
+        assert_eq!(report.sessions_added.len(), 1);
+        assert!(report.sessions_failed.is_empty());
+        assert!(!tb.join("architecture.md").exists());
+    }
+
+    #[test]
+    fn cancelling_between_memory_files_keeps_the_first() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        seed(
+            &bank(&w, &proj),
+            &[
+                ("architecture.md", "a\n"),
+                ("product.md", "p\n"),
+                ("style.md", "s\n"),
+            ],
+        );
+        w.backup(&proj, MEMORY, false).unwrap().unwrap();
+        let target = w.tmp.path().join("target");
+        let prepared = w.prepare(&newest(&w), &target, MEMORY, &w.root).unwrap();
+        let cancel = AtomicBool::new(false);
+        let report = w
+            .service
+            .apply_project_restore(prepared, None, &cancel, &|p: Progress| {
+                if p.stage == Stage::RestoringMemory && p.done == 1 {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .unwrap();
+        assert!(report.cancelled);
+        assert_eq!(report.memory_written, 1);
+        let tb = bank(&w, &target);
+        assert_eq!(read(&tb.join("architecture.md")), "a\n");
+        assert!(!tb.join("product.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_never_writes_through_a_symlinked_bank_or_memory_file() {
+        let w = world();
+        let proj = w.tmp.path().join("proj");
+        seed(
+            &bank(&w, &proj),
+            &[
+                ("architecture.md", "a\n"),
+                ("product.md", "p\n"),
+                ("style.md", "s\n"),
+            ],
+        );
+        w.backup(&proj, MEMORY, false).unwrap().unwrap();
+        let backup = newest(&w);
+
+        // A symlinked memory file in the target bank.
+        let target = w.tmp.path().join("t1");
+        let tb = bank(&w, &target);
+        let outside = w.tmp.path().join("outside.md");
+        fs::write(&outside, "keep me").unwrap();
+        seed(&tb, &[("architecture.md", "old\n")]);
+        symlink(&outside, tb.join("product.md")).unwrap();
+        let prepared = w.prepare(&backup, &target, MEMORY, &w.root).unwrap();
+        assert_eq!(
+            prepared.plan.memory_skipped,
+            ["product.md: a symbolic link is in the way"]
+        );
+        assert_eq!(prepared.plan.memory_overwritten, ["architecture.md"]);
+        assert_eq!(prepared.plan.memory_added, ["style.md"]);
+        let report = apply(&w, prepared);
+        assert_eq!(
+            report.memory_skipped,
+            ["product.md: a symbolic link is in the way"]
+        );
+        assert_eq!((report.memory_written, report.memory_overwritten), (2, 1));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep me");
+        assert_eq!(read(&tb.join("architecture.md")), "a\n");
+
+        // A symlinked bank folder: nothing is written into what it points to.
+        let target = w.tmp.path().join("t2");
+        let tb = bank(&w, &target);
+        let real = w.tmp.path().join("real-bank");
+        write(&real.join("keep.md"), "x");
+        fs::create_dir_all(tb.parent().unwrap()).unwrap();
+        symlink(&real, &tb).unwrap();
+        let prepared = w.prepare(&backup, &target, MEMORY, &w.root).unwrap();
+        let plan = &prepared.plan;
+        assert!(!plan.memory_exists);
+        assert!(plan.memory_added.is_empty() && plan.memory_overwritten.is_empty());
+        assert_eq!(plan.memory_skipped.len(), 3);
+        assert!(
+            plan.memory_skipped
+                .iter()
+                .all(|s| s.ends_with(": the memory folder is a symbolic link"))
+        );
+        let report = apply(&w, prepared);
+        assert_eq!(report.memory_written, 0);
+        assert_eq!(report.memory_skipped.len(), 3);
+        assert!(report.memory_error.is_none());
+        let names: Vec<_> = fs::read_dir(&real).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1, "only keep.md");
+    }
+
+    /// A manifest with only a memory part.
+    fn memory_manifest(files: &[(&str, &[u8])]) -> serde_json::Value {
+        let mut m = manifest_for(&[]);
+        m["omp"] = serde_json::Value::Null;
+        m["memory"] = serde_json::json!({ "files": manifest_for(files)["omp"]["files"] });
+        m
+    }
+
+    #[test]
+    fn memory_archive_members_are_limited_to_the_three_names() {
+        let w = world();
+        let target = w.tmp.path().join("target");
+        let file = tar::EntryType::Regular;
+        let json = |m: &serde_json::Value| m.to_string().into_bytes();
+        let invalid = |r: Result<PreparedProjectRestore>| matches!(r, Err(Error::InvalidBackup(_)));
+        let try_restore = |entries: &[(&str, tar::EntryType, &[u8])], parts: Parts| {
+            let b = put_backup(&w, crafted(entries));
+            w.prepare(&b, &target, parts, &w.root)
+        };
+
+        // Control.
+        let good = memory_manifest(&[("style.md", b"style")]);
+        let prepared = try_restore(
+            &[
+                ("memory/style.md", file, b"style"),
+                ("manifest.json", file, &json(&good)),
+            ],
+            MEMORY,
+        )
+        .unwrap();
+        assert_eq!(prepared.plan.memory_added, ["style.md"]);
+
+        // Other names, nested names, unlisted or corrupt members, a directory entry.
+        for (name, m) in [
+            ("memory/evil.md", memory_manifest(&[("evil.md", b"x")])),
+            (
+                "memory/sub/style.md",
+                memory_manifest(&[("sub/style.md", b"x")]),
+            ),
+            (
+                "memory/state.json",
+                memory_manifest(&[("state.json", b"x")]),
+            ),
+            (
+                "memory/../style.md",
+                memory_manifest(&[("../style.md", b"x")]),
+            ),
+        ] {
+            let r = try_restore(
+                &[(name, file, b"x"), ("manifest.json", file, &json(&m))],
+                MEMORY,
+            );
+            assert!(invalid(r), "{name}");
+        }
+        let unlisted = manifest_for(&[]);
+        assert!(invalid(try_restore(
+            &[
+                ("memory/style.md", file, b"style"),
+                ("manifest.json", file, &json(&unlisted)),
+            ],
+            MEMORY
+        )));
+        let corrupt = memory_manifest(&[("style.md", b"other")]);
+        assert!(invalid(try_restore(
+            &[
+                ("memory/style.md", file, b"style"),
+                ("manifest.json", file, &json(&corrupt)),
+            ],
+            MEMORY
+        )));
+        assert!(invalid(try_restore(
+            &[
+                ("memory/style.md", tar::EntryType::Symlink, b""),
+                ("manifest.json", file, &json(&good)),
+            ],
+            MEMORY
+        )));
+    }
+
+    #[test]
+    fn backups_made_before_memory_existed_still_restore_but_have_no_memory() {
+        let w = world();
+        let target = w.tmp.path().join("target");
+        let file = tar::EntryType::Regular;
+        // No "memory" key at all, like every manifest written by the earlier builds.
+        let old = manifest_for(&[("a.md", b"alpha")]);
+        assert!(old.get("memory").is_none());
+        let archive = crafted(&[
+            ("omp/a.md", file, b"alpha"),
+            ("manifest.json", file, old.to_string().as_bytes()),
+        ]);
+        let backup = put_backup(&w, archive);
+        assert_eq!(backup.memory_bytes, None);
+        let prepared = w.prepare(&backup, &target, OMP, &w.root).unwrap();
+        assert!(prepared.plan.memory_added.is_empty() && !prepared.plan.memory_exists);
+        assert!(prepared.plan.memory_dir.as_os_str().is_empty());
+        let report = apply(&w, prepared);
+        assert_eq!((report.omp_written, report.memory_written), (1, 0));
+        assert!(report.memory_error.is_none());
+        assert!(matches!(
+            w.prepare(&backup, &target, MEMORY, &w.root),
+            Err(Error::InvalidBackup(_))
+        ));
+        assert!(matches!(
+            w.prepare(&backup, &target, OMP_MEMORY, &w.root),
+            Err(Error::InvalidBackup(_))
+        ));
     }
 }
