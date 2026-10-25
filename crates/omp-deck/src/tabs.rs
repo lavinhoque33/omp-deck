@@ -519,7 +519,9 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     let close = ui.interact(close_rect, resp.id.with("close"), Sense::click());
 
     let ctx = ui.ctx().clone();
-    let hov = ctx.animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+    // The ✕ is a widget on top of the tab and takes the hover from it: count either as the tab's.
+    let hovered = resp.hovered() || close.hovered();
+    let hov = ctx.animate_bool_with_time(resp.id.with("hov"), hovered, 0.12);
     let sel = ctx.animate_bool_with_time(resp.id.with("sel"), active, 0.18);
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
