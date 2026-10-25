@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 
 pub mod markup;
 mod scan;
-mod tail;
+pub(crate) mod tail;
 mod transcript;
 mod watcher;
 

@@ -62,6 +62,11 @@ jobs:
           ./packaging/windows/fetch-conpty.ps1 -OutDir target/release -Arch x64
           cargo test --release -p deck-host --no-fail-fast
 
+      # Needs the runner's interactive desktop: shows a tagged toast, then withdraws it by tag and by group.
+      - name: Toast withdraw (WinRT)
+        if: ${{ !cancelled() }}
+        run: cargo test -p omp-deck -- --ignored windows_toast --nocapture
+
       - name: Install omp
         if: ${{ !cancelled() }}
         run: |

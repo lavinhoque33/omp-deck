@@ -17,6 +17,7 @@ use egui::{
     ViewportCommand, pos2, vec2,
 };
 
+use crate::notify_panel;
 use crate::tabs::{self, TabAction, TabBarInput};
 use crate::theme::{self, Palette};
 use crate::update::{Channel, UpdateState, status_line};
@@ -47,6 +48,8 @@ pub struct BarInput<'a> {
     pub omp: Option<OmpBar<'a>>,
     /// A newer OmpDeck release to announce (pill + popover).
     pub app_update: Option<crate::app_update::PillView<'a>>,
+    /// The notification bell (badge + popover).
+    pub notifications: crate::notify_panel::PanelInput<'a>,
 }
 
 /// omp CLI state shown in the bar; absent when omp was not found.
@@ -78,6 +81,8 @@ pub enum BarAction {
     SwitchChannel(UpdateKind),
     CheckUpdates,
     AppUpdate(crate::app_update::UpdateAction),
+    /// The notification popover asked for something.
+    Inbox(crate::notify_panel::PanelAction),
     Quit,
 }
 
@@ -319,7 +324,7 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                 + pill_label
                     .as_ref()
                     .map_or(0.0, |l| 4.0 + badge_width(&badge_galley(ui, l)));
-            let right_w = 68.0 + badge_w + 12.0;
+            let right_w = 68.0 + notify_panel::bell_width() + 2.0 + badge_w + 12.0;
             let right_rect = egui::Rect::from_min_max(
                 pos2(rect.right() - right_w, rect.top()),
                 pos2(rect.right(), rect.bottom()),
@@ -337,6 +342,9 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                     }
                     if icon_button(ui, ICON_SETTINGS, "Settings", input.settings_active).clicked() {
                         action = Some(BarAction::OpenSettings);
+                    }
+                    if let Some(a) = notify_panel::bell(ui, &input.notifications) {
+                        action = Some(BarAction::Inbox(a));
                     }
                     if let Some(o) = &input.omp
                         && let Some((_, latest)) = o.available

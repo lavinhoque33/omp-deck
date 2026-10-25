@@ -51,10 +51,12 @@ host), so closing a tab or the whole app leaves omp running.
   and branch: start a session in a new worktree, move a running session into one, finish it (the agent
   merges following the project's own rules) and let OmpDeck remove it once it is merged. See
   [below](#worktree-sessions).
-- **Desktop notifications**: when a background tab finishes a turn, needs your attention or exits, OmpDeck
-  shows a desktop notification (KDE/GNOME notifications on Linux, toasts on Windows); clicking it brings
-  OmpDeck forward on that tab. By default only while the OmpDeck window is not focused; each event can be
-  turned off in Settings → OmpDeck → Notifications.
+- **Notifications**: when a background tab finishes a turn (or stops with an error), needs your attention or
+  exits, the bell in the title bar shows a count and lists it (one entry per tab; opening the tab clears it),
+  and OmpDeck shows a desktop notification (KDE/GNOME notifications on Linux, toasts on Windows); clicking
+  either brings OmpDeck forward on that tab. Desktop pop-ups by default only while the OmpDeck window is not
+  focused. omp's own notifications (bell, `notify-send`) are turned off inside OmpDeck, so you get one, not
+  two. Settings → OmpDeck → Notifications.
 - **Changes panel** (Ctrl+Shift+G, or click the git chip in the status bar): the active tab's git changes,
   grouped into conflicted, staged, changed and untracked files, with a diff view, stage / unstage, discard,
   delete untracked files (both confirmed first) and copy the whole diff. Click a diff line (Shift+click for a

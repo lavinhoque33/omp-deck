@@ -363,11 +363,13 @@ pub fn effective_cwd(cwd: &Path) -> PathBuf {
 }
 
 /// Overrides omp honours: inside tmux it would otherwise disable images (OmpDeck renders kitty
-/// Unicode-placeholder images) and never emit OSC 8 hyperlinks.
-pub(crate) const OMP_ENV: [(&str, &str); 3] = [
+/// Unicode-placeholder images) and never emit OSC 8 hyperlinks. `PI_NOTIFICATIONS=off` silences
+/// omp's own BEL / desktop notifications: OmpDeck's notifier is the single source.
+pub(crate) const OMP_ENV: [(&str, &str); 4] = [
     ("PI_FORCE_IMAGE_PROTOCOL", "kitty"),
     ("PI_KITTY_PLACEHOLDERS", "1"),
     ("PI_FORCE_HYPERLINKS", "1"),
+    ("PI_NOTIFICATIONS", "off"),
 ];
 
 /// Environment of the PTY child (tmux client or omp itself); a tmux server started by it
@@ -523,6 +525,7 @@ mod tests {
                 kv("PI_FORCE_IMAGE_PROTOCOL", "kitty"),
                 kv("PI_KITTY_PLACEHOLDERS", "1"),
                 kv("PI_FORCE_HYPERLINKS", "1"),
+                kv("PI_NOTIFICATIONS", "off"),
             ]
         );
         assert_eq!(remove.len(), 24);

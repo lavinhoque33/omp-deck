@@ -1935,3 +1935,84 @@ pub struct BankLock { /* platform handle */ }
   on another disk) and is followed, as omp does.
 - UI: `sync_view::part_cell` lays each switch/label/size cell out once (galleys reused) and wraps only between
   cells; the Projects row and the sidebar backup dialog share it.
+
+## Wave 18: OmpDeck owns notifications (omp's silenced) + notification inbox
+
+Facts (omp 18.12.6, `~/PersProject/oh-my-pi/packages`): all three omp notifications — turn complete
+(`coding-agent/src/modes/controllers/event-controller.ts:2735`, `completion.notify`), ask "Waiting for input"
+(`tools/ask.ts:589`, `ask.notify`), "Stopped with error" (`event-controller.ts:2710`, `error.notify`) — go through
+`TERMINAL.sendNotification` (`tui/src/terminal-capabilities.ts:235`), whose first line returns when
+`PI_NOTIFICATIONS` is `off|0|false`. Inside OmpDeck omp detects a generic terminal (`TERM_PROGRAM=tmux`, empty
+`#{client_termtype}` → `trueColor`/`base`, `NotifyProtocol.Bell`), so today it writes BEL **and** on Linux runs
+`notify-send --app-name omp` (`tui/src/desktop-notify.ts`). Suppression removes both; omp emits no other BEL.
+The title run-state glyph (`!` = waiting on the user) is unaffected, so `TabStatus` inputs are unchanged.
+
+### deck-core
+- `mux::OMP_ENV` gains `("PI_NOTIFICATIONS", "off")` (always, independent of OmpDeck's own settings). It reaches
+  tmux tabs via the generated `set-environment -g` (update `docs/notes/tmux.conf` text + `tests/tmux.rs`), host and
+  direct tabs via `terminal_env()`. Sessions already running keep omp's notifications until restarted.
+- `NotifyConfig`: field `enabled` renamed `desktop` (`#[serde(alias = "enabled")]`; old configs load unchanged);
+  meaning narrows to "desktop pop-ups". Events `turn_finished`/`attention`/`exited` and `only_when_unfocused` keep
+  names. Defaults unchanged (all `true`).
+- New `status::last_turn_outcome(path: &Path) -> TurnOutcome { Completed, Error(Option<String>), Aborted, Unknown }`:
+  bounded tail read (≤ 256 KiB from EOF, truncated last line tolerated) of the session jsonl; the last
+  `"type":"message"` with `role:"assistant"` decides (`stopReason` `error` → `Error(errorMessage ≤ 200 chars)`,
+  `aborted` → `Aborted`, anything else → `Completed`; none found → `Unknown`). Unit-tested with fixtures.
+
+### omp-deck
+- **Event routing** (`notify/tracker.rs` stays the single state machine; ≥ 3 s busy rule unchanged):
+  - Per-event toggles gate both the inbox and desktop pop-ups.
+  - Inbox: an event is recorded when the tab is not being viewed (`!(window focused && tab visible in a pane)`).
+  - Desktop pop-up: additionally needs `desktop` on and, if `only_when_unfocused`, an unfocused window (today's rule).
+  - Turn finished is classified off the UI thread via `last_turn_outcome(<tab's current session file>)` before it is
+    shown: `Error` → title "Stopped with error" (+ message line), `Aborted` → dropped entirely (matches omp),
+    `Completed`/`Unknown`/no session file → "Finished its turn". Classification must not delay the event more than
+    ~1 s (omp appends the assistant message before the title flips idle; retry once after 300 ms if the tail's
+    last assistant predates the busy start, then fall back to "Finished its turn").
+- **Bell marker parity**: when a turn-finished (or error) event is recorded for a tab not being viewed, set that tab's
+  `bell` flag (the same flag a terminal BEL sets; existing clearing on view stays). Real terminal BELs keep working.
+- **Inbox** (`notify/inbox.rs` model + `notify_panel.rs` view): one entry per tab (newest event replaces the tab's
+  entry and moves it to the top), fields: tab uid, event kind (finished / error / attention / exited{code}), title
+  (tab label), project (cwd basename), body, time. Entry removed when the user views that tab (same moment the
+  desktop notification is withdrawn), when the tab closes, by its own ✕, or by "Clear all". Not persisted.
+  Click on an entry (or on its desktop pop-up) → activate the tab (focus its pane when it is in a split), raise the
+  window, remove the entry.
+- **Bell button**: lucide bell icon in the title bar's right cluster immediately left of the Settings gear (both the
+  integrated title bar and the native-title-bar tab row), tooltip "Notifications". Badge with the entry count (1–9,
+  then "9+"), hidden at 0; badge uses the style's warn color when any entry is attention/error, else accent; follows
+  the active style (Wave 16) like the update badge. Click toggles a popover (≈ 360 px wide, max ≈ 60 % window height,
+  scrolls): header "Notifications" + "Clear all", rows with kind icon/color, bold tab title, project · relative age,
+  body, hover outline per the hover rule, ✕ on hover; empty state "You're all caught up". Esc / click outside closes.
+  Palette command "Notifications: Open panel" (no new keyboard shortcut).
+- **Settings card** (`notify_view.rs`): sections "Notify me about" (A turn finished — "…or stopped with an error",
+  Needs attention, Session ended) and "Desktop pop-ups" (toggle; Only when OmpDeck is not focused; Test). Card note:
+  "omp's own notifications are turned off inside OmpDeck; these settings decide everything." Palette notify commands
+  renamed to match (`notify.toggle` → "Desktop pop-ups: Turn on/off").
+
+### Acceptance
+- Real omp in a tmux tab, a host tab and a direct tab: `cat /proc/<omp pid>/environ` shows `PI_NOTIFICATIONS=off`;
+  a completed turn produces no BEL byte on the PTY and no `notify-send` child (proc watch), while OmpDeck still
+  records the event, sets the bell dot on a background tab, and (unfocused) shows its pop-up.
+- Inbox: two background tabs finishing → badge 2; viewing one → 1; Clear all → hidden; attention entry → warn badge.
+- Old config with `"enabled": false` loads as `desktop: false` and saves as `desktop`.
+
+### Wave 18 as built
+- `status::last_turn(&Path) -> LastTurn { outcome, assistant_at }`; `assistant_at` is the reply's **finish** time
+  (`message.completedAt`, else the entry's ISO `timestamp`, else `message.timestamp` — omp stamps the latter at
+  request start, so it must not be compared with the busy start). Tail window keeps a line starting exactly at the
+  cut; `agents::tail::from_epoch_ms` rejects non-finite/negative/after-year-9999 values.
+- omp-deck: `notify::tracker::Ticket { uid, generation, session }` — a classifier result is applied only while the
+  tab's transition generation and session path are unchanged (a later Attention/Exited/next turn wins).
+  `classify::predates` allows 2 s slack against the busy start. `notify::inbox`, `notify_panel` (row galleys cached
+  in egui temp data, viewport-only layout), `NotifyAction::Desktop`, `BarAction::Inbox`.
+- Verified with real omp in tmux, host and direct tabs: `PI_NOTIFICATIONS=off` in omp's environ, 0 BEL outside OSC
+  terminators, no `notify-send`/`gdbus` exec; without the variable omp emits both (control run). D-Bus `Notify`
+  gating checked on a private session bus.
+- **Withdrawal parity** (follow-up): every inbox removal withdraws the matching system notification — view, row
+  click, tab close (already) **and** ✕ (`PanelAction::Dismiss`) and **Clear all** (withdraw every tab's notification).
+  Windows: toasts are built with WinRT directly (`windows` 0.62, features `UI_Notifications`, `Data_Xml_Dom`,
+  `Foundation`; `tauri-winrt-notification` removed): `ToastNotification` with `Tag = "tab-<uid>"` (test toast
+  `"test"`) and `Group = "omp-deck"`, shown via `CreateToastNotifierWithId(app_id)` (same app-id rule as before), so a
+  newer toast for a tab replaces the older one; withdraw = `ToastNotificationManager::History()
+  .RemoveGroupedTagWithId(tag, "omp-deck", app_id)`, Clear all = `RemoveGroupWithId("omp-deck", app_id)`.
+  Activated/Dismissed handlers keep today's signals (click → `Signal::Clicked`, dismiss → `Signal::Gone`).

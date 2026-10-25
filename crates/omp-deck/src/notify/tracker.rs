@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use deck_core::config::NotifyConfig;
+use deck_core::status::TurnOutcome;
 
+use super::inbox;
 use crate::tabs::TabStatus;
 
 /// A turn must have run at least this long before its end is worth a notification.
@@ -50,10 +52,23 @@ pub struct Sighting {
     pub visible: bool,
 }
 
+/// What an asynchronous turn classification was asked about; see [`Tracker::is_current`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ticket {
+    pub uid: u64,
+    generation: u64,
+    session: Option<std::path::PathBuf>,
+}
+
 struct Memory {
     kind: Kind,
     /// When the current busy stretch was first seen.
     busy_since: Option<Instant>,
+    /// Length of the busy stretch that ended last.
+    last_busy: Duration,
+    /// Counts this tab's tracked status transitions; an asynchronous verdict about an earlier
+    /// state must not outlive the next one.
+    generation: u64,
 }
 
 #[derive(Default)]
@@ -63,21 +78,20 @@ pub struct Tracker {
     shown: HashSet<u64>,
 }
 
-/// Whether `event` is wanted now: its toggle is on and the user is not already looking at the tab.
-pub fn wanted(cfg: &NotifyConfig, event: Event, window_focused: bool, active: bool) -> bool {
+/// Whether `event` belongs in the inbox: its toggle is on and the user is not already looking at
+/// the tab (window focused and the tab shown in a pane).
+pub fn wanted(cfg: &NotifyConfig, event: Event, window_focused: bool, visible: bool) -> bool {
     let toggle = match event {
         Event::TurnFinished => cfg.turn_finished,
         Event::Attention => cfg.attention,
         Event::Exited { .. } => cfg.exited,
     };
-    if !cfg.enabled || !toggle {
-        return false;
-    }
-    if cfg.only_when_unfocused {
-        !window_focused
-    } else {
-        !(window_focused && active)
-    }
+    toggle && !(window_focused && visible)
+}
+
+/// Whether a recorded event also gets a desktop pop-up.
+pub fn desktop_wanted(cfg: &NotifyConfig, window_focused: bool) -> bool {
+    cfg.desktop && (!cfg.only_when_unfocused || !window_focused)
 }
 
 impl Tracker {
@@ -99,6 +113,8 @@ impl Tracker {
                 Memory {
                     kind,
                     busy_since: (kind == Kind::Busy).then_some(now),
+                    last_busy: Duration::ZERO,
+                    generation: 0,
                 },
             );
             return None;
@@ -112,6 +128,8 @@ impl Tracker {
             .map_or(Duration::ZERO, |since| now.duration_since(since));
         mem.kind = kind;
         mem.busy_since = (kind == Kind::Busy).then_some(now);
+        mem.last_busy = busy_for;
+        mem.generation += 1;
         let event = match (prev, kind) {
             (Kind::Busy, Kind::Idle) if busy_for >= MIN_BUSY => Some(Event::TurnFinished),
             (_, Kind::Attention) => Some(Event::Attention),
@@ -131,6 +149,32 @@ impl Tracker {
     /// The notification for `uid` is gone (dismissed, expired, clicked).
     pub fn gone(&mut self, uid: u64) {
         self.shown.remove(&uid);
+    }
+
+    /// How long the busy stretch lasted that `uid`'s latest busy → other transition ended.
+    pub fn last_busy(&self, uid: u64) -> Duration {
+        self.tabs.get(&uid).map_or(Duration::ZERO, |m| m.last_busy)
+    }
+
+    /// The transition count of `uid`, `None` for an unknown tab.
+    pub fn generation(&self, uid: u64) -> Option<u64> {
+        self.tabs.get(&uid).map(|m| m.generation)
+    }
+
+    /// Whether a verdict requested under `ticket` still describes the tab: it exists, has not
+    /// changed status since, and still shows the same session file.
+    pub fn is_current(&self, ticket: &Ticket, session: Option<&std::path::Path>) -> bool {
+        self.generation(ticket.uid) == Some(ticket.generation)
+            && ticket.session.as_deref() == session
+    }
+
+    /// Stamp for an asynchronous verdict about `uid`'s present state.
+    pub fn ticket(&self, uid: u64, session: Option<std::path::PathBuf>) -> Option<Ticket> {
+        Some(Ticket {
+            uid,
+            generation: self.generation(uid)?,
+            session,
+        })
     }
 
     /// The tab whose notification should be withdrawn now: the user looks at it (window focused,
@@ -167,21 +211,32 @@ impl Tracker {
     }
 }
 
-/// Title and body of the notification for `event` on a tab named `tab` in project `project`.
-pub fn describe(event: Event, tab: &str, project: &str) -> (String, String) {
-    let what = match event {
-        Event::TurnFinished => "Finished its turn".to_owned(),
-        Event::Attention => "Needs your attention".to_owned(),
-        Event::Exited { code: Some(0) } => "Session ended".to_owned(),
-        Event::Exited { code: Some(c) } => format!("Process exited with code {c}"),
-        Event::Exited { code: None } => "Process exited".to_owned(),
-    };
-    let body = if project.is_empty() {
+/// Title and body of the desktop notification for `kind` on a tab named `tab` in project `project`
+/// (an error's message goes on a line of its own).
+pub fn describe(kind: &inbox::Kind, tab: &str, project: &str) -> (String, String) {
+    let what = kind.what();
+    let mut body = if project.is_empty() {
         what
     } else {
         format!("{what} · {project}")
     };
+    if let inbox::Kind::Error(Some(msg)) = kind
+        && !msg.is_empty()
+    {
+        body.push('\n');
+        body.push_str(msg);
+    }
     (tab.to_owned(), body)
+}
+
+/// What a finished turn is reported as, from how its last assistant message ended; `None` = the
+/// user stopped it (omp stays quiet then too).
+pub fn classify(outcome: TurnOutcome) -> Option<inbox::Kind> {
+    match outcome {
+        TurnOutcome::Error(msg) => Some(inbox::Kind::Error(msg)),
+        TurnOutcome::Aborted => None,
+        TurnOutcome::Completed | TurnOutcome::Unknown => Some(inbox::Kind::Finished),
+    }
 }
 
 #[cfg(test)]
@@ -336,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn toggles_gate_each_event_and_the_master_switch_gates_all() {
+    fn toggles_gate_each_event() {
         let mut cfg = NotifyConfig {
             turn_finished: false,
             ..NotifyConfig::default()
@@ -353,60 +408,97 @@ mod tests {
             run(TabStatus::Exited { clean: false }, 0, false, false, &cfg),
             None
         );
-        cfg = NotifyConfig {
-            enabled: false,
-            ..NotifyConfig::default()
-        };
-        assert_eq!(run(IDLE, 10, false, false, &cfg), None);
-        assert_eq!(run(TabStatus::Attention, 0, false, false, &cfg), None);
     }
 
     #[test]
-    fn unfocused_only_mode_ignores_background_tabs_while_the_window_has_focus() {
+    fn the_desktop_switch_does_not_gate_the_inbox() {
+        let cfg = NotifyConfig {
+            desktop: false,
+            ..NotifyConfig::default()
+        };
+        assert_eq!(run(IDLE, 10, false, false, &cfg), Some(Event::TurnFinished));
+        assert_eq!(
+            run(TabStatus::Attention, 0, true, false, &cfg),
+            Some(Event::Attention)
+        );
+    }
+
+    #[test]
+    fn the_inbox_records_everything_the_user_is_not_looking_at() {
         let cfg = NotifyConfig::default();
         assert!(cfg.only_when_unfocused);
         assert_eq!(
             run(IDLE, 10, true, false, &cfg),
-            None,
+            Some(Event::TurnFinished),
             "focused window, background tab"
         );
         assert_eq!(
             run(IDLE, 10, true, true, &cfg),
             None,
-            "focused window, active tab"
+            "focused window, shown tab"
         );
         assert_eq!(
             run(IDLE, 10, false, true, &cfg),
             Some(Event::TurnFinished),
-            "window away, active tab"
+            "window away, shown tab"
         );
-        assert_eq!(run(IDLE, 10, false, false, &cfg), Some(Event::TurnFinished));
     }
 
     #[test]
-    fn background_mode_also_notifies_for_background_tabs_of_a_focused_window() {
-        let cfg = NotifyConfig {
-            only_when_unfocused: false,
-            ..NotifyConfig::default()
-        };
-        assert_eq!(run(IDLE, 10, true, false, &cfg), Some(Event::TurnFinished));
+    fn desktop_pop_ups_follow_the_switch_and_the_focus_rule() {
+        let mut cfg = NotifyConfig::default();
+        assert!(desktop_wanted(&cfg, false));
+        assert!(
+            !desktop_wanted(&cfg, true),
+            "only when unfocused: a background tab of a focused window stays in the inbox"
+        );
+        cfg.only_when_unfocused = false;
+        assert!(desktop_wanted(&cfg, true));
+        cfg.desktop = false;
+        assert!(!desktop_wanted(&cfg, false));
+        assert!(!desktop_wanted(&cfg, true));
+    }
+
+    #[test]
+    fn a_finished_turn_is_classified_by_how_it_ended() {
         assert_eq!(
-            run(IDLE, 10, true, true, &cfg),
-            None,
-            "the user is looking at it"
+            classify(TurnOutcome::Completed),
+            Some(inbox::Kind::Finished)
         );
-        assert_eq!(run(IDLE, 10, false, true, &cfg), Some(Event::TurnFinished));
+        assert_eq!(classify(TurnOutcome::Unknown), Some(inbox::Kind::Finished));
+        assert_eq!(
+            classify(TurnOutcome::Error(Some("boom".into()))),
+            Some(inbox::Kind::Error(Some("boom".into())))
+        );
+        assert_eq!(classify(TurnOutcome::Aborted), None);
     }
 
     #[test]
-    fn a_gated_out_transition_is_consumed() {
+    fn the_busy_time_of_a_finished_turn_is_remembered() {
         let cfg = NotifyConfig::default();
         let mut t = Tracker::default();
         let t0 = Instant::now();
-        t.observe(1, t0, seen(BUSY, false), true, &cfg);
+        t.observe(1, t0, seen(IDLE, false), false, &cfg);
+        t.observe(1, t0, seen(BUSY, false), false, &cfg);
+        t.observe(
+            1,
+            t0 + Duration::from_secs(7),
+            seen(IDLE, false),
+            false,
+            &cfg,
+        );
+        assert_eq!(t.last_busy(1), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn a_transition_while_the_user_looks_is_consumed() {
+        let cfg = NotifyConfig::default();
+        let mut t = Tracker::default();
+        let t0 = Instant::now();
+        t.observe(1, t0, seen(BUSY, true), true, &cfg);
         let end = t0 + Duration::from_secs(10);
-        assert_eq!(t.observe(1, end, seen(IDLE, false), true, &cfg), None);
-        // the window loses focus later: the old transition must not fire now
+        assert_eq!(t.observe(1, end, seen(IDLE, true), true, &cfg), None);
+        // the user looks away later: the old transition must not fire now
         assert_eq!(
             t.observe(
                 1,
@@ -482,25 +574,76 @@ mod tests {
 
     #[test]
     fn describe_names_the_event_and_project() {
+        use inbox::Kind;
         assert_eq!(
-            describe(Event::TurnFinished, "fix bug", "omp-deck"),
+            describe(&Kind::Finished, "fix bug", "omp-deck"),
             ("fix bug".into(), "Finished its turn · omp-deck".into())
         );
         assert_eq!(
-            describe(Event::Attention, "t", "").1,
+            describe(&Kind::Attention, "t", "").1,
             "Needs your attention"
         );
         assert_eq!(
-            describe(Event::Exited { code: Some(137) }, "t", "p").1,
+            describe(&Kind::Exited { code: Some(137) }, "t", "p").1,
             "Process exited with code 137 · p"
         );
         assert_eq!(
-            describe(Event::Exited { code: Some(0) }, "t", "p").1,
+            describe(&Kind::Exited { code: Some(0) }, "t", "p").1,
             "Session ended · p"
         );
         assert_eq!(
-            describe(Event::Exited { code: None }, "t", "p").1,
+            describe(&Kind::Exited { code: None }, "t", "p").1,
             "Process exited · p"
         );
+        assert_eq!(
+            describe(&Kind::Error(Some("rate limited".into())), "t", "p").1,
+            "Stopped with error · p\nrate limited"
+        );
+    }
+
+    fn observe_default(t: &mut Tracker, at: Instant, status: TabStatus) {
+        t.observe(1, at, seen(status, false), false, &NotifyConfig::default());
+    }
+
+    fn finished_turn() -> (Tracker, Ticket, Instant) {
+        let mut t = Tracker::default();
+        let t0 = Instant::now();
+        observe_default(&mut t, t0, IDLE);
+        observe_default(&mut t, t0, BUSY);
+        let t1 = t0 + Duration::from_secs(5);
+        observe_default(&mut t, t1, IDLE);
+        let ticket = t
+            .ticket(1, Some(std::path::PathBuf::from("/s/a.jsonl")))
+            .expect("known tab");
+        (t, ticket, t1)
+    }
+
+    #[test]
+    fn a_verdict_is_current_until_the_tab_changes_status() {
+        let (mut t, ticket, t1) = finished_turn();
+        let path = std::path::Path::new("/s/a.jsonl");
+        assert!(t.is_current(&ticket, Some(path)));
+        observe_default(&mut t, t1, TabStatus::Attention);
+        assert!(!t.is_current(&ticket, Some(path)));
+    }
+
+    #[test]
+    fn the_next_turn_or_an_exit_outdates_the_verdict() {
+        let path = std::path::Path::new("/s/a.jsonl");
+        let (mut t, ticket, t1) = finished_turn();
+        observe_default(&mut t, t1, BUSY);
+        assert!(!t.is_current(&ticket, Some(path)));
+        let (mut t, ticket, t1) = finished_turn();
+        observe_default(&mut t, t1, TabStatus::Exited { clean: true });
+        assert!(!t.is_current(&ticket, Some(path)));
+    }
+
+    #[test]
+    fn a_different_session_file_or_a_closed_tab_outdates_the_verdict() {
+        let (mut t, ticket, _) = finished_turn();
+        assert!(!t.is_current(&ticket, Some(std::path::Path::new("/s/b.jsonl"))));
+        assert!(!t.is_current(&ticket, None));
+        t.retain(&HashSet::new());
+        assert!(!t.is_current(&ticket, Some(std::path::Path::new("/s/a.jsonl"))));
     }
 }

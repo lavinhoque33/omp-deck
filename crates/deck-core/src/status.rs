@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use memchr::{memchr, memmem};
 use serde::Deserialize;
 
+use crate::agents::tail;
 use crate::mux::Mux;
 use crate::platform::{self, FileId};
 
@@ -523,6 +524,8 @@ struct UsageCost {
 
 #[derive(Deserialize)]
 struct MessageEntry<'a> {
+    /// ISO-8601 time the entry was written.
+    timestamp: Option<String>,
     #[serde(borrow)]
     message: Message<'a>,
 }
@@ -538,6 +541,14 @@ struct Message<'a> {
     stop_reason: Option<String>,
     #[serde(rename = "contextSnapshot")]
     context_snapshot: Option<ContextSnapshot>,
+    role: Option<String>,
+    #[serde(rename = "errorMessage")]
+    error_message: Option<String>,
+    /// Epoch milliseconds when the request started.
+    timestamp: Option<f64>,
+    /// Epoch milliseconds when the session wrote the finished message.
+    #[serde(rename = "completedAt")]
+    completed_at: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -552,6 +563,123 @@ struct Part<'a> {
 struct ContextSnapshot {
     #[serde(rename = "promptTokens")]
     prompt_tokens: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Last turn outcome
+
+/// Tail window read by [`last_turn`].
+const TAIL_WINDOW: u64 = 256 * 1024;
+/// Cap of the `Error` message, in chars.
+const MAX_ERROR_CHARS: usize = 200;
+
+/// How the session's most recent assistant message ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnOutcome {
+    /// Any `stopReason` other than `error` / `aborted`.
+    Completed,
+    /// `stopReason: "error"` with `errorMessage` (≤ 200 chars) if present.
+    Error(Option<String>),
+    Aborted,
+    /// No assistant message in the tail window (or the file is unreadable).
+    Unknown,
+}
+
+/// [`TurnOutcome`] plus when the deciding assistant message was written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastTurn {
+    pub outcome: TurnOutcome,
+    /// When the deciding assistant reply finished: `message.completedAt`, else the entry's own
+    /// ISO `timestamp` (both stamped when the message is written), else `message.timestamp` (which
+    /// omp stamps at request start). `None` when `outcome` is `Unknown`, no timestamp is present,
+    /// or the value is not a representable time.
+    pub assistant_at: Option<SystemTime>,
+}
+
+/// Outcome of the last assistant message in the session file at `path` (see [`last_turn`]).
+pub fn last_turn_outcome(path: &Path) -> TurnOutcome {
+    last_turn(path).outcome
+}
+
+/// Reads at most [`TAIL_WINDOW`] bytes from EOF (dropping the leading partial line and ignoring an
+/// unparsable truncated last line) and returns the last `message` entry with role `assistant`.
+pub fn last_turn(path: &Path) -> LastTurn {
+    let unknown = LastTurn {
+        outcome: TurnOutcome::Unknown,
+        assistant_at: None,
+    };
+    let Ok(tail) = read_tail(path) else {
+        return unknown;
+    };
+    for line in tail.rsplit(|&b| b == b'\n') {
+        if !line.starts_with(b"{\"type\":\"message\"") {
+            continue;
+        }
+        let head = &line[..line.len().min(ROLE_PEEK)];
+        if memmem::find(head, br#""role":"assistant""#).is_none() {
+            continue;
+        }
+        let Some(entry) = parse::<MessageEntry>(line) else {
+            continue; // truncated or malformed
+        };
+        let msg = entry.message;
+        if msg.role.as_deref() != Some("assistant") {
+            continue;
+        }
+        let outcome = match msg.stop_reason.as_deref() {
+            Some("error") => TurnOutcome::Error(
+                msg.error_message
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .map(|m| m.chars().take(MAX_ERROR_CHARS).collect()),
+            ),
+            Some("aborted") => TurnOutcome::Aborted,
+            _ => TurnOutcome::Completed,
+        };
+        // The reply's finish time: `message.timestamp` is when the request started.
+        let assistant_at = msg
+            .completed_at
+            .and_then(tail::from_epoch_ms)
+            .or_else(|| {
+                entry
+                    .timestamp
+                    .as_deref()
+                    .and_then(|t| tail::parse_iso(t.as_bytes()))
+            })
+            .or_else(|| msg.timestamp.and_then(tail::from_epoch_ms));
+        return LastTurn {
+            outcome,
+            assistant_at,
+        };
+    }
+    unknown
+}
+
+/// The last [`TAIL_WINDOW`] bytes of `path`, starting at a line boundary: when the window does not
+/// begin right after a `\n` its first (partial) line is dropped.
+fn read_tail(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(TAIL_WINDOW);
+    // One extra leading byte tells whether `start` is already a line start.
+    let from = start.saturating_sub(1);
+    file.seek(SeekFrom::Start(from))?;
+    let mut buf = Vec::with_capacity((len - from) as usize);
+    file.take(len - from).read_to_end(&mut buf)?;
+    if start > 0 {
+        if buf.first() == Some(&b'\n') {
+            buf.remove(0);
+        } else {
+            match memchr(b'\n', &buf) {
+                Some(i) => {
+                    buf.drain(..=i);
+                }
+                None => buf.clear(),
+            }
+        }
+    }
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1692,5 +1820,139 @@ u UU N... 100644 100644 100644 100644 3333 4444 5555 src/conflict.rs
             run_capture(c, Duration::from_secs(5), None).unwrap(),
             b"hi\n"
         );
+    }
+
+    /// An assistant entry; `ts` is the request start, as omp stamps `message.timestamp`.
+    fn tail_msg(stop: &str, extra: &str, ts: u64) -> String {
+        format!(
+            r#"{{"type":"message","id":"a","parentId":null,"timestamp":"2026-10-21T13:08:35.545Z","message":{{"role":"assistant","content":[],"stopReason":"{stop}"{extra},"timestamp":{ts}}}}}"#
+        )
+    }
+
+    #[test]
+    fn last_turn_outcome_classifies_the_last_assistant_message() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        let user = r#"{"type":"message","id":"u","message":{"role":"user","content":[]}}"#;
+        let w = |lines: &[&str]| write_lines(&p, lines);
+
+        w(&[&tail_msg("stop", r#","completedAt":7000"#, 1000), user]);
+        assert_eq!(last_turn_outcome(&p), TurnOutcome::Completed);
+        assert_eq!(
+            last_turn(&p).assistant_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(7000))
+        );
+        w(&[&tail_msg("toolUse", "", 1)]);
+        assert_eq!(last_turn_outcome(&p), TurnOutcome::Completed);
+        w(&[&tail_msg("stop", "", 1), &tail_msg("aborted", "", 2)]);
+        assert_eq!(last_turn_outcome(&p), TurnOutcome::Aborted);
+        w(&[&tail_msg(
+            "error",
+            r#","errorMessage":"429 rate limited""#,
+            3,
+        )]);
+        assert_eq!(
+            last_turn_outcome(&p),
+            TurnOutcome::Error(Some("429 rate limited".into()))
+        );
+        w(&[&tail_msg("error", "", 3)]);
+        assert_eq!(last_turn_outcome(&p), TurnOutcome::Error(None));
+        let long = format!(r#","errorMessage":"{}""#, "é".repeat(500));
+        w(&[&tail_msg("error", &long, 3)]);
+        assert_eq!(
+            last_turn_outcome(&p),
+            TurnOutcome::Error(Some("é".repeat(200)))
+        );
+
+        w(&[user, r#"{"type":"title_change","title":"x"}"#]);
+        assert_eq!(last_turn_outcome(&p), TurnOutcome::Unknown);
+        assert_eq!(last_turn(&p).assistant_at, None);
+        assert_eq!(
+            last_turn_outcome(&d.path().join("nope.jsonl")),
+            TurnOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn last_turn_outcome_skips_a_truncated_last_line() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        let full = tail_msg("aborted", "", 5);
+        let cut = tail_msg("stop", "", 6);
+        let mut text = format!("{full}\n");
+        text.push_str(&cut[..cut.len() - 10]);
+        fs::write(&p, text).unwrap();
+        assert_eq!(last_turn_outcome(&p), TurnOutcome::Aborted);
+    }
+
+    #[test]
+    fn last_turn_outcome_reads_only_the_tail_window() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        let filler = format!(
+            r#"{{"type":"message","id":"u","message":{{"role":"user","content":[{{"type":"text","text":"{}"}}]}}}}"#,
+            "x".repeat(64 * 1024)
+        );
+        // Assistant message beyond the window → Unknown, even though the window's first line is partial.
+        let mut lines = vec![tail_msg("stop", "", 1)];
+        lines.extend(std::iter::repeat_n(filler.clone(), 5));
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_lines(&p, &refs);
+        assert_eq!(last_turn_outcome(&p), TurnOutcome::Unknown);
+
+        // Within the window it is found.
+        let mut lines = vec![filler.clone(), tail_msg("error", "", 1)];
+        lines.extend(std::iter::repeat_n(filler, 2));
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_lines(&p, &refs);
+        assert_eq!(last_turn_outcome(&p), TurnOutcome::Error(None));
+    }
+
+    #[test]
+    fn last_turn_finds_an_assistant_line_starting_exactly_at_the_window() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        let a = tail_msg("error", "", 1);
+        let pad = |n: usize| format!(r#"{{"type":"x","pad":"{}"}}"#, "x".repeat(n));
+        let base = pad(0).len();
+        let f = pad(TAIL_WINDOW as usize - a.len() - 2 - base);
+        fs::write(&p, format!("{}\n{a}\n{f}\n", pad(100))).unwrap();
+        assert_eq!(
+            fs::metadata(&p).unwrap().len() - TAIL_WINDOW,
+            pad(100).len() as u64 + 1
+        );
+        assert_eq!(last_turn_outcome(&p), TurnOutcome::Error(None));
+        // One byte more pushes the line's first byte out of the window.
+        fs::write(&p, format!("{}\n{a}\n{f}x\n", pad(100))).unwrap();
+        assert_eq!(last_turn_outcome(&p), TurnOutcome::Unknown);
+    }
+
+    #[test]
+    fn last_turn_time_is_when_the_reply_finished() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        let at = |ms: u64| Some(SystemTime::UNIX_EPOCH + Duration::from_millis(ms));
+        // Real shape: the request start precedes completion by seconds.
+        let both = tail_msg("error", r#","completedAt":1792896486312"#, 1792896480280);
+        write_lines(&p, &[&both]);
+        assert_eq!(last_turn(&p).assistant_at, at(1792896486312));
+        // No completedAt: the entry's ISO timestamp (2026-10-21T13:08:35.545Z), not the start.
+        write_lines(&p, &[&tail_msg("stop", "", 1)]);
+        assert_eq!(last_turn(&p).assistant_at, at(1_792_588_115_545));
+        // Neither: the message's own timestamp.
+        let bare = r#"{"type":"message","message":{"role":"assistant","stopReason":"stop","timestamp":77}}"#;
+        write_lines(&p, &[bare]);
+        assert_eq!(last_turn(&p).assistant_at, at(77));
+    }
+
+    #[test]
+    fn last_turn_keeps_the_outcome_when_the_time_is_unrepresentable() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        let line = r#"{"type":"message","message":{"role":"assistant","stopReason":"aborted","completedAt":1e300,"timestamp":1e300}}"#;
+        write_lines(&p, &[line]);
+        let t = last_turn(&p);
+        assert_eq!(t.outcome, TurnOutcome::Aborted);
+        assert_eq!(t.assistant_at, None);
     }
 }

@@ -38,7 +38,7 @@ raw-window-handle = "0.6"
 futures-lite = "2"
 
 [target.'cfg(windows)'.dependencies]
-tauri-winrt-notification.workspace = true
+windows = { workspace = true, features = ["UI_Notifications", "Data_Xml_Dom", "Foundation"] }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Shell"] }
 # Native folder dialog (the Unix builds shell out to kdialog / zenity); no async runtime needed.
 rfd = { version = "0.16", default-features = false }

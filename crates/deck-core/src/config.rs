@@ -121,7 +121,9 @@ pub const MAX_PALETTE_RECENT: usize = 20;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotifyConfig {
-    pub enabled: bool,
+    /// Desktop pop-ups (the in-app inbox is governed by the per-event toggles only).
+    #[serde(alias = "enabled")]
+    pub desktop: bool,
     /// A busy tab became idle (turn finished).
     pub turn_finished: bool,
     /// A tab needs attention (question / approval).
@@ -135,7 +137,7 @@ pub struct NotifyConfig {
 impl Default for NotifyConfig {
     fn default() -> Self {
         NotifyConfig {
-            enabled: true,
+            desktop: true,
             turn_finished: true,
             attention: true,
             exited: true,
@@ -798,6 +800,17 @@ mod tests {
             AppConfig::load_from(&p).drive_backup_interval,
             SyncInterval::Off
         );
+    }
+
+    #[test]
+    fn legacy_notify_enabled_loads_as_desktop_and_saves_as_desktop() {
+        let c = load_str(r#"{"notify": {"enabled": false, "exited": false}}"#);
+        assert!(!c.notify.desktop);
+        assert!(!c.notify.exited);
+        assert!(c.notify.turn_finished, "unlisted fields keep defaults");
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains(r#""desktop":false"#), "{json}");
+        assert!(!json.contains(r#""enabled""#), "{json}");
     }
 
     fn load_str(json: &str) -> AppConfig {

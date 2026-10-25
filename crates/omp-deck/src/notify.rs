@@ -1,14 +1,18 @@
 //! Desktop notifications: the trigger rules ([`tracker`]), and a notifier thread per platform that
 //! shows them (Linux: `org.freedesktop.Notifications` over one zbus connection, raising the window
-//! with xdg-activation on Wayland; Windows: WinRT toasts). The UI thread only sends requests and
+//! with xdg-activation on Wayland; Windows: WinRT toasts filed under a tag and group, so they can be withdrawn). The UI thread only sends requests and
 //! drains signals; it never touches D-Bus or WinRT.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
+pub mod classify;
+pub mod inbox;
 pub mod tracker;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(windows, test))]
+mod toast_xml;
 #[cfg(target_os = "linux")]
 mod wayland;
 #[cfg(windows)]
@@ -47,8 +51,9 @@ pub enum Signal {
 
 enum Cmd {
     Show(Request),
-    #[cfg(target_os = "linux")]
     Close(Option<u64>),
+    /// Withdraw every tab's notification (the settings test stays).
+    CloseAll,
     /// winit's `wl_display` and the window's `wl_surface` (raw pointers as integers).
     #[cfg(target_os = "linux")]
     Window {
@@ -99,12 +104,14 @@ impl Notifier {
         let _ = self.tx.send(Cmd::Show(req));
     }
 
-    /// Withdraw the notification of `tab` (best effort; Windows cannot withdraw a shown toast).
+    /// Withdraw the notification of `tab` (best effort).
     pub fn close(&self, tab: Option<u64>) {
-        #[cfg(target_os = "linux")]
         let _ = self.tx.send(Cmd::Close(tab));
-        #[cfg(not(target_os = "linux"))]
-        let _ = tab;
+    }
+
+    /// Withdraw every tab's notification (best effort); the settings test notification stays.
+    pub fn close_all(&self) {
+        let _ = self.tx.send(Cmd::CloseAll);
     }
 
     /// Hand the Wayland window over so a click can raise it (no-op on other windowing systems).

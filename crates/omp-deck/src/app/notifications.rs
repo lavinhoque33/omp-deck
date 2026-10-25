@@ -2,13 +2,17 @@
 //! notifications, and turns clicks into "activate that tab and raise the window".
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant, SystemTime};
 
 use egui::{UserAttentionType, ViewportCommand};
 
 use super::App;
-use crate::notify::tracker::{self, Sighting, Tracker};
+use crate::notify::classify;
+use crate::notify::inbox::{Entry, Inbox, Kind};
+use crate::notify::tracker::{self, Event, Sighting, Ticket, Tracker};
 use crate::notify::{Notifier, Request, Signal};
+use crate::notify_panel::{self, PanelAction};
 use crate::notify_view::NotifyAction;
 use crate::statusfmt::Activity;
 use crate::tabs::{Tab, TabRole, TabStatus};
@@ -20,6 +24,10 @@ const BUSY_WATCH: Duration = Duration::from_secs(1);
 pub(super) struct NotifyUi {
     notifier: Notifier,
     tracker: Tracker,
+    /// What happened in tabs the user was not looking at (the bell's popover).
+    pub(super) inbox: Inbox,
+    classified: Receiver<Classified>,
+    classified_tx: Sender<Classified>,
     /// Why notifications cannot be shown (once the notifier thread found out).
     pub(super) unavailable: Option<String>,
     window_attached: bool,
@@ -27,11 +35,21 @@ pub(super) struct NotifyUi {
     test_pending: bool,
 }
 
+/// A finished turn's verdict from the worker; `kind` is `None` for a turn the user stopped.
+struct Classified {
+    ticket: Ticket,
+    kind: Option<Kind>,
+}
+
 impl NotifyUi {
     pub(super) fn new(ctx: &egui::Context) -> NotifyUi {
+        let (classified_tx, classified) = mpsc::channel();
         NotifyUi {
             notifier: Notifier::start(ctx.clone()),
             tracker: Tracker::default(),
+            inbox: Inbox::default(),
+            classified,
+            classified_tx,
             unavailable: None,
             window_attached: false,
             test_pending: false,
@@ -52,7 +70,7 @@ impl App {
         let visible = self.visible_uids();
         let cfg = &self.cfg.notify;
         let mut live = HashSet::new();
-        let mut due = Vec::new();
+        let mut fired = Vec::new();
         for tab in &self.tabs {
             let Tab::Terminal(t) = tab else { continue };
             if t.role != TabRole::Session {
@@ -66,23 +84,43 @@ impl App {
                 visible: visible.contains(&t.uid),
             };
             if let Some(event) = self.notify.tracker.observe(t.uid, now, seen, focused, cfg) {
-                let project = t.cwd.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let (title, body) = tracker::describe(event, tab.label(&self.labels), project);
-                due.push(Request {
-                    tab: Some(t.uid),
-                    title,
-                    body,
-                });
+                fired.push((t.uid, event));
             }
         }
         for uid in self.notify.tracker.retain(&live) {
             self.notify.notifier.close(Some(uid));
         }
-        for req in due {
-            if let Some(uid) = req.tab {
-                self.notify.tracker.shown(uid);
+        self.notify.inbox.retain_live(&live);
+        for (uid, event) in fired {
+            match event {
+                Event::TurnFinished => self.classify_finished_turn(uid),
+                Event::Attention => self.record_notification(uid, Kind::Attention, focused),
+                Event::Exited { code } => {
+                    self.record_notification(uid, Kind::Exited { code }, focused);
+                }
             }
-            self.notify.notifier.show(req);
+        }
+        while let Ok(done) = self.notify.classified.try_recv() {
+            let uid = done.ticket.uid;
+            // Only for the very state it was asked about: same tab, same session file, no status
+            // change since (a newer attention/exit/next turn wins over a late verdict).
+            let session = self
+                .tabs
+                .iter()
+                .find_map(|t| t.term().filter(|t| t.uid == uid))
+                .map(|t| t.session_path.as_deref());
+            let current = session.is_some_and(|s| self.notify.tracker.is_current(&done.ticket, s));
+            // And only if the user still is not looking at the tab.
+            let viewed = focused && visible.contains(&uid);
+            if let Some(kind) = done.kind
+                && current
+                && !viewed
+            {
+                self.record_notification(uid, kind, focused);
+            }
+        }
+        if focused {
+            self.notify.inbox.remove_viewed(&visible);
         }
         for uid in self.notify.tracker.take_seen(&visible, focused) {
             self.notify.notifier.close(Some(uid));
@@ -92,6 +130,70 @@ impl App {
         }
         for signal in self.notify.notifier.drain() {
             self.on_notify_signal(signal);
+        }
+    }
+
+    /// A turn of tab `uid` just ended: find out on a worker how, then record it (see
+    /// `classified` in [`drive_notifications`](Self::drive_notifications)).
+    fn classify_finished_turn(&mut self, uid: u64) {
+        let Some(t) = self
+            .tabs
+            .iter()
+            .find_map(|t| t.term().filter(|t| t.uid == uid))
+        else {
+            return;
+        };
+        let session = t.session_path.clone();
+        let Some(ticket) = self.notify.tracker.ticket(uid, session.clone()) else {
+            return;
+        };
+        let busy_start = SystemTime::now()
+            .checked_sub(self.notify.tracker.last_busy(uid))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let (tx, ctx) = (self.notify.classified_tx.clone(), self.ctx.clone());
+        let spawned = std::thread::Builder::new()
+            .name("omp-deck-turn-outcome".to_owned())
+            .spawn(move || {
+                let kind = classify::finished_turn(session.as_deref(), busy_start);
+                if tx.send(Classified { ticket, kind }).is_ok() {
+                    ctx.request_repaint();
+                }
+            });
+        if let Err(e) = spawned {
+            log::warn!("cannot start the turn classifier: {e}");
+            let focused = self.ctx.input(|i| i.viewport().focused.unwrap_or(true));
+            self.record_notification(uid, Kind::Finished, focused);
+        }
+    }
+
+    /// Puts the event in the inbox, sets the bell marker for turn ends, and shows a desktop
+    /// pop-up when the settings and the window's focus allow it.
+    fn record_notification(&mut self, uid: u64, kind: Kind, focused: bool) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.uid() == Some(uid)) else {
+            return;
+        };
+        let title = tab.label(&self.labels).to_owned();
+        let Some(t) = tab.term_mut() else { return };
+        let project = t
+            .cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        if matches!(kind, Kind::Finished | Kind::Error(_)) {
+            t.bell = true;
+        }
+        let (pop_title, body) = tracker::describe(&kind, &title, &project);
+        self.notify
+            .inbox
+            .record(Entry::new(uid, kind, &title, &project, SystemTime::now()));
+        if tracker::desktop_wanted(&self.cfg.notify, focused) {
+            self.notify.tracker.shown(uid);
+            self.notify.notifier.show(Request {
+                tab: Some(uid),
+                title: pop_title,
+                body,
+            });
         }
     }
 
@@ -105,6 +207,7 @@ impl App {
                 self.notify.test_pending = false;
                 if let Some(uid) = tab {
                     self.notify.tracker.gone(uid);
+                    self.notify.inbox.remove(uid);
                     let index = self.tabs.iter().position(|t| t.uid() == Some(uid));
                     if let Some(i) = index {
                         self.activate(i);
@@ -156,7 +259,7 @@ impl App {
     pub(super) fn apply_notify_action(&mut self, action: NotifyAction) {
         let cfg = &mut self.cfg.notify;
         match action {
-            NotifyAction::Enabled(v) => cfg.enabled = v,
+            NotifyAction::Desktop(v) => cfg.desktop = v,
             NotifyAction::TurnFinished(v) => cfg.turn_finished = v,
             NotifyAction::Attention(v) => cfg.attention = v,
             NotifyAction::Exited(v) => cfg.exited = v,
@@ -167,6 +270,39 @@ impl App {
             }
         }
         self.dirty = true;
+    }
+
+    /// The inbox popover asked for something.
+    pub(super) fn apply_inbox_action(&mut self, action: PanelAction) {
+        match action {
+            PanelAction::Open(uid) => {
+                self.notify.inbox.remove(uid);
+                self.notify.notifier.close(Some(uid));
+                self.notify.tracker.gone(uid);
+                if let Some(i) = self.tabs.iter().position(|t| t.uid() == Some(uid)) {
+                    self.activate(i);
+                }
+                self.raise_window(None);
+            }
+            PanelAction::Dismiss(uid) => {
+                self.notify.inbox.remove(uid);
+                self.notify.notifier.close(Some(uid));
+                self.notify.tracker.gone(uid);
+            }
+            PanelAction::ClearAll => {
+                let tabs: Vec<u64> = self.notify.inbox.entries().iter().map(|e| e.tab).collect();
+                self.notify.inbox.clear();
+                self.notify.notifier.close_all();
+                for uid in tabs {
+                    self.notify.tracker.gone(uid);
+                }
+            }
+        }
+    }
+
+    /// Opens the inbox popover under the bell.
+    pub(super) fn open_inbox_panel(&self) {
+        egui::Popup::open_id(&self.ctx, notify_panel::popup_id());
     }
 
     pub(super) fn send_test_notification(&mut self) {

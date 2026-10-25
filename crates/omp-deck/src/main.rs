@@ -26,6 +26,7 @@ mod inject;
 mod model_order;
 mod model_picker;
 mod notify;
+mod notify_panel;
 mod notify_view;
 mod omp_rows;
 mod omp_settings;

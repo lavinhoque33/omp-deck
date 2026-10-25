@@ -948,11 +948,8 @@ impl App {
         let n = &cfg.notify;
         let on_off = |v: bool| if v { "turn off" } else { "turn on" };
         add(
-            "notify.toggle",
-            &format!(
-                "Notifications: {}",
-                if n.enabled { "Turn off" } else { "Turn on" }
-            ),
+            "notify.panel",
+            "Notifications: Open panel",
             None,
             ICON_BELL,
             None,
@@ -965,7 +962,7 @@ impl App {
             ),
             None,
             ICON_BELL,
-            need(n.enabled, "Notifications are off"),
+            None,
         );
         add(
             "notify.attention",
@@ -975,28 +972,38 @@ impl App {
             ),
             None,
             ICON_BELL,
-            need(n.enabled, "Notifications are off"),
+            None,
         );
         add(
             "notify.exited",
             &format!("Notifications: {} “session ended”", cap(on_off(n.exited))),
             None,
             ICON_BELL,
-            need(n.enabled, "Notifications are off"),
+            None,
+        );
+        add(
+            "notify.toggle",
+            &format!(
+                "Desktop pop-ups: {}",
+                if n.desktop { "Turn off" } else { "Turn on" }
+            ),
+            None,
+            ICON_BELL,
+            None,
         );
         add(
             "notify.unfocused",
             &format!(
-                "Notifications: {} “only when not focused”",
+                "Desktop pop-ups: {} “only when not focused”",
                 cap(on_off(n.only_when_unfocused))
             ),
             None,
             ICON_BELL,
-            need(n.enabled, "Notifications are off"),
+            need(n.desktop, "Desktop pop-ups are off"),
         );
         add(
             "notify.test",
-            "Notifications: Send test notification",
+            "Desktop pop-ups: Send test notification",
             None,
             ICON_BELL,
             None,
@@ -1254,8 +1261,9 @@ impl App {
             "omp.models" => self.reload_models(),
             "app.check_update" => self.check_app_update_manually(),
             "app.start_update" => self.start_app_update(),
+            "notify.panel" => self.open_inbox_panel(),
             "notify.toggle" => {
-                self.apply_notify_action(NotifyAction::Enabled(!self.cfg.notify.enabled))
+                self.apply_notify_action(NotifyAction::Desktop(!self.cfg.notify.desktop))
             }
             "notify.turn_finished" => {
                 self.apply_notify_action(NotifyAction::TurnFinished(!self.cfg.notify.turn_finished))

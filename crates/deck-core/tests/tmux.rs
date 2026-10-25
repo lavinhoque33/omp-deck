@@ -290,12 +290,13 @@ fn generated_config_sources_cleanly_twice() {
         "PI_FORCE_IMAGE_PROTOCOL=kitty",
         "PI_KITTY_PLACEHOLDERS=1",
         "PI_FORCE_HYPERLINKS=1",
+        "PI_NOTIFICATIONS=off",
     ] {
         assert!(env.lines().any(|l| l == line), "{line} missing: {env}");
     }
     let out_file = dir.path().join("pane-env");
     let script = format!(
-        "echo \"$PI_FORCE_IMAGE_PROTOCOL $PI_KITTY_PLACEHOLDERS $PI_FORCE_HYPERLINKS\" > '{}'",
+        "echo \"$PI_FORCE_IMAGE_PROTOCOL $PI_KITTY_PLACEHOLDERS $PI_FORCE_HYPERLINKS $PI_NOTIFICATIONS\" > '{}'",
         out_file.display()
     );
     let pane = Command::new("tmux")
@@ -317,7 +318,7 @@ fn generated_config_sources_cleanly_twice() {
     wait_for("the pane to write its env", || {
         fs::read_to_string(&out_file).is_ok_and(|s| s.ends_with('\n'))
     });
-    assert_eq!(fs::read_to_string(&out_file).unwrap(), "kitty 1 1\n");
+    assert_eq!(fs::read_to_string(&out_file).unwrap(), "kitty 1 1 off\n");
 }
 
 /// tmux (3.7c, `tty-keys.c:1014`) dereferences `c->session->curw` when a client whose session

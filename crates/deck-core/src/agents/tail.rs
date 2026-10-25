@@ -194,9 +194,14 @@ pub(crate) fn parse_iso(s: &[u8]) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::new(secs, nanos))
 }
 
-/// Epoch milliseconds → `SystemTime`.
+/// Epoch milliseconds → `SystemTime`; `None` for negative, non-finite, or absurd (beyond year
+/// 9999, which not every platform's `SystemTime` can hold) values.
 pub(crate) fn from_epoch_ms(ms: f64) -> Option<SystemTime> {
-    (ms.is_finite() && ms >= 0.0).then(|| SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64))
+    const MAX_MS: f64 = 253_402_300_799_999.0;
+    if !ms.is_finite() || !(0.0..=MAX_MS).contains(&ms) {
+        return None;
+    }
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms as u64))
 }
 
 /// `s` cut to at most `max` bytes on a char boundary; reports whether it was cut.

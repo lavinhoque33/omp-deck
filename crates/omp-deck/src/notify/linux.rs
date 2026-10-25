@@ -82,6 +82,12 @@ pub fn run(cmds: Receiver<Cmd>, out: &Out) {
                     }
                 }
                 Cmd::Close(tab) => zbus::block_on(close(&conn, &state, tab)),
+                Cmd::CloseAll => {
+                    let tabs: Vec<u64> = lock(&state).by_tab.keys().flatten().copied().collect();
+                    for tab in tabs {
+                        zbus::block_on(close(&conn, &state, Some(tab)));
+                    }
+                }
                 Cmd::Window { display, surface } => match Raiser::new(display, surface) {
                     Ok(r) => raiser = Some(r),
                     Err(e) => log::info!("Wayland window raise unavailable: {e}"),

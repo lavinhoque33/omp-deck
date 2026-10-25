@@ -1428,6 +1428,12 @@ impl App {
                 channel: self.update.channel(),
             }),
             app_update: self.app_update_bar(),
+            notifications: crate::notify_panel::PanelInput {
+                entries: self.notify.inbox.entries(),
+                badge: self.notify.inbox.badge(),
+                warn: self.notify.inbox.warns(),
+                now: std::time::SystemTime::now(),
+            },
         };
         let action = titlebar::show(ui, &input);
         self.scroll_to_active = false;
@@ -1452,6 +1458,7 @@ impl App {
             BarAction::SwitchChannel(kind) => self.confirm_channel_switch(kind),
             BarAction::CheckUpdates => self.check_updates_manually(),
             BarAction::AppUpdate(a) => self.apply_app_update_action(a),
+            BarAction::Inbox(a) => self.apply_inbox_action(a),
         }
     }
 

@@ -4,7 +4,7 @@ members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/o
 
 [workspace.package]
 edition = "2024"
-version = "0.12.0"
+version = "0.13.0"
 license = "MIT OR Apache-2.0"
 publish = false
 description = "Desktop wrapper for the omp coding-agent TUI: session sidebar, tabs, embedded terminal backed by tmux or its own session host (Linux, Windows)"
@@ -45,10 +45,11 @@ getrandom = "0.4"
 # Wave 14. Windows self-update unpacks the release zip (PowerShell Compress-Archive → deflate only).
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # Desktop notifications: Linux talks to org.freedesktop.Notifications directly (one connection,
-# ActivationToken + ActionInvoked); Windows toasts via WinRT. Wayland window raise uses
+# ActivationToken + ActionInvoked); Windows toasts via WinRT (`windows`, already in Cargo.lock via
+# wgpu-hal/fontique: tag/group per tab so a toast can be replaced and withdrawn). Wayland window raise uses
 # xdg-activation on winit's own wl_display (both crates already in Cargo.lock via winit/sctk).
 zbus = { version = "5", default-features = false, features = ["async-io"] }
-tauri-winrt-notification = "0.8"
+windows = { version = "0.62", default-features = false }
 wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # Sharpshooter memory restore takes omp's consolidation lock: pi-natives names it with xxh64.
