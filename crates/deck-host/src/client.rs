@@ -1,4 +1,5 @@
-//! Blocking client API: start sessions, attach, stream events.
+//! Blocking client API: start sessions, attach (controller), observe (read-only), stream
+//! events.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,8 +9,8 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 use crate::namespace::{Conn, Namespace, remote_error, valid_session_name};
 use crate::protocol::{
-    self, AttachParams, ExitedPayload, HostInfo, Kind, MAX_FRAME, Palette, PeekParams,
-    ResizeParams, SessionSpec, SpawnRequest,
+    self, AttachParams, ExitedPayload, Grid, HostInfo, Kind, MAX_FRAME, ObserveParams, Palette,
+    PeekParams, ResizeParams, SessionSpec, SpawnRequest,
 };
 use crate::spawn;
 use crate::transport::Stream;
@@ -282,20 +283,7 @@ impl AttachedRx {
             if self.closed {
                 return Ok(HostEvent::Closed);
             }
-            let kind = match protocol::read_frame(&mut self.stream, &mut self.payload) {
-                Ok(kind) => kind,
-                Err(Error::Io(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::ConnectionAborted
-                    ) =>
-                {
-                    None
-                }
-                Err(e) => return Err(e),
-            };
+            let kind = read_event_frame(&mut self.stream, &mut self.payload)?;
             match kind {
                 None => {
                     self.closed = true;
@@ -321,6 +309,206 @@ impl AttachedRx {
                 Some(_) => {}
             }
         }
+    }
+}
+
+/// Reads one frame of an event stream; a connection reset or broken pipe counts as the end.
+fn read_event_frame(stream: &mut Stream, payload: &mut Vec<u8>) -> Result<Option<Kind>> {
+    match protocol::read_frame(stream, payload) {
+        Err(Error::Io(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+            ) =>
+        {
+            Ok(None)
+        }
+        other => other,
+    }
+}
+
+/// Subscribes read-only to a live session's terminal stream without affecting it: no
+/// displacement of the attached controller, no resize, no palette change, and
+/// [`HostInfo::attached`] keeps reporting the controller. Returns the session's info (its
+/// `cols`/`rows` equal the first snapshot's grid) and the subscription; its first event is
+/// [`ObserverEvent::Snapshot`] with up to `history_lines` scrollback rows.
+///
+/// Read-only is enforced by the daemon, not just by this API (which offers no way to write):
+/// an observer connection that sends input, resize, palette, attach or kill is disconnected
+/// immediately and nothing reaches the session. Killing a session stays [`Namespace::kill`].
+///
+/// Errors: [`Error::Unsupported`] when the session's daemon predates observing (it closed
+/// the connection on the unknown request; nothing changed — do not fall back to
+/// [`attach`], which would displace the controller), [`Error::NotRunning`] when the session
+/// is gone or ending, [`Error::ProtocolMismatch`] as for [`attach`].
+pub fn observe(ns: &Namespace, name: &str, history_lines: u32) -> Result<(HostInfo, Observed)> {
+    let mut conn = ns.connect(name, ATTACH_TIMEOUT)?;
+    conn.check_protocol()?;
+    conn.send_json(Kind::Observe, &ObserveParams { history_lines })?;
+    let info: HostInfo = match read_event_frame(&mut conn.stream, &mut conn.payload) {
+        Ok(Some(Kind::Info)) => protocol::parse(&conn.payload)?,
+        Ok(Some(Kind::Error)) => return Err(remote_error(&conn.payload)),
+        Ok(Some(Kind::Exited)) => return Err(Error::NotRunning(name.to_owned())),
+        Ok(Some(kind)) => {
+            return Err(Error::Protocol(format!(
+                "expected Info after Observe, got {kind:?}"
+            )));
+        }
+        // Our Hello was answered, so the daemon dropped the request itself: an older daemon
+        // rejects the unknown kind that way. Unless the session just ended.
+        Ok(None) if ns.has(name) => return Err(Error::Unsupported(name.to_owned())),
+        Ok(None) => return Err(Error::NotRunning(name.to_owned())),
+        Err(Error::Io(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Err(Error::Timeout(
+                "waiting for the session daemon's Observe reply",
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    conn.stream.set_read_timeout(None)?;
+    let Conn {
+        stream,
+        payload,
+        out,
+        ..
+    } = conn;
+    let tx_stream = stream.try_clone()?;
+    let observed = Observed {
+        rx: ObserverRx {
+            stream,
+            payload,
+            snapshot: Vec::new(),
+            grid: None,
+            started: false,
+            closed: false,
+        },
+        tx: ObserverTx(Arc::new(TxInner {
+            conn: Mutex::new(TxConn {
+                stream: tx_stream,
+                buf: out,
+            }),
+            done: AtomicBool::new(false),
+        })),
+    };
+    Ok((info, observed))
+}
+
+/// What an observer receives, in session order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObserverEvent {
+    /// Always first: whole VT replay of the session state at `grid`; size the terminal to
+    /// `grid`, reset it and feed `bytes`.
+    Snapshot { bytes: Vec<u8>, grid: Grid },
+    /// Live PTY output.
+    Output(Vec<u8>),
+    /// The session's grid changed (controller resize or a new controller's attach); applies
+    /// to all output after it. Observers render at the host grid, they cannot change it.
+    Resized(Grid),
+    /// The session's program exited (code `None` when killed by a signal).
+    Exited(Option<i32>),
+    /// The subscription ended: detached, daemon gone, or disconnected by the daemon for
+    /// falling behind (observe again for a fresh snapshot).
+    Closed,
+}
+
+/// A read-only subscription from [`observe`]; [`Observed::split`] it for a reader thread
+/// and a detach handle. Dropping both halves detaches.
+pub struct Observed {
+    rx: ObserverRx,
+    tx: ObserverTx,
+}
+
+impl Observed {
+    pub fn split(self) -> (ObserverRx, ObserverTx) {
+        (self.rx, self.tx)
+    }
+}
+
+/// Receiving half of an observation (blocking).
+pub struct ObserverRx {
+    stream: Stream,
+    payload: Vec<u8>,
+    snapshot: Vec<u8>,
+    /// Grid announced before the snapshot.
+    grid: Option<Grid>,
+    /// The snapshot was delivered; later `Resized` frames are events.
+    started: bool,
+    closed: bool,
+}
+
+impl ObserverRx {
+    /// Next event. After `Exited` or `Closed`, the following call returns `Closed`.
+    pub fn recv(&mut self) -> Result<ObserverEvent> {
+        loop {
+            if self.closed {
+                return Ok(ObserverEvent::Closed);
+            }
+            let kind = match read_event_frame(&mut self.stream, &mut self.payload) {
+                Ok(kind) => kind,
+                // The daemon cut this observer off mid-frame (fell behind): a normal end.
+                Err(e) if protocol::is_truncated(&e) => None,
+                Err(e) => return Err(e),
+            };
+            match kind {
+                // `Displaced` is never sent to observers; treat it as the end regardless.
+                None | Some(Kind::Displaced) => {
+                    self.snapshot = Vec::new();
+                    self.closed = true;
+                    return Ok(ObserverEvent::Closed);
+                }
+                Some(Kind::Output) => {
+                    return Ok(ObserverEvent::Output(std::mem::take(&mut self.payload)));
+                }
+                Some(Kind::Resized) => {
+                    let grid: Grid = protocol::parse(&self.payload)?;
+                    if self.started {
+                        return Ok(ObserverEvent::Resized(grid));
+                    }
+                    self.grid = Some(grid);
+                }
+                Some(Kind::Snapshot) => self.snapshot.extend_from_slice(&self.payload),
+                Some(Kind::SnapshotEnd) => {
+                    let grid = self
+                        .grid
+                        .ok_or_else(|| Error::Protocol("no grid before the snapshot".into()))?;
+                    self.started = true;
+                    return Ok(ObserverEvent::Snapshot {
+                        bytes: std::mem::take(&mut self.snapshot),
+                        grid,
+                    });
+                }
+                Some(Kind::Exited) => {
+                    let exited: ExitedPayload = protocol::parse(&self.payload)?;
+                    self.closed = true;
+                    return Ok(ObserverEvent::Exited(exited.code));
+                }
+                Some(Kind::Error) => {
+                    self.closed = true;
+                    return Err(remote_error(&self.payload));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// Detach handle of an observation; clones share it. It deliberately has no input, resize,
+/// palette or kill operation. Dropping the last clone detaches.
+#[derive(Clone)]
+pub struct ObserverTx(Arc<TxInner>);
+
+impl ObserverTx {
+    /// Ends the subscription (the session is unaffected) and closes the connection, so a
+    /// [`ObserverRx::recv`] blocked on another thread returns `Closed` promptly.
+    pub fn detach(&self) -> Result<()> {
+        self.0.finish(Kind::Detach)
     }
 }
 

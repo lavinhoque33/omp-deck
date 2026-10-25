@@ -458,6 +458,21 @@ impl Stream {
         }
     }
 
+    /// Ends the connection now, discarding unread data and without waiting for the peer
+    /// (unlike the server-side [`Stream::shutdown`], whose flush waits until the client read
+    /// everything): pending reads and writes on every clone are cancelled and fail.
+    pub fn abort(&self) {
+        let h = raw(&self.pipe.handle);
+        self.pipe.closed.store(true, Ordering::Release);
+        // SAFETY: valid handle owned by `self.pipe`.
+        unsafe {
+            CancelIoEx(h, null());
+            if self.pipe.server {
+                DisconnectNamedPipe(h);
+            }
+        }
+    }
+
     fn eof_error(code: u32) -> bool {
         matches!(
             code,

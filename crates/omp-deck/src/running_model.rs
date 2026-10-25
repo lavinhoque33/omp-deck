@@ -12,10 +12,10 @@ use deck_core::mux::RunningSession;
 use deck_core::platform::TreeMemory;
 
 use crate::app::human_size;
-use crate::backend::kind_label;
 use crate::sessions_model::{Check, by_key, plural};
-use crate::statusfmt::Activity;
 use crate::titlebar::strip_omp_prefix;
+use deck_service::backend::kind_label;
+use deck_service::statusfmt::Activity;
 
 /// The two views of the session manager hub.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

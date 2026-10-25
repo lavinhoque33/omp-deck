@@ -11,10 +11,10 @@ use deck_core::sessions::abbreviate_home;
 
 use crate::agent_model::short_model;
 use crate::sidebar::format_age;
-use crate::statusfmt::{
+use deck_service::status::TabStatus;
+use deck_service::statusfmt::{
     Activity, ContextLevel, context_level, context_percent, fmt_cost, fmt_tokens,
 };
-use crate::tabs::TabStatus;
 
 // ------------------------------------------------------------------ status
 

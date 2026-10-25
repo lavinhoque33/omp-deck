@@ -16,7 +16,10 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::Config;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::vte::ansi::Processor;
-use deck_host::{AttachParams, AttachedTx, HostEvent, Namespace, Palette, SessionSpec};
+use deck_host::{
+    AttachParams, AttachedTx, Grid, HostEvent, HostInfo, Namespace, ObserverEvent, ObserverTx,
+    Palette, SessionSpec,
+};
 
 pub const WAIT: Duration = Duration::from_secs(10);
 
@@ -304,4 +307,142 @@ pub fn run_cli(args: &[&str]) -> (bool, String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// A read-only observer that mirrors the session into a local terminal at the host's grid.
+pub struct Observer {
+    pub tx: ObserverTx,
+    pub events: Receiver<deck_host::Result<ObserverEvent>>,
+    pub info: HostInfo,
+    pub grid: Grid,
+    pub term: Term<VoidListener>,
+    pub processor: Processor,
+    pub output: Vec<u8>,
+    /// Grids from `Resized` events, in order.
+    pub resizes: Vec<Grid>,
+}
+
+impl Observer {
+    /// Observes `name` with `history_lines` of scrollback and consumes the snapshot.
+    pub fn new(ns: &TestNs, name: &str, history_lines: u32) -> Observer {
+        let (info, observed) = deck_host::observe(&ns.0, name, history_lines).unwrap();
+        let (mut rx, tx) = observed.split();
+        let (events_tx, events) = mpsc::channel();
+        std::thread::spawn(move || {
+            loop {
+                let event = rx.recv();
+                let end = matches!(event, Err(_) | Ok(ObserverEvent::Closed));
+                if events_tx.send(event).is_err() || end {
+                    break;
+                }
+            }
+        });
+        let mut o = Observer {
+            tx,
+            events,
+            grid: Grid {
+                cols: info.cols,
+                rows: info.rows,
+                cell_width: 0,
+                cell_height: 0,
+            },
+            term: fresh_term(info.cols, info.rows),
+            info,
+            processor: Processor::new(),
+            output: Vec::new(),
+            resizes: Vec::new(),
+        };
+        match o.next() {
+            ObserverEvent::Snapshot { grid, .. } => {
+                assert_eq!((grid.cols, grid.rows), (o.info.cols, o.info.rows));
+            }
+            other => panic!("first observer event is the snapshot, got {other:?}"),
+        }
+        o
+    }
+
+    pub fn next(&mut self) -> ObserverEvent {
+        let event = self
+            .events
+            .recv_timeout(WAIT)
+            .expect("observer event")
+            .expect("observer recv");
+        self.apply(&event);
+        event
+    }
+
+    fn apply(&mut self, event: &ObserverEvent) {
+        match event {
+            ObserverEvent::Snapshot { bytes, grid } => {
+                self.grid = *grid;
+                self.term = fresh_term(grid.cols, grid.rows);
+                self.processor = Processor::new();
+                self.processor.advance(&mut self.term, bytes);
+            }
+            ObserverEvent::Output(bytes) => {
+                self.processor.advance(&mut self.term, bytes);
+                self.output.extend_from_slice(bytes);
+            }
+            ObserverEvent::Resized(grid) => {
+                self.grid = *grid;
+                self.resizes.push(*grid);
+                self.term
+                    .resize(TermSize::new(grid.cols.into(), grid.rows.into()));
+            }
+            ObserverEvent::Exited(_) | ObserverEvent::Closed => {}
+        }
+    }
+
+    pub fn wait_output(&mut self, needle: &str) {
+        let deadline = Instant::now() + WAIT;
+        while !String::from_utf8_lossy(&self.output).contains(needle) {
+            assert!(
+                Instant::now() < deadline,
+                "observer timed out waiting for {needle:?}"
+            );
+            match self.next() {
+                ObserverEvent::Output(_) | ObserverEvent::Resized(_) => {}
+                other => panic!("unexpected {other:?} while waiting for {needle:?}"),
+            }
+        }
+    }
+
+    /// Consumes events until none arrives for `quiet`.
+    pub fn settle(&mut self, quiet: Duration) {
+        while let Ok(event) = self.events.recv_timeout(quiet) {
+            let event = event.expect("observer recv");
+            self.apply(&event);
+        }
+    }
+
+    /// Waits until the mirrored terminal (snapshot plus live output) shows `needle`. Unlike
+    /// [`Observer::wait_output`] this also holds when it was already in the snapshot.
+    pub fn wait_screen(&mut self, needle: &str) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            // Apply everything already received before rendering the (large) screen text
+            // once; rendering it per event is quadratic and far slower than the stream.
+            while let Ok(event) = self.events.try_recv() {
+                self.apply(&event.expect("observer recv"));
+            }
+            let screen = self.screen();
+            if screen.contains(needle) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let lines: Vec<&str> = screen.lines().collect();
+                panic!(
+                    "observer timed out waiting for {needle:?} on screen; last lines: {:?}",
+                    &lines[lines.len().saturating_sub(5)..]
+                );
+            }
+            if let Ok(event) = self.events.recv_timeout(Duration::from_millis(100)) {
+                self.apply(&event.expect("observer recv"));
+            }
+        }
+    }
+
+    pub fn screen(&self) -> String {
+        screen_text(&self.term)
+    }
 }

@@ -2,7 +2,24 @@
 //! `Term` (answering terminal queries while no client is attached), and serves clients.
 //!
 //! Threads: accept loop (main), one per connection, PTY reader, PTY writer, child waiter,
-//! sync-update timer, one writer per attached client.
+//! sync-update timer, one writer per attached client and one per observer.
+//!
+//! Roles: at most one *controller* (`Attach`; a new attach displaces it) owns input, resize
+//! and palette. Any number of *observers* (`Observe`) receive the same stream read-only:
+//! - Joining is atomic: the observer's queue is registered and its info, grid and snapshot
+//!   are encoded in one `Core` critical section, and `read_loop` feeds each PTY chunk and
+//!   queues it to everyone under that same lock, so each byte is either inside the snapshot
+//!   or queued after it.
+//! - Observing changes nothing: no resize, palette, focus, displacement, `HostInfo::attached`
+//!   or exit-linger effect. An observer connection may send only `Ping` and `Detach`; any
+//!   other frame (`Input`, `Resize`, `Palette`, `Attach`, `Kill`, …) aborts the subscription
+//!   and closes the connection at once (no reply). Killing stays available through a separate
+//!   connection (`Namespace::kill`).
+//! - Each observer has its own byte-bounded queue (live output, control frames and the
+//!   snapshot all count until written); one that falls behind is disconnected alone. The PTY
+//!   reader and the controller never wait for an observer. Output chunks are shared via `Arc`.
+//! - Session end queues `Exited` and then closes every observer; shutdown waits at most
+//!   `SHUTDOWN_GRACE` for their writers.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -20,8 +37,8 @@ use alacritty_terminal::vte::ansi::{Processor, Rgb};
 use crate::error::{Error, Result};
 use crate::namespace::Namespace;
 use crate::protocol::{
-    self, AttachParams, ExitedPayload, Hello, HostInfo, Kind, PROTOCOL, Palette, PeekParams,
-    ResizeParams, SNAPSHOT_CHUNK, SpawnRequest,
+    self, AttachParams, ExitedPayload, Grid, Hello, HostInfo, Kind, ObserveParams, PROTOCOL,
+    Palette, PeekParams, ResizeParams, SNAPSHOT_CHUNK, SpawnRequest,
 };
 use crate::pty::{self, PtyChild, PtySize};
 use crate::snapshot::{self, SideScanner};
@@ -44,6 +61,13 @@ const EXIT_LINGER: Duration = Duration::from_secs(10);
 /// Bytes queued for the PTY (client input plus query replies) before the attached client's
 /// input stops being read (backpressure) and query replies are dropped.
 const INPUT_BUDGET: usize = 8 << 20;
+/// Bytes an observer may have queued (live output and control frames, counted until written)
+/// beyond its initial snapshot before it is considered stuck and disconnected (it can observe
+/// again and gets a fresh snapshot).
+const OBSERVER_BUDGET: usize = 4 << 20;
+/// Accounted per queued observer item on top of its payload, so floods of tiny frames are
+/// bounded too.
+const OBSERVER_ITEM_COST: usize = 64;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Options of `omp-deck-host serve`.
@@ -141,6 +165,7 @@ fn start(
             palette: request.palette,
             size,
             client: None,
+            observers: Vec::new(),
             next_client: 1,
             ever_attached: false,
             replies: Vec::new(),
@@ -331,12 +356,141 @@ impl EventListener for EventProxy {
 
 enum Out {
     Frame(Kind, Vec<u8>),
+    /// Live PTY output, shared with the observers.
+    Output(Arc<[u8]>),
     Snapshot(Vec<u8>),
 }
 
 struct ClientHandle {
     id: u64,
     queue: SyncSender<Out>,
+}
+
+/// What an observer's writer sends.
+enum ObsItem {
+    Frame(Kind, Arc<[u8]>),
+    Snapshot(Vec<u8>),
+}
+
+impl ObsItem {
+    fn cost(&self) -> usize {
+        OBSERVER_ITEM_COST
+            + match self {
+                ObsItem::Frame(_, payload) => payload.len(),
+                ObsItem::Snapshot(bytes) => bytes.len(),
+            }
+    }
+}
+
+/// A registered observer (see the module docs).
+struct ObserverHandle {
+    id: u64,
+    queue: Arc<ObserverQueue>,
+}
+
+/// Byte-bounded queue towards one observer, drained by its writer thread. Producers never
+/// block: a push that does not fit fails and the caller disconnects the observer.
+struct ObserverQueue {
+    state: Mutex<ObsState>,
+    cv: Condvar,
+    budget: usize,
+    /// The observer's connection, shut down on abort so a writer blocked on a peer that
+    /// stopped reading (and the connection's reader) return at once.
+    stream: Stream,
+}
+
+struct ObsState {
+    items: VecDeque<ObsItem>,
+    /// Queued plus in-flight cost.
+    bytes: usize,
+    /// No more pushes; the writer drains what is queued, then closes the connection.
+    ending: bool,
+    /// Aborted: everything queued is dropped.
+    closed: bool,
+}
+
+impl ObserverQueue {
+    fn new(budget: usize, stream: Stream) -> ObserverQueue {
+        ObserverQueue {
+            state: Mutex::new(ObsState {
+                items: VecDeque::new(),
+                bytes: 0,
+                ending: false,
+                closed: false,
+            }),
+            cv: Condvar::new(),
+            budget,
+            stream,
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, ObsState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queues `item` if the queue is open and it fits (an empty queue admits anything);
+    /// `false` otherwise.
+    fn push(&self, item: ObsItem) -> bool {
+        let cost = item.cost();
+        let mut st = self.state();
+        if st.closed || st.ending || (st.bytes != 0 && st.bytes + cost > self.budget) {
+            return false;
+        }
+        st.bytes += cost;
+        st.items.push_back(item);
+        self.cv.notify_all();
+        true
+    }
+
+    /// Queues the small final `last` frame regardless of the budget, then lets the writer
+    /// drain and close the connection.
+    fn end(&self, last: ObsItem) {
+        let mut st = self.state();
+        if st.closed || st.ending {
+            return;
+        }
+        st.bytes += last.cost();
+        st.items.push_back(last);
+        st.ending = true;
+        self.cv.notify_all();
+    }
+
+    /// Drops everything queued and closes the connection now.
+    fn abort(&self) {
+        {
+            let mut st = self.state();
+            st.closed = true;
+            st.items.clear();
+            st.bytes = 0;
+            self.cv.notify_all();
+        }
+        // Never blocks (called under the core lock): no flush towards a peer not reading.
+        self.stream.abort();
+    }
+
+    /// Next item for the writer; `None` once aborted, or ended and drained.
+    fn pop(&self) -> Option<ObsItem> {
+        let st = self.state();
+        let mut st = self
+            .cv
+            .wait_while(st, |st| st.items.is_empty() && !st.closed && !st.ending)
+            .unwrap_or_else(PoisonError::into_inner);
+        if st.closed {
+            return None;
+        }
+        st.items.pop_front()
+    }
+
+    /// The writer finished an item of `cost`.
+    fn written(&self, cost: usize) {
+        let mut st = self.state();
+        st.bytes = st.bytes.saturating_sub(cost);
+    }
+}
+
+/// JSON control payload for observer queues, shareable between them.
+fn json_payload<T: serde::Serialize>(value: &T) -> Result<Arc<[u8]>> {
+    Ok(Arc::from(serde_json::to_vec(value)?))
 }
 
 struct Core {
@@ -347,6 +501,8 @@ struct Core {
     palette: Palette,
     size: PtySize,
     client: Option<ClientHandle>,
+    /// Read-only subscribers; never affect the session.
+    observers: Vec<ObserverHandle>,
     next_client: u64,
     /// Whether any client ever attached.
     ever_attached: bool,
@@ -491,6 +647,32 @@ impl Core {
         }
     }
 
+    fn grid(&self) -> Grid {
+        Grid {
+            cols: self.size.cols,
+            rows: self.size.rows,
+            cell_width: self.size.cell_width,
+            cell_height: self.size.cell_height,
+        }
+    }
+
+    /// Queues a frame for every observer. Those that are over budget or whose writer failed
+    /// are disconnected and forgotten; never blocks.
+    fn broadcast(&mut self, kind: Kind, payload: &Arc<[u8]>) {
+        self.observers.retain(|o| {
+            if o.queue.push(ObsItem::Frame(kind, Arc::clone(payload))) {
+                return true;
+            }
+            log::warn!("observer {} fell behind or went away; dropping it", o.id);
+            o.queue.abort();
+            false
+        });
+    }
+
+    fn remove_observer(&mut self, id: u64) {
+        self.observers.retain(|o| o.id != id);
+    }
+
     fn resize(
         &mut self,
         child: &PtyChild,
@@ -499,20 +681,33 @@ impl Core {
         cell_width: u16,
         cell_height: u16,
     ) {
+        let before = self.size;
         if cell_width != 0 && cell_height != 0 {
             self.size.cell_width = cell_width;
             self.size.cell_height = cell_height;
         }
-        if cols == 0 || rows == 0 || (cols == self.size.cols && rows == self.size.rows) {
-            return;
+        if cols != 0 && rows != 0 && (cols != self.size.cols || rows != self.size.rows) {
+            self.size.cols = cols.max(2);
+            self.size.rows = rows;
+            if let Err(e) = child.resize(self.size) {
+                log::warn!("pty resize: {e}");
+            }
+            self.term.resize(term_size(self.size));
+            self.scanner.resize(rows);
         }
-        self.size.cols = cols.max(2);
-        self.size.rows = rows;
-        if let Err(e) = child.resize(self.size) {
-            log::warn!("pty resize: {e}");
+        // Under the core lock like output, so observers apply it between the same bytes.
+        if self.size != before && !self.observers.is_empty() {
+            match json_payload(&self.grid()) {
+                Ok(grid) => self.broadcast(Kind::Resized, &grid),
+                Err(e) => {
+                    // Observers would render at a stale size: end their subscriptions.
+                    log::error!("encoding the grid: {e}; dropping all observers");
+                    for observer in self.observers.drain(..) {
+                        observer.queue.abort();
+                    }
+                }
+            }
         }
-        self.term.resize(term_size(self.size));
-        self.scanner.resize(rows);
     }
 
     fn snapshot(&mut self, history_lines: u32) -> Vec<u8> {
@@ -561,18 +756,20 @@ fn read_loop(shared: &Shared, mut reader: pty::PtyReader) {
         if core.processor.sync_timeout().sync_timeout().is_some() {
             shared.sync_cv.notify_one();
         }
-        if let Some(client) = &core.client {
-            match client
-                .queue
-                .try_send(Out::Frame(Kind::Output, chunk.to_vec()))
-            {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    log::warn!("client {} is not keeping up; dropping it", client.id);
-                    core.client = None;
+        if core.client.is_some() || !core.observers.is_empty() {
+            // One copy of the chunk, shared by the controller and every observer.
+            let output: Arc<[u8]> = Arc::from(chunk);
+            if let Some(client) = &core.client {
+                match client.queue.try_send(Out::Output(Arc::clone(&output))) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        log::warn!("client {} is not keeping up; dropping it", client.id);
+                        core.client = None;
+                    }
+                    Err(TrySendError::Disconnected(_)) => core.client = None,
                 }
-                Err(TrySendError::Disconnected(_)) => core.client = None,
             }
+            core.broadcast(Kind::Output, &output);
         }
         shared.send_replies(core);
     }
@@ -618,8 +815,14 @@ fn finish(shared: &Shared, code: Option<i32>) -> ! {
     });
     {
         let mut core = shared.core();
+        let payload = serde_json::to_vec(&ExitedPayload { code }).unwrap_or_default();
+        let exited: Arc<[u8]> = Arc::from(payload.as_slice());
+        for observer in core.observers.drain(..) {
+            observer
+                .queue
+                .end(ObsItem::Frame(Kind::Exited, Arc::clone(&exited)));
+        }
         if let Some(client) = core.client.take() {
-            let payload = serde_json::to_vec(&ExitedPayload { code }).unwrap_or_default();
             let _ = client.queue.try_send(Out::Frame(Kind::Exited, payload));
         }
     }
@@ -660,11 +863,22 @@ struct Conn<'a> {
     /// Client id while this connection is (or was) the attached one; its writes then go
     /// through the client queue.
     attached: Option<u64>,
+    /// Set by `Observe`: the connection may only `Ping` and `Detach` from then on.
+    read_only: bool,
+    /// Observer id and queue while subscribed; its replies then go through the queue.
+    observing: Option<(u64, Arc<ObserverQueue>)>,
     peer_protocol: u32,
 }
 
 impl Conn<'_> {
     fn reply(&mut self, kind: Kind, payload: &[u8]) -> Result<()> {
+        if let Some((_, queue)) = &self.observing {
+            // Over budget or gone: the stream is closed and the connection ends.
+            if !queue.push(ObsItem::Frame(kind, Arc::from(payload))) {
+                queue.abort();
+            }
+            return Ok(());
+        }
         if let Some(id) = self.attached {
             let core = self.shared.core();
             if let Some(client) = core.client.as_ref().filter(|c| c.id == id) {
@@ -693,6 +907,8 @@ fn serve_conn(shared: &Arc<Shared>, stream: Stream) -> Result<()> {
         payload: Vec::new(),
         out: Vec::new(),
         attached: None,
+        read_only: false,
+        observing: None,
         peer_protocol: 0,
     };
     match protocol::read_frame(&mut conn.stream, &mut conn.payload)? {
@@ -711,6 +927,10 @@ fn serve_conn(shared: &Arc<Shared>, stream: Stream) -> Result<()> {
             core.client = None;
         }
     }
+    if let Some((id, queue)) = conn.observing.take() {
+        shared.core().remove_observer(id);
+        queue.abort();
+    }
     result
 }
 
@@ -720,6 +940,19 @@ fn conn_loop(conn: &mut Conn<'_>) -> Result<()> {
         let Some(kind) = protocol::read_frame(&mut conn.stream, &mut conn.payload)? else {
             return Ok(());
         };
+        if conn.read_only {
+            match kind {
+                Kind::Ping => {
+                    conn.reply(Kind::Pong, &[])?;
+                    continue;
+                }
+                Kind::Detach => return Ok(()),
+                _ => {
+                    refuse_read_only(conn, kind);
+                    return Ok(());
+                }
+            }
+        }
         if kind == Kind::Kill {
             return kill(conn);
         }
@@ -754,6 +987,14 @@ fn conn_loop(conn: &mut Conn<'_>) -> Result<()> {
             Kind::Attach => {
                 let params: AttachParams = protocol::parse(&conn.payload)?;
                 attach(conn, &params)?;
+            }
+            Kind::Observe => {
+                if conn.attached.is_some() {
+                    conn.reply_json(Kind::Error, &"an attached connection cannot observe")?;
+                    continue;
+                }
+                let params: ObserveParams = protocol::parse(&conn.payload)?;
+                observe(conn, &params)?;
             }
             Kind::Input => {
                 // Backpressure: while the PTY input queue is over budget this connection's
@@ -868,6 +1109,13 @@ fn attach_after_exit(
     result
 }
 
+fn write_snapshot(stream: &mut Stream, buf: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    bytes
+        .chunks(SNAPSHOT_CHUNK)
+        .try_for_each(|c| protocol::write_frame(stream, buf, Kind::Snapshot, c))?;
+    protocol::write_frame(stream, buf, Kind::SnapshotEnd, &[])
+}
+
 fn client_writer(mut stream: Stream, rx: &Receiver<Out>) {
     let mut buf = Vec::new();
     for out in rx {
@@ -875,18 +1123,138 @@ fn client_writer(mut stream: Stream, rx: &Receiver<Out>) {
             Out::Frame(kind, payload) => {
                 protocol::write_frame(&mut stream, &mut buf, kind, &payload)
             }
-            Out::Snapshot(bytes) => bytes
-                .chunks(SNAPSHOT_CHUNK)
-                .try_for_each(|c| protocol::write_frame(&mut stream, &mut buf, Kind::Snapshot, c))
-                .and_then(|()| {
-                    protocol::write_frame(&mut stream, &mut buf, Kind::SnapshotEnd, &[])
-                }),
+            Out::Output(payload) => {
+                protocol::write_frame(&mut stream, &mut buf, Kind::Output, &payload)
+            }
+            Out::Snapshot(bytes) => write_snapshot(&mut stream, &mut buf, &bytes),
         };
         if result.is_err() {
             break;
         }
     }
     stream.shutdown();
+}
+
+/// `Observe`: registers a read-only subscriber (see the module docs for the guarantees).
+fn observe(conn: &mut Conn<'_>, params: &ObserveParams) -> Result<()> {
+    let shared = conn.shared;
+    conn.read_only = true;
+    if shared.status().shutting_down {
+        let code = shared.status().exited.flatten();
+        return conn.reply_json(Kind::Exited, &ExitedPayload { code });
+    }
+    shared.settle_exit();
+    let writer_stream = conn.stream.try_clone()?;
+    let abort_stream = conn.stream.try_clone()?;
+    let mut core = shared.core();
+    // Checked under the core lock: `finish` drains the observers under it after recording the
+    // exit, so either it sees this observer or this sees the exit.
+    let exited = shared.status().exited;
+    if let Some(code) = exited {
+        return observe_after_exit(conn, core, params.history_lines, code);
+    }
+    let info = match json_payload(&shared.info(&core)) {
+        Ok(info) => info,
+        Err(e) => {
+            // Reported, not dropped: a silent close would read as an older daemon.
+            drop(core);
+            return conn.reply_json(Kind::Error, &format!("encoding session info: {e}"));
+        }
+    };
+    let grid = json_payload(&core.grid())?;
+    let snapshot = core.snapshot(params.history_lines);
+    let queue = Arc::new(ObserverQueue::new(
+        OBSERVER_BUDGET + snapshot.len(),
+        abort_stream,
+    ));
+    // An empty queue whose budget covers the snapshot admits all three.
+    queue.push(ObsItem::Frame(Kind::Info, info));
+    queue.push(ObsItem::Frame(Kind::Resized, grid));
+    queue.push(ObsItem::Snapshot(snapshot));
+    let id = core.next_client;
+    core.next_client += 1;
+    core.observers.push(ObserverHandle {
+        id,
+        queue: Arc::clone(&queue),
+    });
+    conn.observing = Some((id, Arc::clone(&queue)));
+    shared.send_replies(core);
+
+    shared.update_status(|st| st.busy += 1);
+    let s = Arc::clone(shared);
+    let spawned = spawn_thread("observer-writer", move || {
+        observer_writer(writer_stream, &queue);
+        s.update_status(|st| st.busy -= 1);
+    });
+    if spawned.is_err() {
+        shared.update_status(|st| st.busy -= 1);
+    }
+    spawned
+}
+
+/// Observe while the session lingers after its child exited unseen: info, grid, final screen
+/// and `Exited`, written directly. Unlike a first attach this does not end the linger, so the
+/// controller still gets the final screen.
+fn observe_after_exit(
+    conn: &mut Conn<'_>,
+    mut core: MutexGuard<'_, Core>,
+    history_lines: u32,
+    code: Option<i32>,
+) -> Result<()> {
+    let shared = conn.shared;
+    let info = match serde_json::to_vec(&shared.info(&core)) {
+        Ok(info) => info,
+        Err(e) => {
+            drop(core);
+            return conn.reply_json(Kind::Error, &format!("encoding session info: {e}"));
+        }
+    };
+    let grid = core.grid();
+    let snapshot = core.snapshot(history_lines);
+    core.replies.clear();
+    drop(core);
+    shared.update_status(|st| st.busy += 1);
+    let (stream, out) = (&mut conn.stream, &mut conn.out);
+    let result = protocol::write_frame(stream, out, Kind::Info, &info)
+        .and_then(|()| protocol::write_json(stream, out, Kind::Resized, &grid))
+        .and_then(|()| write_snapshot(stream, out, &snapshot))
+        .and_then(|()| protocol::write_json(stream, out, Kind::Exited, &ExitedPayload { code }));
+    shared.update_status(|st| st.busy -= 1);
+    result
+}
+
+fn observer_writer(mut stream: Stream, queue: &ObserverQueue) {
+    let mut buf = Vec::new();
+    while let Some(item) = queue.pop() {
+        let result = match &item {
+            ObsItem::Frame(kind, payload) => {
+                protocol::write_frame(&mut stream, &mut buf, *kind, payload)
+            }
+            ObsItem::Snapshot(bytes) => write_snapshot(&mut stream, &mut buf, bytes),
+        };
+        queue.written(item.cost());
+        if result.is_err() {
+            queue.abort();
+            return;
+        }
+    }
+    stream.shutdown();
+}
+
+/// A frame other than `Ping`/`Detach` on an observer connection is a violation: the
+/// subscription is aborted at once (queued data dropped, its writer unblocked, connection
+/// closed). The disconnect is the rejection; nothing is promised to the misbehaving peer, so
+/// a peer that never reads cannot pin a writer thread. Nothing reaches the session.
+fn refuse_read_only(conn: &mut Conn<'_>, kind: Kind) {
+    log::warn!("observer connection sent {kind:?}; disconnected");
+    match conn.observing.take() {
+        Some((id, queue)) => {
+            conn.shared.core().remove_observer(id);
+            queue.abort();
+        }
+        // Answered after the session ended (written directly, nothing queued).
+        None => conn.stream.abort(),
+    }
 }
 
 /// `Kill`: terminate the process tree, wait for the session to end, confirm with `Exited`.

@@ -4,7 +4,7 @@
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{TermMode, viewport_to_point};
@@ -321,6 +321,12 @@ impl<'a> TerminalView<'a> {
             metrics.cell_w_px as u16,
             metrics.cell_h_px as u16,
         );
+        let (cols, rows) = if term.is_read_only() {
+            let state = term.term.lock();
+            (state.columns(), state.screen_lines())
+        } else {
+            (cols, rows)
+        };
         let geo = Geometry {
             origin,
             cell_w: metrics.cell_w,
@@ -502,6 +508,9 @@ impl Terminal {
 
     /// Pastes the clipboard as input (bracketed when the app enabled bracketed paste).
     pub fn paste_clipboard(&mut self) {
+        if self.input_held() {
+            return;
+        }
         let text = self.clipboard().get_text();
         let mode = self.mode();
         paste(self, text, mode);
@@ -513,7 +522,7 @@ impl Terminal {
     /// sends nothing (`Some` of no bytes).
     pub fn paste_bytes(&self, text: &str) -> Option<Vec<u8>> {
         let mode = self.mode();
-        mode.contains(TermMode::BRACKETED_PASTE)
+        (!self.is_read_only() && mode.contains(TermMode::BRACKETED_PASTE))
             .then(|| self.paste_encoding(text, mode))
     }
 

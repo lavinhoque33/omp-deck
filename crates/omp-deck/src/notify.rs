@@ -1,13 +1,11 @@
-//! Desktop notifications: the trigger rules ([`tracker`]), and a notifier thread per platform that
+//! Desktop notifications: a notifier thread per platform that
 //! shows them (Linux: `org.freedesktop.Notifications` over one zbus connection, raising the window
 //! with xdg-activation on Wayland; Windows: WinRT toasts filed under a tag and group, so they can be withdrawn). The UI thread only sends requests and
 //! drains signals; it never touches D-Bus or WinRT.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
-pub mod classify;
-pub mod inbox;
-pub mod tracker;
+use deck_service::controller::SessionTarget;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -27,7 +25,7 @@ pub const AUMID: &str = "io.github.lavinhoque33.OmpDeck";
 pub struct Request {
     /// The tab it is about (`None` = the settings test); a newer request for the same tab replaces
     /// the older notification.
-    pub tab: Option<u64>,
+    pub tab: Option<SessionTarget>,
     pub title: String,
     pub body: String,
 }
@@ -37,11 +35,11 @@ pub struct Request {
 pub enum Signal {
     /// The user clicked the notification. `token` is the compositor's xdg-activation token.
     Clicked {
-        tab: Option<u64>,
+        tab: Option<SessionTarget>,
         token: Option<String>,
     },
     /// The notification went away without a click (dismissed, expired, replaced by the server).
-    Gone { tab: Option<u64> },
+    Gone { tab: Option<SessionTarget> },
     /// Notifications cannot be shown (no notification service, WinRT failure); sent once.
     Unavailable(String),
     /// A requested raise could not be done by the platform path: use `Focus` + attention instead.
@@ -51,7 +49,7 @@ pub enum Signal {
 
 enum Cmd {
     Show(Request),
-    Close(Option<u64>),
+    Close(Option<SessionTarget>),
     /// Withdraw every tab's notification (the settings test stays).
     CloseAll,
     /// winit's `wl_display` and the window's `wl_surface` (raw pointers as integers).
@@ -105,7 +103,7 @@ impl Notifier {
     }
 
     /// Withdraw the notification of `tab` (best effort).
-    pub fn close(&self, tab: Option<u64>) {
+    pub fn close(&self, tab: Option<SessionTarget>) {
         let _ = self.tx.send(Cmd::Close(tab));
     }
 

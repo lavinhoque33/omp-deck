@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use super::{App, AppEvent, Focus, PendingConfirm, Post, RestartTarget, SpawnReq};
 use crate::agent_ctl::{self, Link, LinkFacts, Req, ReqKind, Restart, RestartFacts};
 use crate::confirm::Confirm;
-use crate::statusfmt::Activity;
 use crate::tabs::{Anchor, ClosedTab, Tab, TabRole};
 use deck_core::sessions::SessionEntry;
+use deck_service::statusfmt::Activity;
 
 /// The control client of the active session tab.
 pub(super) struct CtlLink {
@@ -94,7 +94,7 @@ impl App {
     /// The session file of the active session tab: the root commands are addressed to.
     pub(super) fn ctl_root(&self) -> Option<&std::path::Path> {
         match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) if t.role == TabRole::Session => t.session_path.as_deref(),
+            Some(Tab::Terminal(t)) if t.role == TabRole::Session => t.session_path(),
             _ => None,
         }
     }
@@ -106,7 +106,7 @@ impl App {
         };
         agent_ctl::link_state(&LinkFacts {
             connected,
-            ended: t.term.is_exited(),
+            ended: t.terminal().is_exited(),
             seen: t.ctl_seen,
             waited: t.ctl_expect.then(|| t.spawned.elapsed()),
         })
@@ -117,15 +117,15 @@ impl App {
         let Some(Tab::Terminal(t)) = self.tabs.get(self.active) else {
             return Restart::Hidden;
         };
-        if t.role != TabRole::Session || t.term.is_exited() {
+        if t.role != TabRole::Session || t.terminal().is_exited() {
             return Restart::Hidden;
         }
         agent_ctl::restart_offer(&RestartFacts {
             link: self.ctl_link(),
             backend: !self.backends.is_empty() && t.mux_name.is_some(),
-            has_session_file: t.session_path.is_some(),
+            has_session_file: t.session_path().is_some(),
             extension: self.ctl_ext.is_some(),
-            idle: Activity::from_title(t.term.title()) == Activity::Idle,
+            idle: Activity::from_title(t.terminal().title()) == Activity::Idle,
         })
     }
 
@@ -138,7 +138,7 @@ impl App {
             Some(Tab::Terminal(t)) if t.role == TabRole::Session => t
                 .ctl_key
                 .clone()
-                .map(|key| (t.uid, key, t.session_path.clone())),
+                .map(|key| (t.uid, key, t.session_path_owned())),
             _ => None,
         }) else {
             self.toasts
@@ -190,9 +190,9 @@ impl App {
             Some(Tab::Terminal(t))
                 if t.uid == uid
                     && t.role == TabRole::Session
-                    && !t.term.is_exited()
+                    && !t.terminal().is_exited()
                     && t.ctl_key.as_deref() == Some(key)
-                    && t.session_path.as_deref() == session
+                    && t.session_path() == session
         );
         if !same_tab || self.ctl.as_ref().is_none_or(|l| l.key != key) {
             self.toasts.error(
@@ -286,7 +286,7 @@ impl App {
         let Some(Tab::Terminal(t)) = self.tabs.get(self.active) else {
             return;
         };
-        let Some(session) = t.session_path.clone() else {
+        let Some(session) = t.session_path_owned() else {
             return;
         };
         let (uid, title) = (t.uid, t.title(&self.labels).to_owned());
@@ -312,7 +312,7 @@ impl App {
         let unchanged = self.restart_offer() == Restart::Ready
             && matches!(
                 self.tabs.get(self.active),
-                Some(Tab::Terminal(t)) if t.uid == uid && t.session_path.as_deref() == Some(session)
+                Some(Tab::Terminal(t)) if t.uid == uid && t.session_path() == Some(session)
             );
         if !unchanged {
             self.toasts.error(
@@ -334,7 +334,7 @@ impl App {
         let Some(Tab::Terminal(t)) = self.tabs.get(at) else {
             return;
         };
-        let (Some(name), Some(path)) = (t.mux_name.clone(), t.session_path.clone()) else {
+        let (Some(name), Some(path)) = (t.mux_name.clone(), t.session_path_owned()) else {
             return;
         };
         let tab = ClosedTab {
@@ -354,7 +354,7 @@ impl App {
         let Some(name) = tab.mux_name.clone() else {
             return;
         };
-        let slot = (tab.session_path.clone(), Some(name.clone()));
+        let slot = (tab.session_path_owned(), Some(name.clone()));
         self.spawn.reserve(slot);
         let relaunch = tab.clone();
         let backends = self.backends.clone();
@@ -382,11 +382,11 @@ impl App {
         let tab = self.tabs.iter().find_map(|t| match t {
             Tab::Terminal(t)
                 if t.role == TabRole::Session
-                    && !t.term.is_exited()
-                    && t.session_path.as_deref() == Some(entry.path.as_path()) =>
+                    && !t.terminal().is_exited()
+                    && t.session_path() == Some(entry.path.as_path()) =>
             {
                 t.mux_name.clone().map(|n| {
-                    let busy = Activity::from_title(t.term.title()) != Activity::Idle;
+                    let busy = Activity::from_title(t.terminal().title()) != Activity::Idle;
                     (t.uid, n, busy)
                 })
             }
@@ -437,7 +437,7 @@ impl App {
         }
         let at = self.tabs.iter().position(|t| {
             matches!(t, Tab::Terminal(x)
-                if x.session_path.as_deref() == Some(target.session.as_path()) && !x.term.is_exited())
+                if x.session_path() == Some(target.session.as_path()) && !x.terminal().is_exited())
         });
         let (tab, anchor) = match (target.uid, at) {
             (Some(uid), Some(at)) if matches!(self.tabs.get(at), Some(Tab::Terminal(t)) if t.uid == uid) =>
@@ -480,13 +480,13 @@ impl App {
         stopped: Result<(), String>,
     ) {
         self.spawn
-            .release(&(tab.session_path.clone(), tab.mux_name.clone()));
+            .release(&(tab.session_path_owned(), tab.mux_name.clone()));
         if let Err(e) = stopped {
             // The old process still runs: attaching shows it again, without control.
             self.toasts
                 .error(&self.ctx, format!("Could not restart: {e}"));
         }
-        let argv = self.with_omp_program(crate::tabs::omp_argv(tab.session_path.as_deref()));
+        let argv = self.with_omp_program(crate::tabs::omp_argv(tab.session_path()));
         self.spawn_tab_post(SpawnReq {
             mux_name: tab.mux_name,
             cwd: tab.cwd,

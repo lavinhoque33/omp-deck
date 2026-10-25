@@ -12,12 +12,7 @@ use deck_core::sessions::{ProjectGroup, abbreviate_home};
 use deck_core::worktree::{Worktree, WorktreeStatus};
 
 use crate::folder_scope;
-use crate::statusfmt::Activity;
-
-/// Label of the injected finish prompt (the injector reports refusals by label).
-pub const FINISH_LABEL: &str = "Finish worktree";
-/// Label of the injected `/wt` command.
-pub const MOVE_LABEL: &str = "Move to worktree";
+use deck_service::statusfmt::Activity;
 
 /// How long a finish waits for its tab (a closed session is resumed first) to reach an idle
 /// composer before it gives up.
@@ -401,7 +396,7 @@ pub fn finish_prompt(
             )),
         ),
     };
-    crate::inject::sanitize_line(&format!(
+    deck_service::inject::sanitize_line(&format!(
         "Finish this worktree: commit any remaining work on {work}, {how}. Follow this project's rules on committing and merging; if they do not let you do that without being asked, ask me first. Do not delete the worktree or its branch — OmpDeck removes both once everything is merged. When you are done, tell me the result."
     ))
 }
@@ -785,9 +780,17 @@ mod tests {
             "control characters in {p:?}"
         );
         assert!(p.contains("evil branch"));
-        assert_eq!(p, crate::inject::sanitize_line(&p), "already sanitized");
-        let job = crate::inject::Job::slash(FINISH_LABEL, &p, crate::inject::Requires::Idle);
-        assert_eq!(job.payload, crate::inject::Payload::Slash(p));
+        assert_eq!(
+            p,
+            deck_service::inject::sanitize_line(&p),
+            "already sanitized"
+        );
+        let job = deck_service::inject::Job::slash(
+            deck_service::controller::WORKTREE_FINISH_LABEL,
+            &p,
+            deck_service::inject::Requires::Idle,
+        );
+        assert_eq!(job.payload, deck_service::inject::Payload::Slash(p));
     }
 
     fn tab(uid: u64, stored: &Path, live: Option<&Path>) -> TabCwd {

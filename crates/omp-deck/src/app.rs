@@ -33,14 +33,11 @@ use serde_json::Value;
 use crate::agent_ctl::Req;
 use crate::agent_model::AgentsView;
 use crate::agent_popup::PopupState;
-use crate::backend::Backends;
 use crate::cli::Cli;
 use crate::clipboard_bridge;
-use crate::config_writer::ConfigWriter;
 use crate::confirm::{self, Confirm};
 use crate::dashboard::DashState;
 use crate::folder_scope;
-use crate::inject::Injector;
 use crate::model_picker::{ModelsCache, PickerState};
 use crate::notify_view::NotifyInput;
 use crate::omp_settings::{config_dir_display, defaults_from_catalog};
@@ -51,10 +48,9 @@ use crate::running::{RunningMonitor, RunningSnapshot};
 use crate::settings_page::{self, SettingsAction, SettingsInput, SettingsState};
 use crate::sidebar::{self, MenuEnv, SidebarAction, SidebarCache, SidebarInput};
 use crate::statusbar;
-use crate::statusfmt::Activity;
 use crate::tabs::{
     self, Anchor, ClosedTab, CopyPending, ReopenStack, Tab, TabAction, TabBarInput, TabRole,
-    TabStatus, TermTab,
+    TermTab,
 };
 use crate::theme::{self, Palette};
 use crate::titlebar::{self, BarAction, BarInput, OmpBar};
@@ -65,6 +61,11 @@ use crate::update::UpdateTracker;
 use crate::usage_state::{Usage, UsageEvent};
 use crate::usage_view;
 use crate::widgets::{empty_state, icon_text, menu_item};
+use deck_service::backend::Backends;
+use deck_service::controller::{RequestId, RequestKeys, SessionTarget};
+use deck_service::settings::{self, Edit, PendingEdit, SettingsError, SettingsService};
+use deck_service::status::TabStatus;
+use deck_service::statusfmt::Activity;
 
 mod agents;
 mod app_update;
@@ -89,6 +90,8 @@ use worktree::{WtEvent, WtUi};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+/// How often the settings file is re-read for commits of other processes.
+const SETTINGS_RELOAD: Duration = Duration::from_secs(1);
 const REFRESH_SPIN: Duration = Duration::from_millis(800);
 const MIN_FONT: f32 = 8.0;
 const MAX_FONT: f32 = 40.0;
@@ -104,6 +107,8 @@ const COPY_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct AppInit {
     pub cli: Cli,
     pub cfg: AppConfig,
+    /// Owner of the settings file (the config above is its snapshot at startup).
+    pub settings: SettingsService,
     pub backends: Backends,
     /// UI font bytes, read before the window opens.
     pub ui_fonts: ui_fonts::UiFonts,
@@ -176,6 +181,8 @@ enum PendingConfirm {
     /// An unsent draft in a tab's composer that a status-bar action would clear.
     ClearDraft {
         uid: u64,
+        /// The controller request waiting for the answer.
+        id: RequestId,
     },
     /// Kill this subagent through the control link.
     KillAgent {
@@ -232,9 +239,128 @@ pub(super) struct RestartTarget {
     pub title: String,
 }
 
+/// The settings this window owns through its live tab and split state instead of through `cfg`
+/// (they are projected into the submitted config). It records what the window last agreed on with
+/// the committed settings: only a projection that differs from it is this window's own change, so
+/// another window's newer commit is never silently overwritten.
+///
+/// The tab list, the active index and the split slots reference each other, so they are one unit
+/// (`Field::TabLayout`): committed together and given up together. A folder-scoped window owns only the entry of its
+/// folder in the folder map.
+#[derive(Clone, PartialEq)]
+struct TabsProj {
+    open_tabs: Vec<TabState>,
+    active_tab: Option<usize>,
+    split: Option<deck_core::config::SplitState>,
+    /// The folder this window is scoped to, and its entry in the folder map.
+    folder_key: Option<PathBuf>,
+    folder: Option<FolderTabs>,
+}
+
+impl TabsProj {
+    fn of(cfg: &AppConfig, folder_key: Option<&PathBuf>) -> TabsProj {
+        TabsProj {
+            open_tabs: cfg.open_tabs.clone(),
+            active_tab: cfg.active_tab,
+            split: cfg.split.clone(),
+            folder_key: folder_key.cloned(),
+            folder: folder_key.and_then(|k| cfg.folder_tabs.get(k).cloned()),
+        }
+    }
+
+    fn layout_is(&self, cfg: &AppConfig) -> bool {
+        cfg.open_tabs == self.open_tabs
+            && cfg.active_tab == self.active_tab
+            && cfg.split == self.split
+    }
+
+    fn take_layout(&mut self, from: &AppConfig) {
+        self.open_tabs = from.open_tabs.clone();
+        self.active_tab = from.active_tab;
+        self.split = from.split.clone();
+    }
+
+    /// In `edited` (a projected config), puts back `base`'s value of what the window has not
+    /// changed since it last synced (for the folder map, only this window's own entry).
+    fn mask_unchanged(&self, edited: &mut AppConfig, base: &AppConfig) {
+        if self.layout_is(edited) {
+            edited.open_tabs = base.open_tabs.clone();
+            edited.active_tab = base.active_tab;
+            edited.split = base.split.clone();
+        }
+        // The working map keeps every explicit edit of other keys (a removed worktree's entry);
+        // only the projected entry of this window's folder is subject to the masking.
+        if let Some(k) = &self.folder_key
+            && edited.folder_tabs.get(k) == self.folder.as_ref()
+        {
+            match base.folder_tabs.get(k) {
+                Some(v) => edited.folder_tabs.insert(k.clone(), v.clone()),
+                None => edited.folder_tabs.remove(k),
+            };
+        }
+    }
+
+    /// An edit that carried `sent` (against `base`) was committed: what it changed is synced.
+    fn committed(&mut self, sent: &AppConfig, base: &AppConfig) {
+        if sent.open_tabs != base.open_tabs
+            || sent.active_tab != base.active_tab
+            || sent.split != base.split
+        {
+            self.take_layout(sent);
+        }
+        if let Some(k) = &self.folder_key {
+            let (new, old) = (sent.folder_tabs.get(k), base.folder_tabs.get(k));
+            if new != old {
+                self.folder = new.cloned();
+            }
+        }
+    }
+
+    /// `fields` conflicted and the other writer's value stands. The layout counts as synced
+    /// whole; a folder entry only when it is this window's own (the conflict is per folder key,
+    /// so another folder's change never acknowledges, and never drops, our entry).
+    fn yield_fields(&mut self, live: &TabsProj, fields: &[settings::Field]) {
+        use settings::Field;
+        if fields.contains(&Field::TabLayout) {
+            self.open_tabs = live.open_tabs.clone();
+            self.active_tab = live.active_tab;
+            self.split = live.split.clone();
+        }
+        if let Some(k) = &self.folder_key
+            && fields
+                .iter()
+                .any(|f| matches!(f, Field::FolderTabs(key) if key == k))
+        {
+            self.folder = live.folder.clone();
+        }
+    }
+}
+
+/// The settings whose adoption needs a runtime effect beyond a new value in `cfg`.
+#[derive(Clone, PartialEq)]
+struct Applied {
+    rows: Vec<deck_core::config::SyncRow>,
+    look: (Theme, UiStyle, Density),
+    backend: BackendChoice,
+    backup_interval: deck_core::config::SyncInterval,
+    sync_interval: deck_core::config::SyncInterval,
+}
+
 pub struct App {
     ctx: egui::Context,
     cfg: AppConfig,
+    /// The single writer of the settings file; `cfg` is this window's working copy of it.
+    settings_service: SettingsService,
+    /// The committed settings `cfg` was last reconciled with (the baseline of the next edit).
+    cfg_base: Arc<AppConfig>,
+    /// Settings revision `cfg_base` reflects.
+    cfg_rev: u64,
+    /// The edit in flight at the settings owner, with the config it carried.
+    saving: Option<(PendingEdit, AppConfig)>,
+    /// The tab/split projection last agreed with the committed settings.
+    tabs_synced: TabsProj,
+    /// When the settings file was last asked to be re-read (other processes' commits).
+    settings_reload_at: Instant,
     backends: Backends,
     /// Warning shown above the panels (no backend, or the chosen one is unavailable).
     backend_banner: Option<String>,
@@ -243,7 +369,8 @@ pub struct App {
     watcher: SessionWatcher,
     running: RunningMonitor,
     clipboard: Clipboard,
-    writer: ConfigWriter,
+    /// Request identities of this client for every controller.
+    request_keys: RequestKeys,
 
     tabs: Vec<Tab>,
     active: usize,
@@ -310,6 +437,8 @@ pub struct App {
     picker: PickerState,
     models: ModelsCache,
     dialog: Option<bar::ActionDialog>,
+    /// The session (and generation) the open dialog was opened on.
+    dialog_target: Option<SessionTarget>,
     next_tab_uid: u64,
     /// Tabs (uid) whose close waits for their injector to reach a job boundary and its last byte to settle.
     closing: Vec<u64>,
@@ -420,6 +549,7 @@ impl App {
         let AppInit {
             cli,
             mut cfg,
+            settings,
             backends,
             ui_fonts,
             folder,
@@ -512,6 +642,12 @@ impl App {
         let mut app = App {
             ctx,
             root_exists: root.exists(),
+            cfg_base: settings.snapshot().config,
+            cfg_rev: settings.snapshot().revision,
+            saving: None,
+            tabs_synced: TabsProj::of(&cfg, launch_folder.as_ref()),
+            settings_reload_at: Instant::now(),
+            settings_service: settings,
             cfg,
             backends,
             backend_banner,
@@ -519,7 +655,7 @@ impl App {
             watcher,
             running,
             clipboard: Clipboard::new(),
-            writer: ConfigWriter::spawn(),
+            request_keys: RequestKeys::new("desktop"),
             tabs: Vec::new(),
             active: 0,
             closed: ReopenStack::new(20),
@@ -572,6 +708,7 @@ impl App {
             picker: PickerState::default(),
             models,
             dialog: None,
+            dialog_target: None,
             next_tab_uid: 0,
             closing: Vec::new(),
             deferred_opens: Vec::new(),
@@ -616,6 +753,10 @@ impl App {
         if let Some(e) = startup_error {
             app.toasts.error(&app.ctx, format!("Folder ignored: {e}"));
         }
+        app.settings_service.on_change({
+            let ctx = app.ctx.clone();
+            move || ctx.request_repaint()
+        });
         // The default model/thinking for fresh sessions come from omp's settings.
         if app.omp.is_some() {
             app.load_catalog();
@@ -644,7 +785,7 @@ impl App {
             if i != self.active
                 && let Some(prev) = self.tabs.get_mut(self.active).and_then(Tab::term_mut)
             {
-                prev.term.set_focused(false);
+                prev.terminal_mut().set_focused(false);
             }
             // Only a tab that is drawn has been seen; the dashboard hides every terminal.
             if !self.dash.open
@@ -759,9 +900,9 @@ impl App {
         });
         if let Some(i) = existing {
             if let Some(t) = self.tabs[i].term_mut()
-                && t.session_path.is_none()
+                && t.session_path().is_none()
             {
-                t.session_path.clone_from(&req.session_path);
+                t.ctl.set_session_path(req.session_path.clone());
             }
             self.activate(i);
             return;
@@ -803,7 +944,7 @@ impl App {
     /// Run omp's official installer in a direct tab; one at a time (re-focus a running one).
     fn open_install_tab(&mut self) {
         let running = self.tabs.iter().position(|t| {
-            matches!(t, Tab::Terminal(t) if t.role == TabRole::InstallOmp && !t.term.is_exited())
+            matches!(t, Tab::Terminal(t) if t.role == TabRole::InstallOmp && !t.terminal().is_exited())
         });
         if let Some(i) = running {
             self.activate(i);
@@ -890,12 +1031,12 @@ impl App {
             self.closed.push(ClosedTab {
                 mux_name: t.mux_name.clone(),
                 cwd: t.cwd.clone(),
-                session_path: t.session_path.clone(),
+                session_path: t.session_path_owned(),
                 title: t.title(&self.labels).to_owned(),
             });
         }
         let launch = match &tab {
-            Tab::Terminal(t) => (t.session_path.clone(), t.mux_name.clone()),
+            Tab::Terminal(t) => (t.session_path_owned(), t.mux_name.clone()),
             _ => (None, None),
         };
         drop(tab);
@@ -969,7 +1110,7 @@ impl App {
                 let label = tab.title(&self.labels).to_owned();
                 self.kill_session(name, label);
             }
-            _ => tab.term.kill(),
+            _ => tab.terminal_mut().kill(),
         }
     }
 
@@ -1037,10 +1178,8 @@ impl App {
             let Some(name) = &tab.mux_name else {
                 continue;
             };
-            if let Some(path) =
-                tabs::followed_path(tab.session_path.as_deref(), snap.files_of(name))
-            {
-                tab.session_path = Some(path.clone());
+            if let Some(path) = tabs::followed_path(tab.session_path(), snap.files_of(name)) {
+                tab.ctl.set_session_path(Some(path.clone()));
                 self.dirty = true;
             }
         }
@@ -1078,7 +1217,7 @@ impl App {
         theme::apply(&self.ctx, self.cfg.style, self.cfg.density, self.cfg.dark());
         let tt = term_theme(self.cfg.theme, self.cfg.style);
         for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
-            tab.term.set_theme(tt);
+            tab.terminal_mut().set_theme(tt);
         }
         self.dirty = true;
     }
@@ -1272,7 +1411,7 @@ impl App {
         let tab = || {
             self.tabs.iter().find_map(|t| {
                 let t = t.term()?;
-                (t.session_path.as_deref() == Some(entry.path.as_path()) && !t.term.is_exited())
+                (t.session_path() == Some(entry.path.as_path()) && !t.terminal().is_exited())
                     .then(|| t.mux_name.clone())
                     .flatten()
             })
@@ -1405,8 +1544,8 @@ impl App {
             .tabs
             .iter()
             .filter_map(Tab::term)
-            .filter(|t| !t.term.is_exited())
-            .filter_map(|t| t.session_path.as_deref())
+            .filter(|t| !t.terminal().is_exited())
+            .filter_map(|t| t.session_path())
             .collect();
         let input = BarInput {
             tabs: TabBarInput {
@@ -1457,9 +1596,9 @@ impl App {
             }),
             app_update: self.app_update_bar(),
             notifications: crate::notify_panel::PanelInput {
-                entries: self.notify.inbox.entries(),
-                badge: self.notify.inbox.badge(),
-                warn: self.notify.inbox.warns(),
+                entries: self.notify.center.inbox().entries(),
+                badge: self.notify.center.inbox().badge(),
+                warn: self.notify.center.inbox().warns(),
                 now: std::time::SystemTime::now(),
             },
         };
@@ -1525,7 +1664,7 @@ impl App {
         let open_paths: Vec<&Path> = self
             .tabs
             .iter()
-            .filter(|t| t.term().is_some_and(|t| !t.term.is_exited()))
+            .filter(|t| t.term().is_some_and(|t| !t.terminal().is_exited()))
             .filter_map(Tab::session_path)
             .collect();
         // Their rows show the tab's live omp state instead of the running LED.
@@ -1760,8 +1899,9 @@ impl App {
             let ctx = ui.ctx().clone();
             let surrender = ctx.options(|o| o.input_options.surrender_focus_on);
             ctx.options_mut(|o| o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never);
-            let out = TerminalView::new(&mut tab.term)
-                .id_salt(tab.uid)
+            let uid = tab.uid;
+            let out = TerminalView::new(tab.terminal_mut())
+                .id_salt(uid)
                 .font_size(self.cfg.font_size)
                 .show(ui);
             ctx.options_mut(|o| o.input_options.surrender_focus_on = surrender);
@@ -1773,11 +1913,11 @@ impl App {
             self.terminal_focused = out.response.has_focus();
             tab.bell = false;
             open_url = out.open_url;
-            match terminal_menu(&out.response, &tab.term) {
+            match terminal_menu(&out.response, tab.terminal()) {
                 Some(TermMenu::Copy) => {
-                    tab.term.copy_selection();
+                    tab.terminal().copy_selection();
                 }
-                Some(TermMenu::Paste) => tab.term.paste_clipboard(),
+                Some(TermMenu::Paste) => tab.terminal_mut().paste_clipboard(),
                 Some(TermMenu::OpenLink(url)) => open_url = Some(url),
                 Some(TermMenu::CopyLink(url)) => copy_link = Some(url),
                 None => {}
@@ -1814,8 +1954,8 @@ impl App {
             return;
         };
         self.focus_pending = true;
-        if let PendingConfirm::ClearDraft { uid } = pending {
-            self.answer_draft(uid, answer);
+        if let PendingConfirm::ClearDraft { uid, id } = pending {
+            self.answer_draft(uid, id, answer);
             return;
         }
         if let PendingConfirm::RestoreBackup(prepared) = pending {
@@ -1899,7 +2039,7 @@ impl App {
                 open_tabs.push(TabState {
                     session_name: mux_name,
                     cwd: t.cwd.clone(),
-                    session_path: t.session_path.clone(),
+                    session_path: t.session_path_owned(),
                     title: t.title(&self.labels).to_owned(),
                 });
                 persisted.push(t.uid);
@@ -1937,6 +2077,148 @@ impl App {
         cfg
     }
 
+    /// This window's config as it would be submitted: the working copy with the live tab and
+    /// split state projected in, where they changed since they last agreed with the commit.
+    fn pending_config(&self) -> AppConfig {
+        let mut edited = self.snapshot_config();
+        self.tabs_synced.mask_unchanged(&mut edited, &self.cfg_base);
+        edited
+    }
+
+    /// Submits what this window changed since the last reconciliation as field edits against
+    /// its baseline. Never blocks: the owner persists on its own thread.
+    fn submit_settings(&mut self) {
+        let edited = self.pending_config();
+        let edit = Edit::between(self.cfg_base.clone(), &edited);
+        if edit.changes.is_empty() {
+            return;
+        }
+        self.saving = Some((self.settings_service.submit(edit), edited));
+    }
+
+    /// Per tick: the outcome of the edit in flight, and commits other windows made.
+    fn poll_settings(&mut self) {
+        // Commits of other processes only reach the snapshot through a reload; the owner re-reads
+        // off the UI thread, so asking is cheap. The result shows up as a revision change.
+        let since = self.settings_reload_at.elapsed();
+        if since >= SETTINGS_RELOAD {
+            self.settings_service.reload();
+            self.settings_reload_at = Instant::now();
+            self.ctx.request_repaint_after(SETTINGS_RELOAD);
+        } else {
+            self.ctx.request_repaint_after(SETTINGS_RELOAD - since);
+        }
+        if let Some((pending, _)) = &self.saving
+            && let Some(result) = pending.try_result()
+            && let Some((_, sent)) = self.saving.take()
+        {
+            self.on_settings_result(result, sent);
+        }
+        let snap = self.settings_service.snapshot();
+        if snap.revision != self.cfg_rev && self.saving.is_none() {
+            // Another window or process committed: take over the fields this window did not touch.
+            let old = self.cfg_base.clone();
+            self.adopt_settings(&old, snap.config, snap.revision);
+        }
+    }
+
+    fn on_settings_result(
+        &mut self,
+        result: Result<settings::Snapshot, SettingsError>,
+        sent: AppConfig,
+    ) {
+        match result {
+            Ok(snap) => {
+                self.tabs_synced.committed(&sent, &self.cfg_base);
+                self.adopt_settings(&sent, snap.config, snap.revision);
+            }
+            Err(SettingsError::Conflict { fields, current }) => {
+                // Someone else changed these fields since this window's baseline: theirs stand,
+                // this window's other changes are sent again against the newer baseline.
+                log::warn!("settings changed elsewhere ({fields:?}): keeping the other value");
+                let names: Vec<String> = fields.iter().map(|f| format!("{f:?}")).collect();
+                self.toasts.info(
+                    &self.ctx,
+                    format!(
+                        "Settings changed elsewhere; kept the other value for: {}",
+                        names.join(", ")
+                    ),
+                );
+                let before = self.applied_settings();
+                let live = TabsProj::of(
+                    &self.snapshot_config(),
+                    self.tabs_synced.folder_key.as_ref(),
+                );
+                self.tabs_synced.yield_fields(&live, &fields);
+                settings::adopt(&mut self.cfg, &current.config, &fields);
+                let old = self.cfg_base.clone();
+                settings::rebase(&mut self.cfg, &old, &current.config);
+                self.cfg_base = current.config;
+                self.cfg_rev = current.revision;
+                self.reconcile_settings(before);
+                self.dirty = true;
+            }
+            Err(e) => {
+                log::warn!("saving settings failed: {e}");
+                self.toasts
+                    .error(&self.ctx, format!("Saving settings failed: {e}"));
+                // The baseline did not advance: the same changes go out again later.
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Moves the working copy onto `new` (a committed snapshot): every field this window has not
+    /// changed since `old` takes the committed value, its own pending changes stay.
+    fn adopt_settings(&mut self, old: &AppConfig, new: Arc<AppConfig>, revision: u64) {
+        let before = self.applied_settings();
+        settings::rebase(&mut self.cfg, old, &new);
+        self.cfg_base = new;
+        self.cfg_rev = revision;
+        self.reconcile_settings(before);
+    }
+
+    /// The settings whose change needs more than a new value in `cfg`.
+    fn applied_settings(&self) -> Applied {
+        Applied {
+            look: (self.cfg.theme, self.cfg.style, self.cfg.density),
+            backend: self.cfg.session_backend,
+            backup_interval: self.cfg.drive_backup_interval,
+            rows: self.cfg.project_sync.clone(),
+            sync_interval: self.cfg.project_sync_interval,
+        }
+    }
+
+    /// Carries out the runtime side effects of settings that changed from `before` through
+    /// adoption, as their settings-page handlers would: restyle, and the backend choice for new
+    /// sessions (running sessions keep their backend).
+    fn reconcile_settings(&mut self, before: Applied) {
+        // A committed font size is trusted no further than the one typed in the settings page.
+        if !self.cfg.font_size.is_finite() {
+            self.cfg.font_size = DEFAULT_FONT;
+        }
+        self.cfg.font_size = self.cfg.font_size.clamp(MIN_FONT, MAX_FONT);
+        let now = self.applied_settings();
+        if before.look != now.look {
+            self.restyle();
+        }
+        if before.backend != now.backend {
+            self.backends.set_choice(now.backend);
+            self.backend_banner = self.backends.banner();
+        }
+        if before.backup_interval != now.backup_interval {
+            self.drive
+                .reschedule(before.backup_interval, now.backup_interval);
+        }
+        if before.rows != now.rows {
+            self.reconcile_sync_rows(&before.rows);
+        }
+        if before.sync_interval != now.sync_interval {
+            self.sync
+                .reschedule(before.sync_interval, now.sync_interval);
+        }
+    }
+
     fn housekeeping(&mut self, ctx: &egui::Context) {
         self.track_geometry(ctx);
 
@@ -1965,12 +2247,16 @@ impl App {
         clipboard_bridge::forward_copies(ctx, &self.clipboard);
 
         if self.dirty {
-            if self.last_save.elapsed() >= SAVE_DEBOUNCE {
-                self.writer.save(self.snapshot_config());
+            let since = self.last_save.elapsed();
+            if since < SAVE_DEBOUNCE {
+                ctx.request_repaint_after(SAVE_DEBOUNCE - since);
+            } else if self.saving.is_none() {
+                self.submit_settings();
                 self.dirty = false;
                 self.last_save = Instant::now();
             } else {
-                ctx.request_repaint_after(SAVE_DEBOUNCE - self.last_save.elapsed());
+                // The previous edit is still at the owner; its result arrives through `logic`.
+                ctx.request_repaint_after(Duration::from_millis(100));
             }
         }
 
@@ -2080,10 +2366,10 @@ impl App {
         for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
             if matches!(tab.role, TabRole::Update(_) | TabRole::InstallOmp)
                 && !tab.exit_handled
-                && tab.term.is_exited()
+                && tab.terminal().is_exited()
             {
                 tab.exit_handled = true;
-                finished.push((tab.role, tab.term.exit_code()));
+                finished.push((tab.role, tab.terminal().exit_code()));
             }
         }
         for (role, code) in finished {
@@ -2303,11 +2589,16 @@ impl App {
         let mut polls = Vec::new();
         let mut pending = false;
         for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
+            if tab.copy.is_none() {
+                continue;
+            }
+            let exited = tab.terminal().is_exited();
+            let exit_code = tab.terminal().exit_code();
             let Some(copy) = &mut tab.copy else {
                 continue;
             };
-            if tab.term.is_exited() {
-                errors.push(match tab.term.exit_code() {
+            if exited {
+                errors.push(match exit_code {
                     Some(code) => format!(
                         "Copy failed: omp exited (code {code}) before the copy was created — see the tab for its output"
                     ),
@@ -2363,7 +2654,7 @@ impl App {
             return;
         };
         tab.copy = None;
-        tab.session_path = Some(path);
+        tab.ctl.set_session_path(Some(path));
         let dest = abbreviate_home(&tab.cwd);
         self.dirty = true;
         self.toasts.success(
@@ -2377,7 +2668,7 @@ impl App {
         let running = self.running_session_name(&entry).is_some()
             || self.tabs.iter().any(|t| {
                 t.term().is_some_and(|t| {
-                    t.session_path.as_deref() == Some(entry.path.as_path()) && !t.term.is_exited()
+                    t.session_path() == Some(entry.path.as_path()) && !t.terminal().is_exited()
                 })
             });
         let mut body = format!(
@@ -2439,7 +2730,7 @@ impl App {
         let (mut slot, mut was_active) = (0, false);
         for i in (0..self.tabs.len()).rev() {
             let hit = self.tabs[i].term().is_some_and(|t| {
-                t.session_path.as_deref() == Some(entry.path.as_path())
+                t.session_path() == Some(entry.path.as_path())
                     || (holder.is_some() && t.mux_name == holder)
             });
             if !hit {
@@ -2452,7 +2743,7 @@ impl App {
                             kill_names.push(name.clone());
                         }
                     }
-                    None => t.term.kill(),
+                    None => t.terminal_mut().kill(),
                 }
                 if tab_state.is_none() {
                     slot = i;
@@ -2490,9 +2781,9 @@ impl App {
         let running = self.running_session_name(&entry).is_some();
         let busy = self.tabs.iter().any(|t| match t {
             Tab::Terminal(t) => {
-                !t.term.is_exited()
-                    && t.session_path.as_deref() == Some(entry.path.as_path())
-                    && Activity::from_title(t.term.title()) != Activity::Idle
+                !t.terminal().is_exited()
+                    && t.session_path() == Some(entry.path.as_path())
+                    && Activity::from_title(t.terminal().title()) != Activity::Idle
             }
             _ => false,
         });
@@ -2535,15 +2826,18 @@ impl App {
         let title = entry.label().to_owned();
         let backends = self.backends.clone();
         self.spawn_omp(move |omp| {
-            session_manager::kill_all(&backends, &kill_names, "delete");
             let mut result = Err("omp did not answer".to_owned());
             let target = deck_core::omp::DeleteTarget {
                 path: path.clone(),
                 id,
             };
-            omp.delete_sessions(std::slice::from_ref(&target), |_, r| {
-                result = r.map_err(|e| session_manager::delete_error_text(&e));
-            });
+            deck_service::lifecycle::stop_then_delete(
+                &omp,
+                &backends,
+                &kill_names,
+                std::slice::from_ref(&target),
+                |_, r| result = r,
+            );
             OmpEvent::DeleteDone {
                 path,
                 title,
@@ -2568,7 +2862,7 @@ impl App {
         let mut kill_names: Vec<String> = holder.iter().cloned().collect();
         for i in (0..self.tabs.len()).rev() {
             let hit = self.tabs[i].term().is_some_and(|t| {
-                t.session_path.as_deref() == Some(entry.path.as_path())
+                t.session_path() == Some(entry.path.as_path())
                     || (holder.is_some() && t.mux_name == holder)
             });
             if !hit {
@@ -2581,7 +2875,7 @@ impl App {
                             kill_names.push(name.clone());
                         }
                     }
-                    None => t.term.kill(),
+                    None => t.terminal_mut().kill(),
                 }
             }
             if close_tabs {
@@ -2653,8 +2947,8 @@ impl App {
         else {
             return;
         };
-        self.retarget_pane_claim(src, t.session_path.clone(), t.mux_name.clone());
-        let argv = self.with_omp_program(tabs::omp_argv(t.session_path.as_deref()));
+        self.retarget_pane_claim(src, t.session_path_owned(), t.mux_name.clone());
+        let argv = self.with_omp_program(tabs::omp_argv(t.session_path()));
         self.spawn_tab_post(SpawnReq {
             mux_name: t.mux_name,
             cwd: t.cwd,
@@ -2730,7 +3024,7 @@ impl App {
                         i == self.active
                     };
                 // A shown tab's bell is moot; the others show the marker.
-                if t.term.poll().bell && !shown {
+                if t.terminal_mut().poll().bell && !shown {
                     t.bell = true;
                 }
             }
@@ -2780,6 +3074,7 @@ impl eframe::App for App {
     /// skips `ui`): terminal polling and the notification rules must not depend on painting.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.poll_tabs();
+        self.poll_settings();
         self.drive_notifications(ctx, frame);
     }
 
@@ -2816,7 +3111,7 @@ impl eframe::App for App {
                     } else {
                         i == self.active
                     };
-                t.term.set_visible(shown);
+                t.terminal().set_visible(shown);
             }
         }
 
@@ -2887,8 +3182,31 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let cfg = self.snapshot_config();
-        self.writer.finish(cfg);
+        // Whatever is still in flight settles first; then the final state goes through the same
+        // compare-and-set path and the owner is flushed so it is on disk before exit.
+        // A conflict drops this window's conflicting fields and leaves the rest dirty: those go
+        // out again, so a lost race on one field never loses the others. Every conflicting round
+        // gives up at least one of the fields still to send, so the fields in flight plus the
+        // fields still dirty, plus one final round, bound the loop. A failed write ends it.
+        let in_flight = self.saving.as_ref().map_or(0, |(_, sent)| {
+            settings::Setting::diff(&self.cfg_base, sent).len()
+        });
+        let dirty = settings::Setting::diff(&self.cfg_base, &self.pending_config()).len();
+        for _ in 0..in_flight + dirty + 1 {
+            if self.saving.is_none() {
+                self.submit_settings();
+            }
+            let Some((pending, sent)) = self.saving.take() else {
+                break;
+            };
+            let result = pending.wait();
+            let failed = matches!(result, Err(SettingsError::Io(_) | SettingsError::Gone));
+            self.on_settings_result(result, sent);
+            if failed {
+                break;
+            }
+        }
+        self.settings_service.flush();
     }
 }
 
@@ -3024,7 +3342,89 @@ pub(crate) fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WindowGeometry, is_openable_url, update_geometry};
+    use super::{TabsProj, WindowGeometry, is_openable_url, update_geometry};
+    use deck_core::config::{AppConfig, FolderTabs};
+    use deck_service::settings::Field;
+    use std::path::PathBuf;
+
+    fn folder(active: usize) -> FolderTabs {
+        FolderTabs {
+            active_tab: Some(active),
+            ..FolderTabs::default()
+        }
+    }
+
+    #[test]
+    fn an_unchanged_projection_never_overwrites_the_committed_layout() {
+        let key = PathBuf::from("/p/a");
+        let local = AppConfig::default();
+        let synced = TabsProj::of(&local, Some(&key));
+        let mut base = local.clone();
+        base.active_tab = Some(3);
+        base.folder_tabs.insert(key.clone(), folder(2));
+        let mut edited = local.clone();
+        synced.mask_unchanged(&mut edited, &base);
+        assert_eq!(edited.active_tab, Some(3));
+        assert_eq!(edited.folder_tabs, base.folder_tabs);
+    }
+
+    #[test]
+    fn only_the_own_folder_entry_is_masked_and_other_keys_keep_explicit_edits() {
+        let (mine, other, gone) = (
+            PathBuf::from("/p/a"),
+            PathBuf::from("/p/b"),
+            PathBuf::from("/wt/x"),
+        );
+        let mut base = AppConfig::default();
+        base.folder_tabs.insert(other.clone(), folder(5));
+        base.folder_tabs.insert(gone.clone(), folder(7));
+        base.folder_tabs.insert(mine.clone(), folder(2));
+        // Working config: a removed worktree entry (explicit edit); own view unchanged.
+        let mut synced = TabsProj::of(&AppConfig::default(), Some(&mine));
+        synced.folder = Some(folder(9));
+        let mut edited = base.clone();
+        edited.folder_tabs.remove(&gone);
+        edited.folder_tabs.insert(mine.clone(), folder(9));
+        synced.mask_unchanged(&mut edited, &base);
+        assert!(!edited.folder_tabs.contains_key(&gone), "removal persists");
+        assert_eq!(edited.folder_tabs.get(&other), Some(&folder(5)));
+        assert_eq!(
+            edited.folder_tabs.get(&mine),
+            Some(&folder(2)),
+            "own view masked"
+        );
+        // A changed own view is sent.
+        let mut moved = base.clone();
+        moved.folder_tabs.insert(mine.clone(), folder(1));
+        synced.mask_unchanged(&mut moved, &base);
+        assert_eq!(moved.folder_tabs.get(&mine), Some(&folder(1)));
+    }
+
+    #[test]
+    fn only_a_conflict_of_the_own_folder_key_is_yielded() {
+        let (mine, other) = (PathBuf::from("/p/a"), PathBuf::from("/p/b"));
+        let local = AppConfig::default();
+        let mut synced = TabsProj::of(&local, Some(&mine));
+        let mut edited = local.clone();
+        edited.folder_tabs.insert(mine.clone(), folder(1));
+        let live = TabsProj::of(&edited, Some(&mine));
+        // A conflict on another folder's key: our entry is not acknowledged and stays pending.
+        synced.yield_fields(&live, &[Field::FolderTabs(other.clone())]);
+        assert_eq!(synced.folder, None);
+        let mut committed = local.clone();
+        committed.folder_tabs.insert(other, folder(5));
+        let mut resend = committed.clone();
+        resend.folder_tabs.insert(mine.clone(), folder(1));
+        synced.mask_unchanged(&mut resend, &committed);
+        assert_eq!(
+            resend.folder_tabs.get(&mine),
+            Some(&folder(1)),
+            "still sent"
+        );
+        // A conflict on our own key: the other value stands, the live entry is the baseline.
+        synced.yield_fields(&live, &[Field::FolderTabs(mine)]);
+        assert_eq!(synced.folder, Some(folder(1)));
+    }
 
     #[test]
     fn geometry_falls_back_to_viewport_size_without_inner_rect() {

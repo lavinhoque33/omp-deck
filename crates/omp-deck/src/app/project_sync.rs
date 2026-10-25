@@ -215,6 +215,20 @@ pub(super) struct SyncUi {
 }
 
 impl SyncUi {
+    /// The sync interval changed from `was` to `now` (by the user, or adopted from another
+    /// window's commit): the next automatic pass is due after the new period, or after the
+    /// first-run delay when syncing was off.
+    pub(super) fn reschedule(&mut self, was: SyncInterval, now: SyncInterval) {
+        if let Some(period) = now.period() {
+            let wait = if was == SyncInterval::Off {
+                AUTO_FIRST
+            } else {
+                period
+            };
+            self.next_auto = Instant::now() + wait;
+        }
+    }
+
     pub(super) fn new() -> SyncUi {
         SyncUi {
             job: None,
@@ -500,6 +514,32 @@ impl App {
         });
     }
 
+    /// The project list changed through another window's commit (`before` is what it was): drop
+    /// what belonged to removed rows, rebuild the cells of rows whose exclusions changed, and
+    /// measure new rows when the page is showing.
+    pub(super) fn reconcile_sync_rows(&mut self, before: &[SyncRow]) {
+        let now = self.cfg.project_sync.clone();
+        for old in before
+            .iter()
+            .filter(|o| !now.iter().any(|r| r.path == o.path))
+        {
+            self.sync.sizes.remove(&old.path);
+            self.sync.cells.remove(&old.path);
+            self.sync.errors.remove(&old.path);
+            self.sync.skipped.remove(&old.path);
+            self.sync.measuring.remove(&old.path);
+        }
+        for row in &now {
+            match before.iter().find(|o| o.path == row.path) {
+                None if self.sync.was_visible || self.sync.seen => self.measure_path(&row.path),
+                Some(o) if o.excluded_sessions != row.excluded_sessions => {
+                    self.refresh_cells(&row.path);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn measure_rows(&mut self) {
         let paths: Vec<PathBuf> = self
             .cfg
@@ -716,13 +756,10 @@ impl App {
                 }
             }
             SyncAction::SetInterval(v) => {
-                let was_off = self.cfg.project_sync_interval == SyncInterval::Off;
+                let was = self.cfg.project_sync_interval;
                 self.cfg.project_sync_interval = v;
                 self.dirty = true;
-                if let Some(period) = v.period() {
-                    self.sync.next_auto =
-                        Instant::now() + if was_off { AUTO_FIRST } else { period };
-                }
+                self.sync.reschedule(was, v);
             }
             SyncAction::OpenRestore => self.open_restore(None),
             SyncAction::ChooseSessions(i) => self.open_sessions_dialog(i),

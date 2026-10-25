@@ -30,9 +30,10 @@ fn state_path() -> PathBuf {
     config_dir().join("state.json")
 }
 
-/// Parses the stored JSON, migrating the retired `drive_auto_backup` bool: `false` without a
-/// `drive_backup_interval` becomes `Off`; `true` or absent keeps the default. The old key is dropped.
-fn parse_config(bytes: &[u8]) -> Result<AppConfig, serde_json::Error> {
+/// Decodes stored settings with the same legacy migrations as [`AppConfig::load_from`].
+/// Unlike the convenience loader, invalid JSON or fields are returned as an error; no defaults
+/// replace unreadable settings. This lets transactional writers preserve a failed read.
+pub fn parse_config(bytes: &[u8]) -> Result<AppConfig, serde_json::Error> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
     if let Some(map) = value.as_object_mut() {
         let legacy = map.remove("drive_auto_backup");

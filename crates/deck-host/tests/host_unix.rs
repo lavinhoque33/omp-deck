@@ -6,13 +6,14 @@
 mod common;
 
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::term::TermMode;
-use common::{Client, TestNs, env, params, scratch, wait_until};
-use deck_host::{Error, HostEvent, SessionSpec};
+use common::{Client, Observer, TestNs, env, params, scratch, wait_until};
+use deck_host::protocol::{self as wire, Kind};
+use deck_host::{Error, Grid, HostEvent, ObserverEvent, Palette, SessionSpec};
 
 fn spec(name: &str, program: &str, args: &[&str]) -> SessionSpec {
     SessionSpec {
@@ -497,4 +498,459 @@ fn clients_that_drop_immediately_do_not_break_the_endpoint() {
     let mut c = Client::attach(&ns, "drop", 80, 24);
     c.type_line("echo still-served");
     c.wait_output("still-served\r\n");
+}
+
+// --- Read-only observers -------------------------------------------------------------------
+
+/// A hand-driven observer connection (Hello + Observe), read through its snapshot.
+fn raw_observer(ns: &TestNs, name: &str) -> UnixStream {
+    let mut s = UnixStream::connect(ns.dir().join(format!("{name}.sock"))).unwrap();
+    s.set_read_timeout(Some(common::WAIT)).unwrap();
+    let (mut buf, mut payload) = (Vec::new(), Vec::new());
+    wire::write_json(&mut s, &mut buf, Kind::Hello, &wire::Hello::ours()).unwrap();
+    assert_eq!(
+        wire::read_frame(&mut s, &mut payload).unwrap(),
+        Some(Kind::Hello)
+    );
+    let observe = wire::ObserveParams { history_lines: 0 };
+    wire::write_json(&mut s, &mut buf, Kind::Observe, &observe).unwrap();
+    let mut kinds = Vec::new();
+    loop {
+        let kind = wire::read_frame(&mut s, &mut payload)
+            .unwrap()
+            .expect("frame");
+        kinds.push(kind);
+        if kind == Kind::SnapshotEnd {
+            break;
+        }
+    }
+    assert_eq!(kinds[..3], [Kind::Info, Kind::Resized, Kind::Snapshot]);
+    s
+}
+
+/// Expects the daemon's read-only refusal: the connection ends (frames already in flight may
+/// precede the end; a frame cut by the abort counts as the end too).
+fn expect_refused(s: &mut UnixStream, sent: Kind) {
+    let mut payload = Vec::new();
+    loop {
+        match wire::read_frame(s, &mut payload) {
+            Ok(Some(
+                Kind::Info | Kind::Resized | Kind::Snapshot | Kind::SnapshotEnd | Kind::Output,
+            )) => {}
+            Ok(None) => return,
+            Err(Error::Protocol(msg)) if msg.starts_with("truncated") => return,
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => return,
+            other => panic!("{sent:?}: expected the connection to close, got {other:?}"),
+        }
+    }
+}
+
+/// Threads of process `pid`.
+fn thread_count(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .count()
+}
+
+/// Lines of the form `n<number>`, in order (screen text or raw `\r\n` output).
+fn numbered_lines(text: &str) -> Vec<u32> {
+    text.lines()
+        .filter_map(|l| l.trim_end_matches('\r').strip_prefix('n')?.parse().ok())
+        .collect()
+}
+
+fn visible(screen: &str, rows: usize) -> Vec<&str> {
+    let lines: Vec<&str> = screen.lines().collect();
+    lines[lines.len().saturating_sub(rows)..].to_vec()
+}
+
+#[test]
+fn observers_join_gap_free_without_displacing_or_resizing_the_controller() {
+    let ns = TestNs::new();
+    let mut c = Client::create(&ns, &shell("gap"), 80, 24);
+    // Paced (a short sleep every 100 lines, ~1.5 s in all) so the joins below land while
+    // output is still flowing rather than after the loop finished.
+    c.type_line(
+        "i=0; while [ $i -lt 3000 ]; do echo n$i; i=$((i+1)); \
+         [ $((i % 100)) -eq 0 ] && sleep 0.05; done; echo loop-''done",
+    );
+    // Joins at different points of the stream, each with enough history for all of it.
+    let mut observers = Vec::new();
+    for mark in ["n10\r\n", "n1000\r\n", "n2000\r\n"] {
+        c.wait_output(mark);
+        observers.push(Observer::new(&ns, "gap", 10_000));
+    }
+    c.wait_output("loop-done\r\n");
+    c.settle(Duration::from_millis(300));
+    let expected: Vec<u32> = (0..3000).collect();
+    for o in &mut observers {
+        // The end may already be in the snapshot (late join), so wait on the screen.
+        o.wait_screen("loop-done");
+        o.settle(Duration::from_millis(200));
+        // Snapshot plus live output: every line exactly once, in order.
+        assert_eq!(numbered_lines(&o.screen()), expected);
+        assert_eq!(visible(&o.screen(), 24), visible(&c.screen(), 24));
+        assert_eq!(o.grid.cols, 80);
+        assert!(o.resizes.is_empty());
+    }
+    // The first join happened mid-loop: part of the sequence arrived live after the snapshot.
+    assert!(
+        !numbered_lines(&String::from_utf8_lossy(&observers[0].output)).is_empty(),
+        "first observer joined after the loop; no live join was exercised"
+    );
+    // The controller is still attached, unresized, and keeps input.
+    let info = ns.0.info("gap").unwrap();
+    assert!(info.attached);
+    assert_eq!((info.cols, info.rows), (80, 24));
+    c.type_line("echo ctl-''still");
+    c.wait_output("ctl-still\r\n");
+    for o in &mut observers {
+        o.wait_output("ctl-still\r\n");
+    }
+}
+
+#[test]
+fn controller_resize_reaches_observers_in_stream_order() {
+    let ns = TestNs::new();
+    let c = Client::create(&ns, &shell("ors"), 80, 24);
+    let mut o = Observer::new(&ns, "ors", 100);
+    assert_eq!(
+        o.grid,
+        Grid {
+            cols: 80,
+            rows: 24,
+            cell_width: 8,
+            cell_height: 16
+        }
+    );
+    c.tx.resize(101, 33, 9, 18).unwrap();
+    c.type_line("stty size; echo size-''done");
+    let mut resized = false;
+    loop {
+        match o.next() {
+            ObserverEvent::Resized(grid) => {
+                assert_eq!(
+                    grid,
+                    Grid {
+                        cols: 101,
+                        rows: 33,
+                        cell_width: 9,
+                        cell_height: 18
+                    }
+                );
+                resized = true;
+            }
+            ObserverEvent::Output(_) => {
+                let out = String::from_utf8_lossy(&o.output).into_owned();
+                if out.contains("33 101") {
+                    assert!(resized, "output of the new size arrived before Resized");
+                }
+                if out.contains("size-done") {
+                    break;
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(o.resizes.len(), 1);
+    let info = ns.0.info("ors").unwrap();
+    assert_eq!((info.cols, info.rows), (101, 33));
+}
+
+#[test]
+fn observer_frames_cannot_affect_the_session() {
+    let ns = TestNs::new();
+    let mut c = Client::create(&ns, &shell("ro"), 80, 24);
+    c.type_line("echo ready-''ro");
+    c.wait_output("ready-ro\r\n");
+    let child = ns.0.info("ro").unwrap().child_pid;
+    fn json(value: &impl serde::Serialize) -> Vec<u8> {
+        serde_json::to_vec(value).unwrap()
+    }
+    let mut palette = Palette::default();
+    palette.0[Palette::BACKGROUND] = [1, 2, 3];
+    let frames: Vec<(Kind, Vec<u8>)> = vec![
+        (Kind::Input, b"echo pwned-''input\r".to_vec()),
+        (
+            Kind::Resize,
+            json(&wire::ResizeParams {
+                cols: 33,
+                rows: 11,
+                cell_width: 1,
+                cell_height: 1,
+            }),
+        ),
+        (Kind::Palette, json(&palette)),
+        (Kind::Attach, json(&params(33, 11))),
+        (Kind::Kill, Vec::new()),
+        (
+            Kind::Observe,
+            json(&wire::ObserveParams { history_lines: 0 }),
+        ),
+        (Kind::Peek, json(&wire::PeekParams { history_lines: 0 })),
+        (Kind::Info, Vec::new()),
+    ];
+    for (kind, payload) in frames {
+        let mut s = raw_observer(&ns, "ro");
+        wire::write_frame(&mut s, &mut Vec::new(), kind, &payload).unwrap();
+        expect_refused(&mut s, kind);
+    }
+    // Nothing reached the session: same controller, size, child; no input executed.
+    c.settle(Duration::from_millis(300));
+    assert!(!String::from_utf8_lossy(&c.output).contains("pwned-input"));
+    let info = ns.0.info("ro").unwrap();
+    assert!(info.attached);
+    assert_eq!((info.cols, info.rows, info.child_pid), (80, 24, child));
+    assert!(pid_alive(child));
+    c.type_line("echo still-''mine");
+    c.wait_output("still-mine\r\n");
+}
+
+#[test]
+fn violating_observers_that_never_read_are_cut_off_without_leaking_threads() {
+    let ns = TestNs::new();
+    let mut c = Client::create(&ns, &shell("leak"), 80, 24);
+    // Megabytes of history: a full snapshot cannot fit into the socket buffers.
+    c.type_line(
+        "seq -f 'history-%06.0f-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' 1 60000; \
+         echo hist-''done",
+    );
+    drain_client_until(&mut c, "hist-done\r\n");
+    c.settle(Duration::from_millis(300));
+    let daemon = ns.0.info("leak").unwrap().daemon_pid;
+    std::thread::sleep(Duration::from_millis(300));
+    let baseline = thread_count(daemon);
+
+    // Observe with the whole history, violate at once, and never read anything.
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let mut s = UnixStream::connect(ns.dir().join("leak.sock")).unwrap();
+        s.set_read_timeout(Some(common::WAIT)).unwrap();
+        let (mut buf, mut payload) = (Vec::new(), Vec::new());
+        wire::write_json(&mut s, &mut buf, Kind::Hello, &wire::Hello::ours()).unwrap();
+        assert_eq!(
+            wire::read_frame(&mut s, &mut payload).unwrap(),
+            Some(Kind::Hello)
+        );
+        let observe = wire::ObserveParams {
+            history_lines: 50_000,
+        };
+        wire::write_json(&mut s, &mut buf, Kind::Observe, &observe).unwrap();
+        wire::write_frame(&mut s, &mut buf, Kind::Input, b"echo pwned-''unread\r").unwrap();
+        held.push(s);
+    }
+    // Their writers and connection threads end although the peers still hold the sockets.
+    wait_until("violating observers' threads gone", || {
+        thread_count(daemon) <= baseline
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(thread_count(daemon) <= baseline, "daemon threads grew");
+    for s in &mut held {
+        expect_refused(s, Kind::Input);
+    }
+
+    c.output.clear();
+    c.type_line("echo ctl-''alive");
+    c.wait_output("ctl-alive\r\n");
+    assert!(!String::from_utf8_lossy(&c.output).contains("pwned-unread"));
+    let info = ns.0.info("leak").unwrap();
+    assert!(info.attached);
+    assert_eq!((info.cols, info.rows), (80, 24));
+}
+
+/// Consumes events until `needle` was output, keeping only a short tail (floods).
+fn drain_client_until(c: &mut Client, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !String::from_utf8_lossy(&c.output).contains(needle) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {needle:?}"
+        );
+        let keep_from = c.output.len().saturating_sub(64);
+        c.output.drain(..keep_from);
+        match c.next() {
+            HostEvent::Output(_) => {}
+            other => panic!("unexpected {other:?} while waiting for {needle:?}"),
+        }
+    }
+}
+
+fn drain_observer_until(o: &mut Observer, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !String::from_utf8_lossy(&o.output).contains(needle) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {needle:?}"
+        );
+        let keep_from = o.output.len().saturating_sub(64);
+        o.output.drain(..keep_from);
+        match o.next() {
+            ObserverEvent::Output(_) => {}
+            other => panic!("unexpected {other:?} while waiting for {needle:?}"),
+        }
+    }
+}
+
+#[test]
+fn slow_observer_is_disconnected_alone() {
+    const FLOOD: usize = 16_000_000;
+    let ns = TestNs::new();
+    let mut c = Client::create(&ns, &shell("slow"), 80, 24);
+    // Subscribe, then never read again: one raw connection and one through the public API.
+    let mut stalled = raw_observer(&ns, "slow");
+    let (_, stalled_api) = deck_host::observe(&ns.0, "slow", 0).unwrap();
+    let (mut stalled_rx, _stalled_tx) = stalled_api.split();
+    let mut fast = Observer::new(&ns, "slow", 0);
+    c.type_line(&format!(
+        "yes 0123456789abcdef | head -c {FLOOD}; echo flood-''done"
+    ));
+    drain_client_until(&mut c, "flood-done\r\n");
+    drain_observer_until(&mut fast, "flood-done\r\n");
+
+    // The stalled observer was cut off: buffered frames, then the end; no `Exited`.
+    let mut payload = Vec::new();
+    let mut received = 0;
+    loop {
+        match wire::read_frame(&mut stalled, &mut payload) {
+            Ok(Some(Kind::Output)) => received += payload.len(),
+            Ok(Some(kind)) => panic!("unexpected {kind:?} on the stalled observer"),
+            Ok(None) => break,
+            // Aborted mid-frame.
+            Err(Error::Protocol(msg)) if msg.starts_with("truncated") => break,
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(e) => panic!("stalled observer was not disconnected: {e}"),
+        }
+    }
+    assert!(
+        received < FLOOD,
+        "stalled observer received {received} bytes"
+    );
+    // Through the API the cut-off is a clean `Closed`, never an error or `Exited`.
+    let drained = std::thread::spawn(move || {
+        let mut received = 0;
+        loop {
+            match stalled_rx.recv().unwrap() {
+                ObserverEvent::Snapshot { .. } | ObserverEvent::Resized(_) => {}
+                ObserverEvent::Output(bytes) => received += bytes.len(),
+                ObserverEvent::Closed => return received,
+                other => panic!("unexpected {other:?} on the stalled API observer"),
+            }
+        }
+    });
+    wait_until("stalled API observer closed", || drained.is_finished());
+    let received = drained.join().unwrap();
+    assert!(
+        received < FLOOD,
+        "stalled API observer received {received} bytes"
+    );
+
+    // Controller and the other observer are unaffected.
+    assert!(ns.0.info("slow").unwrap().attached);
+    c.type_line("echo after-''flood");
+    c.wait_output("after-flood\r\n");
+    fast.wait_output("after-flood\r\n");
+}
+
+#[test]
+fn observer_detach_leaves_the_session_and_exit_reaches_everyone() {
+    let ns = TestNs::new();
+    let mut c = Client::create(&ns, &shell("oex"), 80, 24);
+    let mut gone = Observer::new(&ns, "oex", 0);
+    // Detach from another thread than the one blocked in `recv`.
+    gone.tx.detach().unwrap();
+    loop {
+        match gone.next() {
+            ObserverEvent::Output(_) => {}
+            ObserverEvent::Closed => break,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(ns.0.info("oex").unwrap().attached);
+
+    let mut o = Observer::new(&ns, "oex", 0);
+    c.type_line("echo bye; exit 3");
+    loop {
+        match o.next() {
+            ObserverEvent::Output(_) => {}
+            ObserverEvent::Exited(code) => {
+                assert_eq!(code, Some(3));
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(o.next(), ObserverEvent::Closed);
+    loop {
+        match c.next() {
+            HostEvent::Output(_) => {}
+            HostEvent::Exited(code) => {
+                assert_eq!(code, Some(3));
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(c.next(), HostEvent::Closed);
+    // Observers do not keep the session alive.
+    wait_until("endpoint gone", || !ns.0.has("oex"));
+}
+
+#[test]
+fn observing_an_unseen_exit_shows_the_final_screen_without_ending_the_linger() {
+    let ns = TestNs::new();
+    let script = &["-c", "echo last-words; exit 4"];
+    deck_host::start(&ns.0, &spec("lin", "/bin/sh", script), 80, 24).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let mut o = Observer::new(&ns, "lin", 100);
+    assert!(o.screen().contains("last-words"), "{}", o.screen());
+    assert_eq!(o.next(), ObserverEvent::Exited(Some(4)));
+    assert_eq!(o.next(), ObserverEvent::Closed);
+    drop(o);
+    // Still lingering for its first real attach, which gets the final screen and code.
+    assert!(ns.0.has("lin"));
+    let mut c = Client::new(
+        deck_host::attach(&ns.0, "lin", params(80, 24)).unwrap(),
+        80,
+        24,
+    );
+    c.expect_snapshot();
+    assert!(c.screen().contains("last-words"), "{}", c.screen());
+    assert_eq!(c.next(), HostEvent::Exited(Some(4)));
+    wait_until("endpoint gone", || !ns.0.has("lin"));
+}
+
+#[test]
+fn observing_an_older_daemon_is_unsupported_without_fallback() {
+    let ns = TestNs::new();
+    let dir = ns.dir();
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(dir.join("old.sock")).unwrap();
+    // Same protocol number, but an `Observe` makes it drop the connection like any older
+    // daemon does on an unknown frame kind. The second connection is the liveness probe.
+    let server = std::thread::spawn(move || {
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut payload = Vec::new();
+            let hello = wire::read_frame(&mut s, &mut payload).unwrap();
+            assert_eq!(hello, Some(Kind::Hello));
+            let reply = wire::Hello {
+                protocol: deck_host::PROTOCOL,
+                version: "0.0.1-old".into(),
+            };
+            wire::write_json(&mut s, &mut Vec::new(), Kind::Hello, &reply).unwrap();
+            if let Ok(Some(kind)) = wire::read_frame(&mut s, &mut payload) {
+                kinds.push(kind);
+            }
+        }
+        kinds
+    });
+    match deck_host::observe(&ns.0, "old", 0).err() {
+        Some(Error::Unsupported(name)) => assert_eq!(name, "old"),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    // Only the Observe request was made: no attach fallback, no retry.
+    assert_eq!(server.join().unwrap(), [Kind::Observe]);
 }

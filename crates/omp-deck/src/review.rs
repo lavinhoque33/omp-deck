@@ -9,23 +9,10 @@ use std::path::{Path, PathBuf};
 
 use crate::changes_view::Section;
 
-/// Job labels of the two ways to hand the review to omp (see `inject::Job::text`).
-pub const INSERT_LABEL: &str = "Insert review";
-pub const SEND_LABEL: &str = "Send review";
-
 /// The prompt must stay below this many bytes.
 pub const MAX_PROMPT_BYTES: usize = 32 * 1024;
 /// Quoted lines per comment; a longer range gets a trailing `…` line.
 pub const MAX_QUOTE_LINES: usize = 12;
-
-/// `Some(submit)` when `label` is one of the review jobs.
-pub fn submit_of(label: &str) -> Option<bool> {
-    match label {
-        INSERT_LABEL => Some(false),
-        SEND_LABEL => Some(true),
-        _ => None,
-    }
-}
 
 /// Which version of the file the line numbers refer to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,12 +322,5 @@ mod tests {
         all.of_mut(Path::new("/a")).add(None, "one");
         assert_eq!(all.of(Path::new("/a")).map(Review::len), Some(1));
         assert!(all.of(Path::new("/b")).is_none());
-    }
-
-    #[test]
-    fn job_labels_map_to_submit() {
-        assert_eq!(submit_of(INSERT_LABEL), Some(false));
-        assert_eq!(submit_of(SEND_LABEL), Some(true));
-        assert_eq!(submit_of("Compact"), None);
     }
 }

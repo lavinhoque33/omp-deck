@@ -5,11 +5,20 @@
 #[cfg(windows)]
 pub const GROUP: &str = "omp-deck";
 
-/// The toast tag of a tab's notification (a newer toast with the same tag replaces the older
-/// one); the settings test notification (`None`) is `"test"`.
-pub fn tag(tab: Option<u64>) -> String {
+use std::hash::{DefaultHasher, Hash, Hasher};
+
+use deck_service::controller::SessionTarget;
+
+/// The toast tag of a session's notification (a newer toast with the same tag replaces the older
+/// one); the settings test notification (`None`) is `"test"`. The key is hashed: tags are limited
+/// to 64 characters and a session key is not.
+pub fn tag(tab: Option<&SessionTarget>) -> String {
     match tab {
-        Some(uid) => format!("tab-{uid}"),
+        Some(key) => {
+            let mut h = DefaultHasher::new();
+            key.hash(&mut h);
+            format!("tab-{:016x}", h.finish())
+        }
         None => "test".to_owned(),
     }
 }
@@ -49,9 +58,14 @@ mod tests {
 
     #[test]
     fn tags_are_per_tab_with_a_fixed_test_tag() {
-        assert_eq!(tag(Some(7)), "tab-7");
+        let key = |n: &str| SessionTarget {
+            key: deck_service::controller::SessionKey::tmux("t", n),
+            generation: 1,
+        };
+        assert_eq!(tag(Some(&key("7"))), tag(Some(&key("7"))));
+        assert!(tag(Some(&key("7"))).starts_with("tab-"));
         assert_eq!(tag(None), "test");
-        assert_ne!(tag(Some(1)), tag(Some(11)));
+        assert_ne!(tag(Some(&key("1"))), tag(Some(&key("11"))));
     }
 
     #[test]

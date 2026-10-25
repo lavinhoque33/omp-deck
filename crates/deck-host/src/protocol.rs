@@ -4,6 +4,11 @@
 //! (`Input`, `Output`, `Snapshot`) are raw; control payloads are JSON (unknown fields ignored).
 //! Both sides send `Hello` first. The `Hello` and `Kill` kinds and their payloads never change,
 //! so any client can still kill a daemon of another protocol version.
+//!
+//! `Observe` is an additive read-only subscription: the daemon answers `Info`, `Resized`
+//! (current grid), `Snapshot`… `SnapshotEnd`, then live `Output`/`Resized` in host order, then
+//! `Exited` and end of stream. A daemon predating `Observe` closes the connection on the
+//! unknown kind; clients report that, there is no fallback.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -39,6 +44,10 @@ pub enum Kind {
     /// Non-displacing snapshot request (`dump`): `Peek{history_lines}`, answered with
     /// `Snapshot`… `SnapshotEnd` on the same connection.
     Peek = 0x0a,
+    /// Read-only live subscription: `Observe{history_lines}` (see the module docs). The
+    /// connection may afterwards send only `Ping` and `Detach`; anything else makes the daemon
+    /// drop the subscription and close the connection immediately, without a reply.
+    Observe = 0x0b,
     // Daemon -> client (`Info` reuses 0x08 with a `HostInfo` payload).
     Snapshot = 0x21,
     SnapshotEnd = 0x22,
@@ -47,6 +56,9 @@ pub enum Kind {
     Displaced = 0x25,
     Error = 0x26,
     Pong = 0x27,
+    /// Observers only: the session's grid (JSON [`Grid`]), before the snapshot and on every
+    /// size change.
+    Resized = 0x28,
 }
 
 impl Kind {
@@ -62,6 +74,7 @@ impl Kind {
             0x08 => Kind::Info,
             0x09 => Kind::Ping,
             0x0a => Kind::Peek,
+            0x0b => Kind::Observe,
             0x21 => Kind::Snapshot,
             0x22 => Kind::SnapshotEnd,
             0x23 => Kind::Output,
@@ -69,9 +82,19 @@ impl Kind {
             0x25 => Kind::Displaced,
             0x26 => Kind::Error,
             0x27 => Kind::Pong,
+            0x28 => Kind::Resized,
             _ => return None,
         })
     }
+}
+
+const TRUNCATED_HEADER: &str = "truncated frame header";
+const TRUNCATED_PAYLOAD: &str = "truncated frame payload";
+
+/// Whether `e` is [`read_frame`]'s end of stream in the middle of a frame (e.g. the daemon
+/// aborted a connection while writing).
+pub(crate) fn is_truncated(e: &Error) -> bool {
+    matches!(e, Error::Protocol(msg) if msg == TRUNCATED_HEADER || msg == TRUNCATED_PAYLOAD)
 }
 
 /// Reads one frame into `payload` (cleared first). `Ok(None)` on a clean EOF at a frame boundary.
@@ -81,7 +104,7 @@ pub fn read_frame(r: &mut impl Read, payload: &mut Vec<u8>) -> Result<Option<Kin
     while got < header.len() {
         match r.read(&mut header[got..]) {
             Ok(0) if got == 0 => return Ok(None),
-            Ok(0) => return Err(Error::Protocol("truncated frame header".into())),
+            Ok(0) => return Err(Error::Protocol(TRUNCATED_HEADER.into())),
             Ok(n) => got += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e.into()),
@@ -96,7 +119,7 @@ pub fn read_frame(r: &mut impl Read, payload: &mut Vec<u8>) -> Result<Option<Kin
     payload.clear();
     payload.resize(len, 0);
     r.read_exact(payload).map_err(|e| match e.kind() {
-        io::ErrorKind::UnexpectedEof => Error::Protocol("truncated frame payload".into()),
+        io::ErrorKind::UnexpectedEof => Error::Protocol(TRUNCATED_PAYLOAD.into()),
         _ => Error::Io(e),
     })?;
     Ok(Some(kind))
@@ -218,6 +241,23 @@ pub struct ResizeParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeekParams {
     pub history_lines: u32,
+}
+
+/// `Observe` payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveParams {
+    /// Scrollback rows to include in the snapshot (capped by the daemon's history).
+    pub history_lines: u32,
+}
+
+/// A session's terminal grid as observers see it (`Resized` payload): cells plus cell pixels
+/// (0 when no controller reported them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grid {
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_width: u16,
+    pub cell_height: u16,
 }
 
 /// `Exited` payload.

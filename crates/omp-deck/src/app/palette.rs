@@ -16,13 +16,13 @@ use crate::icons::*;
 use crate::model_picker;
 use crate::notify_view::NotifyAction;
 use crate::palette::{Item, Mode, Outcome, PaletteState, Target};
-use crate::session_actions::{self, Action, ActionCtx, Availability, CompactMode, Kind};
 use crate::settings_page::OmpDeckPage;
 use crate::sidebar::{DriveMenu, SidebarAction, resume_command};
 use crate::sync_view::SyncAction;
 use crate::tabs::{self, Tab, TabRole};
 use crate::transfer::TransferKind;
 use crate::update::Channel;
+use deck_service::session_actions::{self, Action, ActionCtx, Availability, CompactMode, Kind};
 
 const NEED_SESSION: &str = "Open an omp session tab first";
 const NEED_OMP: &str = "omp was not found";
@@ -162,7 +162,7 @@ impl App {
                         ICON_DOWNLOAD
                     },
                     disabled: None,
-                    running: !t.term.is_exited(),
+                    running: !t.terminal().is_exited(),
                 }),
             }
         }
@@ -258,7 +258,7 @@ impl App {
         let groups = self.watcher.latest();
         let worktree = self.active_worktree();
         let drive = self.drive_menu();
-        let live = term.is_some_and(|t| !t.term.is_exited());
+        let live = term.is_some_and(|t| !t.terminal().is_exited());
         let can_stop = !self.backends.is_empty();
         let cfg = &self.cfg;
 
@@ -522,7 +522,7 @@ impl App {
             Some("Ctrl+Shift+B"),
             ICON_LIST_TREE,
             entry_why.or(need(
-                entry.is_some() || session_tab.is_some_and(|t| t.session_path.is_some()),
+                entry.is_some() || session_tab.is_some_and(|t| t.session_path().is_some()),
                 NEED_SESSION,
             )),
         );
@@ -618,7 +618,7 @@ impl App {
 
         // Models and thinking of the active omp tab (same gating as the status-bar picker).
         let model_why = need(
-            session_tab.is_some_and(|t| !t.term.is_exited()),
+            session_tab.is_some_and(|t| !t.terminal().is_exited()),
             NEED_SESSION,
         );
         add(
@@ -1100,12 +1100,7 @@ impl App {
             return;
         }
         if let Some(level) = id.strip_prefix("thinking.") {
-            match self.current_model() {
-                Some(m) => self.queue_change(&m, Some(level)),
-                None => self
-                    .toasts
-                    .info(&self.ctx, "The current model is not known yet"),
-            }
+            self.queue_effort(level.to_owned());
             return;
         }
         match id {
@@ -1134,20 +1129,20 @@ impl App {
             "session.compact_soft" => self.run_action(Action::Compact(CompactMode::Soft)),
             "session.compact_snap" => self.run_action(Action::Compact(CompactMode::Snapcompact)),
             "session.compact_focus" => {
-                self.dialog = Some(ActionDialog::CompactFocus {
+                self.open_action_dialog(ActionDialog::CompactFocus {
                     focus: String::new(),
                     first: true,
                 });
             }
             "session.handoff" => self.run_action(Action::Handoff(None)),
             "session.handoff_focus" => {
-                self.dialog = Some(ActionDialog::Handoff {
+                self.open_action_dialog(ActionDialog::Handoff {
                     focus: String::new(),
                     first: true,
                 });
             }
             "session.rename" => {
-                self.dialog = Some(ActionDialog::Rename {
+                self.open_action_dialog(ActionDialog::Rename {
                     title: String::new(),
                     first: true,
                 });

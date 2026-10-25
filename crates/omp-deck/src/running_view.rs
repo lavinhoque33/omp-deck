@@ -12,7 +12,6 @@ use egui::{
 };
 
 use crate::app::human_size;
-use crate::backend::kind_label;
 use crate::col_alloc::{self, CELL_PAD};
 use crate::icons::{ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CIRCLE_STOP};
 use crate::paint_cache;
@@ -24,6 +23,7 @@ use crate::sessions_view::{
 };
 use crate::theme::{self, Palette};
 use crate::widgets::{Spin, empty_state, paint_icon};
+use deck_service::backend::kind_label;
 
 const TITLE_MIN: f32 = 190.0;
 const KILL_W: f32 = 84.0;

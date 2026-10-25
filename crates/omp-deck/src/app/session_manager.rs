@@ -13,23 +13,24 @@ use std::time::{Duration, Instant, SystemTime};
 
 use deck_core::inventory::{self, InventoryEntry, SessionStats, StatsCache};
 use deck_core::mux::{Mux, session_name_for};
-use deck_core::omp::{DeleteError, DeleteTarget, MoveKind, MoveOutcome, Omp};
+use deck_core::omp::{DeleteTarget, MoveKind, MoveOutcome, Omp};
 use deck_core::platform::TreeMemory;
 use deck_core::sessions::{SessionEntry, abbreviate_home};
 use egui::{Key, Modifiers};
 
 use super::{App, AppEvent, PendingConfirm};
 use crate::app::human_size;
-use crate::backend::Backends;
 use crate::confirm::Confirm;
-use crate::omp_worker::{self, MovedTab};
+use crate::omp_worker::MovedTab;
 use crate::running_model::{HubMode, RunModel, RunPoll};
 use crate::sessions_model::{Live, Model, plural};
 use crate::sessions_view::{self, OpProgress, SessionsAction, ViewInput, ViewState};
-use crate::statusfmt::Activity;
 use crate::tabs::{Anchor, ClosedTab, Tab};
 use crate::transfer::{FolderDialog, Subject, TransferKind};
 use crate::worktree_ui;
+use deck_service::backend::Backends;
+use deck_service::lifecycle;
+use deck_service::statusfmt::Activity;
 
 /// Statistics worker threads (each one parses whole transcripts: I/O and JSON bound).
 const STATS_THREADS: usize = 4;
@@ -60,15 +61,8 @@ impl MovePrep {
         backends: &Backends,
         dest: &Path,
     ) -> (Result<MoveOutcome, String>, Option<Box<MovedTab>>) {
-        kill_all(backends, &self.kill_names, "move");
-        let result = omp_worker::retry_while_live(
-            omp_worker::MOVE_ATTEMPTS,
-            omp_worker::MOVE_RETRY_DELAY,
-            || {
-                omp.move_session(&self.entry.path, dest)
-                    .map_err(|e| e.to_string())
-            },
-        );
+        let result =
+            lifecycle::stop_then_move(omp, backends, &self.kill_names, &self.entry.path, dest);
         let persistent = !backends.is_empty();
         let MovePrep {
             entry,
@@ -91,7 +85,7 @@ impl MovePrep {
                 Err(_) => {
                     // Re-attach a session that survived; else resume the original file under
                     // its canonical name.
-                    let alive = kill_names.iter().find(|n| backends.has_session(n)).cloned();
+                    let alive = lifecycle::surviving_session(backends, &kill_names);
                     tab.mux_name =
                         alive.or_else(|| persistent.then(|| session_name_for(&entry.id)));
                 }
@@ -103,23 +97,6 @@ impl MovePrep {
             })
         });
         (result, tab)
-    }
-}
-
-/// Kill every backend session in `names` (best effort, logged). Blocking.
-pub(super) fn kill_all(backends: &Backends, names: &[String], why: &str) {
-    for name in names {
-        if let Err(e) = backends.kill(name) {
-            log::warn!("kill {name} before {why}: {e}");
-        }
-    }
-}
-
-/// User-facing text of a failed delete.
-pub(super) fn delete_error_text(e: &DeleteError) -> String {
-    match e {
-        DeleteError::Live => "it is open in another omp process".to_owned(),
-        other => other.to_string(),
     }
 }
 
@@ -452,13 +429,13 @@ impl App {
             }
         }
         for t in self.tabs.iter().filter_map(Tab::term) {
-            if t.term.is_exited() {
+            if t.terminal().is_exited() {
                 continue;
             }
-            if let Some(p) = &t.session_path {
-                let l = live.entry(p.clone()).or_default();
+            if let Some(p) = t.session_path() {
+                let l = live.entry(p.to_path_buf()).or_default();
                 l.in_tab = true;
-                l.busy |= Activity::from_title(t.term.title()) != Activity::Idle;
+                l.busy |= Activity::from_title(t.terminal().title()) != Activity::Idle;
             }
         }
         self.sessions.model.set_live(live);
@@ -467,13 +444,12 @@ impl App {
             tabs.iter()
                 .filter_map(Tab::term)
                 .find(|t| {
-                    !t.term.is_exited()
+                    !t.terminal().is_exited()
                         && (t.mux_name.as_deref() == Some(r.name())
-                            || t.session_path
-                                .as_deref()
+                            || t.session_path()
                                 .is_some_and(|p| r.raw.files.iter().any(|f| f == p)))
                 })
-                .map(|t| Activity::from_title(t.term.title()))
+                .map(|t| Activity::from_title(t.terminal().title()))
         });
     }
 
@@ -1011,35 +987,18 @@ impl App {
         let op = self.begin_op(OpKind::Delete, &entries, None);
         let backends = self.backends.clone();
         self.run_op(&entries, move |tx, ctx| {
-            kill_all(&backends, &kill_names, "delete");
-            let mut reported: HashSet<PathBuf> = HashSet::new();
-            omp.delete_sessions(&files, |path, result| {
-                reported.insert(path.to_path_buf());
+            lifecycle::stop_then_delete(&omp, &backends, &kill_names, &files, |path, result| {
                 send(
                     tx,
                     ctx,
                     SessionsEvent::Step {
                         op,
                         path: path.to_path_buf(),
-                        outcome: result
-                            .map(|()| Done::Deleted)
-                            .map_err(|e| delete_error_text(&e)),
+                        outcome: result.map(|()| Done::Deleted),
                         tab: None,
                     },
                 );
             });
-            for f in files.iter().filter(|f| !reported.contains(&f.path)) {
-                send(
-                    tx,
-                    ctx,
-                    SessionsEvent::Step {
-                        op,
-                        path: f.path.clone(),
-                        outcome: Err("omp did not report a result".to_owned()),
-                        tab: None,
-                    },
-                );
-            }
             send(tx, ctx, SessionsEvent::OpFinished { op });
         });
     }

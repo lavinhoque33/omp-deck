@@ -34,11 +34,11 @@ use crate::icons::{
     ICON_GIT_BRANCH, ICON_LIST, ICON_LIST_TREE, ICON_NETWORK, ICON_SEARCH, ICON_X, Icon,
 };
 use crate::statusbar::level_color;
-use crate::statusfmt::ContextLevel;
 use crate::tabs::paint_status;
 use crate::theme::{self, Palette, acc, skin};
 use crate::widgets::{Spin, empty_state, icon_text, paint_icon};
 use deck_core::config::UiStyle;
+use deck_service::statusfmt::ContextLevel;
 
 /// Cards this far outside the viewport are still painted (smooth scrolling).
 const OVERSCAN: f32 = 240.0;

@@ -110,6 +110,20 @@ impl DriveUi {
         }
     }
 
+    /// The backup interval changed from `was` to `now` (by the user, or adopted from another
+    /// window's commit): the next automatic run is due after the new period, or after the
+    /// first-run delay when the backups were off.
+    pub(super) fn reschedule(&mut self, was: SyncInterval, now: SyncInterval) {
+        if let Some(period) = now.period() {
+            let wait = if was == SyncInterval::Off {
+                AUTO_FIRST
+            } else {
+                period
+            };
+            self.next_auto = Instant::now() + wait;
+        }
+    }
+
     /// The restore picker is open.
     pub(super) fn modal_open(&self) -> bool {
         self.picker.is_some()
@@ -136,13 +150,10 @@ impl App {
                 }
             }
             DriveAction::SetInterval(v) => {
-                let was_off = self.cfg.drive_backup_interval == SyncInterval::Off;
+                let was = self.cfg.drive_backup_interval;
                 self.cfg.drive_backup_interval = v;
                 self.dirty = true;
-                if let Some(period) = v.period() {
-                    self.drive.next_auto =
-                        Instant::now() + if was_off { AUTO_FIRST } else { period };
-                }
+                self.drive.reschedule(was, v);
             }
             DriveAction::BackupNow => self.start_backup(true),
             DriveAction::OpenRestore => {

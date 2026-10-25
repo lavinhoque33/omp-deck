@@ -214,6 +214,12 @@ impl Stream {
     pub fn shutdown(&self) {
         let _ = self.0.shutdown(std::net::Shutdown::Both);
     }
+
+    /// Ends the connection without waiting for the peer (same as [`Stream::shutdown`] here:
+    /// never blocks).
+    pub fn abort(&self) {
+        self.shutdown();
+    }
 }
 
 impl Read for Stream {

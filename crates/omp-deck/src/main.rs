@@ -8,22 +8,17 @@ mod agent_output;
 mod agent_popup;
 mod app;
 mod app_update;
-mod backend;
 mod changes_view;
 mod cli;
 mod clipboard_bridge;
 mod col_alloc;
-mod composer;
-mod config_writer;
 mod confirm;
 mod ctx_tip;
 mod dashboard;
 mod dashboard_model;
 mod drive_view;
 mod folder_scope;
-mod host_remote;
 mod icons;
-mod inject;
 mod model_order;
 mod model_picker;
 mod notify;
@@ -40,13 +35,11 @@ mod running;
 mod running_model;
 mod running_view;
 mod scope_bar;
-mod session_actions;
 mod sessions_model;
 mod sessions_view;
 mod settings_page;
 mod sidebar;
 mod statusbar;
-mod statusfmt;
 mod summary;
 mod sync_view;
 mod tabs;
@@ -70,8 +63,8 @@ use anyhow::anyhow;
 use deck_core::config::{AppConfig, config_dir};
 
 use crate::app::{App, AppInit};
-use crate::backend::Backends;
 use crate::cli::Parsed;
+use deck_service::backend::Backends;
 
 const MIN_SIZE: [f32; 2] = [640.0, 400.0];
 
@@ -184,7 +177,9 @@ fn run() -> anyhow::Result<()> {
         }
     };
 
-    let cfg = AppConfig::load();
+    // The one writer of the settings file; the app edits a projection of its snapshot.
+    let settings = deck_service::settings::SettingsService::open_default();
+    let cfg = (*settings.snapshot().config).clone();
     let backends = Backends::detect(cfg.session_backend);
     backends.prepare();
     if backends.is_empty() {
@@ -227,6 +222,7 @@ fn run() -> anyhow::Result<()> {
     let init = AppInit {
         cli,
         cfg,
+        settings,
         backends,
         ui_fonts: ui_fonts::UiFonts::load(),
         folder,

@@ -13,10 +13,11 @@ use crate::icons::{
     ICON_BELL, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_POWER, ICON_SETTINGS,
     ICON_X, Icon,
 };
-use crate::notify::inbox::{Entry, Kind};
 use crate::sidebar::format_age;
 use crate::theme::{self, Palette};
 use crate::widgets::{icon_button, icon_text, paint_icon};
+use deck_service::controller::SessionTarget;
+use deck_service::notifications::inbox::{Entry, Kind};
 
 const BELL_ID: &str = "notify-bell";
 /// Popover width.
@@ -32,15 +33,15 @@ const ESTIMATED_ROW_H: f32 = 72.0;
 #[derive(Debug, PartialEq, Eq)]
 pub enum PanelAction {
     /// Activate the tab, raise the window, drop the entry.
-    Open(u64),
-    Dismiss(u64),
+    Open(SessionTarget),
+    Dismiss(SessionTarget),
     /// Close the popover and open Settings → OmpDeck → Notifications.
     Settings,
     ClearAll,
 }
 
 pub struct PanelInput<'a> {
-    pub entries: &'a [Entry],
+    pub entries: &'a [Entry<SessionTarget>],
     /// Badge text; `None` while the inbox is empty.
     pub badge: Option<&'static str>,
     /// An entry needs the user (error / attention): the badge uses the warn colour.
@@ -252,7 +253,7 @@ struct LayoutKey {
 /// a whole when its tab has a newer event); `age_minutes` is the bucket the sub line shows.
 #[derive(Clone)]
 struct CachedRow {
-    entry: Entry,
+    entry: Entry<SessionTarget>,
     age_minutes: u64,
     title: Arc<Galley>,
     sub: Arc<Galley>,
@@ -263,14 +264,20 @@ struct CachedRow {
 #[derive(Clone, Default)]
 struct RowCache {
     key: Option<LayoutKey>,
-    rows: HashMap<u64, CachedRow>,
+    rows: HashMap<SessionTarget, CachedRow>,
 }
 
 fn age_minutes(now: SystemTime, at: SystemTime) -> u64 {
     now.duration_since(at).map_or(0, |d| d.as_secs() / 60)
 }
 
-fn sub_galley(ui: &Ui, e: &Entry, now: SystemTime, pal: &Palette, text_w: f32) -> Arc<Galley> {
+fn sub_galley(
+    ui: &Ui,
+    e: &Entry<SessionTarget>,
+    now: SystemTime,
+    pal: &Palette,
+    text_w: f32,
+) -> Arc<Galley> {
     let mut sub_text = String::new();
     if !e.project.is_empty() {
         sub_text.push_str(&e.project);
@@ -294,7 +301,7 @@ fn row_height(title: &Galley, sub: &Galley, body: &Galley) -> f32 {
 fn refresh_row(
     ui: &Ui,
     cache: &mut RowCache,
-    e: &Entry,
+    e: &Entry<SessionTarget>,
     now: SystemTime,
     pal: &Palette,
     text_w: f32,
@@ -325,7 +332,7 @@ fn refresh_row(
     );
     let height = row_height(&title, &sub, &body);
     cache.rows.insert(
-        e.tab,
+        e.tab.clone(),
         CachedRow {
             entry: e.clone(),
             age_minutes: minutes,
@@ -338,18 +345,18 @@ fn refresh_row(
 }
 
 /// One entry: kind icon, bold tab title, `project · age`, the body; a ✕ while hovered.
-fn row(ui: &mut Ui, e: &Entry, c: &CachedRow, pal: &Palette) -> Option<PanelAction> {
+fn row(ui: &mut Ui, e: &Entry<SessionTarget>, c: &CachedRow, pal: &Palette) -> Option<PanelAction> {
     let width = ui.available_width();
     let (icon, tint) = kind_icon(&e.kind, pal);
     let (title, sub, body) = (c.title.clone(), c.sub.clone(), c.body.clone());
     let height = c.height;
     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
-    let resp = ui.interact(rect, Id::unique(("notify-row", e.tab)), Sense::click());
+    let resp = ui.interact(rect, Id::unique(("notify-row", &e.tab)), Sense::click());
     let x_rect = Rect::from_min_size(
         pos2(rect.right() - PAD - 18.0, rect.top() + PAD - 2.0),
         vec2(20.0, 20.0),
     );
-    let x = ui.interact(x_rect, Id::unique(("notify-row-x", e.tab)), Sense::click());
+    let x = ui.interact(x_rect, Id::unique(("notify-row-x", &e.tab)), Sense::click());
     let hovered = resp.hovered() || x.hovered();
     let hov = ui
         .ctx()
@@ -402,9 +409,9 @@ fn row(ui: &mut Ui, e: &Entry, c: &CachedRow, pal: &Palette) -> Option<PanelActi
         );
     }
     if x.clicked() {
-        Some(PanelAction::Dismiss(e.tab))
+        Some(PanelAction::Dismiss(e.tab.clone()))
     } else if resp.clicked() {
-        Some(PanelAction::Open(e.tab))
+        Some(PanelAction::Open(e.tab.clone()))
     } else {
         None
     }

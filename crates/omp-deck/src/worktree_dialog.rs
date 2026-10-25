@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use deck_core::worktree::{self, RepoInfo, WorktreeError};
+use deck_service::controller::SessionTarget;
 use egui::{Id, RichText, TextEdit, Ui, vec2};
 
 use crate::confirm::{Dialog as Chrome, show_dialog};
@@ -23,6 +24,9 @@ pub enum Kind {
     /// Move the session of tab `uid` (its cwd is `dir`) into a new worktree.
     Move {
         uid: u64,
+        /// The session (and generation) the dialog was opened on: the move is typed only into
+        /// that conversation.
+        target: SessionTarget,
         dir: PathBuf,
         title: String,
     },
@@ -155,6 +159,7 @@ pub enum Plan {
     },
     Move {
         uid: u64,
+        target: SessionTarget,
         branch: String,
         /// The branch the session is on now: the merge target.
         base: Option<String>,
@@ -349,8 +354,9 @@ impl WorktreeDialog {
         };
         let branch = self.branch.trim().to_owned();
         match (&self.kind, &self.loc_v) {
-            (Kind::Move { uid, .. }, _) => Some(Plan::Move {
+            (Kind::Move { uid, target, .. }, _) => Some(Plan::Move {
                 uid: *uid,
+                target: target.clone(),
                 branch,
                 base: info.current_branch.clone(),
             }),
@@ -564,6 +570,7 @@ fn verdict<T>(ui: &mut Ui, pal: &Palette, check: &Check<T>, pending: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deck_service::controller::SessionKey;
 
     fn info(has_commits: bool) -> RepoInfo {
         RepoInfo {
@@ -689,6 +696,10 @@ mod tests {
         let mut d = WorktreeDialog::new(
             Kind::Move {
                 uid: 7,
+                target: SessionTarget {
+                    key: SessionKey::tmux("test", "s"),
+                    generation: 1,
+                },
                 dir: PathBuf::from("/p/repo"),
                 title: "t".into(),
             },
@@ -704,7 +715,10 @@ mod tests {
             location: None,
             auto_text: None,
         });
-        let Some(Plan::Move { uid, branch, base }) = d.plan() else {
+        let Some(Plan::Move {
+            uid, branch, base, ..
+        }) = d.plan()
+        else {
             panic!("plan");
         };
         assert_eq!(

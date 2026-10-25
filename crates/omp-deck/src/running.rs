@@ -10,7 +10,7 @@ use std::time::Duration;
 use deck_core::mux::session_name_for;
 use deck_core::mux::{Mux, MuxKind};
 
-use crate::statusfmt::Activity;
+use deck_service::statusfmt::Activity;
 
 /// Outcome of [`RunningSnapshot::resolve`]; both variants are the name `attach_or_create` gets.
 #[derive(Clone, Debug, PartialEq, Eq)]

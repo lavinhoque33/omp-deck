@@ -1353,7 +1353,10 @@ mod tests {
                 focused: false,
                 hover_link: 0,
                 hover_url: None,
-                graphics: &Graphics::new(ui.ctx().clone()),
+                graphics: &Graphics::new(
+                    ui.ctx().clone(),
+                    crate::wake::Wake::Gui(ui.ctx().clone()),
+                ),
                 preedit: "",
                 banner: None,
             };

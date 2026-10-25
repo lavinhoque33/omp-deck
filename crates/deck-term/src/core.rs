@@ -24,6 +24,7 @@ use crate::out::{PtyOut, Sink, WriteProgress, register_detaching};
 use crate::remote::{self, Feeder, Remote};
 use crate::scan::{KeyModes, OutputScan};
 use crate::theme::{self, Palette, TermTheme};
+use crate::wake::{Wake, WakeCallback};
 use crate::widget::ViewState;
 
 /// What to run in a local PTY (Unix).
@@ -121,13 +122,13 @@ impl RepaintGate {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn request(&self, ctx: &egui::Context) {
+    fn request(&self, wake: &Wake) {
         let now = u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX);
-        self.request_at(now, ctx);
+        self.request_at(now, wake);
     }
 
     /// [`Self::request`] at `now` (µs since `epoch`).
-    fn request_at(&self, now: u64, ctx: &egui::Context) {
+    fn request_at(&self, now: u64, wake: &Wake) {
         let visible = self.visible.load(Ordering::Relaxed);
         let interval = if visible {
             VISIBLE_REPAINT
@@ -143,7 +144,7 @@ impl RepaintGate {
             s.next = now.saturating_add(step);
             if visible {
                 drop(s);
-                ctx.request_repaint();
+                wake.now();
                 return;
             }
             s.scheduled = s.next;
@@ -153,7 +154,7 @@ impl RepaintGate {
         }
         let delay = Duration::from_micros(s.scheduled - now);
         drop(s);
-        ctx.request_repaint_after(delay);
+        wake.after(delay);
     }
 
     /// Shown again: a hidden-mode slot must not delay the next output repaint.
@@ -174,6 +175,8 @@ pub(crate) enum Notice {
     Closed,
     /// Remote: a snapshot replaced the `Term` (the title starts over).
     Reset,
+    /// Authoritative geometry received by an output observer.
+    Resized(WindowSize),
 }
 
 /// Called from the output thread (and from `Term` methods on the UI thread while the Term is
@@ -184,7 +187,7 @@ pub(crate) enum Notice {
 pub(crate) struct Listener {
     tx: Sender<Notice>,
     out: Arc<PtyOut>,
-    ctx: egui::Context,
+    wake: Wake,
     gate: Arc<RepaintGate>,
     /// Local terminal: this side answers terminal queries.
     answers: bool,
@@ -199,18 +202,18 @@ impl EventListener for Listener {
                 }
             }
             Event::Wakeup | Event::MouseCursorDirty | Event::CursorBlinkingChange => {
-                self.gate.request(&self.ctx);
+                self.gate.request(&self.wake);
             }
             Event::ColorRequest(..) | Event::TextAreaSizeRequest(_) if !self.answers => {}
             e @ (Event::ColorRequest(..)
             | Event::TextAreaSizeRequest(_)
             | Event::ClipboardLoad(..)) => {
                 let _ = self.tx.send(Notice::Term(e));
-                self.ctx.request_repaint();
+                self.wake.now();
             }
             e => {
                 let _ = self.tx.send(Notice::Term(e));
-                self.gate.request(&self.ctx);
+                self.gate.request(&self.wake);
             }
         }
     }
@@ -235,7 +238,7 @@ struct Parts {
 
 impl Parts {
     /// Initial size 80x24 until the first `TerminalView::show`.
-    fn new(opts: &TermOptions, ctx: &egui::Context, answers: bool) -> Parts {
+    fn new(opts: &TermOptions, ctx: &egui::Context, answers: bool, wake: Wake) -> Parts {
         let (cols, rows) = (80u16, 24u16);
         let window_size = WindowSize {
             num_lines: rows,
@@ -245,12 +248,12 @@ impl Parts {
         };
         let (tx, rx) = mpsc::channel();
         let progress = Arc::new(WriteProgress::default());
-        let out = Arc::new(PtyOut::new(progress.clone(), ctx.clone()));
+        let out = Arc::new(PtyOut::new(progress.clone(), wake.clone()));
         let gate = Arc::new(RepaintGate::new());
         let listener = Listener {
             tx: tx.clone(),
             out: out.clone(),
-            ctx: ctx.clone(),
+            wake: wake.clone(),
             gate: gate.clone(),
             answers,
         };
@@ -274,7 +277,7 @@ impl Parts {
             tx,
             rx,
             gate,
-            graphics: Arc::new(Graphics::new(ctx.clone())),
+            graphics: Arc::new(Graphics::new(ctx.clone(), wake)),
             key_modes: Arc::new(KeyModes::default()),
             window_size,
         }
@@ -307,6 +310,7 @@ impl Parts {
             banner: None,
             displaced: false,
             shut_down: false,
+            read_only: false,
             writer,
             last_ctrl_c: Cell::new(None),
             input_hold: Cell::new(None),
@@ -341,6 +345,7 @@ pub struct Terminal {
     pub(crate) banner: Option<String>,
     displaced: bool,
     shut_down: bool,
+    read_only: bool,
     /// Remote writer thread (joined via [`crate::wait_detached`] after drop).
     writer: Option<JoinHandle<()>>,
     /// When the last byte 0x03 was sent to the PTY (see [`Terminal::last_ctrl_c`]).
@@ -363,10 +368,31 @@ impl Terminal {
         opts: TermOptions,
         ctx: egui::Context,
     ) -> std::io::Result<Terminal> {
+        Self::spawn_with_wake(spec, opts, ctx.clone(), Wake::Gui(ctx))
+    }
+
+    /// Spawns without a GUI event loop. The driver polls on output wakeups and the deadlines
+    /// returned by its command controller.
+    #[cfg(unix)]
+    pub fn spawn_headless(
+        spec: SpawnSpec,
+        opts: TermOptions,
+        wake: WakeCallback,
+    ) -> std::io::Result<Terminal> {
+        Self::spawn_with_wake(spec, opts, egui::Context::default(), Wake::Headless(wake))
+    }
+
+    #[cfg(unix)]
+    fn spawn_with_wake(
+        spec: SpawnSpec,
+        opts: TermOptions,
+        ctx: egui::Context,
+        wake: Wake,
+    ) -> std::io::Result<Terminal> {
         use alacritty_terminal::event_loop::EventLoop;
         use alacritty_terminal::tty::{self, Options, Shell};
 
-        let parts = Parts::new(&opts, &ctx, true);
+        let parts = Parts::new(&opts, &ctx, true, wake);
         let tty_opts = Options {
             shell: Some(Shell::new(spec.program, spec.args)),
             working_directory: Some(spec.cwd),
@@ -397,7 +423,63 @@ impl Terminal {
     /// shows `[attached elsewhere]` and stops input. Dropping the terminal detaches (queued
     /// input is sent first), [`Self::kill`] kills the session.
     pub fn connect(remote: Box<dyn Remote>, opts: TermOptions, ctx: egui::Context) -> Terminal {
-        let parts = Parts::new(&opts, &ctx, false);
+        Self::connect_with_wake(remote, opts, ctx.clone(), Wake::Gui(ctx), false)
+    }
+
+    /// Connects a controller without exposing an egui context to the headless caller.
+    pub fn connect_headless(
+        remote: Box<dyn Remote>,
+        opts: TermOptions,
+        wake: WakeCallback,
+    ) -> Terminal {
+        Self::connect_with_wake(
+            remote,
+            opts,
+            egui::Context::default(),
+            Wake::Headless(wake),
+            false,
+        )
+    }
+
+    /// Follows output without acquiring input, focus, palette, resize or process-kill rights.
+    /// Host geometry arrives through `RemoteEvent::Resize`; widget layout cannot change it.
+    pub fn observe(
+        observer: Box<dyn remote::Observer>,
+        opts: TermOptions,
+        ctx: egui::Context,
+    ) -> Terminal {
+        Self::connect_with_wake(
+            Box::new(remote::ObserverRemote(observer)),
+            opts,
+            ctx.clone(),
+            Wake::Gui(ctx),
+            true,
+        )
+    }
+
+    /// Read-only output subscription for a headless caller.
+    pub fn observe_headless(
+        observer: Box<dyn remote::Observer>,
+        opts: TermOptions,
+        wake: WakeCallback,
+    ) -> Terminal {
+        Self::connect_with_wake(
+            Box::new(remote::ObserverRemote(observer)),
+            opts,
+            egui::Context::default(),
+            Wake::Headless(wake),
+            true,
+        )
+    }
+
+    fn connect_with_wake(
+        remote: Box<dyn Remote>,
+        opts: TermOptions,
+        ctx: egui::Context,
+        wake: Wake,
+        read_only: bool,
+    ) -> Terminal {
+        let parts = Parts::new(&opts, &ctx, false, wake.clone());
         let feeder = Feeder {
             term: parts.term.clone(),
             config: parts.config.clone(),
@@ -405,14 +487,18 @@ impl Terminal {
             scan: parts.scan(),
             out: parts.out.clone(),
             notices: parts.tx.clone(),
-            ctx: ctx.clone(),
+            wake,
         };
         let (cmds, writer) = remote::start(remote, feeder, parts.progress.clone());
         parts.out.set_sink(Sink::Remote(cmds));
-        parts
-            .out
-            .palette(Palette::for_theme(opts.theme).host_colors());
-        parts.into_terminal(opts, false, true, writer)
+        if !read_only {
+            parts
+                .out
+                .palette(Palette::for_theme(opts.theme).host_colors());
+        }
+        let mut terminal = parts.into_terminal(opts, false, true, writer);
+        terminal.read_only = read_only;
+        terminal
     }
 
     /// Drains pending terminal events: answers ColorRequest / TextAreaSizeRequest /
@@ -431,7 +517,10 @@ impl Terminal {
                     }
                 }
                 Notice::Closed => {
-                    if self.exit_code.is_none() && !self.displaced {
+                    if self.exit_code.is_none()
+                        && !self.displaced
+                        && !(self.read_only && self.shut_down)
+                    {
                         self.exit_code = Some(-1);
                         self.banner = Some("[connection to the session host lost]".to_owned());
                     }
@@ -440,6 +529,10 @@ impl Terminal {
                     if self.title.take().is_some() {
                         out.title_changed = Some(String::new());
                     }
+                }
+                Notice::Resized(size) => {
+                    self.window_size = size;
+                    self.size_sent = true;
                 }
             }
         }
@@ -462,6 +555,7 @@ impl Terminal {
                 out.title_changed = Some(String::new());
             }
             Event::Bell => out.bell = true,
+            Event::ClipboardStore(..) | Event::ClipboardLoad(..) if self.read_only => {}
             Event::ClipboardStore(ty, text) => match ty {
                 ClipboardType::Clipboard => self.clipboard.set_text(&text),
                 ClipboardType::Selection => self.clipboard.set_primary(&text),
@@ -535,7 +629,7 @@ impl Terminal {
     pub fn set_theme(&mut self, theme: TermTheme) {
         let palette = Palette::for_theme(theme);
         if palette != self.palette {
-            if !self.shut_down {
+            if !self.shut_down && !self.read_only {
                 self.out.palette(palette.host_colors());
             }
             self.palette = palette;
@@ -562,7 +656,9 @@ impl Terminal {
             term.is_focused = focused;
             *term.mode()
         };
-        if let Some(bytes) = crate::input::encode_focus(focused, mode) {
+        if !self.read_only
+            && let Some(bytes) = crate::input::encode_focus(focused, mode)
+        {
             self.out.focus_report(bytes.to_vec());
         }
         self.view.on_focus_change(focused);
@@ -572,6 +668,12 @@ impl Terminal {
     /// SIGHUPs the child. Remote: the host kills the session. Input not yet written is
     /// discarded (unlike drop, see [`Terminal`]'s `Drop`).
     pub fn kill(&mut self) {
+        if self.read_only {
+            self.shut_down = true;
+            self.out.displaced();
+            self.banner = Some("[observer detached]".to_owned());
+            return;
+        }
         if !self.shut_down {
             self.shut_down = true;
             self.out.kill();
@@ -586,13 +688,28 @@ impl Terminal {
     /// by [`Self::hold_input_until`] or by the lone-ESC quiet time (the caller's
     /// responsibility).
     pub fn write(&self, bytes: &[u8]) {
-        if bytes.is_empty() || self.shut_down {
+        if bytes.is_empty() || self.shut_down || self.read_only {
             return;
         }
         if bytes.contains(&0x03) {
             self.note_ctrl_c();
         }
         self.out.write(bytes);
+    }
+
+    /// Whether this connection still owns its write path. Observer and displaced/lost
+    /// connections must be refused by command controllers, never reported as delivered.
+    pub fn accepts_input(&self) -> bool {
+        !self.read_only && !self.shut_down && !self.out.is_closed()
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// A checkpoint for asynchronous command delivery, without waiting on the I/O thread.
+    pub fn input_progress(&self) -> crate::InputProgress {
+        self.out.input_progress()
     }
 
     /// While `Instant::now() < until`, all user keyboard/paste/IME input to this terminal is
@@ -602,8 +719,10 @@ impl Terminal {
         self.input_hold.set(Some(until));
     }
 
-    pub(crate) fn input_held(&self) -> bool {
-        self.input_hold.get().is_some_and(|u| Instant::now() < u)
+    /// User keystrokes/pastes must not pass while an injected sequence owns input.
+    /// Raw [`Self::write`] and [`Self::send_key`] deliberately bypass this gate for the injector.
+    pub fn input_held(&self) -> bool {
+        self.read_only || self.input_hold.get().is_some_and(|u| Instant::now() < u)
     }
 
     /// Instant the last Ctrl+C was written to the child: any 0x03 byte (key input or
@@ -675,12 +794,23 @@ impl Terminal {
     }
 
     pub(crate) fn mode(&self) -> TermMode {
-        *self.term.lock().mode()
+        let mode = *self.term.lock().mode();
+        if self.read_only {
+            mode.difference(TermMode::MOUSE_MODE | TermMode::ALTERNATE_SCROLL)
+        } else {
+            mode
+        }
     }
 
     /// Resizes the Term and tells the child (local SIGWINCH, remote host) when the grid or the
-    /// cell pixel size changed.
-    pub(crate) fn resize(&mut self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
+    /// cell pixel size changed. Grids are clamped to at least 2×1 cells. Read-only observers
+    /// ignore this call and follow their controller's geometry.
+    pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
+        if self.read_only {
+            return;
+        }
+        let cols = cols.max(2);
+        let rows = rows.max(1);
         let ws = WindowSize {
             num_lines: rows,
             num_cols: cols,
@@ -753,6 +883,7 @@ mod tests {
     fn repaint_gate_coalesces_output_wakeups() {
         let ctx = egui::Context::default();
         let seen = observed(&ctx);
+        let wake = Wake::Gui(ctx);
         let gate = RepaintGate::new();
 
         // Simulated clock (µs since the gate's epoch), so slot boundaries are exact.
@@ -761,7 +892,7 @@ mod tests {
         let take = || std::mem::take(&mut *seen.lock().expect("lock"));
         let burst = |from: u64| {
             for k in 0..50 {
-                gate.request_at(from + k * 100, &ctx);
+                gate.request_at(from + k * 100, &wake);
             }
         };
 
@@ -772,7 +903,7 @@ mod tests {
         burst(1_000 + v + 100);
         assert_eq!(take(), [Duration::from_micros(v - 100)]);
         // After a quiet slot: immediate again (typing echo).
-        gate.request_at(1_000 + 4 * v, &ctx);
+        gate.request_at(1_000 + 4 * v, &wake);
         assert_eq!(take(), [Duration::ZERO]);
 
         // Hidden: never immediate; one repaint per 250 ms.
@@ -780,9 +911,9 @@ mod tests {
         let t0 = 1_000 + 6 * v;
         burst(t0);
         assert_eq!(take(), [HIDDEN_REPAINT]);
-        gate.request_at(t0 + h - 1, &ctx);
+        gate.request_at(t0 + h - 1, &wake);
         assert!(take().is_empty());
-        gate.request_at(t0 + h + 10, &ctx);
+        gate.request_at(t0 + h + 10, &wake);
         assert_eq!(take(), [HIDDEN_REPAINT]);
     }
 
@@ -927,10 +1058,10 @@ mod tests {
             )
             .expect("spawn");
             t.set_visible(false);
-            t.gate.request(&ctx);
+            t.gate.request(&Wake::Gui(ctx.clone()));
             t.set_visible(true);
             seen.lock().expect("lock").clear();
-            t.gate.request(&ctx);
+            t.gate.request(&Wake::Gui(ctx));
             assert_eq!(*seen.lock().expect("lock"), [Duration::ZERO]);
         }
 

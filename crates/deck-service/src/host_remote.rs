@@ -11,10 +11,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use deck_host::{
-    AttachParams, AttachedRx, AttachedTx, HostEvent, Namespace, Palette, SessionSpec,
-    create_or_attach,
+    AttachParams, AttachedRx, AttachedTx, HostEvent, HostInfo, Namespace, Observed, ObserverEvent,
+    ObserverRx, Palette, SessionSpec, create_or_attach,
 };
-use deck_term::{Remote, RemoteEvent, RemoteRx, RemoteTx};
+use deck_term::{Observer, ObserverTx, Remote, RemoteEvent, RemoteRx, RemoteTx};
 
 /// Scrollback rows a snapshot carries (the terminal's own scrollback is 10 000 lines).
 const HISTORY_LINES: u32 = 10_000;
@@ -388,6 +388,79 @@ impl Drop for HostTx {
     /// Dropping the writer half leaves the session running.
     fn drop(&mut self) {
         let _ = self.finish(Request::Detach);
+    }
+}
+
+/// A read-only follower of a host session, as a deck-term [`Observer`] (for
+/// `deck_term::Terminal::observe` / `observe_headless`). It never attaches, so the session's
+/// controller keeps its connection; the terminal renders at the host's grid and cannot write,
+/// resize or kill.
+pub struct HostObserver {
+    observed: Observed,
+}
+
+impl HostObserver {
+    /// Subscribes to session `name` (blocks up to the host's handshake timeout: call it on a
+    /// worker). Old daemons answer `deck_host::Error::Unsupported`; there is no attach fallback.
+    pub fn connect(
+        ns: &Namespace,
+        name: &str,
+    ) -> Result<(HostInfo, HostObserver), deck_host::Error> {
+        let (info, observed) = deck_host::observe(ns, name, HISTORY_LINES)?;
+        Ok((info, HostObserver { observed }))
+    }
+}
+
+impl Observer for HostObserver {
+    fn split(self: Box<Self>) -> (Box<dyn RemoteRx>, Box<dyn ObserverTx>) {
+        let (rx, tx) = self.observed.split();
+        (
+            Box::new(HostObserverRx { rx, snapshot: None }),
+            Box::new(HostObserverTx(tx)),
+        )
+    }
+}
+
+struct HostObserverRx {
+    rx: ObserverRx,
+    /// The snapshot bytes due right after the grid they belong to.
+    snapshot: Option<Vec<u8>>,
+}
+
+impl RemoteRx for HostObserverRx {
+    fn recv(&mut self) -> io::Result<RemoteEvent> {
+        if let Some(bytes) = self.snapshot.take() {
+            return Ok(RemoteEvent::Snapshot(bytes));
+        }
+        let e = self.rx.recv().map_err(io::Error::other)?;
+        Ok(match e {
+            ObserverEvent::Snapshot { bytes, grid } => {
+                // Size first, so the replay lands on the host's grid.
+                self.snapshot = Some(bytes);
+                resize_event(grid)
+            }
+            ObserverEvent::Output(b) => RemoteEvent::Output(b),
+            ObserverEvent::Resized(grid) => resize_event(grid),
+            ObserverEvent::Exited(code) => RemoteEvent::Exited(code),
+            ObserverEvent::Closed => RemoteEvent::Closed,
+        })
+    }
+}
+
+fn resize_event(g: deck_host::Grid) -> RemoteEvent {
+    RemoteEvent::Resize {
+        cols: g.cols,
+        rows: g.rows,
+        cell_width: g.cell_width,
+        cell_height: g.cell_height,
+    }
+}
+
+struct HostObserverTx(deck_host::ObserverTx);
+
+impl ObserverTx for HostObserverTx {
+    fn detach(&self) -> io::Result<()> {
+        self.0.detach().map_err(io_err)
     }
 }
 

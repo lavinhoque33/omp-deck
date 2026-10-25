@@ -12,11 +12,11 @@ use crate::changes_view::{
     self, ChangesAction, DiffModel, DiffPane, FileKey, LoadState, ShownDiff, ViewState,
 };
 use crate::confirm::Confirm;
-use crate::inject::Job;
 use crate::omp_worker;
 use crate::review;
 use crate::tabs::{Tab, TabRole};
 use crate::theme::Palette;
+use deck_service::controller::{Command, RequestId};
 
 /// How often the open panel re-reads the repository.
 const REFRESH_EVERY: Duration = Duration::from_secs(3);
@@ -56,15 +56,17 @@ pub(super) struct PendingWrite {
     files: Vec<ChangedFile>,
 }
 
-/// A review handed to a tab's injector: which comments leave the review once it is delivered.
+/// A review handed to a tab's controller: which comments leave the review once it is delivered.
 struct PendingReview {
     uid: u64,
     root: PathBuf,
     ids: Vec<u64>,
     send: bool,
+    /// The controller request that carries it: only its own outcome settles this hand-off.
+    request: RequestId,
 }
 
-/// Review hand-offs in flight, at most one per tab (a tab's injector refuses a second review
+/// Review hand-offs in flight, at most one per tab (a tab's controller refuses a second review
 /// while one runs). Each completion clears exactly the comments of its own hand-off.
 #[derive(Default)]
 struct PendingReviews(Vec<PendingReview>);
@@ -76,9 +78,12 @@ impl PendingReviews {
         self.0.push(p);
     }
 
-    /// The hand-off of tab `uid` that just completed.
-    fn take(&mut self, uid: u64, send: bool) -> Option<PendingReview> {
-        let i = self.0.iter().position(|p| p.uid == uid && p.send == send)?;
+    /// The hand-off of tab `uid` that request `request` just settled.
+    fn take(&mut self, uid: u64, send: bool, request: RequestId) -> Option<PendingReview> {
+        let i = self
+            .0
+            .iter()
+            .position(|p| p.uid == uid && p.send == send && p.request == request)?;
         Some(self.0.swap_remove(i))
     }
 }
@@ -98,7 +103,7 @@ pub(super) struct ChangesUi {
     list_again: bool,
     last_started: Option<Instant>,
     diff_generation: u64,
-    /// The review job in flight (cleared when the injector reports it done).
+    /// The review request in flight (cleared when its controller reports it settled).
     pending_reviews: PendingReviews,
 }
 
@@ -493,8 +498,9 @@ impl App {
     }
 
     /// **Insert into omp** / **Send**: queues the review on the panel's tab (looked up again now).
-    /// The review is cleared only when the injector reports the job done ([`Self::review_delivered`]);
-    /// every refusal (omp busy, a dialog open, draft declined, no bracketed paste) keeps it.
+    /// The review is cleared only when the controller reports the request delivered
+    /// ([`Self::review_delivered`]); every refusal (omp busy, a dialog open, draft declined, no
+    /// bracketed paste) keeps it.
     fn hand_review(&mut self, send: bool) {
         let (Some(uid), Some(root)) = (self.changes.uid, self.changes.view.root.clone()) else {
             return;
@@ -513,46 +519,39 @@ impl App {
                 return;
             }
         };
-        let label = if send {
-            review::SEND_LABEL
-        } else {
-            review::INSERT_LABEL
-        };
-        let refusal = match self
+        let Some(target) = self
             .tabs
-            .iter_mut()
-            .filter_map(Tab::term_mut)
+            .iter()
+            .filter_map(Tab::term)
             .find(|t| t.uid == uid)
-        {
-            None => Some("The session tab was closed; nothing was sent"),
-            Some(t) if t.term.is_exited() => Some("omp has exited in this tab; nothing was sent"),
-            Some(t) if t.term.paste_bytes("x").is_none() => {
-                Some("omp has not enabled bracketed paste yet; try again in a moment")
-            }
-            Some(t) if t.injector.is_busy() => {
-                Some("omp is still handling another command; try again in a moment")
-            }
-            Some(t) => {
-                t.injector.push(Job::text(label, &text, send));
-                None
-            }
-        };
-        if let Some(why) = refusal {
-            self.toasts.error(&self.ctx, why);
+            .map(|t| t.ctl.target().clone())
+        else {
+            self.toasts
+                .error(&self.ctx, "The session tab was closed; nothing was sent");
             return;
-        }
+        };
+        let Some(request) = self.submit_command(&target, Command::Review { text, send }) else {
+            return;
+        };
         self.changes.pending_reviews.start(PendingReview {
             uid,
             root,
             ids: comments.iter().map(|c| c.id).collect(),
             send,
+            request,
         });
-        self.ctx.request_repaint();
     }
 
-    /// The injector finished a review job on tab `uid`: those comments are in omp's hands now.
-    pub(super) fn review_delivered(&mut self, uid: u64, send: bool) {
-        let Some(p) = self.changes.pending_reviews.take(uid, send) else {
+    /// A review request ended without reaching omp (refused, declined, cancelled): its comments
+    /// stay in the review.
+    pub(super) fn review_dropped(&mut self, uid: u64, send: bool, request: RequestId) {
+        self.changes.pending_reviews.take(uid, send, request);
+    }
+
+    /// The controller delivered a review request on tab `uid`: those comments are in omp's hands
+    /// now (delivered bytes, not proof that omp acted on them).
+    pub(super) fn review_delivered(&mut self, uid: u64, send: bool, request: RequestId) {
+        let Some(p) = self.changes.pending_reviews.take(uid, send, request) else {
             return;
         };
         let n = p.ids.len();
@@ -670,21 +669,28 @@ mod tests {
             root: PathBuf::from(root),
             ids,
             send: true,
+            request: RequestId(uid),
         };
         let mut pending = PendingReviews::default();
         pending.start(p(1, "/a", vec![1, 2]));
         pending.start(p(2, "/b", vec![7]));
         // Tab 2's hand-off did not overwrite tab 1's.
-        let done = pending.take(1, true).unwrap();
+        let done = pending.take(1, true, RequestId(1)).unwrap();
         assert_eq!((done.root, done.ids), (PathBuf::from("/a"), vec![1, 2]));
-        assert!(pending.take(1, true).is_none(), "already completed");
-        assert!(pending.take(2, false).is_none(), "other kind of job");
-        assert_eq!(pending.take(2, true).unwrap().ids, vec![7]);
+        assert!(
+            pending.take(1, true, RequestId(1)).is_none(),
+            "already completed"
+        );
+        assert!(
+            pending.take(2, false, RequestId(2)).is_none(),
+            "other kind of job"
+        );
+        assert_eq!(pending.take(2, true, RequestId(2)).unwrap().ids, vec![7]);
         // A retry on the same tab replaces its refused predecessor.
         pending.start(p(3, "/c", vec![1]));
         pending.start(p(3, "/c", vec![1, 2]));
-        assert_eq!(pending.take(3, true).unwrap().ids, vec![1, 2]);
-        assert!(pending.take(3, true).is_none());
+        assert_eq!(pending.take(3, true, RequestId(3)).unwrap().ids, vec![1, 2]);
+        assert!(pending.take(3, true, RequestId(3)).is_none());
     }
 
     #[test]

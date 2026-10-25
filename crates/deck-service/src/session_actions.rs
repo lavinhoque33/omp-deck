@@ -25,7 +25,7 @@ pub enum Kind {
     Export,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CompactMode {
     Default,
     Soft,
@@ -34,7 +34,7 @@ pub enum CompactMode {
 }
 
 /// A fully specified action ready to run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
     Handoff(Option<String>),
     Compact(CompactMode),

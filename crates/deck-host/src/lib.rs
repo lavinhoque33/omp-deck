@@ -4,7 +4,10 @@
 //!
 //! Client side (blocking; run it on worker threads): [`Namespace`] lists, inspects and kills
 //! sessions, [`create_or_attach`] starts a daemon when needed and returns an [`Attached`]
-//! connection that splits into [`AttachedRx`] / [`AttachedTx`].
+//! connection that splits into [`AttachedRx`] / [`AttachedTx`]. The attached client is the
+//! session's single controller (input, resize, palette); a new attach displaces it.
+//! [`observe`] is a read-only, non-displacing subscription ([`ObserverRx`] /
+//! [`ObserverTx`]) for any number of additional viewers; the daemon enforces read-only.
 
 mod client;
 pub mod daemon;
@@ -20,11 +23,12 @@ mod transport;
 mod winproc;
 
 pub use client::{
-    Attached, AttachedRx, AttachedTx, HostEvent, attach, create_or_attach, daemon_exe, peek, start,
+    Attached, AttachedRx, AttachedTx, HostEvent, Observed, ObserverEvent, ObserverRx, ObserverTx,
+    attach, create_or_attach, daemon_exe, observe, peek, start,
 };
 pub use error::{Error, Result};
 pub use namespace::{Namespace, valid_namespace, valid_session_name};
-pub use protocol::{AttachParams, HostInfo, PROTOCOL, Palette, SessionSpec};
+pub use protocol::{AttachParams, Grid, HostInfo, PROTOCOL, Palette, SessionSpec};
 
 /// Version of this crate, reported in `Hello` and [`HostInfo::host_version`].
 pub const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");

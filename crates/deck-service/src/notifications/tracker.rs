@@ -1,14 +1,18 @@
-//! When a tab's status change deserves a desktop notification: a pure state machine over
-//! [`TabStatus`] transitions, the window's focus, which tab is active and the user's toggles.
+//! When a session's status change deserves a notification: a pure state machine over
+//! [`TabStatus`] transitions, the window's focus, which sessions are in view and the user's
+//! toggles. Keyed by the session's identity `K` (the service uses
+//! [`SessionKey`](crate::controller::SessionKey)).
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use deck_core::config::NotifyConfig;
 use deck_core::status::TurnOutcome;
 
 use super::inbox;
-use crate::tabs::TabStatus;
+use crate::status::TabStatus;
 
 /// A turn must have run at least this long before its end is worth a notification.
 pub const MIN_BUSY: Duration = Duration::from_secs(3);
@@ -54,10 +58,10 @@ pub struct Sighting {
 
 /// What an asynchronous turn classification was asked about; see [`Tracker::is_current`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Ticket {
-    pub uid: u64,
+pub struct Ticket<K> {
+    pub uid: K,
     generation: u64,
-    session: Option<std::path::PathBuf>,
+    session: Option<PathBuf>,
 }
 
 struct Memory {
@@ -71,14 +75,23 @@ struct Memory {
     generation: u64,
 }
 
-#[derive(Default)]
-pub struct Tracker {
-    tabs: HashMap<u64, Memory>,
+pub struct Tracker<K> {
+    tabs: HashMap<K, Memory>,
     /// Tabs with a notification still on screen.
-    shown: HashSet<u64>,
+    shown: HashSet<K>,
     /// Of those, the ones sent while the user looked at the tab: [`Tracker::take_seen`] leaves
     /// them alone, their inbox entry's removal withdraws them (see `Inbox::sync_viewing`).
-    held: HashSet<u64>,
+    held: HashSet<K>,
+}
+
+impl<K> Default for Tracker<K> {
+    fn default() -> Self {
+        Tracker {
+            tabs: HashMap::new(),
+            shown: HashSet::new(),
+            held: HashSet::new(),
+        }
+    }
 }
 
 /// Whether `event` belongs in the inbox: its toggle is on and either the user may be told while
@@ -97,12 +110,12 @@ pub fn desktop_wanted(cfg: &NotifyConfig, window_focused: bool) -> bool {
     cfg.desktop && (!cfg.only_when_unfocused || !window_focused)
 }
 
-impl Tracker {
+impl<K: Clone + Eq + Hash> Tracker<K> {
     /// Feed one tab's current state. Returns the event to notify about, once per transition
     /// (a transition that is gated out is consumed all the same).
     pub fn observe(
         &mut self,
-        uid: u64,
+        uid: K,
         now: Instant,
         seen: Sighting,
         window_focused: bool,
@@ -145,74 +158,74 @@ impl Tracker {
     }
 
     /// Whether the tab was last seen busy (a turn is running).
-    pub fn is_busy(&self, uid: u64) -> bool {
-        self.tabs.get(&uid).is_some_and(|m| m.kind == Kind::Busy)
+    pub fn is_busy(&self, uid: &K) -> bool {
+        self.tabs.get(uid).is_some_and(|m| m.kind == Kind::Busy)
     }
 
     /// A notification for `uid` was sent; `while_looking` when the user was looking at the tab,
     /// which keeps it up until it is withdrawn with the tab's inbox entry.
-    pub fn shown(&mut self, uid: u64, while_looking: bool) {
-        self.shown.insert(uid);
+    pub fn shown(&mut self, uid: K, while_looking: bool) {
         if while_looking {
-            self.held.insert(uid);
+            self.held.insert(uid.clone());
         } else {
             self.held.remove(&uid);
         }
+        self.shown.insert(uid);
     }
 
     /// The notification for `uid` is gone (dismissed, expired, clicked).
-    pub fn gone(&mut self, uid: u64) {
-        self.shown.remove(&uid);
-        self.held.remove(&uid);
+    pub fn gone(&mut self, uid: &K) {
+        self.shown.remove(uid);
+        self.held.remove(uid);
     }
 
     /// How long the busy stretch lasted that `uid`'s latest busy → other transition ended.
-    pub fn last_busy(&self, uid: u64) -> Duration {
-        self.tabs.get(&uid).map_or(Duration::ZERO, |m| m.last_busy)
+    pub fn last_busy(&self, uid: &K) -> Duration {
+        self.tabs.get(uid).map_or(Duration::ZERO, |m| m.last_busy)
     }
 
     /// The transition count of `uid`, `None` for an unknown tab.
-    pub fn generation(&self, uid: u64) -> Option<u64> {
-        self.tabs.get(&uid).map(|m| m.generation)
+    pub fn generation(&self, uid: &K) -> Option<u64> {
+        self.tabs.get(uid).map(|m| m.generation)
     }
 
     /// Whether a verdict requested under `ticket` still describes the tab: it exists, has not
     /// changed status since, and still shows the same session file.
-    pub fn is_current(&self, ticket: &Ticket, session: Option<&std::path::Path>) -> bool {
-        self.generation(ticket.uid) == Some(ticket.generation)
+    pub fn is_current(&self, ticket: &Ticket<K>, session: Option<&Path>) -> bool {
+        self.generation(&ticket.uid) == Some(ticket.generation)
             && ticket.session.as_deref() == session
     }
 
     /// Stamp for an asynchronous verdict about `uid`'s present state.
-    pub fn ticket(&self, uid: u64, session: Option<std::path::PathBuf>) -> Option<Ticket> {
+    pub fn ticket(&self, uid: K, session: Option<PathBuf>) -> Option<Ticket<K>> {
         Some(Ticket {
+            generation: self.generation(&uid)?,
             uid,
-            generation: self.generation(uid)?,
             session,
         })
     }
 
-    /// The tab whose notification should be withdrawn now: the user looks at it (window focused,
-    /// tabs shown in a pane). Notifications sent while looking are not taken.
-    pub fn take_seen(&mut self, visible: &[u64], window_focused: bool) -> Vec<u64> {
+    /// The tabs whose notification should be withdrawn now: the user looks at them (window
+    /// focused, tabs shown in a pane). Notifications sent while looking are not taken.
+    pub fn take_seen(&mut self, visible: &[K], window_focused: bool) -> Vec<K> {
         if !window_focused {
             return Vec::new();
         }
         visible
             .iter()
-            .copied()
-            .filter(|uid| !self.held.contains(uid) && self.shown.remove(uid))
+            .filter(|uid| !self.held.contains(*uid) && self.shown.remove(*uid))
+            .cloned()
             .collect()
     }
 
     /// Forget tabs that no longer exist; returns those that still had a notification up.
-    pub fn retain(&mut self, live: &HashSet<u64>) -> Vec<u64> {
+    pub fn retain(&mut self, live: &HashSet<K>) -> Vec<K> {
         self.tabs.retain(|uid, _| live.contains(uid));
-        let stale: Vec<u64> = self
+        let stale: Vec<K> = self
             .shown
             .iter()
-            .copied()
-            .filter(|u| !live.contains(u))
+            .filter(|u| !live.contains(*u))
+            .cloned()
             .collect();
         for u in &stale {
             self.shown.remove(u);
@@ -523,7 +536,7 @@ mod tests {
             false,
             &cfg,
         );
-        assert_eq!(t.last_busy(1), Duration::from_secs(7));
+        assert_eq!(t.last_busy(&1), Duration::from_secs(7));
     }
 
     #[test]
@@ -592,7 +605,7 @@ mod tests {
     fn a_dismissed_notification_is_not_withdrawn_again() {
         let mut t = Tracker::default();
         t.shown(4, false);
-        t.gone(4);
+        t.gone(&4);
         assert!(t.take_seen(&[4], true).is_empty());
     }
 
@@ -607,7 +620,7 @@ mod tests {
         assert_eq!(t.take_seen(&[4], true), vec![4]);
         // gone releases the hold
         t.shown(4, true);
-        t.gone(4);
+        t.gone(&4);
         t.shown(4, false);
         assert_eq!(t.take_seen(&[4], true), vec![4]);
     }
@@ -656,11 +669,11 @@ mod tests {
         );
     }
 
-    fn observe_default(t: &mut Tracker, at: Instant, status: TabStatus) {
+    fn observe_default(t: &mut Tracker<u64>, at: Instant, status: TabStatus) {
         t.observe(1, at, seen(status, false), false, &NotifyConfig::default());
     }
 
-    fn finished_turn() -> (Tracker, Ticket, Instant) {
+    fn finished_turn() -> (Tracker<u64>, Ticket<u64>, Instant) {
         let mut t = Tracker::default();
         let t0 = Instant::now();
         observe_default(&mut t, t0, IDLE);

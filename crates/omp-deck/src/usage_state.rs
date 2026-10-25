@@ -12,8 +12,8 @@ use deck_core::usage::{
     tightest,
 };
 
-use crate::statusfmt::fmt_tokens;
 use crate::usage_fmt::{left_pct, left_text, money, requests, requests_short, short_date};
+use deck_service::statusfmt::fmt_tokens;
 
 /// First fetch after startup.
 pub const FIRST_FETCH_DELAY: Duration = Duration::from_secs(3);

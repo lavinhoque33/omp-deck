@@ -20,10 +20,10 @@ use crate::agent_popup::{self, PopupAction, PopupInput, PopupState, PopupTab};
 use crate::dashboard::{self, DashAction, DashInput, DashState};
 use crate::dashboard_model::{Card, CardKey, CardSrc, Extra, Status};
 use crate::running::RunningSnapshot;
-use crate::statusfmt::short_model_name;
 use crate::tabs::{ClosedTab, Tab, TabRole};
 use crate::theme::{self, Palette};
 use crate::toast::ToastKind;
+use deck_service::statusfmt::short_model_name;
 
 /// What the dashboard knows about a session file from the sidebar's scan.
 pub(super) struct IndexEntry {
@@ -71,7 +71,7 @@ fn collect_sources<'a>(
         if t.role != TabRole::Session {
             continue;
         }
-        let entry = t.session_path.as_deref().and_then(|p| index.entries.get(p));
+        let entry = t.session_path().and_then(|p| index.entries.get(p));
         let title = tab.label(labels);
         out.push(Src {
             card: CardSrc {
@@ -82,17 +82,14 @@ fn collect_sources<'a>(
                     title
                 },
                 cwd: &t.cwd,
-                session: t.session_path.as_deref(),
-                id: entry.map_or_else(
-                    || t.session_path.as_deref().map_or("", file_stem),
-                    |e| e.id.as_str(),
-                ),
+                session: t.session_path(),
+                id: entry.map_or_else(|| t.session_path().map_or("", file_stem), |e| e.id.as_str()),
                 status: Status::of_tab(tab.status(false)),
                 // A session without a file yet was just started: it is the most recent thing.
                 activity_at: entry.map(|e| e.modified).or(Some(bucket_time)),
                 active: i == active,
             },
-            owner_alive: !t.term.is_exited(),
+            owner_alive: !t.terminal().is_exited(),
         });
     }
     let Some(running) = running else { return out };
@@ -100,7 +97,7 @@ fn collect_sources<'a>(
         tabs.iter().filter_map(Tab::term).any(|t| {
             t.role == TabRole::Session
                 && (t.mux_name.as_deref() == Some(name)
-                    || file.is_some_and(|f| t.session_path.as_deref() == Some(f)))
+                    || file.is_some_and(|f| t.session_path() == Some(f)))
         })
     };
     for name in &running.alive {
@@ -166,9 +163,9 @@ impl App {
         self.drive_ctl();
         let want = match self.tabs.get(self.active) {
             Some(Tab::Terminal(t)) if t.role == TabRole::Session => {
-                t.session_path.clone().map(|session| AgentsTarget {
+                t.session_path_owned().map(|session| AgentsTarget {
                     session,
-                    owner_alive: !t.term.is_exited(),
+                    owner_alive: !t.terminal().is_exited(),
                 })
             }
             _ => None,
@@ -276,10 +273,10 @@ impl App {
             t.uid.hash(&mut h);
             tab.label(&self.labels).hash(&mut h);
             t.cwd.hash(&mut h);
-            t.session_path.hash(&mut h);
+            t.session_path().hash(&mut h);
             t.mux_name.hash(&mut h);
             Status::of_tab(tab.status(false)).hash(&mut h);
-            t.term.is_exited().hash(&mut h);
+            t.terminal().is_exited().hash(&mut h);
         }
         h.finish()
     }
@@ -329,7 +326,7 @@ impl App {
         self.dash.show_with(focus);
         // The terminals leave the screen: tell omp its focus is gone.
         for t in self.tabs.iter_mut().filter_map(Tab::term_mut) {
-            t.term.set_focused(false);
+            t.terminal_mut().set_focused(false);
         }
         self.running.poke();
         self.ctx.request_repaint();

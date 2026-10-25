@@ -682,13 +682,15 @@ impl Store {
 pub(crate) struct Graphics {
     store: Mutex<Store>,
     ctx: egui::Context,
+    wake: crate::wake::Wake,
 }
 
 impl Graphics {
-    pub(crate) fn new(ctx: egui::Context) -> Graphics {
+    pub(crate) fn new(ctx: egui::Context, wake: crate::wake::Wake) -> Graphics {
         Graphics {
             store: Mutex::new(Store::new()),
             ctx,
+            wake,
         }
     }
 
@@ -722,7 +724,7 @@ impl Graphics {
                         let max_side = graphics.ctx.input(|i| i.max_texture_side).min(MAX_SIDE);
                         let result = decode(&up, max_side);
                         if graphics.store().finish(id, generation, result) {
-                            graphics.ctx.request_repaint();
+                            graphics.wake.now();
                         }
                     });
                 if let Err(e) = spawned {
@@ -737,11 +739,11 @@ impl Graphics {
                 rows,
             } => {
                 self.store().place(id, pid, cols, rows);
-                self.ctx.request_repaint();
+                self.wake.now();
             }
             Command::Delete { what, id, pid } => {
                 self.store().delete(what, id, pid);
-                self.ctx.request_repaint();
+                self.wake.now();
             }
         }
     }
@@ -1180,5 +1182,41 @@ mod tests {
         assert_eq!(resolve_box([0, 0], [95, 41], cell), [10, 3]);
         assert_eq!(resolve_box([4, 0], [200, 100], cell), [4, 1]);
         assert_eq!(resolve_box([0, 2], [200, 100], cell), [8, 2]);
+    }
+
+    #[test]
+    fn asynchronous_decode_wakes_a_headless_reader_when_pixels_are_ready() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (tx, rx) = mpsc::channel();
+        let graphics = Arc::new(Graphics::new(
+            egui::Context::default(),
+            crate::wake::Wake::Headless(Arc::new(move |delay| {
+                let _ = tx.send(delay);
+            })),
+        ));
+        graphics.apply(Command::Transmit(Upload {
+            id: 11,
+            format: 24,
+            width: 2,
+            height: 1,
+            data: b"/wAAAP8A".to_vec(),
+            ..Upload::default()
+        }));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("decode wake"),
+            Duration::ZERO
+        );
+        let store = graphics.store();
+        let ImageState::Ready {
+            pixels: Some(pixels),
+            ..
+        } = &store.images[&11].state
+        else {
+            panic!("the decode wake must publish ready pixels");
+        };
+        assert_eq!(pixels.size, [2, 1]);
+        assert_eq!(pixels.pixels, [egui::Color32::RED, egui::Color32::GREEN]);
     }
 }

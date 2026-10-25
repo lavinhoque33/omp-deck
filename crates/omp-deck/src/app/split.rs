@@ -14,9 +14,10 @@ use egui::{
 use super::{App, TermMenu, terminal_menu};
 use crate::icons::{ICON_TERMINAL, ICON_X};
 use crate::panes::{self, Dir, Side};
-use crate::tabs::{Tab, TabStatus, paint_status};
+use crate::tabs::{Tab, paint_status};
 use crate::theme::{self, Palette};
 use crate::widgets::paint_icon;
+use deck_service::status::TabStatus;
 
 /// Height of a pane's header strip.
 const HEADER_H: f32 = 24.0;
@@ -420,8 +421,9 @@ impl App {
                             .layout(Layout::top_down(Align::Min)),
                     );
                     child.set_clip_rect(body.intersect(ui.clip_rect()));
-                    let out = TerminalView::new(&mut t.term)
-                        .id_salt(t.uid)
+                    let uid = t.uid;
+                    let out = TerminalView::new(t.terminal_mut())
+                        .id_salt(uid)
                         .font_size(font_size)
                         .show(&mut child);
                     if self.focus_pending && is_focused {
@@ -434,11 +436,11 @@ impl App {
                     if out.open_url.is_some() {
                         frame.open_url = out.open_url;
                     }
-                    match terminal_menu(&out.response, &t.term) {
+                    match terminal_menu(&out.response, t.terminal()) {
                         Some(TermMenu::Copy) => {
-                            t.term.copy_selection();
+                            t.terminal().copy_selection();
                         }
-                        Some(TermMenu::Paste) => t.term.paste_clipboard(),
+                        Some(TermMenu::Paste) => t.terminal_mut().paste_clipboard(),
                         Some(TermMenu::OpenLink(url)) => frame.open_url = Some(url),
                         Some(TermMenu::CopyLink(url)) => frame.copy_link = Some(url),
                         None => {}

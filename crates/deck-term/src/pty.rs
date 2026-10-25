@@ -35,9 +35,20 @@ pub(crate) struct CountingWriter {
 
 impl Write for CountingWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.file.write(buf)?;
-        self.progress.add(n);
-        Ok(n)
+        let result = self.file.write(buf);
+        match &result {
+            Ok(n) => self.progress.record(*n, true),
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                self.progress.record(0, false);
+            }
+            Err(_) => {}
+        }
+        result
     }
 
     fn flush(&mut self) -> io::Result<()> {

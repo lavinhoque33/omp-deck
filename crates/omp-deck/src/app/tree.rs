@@ -14,11 +14,11 @@ use super::ctl::CtlLink;
 use super::spawn::Focus;
 use super::{App, AppEvent};
 use crate::agent_ctl::Link;
-use crate::statusfmt::Activity;
 use crate::tabs::{ClosedTab, Tab, TabRole};
 use crate::titlebar;
 use crate::toast::ToastKind;
 use crate::tree_view::{self, TreeAction, TreeInput, TreeState};
+use deck_service::statusfmt::Activity;
 
 /// The open tree window.
 pub(super) struct TreeUi {
@@ -168,7 +168,7 @@ impl App {
         if t.role != TabRole::Session {
             return;
         }
-        let Some(session) = t.session_path.clone() else {
+        let Some(session) = t.session_path_owned() else {
             self.toasts.info(
                 &self.ctx,
                 "The session has no file yet — send a prompt first",
@@ -206,14 +206,14 @@ impl App {
         self.tabs
             .iter()
             .filter_map(Tab::term)
-            .any(|t| t.session_path.as_deref() == Some(session) && !t.term.is_exited())
+            .any(|t| t.session_path() == Some(session) && !t.terminal().is_exited())
     }
 
     /// The active tab shows `session` and has a live control link.
     fn tree_link(&self, session: &Path) -> Result<(), &'static str> {
         let active = match self.tabs.get(self.active) {
             Some(Tab::Terminal(t))
-                if t.role == TabRole::Session && t.session_path.as_deref() == Some(session) =>
+                if t.role == TabRole::Session && t.session_path() == Some(session) =>
             {
                 t
             }
@@ -222,7 +222,7 @@ impl App {
             }
             _ => return Err("Open the session in a tab with live control first"),
         };
-        if active.term.is_exited() {
+        if active.terminal().is_exited() {
             return Err("omp has exited in this tab");
         }
         if self.ctl_link() != Link::Live {
@@ -245,7 +245,7 @@ impl App {
                 self.tabs
                     .get(self.active)
                     .and_then(Tab::term)
-                    .map(|t| Activity::from_title(t.term.title()) == Activity::Idle)
+                    .map(|t| Activity::from_title(t.terminal().title()) == Activity::Idle)
             })
             .unwrap_or(false);
         if idle {
@@ -262,7 +262,7 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(i, t)| t.term().map(|t| (i, t)))
-            .find(|(_, t)| t.session_path.as_deref() == Some(session) && !t.term.is_exited());
+            .find(|(_, t)| t.session_path() == Some(session) && !t.terminal().is_exited());
         let tab = match tab {
             None => TabFact::None,
             Some((i, _)) if i == self.active && self.tree_link(session).is_ok() => {

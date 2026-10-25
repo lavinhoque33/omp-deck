@@ -9,7 +9,7 @@ use deck_core::agents::{AgentStatus, AgentSummary, AgentsSnapshot};
 use deck_core::ctl::{LiveAgent, LiveSnapshot, LiveStatus};
 
 use crate::sidebar::format_age;
-use crate::statusfmt::fmt_tokens;
+use deck_service::statusfmt::fmt_tokens;
 
 /// Age strings only change by minutes; they are refreshed at this granularity.
 const AGE_BUCKET_SECS: u64 = 15;

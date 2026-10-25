@@ -31,6 +31,10 @@ pub enum Error {
     },
     #[error("host protocol error: {0}")]
     Protocol(String),
+    /// The session's daemon predates the requested operation (e.g. `Observe`); nothing was
+    /// changed and the caller must not fall back to a displacing attach.
+    #[error("session {0:?} runs an older omp-deck-host that does not support observing")]
+    Unsupported(String),
     #[error("frame of {0} bytes exceeds the 1 MiB limit")]
     FrameTooLarge(usize),
     #[error("host daemon reported: {0}")]

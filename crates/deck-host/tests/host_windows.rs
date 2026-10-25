@@ -6,8 +6,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Client, TestNs, env, wait_until, wait_until_for};
-use deck_host::{Error, HostEvent, SessionSpec};
+use common::{Client, Observer, TestNs, env, wait_until, wait_until_for};
+use deck_host::{Error, HostEvent, ObserverEvent, SessionSpec};
 
 fn spec(name: &str, program: &str, args: &[&str]) -> SessionSpec {
     SessionSpec {
@@ -51,6 +51,60 @@ fn conpty_round_trip_detach_and_reattach() {
     let info = ns.0.info("rt").unwrap();
     assert!(info.attached && info.tty.is_none());
     assert_eq!(ns.0.list(), ["rt"]);
+}
+
+#[test]
+fn observer_follows_without_affecting_the_controller() {
+    let ns = TestNs::new();
+    let mut c = Client::create(&ns, &cmd("ob"), 80, 24);
+    c.type_line("echo before-%OMP_DECK_TEST%-ok");
+    c.wait_output("before-1-ok");
+    c.settle(Duration::from_millis(500));
+    let mut o = Observer::new(&ns, "ob", 1000);
+    assert!(o.screen().contains("before-1-ok"), "{}", o.screen());
+    assert!(ns.0.info("ob").unwrap().attached);
+
+    c.tx.resize(101, 33, 9, 18).unwrap();
+    c.type_line("echo live-%OMP_DECK_TEST%-ok");
+    c.wait_output("live-1-ok");
+    o.wait_output("live-1-ok");
+    assert_eq!((o.grid.cols, o.grid.rows), (101, 33));
+
+    let mut gone = Observer::new(&ns, "ob", 0);
+    gone.tx.detach().unwrap();
+    loop {
+        match gone.next() {
+            ObserverEvent::Output(_) | ObserverEvent::Resized(_) => {}
+            ObserverEvent::Closed => break,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let info = ns.0.info("ob").unwrap();
+    assert!(info.attached);
+    assert_eq!((info.cols, info.rows), (101, 33));
+
+    c.type_line("exit 3");
+    loop {
+        match o.next() {
+            ObserverEvent::Output(_) | ObserverEvent::Resized(_) => {}
+            ObserverEvent::Exited(code) => {
+                assert_eq!(code, Some(3));
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    loop {
+        match c.next() {
+            HostEvent::Output(_) => {}
+            HostEvent::Exited(code) => {
+                assert_eq!(code, Some(3));
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    wait_until("endpoint gone", || !ns.0.has("ob"));
 }
 
 #[test]

@@ -26,14 +26,15 @@ use crate::ctx_tip::{self, CtxTip};
 use crate::usage_state::Summary;
 use crate::usage_view;
 
-use crate::model_picker::{self, ModelsCache, Pending, PickerAction, PickerInput, PickerState};
-use crate::session_actions::{self, Action, ActionCtx, Availability, CompactMode, Kind};
-use crate::statusfmt::{
+use crate::model_picker::{self, ModelsCache, PickerAction, PickerInput, PickerState};
+use crate::theme::{self, Palette};
+use crate::widgets::{icon_text, menu_item, paint_icon};
+use deck_service::model_switch::Pending;
+use deck_service::session_actions::{self, Action, ActionCtx, Availability, CompactMode, Kind};
+use deck_service::statusfmt::{
     self, Activity, ContextLevel, context_label, context_level, context_percent, fmt_cost,
     fmt_tokens, thinking_fill, thinking_short,
 };
-use crate::theme::{self, Palette};
-use crate::widgets::{icon_text, menu_item, paint_icon};
 
 pub const BAR_H: f32 = 41.0;
 const CHIP_H: f32 = 29.0;
@@ -829,7 +830,10 @@ fn model_chip(
         if let Some(p) = pending {
             ui.add(crate::widgets::Spin::new(16.8, pal.accent));
             ui.add(text(
-                &format!("switching to {}…", p.describe(input.catalog)),
+                &format!(
+                    "switching to {}…",
+                    p.describe(&|s| input.catalog.get(s).map(|m| m.name.clone()))
+                ),
                 15.2,
                 pal.accent,
             ));

@@ -30,11 +30,12 @@ use crate::folder_scope;
 use crate::panes::Side;
 use crate::running::RunningSnapshot;
 use crate::scope_bar::{self, ScopeAction, ScopeInput, ScopeState};
-use crate::tabs::{self, Tab, TabStatus};
+use crate::tabs::{self, Tab};
 use crate::theme::{self, Palette};
 use crate::transfer::{self, TransferKind};
 use crate::widgets::{empty_state, icon_text, menu_item, paint_icon};
 use crate::worktree_ui::{self, Family, Finishing, Head};
+use deck_service::status::TabStatus;
 
 /// "now", "5m", "3h", "2d", "4w", "2y".
 pub fn format_age(now: SystemTime, modified: SystemTime) -> String {
@@ -1841,8 +1842,8 @@ pub fn tab_menu(ui: &mut Ui, i: usize, tab: &Tab, env: &MenuEnv<'_>, out: &mut S
     let Some(t) = tab.term() else {
         return;
     };
-    let running = !t.term.is_exited();
-    let entry = t.session_path.as_deref().and_then(|p| env.entry(p));
+    let running = !t.terminal().is_exited();
+    let entry = t.session_path().and_then(|p| env.entry(p));
     // The session menu's "Stop session process" covers this whenever it is offered.
     if (entry.is_none() || !env.can_stop)
         && menu_item(ui, ICON_POWER, "Kill session process", None, running, false).clicked()

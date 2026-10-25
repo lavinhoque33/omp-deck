@@ -10,9 +10,9 @@ use egui::{
 
 use crate::icons::ICON_CHART_PIE;
 use crate::statusbar::{group_digits, level_color};
-use crate::statusfmt::{ContextLevel, context_level, fmt_tokens};
 use crate::theme::{self, Palette};
 use crate::widgets::paint_icon;
+use deck_service::statusfmt::{ContextLevel, context_level, fmt_tokens};
 
 /// Tool schemas listed before "N more".
 pub const MAX_TOOLS: usize = 8;

@@ -707,6 +707,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "deck-service"
+version = "0.14.3"
+dependencies = [
+ "deck-core",
+ "deck-host",
+ "deck-term",
+ "dirs",
+ "log",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "deck-term"
 version = "0.14.3"
 dependencies = [
@@ -2451,6 +2464,7 @@ dependencies = [
  "anyhow",
  "deck-core",
  "deck-host",
+ "deck-service",
  "deck-term",
  "dirs",
  "eframe",

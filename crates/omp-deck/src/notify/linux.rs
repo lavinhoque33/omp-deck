@@ -7,6 +7,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use deck_service::controller::SessionTarget;
 use futures_lite::StreamExt;
 use zbus::message::Type;
 use zbus::zvariant::Value;
@@ -27,8 +28,8 @@ const ICON: &str = "omp-deck";
 
 #[derive(Default)]
 struct Shared {
-    by_tab: HashMap<Option<u64>, u32>,
-    by_id: HashMap<u32, Option<u64>>,
+    by_tab: HashMap<Option<SessionTarget>, u32>,
+    by_id: HashMap<u32, Option<SessionTarget>>,
     /// `ActivationToken` seen, `ActionInvoked` not yet.
     tokens: HashMap<u32, String>,
 }
@@ -83,7 +84,8 @@ pub fn run(cmds: Receiver<Cmd>, out: &Out) {
                 }
                 Cmd::Close(tab) => zbus::block_on(close(&conn, &state, tab)),
                 Cmd::CloseAll => {
-                    let tabs: Vec<u64> = lock(&state).by_tab.keys().flatten().copied().collect();
+                    let tabs: Vec<SessionTarget> =
+                        lock(&state).by_tab.keys().flatten().cloned().collect();
                     for tab in tabs {
                         zbus::block_on(close(&conn, &state, Some(tab)));
                     }
@@ -116,7 +118,7 @@ fn coalesce(batch: Vec<Cmd>) -> Vec<Cmd> {
         .into_iter()
         .rev()
         .filter(|c| match c {
-            Cmd::Show(Request { tab: Some(t), .. }) => seen.insert(*t),
+            Cmd::Show(Request { tab: Some(t), .. }) => seen.insert(t.clone()),
             _ => true,
         })
         .collect();
@@ -152,17 +154,17 @@ async fn notify(conn: &Connection, state: &State, req: &Request) -> Result<(), S
         .deserialize()
         .map_err(|e| format!("unexpected Notify reply: {e}"))?;
     let mut s = lock(state);
-    if let Some(old) = s.by_tab.insert(req.tab, id)
+    if let Some(old) = s.by_tab.insert(req.tab.clone(), id)
         && old != id
     {
         s.by_id.remove(&old);
         s.tokens.remove(&old);
     }
-    s.by_id.insert(id, req.tab);
+    s.by_id.insert(id, req.tab.clone());
     Ok(())
 }
 
-async fn close(conn: &Connection, state: &State, tab: Option<u64>) {
+async fn close(conn: &Connection, state: &State, tab: Option<SessionTarget>) {
     let id = {
         let mut s = lock(state);
         let id = s.by_tab.remove(&tab);
@@ -227,7 +229,7 @@ fn on_signal(msg: &Message, state: &State, out: &Out) {
             if let Ok((id, _action)) = body.deserialize::<(u32, String)>() {
                 let (tab, token) = {
                     let mut s = lock(state);
-                    let Some(tab) = s.by_id.get(&id).copied() else {
+                    let Some(tab) = s.by_id.get(&id).cloned() else {
                         log::debug!("ActionInvoked for unknown notification {id}");
                         return;
                     };
@@ -242,10 +244,10 @@ fn on_signal(msg: &Message, state: &State, out: &Out) {
                     let mut s = lock(state);
                     s.tokens.remove(&id);
                     let tab = s.by_id.remove(&id);
-                    if let Some(tab) = tab
-                        && s.by_tab.get(&tab) == Some(&id)
+                    if let Some(tab) = &tab
+                        && s.by_tab.get(tab) == Some(&id)
                     {
-                        s.by_tab.remove(&tab);
+                        s.by_tab.remove(tab);
                     }
                     tab
                 };
@@ -262,7 +264,14 @@ fn on_signal(msg: &Message, state: &State, out: &Out) {
 mod tests {
     use super::*;
 
-    fn show(tab: Option<u64>, body: &str) -> Cmd {
+    fn key(n: u64) -> SessionTarget {
+        SessionTarget {
+            key: deck_service::controller::SessionKey::tmux("test", &n.to_string()),
+            generation: 1,
+        }
+    }
+
+    fn show(tab: Option<SessionTarget>, body: &str) -> Cmd {
         Cmd::Show(Request {
             tab,
             title: String::new(),
@@ -273,11 +282,11 @@ mod tests {
     #[test]
     fn only_the_newest_show_per_tab_survives_in_order() {
         let batch = vec![
-            show(Some(1), "old"),
+            show(Some(key(1)), "old"),
             show(None, "test"),
-            Cmd::Close(Some(2)),
-            show(Some(1), "new"),
-            show(Some(2), "other"),
+            Cmd::Close(Some(key(2))),
+            show(Some(key(1)), "new"),
+            show(Some(key(2)), "other"),
         ];
         let out = coalesce(batch);
         let bodies: Vec<&str> = out

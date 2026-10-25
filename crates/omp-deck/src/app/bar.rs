@@ -1,30 +1,35 @@
-//! App-side glue for the status bar: status watcher target, optimistic model switches, the
-//! per-tab injection queues, action dispatch and the small dialogs.
+//! App-side glue for the status bar: status watcher target, the model-switch confirmation fed
+//! to each tab's controller, command submission and the small dialogs.
+//!
+//! Every command that writes into a session (status-bar actions, the palette, review text,
+//! worktree move/finish) is submitted to that session's [`SessionController`] with the
+//! [`SessionTarget`] the user acted on; this module only turns the controller's events into
+//! dialogs and toasts.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use deck_core::platform;
 use deck_core::sessions::{SessionEntry, abbreviate_home};
 use deck_core::status::{SessionStats, StatusTarget};
+use deck_service::controller::{
+    ActionFacts, Command, CommandKind, ControllerEvent, Delivery, ModelFacts, Refusal, Rejected,
+    RequestId, SessionTarget, Submission,
+};
+use deck_service::inject::Requires;
+use deck_service::session_actions::{self, Action, ActionCtx, CompactMode};
 use egui::{TextEdit, Ui};
+use std::path::PathBuf;
 
 use super::{App, AppEvent, PendingConfirm};
 use crate::confirm::{self, Confirm, Dialog};
-use crate::inject::{Env, Job, Requires, Write};
-use crate::model_picker::{self, FRESH_TIMEOUT, Pending, PickerAction, SWITCH_TIMEOUT};
-use crate::session_actions::{self, Action, ActionCtx, CompactMode};
+use crate::model_picker::PickerAction;
 use crate::statusbar::{self, BarAction, BarInput};
-use crate::statusfmt::Activity;
-use crate::tabs::{Tab, TabRole};
+use crate::tabs::{Tab, TabRole, TermTab};
 use crate::toast::ToastKind;
-use crate::worktree_ui::{FINISH_LABEL, MOVE_LABEL};
 
-/// Label of the injection job behind the model/thinking dropdown.
-const MODEL_SWITCH: &str = "Model switch";
 /// Terminal input is dropped for this long (renewed every frame) while a dialog is open.
 const MODAL_HOLD: Duration = Duration::from_millis(250);
-/// How often a deferred tab close checks whether its injector reached a job boundary.
+/// How often a deferred tab close checks whether its controller reached a job boundary.
 const CLOSE_POLL: Duration = Duration::from_millis(50);
 
 /// A text prompt opened from the bar's menus.
@@ -36,7 +41,7 @@ pub enum ActionDialog {
 
 impl App {
     /// Per frame, before drawing: follow the active tab, feed the bar, resolve pending switches and
-    /// run the injection queues.
+    /// run the controllers' injection queues.
     pub(super) fn drive_status(&mut self, ctx: &egui::Context) {
         let want = match self.tabs.get(self.active) {
             Some(Tab::Terminal(t)) if t.role == TabRole::Session => Some(t),
@@ -47,12 +52,12 @@ impl App {
             self.status_uid = want_uid;
             self.bar_view = statusbar::BarView::default();
         }
-        // Submitted every frame so /new, /fork, /move (which update `session_path`) also move the
+        // Submitted every frame so /new, /fork, /move (which update the session path) also move the
         // watcher's fallback; rebuilt only when a field differs from the last submitted target.
         let unchanged = match (want, &self.status_target) {
             (None, None) => true,
             (Some(t), Some(cur)) => {
-                cur.session == t.session_path
+                cur.session.as_deref() == t.session_path()
                     && cur.cwd == t.cwd
                     && cur.mux.as_ref().map(|(_, n)| n) == t.mux_name.as_ref()
             }
@@ -61,7 +66,7 @@ impl App {
         if !unchanged {
             let target = want.map(|t| StatusTarget {
                 mux: t.mux.clone().zip(t.mux_name.clone()),
-                session: t.session_path.clone(),
+                session: t.session_path_owned(),
                 cwd: t.cwd.clone(),
             });
             self.status.set_target(target.clone());
@@ -79,10 +84,11 @@ impl App {
                 && tab.copy.is_none()
                 && !s.fresh
                 && let Some(p) = &s.session
-                && tab.session_path.as_deref() != Some(p.as_path())
+                && tab.session_path() != Some(p.as_path())
             {
-                // /new, /fork, /move … switched this tab's session file.
-                tab.session_path = Some(p.clone());
+                // /new, /fork, /move … switched this tab's session file: the controller starts a
+                // new generation and drops what was queued for the old conversation.
+                tab.ctl.set_session_path(Some(p.clone()));
                 self.dirty = true;
             }
 
@@ -90,65 +96,44 @@ impl App {
             let no_stats = SessionStats::default();
             let stats = snap.as_deref().map_or(&no_stats, |s| &s.stats);
             let state = statusbar::model_state(stats, live_model);
-            let model = state.model;
-            if model.is_some() {
-                tab.assumed_switch = None;
-            }
-            if let Some(p) = &mut tab.pending_switch {
-                let confirmed = p.confirmed_by(model, state.thinking, state.configured);
-                let limit = if model.is_none() {
-                    FRESH_TIMEOUT
-                } else {
-                    SWITCH_TIMEOUT
-                };
-                if confirmed {
-                    tab.pending_switch = None;
-                } else if tab.injector.is_busy() {
-                    // The timer starts once the command has actually been typed.
-                    p.since = now;
-                    ctx.request_repaint_after(Duration::from_millis(200));
-                } else if p.timed_out(now, limit) {
-                    let desc = p.describe(&self.models);
-                    if model.is_none() {
-                        // Nothing reports the model (no file entry, no live control): assume it
-                        // worked, on top of an earlier assumed switch (`/effort` keeps the model).
-                        let prev = tab.assumed_switch.take();
-                        tab.assumed_switch = tab.pending_switch.take().map(|mut p| {
-                            if let Some(prev) = prev {
-                                p.selector = p.selector.or(prev.selector);
-                                p.level = p.level.or(prev.level);
-                            }
-                            p
-                        });
-                    } else {
-                        tab.pending_switch = None;
-                        toast = Some(format!(
-                            "omp did not confirm the switch to {desc} — it may be unavailable or omp is busy; check the terminal"
-                        ));
-                    }
-                } else {
-                    ctx.request_repaint_after(limit.saturating_sub(now.duration_since(p.since)));
-                }
-            }
             self.bar_view.set_defaults(&self.omp_defaults);
             self.bar_view.set_live_model(live_model);
             self.bar_view
                 .set_context(live.as_deref().and_then(|l| l.context.as_ref()));
             self.bar_view.set_usage(self.usage.summary());
             self.bar_view.update(snap.as_ref(), &tab.cwd, &self.models);
+            let progress = tab.ctl.observe_model(
+                now,
+                ModelFacts {
+                    model: state.model,
+                    thinking: state.thinking,
+                    configured: state.configured,
+                    shown: self.bar_view.model_selector.as_deref(),
+                    shown_is_default: self.bar_view.model_is_default,
+                },
+            );
+            if let Some(w) = progress.wake_in {
+                ctx.request_repaint_after(w);
+            }
+            if let Some(p) = progress.unconfirmed {
+                let desc = p.describe(&|s| self.models.get(s).map(|m| m.name.clone()));
+                toast = Some(format!(
+                    "omp did not confirm the switch to {desc} — it may be unavailable or omp is busy; check the terminal"
+                ));
+            }
         }
         if let Some(t) = toast {
             self.toasts.error(&self.ctx, t);
         }
-        self.drive_injectors(ctx);
+        self.drive_controllers(ctx);
     }
 
-    /// Advance every tab's injection queue (never blocks: waits are repaint timers), then close
-    /// the tabs whose close was deferred until their injector reached a job boundary.
-    fn drive_injectors(&mut self, ctx: &egui::Context) {
+    /// Advance every tab's controller (never blocks: waits are repaint timers), then close the
+    /// tabs whose close was deferred until their controller reached a job boundary.
+    fn drive_controllers(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         // While a dialog or menu is up the terminal may still own the keyboard: Enter/Esc meant for the
-        // dialog must not reach omp. (Set first: an injector poll below replaces the deadline.)
+        // dialog must not reach omp. (Set first: a controller drive below replaces the deadline.)
         if self.confirm.is_some()
             || self.folder_dialog.is_some()
             || self.wt.dialog.is_some()
@@ -162,149 +147,149 @@ impl App {
             let visible = self.visible_uids();
             for t in self.tabs.iter().filter_map(Tab::term) {
                 if visible.contains(&t.uid) {
-                    t.term.hold_input_until(now + MODAL_HOLD);
+                    t.terminal().hold_input_until(now + MODAL_HOLD);
                 }
             }
         }
-        let mut prompts = Vec::new();
-        let mut notes: Vec<String> = Vec::new();
-        let mut lost: Vec<(u64, String)> = Vec::new();
-        let mut delivered: Vec<(u64, bool)> = Vec::new();
+        let mut events: Vec<(u64, ControllerEvent)> = Vec::new();
         let mut wake: Option<Duration> = None;
         for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
-            if !tab.injector.is_busy() {
-                continue;
-            }
-            if tab.term.is_exited() {
-                tab.injector.clear();
-                tab.pending_switch = None;
-                continue;
-            }
-            let activity = Activity::from_title(tab.term.title());
-            let term = &tab.term;
-            let screen = || term.screen_text();
-            let paste = |t: &str| term.paste_bytes(t);
-            let poll = tab.injector.poll(&Env {
-                now,
-                activity,
-                last_ctrl_c: term.last_ctrl_c(),
-                screen: &screen,
-                paste: &paste,
-            });
-            // The hold comes first so no user key can slip in between our bytes.
-            if let Some(h) = poll.hold_for {
-                term.hold_input_until(now + h);
-            }
-            for w in poll.writes {
-                match w {
-                    Write::Bytes(bytes) => term.write(&bytes),
-                    Write::Key(key, mods) => term.send_key(key, mods),
-                }
-            }
-            for label in &poll.completed {
-                if let Some(send) = crate::review::submit_of(label) {
-                    delivered.push((tab.uid, send));
-                }
-            }
-            for label in &poll.no_paste {
-                notes.push(format!(
-                    "{label} refused: omp has not enabled bracketed paste"
-                ));
-            }
-            if let Some(c) = poll.confirm {
-                prompts.push((tab.uid, c));
-            }
-            let dropped = poll
-                .dialog_open
-                .iter()
-                .chain(&poll.aborted)
-                .chain(&poll.stalled)
-                .any(|l| l == MODEL_SWITCH);
-            if dropped {
-                tab.pending_switch = None;
-            }
-            for (label, _) in &poll.refused {
-                if label == FINISH_LABEL || label == MOVE_LABEL {
-                    lost.push((tab.uid, label.clone()));
-                }
-            }
-            for label in poll
-                .dialog_open
-                .iter()
-                .chain(&poll.aborted)
-                .chain(&poll.stalled)
-            {
-                if label == FINISH_LABEL || label == MOVE_LABEL {
-                    lost.push((tab.uid, label.clone()));
-                }
-            }
-            // The finish prompt retries by itself; only its final failure is announced.
-            for (label, why) in poll.refused.into_iter().filter(|(l, _)| l != FINISH_LABEL) {
-                if why == Requires::Idle {
-                    notes.push(format!(
-                        "{label} needs omp to be idle — try again when it finishes"
-                    ));
-                }
-            }
-            if poll.dialog_open.iter().any(|l| l != FINISH_LABEL) {
-                notes.push("Close omp's open dialog first".to_owned());
-            }
-            for label in poll.aborted.into_iter().filter(|l| l != FINISH_LABEL) {
-                notes.push(format!(
-                    "{label} cancelled: omp started working — check the composer"
-                ));
-            }
-            for label in poll.stalled.into_iter().filter(|l| l != FINISH_LABEL) {
-                notes.push(format!(
-                    "{label} cancelled: omp did not show it in time — check the composer"
-                ));
-            }
-            if let Some(d) = poll.wake_in {
+            let driven = tab.ctl.drive(now);
+            events.extend(driven.events.into_iter().map(|e| (tab.uid, e)));
+            if let Some(d) = driven.wake_in {
                 wake = Some(wake.map_or(d, |w| w.min(d)));
             }
         }
         if let Some(d) = wake {
             ctx.request_repaint_after(d);
         }
-        for (uid, c) in prompts {
-            if self.confirm.is_none() {
-                self.confirm = Some((
-                    Confirm {
-                        title: "Clear your unsent message?".to_owned(),
-                        body: format!(
-                            "The composer holds “{}”. Running {} clears it first.",
-                            crate::statusfmt::ellipsize_left(&c.draft, 80),
-                            c.label
-                        ),
-                        confirm_label: "Clear and run".to_owned(),
-                        danger: true,
-                    },
-                    PendingConfirm::ClearDraft { uid },
-                ));
-            } else {
-                self.answer_draft(uid, false);
-            }
-        }
-        for note in notes {
-            self.toasts.info(&self.ctx, note);
-        }
-        for (uid, label) in lost {
-            self.injection_lost(uid, &label);
-        }
-        for (uid, send) in delivered {
-            self.review_delivered(uid, send);
-        }
+        self.dispatch_controller_events(events);
         self.finish_deferred_closes(ctx);
     }
 
-    /// Close tab `i` (the user's close click). A tab whose injector is mid-job stays until the job
-    /// ends (queued jobs are dropped): closing detaches the PTY client halfway through a paste.
+    /// Carries out what the controllers reported: the draft prompt, and the end of each command.
+    fn dispatch_controller_events(&mut self, events: Vec<(u64, ControllerEvent)>) {
+        for (uid, event) in events {
+            match event {
+                ControllerEvent::Confirm { id, label, draft } => {
+                    if self.confirm.is_none() {
+                        self.confirm = Some((
+                            Confirm {
+                                title: "Clear your unsent message?".to_owned(),
+                                body: format!(
+                                    "The composer holds “{}”. Running {} clears it first.",
+                                    deck_service::statusfmt::ellipsize_left(&draft, 80),
+                                    label
+                                ),
+                                confirm_label: "Clear and run".to_owned(),
+                                danger: true,
+                            },
+                            PendingConfirm::ClearDraft { uid, id },
+                        ));
+                    } else {
+                        self.answer_draft(uid, id, false);
+                    }
+                }
+                ControllerEvent::Ended {
+                    id,
+                    kind,
+                    label,
+                    delivery,
+                } => self.command_ended(uid, id, kind, &label, &delivery),
+            }
+        }
+    }
+
+    /// The controller of tab `i` is ready to close: collect the outcomes it queued on the way
+    /// (`can_close` ends what was still waiting) and report them, before the tab, and with it
+    /// the controller, is destroyed. Nothing is written by this.
+    fn drain_before_close(&mut self, i: usize) {
+        let Some(Tab::Terminal(tab)) = self.tabs.get_mut(i) else {
+            return;
+        };
+        let uid = tab.uid;
+        let events: Vec<(u64, ControllerEvent)> = tab
+            .ctl
+            .drive(Instant::now())
+            .events
+            .into_iter()
+            .map(|e| (uid, e))
+            .collect();
+        self.dispatch_controller_events(events);
+    }
+
+    /// A command of tab `uid` reached its final delivery state. "Delivered" means the transport
+    /// accepted the bytes, not that omp (or the host's PTY) executed anything; "Unobserved" means
+    /// they were queued but no acknowledgement was seen before the view closed. Only the waiting UI
+    /// state (review comments, worktree moves) acts on "Delivered".
+    fn command_ended(
+        &mut self,
+        uid: u64,
+        id: RequestId,
+        kind: CommandKind,
+        label: &str,
+        delivery: &Delivery,
+    ) {
+        let finish = kind == CommandKind::WorktreeFinish;
+        match (kind, delivery) {
+            (CommandKind::Review { send }, Delivery::Delivered) => {
+                self.review_delivered(uid, send, id);
+            }
+            (CommandKind::Review { send }, _) => self.review_dropped(uid, send, id),
+            _ => {}
+        }
+        // The finish prompt retries by itself; only its final failure is announced.
+        let note = match delivery {
+            Delivery::Refused(Refusal::NoBracketedPaste) => Some(format!(
+                "{label} refused: omp has not enabled bracketed paste"
+            )),
+            Delivery::Refused(Refusal::Precondition(Requires::Idle)) if !finish => Some(format!(
+                "{label} needs omp to be idle — try again when it finishes"
+            )),
+            Delivery::Refused(Refusal::DialogOpen) if !finish => {
+                Some("Close omp's open dialog first".to_owned())
+            }
+            Delivery::Aborted if !finish => Some(format!(
+                "{label} cancelled: omp started working — check the composer"
+            )),
+            Delivery::Stalled if !finish => Some(format!(
+                "{label} cancelled: omp did not show it in time — check the composer"
+            )),
+            // Never a success claim and never retried: it may still be written.
+            Delivery::Unobserved => Some(format!(
+                "{label} may not have reached omp — check the session"
+            )),
+            _ => None,
+        };
+        if let Some(note) = note {
+            self.toasts.info(&self.ctx, note);
+        }
+        let lost = matches!(
+            delivery,
+            Delivery::Refused(Refusal::Precondition(_) | Refusal::DialogOpen)
+                | Delivery::Aborted
+                | Delivery::Stalled
+        ) || (kind == CommandKind::WorktreeMove
+            && matches!(delivery, Delivery::Cancelled(_)));
+        if lost {
+            self.injection_lost(uid, kind);
+        }
+        // A cancelled or declined finish prompt never goes in on its own: stop the finish.
+        if finish && matches!(delivery, Delivery::Cancelled(_) | Delivery::Declined) {
+            self.finish_cancelled(uid);
+        }
+    }
+
+    /// Close tab `i` (the user's close click). A tab whose controller is mid-command stays until
+    /// the command ends (queued ones are dropped): closing detaches the PTY client halfway
+    /// through a paste.
     pub(super) fn request_close(&mut self, i: usize) {
         let Some(Tab::Terminal(tab)) = self.tabs.get_mut(i) else {
             self.close_tab(i, true);
             return;
         };
-        if tab.injector.can_close(Instant::now()) {
+        if tab.ctl.can_close(Instant::now()) {
+            self.drain_before_close(i);
             self.close_tab(i, true);
             return;
         }
@@ -330,10 +315,11 @@ impl App {
                 continue;
             };
             let ready = match self.tabs.get_mut(i) {
-                Some(Tab::Terminal(t)) => t.term.is_exited() || t.injector.can_close(now),
+                Some(Tab::Terminal(t)) => t.ctl.can_close(now),
                 _ => true,
             };
             if ready {
+                self.drain_before_close(i);
                 self.close_tab(i, true);
                 // This runs after the tab strip was drawn: paint the closed state next frame.
                 ctx.request_repaint();
@@ -347,33 +333,27 @@ impl App {
     }
 
     /// The user's answer to the draft prompt.
-    pub(super) fn answer_draft(&mut self, uid: u64, clear: bool) {
+    pub(super) fn answer_draft(&mut self, uid: u64, id: RequestId, clear: bool) {
         if let Some(tab) = self
             .tabs
             .iter_mut()
             .filter_map(Tab::term_mut)
             .find(|t| t.uid == uid)
         {
-            tab.injector.answer(clear);
-            if !clear {
-                tab.pending_switch = None;
-            }
+            // An answer for a confirmation the controller no longer waits for (the session
+            // changed, the request was dropped) is ignored there.
+            tab.ctl.answer(id, clear);
         }
         self.ctx.request_repaint();
     }
 
     /// What the availability rules of the session actions see for `tab` (status bar and palette).
-    pub(super) fn action_ctx(&self, tab: &crate::tabs::TermTab) -> ActionCtx {
-        let activity = Activity::from_title(tab.term.title());
-        ActionCtx {
-            busy: activity.is_busy(),
-            idle: activity == Activity::Idle,
-            has_session_file: tab.session_path.is_some(),
+    pub(super) fn action_ctx(&self, tab: &TermTab) -> ActionCtx {
+        tab.ctl.action_ctx(ActionFacts {
             last_turn_failed: self.bar_view.last_turn_failed,
             has_last_reply: self.bar_view.has_reply,
-            exited: tab.term.is_exited(),
             omp_found: self.omp.is_some(),
-        }
+        })
     }
 
     pub(super) fn show_status_bar(&mut self, ui: &mut Ui) {
@@ -383,14 +363,14 @@ impl App {
         if tab.role != TabRole::Session {
             return;
         }
-        let activity = Activity::from_title(tab.term.title());
+        let activity = tab.ctl.activity();
         let input = BarInput {
             catalog: &self.models,
             favorites: &self.cfg.favorite_models,
             provider: self.cfg.model_provider_filter.as_deref(),
             activity,
-            pending: tab.pending_switch.as_ref(),
-            assumed: tab.assumed_switch.as_ref(),
+            pending: tab.ctl.pending_switch(),
+            assumed: tab.ctl.assumed_switch(),
             actions: self.action_ctx(tab),
             agents: statusbar::AgentsChip {
                 counts: self.agents_view.counts,
@@ -421,34 +401,20 @@ impl App {
                 self.cfg.model_provider_filter = provider;
                 self.dirty = true;
             }
-            BarAction::Picker(PickerAction::Effort(level)) => {
-                let current = self.current_model();
-                match current {
-                    Some(m) => self.queue_change(&m, Some(&level)),
-                    None => self
-                        .toasts
-                        .info(&self.ctx, "The current model is not known yet"),
-                }
-            }
+            BarAction::Picker(PickerAction::Effort(level)) => self.queue_effort(level),
             BarAction::Run(a) => self.run_action(a),
-            BarAction::AskHandoff => {
-                self.dialog = Some(ActionDialog::Handoff {
-                    focus: String::new(),
-                    first: true,
-                });
-            }
-            BarAction::AskCompactFocus => {
-                self.dialog = Some(ActionDialog::CompactFocus {
-                    focus: String::new(),
-                    first: true,
-                });
-            }
-            BarAction::AskRename => {
-                self.dialog = Some(ActionDialog::Rename {
-                    title: String::new(),
-                    first: true,
-                });
-            }
+            BarAction::AskHandoff => self.open_action_dialog(ActionDialog::Handoff {
+                focus: String::new(),
+                first: true,
+            }),
+            BarAction::AskCompactFocus => self.open_action_dialog(ActionDialog::CompactFocus {
+                focus: String::new(),
+                first: true,
+            }),
+            BarAction::AskRename => self.open_action_dialog(ActionDialog::Rename {
+                title: String::new(),
+                first: true,
+            }),
             BarAction::CopyPath(p) => self.copy_text(&p, "path"),
             BarAction::OpenUrl(u) => self.open_external(u),
             BarAction::ToggleAgents => self.toggle_dashboard(true),
@@ -477,45 +443,108 @@ impl App {
     /// model (omp applies it before anything queued now), else an assumed switch's model while
     /// the bar can only show omp's defaults (the same rule as the model chip).
     pub(super) fn current_model(&self) -> Option<String> {
-        let v = &self.bar_view;
-        let tab = match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) => Some(t),
-            _ => None,
-        };
-        let pending = tab
-            .and_then(|t| t.pending_switch.as_ref())
-            .and_then(|p| p.selector.clone());
-        let assumed = tab
-            .filter(|_| v.model_selector.is_none() || v.model_is_default)
-            .and_then(|t| t.assumed_switch.as_ref())
-            .and_then(|a| a.selector.clone());
-        pending.or(assumed).or_else(|| v.model_selector.clone())
+        match self.tabs.get(self.active) {
+            Some(Tab::Terminal(t)) => t.ctl.current_model(),
+            _ => self.bar_view.model_selector.clone(),
+        }
     }
 
-    /// Send `/switch` or `/effort` to the active tab and show the optimistic state.
-    pub(super) fn queue_change(&mut self, selector: &str, level: Option<&str>) {
-        let current = self.current_model();
-        let Some(change) = model_picker::plan_switch(current.as_deref(), selector, level) else {
-            return;
-        };
-        let Some(Tab::Terminal(tab)) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        if tab.term.is_exited() {
-            return;
+    /// The session the status bar and palette act on now: the active session tab's current target.
+    pub(super) fn active_target(&self) -> Option<SessionTarget> {
+        match self.tabs.get(self.active) {
+            Some(Tab::Terminal(t)) if t.role == TabRole::Session => Some(t.ctl.target().clone()),
+            _ => None,
         }
-        tab.injector
-            .push(Job::slash(MODEL_SWITCH, &change.command, Requires::Any));
-        let next = Pending {
-            selector: change.selector,
-            level: change.level,
-            since: Instant::now(),
+    }
+
+    /// Opens a text prompt for the active session. The dialog is bound to the session (and
+    /// generation) it was opened on: if that session changed or went away by the time the user
+    /// confirms, nothing is sent.
+    pub(super) fn open_action_dialog(&mut self, dialog: ActionDialog) {
+        let Some(target) = self.active_target() else {
+            return;
         };
-        tab.pending_switch = Some(match tab.pending_switch.take() {
-            Some(prev) => prev.then(next),
-            None => next,
-        });
-        self.ctx.request_repaint();
+        self.dialog = Some(dialog);
+        self.dialog_target = Some(target);
+    }
+
+    /// Submits `command` to the session `target` names. Returns the accepted request, or tells
+    /// the user why not (a refusal that only restates a no-op stays silent).
+    pub(super) fn submit_command(
+        &mut self,
+        target: &SessionTarget,
+        command: Command,
+    ) -> Option<RequestId> {
+        // Actions and model switches that find omp gone stay silent, as the bar always did.
+        let quiet_exit = matches!(
+            command,
+            Command::Action(_) | Command::SwitchModel { .. } | Command::SetEffort { .. }
+        );
+        let key = self.request_keys.next_key();
+        let outcome = match self
+            .tabs
+            .iter_mut()
+            .filter_map(Tab::term_mut)
+            .find(|t| t.ctl.target().key == target.key)
+        {
+            Some(tab) => tab.ctl.submit(Submission {
+                key,
+                target: target.clone(),
+                command,
+            }),
+            None => {
+                self.toasts
+                    .error(&self.ctx, "The session's tab was closed — nothing was sent");
+                return None;
+            }
+        };
+        match outcome {
+            Ok(done) => {
+                self.ctx.request_repaint();
+                Some(done.id)
+            }
+            Err(why) => {
+                self.report_rejected(&why, quiet_exit);
+                None
+            }
+        }
+    }
+
+    fn report_rejected(&mut self, why: &Rejected, quiet_exit: bool) {
+        match why {
+            // Nothing to do: the request restated the state the session already has.
+            Rejected::NoChange | Rejected::NotInjected => {}
+            Rejected::Exited if quiet_exit => {}
+            Rejected::Exited => self
+                .toasts
+                .error(&self.ctx, "omp has exited in this tab; nothing was sent"),
+            Rejected::ModelUnknown => self
+                .toasts
+                .info(&self.ctx, "The current model is not known yet"),
+            other => self.toasts.error(&self.ctx, other.to_string()),
+        }
+    }
+
+    /// Send `/switch` or `/effort` to the active tab; the controller shows the optimistic state.
+    pub(super) fn queue_change(&mut self, selector: &str, level: Option<&str>) {
+        let Some(target) = self.active_target() else {
+            return;
+        };
+        self.submit_command(
+            &target,
+            Command::SwitchModel {
+                selector: selector.to_owned(),
+                level: level.map(str::to_owned),
+            },
+        );
+    }
+
+    /// `/effort` on the active session's current model.
+    pub(super) fn queue_effort(&mut self, level: String) {
+        let Some(target) = self.active_target() else {
+            return;
+        };
+        self.submit_command(&target, Command::SetEffort { level });
     }
 
     pub(super) fn run_action(&mut self, action: Action) {
@@ -533,14 +562,8 @@ impl App {
             },
             Action::ExportHtml => self.export_active(),
             other => {
-                let Some(job) = session_actions::job(&other) else {
-                    return;
-                };
-                if let Some(Tab::Terminal(tab)) = self.tabs.get_mut(self.active)
-                    && !tab.term.is_exited()
-                {
-                    tab.injector.push(job);
-                    self.ctx.request_repaint();
+                if let Some(target) = self.active_target() {
+                    self.submit_command(&target, Command::Action(other));
                 }
             }
         }
@@ -678,6 +701,7 @@ impl App {
         let Some(dialog) = self.dialog.take() else {
             return;
         };
+        let target = self.dialog_target.take();
         if !ok {
             return;
         }
@@ -688,7 +712,9 @@ impl App {
             ActionDialog::CompactFocus { focus, .. } => Action::Compact(CompactMode::Focus(focus)),
             ActionDialog::Rename { title, .. } => Action::Rename(title),
         };
-        self.run_action(action);
+        if let Some(target) = target {
+            self.submit_command(&target, Command::Action(action));
+        }
     }
 }
 

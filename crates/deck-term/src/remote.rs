@@ -9,7 +9,7 @@
 
 use std::io;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -21,6 +21,7 @@ use alacritty_terminal::vte::ansi::Processor;
 use crate::core::{Listener, Notice, SharedTerm};
 use crate::out::{PtyOut, WriteProgress};
 use crate::scan::OutputScan;
+use crate::wake::Wake;
 
 /// What a session host sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +31,14 @@ pub enum RemoteEvent {
     Snapshot(Vec<u8>),
     /// Child output.
     Output(Vec<u8>),
+    /// Authoritative host geometry, sent before an observer snapshot and after a controller
+    /// resize. It changes only this renderer, never the host.
+    Resize {
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+    },
     /// The child exited (`None`: no exit code, e.g. killed by a signal).
     Exited(Option<i32>),
     /// Another client attached to the session; this connection is over.
@@ -66,6 +75,53 @@ pub trait RemoteTx: Send + Sync {
     fn detach(&self) -> io::Result<()>;
 }
 
+/// Read-only connection to a session's output. It cannot acquire controller rights.
+pub trait Observer: Send {
+    fn split(self: Box<Self>) -> (Box<dyn RemoteRx>, Box<dyn ObserverTx>);
+}
+
+/// The only operation available to an observer: stop following, leaving the child running.
+pub trait ObserverTx: Send + Sync {
+    /// Must promptly unblock the receiving half. Dropping the last sending half also detaches.
+    fn detach(&self) -> io::Result<()>;
+}
+
+pub(crate) struct ObserverRemote(pub(crate) Box<dyn Observer>);
+
+impl Remote for ObserverRemote {
+    fn split(self: Box<Self>) -> (Box<dyn RemoteRx>, Box<dyn RemoteTx>) {
+        let (rx, tx) = self.0.split();
+        (rx, Box::new(ReadOnlyTx(tx)))
+    }
+}
+
+struct ReadOnlyTx(Box<dyn ObserverTx>);
+
+fn read_only() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "terminal observer is read-only",
+    ))
+}
+
+impl RemoteTx for ReadOnlyTx {
+    fn input(&self, _: &[u8]) -> io::Result<()> {
+        read_only()
+    }
+    fn resize(&self, _: u16, _: u16, _: u16, _: u16) -> io::Result<()> {
+        read_only()
+    }
+    fn palette(&self, _: [[u8; 3]; 19]) -> io::Result<()> {
+        read_only()
+    }
+    fn kill(&self) -> io::Result<()> {
+        read_only()
+    }
+    fn detach(&self) -> io::Result<()> {
+        self.0.detach()
+    }
+}
+
 /// Work for the writer thread, in order.
 pub(crate) enum RemoteCmd {
     Input(Vec<u8>),
@@ -79,9 +135,9 @@ pub(crate) enum RemoteCmd {
 /// bound), so a large snapshot never stalls the UI thread for long.
 const MAX_LOCKED: usize = 0x1_0000;
 
-/// Writer thread: forwards commands until `Detach`/`Kill` (or until every sender is gone;
-/// dropping `tx` then detaches). Every input chunk counts as handled in `progress` whether
-/// or not the write succeeded, so a dropped terminal's detach never waits on a dead link.
+/// Writer thread: forwards commands until `Detach`/`Kill` (or every sender is gone).
+/// Handled bytes advance even on failure for bounded detach; only successful input calls
+/// advance the separate delivery acknowledgement. A failed input closes the connection.
 pub(crate) fn run_writer(
     tx: Box<dyn RemoteTx>,
     cmds: Receiver<RemoteCmd>,
@@ -100,8 +156,12 @@ pub(crate) fn run_writer(
         match cmd {
             RemoteCmd::Input(bytes) => {
                 let result = tx.input(&bytes);
-                progress.add(bytes.len());
-                report("input", result);
+                progress.record(bytes.len(), result.is_ok());
+                if result.is_err() {
+                    report("input", result);
+                    let _ = tx.detach();
+                    return;
+                }
             }
             RemoteCmd::Resize(ws) => report(
                 "resize",
@@ -115,7 +175,7 @@ pub(crate) fn run_writer(
 }
 
 /// Reader thread: forwards events to the feeder until the connection ends.
-pub(crate) fn run_reader(mut rx: Box<dyn RemoteRx>, events: Sender<RemoteEvent>) {
+pub(crate) fn run_reader(mut rx: Box<dyn RemoteRx>, events: SyncSender<RemoteEvent>) {
     loop {
         let event = rx.recv().unwrap_or_else(|e| {
             log::debug!("remote terminal connection lost: {e}");
@@ -137,7 +197,7 @@ pub(crate) struct Feeder {
     pub(crate) scan: OutputScan,
     pub(crate) out: Arc<PtyOut>,
     pub(crate) notices: Sender<Notice>,
-    pub(crate) ctx: egui::Context,
+    pub(crate) wake: Wake,
 }
 
 impl Feeder {
@@ -170,19 +230,42 @@ impl Feeder {
                     self.feed(&mut parser, &bytes);
                 }
                 RemoteEvent::Output(bytes) => self.feed(&mut parser, &bytes),
+                RemoteEvent::Resize {
+                    cols,
+                    rows,
+                    cell_width,
+                    cell_height,
+                } => {
+                    if cols == 0 || rows == 0 {
+                        self.out.displaced();
+                        return self.notify(Notice::Closed);
+                    }
+                    self.term
+                        .lock()
+                        .resize(TermSize::new(usize::from(cols), usize::from(rows)));
+                    self.notify(Notice::Resized(WindowSize {
+                        num_cols: cols,
+                        num_lines: rows,
+                        cell_width,
+                        cell_height,
+                    }));
+                }
                 RemoteEvent::Exited(code) => self.notify(Notice::Exited(code)),
                 RemoteEvent::Displaced => {
                     self.out.displaced();
                     self.notify(Notice::Displaced);
                 }
-                RemoteEvent::Closed => return self.notify(Notice::Closed),
+                RemoteEvent::Closed => {
+                    self.out.displaced();
+                    return self.notify(Notice::Closed);
+                }
             }
         }
     }
 
     fn notify(&self, notice: Notice) {
         let _ = self.notices.send(notice);
-        self.ctx.request_repaint();
+        self.wake.now();
     }
 
     /// Fresh `Term` at the current size (keeping focus state), fresh scanners.
@@ -229,9 +312,11 @@ pub(crate) fn start(
             None
         }
     };
-    let (ev_tx, ev_rx) = mpsc::channel();
+    // Bound decoded-but-unparsed frames. Without backpressure here a slow observer renderer
+    // could drain the host's bounded socket queue into unbounded frontend memory.
+    let (ev_tx, ev_rx) = mpsc::sync_channel(4);
     let notices = feeder.notices.clone();
-    let ctx = feeder.ctx.clone();
+    let wake = feeder.wake.clone();
     let started = std::thread::Builder::new()
         .name("deck-term-remote-feed".into())
         .spawn(move || feeder.run(ev_rx))
@@ -243,7 +328,7 @@ pub(crate) fn start(
     if let Err(e) = started {
         log::warn!("remote terminal reader threads: {e}");
         let _ = notices.send(Notice::Closed);
-        ctx.request_repaint();
+        wake.now();
     }
     (cmd_tx, writer)
 }
@@ -615,5 +700,104 @@ pub(crate) mod tests {
             !t.mode().contains(TermMode::BRACKETED_PASTE)
         });
         assert_eq!(t.paste_bytes("a\nb"), None);
+    }
+
+    struct Follow {
+        events: Receiver<RemoteEvent>,
+        end: Sender<RemoteEvent>,
+    }
+
+    struct FollowTx(Sender<RemoteEvent>);
+
+    impl Observer for Follow {
+        fn split(self: Box<Self>) -> (Box<dyn RemoteRx>, Box<dyn ObserverTx>) {
+            (Box::new(FakeRx(self.events)), Box::new(FollowTx(self.end)))
+        }
+    }
+
+    impl ObserverTx for FollowTx {
+        fn detach(&self) -> io::Result<()> {
+            self.0.send(RemoteEvent::Closed).map_err(io::Error::other)
+        }
+    }
+
+    #[test]
+    fn observer_uses_host_geometry_without_acquiring_input_or_resize_rights() {
+        use crate::input::{Key, Mods};
+        let (host, events) = mpsc::channel();
+        let mut t = Terminal::observe_headless(
+            Box::new(Follow {
+                events,
+                end: host.clone(),
+            }),
+            TermOptions::default(),
+            Arc::new(|_| {}),
+        );
+        host.send(RemoteEvent::Resize {
+            cols: 100,
+            rows: 30,
+            cell_width: 9,
+            cell_height: 18,
+        })
+        .expect("send geometry");
+        host.send(RemoteEvent::Snapshot(
+            b"\x1b[?2004h\x1b[?1000h\x1b[?1004h\x1b[30;96Hedge".to_vec(),
+        ))
+        .expect("send snapshot");
+        until(&mut t, "snapshot at host edge", |t| {
+            let screen = t.screen_text();
+            screen.lines.len() == 30 && screen.lines[29].ends_with("edge")
+        });
+        t.resize(20, 4, 8, 16);
+        assert_eq!(t.screen_text().lines.len(), 30);
+        assert_eq!(t.term.lock().columns(), 100);
+        assert!(t.is_read_only());
+        assert!(!t.accepts_input());
+        assert!(t.input_held());
+        assert_eq!(t.paste_bytes("must not submit"), None);
+        assert!(
+            !t.mode()
+                .intersects(TermMode::MOUSE_MODE | TermMode::ALTERNATE_SCROLL)
+        );
+        t.send_key(Key::Char('c'), Mods::CTRL);
+        t.set_focused(true);
+        host.send(RemoteEvent::Resize {
+            cols: 60,
+            rows: 12,
+            cell_width: 8,
+            cell_height: 16,
+        })
+        .expect("send controller resize");
+        output(&host, b"\x1b[2J\x1b[12;55Hnew");
+        until(&mut t, "controller resize output", |t| {
+            let screen = t.screen_text();
+            screen.lines.len() == 12 && screen.lines[11].ends_with("new")
+        });
+        assert_eq!(t.term.lock().columns(), 60);
+        drop(t);
+        wait_detached(TIMEOUT);
+    }
+
+    #[test]
+    fn detaching_an_observer_is_not_a_process_exit() {
+        let (host, events) = mpsc::channel();
+        let (wake, awakened) = mpsc::channel();
+        let mut t = Terminal::observe_headless(
+            Box::new(Follow { events, end: host }),
+            TermOptions::default(),
+            Arc::new(move |delay| {
+                let _ = wake.send(delay);
+            }),
+        );
+        t.kill();
+        awakened
+            .recv_timeout(TIMEOUT)
+            .expect("detach closed the receiver");
+        let events = t.poll();
+        assert_eq!(events.exited, None);
+        assert_eq!(t.exit_code(), None);
+        assert_eq!(t.banner.as_deref(), Some("[observer detached]"));
+        drop(t);
+        wait_detached(TIMEOUT);
     }
 }

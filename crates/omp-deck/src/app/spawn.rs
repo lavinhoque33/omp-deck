@@ -11,11 +11,12 @@ use deck_core::ctl::{ctl_dir, ctl_env, prepare_ctl_dir, with_ctl};
 use deck_core::mux::{Launch, Mux};
 use deck_term::{TermOptions, Terminal};
 
-use super::{App, AppEvent, CopyPending, Injector, Tab, TabRole, TermTab, term_theme};
-use crate::host_remote::HostRemote;
+use super::{App, AppEvent, CopyPending, Tab, TabRole, TermTab, term_theme};
 use crate::omp_worker;
 use crate::panes::Split;
 use crate::tabs::Anchor;
+use deck_service::controller::{SessionController, SessionKey};
+use deck_service::host_remote::HostRemote;
 
 /// What to do with the tab once it exists.
 pub(super) enum Post {
@@ -438,21 +439,21 @@ impl App {
         };
         self.next_tab_uid += 1;
         let uid = self.next_tab_uid;
+        let session_key = match (&mux, &mux_name) {
+            (Some(m), Some(name)) => SessionKey::backend(m, name),
+            _ => SessionKey::direct(),
+        };
         self.tabs.push(Tab::Terminal(Box::new(TermTab {
-            term,
+            ctl: SessionController::new(session_key, term, session_path),
             mux_name,
             mux,
             cwd,
-            session_path,
             fallback_title: title,
             bell: false,
             role,
             exit_handled: false,
             copy: None,
             uid,
-            injector: Injector::default(),
-            pending_switch: None,
-            assumed_switch: None,
             // Attaching to an existing session ignores the argv: only a launch that created the
             // session can be expected to open the socket.
             ctl_expect: key.is_some() && created,

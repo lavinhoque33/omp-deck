@@ -14,14 +14,11 @@ use deck_core::worktree::{self, Removed, RepoInfo, Worktree, WorktreeError, Work
 
 use super::{App, AppEvent, PendingConfirm};
 use crate::confirm::Confirm;
-use crate::inject::{Job, Requires};
-use crate::statusfmt::Activity;
 use crate::tabs::{Tab, TabRole};
 use crate::transfer;
 use crate::worktree_dialog::{CheckRes, Kind, Outcome, Plan, WorktreeDialog, brief};
-use crate::worktree_ui::{
-    self, FINISH_LABEL, FINISH_TAB_TIMEOUT, Finishing, MOVE_LABEL, MergeTarget, Step, Verdict,
-};
+use crate::worktree_ui::{self, FINISH_TAB_TIMEOUT, Finishing, MergeTarget, Step, Verdict};
+use deck_service::controller::{Command, CommandKind};
 
 /// A move that was typed into a tab: the session reappears in the worktree omp creates.
 const MOVE_EXPIRES: Duration = Duration::from_secs(10 * 60);
@@ -172,14 +169,16 @@ impl App {
             .tabs
             .iter()
             .filter_map(Tab::term)
-            .find(|t| t.session_path.as_deref() == Some(entry.path.as_path()));
-        let Some(tab) = tab.filter(|t| !t.term.is_exited() && t.role == TabRole::Session) else {
+            .find(|t| t.session_path() == Some(entry.path.as_path()));
+        let Some(tab) = tab.filter(|t| !t.terminal().is_exited() && t.role == TabRole::Session)
+        else {
             self.toasts
                 .info(&self.ctx, "Open the session in a tab first");
             return;
         };
         self.start_dialog(Kind::Move {
             uid: tab.uid,
+            target: tab.ctl.target().clone(),
             dir: tab.cwd.clone(),
             title: entry.label().to_owned(),
         });
@@ -252,28 +251,34 @@ impl App {
                     })
                 });
             }
-            Plan::Move { uid, branch, base } => {
-                let Some(tab) = self
+            Plan::Move {
+                uid,
+                target,
+                branch,
+                base,
+            } => {
+                let open = self
                     .tabs
-                    .iter_mut()
-                    .filter_map(Tab::term_mut)
-                    .find(|t| t.uid == uid && !t.term.is_exited())
-                else {
+                    .iter()
+                    .filter_map(Tab::term)
+                    .any(|t| t.uid == uid && !t.terminal().is_exited());
+                if !open {
                     self.toasts
                         .error(&self.ctx, "The session's tab was closed — nothing moved");
                     return;
-                };
-                tab.injector.push(Job::slash(
-                    MOVE_LABEL,
-                    &format!("/wt {branch}"),
-                    Requires::Idle,
-                ));
-                self.wt.moves.push(PendingMove {
-                    uid,
-                    base,
-                    since: Instant::now(),
-                });
-                self.ctx.request_repaint();
+                }
+                // Bound to the session the dialog was opened on: if it moved on to another
+                // conversation meanwhile, the controller refuses and nothing is typed.
+                if self
+                    .submit_command(&target, Command::WorktreeMove { branch })
+                    .is_some()
+                {
+                    self.wt.moves.push(PendingMove {
+                        uid,
+                        base,
+                        since: Instant::now(),
+                    });
+                }
             }
         }
     }
@@ -499,7 +504,9 @@ impl App {
     /// The running session tab whose folder is inside the worktree.
     fn tab_in(&self, wt: &Worktree) -> Option<&crate::tabs::TermTab> {
         self.tabs.iter().filter_map(Tab::term).find(|t| {
-            t.role == TabRole::Session && !t.term.is_exited() && worktree_ui::inside(wt, &t.cwd)
+            t.role == TabRole::Session
+                && !t.terminal().is_exited()
+                && worktree_ui::inside(wt, &t.cwd)
         })
     }
 
@@ -553,7 +560,7 @@ impl App {
                 self.tabs
                     .iter()
                     .filter_map(Tab::term)
-                    .any(|t| t.uid == *u && !t.term.is_exited())
+                    .any(|t| t.uid == *u && !t.terminal().is_exited())
             })
             .or_else(|| self.tab_in(&wt).map(|t| t.uid));
         let Some(uid) = uid else {
@@ -575,31 +582,48 @@ impl App {
             return;
         };
         f.uid = Some(uid);
-        let Some(tab) = self
+        let Some((activity, busy, session)) = self
             .tabs
-            .iter_mut()
-            .filter_map(Tab::term_mut)
+            .iter()
+            .filter_map(Tab::term)
             .find(|t| t.uid == uid)
+            .map(|t| {
+                (
+                    t.ctl.activity(),
+                    t.ctl.is_busy(),
+                    // The tab was just found through its session file: its current target is the
+                    // conversation the worktree belongs to.
+                    t.ctl.target().clone(),
+                )
+            })
         else {
             return;
         };
-        let activity = Activity::from_title(tab.term.title());
         match f.observe(activity) {
             Step::Nothing => {}
             Step::Inject => {
-                if !tab.injector.is_busy()
-                    && f.may_inject(Instant::now())
-                    && let Some(target) = f.target.clone()
-                {
-                    let prompt = worktree_ui::finish_prompt(
-                        wt.branch.as_deref(),
-                        &f.base,
-                        &wt.path,
-                        &target,
-                    );
-                    tab.injector
-                        .push(Job::slash(FINISH_LABEL, &prompt, Requires::Idle));
-                    f.mark_injected();
+                let command = match f.target.clone() {
+                    Some(target) if !busy && f.may_inject(Instant::now()) => {
+                        Some(Command::WorktreeFinish {
+                            prompt: worktree_ui::finish_prompt(
+                                wt.branch.as_deref(),
+                                &f.base,
+                                &wt.path,
+                                &target,
+                            ),
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    let accepted = self.submit_command(&session, command).is_some();
+                    if let Some(f) = self.wt.finishing.get_mut(path) {
+                        if accepted {
+                            f.mark_injected();
+                        } else {
+                            f.injection_failed(Instant::now());
+                        }
+                    }
                 }
             }
             Step::Recheck => {
@@ -633,7 +657,7 @@ impl App {
             // An exited tab still shows this session: opening would only focus it.
             let exited = self.tabs.iter().position(|t| {
                 t.term().is_some_and(|t| {
-                    t.term.is_exited() && t.session_path.as_deref() == Some(entry.path.as_path())
+                    t.terminal().is_exited() && t.session_path() == Some(entry.path.as_path())
                 })
             });
             if let Some(i) = exited {
@@ -643,9 +667,33 @@ impl App {
         }
     }
 
+    /// The finish prompt of tab `uid` was definitively cancelled or declined: it was never (or no
+    /// longer will be) typed, so the wait for omp's turn would never end. The finish stops; the
+    /// prompt is not sent again on its own.
+    pub(super) fn finish_cancelled(&mut self, uid: u64) {
+        let paths: Vec<PathBuf> = self
+            .wt
+            .finishing
+            .iter()
+            .filter(|(_, f)| f.uid == Some(uid))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in paths {
+            if let Some(f) = self.wt.finishing.remove(&path) {
+                self.toasts.info(
+                    &self.ctx,
+                    format!(
+                        "Stopped finishing “{}”: the finish prompt was not sent — the worktree stays",
+                        worktree_ui::worktree_label(&f.worktree)
+                    ),
+                );
+            }
+        }
+    }
+
     /// The injector dropped (or never ran) a job of ours: whatever waited for it gives up.
-    pub(super) fn injection_lost(&mut self, uid: u64, label: &str) {
-        if label == FINISH_LABEL {
+    pub(super) fn injection_lost(&mut self, uid: u64, kind: CommandKind) {
+        if kind == CommandKind::WorktreeFinish {
             // omp was not ready (still starting, a dialog open, working): the prompt is offered
             // again until the finish times out.
             let now = Instant::now();
@@ -657,7 +705,7 @@ impl App {
             {
                 f.injection_failed(now);
             }
-        } else if label == MOVE_LABEL {
+        } else if kind == CommandKind::WorktreeMove {
             self.wt.moves.retain(|m| m.uid != uid);
         }
     }
@@ -686,12 +734,14 @@ impl App {
         self.tabs
             .iter()
             .filter_map(Tab::term)
-            .filter(|t| t.role == TabRole::Session && !t.term.is_exited() && !skip.contains(&t.uid))
+            .filter(|t| {
+                t.role == TabRole::Session && !t.terminal().is_exited() && !skip.contains(&t.uid)
+            })
             .map(|t| TabProbe {
                 uid: t.uid,
                 label: t.fallback_title.clone(),
                 stored: t.cwd.clone(),
-                session: t.session_path.clone(),
+                session: t.session_path_owned(),
                 mux: t.mux.clone().zip(t.mux_name.clone()),
             })
             .collect()
@@ -723,7 +773,7 @@ impl App {
                 Some(n) => names.push(n),
                 None => {
                     if let Some(t) = self.tabs.get_mut(i).and_then(Tab::term_mut) {
-                        t.term.kill();
+                        t.terminal_mut().kill();
                     }
                 }
             }
@@ -847,13 +897,13 @@ impl App {
         for tab in self.tabs.iter().filter_map(Tab::term) {
             match self.wt.seen.get(&tab.uid) {
                 None => {
-                    self.wt.seen.insert(tab.uid, tab.session_path.clone());
+                    self.wt.seen.insert(tab.uid, tab.session_path_owned());
                 }
-                Some(prev) if *prev != tab.session_path => {
-                    if let Some(p) = &tab.session_path
+                Some(prev) if prev.as_deref() != tab.session_path() => {
+                    if let Some(p) = tab.session_path_owned()
                         && self.wt.tried.get(&tab.uid) != Some(&(p.clone(), generation))
                     {
-                        changed.push((tab.uid, p.clone()));
+                        changed.push((tab.uid, p));
                     }
                 }
                 Some(_) => {}

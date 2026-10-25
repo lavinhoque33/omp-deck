@@ -1,9 +1,10 @@
-//! The notification inbox: what happened in tabs the user was not looking at. One entry per tab
-//! (a newer event replaces it and moves it to the top); entries leave when the tab is viewed or
-//! closed, by their own ✕ or by "Clear all" (one recorded while looking leaves later, see
-//! [`Entry::armed`]). Not persisted.
+//! The notification inbox: what happened in sessions the user was not looking at. One entry per
+//! session (a newer event replaces it and moves it to the top); entries leave when the session is
+//! viewed or closed, by their own ✕ or by "Clear all" (one recorded while looking leaves later,
+//! see [`Entry::armed`]). Not persisted. Keyed by the session's identity `K`.
 
 use std::collections::HashSet;
+use std::hash::Hash;
 use std::time::SystemTime;
 
 /// What an entry reports.
@@ -39,9 +40,9 @@ impl Kind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Entry {
-    /// The tab's uid.
-    pub tab: u64,
+pub struct Entry<K> {
+    /// The session it is about.
+    pub tab: K,
     pub kind: Kind,
     /// The tab's label when the event happened.
     pub title: String,
@@ -55,8 +56,8 @@ pub struct Entry {
     pub armed: bool,
 }
 
-impl Entry {
-    pub fn new(tab: u64, kind: Kind, title: &str, project: &str, at: SystemTime) -> Entry {
+impl<K> Entry<K> {
+    pub fn new(tab: K, kind: Kind, title: &str, project: &str, at: SystemTime) -> Entry<K> {
         let mut body = kind.what();
         if let Kind::Error(Some(msg)) = &kind
             && !msg.is_empty()
@@ -76,40 +77,47 @@ impl Entry {
     }
 
     /// Marks the entry as recorded while the user was looking at the tab.
-    pub fn while_looking(mut self) -> Entry {
+    pub fn while_looking(mut self) -> Entry<K> {
         self.armed = false;
         self
     }
 }
 
-#[derive(Default)]
-pub struct Inbox {
+pub struct Inbox<K> {
     /// Newest first.
-    entries: Vec<Entry>,
+    entries: Vec<Entry<K>>,
 }
 
-impl Inbox {
+impl<K> Default for Inbox<K> {
+    fn default() -> Self {
+        Inbox {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone> Inbox<K> {
     /// Records `entry`, replacing the tab's older one and putting it on top.
-    pub fn record(&mut self, entry: Entry) {
+    pub fn record(&mut self, entry: Entry<K>) {
         self.entries.retain(|e| e.tab != entry.tab);
         self.entries.insert(0, entry);
     }
 
-    pub fn entries(&self) -> &[Entry] {
+    pub fn entries(&self) -> &[Entry<K>] {
         &self.entries
     }
 
     /// Drops the tab's entry; whether there was one.
-    pub fn remove(&mut self, tab: u64) -> bool {
+    pub fn remove(&mut self, tab: &K) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|e| e.tab != tab);
+        self.entries.retain(|e| e.tab != *tab);
         self.entries.len() != before
     }
 
     /// Per frame: entries of tabs the user does not look at become armed; armed entries of tabs
     /// the user looks at now (window focused, tab in `visible`) are removed. Returns the tabs
     /// whose entry went.
-    pub fn sync_viewing(&mut self, visible: &[u64], window_focused: bool) -> Vec<u64> {
+    pub fn sync_viewing(&mut self, visible: &[K], window_focused: bool) -> Vec<K> {
         for e in &mut self.entries {
             if !(window_focused && visible.contains(&e.tab)) {
                 e.armed = true;
@@ -120,7 +128,7 @@ impl Inbox {
             self.entries.retain(|e| {
                 let go = e.armed && visible.contains(&e.tab);
                 if go {
-                    removed.push(e.tab);
+                    removed.push(e.tab.clone());
                 }
                 !go
             });
@@ -129,14 +137,14 @@ impl Inbox {
     }
 
     /// The tab's next turn began: its entry recorded while looking is stale. Whether it went.
-    pub fn turn_started(&mut self, tab: u64) -> bool {
+    pub fn turn_started(&mut self, tab: &K) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|e| e.tab != tab || e.armed);
+        self.entries.retain(|e| e.tab != *tab || e.armed);
         self.entries.len() != before
     }
 
     /// Forgets the entries of tabs that no longer exist.
-    pub fn retain_live(&mut self, live: &HashSet<u64>) {
+    pub fn retain_live(&mut self, live: &HashSet<K>) {
         self.entries.retain(|e| live.contains(&e.tab));
     }
 
@@ -163,7 +171,7 @@ impl Inbox {
 mod tests {
     use super::*;
 
-    fn entry(tab: u64, kind: Kind) -> Entry {
+    fn entry(tab: u64, kind: Kind) -> Entry<u64> {
         Entry::new(tab, kind, "t", "p", SystemTime::UNIX_EPOCH)
     }
 
@@ -187,8 +195,8 @@ mod tests {
         assert_eq!(i.entries().len(), 4);
         i.retain_live(&[1, 3, 4].into_iter().collect());
         assert_eq!(i.entries().len(), 3);
-        assert!(i.remove(3));
-        assert!(!i.remove(3));
+        assert!(i.remove(&3));
+        assert!(!i.remove(&3));
         i.clear();
         assert!(i.entries().is_empty());
     }
@@ -246,9 +254,9 @@ mod tests {
         let mut i = Inbox::default();
         i.record(entry(1, Kind::Finished).while_looking());
         i.record(entry(2, Kind::Finished));
-        assert!(i.turn_started(1));
-        assert!(!i.turn_started(1));
-        assert!(!i.turn_started(2), "an armed entry is kept");
+        assert!(i.turn_started(&1));
+        assert!(!i.turn_started(&1));
+        assert!(!i.turn_started(&2), "an armed entry is kept");
         assert_eq!(i.entries().len(), 1);
     }
 
@@ -275,7 +283,7 @@ mod tests {
         assert!(!i.warns());
         i.record(entry(3, Kind::Error(None)));
         assert!(i.warns());
-        i.remove(3);
+        i.remove(&3);
         i.record(entry(4, Kind::Attention));
         assert!(i.warns());
     }

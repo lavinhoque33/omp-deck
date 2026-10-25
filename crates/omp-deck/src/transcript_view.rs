@@ -24,9 +24,9 @@ use egui::{
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::agent_model::short_model;
-use crate::statusfmt::fmt_tokens;
 use crate::theme::{self, Palette};
 use crate::widgets::{Spin, paint_icon};
+use deck_service::statusfmt::fmt_tokens;
 
 const GAP: f32 = 10.0;
 const OVERSCAN: f32 = 400.0;

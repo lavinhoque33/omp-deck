@@ -17,14 +17,15 @@
 //! `Esc` … 150 ms … Enter back to back — a newline under a still-open popup, the command unsent.
 //! The popup is detected as a change of [`composer::rows_below`] against the empty composer before
 //! the paste; without one no `Esc` is sent at all. A step omp never shows in time ([`SHOW_TIMEOUT`],
-//! [`ESC_TIMEOUT`]) abandons the job without Enter ([`Poll::stalled`]): the command stays in the
+//! [`ESC_TIMEOUT`]) abandons the job without Enter ([`End::Stalled`]): the command stays in the
 //! composer rather than risk the merge.
 //!
 //! Text jobs (review comments): the paste bytes come from [`Env::paste`] (the terminal's own mode-aware
 //! encoding, evaluated at write time so the pure state machine never guesses the modes); `None` →
-//! the job is refused ([`Poll::no_paste`]). Insert (`submit=false`) pastes at omp's cursor and
+//! the job is refused ([`End::NoPaste`]). Insert (`submit=false`) pastes at omp's cursor and
 //! ends there; Send (`submit=true`) follows the slash sequence with the text as the paste.
-//! [`Poll::completed`] names the jobs that reached their last step.
+//! [`Poll::ended`] reports every job that left the queue, by [`JobId`]; [`End::Completed`] means
+//! every byte of it was handed out — not that omp ran it successfully.
 //!
 //! Keys (Ctrl+C, Esc, Enter, hotkeys) are [`Write::Key`] strokes that the terminal encodes like
 //! the user's own key press (`deck_term::Terminal::send_key`), never raw bytes: in
@@ -200,6 +201,35 @@ const ESC_KEY: Write = Write::Key(Key::Escape, Mods::NONE);
 const ENTER_KEY: Write = Write::Key(Key::Enter, Mods::NONE);
 const CTRL_C_KEY: Write = Write::Key(Key::Char('c'), Mods::CTRL);
 
+/// Identity of one pushed job, unique per [`Injector`] (see [`Injector::push`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct JobId(pub u64);
+
+/// How a job left the injector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
+    /// It ran to its last step (every byte of it was handed out).
+    Completed,
+    /// Dropped before it started because its precondition failed.
+    Refused(Requires),
+    /// A slash/text job dropped because the cursor is not in omp's composer (an overlay is open).
+    DialogOpen,
+    /// Abandoned after it started because omp stopped being idle.
+    Aborted,
+    /// Abandoned because omp did not show a step in time ([`SHOW_TIMEOUT`]); the command may sit
+    /// unsent in the composer.
+    Stalled,
+    /// A text job dropped because omp has not enabled bracketed paste (`Env::paste` was `None`).
+    NoPaste,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ended {
+    pub id: JobId,
+    pub label: String,
+    pub end: End,
+}
+
 /// What the caller must do after a poll.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Poll {
@@ -209,26 +239,51 @@ pub struct Poll {
     pub wake_in: Option<Duration>,
     /// The composer holds an unsent draft: ask the user, then call [`Injector::answer`].
     pub confirm: Option<Confirm>,
-    /// Jobs dropped because their precondition failed (`Requires`), with the label.
-    pub refused: Vec<(String, Requires)>,
-    /// Slash jobs dropped because the cursor is not in omp's composer (an overlay is open).
-    pub dialog_open: Vec<String>,
-    /// Jobs abandoned after they started because omp stopped being idle.
-    pub aborted: Vec<String>,
-    /// Jobs abandoned because omp did not show a step in time ([`SHOW_TIMEOUT`]); the command may
-    /// sit unsent in the composer.
-    pub stalled: Vec<String>,
-    /// Jobs that ran to their last step (every byte of them was handed out).
-    pub completed: Vec<String>,
-    /// Text jobs dropped because omp has not enabled bracketed paste (`Env::paste` was `None`).
-    pub no_paste: Vec<String>,
+    /// The jobs that left the injector during this poll, in order.
+    pub ended: Vec<Ended>,
     /// Drop the user's keyboard/paste input to the terminal for this long from now: bytes were
     /// written, or a job with written bytes still waits for its next step.
     pub hold_for: Option<Duration>,
 }
 
+#[cfg(test)]
+impl Poll {
+    fn labels(&self, end: End) -> Vec<String> {
+        self.ended
+            .iter()
+            .filter(|e| e.end == end)
+            .map(|e| e.label.clone())
+            .collect()
+    }
+    fn completed(&self) -> Vec<String> {
+        self.labels(End::Completed)
+    }
+    fn dialog_open(&self) -> Vec<String> {
+        self.labels(End::DialogOpen)
+    }
+    fn aborted(&self) -> Vec<String> {
+        self.labels(End::Aborted)
+    }
+    fn stalled(&self) -> Vec<String> {
+        self.labels(End::Stalled)
+    }
+    fn no_paste(&self) -> Vec<String> {
+        self.labels(End::NoPaste)
+    }
+    fn refused(&self) -> Vec<(String, Requires)> {
+        self.ended
+            .iter()
+            .filter_map(|e| match e.end {
+                End::Refused(r) => Some((e.label.clone(), r)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Confirm {
+    pub id: JobId,
     pub label: String,
     pub draft: String,
 }
@@ -257,6 +312,7 @@ enum Stage {
 }
 
 struct Active {
+    id: JobId,
     job: Job,
     stage: Stage,
     /// A byte of this job already reached the PTY.
@@ -267,8 +323,10 @@ struct Active {
 
 #[derive(Default)]
 pub struct Injector {
-    queue: VecDeque<Job>,
+    queue: VecDeque<(JobId, Job)>,
     active: Option<Active>,
+    /// Id of the next pushed job.
+    next_id: u64,
     /// Earliest start of the next job.
     ready_at: Option<Instant>,
     /// Own record of the last Ctrl+C (also covers PTY writes not yet seen by the terminal).
@@ -278,8 +336,27 @@ pub struct Injector {
 }
 
 impl Injector {
-    pub fn push(&mut self, job: Job) {
-        self.queue.push_back(job);
+    pub fn push(&mut self, job: Job) -> JobId {
+        let id = JobId(self.next_id);
+        self.next_id += 1;
+        self.queue.push_back((id, job));
+        id
+    }
+
+    /// The jobs still held (running first, then queued in order). A pushed job that is no longer
+    /// here and was not reported in a [`Poll::ended`] was dropped by [`Self::answer`],
+    /// [`Self::clear`] or [`Self::drop_unstarted`].
+    pub fn live_ids(&self) -> impl Iterator<Item = JobId> + '_ {
+        self.active
+            .as_ref()
+            .map(|a| a.id)
+            .into_iter()
+            .chain(self.queue.iter().map(|(id, _)| *id))
+    }
+
+    /// Whether a byte of the running job `id` already reached the PTY.
+    pub fn has_written(&self, id: JobId) -> bool {
+        self.active.as_ref().is_some_and(|a| a.id == id && a.wrote)
     }
 
     /// True while a job runs or is queued.
@@ -356,23 +433,35 @@ impl Injector {
                 Step::Blocked => break,
                 Step::Done => {
                     if let Some(a) = self.active.take() {
-                        out.completed.push(a.job.label);
+                        out.ended.push(Ended {
+                            id: a.id,
+                            label: a.job.label,
+                            end: End::Completed,
+                        });
                     }
                     self.ready_at = Some(env.now + BETWEEN_JOBS);
                 }
-                Step::Dropped => {
+                Step::Dropped(end) => {
                     // Nothing was sent, so no pause is needed before the next job.
-                    self.active = None;
-                }
-                Step::Aborted => {
                     if let Some(a) = self.active.take() {
-                        out.aborted.push(a.job.label);
+                        out.ended.push(Ended {
+                            id: a.id,
+                            label: a.job.label,
+                            end,
+                        });
                     }
-                    self.ready_at = Some(env.now + BETWEEN_JOBS);
                 }
-                Step::Stalled => {
+                ended @ (Step::Aborted | Step::Stalled) => {
                     if let Some(a) = self.active.take() {
-                        out.stalled.push(a.job.label);
+                        out.ended.push(Ended {
+                            id: a.id,
+                            label: a.job.label,
+                            end: if matches!(ended, Step::Aborted) {
+                                End::Aborted
+                            } else {
+                                End::Stalled
+                            },
+                        });
                     }
                     self.ready_at = Some(env.now + BETWEEN_JOBS);
                 }
@@ -400,17 +489,22 @@ impl Injector {
             }
             self.ready_at = None;
         }
-        while let Some(job) = self.queue.pop_front() {
+        while let Some((id, job)) = self.queue.pop_front() {
             let blocked = match job.requires {
                 Requires::Any => false,
                 Requires::Idle => env.activity != Activity::Idle,
                 Requires::Busy => !env.activity.is_busy(),
             };
             if blocked {
-                out.refused.push((job.label, job.requires));
+                out.ended.push(Ended {
+                    id,
+                    end: End::Refused(job.requires),
+                    label: job.label,
+                });
                 continue;
             }
             self.active = Some(Active {
+                id,
                 job,
                 stage: Stage::Start,
                 wrote: false,
@@ -428,8 +522,8 @@ enum Step {
     /// Needs outside input (confirmation).
     Blocked,
     Done,
-    /// Ended before any byte was written.
-    Dropped,
+    /// Ended before any byte was written, for this reason.
+    Dropped(End),
     /// Ended without its final Enter because omp left the idle state.
     Aborted,
     /// Ended without its final Enter because omp did not show a step in time.
@@ -474,16 +568,13 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             if let Payload::Text { text, .. } = &a.job.payload
                 && (env.paste)(text).is_none()
             {
-                out.no_paste.push(a.job.label.clone());
-                return Step::Dropped;
+                return Step::Dropped(End::NoPaste);
             }
             match composer::inspect(&(env.screen)()) {
-                Composer::Missing => {
-                    out.dialog_open.push(a.job.label.clone());
-                    Step::Dropped
-                }
+                Composer::Missing => Step::Dropped(End::DialogOpen),
                 Composer::Draft(draft) => {
                     out.confirm = Some(Confirm {
+                        id: a.id,
                         label: a.job.label.clone(),
                         draft,
                     });
@@ -505,12 +596,10 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
         ) => {
             // Insert: pasted at omp's cursor; a draft stays, nothing is cleared, nothing submitted.
             let Some(bytes) = (env.paste)(text) else {
-                out.no_paste.push(a.job.label.clone());
-                return Step::Dropped;
+                return Step::Dropped(End::NoPaste);
             };
             if matches!(composer::inspect(&(env.screen)()), Composer::Missing) {
-                out.dialog_open.push(a.job.label.clone());
-                return Step::Dropped;
+                return Step::Dropped(End::DialogOpen);
             }
             write(a, out, Write::Bytes(bytes));
             Step::Done
@@ -859,8 +948,8 @@ mod tests {
         let mut t = 0;
         while inj.is_busy() && t < 10_000 {
             let p = fx.poll(&mut inj, t);
+            stalled.extend(p.stalled());
             writes.extend(p.writes);
-            stalled.extend(p.stalled);
             t += 10;
         }
         assert_eq!(writes, vec![paste("/switch a/b"), ESC_KEY]);
@@ -906,10 +995,10 @@ mod tests {
         let mut writes = Vec::new();
         for t in (0..5_000).step_by(10) {
             let p = fx.poll(&mut inj, t);
-            writes.extend(p.writes);
-            if !p.stalled.is_empty() && stalled_at.is_none() {
+            if !p.stalled().is_empty() && stalled_at.is_none() {
                 stalled_at = Some(t);
             }
+            writes.extend(p.writes);
         }
         assert_eq!(writes, vec![paste("/compact")]);
         assert_eq!(stalled_at, Some(SHOW_TIMEOUT.as_millis() as u64));
@@ -928,8 +1017,8 @@ mod tests {
         let mut stalled = Vec::new();
         for t in (0..6_000).step_by(10) {
             let p = fx.poll(&mut inj, t);
+            stalled.extend(p.stalled());
             writes.extend(p.writes);
-            stalled.extend(p.stalled);
         }
         assert_eq!(writes, vec![CTRL_C_KEY]);
         assert_eq!(stalled, vec!["Compact".to_owned()]);
@@ -962,7 +1051,7 @@ mod tests {
         let mut fx = Fixture::new();
         fx.draft = "half typed".into();
         let mut inj = Injector::default();
-        inj.push(Job::slash(
+        let id = inj.push(Job::slash(
             "Compact (soft)",
             "/compact soft",
             Requires::Idle,
@@ -971,6 +1060,7 @@ mod tests {
         assert_eq!(
             p.confirm,
             Some(Confirm {
+                id,
                 label: "Compact (soft)".to_owned(),
                 draft: "half typed".to_owned()
             })
@@ -1001,8 +1091,8 @@ mod tests {
         let mut stalled = Vec::new();
         for t in (0..5_000).step_by(10) {
             let p = fx.poll(&mut inj, t);
+            stalled.extend(p.stalled());
             writes.extend(p.writes);
-            stalled.extend(p.stalled);
         }
         assert!(stalled.is_empty());
         assert_eq!(writes.first(), Some(&CTRL_C_KEY));
@@ -1044,7 +1134,7 @@ mod tests {
         inj.push(Job::slash("Compact", "/compact", Requires::Idle));
         inj.push(plan_job("Plan mode"));
         let p = fx.poll(&mut inj, 0);
-        assert_eq!(p.dialog_open, vec!["Compact".to_owned()]);
+        assert_eq!(p.dialog_open(), vec!["Compact".to_owned()]);
         // The refusal costs no pause: the hotkey runs in the same poll.
         assert_eq!(p.writes, vec![Write::Key(Key::Char('p'), ALT_SHIFT)]);
     }
@@ -1074,7 +1164,7 @@ mod tests {
             inj.push(Job::slash("Compact", "/compact", Requires::Idle));
             let p = fx.poll(&mut inj, 0);
             assert_eq!(
-                p.refused,
+                p.refused(),
                 vec![("Compact".to_owned(), Requires::Idle)],
                 "{activity:?}"
             );
@@ -1088,7 +1178,7 @@ mod tests {
         let mut inj = Injector::default();
         inj.push(Job::stop());
         let p = fx.poll(&mut inj, 0);
-        assert_eq!(p.refused, vec![("Stop".to_owned(), Requires::Busy)]);
+        assert_eq!(p.refused(), vec![("Stop".to_owned(), Requires::Busy)]);
         fx.activity = Activity::Busy;
         inj.push(Job::stop());
         assert_eq!(fx.poll(&mut inj, 1_000).writes, vec![ESC_KEY]);
@@ -1105,7 +1195,7 @@ mod tests {
         fx.activity = Activity::Busy;
         let p = fx.poll(&mut inj, 150);
         assert!(p.writes.is_empty());
-        assert_eq!(p.aborted, vec!["Compact".to_owned()]);
+        assert_eq!(p.aborted(), vec!["Compact".to_owned()]);
         assert!(!inj.is_busy());
         assert!(drain(&mut fx, &mut inj).is_empty());
     }
@@ -1123,7 +1213,7 @@ mod tests {
         fx.activity = Activity::Attention;
         let p = fx.poll(&mut inj, t + 300);
         assert!(p.writes.is_empty());
-        assert_eq!(p.aborted, vec!["Context".to_owned()]);
+        assert_eq!(p.aborted(), vec!["Context".to_owned()]);
     }
 
     #[test]
@@ -1137,7 +1227,7 @@ mod tests {
         let mut writes = Vec::new();
         for t in (10..3_000).step_by(10) {
             let p = fx.poll(&mut inj, t);
-            assert!(p.aborted.is_empty());
+            assert!(p.aborted().is_empty());
             writes.extend(p.writes);
         }
         // Idle now, so the popup Esc is safe.
@@ -1180,7 +1270,7 @@ mod tests {
         fx.poll(&mut inj, 0);
         fx.activity = Activity::Idle;
         let p = fx.poll(&mut inj, 650);
-        assert!(p.writes.is_empty() && p.aborted.is_empty());
+        assert!(p.writes.is_empty() && p.aborted().is_empty());
         assert!(!inj.is_busy());
     }
 
@@ -1329,7 +1419,7 @@ mod tests {
         let p = fx.poll(&mut inj, 0);
         assert_eq!(p.confirm, None);
         assert_eq!(p.writes, vec![paste(REVIEW)]);
-        assert_eq!(p.completed, vec!["Insert review".to_owned()]);
+        assert_eq!(p.completed(), vec!["Insert review".to_owned()]);
         assert!(!inj.is_busy());
     }
 
@@ -1340,8 +1430,8 @@ mod tests {
         let mut inj = Injector::default();
         inj.push(Job::text("Insert review", REVIEW, false));
         let p = fx.poll(&mut inj, 0);
-        assert_eq!(p.dialog_open, vec!["Insert review".to_owned()]);
-        assert!(p.writes.is_empty() && p.completed.is_empty());
+        assert_eq!(p.dialog_open(), vec!["Insert review".to_owned()]);
+        assert!(p.writes.is_empty() && p.completed().is_empty());
     }
 
     #[test]
@@ -1352,7 +1442,7 @@ mod tests {
             let mut inj = Injector::default();
             inj.push(Job::text("Review", REVIEW, submit));
             let p = fx.poll(&mut inj, 0);
-            assert_eq!(p.no_paste, vec!["Review".to_owned()], "submit={submit}");
+            assert_eq!(p.no_paste(), vec!["Review".to_owned()], "submit={submit}");
             assert!(p.writes.is_empty() && !inj.is_busy());
         }
     }
@@ -1366,8 +1456,8 @@ mod tests {
         let mut done = Vec::new();
         for t in (0..3_000).step_by(10) {
             let p = fx.poll(&mut inj, t);
+            done.extend(p.completed());
             writes.extend(p.writes);
-            done.extend(p.completed);
         }
         assert_eq!(writes, vec![paste(REVIEW), ENTER_KEY]);
         assert_eq!(done, vec!["Send review".to_owned()]);
@@ -1383,7 +1473,7 @@ mod tests {
             inj.push(Job::text("Send review", REVIEW, true));
             let p = fx.poll(&mut inj, 0);
             assert_eq!(
-                p.refused,
+                p.refused(),
                 vec![("Send review".to_owned(), Requires::Idle)],
                 "{activity:?}"
             );
@@ -1418,7 +1508,7 @@ mod tests {
         inj.answer(false);
         assert!(!inj.is_busy());
         let p = fx.poll(&mut inj, 100);
-        assert!(p.writes.is_empty() && p.completed.is_empty());
+        assert!(p.writes.is_empty() && p.completed().is_empty());
     }
 
     #[test]
@@ -1430,7 +1520,7 @@ mod tests {
         assert_eq!(p.writes, vec![paste(REVIEW)]);
         fx.activity = Activity::Busy;
         let p = fx.poll(&mut inj, 200);
-        assert_eq!(p.aborted, vec!["Send review".to_owned()]);
-        assert!(p.writes.is_empty() && p.completed.is_empty());
+        assert_eq!(p.aborted(), vec!["Send review".to_owned()]);
+        assert!(p.writes.is_empty() && p.completed().is_empty());
     }
 }

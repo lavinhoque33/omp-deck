@@ -25,10 +25,10 @@ use crate::agent_model::{
 };
 use crate::agent_output::{MdPane, OutputPane};
 use crate::sidebar::format_age;
-use crate::statusfmt::fmt_tokens;
 use crate::theme::{self, Palette};
 use crate::transcript_view::TranscriptView;
 use crate::widgets::{Spin, empty_state, icon_text, paint_icon};
+use deck_service::statusfmt::fmt_tokens;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PopupTab {

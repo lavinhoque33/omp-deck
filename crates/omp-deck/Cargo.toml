@@ -13,6 +13,7 @@ readme.workspace = true
 [dependencies]
 deck-core.workspace = true
 deck-term.workspace = true
+deck-service.workspace = true
 deck-host.workspace = true
 eframe.workspace = true
 egui.workspace = true

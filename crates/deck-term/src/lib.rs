@@ -18,6 +18,7 @@ mod remote;
 mod render;
 mod scan;
 mod theme;
+mod wake;
 mod widget;
 
 pub use crate::clipboard::Clipboard;
@@ -25,7 +26,8 @@ pub use crate::clipboard::Clipboard;
 pub use crate::core::SpawnSpec;
 pub use crate::core::{ScreenText, TermOptions, Terminal, TerminalEvents};
 pub use crate::fonts::{FontReport, install_fonts};
-pub use crate::out::wait_detached;
-pub use crate::remote::{Remote, RemoteEvent, RemoteRx, RemoteTx};
+pub use crate::out::{InputProgress, wait_detached};
+pub use crate::remote::{Observer, ObserverTx, Remote, RemoteEvent, RemoteRx, RemoteTx};
 pub use crate::theme::{TermColors, TermTheme};
+pub use crate::wake::WakeCallback;
 pub use crate::widget::{TerminalResponse, TerminalView};

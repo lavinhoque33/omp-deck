@@ -360,6 +360,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 ```
 
+The workspace separates native presentation (`omp-deck`), terminal rendering/encoding (`deck-term`),
+PTY/ConPTY persistence (`deck-host`), OS/session/project operations (`deck-core`), and executable
+application policy (`deck-service`). The desktop uses the shared service for composer-safe commands,
+model tracking, input ownership, transactional settings and notification policy. Headless owners use
+wake callbacks rather than an eframe loop; host observers can follow output without taking control.
+
+The [mobile companion contract](docs/notes/mobile-companion.md) records command parity and remaining
+slices. Only the shared in-process service is implemented here: no gateway/autostart, relay or PWA
+is enabled. Generic terminal subscribers receive state/text; host observers additionally receive VT
+replay/live bytes. Raw tmux/direct VT mirroring is a later transport requirement.
+
 Packaging scripts live in `packaging/`: `build-tarball.sh`, `appimage/build-appimage.sh`, `install.sh`,
 `install.ps1`, `windows/fetch-conpty.ps1`. CI runs on Linux and Windows; releases are built by GitHub Actions
 when a `v*` tag is pushed (the tag must match the version in `Cargo.toml`).

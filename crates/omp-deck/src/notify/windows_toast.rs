@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+use deck_service::controller::SessionTarget;
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::Foundation::TypedEventHandler;
 use windows::UI::Notifications::{
@@ -65,13 +66,17 @@ fn build_toast(req: &Request, sink: &Sink) -> windows::core::Result<ToastNotific
     let doc = XmlDocument::new()?;
     doc.LoadXml(&HSTRING::from(toast_xml::document(&req.title, &req.body)))?;
     let toast = ToastNotification::CreateToastNotification(&doc)?;
-    toast.SetTag(&HSTRING::from(toast_xml::tag(req.tab)))?;
+    toast.SetTag(&HSTRING::from(toast_xml::tag(req.tab.as_ref())))?;
     toast.SetGroup(&HSTRING::from(GROUP))?;
-    let tab = req.tab;
+    let tab = req.tab.clone();
+    let clicked_tab = tab.clone();
     let clicked = sink.clone();
     toast.Activated(&TypedEventHandler::<ToastNotification, IInspectable>::new(
         move |_, _| {
-            clicked(Signal::Clicked { tab, token: None });
+            clicked(Signal::Clicked {
+                tab: clicked_tab.clone(),
+                token: None,
+            });
             Ok(())
         },
     ))?;
@@ -83,7 +88,7 @@ fn build_toast(req: &Request, sink: &Sink) -> windows::core::Result<ToastNotific
         let hidden_by_app = args.as_ref().and_then(|a| a.Reason().ok())
             == Some(ToastDismissalReason::ApplicationHidden);
         if !hidden_by_app {
-            dismissed(Signal::Gone { tab });
+            dismissed(Signal::Gone { tab: tab.clone() });
         }
         Ok(())
     }))?;
@@ -96,7 +101,7 @@ fn show(app_id: &str, req: &Request, sink: &Sink) -> windows::core::Result<()> {
 }
 
 /// Removes the notification of `tab` from the screen and the Action Center.
-fn withdraw(app_id: &str, tab: Option<u64>) -> windows::core::Result<()> {
+fn withdraw(app_id: &str, tab: Option<&SessionTarget>) -> windows::core::Result<()> {
     ToastNotificationManager::History()?.RemoveGroupedTagWithId(
         &HSTRING::from(toast_xml::tag(tab)),
         &HSTRING::from(GROUP),
@@ -120,7 +125,7 @@ pub fn run(cmds: Receiver<Cmd>, out: &Out) {
     for cmd in cmds.iter() {
         let result = match cmd {
             Cmd::Show(req) => show(app_id, &req, &sink),
-            Cmd::Close(tab) => withdraw(app_id, tab),
+            Cmd::Close(tab) => withdraw(app_id, tab.as_ref()),
             Cmd::CloseAll => withdraw_all(app_id),
         };
         if let Err(e) = result {
@@ -143,11 +148,15 @@ mod tests {
     #[ignore = "needs an interactive Windows desktop (toast platform); run with --ignored"]
     fn windows_toast_show_then_withdraw_by_tag() {
         let app_id = POWERSHELL_APP_ID;
-        let tab = Some(987_654_321);
-        let tag = toast_xml::tag(tab);
+        let key = SessionTarget {
+            key: deck_service::controller::SessionKey::tmux("test", "987654321"),
+            generation: 1,
+        };
+        let tab = Some(key);
+        let tag = toast_xml::tag(tab.as_ref());
         let sink: Sink = Arc::new(|_| {});
         let req = Request {
-            tab,
+            tab: tab.clone(),
             title: "OmpDeck <test> & \"quotes\"".to_owned(),
             body: "withdrawal test".to_owned(),
         };
@@ -159,10 +168,10 @@ mod tests {
                 t.Tag().is_ok_and(|v| v == tag.as_str()) && t.Group().is_ok_and(|v| v == GROUP)
             })
         };
-        withdraw(app_id, tab).expect("clearing leftovers");
+        withdraw(app_id, tab.as_ref()).expect("clearing leftovers");
         show(app_id, &req, &sink).expect("showing the toast");
         assert!(in_history(), "the toast should be in the history");
-        withdraw(app_id, tab).expect("withdrawing the toast");
+        withdraw(app_id, tab.as_ref()).expect("withdrawing the toast");
         assert!(!in_history(), "the toast should be withdrawn");
 
         show(app_id, &req, &sink).expect("showing the toast again");

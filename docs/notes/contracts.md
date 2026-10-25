@@ -2272,3 +2272,114 @@ omp-deck (hub):
   off ⇒ Notify, no Close while looking, `CLOSE` after switching tab and back and when the next turn starts; defaults ⇒ no
   Notify; unfocused window ⇒ Notify; Desktop pop-ups off ⇒ none. Not driven: dismissing a held pop-up from the bell panel
   (same `close` + `gone` path as before).
+
+## Mobile companion step 1: shared application service
+
+Implemented (2026-10-25): the first numbered slice of `docs/notes/mobile-companion.md`.
+No gateway daemon, public listener, relay or PWA is enabled by this slice.
+
+- New workspace crate `deck-service` depends on `deck-core`, `deck-host` and `deck-term`; it has no
+  direct `egui`/`eframe` dependency. It owns shared execution policy, not native presentation.
+  `deck-core` and `deck-term` remain independent of each other.
+- Existing composer recognition, injection protocol and action construction live in this crate with
+  one implementation; GUI copies were removed. Do not replace slash commands by individual direct
+  ctl operations: runtime-command parity must be established for the complete set before a migration.
+- A `SessionController` owns the terminal writer and serialized command execution. Stable process/session
+  targeting plus a generation protects pending requests and draft confirmations against `/new`, `/fork`,
+  `/resume`, move and restart. A request accepted previously must never be blindly resubmitted.
+  Delivery of bytes is not proof of successful runtime execution.
+- The desktop widget borrows the controller's terminal; it does not attach another writer. User input
+  obeys the same input-hold boundary as injected jobs. Preserve idle/overlay checks, draft confirmation,
+  mode-aware paste, control-key spacing and close-after-input-drain behavior.
+- Host `Observe` is read-only: atomic snapshot followed by live output and authoritative geometry, no
+  controller displacement or input/resize/palette/focus/kill rights. Each observer has byte-bounded
+  backpressure and a slow/disconnected observer cannot stall the controller or PTY.
+- `deck-term` provides headless constructors and a duration-bearing wake callback, independent of an
+  egui frame loop. Read-only renderers follow host geometry, not their widget's layout. Observation
+  cannot silently promote to `Attach`, even when talking to an older daemon.
+- Shared settings have one transaction owner per service and a cross-process file lock. Clients submit
+  field-level compare-and-set edits; disjoint changes merge, conflicting edits fail atomically.
+  Window/view fields remain device-scoped. Existing state files retain their migration behavior.
+  `TabLayout` groups open tabs, active index and split as one CAS unit. `Field::FolderTabs(path)`
+  compares one folder's complete layout; disjoint folder edits merge, including additions/removals.
+- Notification transition detection, turn classification and inbox policy have one canonical service
+  owner. Native OS delivery/window activation stay in the desktop client. Preserve focused-view inbox
+  notifications, per-event toggles, aborted-turn suppression and the desktop-unfocused popup policy.
+  Every omp launch retains `PI_NOTIFICATIONS=off`.
+- Session-store mutations still go through omp; no controller, observer or service writes session JSONL
+  or artifacts directly. Real session/blob roots remain read-only during implementation and verification.
+
+### Executable service API
+
+- `controller::{SessionKey, SessionTarget, RequestKey, Submission, SessionController}`:
+  `SessionKey::{backend,tmux,host,direct}` distinguishes backend kind and namespace (including when tmux
+  and host both use `omp-deck`). A `SessionTarget` is `{ key, generation }`; pending actions, draft answers,
+  notification tickets and activation targets are fenced by this identity.
+- `SessionController::submit` accepts `Command::{Action,SwitchModel,SetEffort,Review,WorktreeMove,WorktreeFinish}`.
+  The caller drives `tick` (poll + drive) or `drive` and consumes `ControllerEvent::{Confirm,Ended}`.
+  `answer` applies only to the original request. `observe_model` supplies actual model/effort facts.
+  Per-client accepted-sequence watermarks survive settled-history eviction: old requests are expired,
+  not re-executed. A duplicate key cannot be reused for different work. Pending/confirmation/runtime
+  verdict requests are retained.
+- `SessionController::write_input(&SessionTarget, &[u8])` accepts already-encoded, ephemeral user input:
+  stale/exited/read-only/detached/held input is refused before writing; held keystrokes are not queued.
+  `Terminal::input_held` is public for trusted native widgets. Raw `Terminal::{write,send_key}` bypass
+  that gate intentionally for injection; protocol clients must use the controller's checked route.
+- `subscribe_view(WakeCallback)` returns a latest-only `ViewReceiver`; `take_changed` / `latest` yield
+  `Arc<SessionSnapshot>` containing target, path, title, activity, exit and `ScreenText`. This is state/text,
+  not a styled VT transport. It neither creates another mux attachment nor changes geometry. Adding a
+  subscriber must not advance the publication baseline past updates owed to existing subscribers.
+- `deck-term` adds `Terminal::{spawn_headless,connect_headless,observe,observe_headless}` and
+  `WakeCallback = Arc<dyn Fn(Duration) + Send + Sync>`. Headless activity, including decoded graphics,
+  wakes the owner without an eframe event loop. `Terminal::resize` serves the controlling headless owner;
+  observed terminals ignore local geometry/input/focus/palette/clipboard effects.
+- `deck-host::observe(ns,name,history_lines)` returns `(HostInfo, Observed)`.
+  `Observed::split` gives `ObserverRx` / `ObserverTx`; events are `Snapshot { bytes, grid }`,
+  `Output`, `Resized`, `Exited` and `Closed`. Protocol v1 gains `Observe` (0x0b) / `Resized` (0x28);
+  normal `Attach` remains unchanged. Snapshot and registration are atomic under the PTY/core lock.
+  Per-observer bounds include in-flight output and per-item cost (4 MiB plus the initial snapshot).
+  Forbidden requests abort immediately, including blocked Windows pipe I/O, without draining a reply
+  behind an unread snapshot. Detach unblocks readers and never reports a fabricated child exit.
+- Generic tmux/direct state subscriptions are supported; raw tmux/direct VT mirroring is not.
+  A later mobile terminal transport must resolve that fidelity boundary before full terminal parity.
+  Existing native terminal rendering and command encoding stay unchanged.
+- `settings::{SettingsService,Edit,PendingEdit,SettingsError,Field}`: open, snapshot, submit, reload,
+  flush and change subscriptions. `Edit::between(base,edited)` is a field CAS, not a replacement save.
+  The transaction worker locks a sibling file, strictly re-reads once using `deck_core::config::parse_config`,
+  merges disjoint edits and commits, or returns `Conflict { fields,current }` with no partial edit.
+  Reload/decode errors retain the last-good snapshot; corrupt files are never replaced by defaults.
+  A capacity-one notifier channel isolates arbitrary change callbacks from the transaction worker.
+  The desktop periodically reloads off-thread, rebases pending local changes, reconciles style/backend
+  and backup-schedule effects, and surfaces conflicts. Unchanged native view projections cannot
+  overwrite another window's committed layout; explicit folder-map edits are retained. Shutdown
+  retries conflict-rebased survivors within a changed-setting-derived bound, but does not retry
+  I/O failures, then flushes before exit.
+- `notifications::NotificationCenter` owns transition detection, asynchronous turn classification,
+  generation-bound tickets, inbox and `Effect::{Show,Withdraw,WithdrawAll,Bell}`. `Observation` supplies
+  native visibility/focus and actual status facts; only the native adapter performs OS delivery/raising.
+  Unknown/old turn outcomes retry up to four times at 300 ms before fallback; aborted turns remain
+  suppressed. A late status/path/generation result cannot notify a different session.
+- `backend::Backends`, `host_remote::{HostRemote,HostObserver}`, `session_actions::export_html` and
+  `lifecycle::{stop_then_move,stop_then_delete,retry_while_live,kill_all,surviving_session}` are executable
+  shared helpers. Existing core ctl/tree/git/worktree/Drive/update executors remain the implementation
+  for their action families, not empty service-command wrappers. The complete route matrix is in
+  `mobile-companion.md`; native dialogs/clipboard/folder/window effects remain client-local.
+
+### Delivery, close and later IPC
+
+`Delivery::Delivered` acknowledges local PTY writes or successful `RemoteTx::input`, not omp execution
+or the host daemon's child PTY. Model/effort requests retain a separate runtime verdict.
+`Writing` has no ordinary acknowledgement timeout while those bytes could still be delivered.
+
+An explicit native close preserves the old injector `can_close` boundary (no half-written/queued
+command, then the 150 ms tail). If the transport still has not acknowledged, `Delivery::Unobserved`
+settles that request before detach: bytes may yet arrive. This is not success or a retry invitation.
+Keep review comments; do not resend worktree prompts; preserve an already observed `Runtime::Confirmed`.
+The desktop drains and dispatches controller events before destroying a tab. Failed output rejects
+new input and does not wait for the ordinary two-second drain of unreachable bytes.
+
+The Rust service API is not an IPC serializer, paired-device permission model or persistent request
+ledger. Later gateway/relay slices must bind process-local generations to a service-instance epoch,
+preserve refusal/outcome distinctions and recover accepted work without blind replay. They must also
+implement long-job and explicit native-effect transport; no mobile capability is implied by merely
+having a shared executor.

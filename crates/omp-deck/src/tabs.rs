@@ -6,15 +6,14 @@ use std::time::{Instant, SystemTime};
 
 use deck_core::mux::{Mux, is_noise_title};
 use deck_core::omp::UpdateKind;
+use deck_service::controller::SessionController;
 use deck_term::Terminal;
 
 use crate::icons::{
     ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_SETTINGS, ICON_TERMINAL, ICON_X, Icon,
 };
-use crate::inject::Injector;
-use crate::model_picker::Pending;
-use crate::statusfmt::Activity;
 use crate::titlebar::strip_omp_prefix;
+use deck_service::status::TabStatus;
 use egui::{
     Align2, Color32, CursorIcon, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
@@ -36,13 +35,15 @@ pub enum TabRole {
 
 /// A terminal tab: an omp process (usually in a tmux or host session) rendered by deck-term.
 pub struct TermTab {
-    pub term: Terminal,
+    /// Owns the tab's terminal, its session identity (session file, generation) and every injected
+    /// command (status-bar actions, review, worktree): the only path that writes into the pty on
+    /// behalf of the app.
+    pub ctl: SessionController,
     /// Session name in the backend; `None` for direct tabs (update/installer, or no backend).
     pub mux_name: Option<String>,
     /// The backend running the session (`None` with `mux_name`).
     pub mux: Option<Mux>,
     pub cwd: PathBuf,
-    pub session_path: Option<PathBuf>,
     /// Label used until the sidebar knows this session (restored state / click time).
     pub fallback_title: String,
     pub bell: bool,
@@ -53,12 +54,6 @@ pub struct TermTab {
     pub copy: Option<CopyPending>,
     /// Stable identity of the tab (indices shift when tabs close).
     pub uid: u64,
-    /// Queued composer/hotkey injections (status-bar actions).
-    pub injector: Injector,
-    /// A model/thinking change sent to omp and not yet seen in the session file.
-    pub pending_switch: Option<Pending>,
-    /// The last confirmed-by-timeout switch, shown while the session file records no model yet.
-    pub assumed_switch: Option<Pending>,
     /// Key of this tab's control socket (`deck_core::ctl::ctl_dir(key)`) when it was launched
     /// with the control extension; `None` for update tabs and when no extension is installed.
     pub ctl_key: Option<String>,
@@ -125,7 +120,7 @@ impl Tab {
     }
 
     pub fn session_path(&self) -> Option<&Path> {
-        self.term().and_then(|t| t.session_path.as_deref())
+        self.term().and_then(TermTab::session_path)
     }
 
     pub fn mux_name(&self) -> Option<&str> {
@@ -144,7 +139,7 @@ impl Tab {
         match self {
             // Restored tabs fall back to the stored (raw) title until omp sets one.
             Tab::Terminal(t) => {
-                strip_omp_prefix(t.pick_title(labels, t.term.title().map(strip_omp_prefix)))
+                strip_omp_prefix(t.pick_title(labels, t.terminal().title().map(strip_omp_prefix)))
             }
             Tab::Settings => "Settings",
         }
@@ -153,11 +148,7 @@ impl Tab {
     /// The leading indicator; the bell only counts on a background tab.
     pub fn status(&self, active: bool) -> TabStatus {
         match self.term() {
-            Some(t) => TabStatus::of(
-                t.term.exit_code(),
-                Activity::from_title(t.term.title()),
-                t.bell && !active,
-            ),
+            Some(t) => t.ctl.status(t.bell && !active),
             None => TabStatus::Idle,
         }
     }
@@ -176,9 +167,28 @@ impl Tab {
 }
 
 impl TermTab {
+    /// The terminal, for rendering, user input and read-only queries.
+    pub fn terminal(&self) -> &Terminal {
+        self.ctl.terminal()
+    }
+
+    pub fn terminal_mut(&mut self) -> &mut Terminal {
+        self.ctl.terminal_mut()
+    }
+
+    /// The session file behind the tab (the controller owns it: it starts a new generation when
+    /// another file takes over).
+    pub fn session_path(&self) -> Option<&Path> {
+        self.ctl.session_path()
+    }
+
+    pub fn session_path_owned(&self) -> Option<PathBuf> {
+        self.ctl.session_path().map(Path::to_path_buf)
+    }
+
     /// OSC title if non-empty, else the session label, else the stored title, else cwd basename.
     pub fn title<'a>(&'a self, labels: &'a HashMap<PathBuf, String>) -> &'a str {
-        self.pick_title(labels, self.term.title())
+        self.pick_title(labels, self.terminal().title())
     }
 
     fn pick_title<'a>(
@@ -193,50 +203,13 @@ impl TermTab {
         }
         osc.filter(|t| !is_noise_title(t))
             .or_else(|| {
-                self.session_path
-                    .as_ref()
+                self.session_path()
                     .and_then(|p| labels.get(p))
                     .map(String::as_str)
             })
             .or_else(|| Some(self.fallback_title.as_str()).filter(|t| !t.is_empty()))
             .or_else(|| self.cwd.file_name().and_then(|n| n.to_str()))
             .unwrap_or("omp")
-    }
-}
-
-/// What a tab's leading indicator shows, in precedence order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TabStatus {
-    /// The process ended (`clean` = exit code 0).
-    Exited { clean: bool },
-    /// omp waits for the user (`π !`).
-    Attention,
-    /// omp is working (spinner frame in the title).
-    Busy,
-    /// A bell rang on a background tab.
-    Bell,
-    /// Nothing to report: the caller's own idle look.
-    Idle,
-}
-
-impl TabStatus {
-    pub fn of(exit_code: Option<i32>, activity: Activity, bell: bool) -> TabStatus {
-        match (exit_code, activity) {
-            (Some(code), _) => TabStatus::Exited { clean: code == 0 },
-            (None, Activity::Attention) => TabStatus::Attention,
-            (None, Activity::Busy) => TabStatus::Busy,
-            _ if bell => TabStatus::Bell,
-            _ => TabStatus::Idle,
-        }
-    }
-
-    /// Tooltip line for the live omp states.
-    pub fn hint(self) -> Option<&'static str> {
-        match self {
-            TabStatus::Attention => Some("omp is waiting for your input"),
-            TabStatus::Busy => Some("omp is working…"),
-            _ => None,
-        }
     }
 }
 
@@ -289,6 +262,16 @@ pub struct ClosedTab {
     pub cwd: PathBuf,
     pub session_path: Option<PathBuf>,
     pub title: String,
+}
+
+impl ClosedTab {
+    pub fn session_path(&self) -> Option<&Path> {
+        self.session_path.as_deref()
+    }
+
+    pub fn session_path_owned(&self) -> Option<PathBuf> {
+        self.session_path.clone()
+    }
 }
 
 /// Where a relaunched tab goes, remembered as its neighbours' uids (not an index): tabs that
@@ -652,7 +635,7 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
             if let Some(p) = tab.session_path() {
                 ui.weak(p.display().to_string());
             }
-            if let Some(code) = term.and_then(|t| t.term.exit_code()) {
+            if let Some(code) = term.and_then(|t| t.terminal().exit_code()) {
                 ui.weak(format!("process exited: {code}"));
             }
         })
@@ -760,24 +743,5 @@ mod tests {
         assert_eq!(active_after_close(1, 1, 3), 1); // closed active, next slides in
         assert_eq!(active_after_close(2, 2, 3), 1); // closed last active
         assert_eq!(active_after_close(0, 0, 1), 0); // empty: clamped to 0
-    }
-
-    #[test]
-    fn tab_status_precedence() {
-        use Activity::*;
-        let of = TabStatus::of;
-        // Exited wins over everything; the code decides clean/failed.
-        assert_eq!(
-            of(Some(0), Attention, true),
-            TabStatus::Exited { clean: true }
-        );
-        assert_eq!(of(Some(1), Busy, false), TabStatus::Exited { clean: false });
-        // Then attention, busy, the bell, idle.
-        assert_eq!(of(None, Attention, true), TabStatus::Attention);
-        assert_eq!(of(None, Busy, true), TabStatus::Busy);
-        assert_eq!(of(None, Idle, true), TabStatus::Bell);
-        assert_eq!(of(None, Unknown, true), TabStatus::Bell);
-        assert_eq!(of(None, Idle, false), TabStatus::Idle);
-        assert_eq!(of(None, Unknown, false), TabStatus::Idle);
     }
 }
