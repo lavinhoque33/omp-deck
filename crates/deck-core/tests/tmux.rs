@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(target_os = "linux")]
+use deck_core::mux::{Mux, MuxKind};
 use deck_core::mux::{
     direct_launch, effective_cwd, new_session_name, session_name_for, terminal_env,
 };
@@ -538,4 +540,69 @@ fn pane_titles_report_each_sessions_active_pane_title() {
     assert_eq!(titles["omp-ta"], "π Working: my taskwith tab");
     assert_eq!(titles["omp-tb"], "second");
     assert_ne!(titles.get("omp-tc").map(String::as_str), Some("second"));
+}
+
+/// `Mux::running` reports every live session with its pane pid, working dir, start and the memory
+/// of its process tree from one pass; killing a session removes it; the server's own memory is
+/// reported separately.
+#[cfg(target_os = "linux")]
+#[test]
+fn running_reports_pid_cwd_started_and_memory_until_killed() {
+    if !tmux_available() {
+        eprintln!("tmux not installed; skipping running test");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let socket = format!("omp-deck-test-{}-running", std::process::id());
+    let tmux = Tmux::with_socket("tmux", socket, dir.path().join("cfg/tmux.conf"));
+    let _server = Server { tmux: tmux.clone() };
+    let mux = Mux::Tmux(tmux.clone());
+    assert!(mux.running(dir.path()).is_empty(), "no server → empty");
+    assert_eq!(mux.server_memory(), None);
+    tmux.ensure_config().unwrap();
+
+    let work = fs::canonicalize(dir.path()).unwrap();
+    let before = SystemTime::now() - Duration::from_secs(2);
+    for name in ["omp-r1", "omp-r2"] {
+        let argv = vec!["sleep".to_string(), "30".to_string()];
+        let spec = tmux.attach_or_create(name, &work, &argv);
+        let mut args = spec.args.clone();
+        let at = args.iter().position(|a| a == "new-session").unwrap() + 1;
+        args.insert(at, "-d".to_string());
+        let out = Command::new(&spec.program).args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let running = mux.running(dir.path());
+    let names: Vec<&str> = running.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["omp-r1", "omp-r2"]);
+    for r in &running {
+        assert_eq!(r.backend, MuxKind::Tmux);
+        assert_eq!(r.cwd.as_deref(), Some(work.as_path()), "{r:?}");
+        let pid = r.pid.expect("pane pid");
+        // The pane pid is the forked child until it has exec'd `sleep`.
+        wait_for("the pane to exec sleep", || {
+            fs::read_to_string(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c.starts_with("sleep"))
+        });
+        let started = r.started.expect("session_created");
+        assert!(started >= before && started <= SystemTime::now(), "{r:?}");
+        let mem = r.memory.expect("memory");
+        assert!(mem.processes >= 1 && mem.bytes > 0, "{mem:?}");
+        assert!(r.files.is_empty());
+    }
+    let server = mux.server_memory().expect("server memory");
+    assert_eq!(server.processes, 1);
+    assert!(server.bytes > 0);
+
+    mux.kill("omp-r1").unwrap();
+    wait_for("omp-r1 to disappear", || {
+        mux.running(dir.path()).iter().all(|r| r.name != "omp-r1")
+    });
+    let rest = mux.running(dir.path());
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].name, "omp-r2");
 }

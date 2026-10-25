@@ -1,0 +1,4 @@
+{"type":"session","version":3,"id":"01c00004","timestamp":"2026-02-04T10:00:00.000Z","cwd":"@CWD@"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-02-04T10:00:01.000Z","message":{"role":"user","content":"cut me","timestamp":1}}
+{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-04T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"api":"x","provider":"p","model":"m-a","usage":{"input":5,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.1}},"stopReason":"stop","timestamp":2}}
+{"type":"message","id":"a2","timestamp":"2026-02-04T10:00:03.000Z","message":{"role":"assistant","model":"m-a","usage":{"input":9

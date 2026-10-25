@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::PathBuf;
 
@@ -246,4 +247,92 @@ fn file_identity_follows_the_file_not_the_name() {
 #[test]
 fn path_bytes_round_trip_utf8_names() {
     assert_eq!(path_bytes(Path::new("/a/ü.jsonl")), "/a/ü.jsonl".as_bytes());
+}
+
+fn table(edges: &[(u32, &[u32])]) -> HashMap<u32, Vec<u32>> {
+    edges.iter().map(|(p, kids)| (*p, kids.to_vec())).collect()
+}
+
+#[test]
+fn tree_aggregation_sums_root_and_descendants_per_root() {
+    // 1 ─ 2 ─ 4, 1 ─ 3; 10 is a separate tree; 99 is an unrelated process.
+    let children = table(&[(1, &[2, 3]), (2, &[4]), (10, &[])]);
+    let mem = |pid: u32| Some(u64::from(pid) * 100);
+    let got = aggregate_tree(&[1, 2, 10], &children, mem);
+    assert_eq!(
+        got,
+        vec![
+            Some(TreeMemory {
+                bytes: 1000,
+                processes: 4
+            }),
+            Some(TreeMemory {
+                bytes: 600,
+                processes: 2
+            }),
+            Some(TreeMemory {
+                bytes: 1000,
+                processes: 1
+            }),
+        ]
+    );
+}
+
+#[test]
+fn tree_aggregation_survives_cycles_duplicates_and_vanished_processes() {
+    // pid reuse can make a table cyclic (2 → 1 → 2) and list a child twice; 5 vanished between the
+    // table pass and its memory read; the root 7 is gone altogether.
+    let children = table(&[(1, &[2, 2, 5]), (2, &[1, 3])]);
+    let mem = |pid: u32| (pid != 5 && pid != 7).then_some(10);
+    let got = aggregate_tree(&[1, 7], &children, mem);
+    assert_eq!(
+        got,
+        vec![
+            Some(TreeMemory {
+                bytes: 30,
+                processes: 3
+            }),
+            None
+        ]
+    );
+}
+
+#[test]
+fn tree_aggregation_of_nothing_is_empty() {
+    assert!(tree_memory(&[]).is_empty());
+}
+
+/// A shell with one background sleeper is two processes; the shell's tree accounts for both and
+/// a pid that does not exist is `None`.
+#[cfg(target_os = "linux")]
+#[test]
+fn tree_memory_counts_a_spawned_child_tree() {
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let child = Command::new("sh")
+        .args(["-c", "sleep 30 & wait"])
+        .spawn()
+        .unwrap();
+    let root = child.id();
+    let _reap = Reap(child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let tree = loop {
+        let tree = tree_memory(&[root, u32::MAX]);
+        if tree[0].is_some_and(|t| t.processes >= 2) {
+            break tree;
+        }
+        assert!(std::time::Instant::now() < deadline, "no sleeper: {tree:?}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let own = tree[0].unwrap();
+    assert!(own.bytes > 0, "{own:?}");
+    assert_eq!(tree[1], None);
+    let shell = process_memory(root).unwrap();
+    assert_eq!(shell.processes, 1);
+    assert!(own.bytes > shell.bytes, "{own:?} vs {shell:?}");
 }

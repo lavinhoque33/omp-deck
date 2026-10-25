@@ -25,6 +25,32 @@ fn sandboxed(agent: &Path) -> Option<Omp> {
         }
     }
 }
+/// An rpc omp that closes stdin and stdout but keeps running must not hang the caller: the
+/// shutdown is bounded, the process killed, and its stderr reported.
+#[cfg(unix)]
+#[test]
+fn an_rpc_omp_that_closes_its_pipes_but_stays_alive_is_killed_after_a_bounded_wait() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fake = tmp.path().join("omp");
+    fs::write(
+        &fake,
+        "#!/bin/sh\necho boom >&2\nexec 0<&- 1>&-\nexec sleep 120\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let started = std::time::Instant::now();
+    let err = Omp::at(&fake)
+        .copy_session(&tmp.path().join("src.jsonl"), tmp.path())
+        .unwrap_err();
+    assert!(err.to_string().contains("boom"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+}
 
 fn setting<'a>(cat: &'a deck_core::omp::SettingsCatalog, key: &str) -> &'a deck_core::omp::Setting {
     cat.tabs
@@ -243,6 +269,165 @@ fn fork_at_creates_a_new_file_ending_at_the_entry_and_keeps_the_source() {
 
     let err = omp.fork_at(&src, "no-such-entry").unwrap_err();
     assert!(!err.to_string().is_empty());
+}
+
+#[test]
+fn copy_session_copies_the_whole_session_with_artifacts_into_the_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = tmp.path().join("agent");
+    let cwd = tmp.path().join("proj");
+    let dest = tmp.path().join("dest");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    let Some(omp) = sandboxed(&agent) else {
+        return;
+    };
+    let omp = omp.with_env("PI_CONFIG_DIR", tmp.path().join("cfg"));
+    let src = write_session(&agent, &cwd);
+    let artifacts = src.with_extension("");
+    fs::create_dir_all(artifacts.join("artifacts")).unwrap();
+    fs::write(artifacts.join("artifacts/a.txt"), "hello").unwrap();
+    let before = fs::read(&src).unwrap();
+
+    let new = omp.copy_session(&src, &dest).unwrap();
+    assert_ne!(new, src);
+    assert!(new.is_file(), "{}", new.display());
+    assert_eq!(
+        entry_ids(&new),
+        ["u1", "a1", "u2", "a2"],
+        "the whole session"
+    );
+    assert_eq!(fs::read(&src).unwrap(), before, "source untouched");
+    assert!(src.is_file() && artifacts.join("artifacts/a.txt").is_file());
+    assert_eq!(
+        fs::read_to_string(new.with_extension("").join("artifacts/a.txt")).unwrap(),
+        "hello",
+        "artifacts are copied"
+    );
+
+    let header: serde_json::Value = fs::read_to_string(&new)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["type"] == "session")
+        .unwrap();
+    assert_eq!(header["cwd"].as_str(), dest.to_str());
+    assert_eq!(
+        header["parentSession"].as_str(),
+        Some("01a00000-0000-7000-8000-000000000001"),
+        "omp records the parent's session id"
+    );
+    assert_ne!(
+        header["id"].as_str(),
+        Some("01a00000-0000-7000-8000-000000000001")
+    );
+
+    // Copying again makes another fresh copy.
+    let again = omp.copy_session(&src, &dest).unwrap();
+    assert_ne!(again, new);
+}
+
+/// Without credentials for the session's model omp aborts start-up *after* `--fork` wrote the
+/// copy: the copy must be reported (not "failed"), and a retry must not be needed.
+#[test]
+fn copy_session_finds_the_fork_omp_wrote_before_failing_to_restore_the_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = tmp.path().join("agent");
+    let cwd = tmp.path().join("proj");
+    let dest = tmp.path().join("dest");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    let Some(omp) = sandboxed(&agent) else {
+        return;
+    };
+    let omp = omp.with_env("PI_CONFIG_DIR", tmp.path().join("cfg"));
+    let src = write_session(&agent, &cwd);
+    // No provider for `fake/fake-1`: nothing to restore the model with.
+    fs::remove_file(agent.join("models.yml")).unwrap();
+    let artifacts = src.with_extension("");
+    fs::create_dir_all(artifacts.join("artifacts")).unwrap();
+    fs::write(artifacts.join("artifacts/a.txt"), "hello").unwrap();
+
+    let new = omp.copy_session(&src, &dest).unwrap();
+    assert_ne!(new, src);
+    assert_eq!(entry_ids(&new), ["u1", "a1", "u2", "a2"]);
+    assert_eq!(
+        fs::read_to_string(new.with_extension("").join("artifacts/a.txt")).unwrap(),
+        "hello",
+        "artifacts are copied"
+    );
+    let top_level: Vec<_> = fs::read_dir(new.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .collect();
+    assert_eq!(top_level.len(), 1, "exactly one new session file");
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_session_failure_without_a_fork_reports_only_the_error_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dies = tmp.path().join("dies.sh");
+    install_exec(
+        &dies,
+        "#!/bin/sh\nprintf '27217 |   throw new Error(`x`)\\n              ^\\nerror: Could not restore model a/b\\n      at mY (/$bunfs/root/x.js:1:2)\\n' >&2\nexit 1\n",
+    );
+    let e = Omp::at(dies)
+        .with_env("PI_CODING_AGENT_DIR", tmp.path().join("agent"))
+        .copy_session(Path::new("/a.jsonl"), Path::new("/b"))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(e, "Could not restore model a/b");
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_session_runs_omp_fork_with_absolute_paths_and_reads_the_new_file_from_get_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("omp.sh");
+    install_exec(
+        &script,
+        r#"#!/bin/sh
+echo "$@" > "$(dirname "$0")/argv"
+read a
+echo "$a" > "$(dirname "$0")/request"
+echo '{"type":"ready"}'
+echo '{"id":"2","type":"response","command":"get_state","success":true,"data":{"sessionFile":"/new/copy.jsonl"}}'
+cat >/dev/null
+"#,
+    );
+    let omp = Omp::at(script);
+    let got = omp
+        .copy_session(Path::new("rel/src.jsonl"), Path::new("rel/dest"))
+        .unwrap();
+    assert_eq!(got, Path::new("/new/copy.jsonl"));
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("argv")).unwrap().trim(),
+        format!(
+            "--mode rpc --fork {} --cwd {}",
+            cwd.join("rel/src.jsonl").display(),
+            cwd.join("rel/dest").display()
+        )
+    );
+    let req: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(tmp.path().join("request")).unwrap()).unwrap();
+    assert_eq!(
+        req["type"], "get_state",
+        "no fork request: --fork already copied"
+    );
+
+    let dies = tmp.path().join("dies.sh");
+    install_exec(
+        &dies,
+        "#!/bin/sh\necho 'Error: destination missing' >&2\nexit 1\n",
+    );
+    let e = Omp::at(dies)
+        .copy_session(Path::new("/a.jsonl"), Path::new("/b"))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(e, "destination missing");
 }
 
 #[cfg(unix)]

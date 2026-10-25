@@ -36,8 +36,8 @@ pub use windows::{ctl_dir, prepare_ctl_dir, prune_ctl_dirs};
 /// `OMPDECK_CTL_PIPE` (Windows) is set.
 pub const EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-ctl.ts");
 
-/// The session-delete extension (see [`crate::omp::Omp::delete_session`]): inert unless
-/// `OMPDECK_DEL_TARGET` and `OMPDECK_DEL_OUT` are set.
+/// The session-delete extension (see [`crate::omp::Omp::delete_sessions`]): inert unless
+/// `OMPDECK_DEL_TARGETS` and `OMPDECK_DEL_OUT` are set.
 pub const DELETE_EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-del.ts");
 
 const EXTENSION_FILE: &str = "ompdeck-ctl.ts";

@@ -750,6 +750,13 @@ impl App {
             None,
         );
         add(
+            "view.sessions",
+            "View: Session manager",
+            Some("Ctrl+Shift+S"),
+            ICON_HARD_DRIVE,
+            None,
+        );
+        add(
             "view.dashboard",
             "View: Agents dashboard",
             Some("Ctrl+Shift+A"),
@@ -1224,6 +1231,7 @@ impl App {
                 }
             }
             "view.usage" => self.toggle_usage(),
+            "view.sessions" => self.toggle_sessions(),
             "view.dashboard" => self.toggle_dashboard(false),
             "view.changes" => self.toggle_changes_panel(),
             "view.switcher" => self.open_palette(Mode::Switcher),

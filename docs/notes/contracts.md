@@ -2016,3 +2016,180 @@ The title run-state glyph (`!` = waiting on the user) is unaffected, so `TabStat
   newer toast for a tab replaces the older one; withdraw = `ToastNotificationManager::History()
   .RemoveGroupedTagWithId(tag, "omp-deck", app_id)`, Clear all = `RemoveGroupWithId("omp-deck", app_id)`.
   Activated/Dismissed handlers keep today's signals (click → `Signal::Clicked`, dismiss → `Signal::Gone`).
+
+## Wave 19: session manager hub (inventory, sizes, bulk delete / copy / move)
+
+Facts (omp 18.12.6, `~/PersProject/oh-my-pi/packages`; real store measured 2026-10-24):
+- `deleteSessionWithArtifacts` (`coding-agent/src/session/session-storage.ts:1057-1093`) removes the `.jsonl`, the
+  same-stem sibling dir and `<stem>.jsonl.*.bak`. Blobs (`~/.omp/agent/blobs`, content-addressed, shared) are only
+  reclaimed by `omp gc --blobs`. So "space freed by delete" = jsonl + sibling dir + `.bak` files.
+- Usage/cost live inline on each assistant `message` entry (`message.usage {input,output,cacheRead,cacheWrite,
+  totalTokens}`, `message.cost.total` — may be absent; `message.model`, `message.provider`); calls outside the
+  transcript are `model_usage` entries with the same `usage`/`model` fields. Header (`type:"session"`) carries
+  `id, timestamp, cwd, parentSession? (abs path of the parent jsonl), previousSessionFiles?`. Subagent transcripts
+  are `<stem>/**/<AgentId>.jsonl` (same entry format, `parentSession` → the main file).
+- `~/.omp/stats.db` has per-file rows but is only synced while `omp stats`/`/usage` run (stale rows for deleted
+  files observed) → **not used**; OmpDeck parses the jsonl itself.
+- Store here: ~114 top-level sessions, ~12.7 k files / 3.2 GiB under the sessions root; a metadata-only walk of
+  everything takes ~0.4 s warm. Main jsonl total ~0.8 GB, subagent transcripts ~1.4 GB (largest single file 196 MiB).
+- omp has no session-listing CLI; `omp session` = pack | unpack | moved.
+
+### deck-core (new module `deck_core::inventory`; `sessions.rs` scanner unchanged for the sidebar)
+- `pub fn scan(root: &SessionsRoot) -> Vec<InventoryEntry>`: every top-level `<root>/<dir>/*.jsonl` that has a
+  session header — **including the prompt-less stubs the sidebar hides** — metadata + bounded header reads (reuse
+  the sessions parser rules: 16 KiB header window, ≤ 2 MiB for the first prompt) plus a metadata-only recursive walk
+  of the sibling dir (no symlink following, depth ≤ 16). Never lists subagent transcripts as sessions.
+  ```rust
+  pub struct InventoryEntry {
+      pub id: String, pub path: PathBuf, pub cwd: PathBuf,          // header cwd
+      pub title: Option<String>, pub first_prompt: Option<String>,
+      pub created: Option<SystemTime>,                               // header timestamp
+      pub modified: SystemTime,                                      // jsonl mtime
+      pub jsonl_bytes: u64,
+      pub artifact_bytes: u64, pub artifact_files: u32,              // sibling dir (recursive) + .bak files
+      pub subagents: u32,                                            // *.jsonl transcripts in the sibling dir (no .bak)
+      pub parent: Option<PathBuf>,                                   // header parentSession
+      pub cwd_exists: bool,
+  }
+  impl InventoryEntry { pub fn total_bytes(&self) -> u64; pub fn is_stub(&self) -> bool /* no title, no prompt */; }
+  ```
+- `pub struct SessionStats { user_messages: u32, assistant_turns: u32, input_tokens: u64, output_tokens: u64,
+  cache_read_tokens: u64, cache_write_tokens: u64, cost: f64, subagent_cost: f64, models: Vec<String> /* by use count
+  desc */, compactions: u32, last_activity: Option<SystemTime> /* last entry timestamp */, last_outcome: TurnOutcome }`
+  (all `pub`; `TurnOutcome` = `status::TurnOutcome`). Main-file numbers come from the main jsonl only; `subagent_cost`
+  sums `cost.total` over the sibling dir's transcripts.
+- `pub struct StatsCache` (`new()`, `get(&self, path) -> Option<&SessionStats>`, `compute(&mut self, entry:
+  &InventoryEntry) -> io::Result<SessionStats>`): keyed by file (path, len, mtime) for the main file and each
+  transcript; an appended file (same path, larger len, same prefix) is parsed **incrementally from the cached offset**;
+  truncated last line tolerated; parse cost proportional to bytes (prefilter lines by type before full JSON decode;
+  never deserialize message content). In-memory only (no disk cache). Blocking; callers run it on a worker.
+- `Omp::delete_sessions(&self, files: &[PathBuf], on_result: impl FnMut(&Path, Result<(), DeleteError>))`: **one**
+  headless omp process for the whole batch. `ompdeck-del.ts` gains batch mode: `OMPDECK_DEL_TARGETS=<file with one
+  abs path per line>` (the single `OMPDECK_DEL_TARGET` mode is removed), one NDJSON result line per target
+  `{"target":…,"ok":true,"id":…}` / `{"target":…,"ok":false,"error":"live"|"no session header"|msg}`, each target under
+  its own lease. Targets answering `live` are retried in a fresh batch up to 5 rounds ~250 ms apart (the retry moves
+  from the app into deck-core). Timeout scales with the batch (20 s + 2 s per target). Results are reported per target
+  as they complete. `delete_session` is removed; the sidebar's single delete calls `delete_sessions` with one file.
+- `Omp::copy_session(&self, src: &Path, dest_cwd: &Path) -> Result<PathBuf, OmpError>`: headless whole-session copy
+  with the same semantics as the tab Copy (`omp --fork <src> --cwd <dest>`: fresh id, `parentSession` = src, artifacts
+  copied, src untouched) via a headless omp (`--mode rpc` + stdin EOF, like `fork_at`); returns the new file. Fact-check
+  the route with real omp and record it in `docs/notes/` facts of the result.
+- `Omp::move_session` unchanged.
+
+### omp-deck (`sessions_view.rs` rendering + `app/session_manager.rs` glue)
+- **Hub**: large modal window like Usage (scrim, resizable `egui::Window`, palette frame, Esc closes when no popup is
+  open). Opened by **Ctrl+Shift+S**, ⋯ app menu "Session manager…", palette "View: Session manager", a sidebar header
+  icon button, and project context menu "Manage sessions…" (opens scoped to that project). Registered in the `ui()`
+  focus block so the terminal does not take keys while it is open.
+- **Left pane — projects**: "All projects" + one row per project cwd (display = `~`-abbreviated, worktrees by their
+  branch label like the sidebar): session count + total size, sorted by size desc; "folder missing" marker when
+  `!cwd_exists`. Selecting a row scopes the table.
+- **Table** (hand-rolled rows; visible borders, hover pops the outline, theme palette): checkbox, title (fallback
+  first prompt, else `(empty)` stub badge), project (when All), size (total; tooltip jsonl / artifacts / files),
+  messages (user prompts · assistant turns), tokens (in/out), cost (main + subagents), model (most used), subagents,
+  created, last activity (relative), status badges: Running, Open in tab, Busy, Error/Aborted last turn, Fork of …,
+  Folder missing, Stub. Sort by clicking any column header (default: last activity desc). Stats columns fill in
+  progressively from a background worker (spinner/“…” until computed); the table never blocks.
+- **Filters**: text (title, prompt, cwd, id prefix; case-insensitive) + quick chips that combine: "Older than"
+  (7/30/90 days, by last activity), "Larger than" (10/100 MB), "Empty stubs", "Folder missing", "Not running".
+  Header shows totals for the scope: N sessions · size, and the selection: N selected · frees X.
+- **Selection**: checkbox per row, Shift+click range, header checkbox = all visible, Esc-safe; selection drops paths
+  that disappear after a refresh.
+- **Detail pane** (row click): full title, id (copy), path (copy, show in file manager), cwd (open folder), created,
+  last activity, size breakdown (jsonl / artifacts / files / subagents), tokens (in/out/cache r/w), cost split, models
+  list, compactions, parent (click → select it) and forks of this session (sessions whose `parent` = this path), and
+  buttons Open (tab; closes the hub), Copy to…, Move to…, Delete…, Stop process (running only).
+- **Bulk actions** on the selection: **Delete…** (confirm: count, projects, total freed size, running count — running
+  ones are stopped first, busy ones flagged as interrupted; then one `delete_sessions` batch on a worker with a
+  per-row progress state; tabs for deleted sessions are closed without "remember", paths dropped from recently-closed
+  / persisted tabs — the same cleanup the sidebar delete does), **Copy to…** / **Move to…** (destination = transfer
+  targets list + "Choose folder…" `FolderDialog`; copy = sequential `copy_session` on one worker, no tabs opened; move
+  = existing confirm text + stop-first + `retry_while_live(move_session)` per session sequentially, with tabs reopened
+  on the new path like the single move), **Stop** (running ones; only those sessions' processes). Progress shows
+  in the hub footer ("Deleting 3 / 12…"), results as toasts + per-row error text; the inventory refreshes after.
+- The sidebar's single delete / copy / move keep their current UX but route through the same deck-core calls
+  (`delete_sessions` with one file).
+- Inventory scan runs on a worker when the hub opens and after every hub operation (plus a Refresh button); it is not
+  polled while the hub is closed. StatsCache lives in the app for the process lifetime (re-open is instant for
+  unchanged files).
+
+### Wave 19 as built
+- Facts verified with omp 18.12.6 (CoreW19): cost lives at `message.usage.cost.total` (stats read it first, fall back
+  to `message.cost.total`). `parentSession` is **either** the parent's session id (`omp --fork` writes the id) **or**
+  an absolute path (subagents, older forks); `inventory::scan` resolves an id to the parent's file when it is in the
+  store (else `parent = None`) and keeps absolute paths as written. `model_usage` entries count into tokens/cost/models
+  but not `assistant_turns`.
+- `Omp::copy_session` = headless `omp --mode rpc --fork <abs src> --cwd <abs dest>` + `get_state` (`sessionFile`) +
+  stdin EOF; fresh id, header cwd = dest, sibling dir copied, src untouched; the source path must be absolute.
+  `fork_at` and `copy_session` share one private rpc helper (surfaces omp's stderr on an early exit / broken pipe).
+- Extra API: `InventoryEntry::artifact_dir()`, `StatsCache::compute_many(entries, threads, cancel, on_done)` (slice
+  order, `on_done` on the caller's thread), `StatsCache::prune(entries)`. `Omp::delete_session` removed.
+- Real store (113 sessions, 2.6 GiB parsed, warm page cache): scan 35–340 ms; stats cold 4.3 s on 1 thread, 1.3–2.4 s
+  on 4–8 threads; warm (cached) 25–90 ms.
+- omp-deck: pure model `sessions_model.rs` (filters, chips, sort, Shift-range, pruning, badges), view
+  `sessions_view.rs`, glue `app/session_manager.rs`; `transfer::{Subject, FolderDialog::many, check_dest_dir}`;
+  move split into `prepare_move` + `MovePrep::run` shared by sidebar and hub; app-side delete retry removed.
+
+### Wave 19b: running sessions — RAM + kill (user follow-up)
+User ask: "in the session manager, give an option to kill running sessions (tmux processes and how much ram they are
+taking)".
+
+deck-core:
+- `platform::tree_memory(roots: &[u32]) -> Vec<Option<TreeMemory>>`, `pub struct TreeMemory { bytes: u64, processes:
+  u32 }` (all `pub`): memory of each root's whole process tree (root + descendants). Linux: `/proc/<pid>/smaps_rollup`
+  `Pss:` (proportional, so shared pages are not double counted), falling back to `VmRSS` from `/proc/<pid>/status`
+  when unreadable; one `/proc` pass for all roots (build the ppid map once). Windows: Toolhelp32 snapshot for the tree,
+  `GetProcessMemoryInfo` → `PrivateUsage` (fallback `WorkingSetSize`). Vanished processes skipped; root gone → `None`.
+  Unit-test the tree aggregation with an injected process table (pure function), plus one Linux test that spawns a
+  child tree and sees `processes ≥ 2` and `bytes > 0`.
+- `Mux::running(&self, root: &Path) -> Vec<RunningSession>` (blocking, ≤ ~200 ms typical; called on a worker):
+  ```rust
+  pub struct RunningSession {
+      pub name: String,                 // mux session name (what Mux::kill takes)
+      pub backend: BackendKind,         // Tmux | Host (existing enum if there is one, else new)
+      pub files: Vec<PathBuf>,          // same mapping as session_files
+      pub title: Option<String>,        // pane title (as pane_titles)
+      pub cwd: Option<PathBuf>,         // pane current path / host cwd
+      pub started: Option<SystemTime>,  // tmux session_created / host child_started_unix_ms
+      pub pid: Option<u32>,             // pane pid / host child pid
+      pub memory: Option<TreeMemory>,   // tmux: pane process tree; host: daemon tree (daemon + child + descendants)
+  }
+  ```
+  plus `Tmux::server_memory(&self) -> Option<TreeMemory>` (the server process alone, `#{pid}`), exposed through
+  `Mux::server_memory()` (`None` for Host). One tmux `list-panes -a` call for all panes; one `/proc` pass.
+- Kill uses the existing `Mux::kill` (tmux detaches clients first — the tmux segfault rule stays).
+
+omp-deck (hub):
+- Hub gets a top-level switch **Sessions | Running** (Running label shows `N · <total RAM>`). The Running view lists
+  every live session of every polled backend — including ones not mapped to a session file (e.g. a new session before
+  its first message, an omp that `/resume`d elsewhere) — columns: checkbox, title (session title via file → inventory,
+  else pane title, else mux name), project, backend, **RAM** (tree total, tooltip: processes count, pid), uptime,
+  badges (Open in tab, Busy, Attention). Sort by RAM desc default; any column sortable. Footer: total RAM of the
+  listed sessions + tmux server line ("tmux server: X") when tmux is in use.
+- Polled on a worker every 2 s **only while the Running view is visible**.
+- **Kill…** on the selection (and per-row button): confirm with count, RAM to be freed, and warnings for busy ones
+  ("will be interrupted") and ones open in tabs (those tabs show `[process exited: …]`, same as the existing "Stop
+  session process"). Kills **only the selected sessions** via the same path the existing stop action uses; other tabs'
+  processes untouched. Results toast; list refreshes immediately.
+- Sessions table: a **RAM** column (blank for not-running) and a "Running" filter chip; the detail pane shows RAM and
+  a "Kill process" button for running sessions (the existing Stop wording becomes "Kill process" in the hub).
+
+### Wave 19b as built + fix loop
+- deck-core reuses `mux::MuxKind { Tmux, Host }` (no `BackendKind`); `platform::process_memory(pid)` for the tmux
+  server; `Tmux::running` = one `list-panes -a`; tmux memory/files cover all panes of a session.
+- Review fixes: `Omp::delete_sessions(&[DeleteTarget { path, id }], …)` — the extension leases the **expected id** and
+  re-reads the header under the lease; mismatch/missing → `DeleteError::Changed` (never retried); a `.jsonl` without
+  a readable header also reports `Changed`. Inventory and `sessions::Scanner`/`find_fork` skip symlinked project dirs
+  and symlinked `.jsonl` files. rpc helper shutdown is bounded (5 s, then kill + reap) on every path. StatsCache
+  append check = SipHash over the whole parsed prefix after the title line (+ first-line length).
+- `copy_session`: when omp fails after writing the fork (e.g. "Could not restore model …" without credentials) the
+  fork is found via `sessions::find_copy(root, parents, dest_cwd, since)` and returned as success; omp error text is
+  trimmed to its `error:` line everywhere (full stderr logged).
+- UI: selection/stats/errors survive a rescan only when path **and** id match; cell galleys cached (`paint_cache.rs`);
+  hub releases terminal focus on open; Project column = folder name + elided parent; short badges (`Fork`,
+  `No folder`, `In tab`) with full tooltips; Subs column dropped (count in the Msgs tooltip); detail buttons pinned;
+  copy toast reports skipped sessions already in the destination. Sessions view also polls running/RAM every 5 s
+  while a session runs (hub open only).
+- Known, unchanged: an omp started outside OmpDeck that has not written yet holds no lease, so it is neither shown as
+  running nor protected from delete (omp's own lease behaviour). Sizes use binary units labelled KB/MB (app-wide).
+- Column widths: `col_alloc::allocate` (pure) sizes fixed columns to their widest cached cell, title gets the rest (min 160), drop order Created → Model → idle RAM → empty Status → …; Size and Cost never dropped. Model shown compact (`compact_model`, full name in tooltip).

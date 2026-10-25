@@ -88,6 +88,28 @@ pub fn tree_open_files(roots: &[u32]) -> Vec<Vec<PathBuf>> {
         .collect()
 }
 
+/// ppid → children of every process (`/proc/*/stat`, Linux; empty elsewhere).
+pub fn process_children() -> HashMap<u32, Vec<u32>> {
+    proc_children()
+}
+
+/// Bytes charged to `pid`: `Pss` from `/proc/<pid>/smaps_rollup`, else `VmRSS` from
+/// `/proc/<pid>/status` (smaps_rollup is unreadable for other users' processes). `None` when the
+/// process is gone or has neither (kernel threads, no procfs).
+pub fn process_memory(pid: u32) -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let kb_field = |path: String, key: &str| -> Option<u64> {
+        let text = fs::read_to_string(path).ok()?;
+        let line = text.lines().find_map(|l| l.strip_prefix(key))?;
+        line.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()
+    };
+    kb_field(format!("/proc/{pid}/smaps_rollup"), "Pss:")
+        .or_else(|| kb_field(format!("/proc/{pid}/status"), "VmRSS:"))
+        .map(|kb| kb.saturating_mul(1024))
+}
+
 /// ppid → children, from `/proc/*/stat`.
 fn proc_children() -> HashMap<u32, Vec<u32>> {
     let mut map: HashMap<u32, Vec<u32>> = HashMap::new();

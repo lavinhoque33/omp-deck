@@ -155,6 +155,7 @@ impl App {
             || self.popup.is_some()
             || self.tree.is_some()
             || self.usage_open
+            || self.sessions.open
             || self.palette.is_some()
             || egui::Popup::is_any_open(ctx)
         {

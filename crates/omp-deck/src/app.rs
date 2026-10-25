@@ -78,10 +78,12 @@ mod project_sync;
 mod spawn;
 mod split;
 use split::PaneClaim;
+mod session_manager;
 mod tree;
 mod usage;
 mod worktree;
 
+use session_manager::MovePrep;
 use spawn::{Focus, Post, SpawnReq};
 use worktree::{WtEvent, WtUi};
 
@@ -146,6 +148,8 @@ enum AppEvent {
     TreeForked(Result<PathBuf, String>),
     /// A usage fetch / `stats.db` read finished.
     Usage(UsageEvent),
+    /// The session manager's scan / statistics / bulk-operation workers reported.
+    Sessions(session_manager::SessionsEvent),
     /// A Google Drive backup job finished.
     Drive(drive::DriveEvent),
     /// A project sync worker finished.
@@ -192,6 +196,17 @@ enum PendingConfirm {
     RestartSession(RestartTarget),
     /// Delete a session file (and its artifacts) through omp.
     DeleteSession(SessionEntry),
+    /// Delete the sessions checked in the session manager.
+    DeleteSessions(Vec<deck_core::omp::DeleteTarget>),
+    /// Move the session manager's selection into a folder.
+    MoveSessions {
+        paths: Vec<PathBuf>,
+        dest: PathBuf,
+    },
+    /// Stop the running sessions checked in the session manager.
+    StopSessions(Vec<PathBuf>),
+    /// Kill the live sessions (by backend name) checked in the session manager's Running view.
+    KillRunning(Vec<String>),
     /// Restore a downloaded Google Drive backup over the local omp config.
     RestoreBackup(Box<deck_core::gdrive::PreparedRestore>),
     /// Remove a clean, merged worktree (and its branch) after stopping the tabs inside it.
@@ -322,6 +337,7 @@ pub struct App {
     usage: Usage,
     usage_open: bool,
     usage_ui: usage_view::ViewState,
+    sessions: session_manager::SessionHub,
     tree_busy: Option<tree::TreeBusy>,
     // Wave 5: live subagent control.
     /// The installed control extension every omp launch loads.
@@ -576,6 +592,7 @@ impl App {
             usage,
             usage_open: false,
             usage_ui: usage_view::ViewState::default(),
+            sessions: session_manager::SessionHub::default(),
             tree_busy: None,
             fonts_finalized: false,
             frame_count: 0,
@@ -1291,6 +1308,7 @@ impl App {
         // Most specific first (egui ignores extra Shift/Alt when matching).
         let tree_key = (session_tab || self.tree.is_some()) && self.tree_shortcut(ctx);
         let usage_key = self.usage_shortcut(ctx);
+        let sessions_key = self.sessions_shortcut(ctx);
         let changes_key =
             self.changes_available() && ctx.input_mut(|i| i.consume_key(ctrl_shift, Key::G));
         let (reopen, prev, next, bigger, smaller, reset, dashboard) = ctx.input_mut(|i| {
@@ -1320,6 +1338,9 @@ impl App {
         }
         if usage_key {
             self.toggle_usage();
+        }
+        if sessions_key {
+            self.toggle_sessions();
         }
         if reopen {
             self.reopen_closed();
@@ -1359,6 +1380,7 @@ impl App {
                 AppEvent::SpawnPrepared(p) => self.on_spawn_prepared(p),
                 AppEvent::TreeForked(r) => self.on_tree_forked(r),
                 AppEvent::Usage(u) => self.on_usage_event(u),
+                AppEvent::Sessions(ev) => self.on_sessions_event(ev),
                 AppEvent::Drive(ev) => self.on_drive_event(ev),
                 AppEvent::Sync(ev) => self.on_sync_event(ev),
                 AppEvent::Worktree(ev) => self.on_wt_event(ev),
@@ -1449,6 +1471,7 @@ impl App {
             BarAction::FontLarger => self.set_font_size(self.cfg.font_size + 1.0),
             BarAction::FontSmaller => self.set_font_size(self.cfg.font_size - 1.0),
             BarAction::OpenUsage => self.open_usage(),
+            BarAction::OpenSessions => self.open_sessions(None),
             BarAction::OpenAgents => self.toggle_dashboard(false),
             BarAction::FontReset => self.set_font_size(DEFAULT_FONT),
             BarAction::SetTheme(t) => self.set_theme(t),
@@ -1578,6 +1601,7 @@ impl App {
             SidebarAction::Open(entry) => self.open_session(&entry),
             SidebarAction::New(cwd) => self.new_session(cwd),
             SidebarAction::Refresh => self.refresh_sessions(),
+            SidebarAction::ManageSessions(scope) => self.open_sessions(scope),
             SidebarAction::CopyText { text, what } => self.copy_text(&text, what),
             SidebarAction::OpenFolder(dir) => self.open_folder(dir),
             SidebarAction::Stop(entry) => self.request_stop(&entry),
@@ -1769,6 +1793,7 @@ impl App {
             || self.wt.dialog.is_some()
             || self.drive.modal_open()
             || self.sync.modal_open()
+            || self.sessions.open
             || self.palette.is_some()
     }
 
@@ -1811,6 +1836,12 @@ impl App {
             }
             PendingConfirm::RestartSession(target) => self.execute_restart_session(target),
             PendingConfirm::DeleteSession(entry) => self.execute_delete(entry),
+            PendingConfirm::DeleteSessions(paths) => self.execute_delete_sessions(paths),
+            PendingConfirm::MoveSessions { paths, dest } => {
+                self.execute_move_sessions(paths, dest);
+            }
+            PendingConfirm::StopSessions(paths) => self.execute_stop_sessions(paths),
+            PendingConfirm::KillRunning(names) => self.execute_kill_running(names),
             PendingConfirm::RemoveWorktree { wt, base } => self.execute_remove(wt, base),
             PendingConfirm::DropSyncRow { path } => self.drop_sync_row(&path),
             PendingConfirm::Changes(w) => self.execute_changes_write(w),
@@ -2371,9 +2402,32 @@ impl App {
         if self.omp.is_none() || !self.moving.insert(entry.path.clone()) {
             return;
         }
+        let prep = self.prepare_move(entry);
+        let title = prep.entry.label().to_owned();
+        self.toasts.info(
+            &self.ctx,
+            format!("Moving “{title}” to {}…", abbreviate_home(&dest)),
+        );
+        let backends = self.backends.clone();
+        let src = prep.entry.path.clone();
+        self.spawn_omp(move |omp| {
+            let (result, tab) = prep.run(&omp, &backends, &dest);
+            OmpEvent::MoveDone {
+                src,
+                dest,
+                title,
+                tab,
+                result,
+            }
+        });
+        self.running.poke();
+    }
+
+    /// Capture the tab state of a session about to be moved and close its tabs. The monitor
+    /// snapshot can lag behind a tab that was just opened: the session each matching tab
+    /// recorded is killed as well, not only the snapshot's holder.
+    pub(super) fn prepare_move(&mut self, entry: SessionEntry) -> MovePrep {
         let holder = self.running_session_name(&entry);
-        // The monitor snapshot can lag behind a tab that was just opened: kill the session
-        // each matching tab recorded as well, not only the snapshot's holder.
         let mut kill_names: Vec<String> = holder.iter().cloned().collect();
         let mut tab_state: Option<ClosedTab> = None;
         let (mut slot, mut was_active) = (0, false);
@@ -2413,58 +2467,13 @@ impl App {
         // switched since.
         let refocus = was_active.then_some(self.activation_seq);
         let anchor = Anchor::at(&self.tab_uids(), slot);
-        let title = entry.label().to_owned();
-        self.toasts.info(
-            &self.ctx,
-            format!("Moving “{title}” to {}…", abbreviate_home(&dest)),
-        );
-        let backends = self.backends.clone();
-        let persistent = !backends.is_empty();
-        let (src, id) = (entry.path, entry.id);
-        self.spawn_omp(move |omp| {
-            for name in &kill_names {
-                if let Err(e) = backends.kill(name) {
-                    log::warn!("kill {name} before move: {e}");
-                }
-            }
-            let result = omp_worker::retry_while_live(
-                omp_worker::MOVE_ATTEMPTS,
-                omp_worker::MOVE_RETRY_DELAY,
-                || omp.move_session(&src, &dest).map_err(|e| e.to_string()),
-            );
-            let tab = tab_state.map(|mut tab| {
-                match &result {
-                    Ok(outcome) => {
-                        let new_id = match &outcome.kind {
-                            MoveKind::Forked { new_id } => new_id,
-                            _ => &id,
-                        };
-                        tab.mux_name = persistent.then(|| session_name_for(new_id));
-                        tab.cwd = dest.clone();
-                        tab.session_path = Some(outcome.new_path.clone());
-                    }
-                    Err(_) => {
-                        // Re-attach a session that survived; else resume the original file
-                        // under its canonical name.
-                        let alive = kill_names.iter().find(|n| backends.has_session(n)).cloned();
-                        tab.mux_name = alive.or_else(|| persistent.then(|| session_name_for(&id)));
-                    }
-                }
-                Box::new(MovedTab {
-                    tab,
-                    anchor,
-                    refocus,
-                })
-            });
-            OmpEvent::MoveDone {
-                src,
-                dest,
-                title,
-                tab,
-                result,
-            }
-        });
-        self.running.poke();
+        MovePrep {
+            entry,
+            kill_names,
+            tab: tab_state,
+            anchor,
+            refocus,
+        }
     }
 
     fn request_delete(&mut self, entry: SessionEntry) {
@@ -2514,7 +2523,42 @@ impl App {
         if self.omp.is_none() || !self.moving.insert(entry.path.clone()) {
             return;
         }
-        let holder = self.running_session_name(&entry);
+        let kill_names = self.session_kill_names(&entry, true);
+        let path = entry.path.clone();
+        let id = entry.id.clone();
+        let title = entry.label().to_owned();
+        let backends = self.backends.clone();
+        self.spawn_omp(move |omp| {
+            session_manager::kill_all(&backends, &kill_names, "delete");
+            let mut result = Err("omp did not answer".to_owned());
+            let target = deck_core::omp::DeleteTarget {
+                path: path.clone(),
+                id,
+            };
+            omp.delete_sessions(std::slice::from_ref(&target), |_, r| {
+                result = r.map_err(|e| session_manager::delete_error_text(&e));
+            });
+            OmpEvent::DeleteDone {
+                path,
+                title,
+                result,
+            }
+        });
+        self.running.poke();
+        self.toasts
+            .info(&self.ctx, format!("Deleting “{}”…", entry.label()));
+    }
+
+    /// Kill list for stopping `entry`: the backend session that holds it, plus the ones its
+    /// tabs recorded (the monitor snapshot can lag behind a tab that was just opened). Tabs
+    /// without a backend session are killed on the spot; with `close_tabs` every tab on the
+    /// session is closed without being remembered and the reopen stack forgets the session.
+    pub(super) fn session_kill_names(
+        &mut self,
+        entry: &SessionEntry,
+        close_tabs: bool,
+    ) -> Vec<String> {
+        let holder = self.running_session_name(entry);
         let mut kill_names: Vec<String> = holder.iter().cloned().collect();
         for i in (0..self.tabs.len()).rev() {
             let hit = self.tabs[i].term().is_some_and(|t| {
@@ -2534,43 +2578,15 @@ impl App {
                     None => t.term.kill(),
                 }
             }
-            self.close_tab(i, false);
+            if close_tabs {
+                self.close_tab(i, false);
+            }
         }
-        let path = entry.path.clone();
-        self.closed
-            .retain(|c| c.session_path.as_deref() != Some(path.as_path()));
-        let title = entry.label().to_owned();
-        let backends = self.backends.clone();
-        self.spawn_omp(move |omp| {
-            for name in &kill_names {
-                if let Err(e) = backends.kill(name) {
-                    log::warn!("kill {name} before delete: {e}");
-                }
-            }
-            // Each attempt spawns a headless omp (~0.8 s): few attempts, short delay (~5 s total).
-            let mut tries = 1;
-            let result = loop {
-                match omp.delete_session(&path) {
-                    // A just-killed omp needs a moment to release the session lease.
-                    Err(deck_core::omp::DeleteError::Live) if tries < DELETE_ATTEMPTS => {
-                        tries += 1;
-                        std::thread::sleep(DELETE_RETRY_DELAY);
-                    }
-                    Err(deck_core::omp::DeleteError::Live) => {
-                        break Err("it is open in another omp process".to_owned());
-                    }
-                    other => break other.map_err(|e| e.to_string()),
-                }
-            };
-            OmpEvent::DeleteDone {
-                path,
-                title,
-                result,
-            }
-        });
-        self.running.poke();
-        self.toasts
-            .info(&self.ctx, format!("Deleting “{}”…", entry.label()));
+        if close_tabs {
+            self.closed
+                .retain(|c| c.session_path.as_deref() != Some(entry.path.as_path()));
+        }
+        kill_names
     }
 
     fn on_delete_done(&mut self, path: &std::path::Path, title: &str, result: Result<(), String>) {
@@ -2617,29 +2633,36 @@ impl App {
                 ),
             ),
         }
-        if let Some(MovedTab {
+        self.restore_moved_tab(&src, tab);
+    }
+
+    /// Bring back the tab that was open on a moved session: on the new path after a successful
+    /// move, on the original one (re-attached if its session survived) after a failure.
+    pub(super) fn restore_moved_tab(&mut self, src: &Path, tab: Option<Box<MovedTab>>) {
+        let Some(MovedTab {
             tab: t,
             anchor,
             refocus,
         }) = tab.map(|b| *b)
-        {
-            self.retarget_pane_claim(&src, t.session_path.clone(), t.mux_name.clone());
-            let argv = self.with_omp_program(tabs::omp_argv(t.session_path.as_deref()));
-            self.spawn_tab_post(SpawnReq {
-                mux_name: t.mux_name,
-                cwd: t.cwd,
-                session_path: t.session_path,
-                title: t.title,
-                argv,
-                role: TabRole::Session,
-                post: Post::Anchor(anchor),
-                focus: if refocus == Some(self.activation_seq) {
-                    Focus::Claim
-                } else {
-                    Focus::Never
-                },
-            });
-        }
+        else {
+            return;
+        };
+        self.retarget_pane_claim(src, t.session_path.clone(), t.mux_name.clone());
+        let argv = self.with_omp_program(tabs::omp_argv(t.session_path.as_deref()));
+        self.spawn_tab_post(SpawnReq {
+            mux_name: t.mux_name,
+            cwd: t.cwd,
+            session_path: t.session_path,
+            title: t.title,
+            argv,
+            role: TabRole::Session,
+            post: Post::Anchor(anchor),
+            focus: if refocus == Some(self.activation_seq) {
+                Focus::Claim
+            } else {
+                Focus::Never
+            },
+        });
     }
 
     fn show_folder_dialog(&mut self, ctx: &egui::Context) {
@@ -2655,7 +2678,7 @@ impl App {
             FolderOutcome::Confirm(dest) => {
                 if let Some(d) = self.folder_dialog.take() {
                     self.focus_pending = true;
-                    self.begin_transfer(d.kind, d.src, dest);
+                    self.finish_folder_dialog(d, dest);
                 }
             }
             FolderOutcome::Browse => {
@@ -2788,6 +2811,7 @@ impl eframe::App for App {
             && !self.dash.open
             && self.tree.is_none()
             && !self.usage_open
+            && !self.sessions.open
             && self.palette.is_none()
             && !egui::Popup::is_any_open(&ctx)
             && ctx.memory(|m| m.focused()).is_none()
@@ -2814,6 +2838,7 @@ impl eframe::App for App {
         self.show_agent_popup(&ctx);
         self.show_tree(&ctx);
         self.show_usage(&ctx);
+        self.show_sessions(&ctx);
         self.show_drive_picker(&ctx);
         self.show_sync_dialogs(&ctx);
         self.show_confirm(&ctx);
@@ -2962,11 +2987,6 @@ fn update_geometry(
     }
     g
 }
-
-/// Deleting retries only while a just-killed omp releases the session lease; every attempt
-/// spawns a headless omp (~0.8 s), so this bounds the whole delete to about 5 s.
-const DELETE_ATTEMPTS: u32 = 5;
-const DELETE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// `1536` → `1.5 KB` (binary steps, one decimal above bytes).
 pub(crate) fn human_size(bytes: u64) -> String {

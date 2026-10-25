@@ -8,6 +8,7 @@ pub mod ctl;
 pub mod fleet;
 pub mod gdrive;
 pub(crate) mod git;
+pub mod inventory;
 pub mod mux;
 pub mod omp;
 pub mod platform;

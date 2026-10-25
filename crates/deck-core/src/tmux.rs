@@ -8,7 +8,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::config_dir;
-use crate::mux::{LaunchSpec, OMP_ENV, Pane, effective_cwd, terminal_env};
+use crate::mux::{LaunchSpec, MuxKind, OMP_ENV, Pane, RunningSession, effective_cwd, terminal_env};
 use crate::platform;
 use crate::status::breadcrumb_key_for_tty;
 
@@ -270,17 +270,130 @@ impl Tmux {
         let pids: Vec<u32> = panes.iter().map(|(_, pid)| *pid).collect();
         for ((name, _), held) in panes.iter().zip(platform::tree_open_files(&pids)) {
             let files: &mut Vec<PathBuf> = result.entry((*name).to_owned()).or_default();
-            for target in held {
-                if is_top_level_session(&target, root, canon_root.as_deref())
-                    && !files.contains(&target)
-                {
-                    files.push(target);
-                }
-            }
+            add_top_level(files, held, root, canon_root.as_deref());
             files.sort();
         }
         result
     }
+
+    /// Every live session in one `list-panes -a` plus one pass over the process table: the
+    /// active pane's pid, path, title and the session's creation time; files and memory over all
+    /// of the session's panes. No server or any failure → empty.
+    pub fn running(&self, root: &Path) -> Vec<RunningSession> {
+        let Ok(out) = self.run(&["list-panes", "-a", "-F", RUNNING_FORMAT]) else {
+            return Vec::new();
+        };
+        if !out.status.success() {
+            return Vec::new();
+        }
+        let rows = parse_pane_rows(&String::from_utf8_lossy(&out.stdout));
+        let pids: Vec<u32> = rows.iter().map(|r| r.pid).collect();
+        let held = platform::tree_open_files(&pids);
+        let memory = platform::tree_memory(&pids);
+        let canon_root = std::fs::canonicalize(root).ok();
+        let mut sessions: Vec<RunningSession> = Vec::new();
+        let mut index: HashMap<&str, usize> = HashMap::new();
+        for ((row, held), memory) in rows.iter().zip(held).zip(memory) {
+            let at = *index.entry(row.session.as_str()).or_insert_with(|| {
+                sessions.push(RunningSession {
+                    name: row.session.clone(),
+                    backend: MuxKind::Tmux,
+                    files: Vec::new(),
+                    title: None,
+                    cwd: None,
+                    started: row.created,
+                    pid: None,
+                    memory: None,
+                });
+                sessions.len() - 1
+            });
+            let session = &mut sessions[at];
+            add_top_level(&mut session.files, held, root, canon_root.as_deref());
+            if let Some(m) = memory {
+                let total = session.memory.get_or_insert_default();
+                total.bytes = total.bytes.saturating_add(m.bytes);
+                total.processes += m.processes;
+            }
+            // The active pane speaks for the session; without one, the first pane does.
+            if row.active || session.pid.is_none() {
+                session.pid = Some(row.pid);
+                session.cwd = row.path.clone();
+                session.title = row.title.clone();
+            }
+        }
+        for s in &mut sessions {
+            s.files.sort();
+        }
+        sessions
+    }
+
+    /// Memory of the tmux server process alone (`#{pid}`, not its panes' trees); `None` when no
+    /// server runs or the OS cannot tell.
+    pub fn server_memory(&self) -> Option<platform::TreeMemory> {
+        let out = self
+            .run(&["display-message", "-p", "#{pid}"])
+            .ok()
+            .filter(|o| o.status.success())?;
+        let pid = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        platform::process_memory(pid)
+    }
+}
+
+/// Adds the top-level session files among `held` to `files` (no duplicates).
+fn add_top_level(
+    files: &mut Vec<PathBuf>,
+    held: Vec<PathBuf>,
+    root: &Path,
+    canon_root: Option<&Path>,
+) {
+    for target in held {
+        if is_top_level_session(&target, root, canon_root) && !files.contains(&target) {
+            files.push(target);
+        }
+    }
+}
+
+/// `list-panes -a` format of [`Tmux::running`]: the title comes last (a tab inside it survives
+/// `splitn`); tmux strips control characters from titles, so a title cannot span lines.
+const RUNNING_FORMAT: &str = "#{session_name}\t#{?#{&&:#{pane_active},#{window_active}},1,0}\t#{pane_pid}\t#{session_created}\t#{pane_current_path}\t#{pane_title}";
+
+/// One pane of [`Tmux::running`]'s query.
+#[derive(Debug, PartialEq, Eq)]
+struct PaneRow {
+    session: String,
+    /// The active pane of the active window.
+    active: bool,
+    pid: u32,
+    created: Option<SystemTime>,
+    path: Option<PathBuf>,
+    title: Option<String>,
+}
+
+/// Parses [`RUNNING_FORMAT`] output; a line without a numeric pid is skipped.
+fn parse_pane_rows(text: &str) -> Vec<PaneRow> {
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.splitn(6, '\t');
+            let session = f.next()?.to_owned();
+            let active = f.next()? == "1";
+            let pid = f.next()?.parse().ok()?;
+            let created = f
+                .next()?
+                .parse::<u64>()
+                .ok()
+                .map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s));
+            let path = Some(f.next()?).filter(|p| !p.is_empty()).map(PathBuf::from);
+            let title = Some(f.next()?).filter(|t| !t.is_empty()).map(str::to_owned);
+            Some(PaneRow {
+                session,
+                active,
+                pid,
+                created,
+                path,
+                title,
+            })
+        })
+        .collect()
 }
 
 /// Parses `pane_titles` output; only active-pane lines with a non-empty title count.

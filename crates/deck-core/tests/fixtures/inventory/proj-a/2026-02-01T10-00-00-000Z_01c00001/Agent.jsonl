@@ -1,0 +1,2 @@
+{"type":"session","version":3,"id":"sub1","timestamp":"2026-02-01T10:00:02.000Z","cwd":"@CWD@","parentSession":"X"}
+{"type":"message","id":"s1","parentId":null,"timestamp":"2026-02-01T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"api":"x","provider":"p","model":"m-s","usage":{"input":10,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.3}},"stopReason":"stop","timestamp":2}}

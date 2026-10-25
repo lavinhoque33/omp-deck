@@ -60,14 +60,46 @@ pub fn lexical_dest(text: &str, home: Option<&Path>) -> Result<PathBuf, String> 
 
 /// Blocking filesystem part: an existing directory other than the session's own project.
 pub fn check_dest_fs(path: &Path, src_cwd: &Path) -> Result<(), String> {
-    if !path.is_dir() {
-        return Err("That folder does not exist".to_owned());
-    }
+    check_dest_dir(path)?;
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     if canon(path) == canon(src_cwd) {
         return Err("The session already lives in that folder".to_owned());
     }
     Ok(())
+}
+
+/// Just the existence part of [`check_dest_fs`] (a selection from several projects).
+pub fn check_dest_dir(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        Ok(())
+    } else {
+        Err("That folder does not exist".to_owned())
+    }
+}
+
+/// What a "Choose folder…" dialog moves or copies.
+pub enum Subject {
+    One(SessionEntry),
+    Many {
+        paths: Vec<PathBuf>,
+        cwd: Option<PathBuf>,
+    },
+}
+
+impl Subject {
+    fn label(&self) -> String {
+        match self {
+            Subject::One(e) => format!("“{}”", e.label()),
+            Subject::Many { paths, .. } => format!("the {} selected sessions", paths.len()),
+        }
+    }
+
+    fn cwd(&self) -> Option<&Path> {
+        match self {
+            Subject::One(e) => Some(&e.cwd),
+            Subject::Many { cwd, .. } => cwd.as_deref(),
+        }
+    }
 }
 
 /// Native directory picker available on this machine.
@@ -150,13 +182,17 @@ fn run_picker(picker: &Picker) -> Option<PathBuf> {
 pub struct DestCheck {
     pub generation: u64,
     pub path: PathBuf,
-    pub src_cwd: PathBuf,
+    pub src_cwd: Option<PathBuf>,
 }
 
 impl DestCheck {
     /// Blocking: `Ok(path)` when it is an existing directory other than the source project.
     pub fn run(self) -> (u64, Result<PathBuf, String>) {
-        let result = check_dest_fs(&self.path, &self.src_cwd).map(|()| self.path);
+        let result = match &self.src_cwd {
+            Some(src) => check_dest_fs(&self.path, src),
+            None => check_dest_dir(&self.path),
+        }
+        .map(|()| self.path);
         (self.generation, result)
     }
 }
@@ -172,7 +208,7 @@ enum Checked {
 /// State of the "Choose folder…" dialog.
 pub struct FolderDialog {
     pub kind: TransferKind,
-    pub src: SessionEntry,
+    pub subject: Subject,
     text: String,
     checked: Checked,
     /// Bumped with every text change; stale worker answers are dropped.
@@ -191,9 +227,18 @@ pub enum FolderOutcome {
 
 impl FolderDialog {
     pub fn new(kind: TransferKind, src: SessionEntry) -> FolderDialog {
+        Self::with_subject(kind, Subject::One(src))
+    }
+
+    /// A dialog for the session manager's selection (`cwd` = the project they all share, if any).
+    pub fn many(kind: TransferKind, paths: Vec<PathBuf>, cwd: Option<PathBuf>) -> FolderDialog {
+        Self::with_subject(kind, Subject::Many { paths, cwd })
+    }
+
+    fn with_subject(kind: TransferKind, subject: Subject) -> FolderDialog {
         FolderDialog {
             kind,
-            src,
+            subject,
             text: String::new(),
             checked: Checked::Invalid("Enter the destination folder".to_owned()),
             generation: 0,
@@ -223,7 +268,7 @@ impl FolderDialog {
                 self.request = Some(DestCheck {
                     generation: self.generation,
                     path,
-                    src_cwd: self.src.cwd.clone(),
+                    src_cwd: self.subject.cwd().map(Path::to_path_buf),
                 });
                 Checked::Pending
             }
@@ -274,8 +319,8 @@ impl FolderDialog {
                 ui.add(
                     egui::Label::new(
                         RichText::new(format!(
-                            "Choose the project folder for “{}”.",
-                            self.src.label()
+                            "Choose the project folder for {}.",
+                            self.subject.label()
                         ))
                         .color(pal.weak),
                     )

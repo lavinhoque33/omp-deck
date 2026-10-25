@@ -1,0 +1,2 @@
+{"type":"session","version":3,"id":"01c00003","timestamp":"2026-02-03T10:00:00.000Z","cwd":"@CWD@","parentSession":"01c00001"}
+{"type":"message","id":"f1","parentId":null,"timestamp":"2026-02-03T10:00:01.000Z","message":{"role":"user","content":"forked prompt","timestamp":1}}

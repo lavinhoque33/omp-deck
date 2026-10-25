@@ -226,7 +226,7 @@ fn tabs(ui: &mut Ui, st: &mut ViewState) {
     });
 }
 
-fn tab_chip(ui: &mut Ui, label: &str, on: bool) -> egui::Response {
+pub(crate) fn tab_chip(ui: &mut Ui, label: &str, on: bool) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let g = ui
         .painter()

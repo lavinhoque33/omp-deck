@@ -1,0 +1,9 @@
+{"type":"title","v":1,"title":"Refactor parser","source":"user","updatedAt":"2026-02-01T10:00:00.000Z","pad":""}
+{"type":"session","version":3,"id":"01c00001","timestamp":"2026-02-01T10:00:00.000Z","cwd":"@CWD@"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-02-01T10:00:01.000Z","message":{"role":"user","content":"hello","timestamp":1}}
+{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-01T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"api":"x","provider":"p","model":"m-a","usage":{"input":100,"output":20,"cacheRead":50,"cacheWrite":5,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.5}},"stopReason":"stop","timestamp":2}}
+{"type":"message","id":"t1","parentId":null,"timestamp":"2026-02-01T10:00:02.500Z","message":{"role":"toolResult","toolCallId":"c","toolName":"read","content":"{\"role\":\"assistant\"}"}}
+{"type":"message","id":"u2","parentId":null,"timestamp":"2026-02-01T10:00:03.000Z","message":{"role":"user","content":"again","timestamp":1}}
+{"type":"message","id":"a2","parentId":null,"timestamp":"2026-02-01T10:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"api":"x","provider":"p","model":"m-a","usage":{"input":200,"output":30,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.25}},"stopReason":"aborted","timestamp":2}}
+{"type":"model_usage","id":"mu","parentId":null,"timestamp":"2026-02-01T10:00:05.000Z","purpose":"find","provider":"p","model":"m-b","usage":{"input":7,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":10,"cost":{"total":0.01}}}
+{"type":"compaction","id":"cp","parentId":null,"timestamp":"2026-02-01T10:00:06.000Z","summary":"s"}

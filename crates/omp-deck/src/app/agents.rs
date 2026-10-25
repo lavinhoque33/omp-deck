@@ -364,6 +364,7 @@ impl App {
             && self.popup.is_none()
             && self.tree.is_none()
             && !self.usage_open
+            && !self.sessions.open
             && !self.modal_open()
             && !egui::Popup::is_any_open(ctx)
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))

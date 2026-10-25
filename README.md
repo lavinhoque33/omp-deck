@@ -30,6 +30,14 @@ host), so closing a tab or the whole app leaves omp running.
   auto-compact buffer, per-tool schema sizes) for tabs running with live control.
 - **Usage**: omp's `/usage` as a native view (Ctrl+Shift+U or the status-bar usage chip): remaining quota
   per provider and window with reset times, a year of activity as a heatmap, and top models by cost.
+- **Session manager** (Ctrl+Shift+S, the ⋯ menu, the sidebar button or a project's "Manage sessions…"): every
+  omp session on the machine, including empty ones the sidebar hides, in a sortable table with its disk size
+  (session file plus attachments and subagent transcripts, i.e. what deleting it frees), prompts and turns, tokens,
+  cost (including subagents), model, created and last activity, and badges for running, open in a tab, last turn
+  failed, fork and missing folder. Filter by text, age, size, empty, missing folder or running; pick sessions
+  (Shift+click for a range) and **Delete**, **Copy to** or **Move to** another folder in one go. The **Running** view
+  lists every session process with the memory it uses (the whole process tree) and the tmux server's own; select
+  sessions and **Kill** only those.
 - **Agents dashboard** (Ctrl+Shift+A or the status-bar Agents chip): one card per open tab and per session still
   running in the background, with its state (working, needs input, idle, ended), model, context use, cost,
   tokens, changed files and last reply; expand a card to see its subagents and open their transcripts. Search and

@@ -1,11 +1,13 @@
-// ompdeck-del.ts — OmpDeck session-delete extension.
-// Run headless: env OMPDECK_DEL_TARGET=<abs .jsonl> OMPDECK_DEL_OUT=<result file> omp --mode rpc --no-session --no-extensions -e <path>
-// Inert when either variable is unset. Appends exactly one JSON line to OMPDECK_DEL_OUT:
-//   {"ok":true,"id":"…"} | {"ok":false,"error":"live"|"no session header"|"<message>"}
-// A missing line means failure (e.g. an omp-internal specifier below no longer resolves).
+// ompdeck-del.ts — OmpDeck session-delete extension (batch).
+// Run headless: env OMPDECK_DEL_TARGETS=<file, one NDJSON {"path":"<absolute .jsonl>","id":"<expected session id>"} per line> OMPDECK_DEL_OUT=<result file>
+//   omp --mode rpc --no-session --no-extensions -e <path>
+// Inert when either variable is unset. Appends one JSON line per target to OMPDECK_DEL_OUT, as soon as
+// that target is done (each target under its own session lease):
+//   {"target":"…","ok":true,"id":"…"} | {"target":"…","ok":false,"error":"live"|"changed"|"<message>"}
+// A target without a line means failure (e.g. an omp-internal specifier below no longer resolves).
 import * as fs from "node:fs";
 
-const TARGET = process.env.OMPDECK_DEL_TARGET;
+const TARGETS = process.env.OMPDECK_DEL_TARGETS;
 const OUT = process.env.OMPDECK_DEL_OUT;
 
 const report = (r: unknown) => {
@@ -35,22 +37,41 @@ function headerId(file: string): string | undefined {
 }
 
 export default async function ompdeckDel(_api: any) {
-  if (!TARGET || !OUT) return; // not launched by OmpDeck -> inert
+  if (!TARGETS || !OUT) return; // not launched by OmpDeck -> inert
+  let targets: { path: string; id: string }[];
   try {
-    const { FileSessionStorage, tryAcquireSessionLease } = await import(
-      "@oh-my-pi/pi-coding-agent/session/session-storage"
-    );
-    const id = headerId(TARGET);
-    if (!id) return report({ ok: false, error: "no session header" });
-    const lease = tryAcquireSessionLease(id);
-    if (!lease) return report({ ok: false, error: "live", id });
-    try {
-      await new FileSessionStorage().deleteSessionWithArtifacts(TARGET);
-    } finally {
-      try { await lease.release(); } catch {}
-    }
-    report({ ok: true, id });
+    targets = fs.readFileSync(TARGETS, "utf8").split("\n").filter((t) => t.length > 0).map((t) => JSON.parse(t))
+      .filter((t) => typeof t?.path === "string" && typeof t?.id === "string" && t.id.length > 0);
   } catch (e) {
-    report({ ok: false, error: String((e as any)?.message ?? e) });
+    return;
+  }
+  let storage: any;
+  let acquire: any;
+  try {
+    const mod = await import("@oh-my-pi/pi-coding-agent/session/session-storage");
+    storage = new mod.FileSessionStorage();
+    acquire = mod.tryAcquireSessionLease;
+  } catch (e) {
+    // No target gets a line: the host reports omp's stderr.
+    return;
+  }
+  for (const { path: target, id: expected } of targets) {
+    try {
+      const lease = acquire(expected);
+      if (!lease) { report({ target, ok: false, error: "live", id: expected }); continue; }
+      let deleted = false;
+      try {
+        // Re-read the header id under the lease: the file at `target` may have been replaced since selection.
+        if (headerId(target) === expected) {
+          await storage.deleteSessionWithArtifacts(target);
+          deleted = true;
+        }
+      } finally {
+        try { await lease.release(); } catch {}
+      }
+      report(deleted ? { target, ok: true, id: expected } : { target, ok: false, error: "changed", id: expected });
+    } catch (e) {
+      report({ target, ok: false, error: String((e as any)?.message ?? e) });
+    }
   }
 }

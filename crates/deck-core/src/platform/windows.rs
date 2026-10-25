@@ -1,5 +1,6 @@
 //! Windows side of [`super`].
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io;
@@ -22,12 +23,16 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
+};
+use windows_sys::Win32::System::ProcessStatus::{
+    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 use windows_sys::Win32::System::Threading::{
@@ -96,6 +101,64 @@ pub fn process_start_os(pid: u32) -> Option<SystemTime> {
     let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
     let since_unix = ticks.checked_sub(FILETIME_UNIX_EPOCH)?;
     Some(UNIX_EPOCH + Duration::from_nanos(since_unix.saturating_mul(100)))
+}
+
+/// ppid → children of every process, from a Toolhelp32 snapshot (empty when it fails).
+pub fn process_children() -> HashMap<u32, Vec<u32>> {
+    let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
+    // SAFETY: plain snapshot of all processes; the handle is owned and closed by `OwnedHandle`.
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap == INVALID_HANDLE_VALUE {
+        return map;
+    }
+    // SAFETY: we own the snapshot handle.
+    let _snap = unsafe { OwnedHandle::from_raw_handle(snap as RawHandle) };
+    // SAFETY: plain data; all-zero is a valid value before `dwSize` is set.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: `entry.dwSize` is set and `snap` is a process snapshot.
+    let mut more = unsafe { Process32FirstW(snap, &mut entry) } != 0;
+    while more {
+        map.entry(entry.th32ParentProcessID)
+            .or_default()
+            .push(entry.th32ProcessID);
+        // SAFETY: as for `Process32FirstW`.
+        more = unsafe { Process32NextW(snap, &mut entry) } != 0;
+    }
+    map
+}
+
+/// Private bytes of `pid` (`PrivateUsage`: committed memory it does not share), else its working
+/// set; `None` when the process is gone or cannot be opened.
+pub fn process_memory(pid: u32) -> Option<u64> {
+    // SAFETY: plain call; a null result means failure.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: `raw` is a handle we own; `OwnedHandle` closes it.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
+    // SAFETY: plain data; all-zero is a valid value.
+    let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    counters.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    // SAFETY: the handle is valid; `PROCESS_MEMORY_COUNTERS_EX` starts with
+    // `PROCESS_MEMORY_COUNTERS` and `cb` tells the API the larger size.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            process.as_raw_handle() as HANDLE,
+            (&raw mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
+            counters.cb,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let bytes = if counters.PrivateUsage != 0 {
+        counters.PrivateUsage
+    } else {
+        counters.WorkingSetSize
+    };
+    Some(bytes as u64)
 }
 
 /// 16 hex digits of sha256 over the current user's SID bytes: names per-user endpoints (named

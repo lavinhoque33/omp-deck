@@ -191,8 +191,39 @@ pub fn abbreviate_home(path: &Path) -> String {
 /// alone; matching files are read for at most [`HEADER_LIMIT`] bytes. Sibling artifact
 /// directories are never entered.
 pub fn find_fork(root: &SessionsRoot, parent_id: &str, since: SystemTime) -> Option<PathBuf> {
+    newest_fork(root, since, |h| h.parent.as_deref() == Some(parent_id))
+}
+
+/// Like [`find_fork`] for a copy made into `dest_cwd`: the header's `parentSession` is any of
+/// `parents` (omp writes the source's id; an absolute source path is also accepted) and its
+/// `cwd` is `dest_cwd`.
+pub fn find_copy(
+    root: &SessionsRoot,
+    parents: &[&str],
+    dest_cwd: &Path,
+    since: SystemTime,
+) -> Option<PathBuf> {
+    newest_fork(root, since, |h| {
+        h.parent.as_deref().is_some_and(|p| parents.contains(&p))
+            && h.cwd.as_deref().is_some_and(|c| Path::new(c) == dest_cwd)
+    })
+}
+
+struct ForkHeader {
+    parent: Option<String>,
+    cwd: Option<String>,
+}
+
+fn newest_fork(
+    root: &SessionsRoot,
+    since: SystemTime,
+    matches: impl Fn(&ForkHeader) -> bool,
+) -> Option<PathBuf> {
     let mut best: Option<(SystemTime, PathBuf)> = None;
     for project in fs::read_dir(&root.path).ok()?.flatten() {
+        if !project.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
         let pdir = project.path();
         let Ok(files) = fs::read_dir(&pdir) else {
             continue;
@@ -202,7 +233,8 @@ pub fn find_fork(root: &SessionsRoot, parent_id: &str, since: SystemTime) -> Opt
             if path.extension().is_none_or(|e| e != "jsonl") {
                 continue;
             }
-            let Ok(meta) = fs::metadata(&path) else {
+            // `DirEntry` metadata does not follow symlinks.
+            let Ok(meta) = file.metadata() else {
                 continue;
             };
             let Ok(mtime) = meta.modified() else {
@@ -214,8 +246,8 @@ pub fn find_fork(root: &SessionsRoot, parent_id: &str, since: SystemTime) -> Opt
             if best.as_ref().is_some_and(|(t, _)| *t >= mtime) {
                 continue;
             }
-            match header_parent(&path) {
-                Ok(Some(p)) if p == parent_id => best = Some((mtime, path)),
+            match header_fork(&path) {
+                Ok(Some(h)) if matches(&h) => best = Some((mtime, path)),
                 Ok(_) => {}
                 Err(e) => log::debug!("find_fork: skip {}: {e}", path.display()),
             }
@@ -224,8 +256,8 @@ pub fn find_fork(root: &SessionsRoot, parent_id: &str, since: SystemTime) -> Opt
     best.map(|(_, p)| p)
 }
 
-/// `parentSession` of the session header found within the first [`HEADER_LIMIT`] bytes.
-fn header_parent(path: &Path) -> io::Result<Option<String>> {
+/// `parentSession` and `cwd` of the session header found within the first [`HEADER_LIMIT`] bytes.
+fn header_fork(path: &Path) -> io::Result<Option<ForkHeader>> {
     let reader =
         BufReader::with_capacity(16 * 1024, io::Read::take(File::open(path)?, HEADER_LIMIT));
     let mut rd = LineReader { r: reader, pos: 0 };
@@ -235,7 +267,10 @@ fn header_parent(path: &Path) -> io::Result<Option<String>> {
             continue;
         };
         if line.kind.as_deref() == Some("session") {
-            return Ok(line.parent_session);
+            return Ok(Some(ForkHeader {
+                parent: line.parent_session,
+                cwd: line.cwd,
+            }));
         }
     }
     Ok(None)
@@ -246,11 +281,15 @@ pub fn scan(root: &SessionsRoot) -> Vec<ProjectGroup> {
 }
 
 #[derive(Clone, Debug)]
-struct Parsed {
-    id: String,
-    cwd: PathBuf,
-    title: Option<String>,
-    first_prompt: Option<String>,
+pub(crate) struct Parsed {
+    pub(crate) id: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) title: Option<String>,
+    pub(crate) first_prompt: Option<String>,
+    /// Header `parentSession` exactly as written (an absolute path or a session id).
+    pub(crate) parent: Option<String>,
+    /// Header `timestamp` (ISO 8601).
+    pub(crate) created: Option<String>,
 }
 
 struct CacheEntry {
@@ -299,10 +338,11 @@ impl Scanner {
             }
         };
         for project in projects.flatten() {
-            let pdir = project.path();
-            if !pdir.is_dir() {
+            // Real directories only: a symlinked project dir could lead outside the store.
+            if !project.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
+            let pdir = project.path();
             let files = match fs::read_dir(&pdir) {
                 Ok(rd) => rd,
                 Err(e) => {
@@ -315,7 +355,8 @@ impl Scanner {
                 if path.extension().is_none_or(|e| e != "jsonl") {
                     continue;
                 }
-                let Ok(meta) = fs::metadata(&path) else {
+                // `DirEntry` metadata does not follow symlinks: a symlinked "session" is ignored.
+                let Ok(meta) = file.metadata() else {
                     continue;
                 };
                 if !meta.is_file() {
@@ -443,6 +484,7 @@ struct RawLine {
     kind: Option<String>,
     id: Option<String>,
     cwd: Option<String>,
+    timestamp: Option<String>,
     #[serde(rename = "parentSession")]
     parent_session: Option<String>,
     title: Option<String>,
@@ -491,7 +533,7 @@ pub(crate) fn header_cwd(path: &Path) -> Option<PathBuf> {
     parse_file(path).ok().flatten().map(|p| p.cwd)
 }
 
-fn parse_file(path: &Path) -> io::Result<Option<Parsed>> {
+pub(crate) fn parse_file(path: &Path) -> io::Result<Option<Parsed>> {
     parse_reader(File::open(path)?)
 }
 
@@ -500,7 +542,7 @@ fn parse_reader<R: io::Read>(reader: R) -> io::Result<Option<Parsed>> {
     let reader = BufReader::with_capacity(64 * 1024, io::Read::take(reader, MAX_READ));
     let mut rd = LineReader { r: reader, pos: 0 };
     let mut buf = Vec::new();
-    let mut header: Option<(String, PathBuf)> = None;
+    let mut header: Option<(String, PathBuf, Option<String>, Option<String>)> = None;
     let mut title: Option<String> = None;
     let mut prompt: Option<String> = None;
 
@@ -524,7 +566,7 @@ fn parse_reader<R: io::Read>(reader: R) -> io::Result<Option<Parsed>> {
             }
             Some("session") if header.is_none() => {
                 if let (Some(id), Some(cwd)) = (line.id, line.cwd) {
-                    header = Some((id, PathBuf::from(cwd)));
+                    header = Some((id, PathBuf::from(cwd), line.parent_session, line.timestamp));
                 }
             }
             Some("message") if header.is_some() && prompt.is_none() => {
@@ -541,11 +583,13 @@ fn parse_reader<R: io::Read>(reader: R) -> io::Result<Option<Parsed>> {
             break;
         }
     }
-    Ok(header.map(|(id, cwd)| Parsed {
+    Ok(header.map(|(id, cwd, parent, created)| Parsed {
         id,
         cwd,
         title,
         first_prompt: prompt,
+        parent,
+        created,
     }))
 }
 

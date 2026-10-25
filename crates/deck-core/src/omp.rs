@@ -22,7 +22,15 @@ pub enum OmpError {
     Parse(String),
 }
 
-/// Why [`Omp::delete_session`] did not delete.
+/// One session to delete: the file and the session id it held when the user selected it. The id
+/// is re-checked under the session lease, so a file replaced since selection is never deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteTarget {
+    pub path: PathBuf,
+    pub id: String,
+}
+
+/// Why [`Omp::delete_sessions`] did not delete a target.
 #[derive(Debug, thiserror::Error)]
 pub enum DeleteError {
     /// A live omp holds the session lease; nothing was removed.
@@ -36,8 +44,12 @@ pub enum DeleteError {
     Omp(String),
     #[error("delete failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("omp did not finish deleting within 20 s")]
+    #[error("omp did not finish deleting in time")]
     Timeout,
+    /// The file at the path no longer holds the session that was selected (replaced, renamed or
+    /// removed); nothing was removed. Not retried.
+    #[error("the session file changed since it was selected")]
+    Changed,
 }
 
 #[derive(Clone, Debug)]
@@ -341,11 +353,42 @@ fn powershell_install_argv() -> Vec<String> {
     .collect()
 }
 
+/// One target's NDJSON line from `ompdeck-del.ts`.
+fn delete_result(v: &Value) -> Result<(), DeleteError> {
+    if v.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    match v.get("error").and_then(Value::as_str) {
+        Some("live") => Err(DeleteError::Live),
+        Some("changed") => Err(DeleteError::Changed),
+        Some(m) => Err(DeleteError::Omp(m.to_string())),
+        None => Err(DeleteError::Omp("delete failed".into())),
+    }
+}
+
 fn failed(message: impl Into<String>) -> OmpError {
     OmpError::Failed {
         code: None,
         message: message.into(),
     }
+}
+/// Ends an rpc child: closing stdin ends rpc mode (omp flushes and exits); a process still alive
+/// after 5 s is killed and reaped with its tree. Returns the exit code when it exited on its own.
+fn shut_down(child: platform::KillableChild, stdin: std::process::ChildStdin) -> Option<i32> {
+    use std::time::{Duration, Instant};
+
+    let mut child = child;
+    drop(stdin);
+    let end = Instant::now() + Duration::from_secs(5);
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            _ => break None,
+        }
+    };
+    drop(child);
+    code
 }
 
 /// Value → the single CLI argument: bool "true"/"false", number as JSON number text, enum/string
@@ -395,17 +438,26 @@ fn strip_error_prefix(s: &str) -> &str {
         .unwrap_or(s)
 }
 
-/// Builds the error for a non-zero exit.
+/// Builds the error for a non-zero exit. A runtime crash dump (source excerpt, caret, the
+/// `error: …` line, stack frames) is reduced to its `error:` line; the full text is logged.
 fn failure(code: Option<i32>, stdout: &str, stderr: &str) -> OmpError {
     let src = if stderr.trim().is_empty() {
         stdout
     } else {
         stderr
     };
-    OmpError::Failed {
-        code,
-        message: strip_error_prefix(src).to_string(),
-    }
+    let message = match src
+        .lines()
+        .map(str::trim_start)
+        .find(|l| l.starts_with("error: ") || l.starts_with("Error: "))
+    {
+        Some(line) if src.trim().lines().nth(1).is_some() => {
+            log::debug!("omp failed (exit {code:?}): {}", src.trim());
+            strip_error_prefix(line).to_string()
+        }
+        _ => strip_error_prefix(src).to_string(),
+    };
+    OmpError::Failed { code, message }
 }
 
 /// Parses `omp update --check` stdout.
@@ -861,19 +913,98 @@ impl Omp {
     /// file is untouched. Fails with omp's own text when a live omp holds the session lease. 30 s
     /// timeout. Blocking: run on a worker.
     pub fn fork_at(&self, session_file: &Path, entry_id: &str) -> Result<PathBuf, OmpError> {
-        use std::io::{BufRead, BufReader, Read, Write};
-        use std::sync::mpsc::{RecvTimeoutError, channel};
-        use std::time::{Duration, Instant};
-
-        const TIMEOUT: Duration = Duration::from_secs(30);
         let file = std::path::absolute(session_file)?;
         let cwd = crate::sessions::header_cwd(&file)
             .filter(|d| d.is_dir())
             .or_else(dirs::home_dir)
             .unwrap_or_else(platform::root_dir);
+        let args = vec![OsString::from("--resume"), file.into_os_string()];
+        self.rpc_session_file(
+            &args,
+            cwd,
+            Some(entry_id),
+            std::time::Duration::from_secs(30),
+        )
+    }
+
+    /// Copies a whole session into `dest_cwd` without a terminal: a headless
+    /// `omp --mode rpc --fork <src> --cwd <dest>` (the same copy as the tab Copy: fresh id,
+    /// header `parentSession` = the source, sibling artifacts copied, source untouched), then
+    /// `get_state` for the new `sessionFile`, stdin closed and the process reaped. Returns the new
+    /// file. 120 s timeout (artifacts are copied). Blocking: run on a worker.
+    pub fn copy_session(&self, src: &Path, dest_cwd: &Path) -> Result<PathBuf, OmpError> {
+        let src = std::path::absolute(src)?;
+        let dest = std::path::absolute(dest_cwd)?;
+        let argv = fork_argv(&src, &dest);
+        // argv = ["omp", "--fork", src, "--cwd", dest]; the program is ours.
+        let args: Vec<OsString> = argv.into_iter().skip(1).map(OsString::from).collect();
+        // Slack for coarse file-system timestamps.
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(2);
+        let err = match self.rpc_session_file(
+            &args,
+            platform::home_or_root(),
+            None,
+            std::time::Duration::from_secs(120),
+        ) {
+            Ok(file) => return Ok(file),
+            Err(e) => e,
+        };
+        // omp writes the fork (with artifacts) before it restores the model and the rest of its
+        // start-up: a failure afterwards (e.g. no credentials for the session's model) leaves a
+        // complete copy behind. Reporting failure would make a retry duplicate it.
+        if let Some(file) = self.find_created_copy(&src, &dest, since) {
+            log::debug!(
+                "copy_session: omp failed after forking ({err}); using {}",
+                file.display()
+            );
+            return Ok(file);
+        }
+        Err(err)
+    }
+
+    /// The fork `omp --fork <src> --cwd <dest>` created since `since`, if any.
+    fn find_created_copy(
+        &self,
+        src: &Path,
+        dest: &Path,
+        since: std::time::SystemTime,
+    ) -> Option<PathBuf> {
+        let agent_dir = self
+            .env
+            .iter()
+            .rev()
+            .find(|(k, v)| k == "PI_CODING_AGENT_DIR" && !v.is_empty())
+            .map(|(_, v)| PathBuf::from(v));
+        let root = match agent_dir {
+            Some(dir) => crate::sessions::SessionsRoot::at(dir.join("sessions")),
+            None => crate::sessions::SessionsRoot::resolve(),
+        };
+        let id = crate::sessions::parse_file(src)
+            .ok()
+            .flatten()
+            .map(|p| p.id);
+        let path = src.to_string_lossy();
+        let mut parents = vec![path.as_ref()];
+        parents.extend(id.as_deref());
+        crate::sessions::find_copy(&root, &parents, dest, since)
+    }
+
+    /// Runs `omp --mode rpc <args>` headless, optionally sends a `fork` of `fork_entry`, then
+    /// `get_state`, and returns the reported `sessionFile`. stdin is closed afterwards.
+    fn rpc_session_file(
+        &self,
+        args: &[OsString],
+        cwd: PathBuf,
+        fork_entry: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<PathBuf, OmpError> {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        use std::time::Instant;
+
         let mut cmd = Command::new(&self.program);
-        cmd.args(["--mode", "rpc", "--resume"])
-            .arg(&file)
+        cmd.args(["--mode", "rpc"])
+            .args(args)
             .current_dir(cwd)
             .env("NO_COLOR", "1")
             .stdin(Stdio::piped())
@@ -903,28 +1034,41 @@ impl Omp {
             let _ = (&mut stderr).take(64 * 1024).read_to_string(&mut text);
             text
         });
-        let requests = [
-            serde_json::json!({"id": "1", "type": "fork", "entryId": entry_id}),
-            serde_json::json!({"id": "2", "type": "get_state"}),
-        ];
-        for r in &requests {
-            writeln!(stdin, "{r}")?;
+        let mut requests = Vec::new();
+        if let Some(entry_id) = fork_entry {
+            requests.push(serde_json::json!({"id": "1", "type": "fork", "entryId": entry_id}));
         }
-        stdin.flush()?;
+        requests.push(serde_json::json!({"id": "2", "type": "get_state"}));
+        let sent = requests
+            .iter()
+            .try_for_each(|r| writeln!(stdin, "{r}"))
+            .and_then(|()| stdin.flush());
+        match sent {
+            Ok(()) => {}
+            // omp exited before reading its requests: its stderr says why.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                let code = shut_down(child, stdin);
+                let _ = reader.join();
+                let err = err_reader.join().unwrap_or_default();
+                return Err(failure(code, "", &err));
+            }
+            Err(e) => return Err(e.into()),
+        }
 
-        let deadline = Instant::now() + TIMEOUT;
-        let mut forked = false;
+        let deadline = Instant::now() + timeout;
+        // Without a fork request there is nothing to wait for before `get_state`.
+        let mut forked = fork_entry.is_none();
         let outcome: Result<PathBuf, OmpError> = loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let line = match rx.recv_timeout(left) {
                 Ok(l) => l,
-                Err(RecvTimeoutError::Timeout) => break Err(failed("omp fork timed out")),
+                Err(RecvTimeoutError::Timeout) => break Err(failed("omp timed out")),
                 Err(RecvTimeoutError::Disconnected) => {
-                    // omp exited before answering: its stderr says why.
-                    drop(stdin);
-                    let status = child.wait()?;
+                    // omp closed stdout before answering: its stderr says why.
+                    let code = shut_down(child, stdin);
+                    let _ = reader.join();
                     let err = err_reader.join().unwrap_or_default();
-                    return Err(failure(status.code(), "", &err));
+                    return Err(failure(code, "", &err));
                 }
             };
             let Ok(v) = serde_json::from_str::<Value>(&line) else {
@@ -957,83 +1101,258 @@ impl Omp {
                 _ => {}
             }
         };
-        // Closing stdin ends rpc mode; omp flushes and exits. A stuck process is killed.
-        drop(stdin);
-        let end = Instant::now() + Duration::from_secs(5);
-        while child.try_wait()?.is_none() && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        drop(child);
+        shut_down(child, stdin);
         let _ = reader.join();
         let _ = err_reader.join();
         outcome
     }
 
-    /// Deletes a closed session the way omp's own picker does: a headless
-    /// `omp --mode rpc --no-session --no-extensions -e <ompdeck-del.ts>` (cwd `$HOME`, stdin
-    /// null) takes the session lease (held by a live omp → [`DeleteError::Live`], nothing
-    /// removed) and runs `FileSessionStorage.deleteSessionWithArtifacts`: the `.jsonl`, its
-    /// sibling `<stem>/` directory and stale `.jsonl.<n>.bak` files. Pins, blobs and breadcrumbs
-    /// are untouched. The extension is written to a private temp dir per call; a missing result
-    /// line is a failure. 20 s timeout, child killed on timeout/drop. Blocking: run on a worker.
-    pub fn delete_session(&self, file: &Path) -> Result<(), DeleteError> {
+    /// Deletes closed sessions the way omp's own picker does, **one** headless omp process per
+    /// batch: `omp --mode rpc --no-session --no-extensions -e <ompdeck-del.ts>` (cwd `$HOME`,
+    /// stdin null) takes each target's session lease in turn (held by a live omp →
+    /// [`DeleteError::Live`], nothing removed for that target), re-reads the file's header id
+    /// under that lease (unless it equals [`DeleteTarget::id`] the target is
+    /// [`DeleteError::Changed`], never retried, nothing removed) and runs
+    /// `FileSessionStorage.deleteSessionWithArtifacts`: the `.jsonl`, its sibling `<stem>/`
+    /// directory and stale `.jsonl.<n>.bak` files. Pins, blobs and breadcrumbs are untouched.
+    ///
+    /// `on_result` runs once per distinct file, on the calling thread, as soon as that target's
+    /// outcome is known (the extension reports one NDJSON line per target while it works). Targets
+    /// that are not `.jsonl` regular files are [`DeleteError::NotASession`] (a missing file is
+    /// [`DeleteError::Io`]) without starting omp. Targets answering `Live` are retried in a fresh
+    /// batch, up to 5 rounds ~250 ms apart, before `Live` is reported. A round times out after
+    /// 20 s + 2 s per target; its unanswered targets report [`DeleteError::Timeout`]. A target
+    /// with no result line (omp died) reports omp's stderr. Blocking: run on a worker.
+    pub fn delete_sessions(
+        &self,
+        targets: &[DeleteTarget],
+        mut on_result: impl FnMut(&Path, Result<(), DeleteError>),
+    ) {
+        use std::time::Duration;
+
+        const ROUNDS: u32 = 5;
+        const ROUND_DELAY: Duration = Duration::from_millis(250);
+
+        let mut pending: Vec<(&Path, String, &str)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for target in targets {
+            let file = target.path.as_path();
+            let abs = match std::path::absolute(file) {
+                Ok(a) => a,
+                Err(e) => {
+                    on_result(file, Err(e.into()));
+                    continue;
+                }
+            };
+            if !seen.insert(abs.clone()) {
+                continue;
+            }
+            if target.id.is_empty() || abs.extension().is_none_or(|e| e != "jsonl") {
+                on_result(file, Err(DeleteError::NotASession));
+                continue;
+            }
+            match std::fs::metadata(&abs) {
+                Ok(m) if m.is_file() => {}
+                Ok(_) => {
+                    on_result(file, Err(DeleteError::NotASession));
+                    continue;
+                }
+                Err(e) => {
+                    on_result(file, Err(e.into()));
+                    continue;
+                }
+            }
+            // The target list is NDJSON, read as UTF-8 by the extension.
+            match abs.to_str() {
+                Some(text) => pending.push((file, text.to_string(), target.id.as_str())),
+                None => on_result(
+                    &target.path,
+                    Err(DeleteError::Omp("path is not valid UTF-8".into())),
+                ),
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+        let setup = tempfile::Builder::new()
+            .prefix("ompdeck-del")
+            .tempdir()
+            .and_then(|work| crate::ctl::install_delete_extension(work.path()).map(|e| (work, e)));
+        let (work, ext) = match setup {
+            Ok(w) => w,
+            Err(e) => {
+                let msg = e.to_string();
+                for (file, _, _) in &pending {
+                    on_result(
+                        file,
+                        Err(DeleteError::Io(std::io::Error::other(msg.clone()))),
+                    );
+                }
+                return;
+            }
+        };
+        for round in 0..ROUNDS {
+            if round > 0 {
+                std::thread::sleep(ROUND_DELAY);
+            }
+            let last = round + 1 == ROUNDS;
+            let targets: Vec<(&str, &str)> =
+                pending.iter().map(|(_, t, id)| (t.as_str(), *id)).collect();
+            let mut live = vec![false; pending.len()];
+            self.delete_round(
+                work.path(),
+                &ext,
+                round,
+                &targets,
+                &mut |i, result| match result {
+                    Err(DeleteError::Live) if !last => live[i] = true,
+                    other => on_result(pending[i].0, other),
+                },
+            );
+            let mut idx = 0;
+            pending.retain(|_| {
+                idx += 1;
+                live[idx - 1]
+            });
+            if pending.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// One batch: one omp process for `targets`; calls `report(index, result)` exactly once per
+    /// target, as its result line arrives or, failing that, when omp exits or times out.
+    fn delete_round(
+        &self,
+        work: &Path,
+        ext: &Path,
+        round: u32,
+        targets: &[(&str, &str)],
+        report: &mut dyn FnMut(usize, Result<(), DeleteError>),
+    ) {
+        use std::io::{Read, Seek, SeekFrom};
         use std::time::{Duration, Instant};
 
-        const TIMEOUT: Duration = Duration::from_secs(20);
-        let file = std::path::absolute(file)?;
-        if file.extension().is_none_or(|e| e != "jsonl") || !std::fs::metadata(&file)?.is_file() {
-            return Err(DeleteError::NotASession);
-        }
-        let work = tempfile::Builder::new().prefix("ompdeck-del").tempdir()?;
-        let ext = crate::ctl::install_delete_extension(work.path())?;
-        let out = work.path().join("result");
-        let err_path = work.path().join("stderr");
-        let cwd = platform::home_or_root();
-        let mut cmd = Command::new(&self.program);
-        cmd.args(["--mode", "rpc", "--no-session", "--no-extensions", "-e"])
-            .arg(&ext)
-            .current_dir(cwd)
-            .env("NO_COLOR", "1")
-            .env("OMPDECK_DEL_TARGET", &file)
-            .env("OMPDECK_DEL_OUT", &out)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(&err_path)?);
-        for (k, v) in &self.env {
-            cmd.env(k, v);
-        }
-        headless(&mut cmd);
-        let mut child = platform::spawn_killable(cmd)?;
-        let deadline = Instant::now() + TIMEOUT;
-        while child.try_wait()?.is_none() {
+        let timeout = Duration::from_secs(20 + 2 * targets.len() as u64);
+        let list = work.join(format!("targets-{round}"));
+        let out = work.join(format!("result-{round}"));
+        let err_path = work.join(format!("stderr-{round}"));
+        let started = (|| -> Result<_, DeleteError> {
+            let body: Vec<String> = targets
+                .iter()
+                .map(|(path, id)| serde_json::json!({ "path": path, "id": id }).to_string())
+                .collect();
+            std::fs::write(&list, body.join("\n"))?;
+            let mut cmd = Command::new(&self.program);
+            cmd.args(["--mode", "rpc", "--no-session", "--no-extensions", "-e"])
+                .arg(ext)
+                .current_dir(platform::home_or_root())
+                .env("NO_COLOR", "1")
+                .env("OMPDECK_DEL_TARGETS", &list)
+                .env("OMPDECK_DEL_OUT", &out)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(&err_path)?);
+            for (k, v) in &self.env {
+                cmd.env(k, v);
+            }
+            headless(&mut cmd);
+            Ok(platform::spawn_killable(cmd)?)
+        })();
+        let mut child = match started {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = e.to_string();
+                for i in 0..targets.len() {
+                    report(i, Err(DeleteError::Omp(msg.clone())));
+                }
+                return;
+            }
+        };
+
+        let index: std::collections::HashMap<&str, usize> =
+            targets.iter().enumerate().map(|(i, t)| (t.0, i)).collect();
+        let mut done = vec![false; targets.len()];
+        let mut left = targets.len();
+        let (mut offset, mut carry) = (0u64, Vec::<u8>::new());
+        // Reads the result lines that appeared since the last call.
+        let mut drain = |done: &mut [bool], left: &mut usize| {
+            let Ok(mut f) = std::fs::File::open(&out) else {
+                return;
+            };
+            if f.seek(SeekFrom::Start(offset)).is_err() {
+                return;
+            }
+            let mut fresh = Vec::new();
+            if f.read_to_end(&mut fresh).is_err() {
+                return;
+            }
+            offset += fresh.len() as u64;
+            carry.extend_from_slice(&fresh);
+            while let Some(nl) = carry.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = carry.drain(..=nl).collect();
+                let Ok(v) = serde_json::from_slice::<Value>(&line) else {
+                    continue;
+                };
+                let Some(i) = v
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .and_then(|t| index.get(t))
+                    .copied()
+                else {
+                    continue;
+                };
+                if std::mem::replace(&mut done[i], true) {
+                    continue;
+                }
+                *left -= 1;
+                report(i, delete_result(&v));
+            }
+        };
+        let deadline = Instant::now() + timeout;
+        let mut timed_out = false;
+        loop {
+            drain(&mut done, &mut left);
+            if left == 0 {
+                break;
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    // The exit code is not trusted (omp exits 1 without a default model after the
+                    // extension already ran); the result lines are. Read what is left.
+                    drain(&mut done, &mut left);
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
             if Instant::now() >= deadline {
-                return Err(DeleteError::Timeout);
+                timed_out = true;
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        // The exit code is not trusted (omp exits 1 without a default model after the extension
-        // already ran); the result line is.
-        let result = std::fs::read_to_string(&out).unwrap_or_default();
-        let Some(line) = result.lines().find(|l| !l.trim().is_empty()) else {
-            let stderr = std::fs::read(&err_path).unwrap_or_default();
-            let text = String::from_utf8_lossy(&stderr[..stderr.len().min(64 * 1024)]);
-            let text = text.trim();
-            return Err(DeleteError::Omp(if text.is_empty() {
-                "omp produced no delete result".into()
-            } else {
-                strip_error_prefix(text).to_string()
-            }));
-        };
-        let v: Value = serde_json::from_str(line)
-            .map_err(|e| DeleteError::Omp(format!("unexpected delete result: {e}")))?;
-        if v.get("ok").and_then(Value::as_bool) == Some(true) {
-            return Ok(());
+        drop(child);
+        if left == 0 {
+            return;
         }
-        match v.get("error").and_then(Value::as_str) {
-            Some("live") => Err(DeleteError::Live),
-            Some("no session header") => Err(DeleteError::NotASession),
-            Some(m) => Err(DeleteError::Omp(m.to_string())),
-            None => Err(DeleteError::Omp("delete failed".into())),
+        let stderr = std::fs::read(&err_path).unwrap_or_default();
+        let text = String::from_utf8_lossy(&stderr[..stderr.len().min(64 * 1024)]);
+        let text = strip_error_prefix(text.trim()).to_string();
+        for (i, d) in done.iter().enumerate() {
+            if *d {
+                continue;
+            }
+            report(
+                i,
+                Err(if timed_out {
+                    DeleteError::Timeout
+                } else if text.is_empty() {
+                    DeleteError::Omp("omp produced no delete result".into())
+                } else {
+                    DeleteError::Omp(text.clone())
+                }),
+            );
         }
     }
 

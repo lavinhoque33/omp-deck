@@ -68,6 +68,8 @@ pub enum BarAction {
     Reopen,
     Refresh,
     OpenUsage,
+    /// Open the session manager hub.
+    OpenSessions,
     /// Show or hide the agents dashboard.
     OpenAgents,
     FontLarger,
@@ -496,6 +498,18 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
         .clicked()
         {
             pick(ui, &mut action, BarAction::OpenUsage);
+        }
+        if menu_item(
+            ui,
+            crate::icons::ICON_HARD_DRIVE,
+            "Session manager…",
+            Some("Ctrl+Shift+S"),
+            true,
+            false,
+        )
+        .clicked()
+        {
+            pick(ui, &mut action, BarAction::OpenSessions);
         }
         if menu_item(
             ui,

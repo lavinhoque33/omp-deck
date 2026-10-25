@@ -2,6 +2,7 @@
 //! per-OS convention lives here (or in the `cfg` branches of [`crate::ctl`]). The rest of the
 //! crate calls these functions and never names an OS.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Write};
@@ -24,6 +25,72 @@ pub use imp::{effective_uid, process_start_ticks};
 pub use imp::{
     file_identity, file_mode, open_regular_file, root_dir, set_file_mode, tree_open_files,
 };
+
+// ---- process trees: memory ----------------------------------------------------------------------
+
+/// Memory of the single process `pid` (no descendants), measured as in [`TreeMemory`]; `None`
+/// when it is gone or the OS cannot tell.
+pub fn process_memory(pid: u32) -> Option<TreeMemory> {
+    Some(TreeMemory {
+        bytes: imp::process_memory(pid)?,
+        processes: 1,
+    })
+}
+
+/// Memory of one process tree (root + every descendant).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeMemory {
+    /// Linux: summed proportional set size (shared pages split between their users, so a tree is
+    /// not charged for pages it only shares), `VmRSS` where `smaps_rollup` is unreadable.
+    /// Windows: summed private bytes.
+    pub bytes: u64,
+    /// Live processes counted, root included.
+    pub processes: u32,
+}
+
+/// Memory of each root's whole process tree, in `roots` order. One pass over the process table
+/// serves every root. A root that is gone (or whose memory cannot be read at all) → `None`;
+/// descendants that vanish or cannot be read are skipped. Always `None` where the OS offers no
+/// process table (macOS, BSDs). Blocking: call off the UI thread.
+pub fn tree_memory(roots: &[u32]) -> Vec<Option<TreeMemory>> {
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    aggregate_tree(roots, &imp::process_children(), imp::process_memory)
+}
+
+/// [`tree_memory`] over an injected process table (`children`: pid → child pids) and per-process
+/// memory reader. Each pid is counted once per root, so cycles and shared subtrees terminate.
+fn aggregate_tree(
+    roots: &[u32],
+    children: &HashMap<u32, Vec<u32>>,
+    memory: impl Fn(u32) -> Option<u64>,
+) -> Vec<Option<TreeMemory>> {
+    roots
+        .iter()
+        .map(|&root| {
+            let mut total = TreeMemory {
+                bytes: memory(root)?,
+                processes: 1,
+            };
+            let mut seen = HashSet::from([root]);
+            let mut stack: Vec<u32> = children.get(&root).cloned().unwrap_or_default();
+            while let Some(pid) = stack.pop() {
+                if !seen.insert(pid) {
+                    continue;
+                }
+                if let Some(kids) = children.get(&pid) {
+                    stack.extend(kids);
+                }
+                if let Some(bytes) = memory(pid) {
+                    total.bytes = total.bytes.saturating_add(bytes);
+                    total.processes += 1;
+                }
+            }
+            Some(total)
+        })
+        .collect()
+}
 
 // ---- process / machine -------------------------------------------------------------------------
 

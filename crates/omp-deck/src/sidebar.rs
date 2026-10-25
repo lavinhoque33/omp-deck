@@ -12,9 +12,9 @@ use crate::icons::{
     ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_STOP, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_COLUMNS_2,
     ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS, ICON_FOLDER,
     ICON_FOLDER_GIT_2, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_GIT_BRANCH_PLUS,
-    ICON_GIT_MERGE, ICON_KEY_ROUND, ICON_LIST_TREE, ICON_PLAY, ICON_PLUS, ICON_POWER,
-    ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_ROWS_2, ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL,
-    ICON_TRASH_2, ICON_X,
+    ICON_GIT_MERGE, ICON_HARD_DRIVE, ICON_KEY_ROUND, ICON_LIST_TREE, ICON_PLAY, ICON_PLUS,
+    ICON_POWER, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_ROWS_2, ICON_SEARCH, ICON_SEARCH_X,
+    ICON_TERMINAL, ICON_TRASH_2, ICON_X,
 };
 use deck_core::config::RemovedWorktree;
 use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot};
@@ -107,6 +107,8 @@ pub enum SidebarAction {
     Tree(SessionEntry),
     New(PathBuf),
     Refresh,
+    /// Open the session manager (scoped to this project when given).
+    ManageSessions(Option<PathBuf>),
     /// Put `text` on the clipboard and confirm with a toast naming `what`.
     CopyText {
         text: String,
@@ -470,8 +472,20 @@ pub fn show(
         egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            if refresh_button(ui, input.refreshing).clicked() {
+            if header_button(ui, ICON_REFRESH_CW, "Rescan sessions now", input.refreshing).clicked()
+            {
                 out.actions.push(SidebarAction::Refresh);
+                out.interacted = true;
+            }
+            if header_button(
+                ui,
+                ICON_HARD_DRIVE,
+                "Session manager — sizes, bulk delete / copy / move (Ctrl+Shift+S)",
+                false,
+            )
+            .clicked()
+            {
+                out.actions.push(SidebarAction::ManageSessions(None));
                 out.interacted = true;
             }
             let id = Id::unique("sidebar-filter");
@@ -750,6 +764,15 @@ fn show_group(
             out.interacted = true;
             ui.close();
         }
+        if menu_item(ui, ICON_HARD_DRIVE, "Manage sessions…", None, true, false)
+            .on_hover_text("Open the session manager on this project")
+            .clicked()
+        {
+            out.actions
+                .push(SidebarAction::ManageSessions(Some(group.cwd.clone())));
+            out.interacted = true;
+            ui.close();
+        }
         if menu_item(ui, ICON_FOLDER_OPEN, "Open folder", None, true, false).clicked() {
             out.actions
                 .push(SidebarAction::OpenFolder(group.cwd.clone()));
@@ -899,7 +922,7 @@ fn scope_empty(ui: &mut Ui, dir: &Path) {
     });
 }
 
-fn refresh_button(ui: &mut Ui, spinning: bool) -> egui::Response {
+fn header_button(ui: &mut Ui, icon: Icon, tip: &str, spinning: bool) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let (rect, resp) = ui.allocate_exact_size(
         vec2(theme::dens(28.0, 32.0), theme::dens(28.0, 36.0)),
@@ -925,12 +948,12 @@ fn refresh_button(ui: &mut Ui, spinning: bool) -> egui::Response {
             p,
             rect.center(),
             Align2::CENTER_CENTER,
-            ICON_REFRESH_CW,
+            icon,
             if neutral { 15.0 } else { 19.0 },
             theme::mix(pal.weak, pal.text_strong, hov),
         );
     }
-    resp.on_hover_text("Rescan sessions now")
+    resp.on_hover_text(tip)
         .on_hover_cursor(CursorIcon::PointingHand)
 }
 

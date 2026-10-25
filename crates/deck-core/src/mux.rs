@@ -35,10 +35,30 @@ pub enum BackendChoice {
     Host,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MuxKind {
     Tmux,
     Host,
+}
+
+/// One live mux session as the Running view shows it ([`Mux::running`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningSession {
+    /// Mux session name (what [`Mux::kill`] takes).
+    pub name: String,
+    pub backend: MuxKind,
+    /// Top-level session files its omp has open: the same mapping as [`Mux::session_files`].
+    pub files: Vec<PathBuf>,
+    /// Terminal title of the (active) pane; `None` when it set none.
+    pub title: Option<String>,
+    /// tmux: the pane's current path. Host: the session's working directory.
+    pub cwd: Option<PathBuf>,
+    /// tmux `session_created`; host: when its child started.
+    pub started: Option<SystemTime>,
+    /// Pid of the (active) pane's process / the host child.
+    pub pid: Option<u32>,
+    /// tmux: every pane's process tree. Host: the daemon's tree (daemon, child, descendants).
+    pub memory: Option<platform::TreeMemory>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,16 +135,46 @@ impl HostMux {
 
     /// breadcrumb key + child start time of a live session, from its daemon.
     fn pane(&self, name: &str) -> Option<Pane> {
-        let info = self.ns.info(name).ok()?;
-        let key = match (&info.tty, &info.term_session_id) {
-            (Some(tty), _) => breadcrumb_key_for_tty(tty),
-            (None, Some(id)) => breadcrumb_key_for_term_session(id),
-            (None, None) => return None,
-        };
-        Some(Pane {
-            breadcrumb_key: key,
-            started: UNIX_EPOCH + Duration::from_millis(info.child_started_unix_ms),
+        pane_of_info(&self.ns.info(name).ok()?)
+    }
+
+    /// `info` of every live session, concurrently (one stuck daemon costs one control timeout,
+    /// not one per session); sessions whose daemon fails to answer are left out.
+    fn infos(&self) -> Vec<deck_host::HostInfo> {
+        let names = self.ns.list();
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = names
+                .iter()
+                .map(|name| scope.spawn(|| self.ns.info(name).ok()))
+                .collect();
+            jobs.into_iter()
+                .filter_map(|job| job.join().ok().flatten())
+                .collect()
         })
+    }
+
+    fn running(&self, root: &Path) -> Vec<RunningSession> {
+        let infos = self.infos();
+        let roots: Vec<u32> = infos.iter().map(|i| i.daemon_pid).collect();
+        let memory = platform::tree_memory(&roots);
+        let files = files_from_breadcrumbs(
+            infos.iter().map(|i| (i.name.clone(), pane_of_info(i))),
+            root,
+        );
+        infos
+            .into_iter()
+            .zip(memory)
+            .map(|(info, memory)| RunningSession {
+                files: files.get(&info.name).cloned().unwrap_or_default(),
+                name: info.name,
+                backend: MuxKind::Host,
+                title: info.title.filter(|t| !t.is_empty()),
+                cwd: Some(info.cwd),
+                started: Some(UNIX_EPOCH + Duration::from_millis(info.child_started_unix_ms)),
+                pid: Some(info.child_pid),
+                memory,
+            })
+            .collect()
     }
 
     /// Titles reported by the live sessions' daemons.
@@ -235,6 +285,27 @@ impl Mux {
         }
     }
 
+    /// Every live session with the facts the Running view needs, from one tmux `list-panes -a`
+    /// (or one `info` per host daemon) and one pass over the process table. Sorted by name.
+    /// Blocking: call on a worker.
+    pub fn running(&self, root: &Path) -> Vec<RunningSession> {
+        let mut sessions = match self {
+            Mux::Tmux(t) => t.running(root),
+            Mux::Host(h) => h.running(root),
+        };
+        sessions.sort_by(|a, b| a.name.cmp(&b.name));
+        sessions
+    }
+
+    /// Memory of the tmux server process alone (not its panes); `None` for the host, or when
+    /// there is no server or the OS cannot tell.
+    pub fn server_memory(&self) -> Option<platform::TreeMemory> {
+        match self {
+            Mux::Tmux(t) => t.server_memory(),
+            Mux::Host(_) => None,
+        }
+    }
+
     /// Names of the live sessions.
     pub fn alive_sessions(&self) -> HashSet<String> {
         match self {
@@ -284,6 +355,19 @@ impl Mux {
             Mux::Host(h) => h.titles(),
         }
     }
+}
+
+/// breadcrumb key + child start time of a host session, from its `info`.
+fn pane_of_info(info: &deck_host::HostInfo) -> Option<Pane> {
+    let key = match (&info.tty, &info.term_session_id) {
+        (Some(tty), _) => breadcrumb_key_for_tty(tty),
+        (None, Some(id)) => breadcrumb_key_for_term_session(id),
+        (None, None) => return None,
+    };
+    Some(Pane {
+        breadcrumb_key: key,
+        started: UNIX_EPOCH + Duration::from_millis(info.child_started_unix_ms),
+    })
 }
 
 fn host_session_files(host: &HostMux, root: &Path) -> HashMap<String, Vec<PathBuf>> {
