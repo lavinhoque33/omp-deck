@@ -229,7 +229,11 @@ fn an_older_owner_is_asked_to_exit_once_drained_and_only_once() {
     welcome_as(&mut s, ServiceEpoch([1; 16]), &profile, "0.0.1");
     let mut asm = Assembly::default();
     let env = request(&mut s, &mut asm).expect("request");
-    assert!(matches!(env.body, Request::Maintenance(MaintenanceOp::Poll)), "{:?}", env.body);
+    assert!(
+        matches!(env.body, Request::Maintenance(MaintenanceOp::Poll)),
+        "{:?}",
+        env.body
+    );
     let busy = DrainState::Draining {
         jobs: 1,
         controllers_busy: 0,
@@ -251,10 +255,22 @@ fn an_older_owner_is_asked_to_exit_once_drained_and_only_once() {
     welcome_as(&mut s, ServiceEpoch([2; 16]), &profile, "0.0.1");
     let mut asm = Assembly::default();
     let env = request(&mut s, &mut asm).expect("request");
-    assert!(matches!(env.body, Request::Maintenance(MaintenanceOp::Poll)), "{:?}", env.body);
-    reply(&mut s, env.id, &Ok(Answer::Maintenance(DrainState::Drained)));
+    assert!(
+        matches!(env.body, Request::Maintenance(MaintenanceOp::Poll)),
+        "{:?}",
+        env.body
+    );
+    reply(
+        &mut s,
+        env.id,
+        &Ok(Answer::Maintenance(DrainState::Drained)),
+    );
     let env = until(&mut s, &mut asm, is_maintenance);
-    assert!(matches!(env.body, Request::Maintenance(MaintenanceOp::Exit)), "{:?}", env.body);
+    assert!(
+        matches!(env.body, Request::Maintenance(MaintenanceOp::Exit)),
+        "{:?}",
+        env.body
+    );
     reply(&mut s, env.id, &Ok(Answer::Done));
     s.shutdown();
     drop(s);
