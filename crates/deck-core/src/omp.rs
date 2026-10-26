@@ -238,8 +238,34 @@ pub fn fork_argv(src: &Path, dest_cwd: &Path) -> Vec<String> {
     ]
 }
 
-/// One entry of the `omp models --json` catalog.
+/// How omp reads a model's token-rate card (`pricingStatus` of `omp models --json`): `Fixed`
+/// means the `cost` rates apply; omp reports `Unknown` for an all-zero card it cannot call free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pricing {
+    Fixed,
+    Free,
+    Included,
+    Variable,
+    Unknown,
+}
+
+/// Output speed measured on this machine: omp's `model_perf` aggregate in `agent.db`, the speed
+/// omp's model browser prefers over the catalog estimate.
 #[derive(Clone, Debug, PartialEq)]
+pub struct MeasuredSpeed {
+    /// Output tokens per second over the decode window.
+    pub tps: f64,
+    /// Average time to first token; `None` when no sample measured it.
+    pub ttft_ms: Option<f64>,
+    /// Recency-weighted sample count (omp halves it past 256, so it can be fractional).
+    pub samples: f64,
+    /// Service tier of the aggregate (`ultrafast`) when no standard-tier measurement exists.
+    pub tier: Option<String>,
+}
+
+/// One entry of the `omp models --json` catalog, plus the catalog metrics and measured speed omp's
+/// model browser shows. Every metadata field is `None`/empty when omp does not report it.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModelInfo {
     /// `provider/id`, what `/switch` takes.
     pub selector: String,
@@ -247,16 +273,36 @@ pub struct ModelInfo {
     pub id: String,
     pub name: String,
     pub context_window: Option<u64>,
+    /// Output-token cap.
+    pub max_tokens: Option<u64>,
+    pub reasoning: Option<bool>,
     /// Supported effort levels in omp's order; empty = the model has no thinking.
     pub thinking: Vec<String>,
+    /// Input modalities (`text`, `image`).
+    pub input: Vec<String>,
     /// $ per million tokens.
     pub cost_input: Option<f64>,
     pub cost_output: Option<f64>,
+    pub cost_cache_read: Option<f64>,
+    pub pricing: Option<Pricing>,
+    /// omp's catalog intelligence score (`int`).
+    pub intelligence: Option<f64>,
+    /// omp's catalog output-speed estimate in tokens/s (`tps`); `None` when unmeasured.
+    pub catalog_tps: Option<f64>,
+    pub measured: Option<MeasuredSpeed>,
 }
 
-/// Parses `omp models --json` (`{"models":[{provider,id,selector,name,contextWindow,thinking,
-/// cost:{input,output}}…]}`). Entries without provider or id are skipped; a missing selector
-/// becomes `provider/id`, a missing name the id; `thinking: null` → empty.
+/// omp's catalog metrics of one model object: `int` and `tps`. A non-positive speed means
+/// "unmeasured" in omp (`catalogMetricsOf`), not a score.
+fn catalog_metrics(m: &Value) -> (Option<f64>, Option<f64>) {
+    let num = |k: &str| m.get(k).and_then(Value::as_f64).filter(|v| v.is_finite());
+    (num("int"), num("tps").filter(|t| *t > 0.0))
+}
+
+/// Parses `omp models --json` (`{"models":[{provider,id,selector,name,contextWindow,maxTokens,
+/// reasoning,thinking,input,cost:{input,output,cacheRead},pricingStatus}…]}`). Entries without
+/// provider or id are skipped; a missing selector becomes `provider/id`, a missing name the id;
+/// `thinking: null` → empty. Unknown `pricingStatus` values are left unset.
 pub fn parse_models(stdout: &str) -> Result<Vec<ModelInfo>, OmpError> {
     let parse_err = |e: serde_json::Error| OmpError::Parse(format!("models: {e}"));
     let start = stdout.find('{').unwrap_or(0);
@@ -271,32 +317,160 @@ pub fn parse_models(stdout: &str) -> Result<Vec<ModelInfo>, OmpError> {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
     };
+    let strings = |m: &Value, k: &str| -> Vec<String> {
+        m.get(k)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|l| l.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     Ok(list
         .iter()
         .filter_map(|m| {
             let provider = text(m, "provider")?;
             let id = text(m, "id")?;
             let cost = |k: &str| m.get("cost").and_then(|c| c.get(k)).and_then(Value::as_f64);
+            let (intelligence, catalog_tps) = catalog_metrics(m);
             Some(ModelInfo {
                 selector: text(m, "selector").unwrap_or_else(|| format!("{provider}/{id}")),
                 name: text(m, "name").unwrap_or_else(|| id.clone()),
                 context_window: m.get("contextWindow").and_then(Value::as_u64),
-                thinking: m
-                    .get("thinking")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|l| l.as_str().map(str::to_owned))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                max_tokens: m.get("maxTokens").and_then(Value::as_u64),
+                reasoning: m.get("reasoning").and_then(Value::as_bool),
+                thinking: strings(m, "thinking"),
+                input: strings(m, "input"),
                 cost_input: cost("input"),
                 cost_output: cost("output"),
+                cost_cache_read: cost("cacheRead"),
+                pricing: match m.get("pricingStatus").and_then(Value::as_str) {
+                    Some("fixed") => Some(Pricing::Fixed),
+                    Some("free") => Some(Pricing::Free),
+                    Some("included") => Some(Pricing::Included),
+                    Some("variable") => Some(Pricing::Variable),
+                    Some("unknown") => Some(Pricing::Unknown),
+                    _ => None,
+                },
+                intelligence,
+                catalog_tps,
+                measured: None,
                 provider,
                 id,
             })
         })
         .collect())
+}
+
+/// Fills the `intelligence`/`catalog_tps` that `omp models --json` leaves out from `rpc_models`,
+/// the `data.models` of omp's RPC `get_available_models`: the same registry models after omp's
+/// catalog-metric pass (scores matched across provider id dialects), keyed by `provider/id`.
+pub fn apply_catalog_metrics(models: &mut [ModelInfo], rpc_models: &Value) {
+    let Some(list) = rpc_models.as_array() else {
+        return;
+    };
+    let by_key: std::collections::HashMap<String, (Option<f64>, Option<f64>)> = list
+        .iter()
+        .filter_map(|m| {
+            let provider = m.get("provider")?.as_str()?;
+            let id = m.get("id")?.as_str()?;
+            Some((format!("{provider}/{id}"), catalog_metrics(m)))
+        })
+        .collect();
+    for m in models {
+        if let Some(&(int, tps)) = by_key.get(&format!("{}/{}", m.provider, m.id)) {
+            m.intelligence = m.intelligence.or(int);
+            m.catalog_tps = m.catalog_tps.or(tps);
+        }
+    }
+}
+
+/// One `model_perf` row of omp's `agent.db`: running sums keyed `provider/id`, or
+/// `provider/id@tier` for a non-default service tier.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PerfRow {
+    pub key: String,
+    pub samples: f64,
+    pub output_tokens: f64,
+    pub gen_ms: f64,
+    pub ttft_samples: f64,
+    pub ttft_ms: f64,
+}
+
+/// Reads `model_perf` from omp's `agent.db` without writing anything; a missing database or
+/// table is no measurements.
+pub fn read_model_perf(db: &Path) -> Result<Vec<PerfRow>, OmpError> {
+    if !db.exists() {
+        return Ok(Vec::new());
+    }
+    let db_err = |e: rusqlite::Error| OmpError::Parse(format!("model_perf: {e}"));
+    let conn = crate::usage::open_stats_readonly(db).map_err(db_err)?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(db_err)?;
+    let has_table: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_perf')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    if !has_table {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT model_key, samples, output_tokens, gen_ms, ttft_samples, ttft_ms \
+             FROM model_perf WHERE model_key IS NOT NULL",
+        )
+        .map_err(db_err)?;
+    stmt.query_map([], |r| {
+        Ok(PerfRow {
+            key: r.get(0)?,
+            samples: r.get(1)?,
+            output_tokens: r.get(2)?,
+            gen_ms: r.get(3)?,
+            ttft_samples: r.get(4)?,
+            ttft_ms: r.get(5)?,
+        })
+    })
+    .map_err(db_err)?
+    .collect::<rusqlite::Result<_>>()
+    .map_err(db_err)
+}
+
+/// Sets each model's [`MeasuredSpeed`] the way omp's model browser picks it: the standard
+/// `provider/id` aggregate, else the fastest `provider/id@tier` one (first wins ties). Rows
+/// without output tokens or decode time are unmeasured and skipped.
+pub fn apply_measured_speed(models: &mut [ModelInfo], rows: &[PerfRow]) {
+    let speed = |r: &PerfRow, tier: Option<&str>| MeasuredSpeed {
+        tps: r.output_tokens * 1000.0 / r.gen_ms,
+        ttft_ms: (r.ttft_samples > 0.0).then(|| r.ttft_ms / r.ttft_samples),
+        samples: r.samples,
+        tier: tier.map(str::to_owned),
+    };
+    let measured = || {
+        rows.iter()
+            .filter(|r| r.gen_ms > 0.0 && r.output_tokens > 0.0)
+    };
+    let mut best: std::collections::HashMap<&str, MeasuredSpeed> = std::collections::HashMap::new();
+    for r in measured() {
+        // Every `@` may end the selector: `a@b@t` is tier `b@t` of `a` and tier `t` of `a@b`.
+        for (at, _) in r.key.match_indices('@') {
+            let s = speed(r, Some(&r.key[at + 1..]));
+            let owner = &r.key[..at];
+            if best.get(owner).is_none_or(|b| s.tps > b.tps) {
+                best.insert(owner, s);
+            }
+        }
+    }
+    for m in models {
+        let key = format!("{}/{}", m.provider, m.id);
+        m.measured = measured()
+            .find(|r| r.key == key)
+            .map(|r| speed(r, None))
+            .or_else(|| best.get(key.as_str()).cloned());
+    }
 }
 
 /// argv for an update tab.
@@ -831,9 +1005,52 @@ impl Omp {
         parse_update_check(&self.run(&["update", "--check"], None)?.stdout)
     }
 
-    /// `omp models --json`: the model catalog (can take >1 s; call from a worker).
+    /// `omp models --json`, plus what omp's model browser shows beyond it: catalog intelligence
+    /// and speed from a concurrent headless RPC `get_available_models`, and the measured speed in
+    /// omp's `agent.db`. Either extra source failing only leaves those fields unset. Can take
+    /// >1 s; call from a worker.
     pub fn models(&self) -> Result<Vec<ModelInfo>, OmpError> {
-        parse_models(&self.run(&["models", "--json"], None)?.stdout)
+        let (cli, rpc) = std::thread::scope(|s| {
+            let rpc = s.spawn(|| self.rpc_models());
+            let cli = self.run(&["models", "--json"], None);
+            let rpc = rpc
+                .join()
+                .unwrap_or_else(|_| Err(failed("models rpc worker panicked")));
+            (cli, rpc)
+        });
+        let mut models = parse_models(&cli?.stdout)?;
+        match rpc {
+            Ok(list) => apply_catalog_metrics(&mut models, &list),
+            Err(e) => log::warn!("model catalog metrics unavailable: {e}"),
+        }
+        match read_model_perf(&self.sessions_root().agent_dir().join("agent.db")) {
+            Ok(rows) => apply_measured_speed(&mut models, &rows),
+            Err(e) => log::warn!("measured model speed unavailable: {e}"),
+        }
+        Ok(models)
+    }
+
+    /// The registry models of a headless `omp --mode rpc --no-session --no-extensions`
+    /// (`get_available_models`), as omp's JSON. 20 s timeout.
+    fn rpc_models(&self) -> Result<Value, OmpError> {
+        let args = [
+            OsString::from("--no-session"),
+            OsString::from("--no-extensions"),
+        ];
+        let request = serde_json::json!({"id": "1", "type": "get_available_models"});
+        self.rpc_exchange(
+            &args,
+            platform::root_dir(),
+            &[request],
+            std::time::Duration::from_secs(20),
+            |id, v| {
+                (id == Some("1")).then(|| {
+                    v.pointer("/data/models").cloned().ok_or_else(|| {
+                        OmpError::Parse("get_available_models without models".into())
+                    })
+                })
+            },
+        )
     }
 
     /// Merges `config list`, `config list --json` and the defaults (the same command in an empty
@@ -969,16 +1186,7 @@ impl Omp {
         dest: &Path,
         since: std::time::SystemTime,
     ) -> Option<PathBuf> {
-        let agent_dir = self
-            .env
-            .iter()
-            .rev()
-            .find(|(k, v)| k == "PI_CODING_AGENT_DIR" && !v.is_empty())
-            .map(|(_, v)| PathBuf::from(v));
-        let root = match agent_dir {
-            Some(dir) => crate::sessions::SessionsRoot::at(dir.join("sessions")),
-            None => crate::sessions::SessionsRoot::resolve(),
-        };
+        let root = self.sessions_root();
         let id = crate::sessions::parse_file(src)
             .ok()
             .flatten()
@@ -987,6 +1195,21 @@ impl Omp {
         let mut parents = vec![path.as_ref()];
         parents.extend(id.as_deref());
         crate::sessions::find_copy(&root, &parents, dest, since)
+    }
+
+    /// The sessions root this omp uses: its [`Omp::with_env`] `PI_CODING_AGENT_DIR`, else the
+    /// process environment's.
+    fn sessions_root(&self) -> crate::sessions::SessionsRoot {
+        use crate::sessions::SessionsRoot;
+        let dir = self
+            .env
+            .iter()
+            .rev()
+            .find(|(k, v)| k == "PI_CODING_AGENT_DIR" && !v.is_empty());
+        match dir {
+            Some((_, dir)) => SessionsRoot::at(PathBuf::from(dir).join("sessions")),
+            None => SessionsRoot::resolve(),
+        }
     }
 
     /// Runs `omp --mode rpc <args>` headless, optionally sends a `fork` of `fork_entry`, then
@@ -998,6 +1221,42 @@ impl Omp {
         fork_entry: Option<&str>,
         timeout: std::time::Duration,
     ) -> Result<PathBuf, OmpError> {
+        let mut requests = Vec::new();
+        if let Some(entry_id) = fork_entry {
+            requests.push(serde_json::json!({"id": "1", "type": "fork", "entryId": entry_id}));
+        }
+        requests.push(serde_json::json!({"id": "2", "type": "get_state"}));
+        // Without a fork request there is nothing to wait for before `get_state`.
+        let mut forked = fork_entry.is_none();
+        self.rpc_exchange(args, cwd, &requests, timeout, |id, v| match id {
+            Some("1") => {
+                if v.pointer("/data/cancelled").and_then(Value::as_bool) == Some(true) {
+                    return Some(Err(failed("omp cancelled the fork")));
+                }
+                forked = true;
+                None
+            }
+            Some("2") if forked => Some(
+                match v.pointer("/data/sessionFile").and_then(Value::as_str) {
+                    Some(f) => Ok(PathBuf::from(f)),
+                    None => Err(OmpError::Parse("get_state without sessionFile".into())),
+                },
+            ),
+            _ => None,
+        })
+    }
+
+    /// Runs `omp --mode rpc <args>` headless, sends `requests`, and feeds every successful
+    /// response (`id`, whole message) to `handle` until it returns the outcome; a failed response
+    /// is the error. stdin is closed and the process reaped afterwards.
+    fn rpc_exchange<T>(
+        &self,
+        args: &[OsString],
+        cwd: PathBuf,
+        requests: &[Value],
+        timeout: std::time::Duration,
+        mut handle: impl FnMut(Option<&str>, &Value) -> Option<Result<T, OmpError>>,
+    ) -> Result<T, OmpError> {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::sync::mpsc::{RecvTimeoutError, channel};
         use std::time::Instant;
@@ -1034,11 +1293,6 @@ impl Omp {
             let _ = (&mut stderr).take(64 * 1024).read_to_string(&mut text);
             text
         });
-        let mut requests = Vec::new();
-        if let Some(entry_id) = fork_entry {
-            requests.push(serde_json::json!({"id": "1", "type": "fork", "entryId": entry_id}));
-        }
-        requests.push(serde_json::json!({"id": "2", "type": "get_state"}));
         let sent = requests
             .iter()
             .try_for_each(|r| writeln!(stdin, "{r}"))
@@ -1056,9 +1310,7 @@ impl Omp {
         }
 
         let deadline = Instant::now() + timeout;
-        // Without a fork request there is nothing to wait for before `get_state`.
-        let mut forked = fork_entry.is_none();
-        let outcome: Result<PathBuf, OmpError> = loop {
+        let outcome: Result<T, OmpError> = loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let line = match rx.recv_timeout(left) {
                 Ok(l) => l,
@@ -1085,20 +1337,8 @@ impl Omp {
                     .unwrap_or("request failed");
                 break Err(failed(strip_error_prefix(msg).to_string()));
             }
-            match id {
-                Some("1") => {
-                    if v.pointer("/data/cancelled").and_then(Value::as_bool) == Some(true) {
-                        break Err(failed("omp cancelled the fork"));
-                    }
-                    forked = true;
-                }
-                Some("2") if forked => {
-                    break match v.pointer("/data/sessionFile").and_then(Value::as_str) {
-                        Some(f) => Ok(PathBuf::from(f)),
-                        None => Err(OmpError::Parse("get_state without sessionFile".into())),
-                    };
-                }
-                _ => {}
+            if let Some(outcome) = handle(id, &v) {
+                break outcome;
             }
         };
         shut_down(child, stdin);
@@ -1838,6 +2078,13 @@ mod models_tests {
             .unwrap();
         assert!(old.thinking.is_empty());
         assert_eq!(old.context_window, Some(200_000));
+        assert_eq!(old.max_tokens, Some(8192));
+        assert_eq!(old.reasoning, Some(false));
+        assert_eq!(old.input, ["text", "image"]);
+        assert_eq!(old.cost_cache_read, Some(0.3));
+        assert_eq!(old.pricing, Some(Pricing::Fixed));
+        // The CLI catalog carries no metrics; they come from RPC / agent.db.
+        assert_eq!((old.intelligence, old.catalog_tps), (None, None));
     }
 
     #[test]
@@ -1850,9 +2097,90 @@ mod models_tests {
         assert_eq!(m[0].name, "i");
         assert_eq!(m[0].context_window, None);
         assert_eq!(m[0].cost_input, None);
+        assert_eq!(
+            (m[0].max_tokens, m[0].reasoning, m[0].pricing),
+            (None, None, None)
+        );
+        assert!(m[0].input.is_empty());
         assert_eq!(m[1].selector, "q/custom");
         assert_eq!(m[1].thinking, ["low"]);
         assert!(matches!(parse_models("[]"), Err(OmpError::Parse(_))));
         assert!(matches!(parse_models("nope"), Err(OmpError::Parse(_))));
+    }
+
+    #[test]
+    fn rpc_metrics_fill_by_provider_and_id_and_zero_speed_is_unmeasured() {
+        let out = r#"{"models":[
+            {"provider":"a","id":"m","selector":"a/custom"},
+            {"provider":"b","id":"m","pricingStatus":"someday"},
+            {"provider":"c","id":"n","int":7}]}"#;
+        let mut m = parse_models(out).unwrap();
+        assert_eq!(m[1].pricing, None);
+        let rpc = serde_json::json!([
+            {"provider":"a","id":"m","int":52.4,"tps":118.2},
+            {"provider":"b","id":"m","int":40,"tps":0},
+            {"provider":"c","id":"n","int":99,"tps":12.5},
+            {"id":"orphan","int":1}
+        ]);
+        apply_catalog_metrics(&mut m, &rpc);
+        assert_eq!(
+            (m[0].intelligence, m[0].catalog_tps),
+            (Some(52.4), Some(118.2))
+        );
+        assert_eq!((m[1].intelligence, m[1].catalog_tps), (Some(40.0), None));
+        // A metric the CLI already reported is kept.
+        assert_eq!(
+            (m[2].intelligence, m[2].catalog_tps),
+            (Some(7.0), Some(12.5))
+        );
+        apply_catalog_metrics(&mut m, &serde_json::json!({"not": "a list"}));
+        assert_eq!(m[0].intelligence, Some(52.4));
+    }
+
+    #[test]
+    fn measured_speed_prefers_standard_then_fastest_tier() {
+        let row = |key: &str, out: f64, gen_ms: f64, ttft: (f64, f64)| PerfRow {
+            key: key.to_owned(),
+            samples: 3.0,
+            output_tokens: out,
+            gen_ms,
+            ttft_samples: ttft.0,
+            ttft_ms: ttft.1,
+        };
+        let rows = [
+            row("p/a@fast", 3000.0, 1000.0, (0.0, 0.0)),
+            row("p/a", 1000.0, 2000.0, (2.0, 1800.0)),
+            row("p/b@slow", 100.0, 1000.0, (0.0, 0.0)),
+            row("p/b@fast", 400.0, 1000.0, (1.0, 300.0)),
+            row("p/c", 0.0, 1000.0, (0.0, 0.0)),
+            row("p/d", 10.0, 0.0, (0.0, 0.0)),
+        ];
+        let model = |id: &str| ModelInfo {
+            provider: "p".into(),
+            id: id.into(),
+            ..Default::default()
+        };
+        let mut m = vec![model("a"), model("b"), model("c"), model("d")];
+        apply_measured_speed(&mut m, &rows);
+        assert_eq!(
+            m[0].measured,
+            Some(MeasuredSpeed {
+                tps: 500.0,
+                ttft_ms: Some(900.0),
+                samples: 3.0,
+                tier: None
+            })
+        );
+        assert_eq!(
+            m[1].measured,
+            Some(MeasuredSpeed {
+                tps: 400.0,
+                ttft_ms: Some(300.0),
+                samples: 3.0,
+                tier: Some("fast".into())
+            })
+        );
+        // No output tokens / no decode time: unmeasured, not 0 t/s.
+        assert_eq!((&m[2].measured, &m[3].measured), (&None, &None));
     }
 }

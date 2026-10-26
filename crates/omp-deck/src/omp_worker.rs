@@ -23,7 +23,7 @@ pub enum OmpEvent {
     Version(Result<String, String>),
     UpdateChecked(Result<UpdateStatus, String>),
     Catalog(Result<SettingsCatalog, String>),
-    /// `omp models --json` for the model dropdown.
+    /// `Omp::models` (catalog + metrics) for the model dropdown.
     Models(Result<Vec<ModelInfo>, String>),
     /// `outcome`: `Ok(Some(v))` = saved value (`Null` for secrets), `Ok(None)` = reset done.
     SettingDone {

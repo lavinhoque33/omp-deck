@@ -1217,7 +1217,7 @@ fn is_wal_mode(db: &Path) -> bool {
 /// - WAL database whose sidecars are missing: `immutable=1` (no locking, no `-wal`/`-shm` creation;
 ///   there is nothing beyond the main file to see);
 /// - rollback-journal database: `mode=ro` (a hot journal is never rolled back or deleted).
-fn open_stats_readonly(db: &Path) -> rusqlite::Result<Connection> {
+pub(crate) fn open_stats_readonly(db: &Path) -> rusqlite::Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;

@@ -142,8 +142,11 @@ pub struct SessionStats {
     pub cache_read: u64,
     pub cache_write: u64,
     /// Σ assistant `usage.cost.total` + `model_usage` entries, over the whole file (omp's rule;
-    /// compaction does not reset it).
+    /// compaction does not reset it). A missing, non-numeric, negative or non-finite total adds
+    /// nothing (counted in [`CostSource::uncosted`]).
     pub cost: f64,
+    /// [`Self::cost`] split by source and by recorded `usage.cost` component.
+    pub cost_detail: CostDetail,
     /// Prompt tokens of the last completed assistant message after the last compaction
     /// (`contextSnapshot.promptTokens`, else `contextTokens`, else input+cacheRead+cacheWrite).
     /// Right after a compaction: its `tokensAfter` estimate, or None when absent.
@@ -152,6 +155,96 @@ pub struct SessionStats {
     pub last_turn_failed: bool,
     /// Text parts of the most recent assistant message that has any (≤ 256 KiB).
     pub last_assistant_text: Option<String>,
+}
+
+/// Recorded session cost per source; `assistant.total + side.total == SessionStats::cost`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CostDetail {
+    /// Assistant `message` entries.
+    pub assistant: CostSource,
+    /// `model_usage` entries (side-model calls: titles, judges, `find`, …).
+    pub side: CostSource,
+}
+
+/// Σ of one source's `usage` records as omp wrote them; nothing is priced from the model catalog.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CostSource {
+    /// Records carrying a `usage` object.
+    pub records: u64,
+    /// Σ usable `usage.cost.total`.
+    pub total: f64,
+    /// Records with a usable total and all four usable components (explicit zeros count).
+    pub itemized: u64,
+    /// Components (and their token counts) of the [`Self::itemized`] records only.
+    pub input: CostPart,
+    pub output: CostPart,
+    pub cache_read: CostPart,
+    pub cache_write: CostPart,
+    /// Records with a usable total but a missing / unusable component.
+    pub unitemized_records: u64,
+    /// Their Σ total and Σ input+output+cacheRead+cacheWrite tokens.
+    pub unitemized: CostPart,
+    /// Records without a usable total (they add nothing to [`Self::total`]).
+    pub uncosted: u64,
+    /// Their Σ input+output+cacheRead+cacheWrite tokens.
+    pub uncosted_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CostPart {
+    pub usd: f64,
+    pub tokens: u64,
+}
+
+impl CostPart {
+    fn add(&mut self, usd: f64, tokens: u64) {
+        self.usd += usd;
+        self.tokens += tokens;
+    }
+}
+
+impl CostSource {
+    /// Σ of the four components of the itemized records.
+    pub fn components(&self) -> f64 {
+        self.input.usd + self.output.usd + self.cache_read.usd + self.cache_write.usd
+    }
+
+    /// Part of the itemized records' totals their four components do not account for (omp may
+    /// bill something else, or round); negative when the components exceed the totals.
+    pub fn unreconciled(&self) -> f64 {
+        self.total - self.unitemized.usd - self.components()
+    }
+
+    fn add(&mut self, u: &Usage, tokens: [u64; 4]) {
+        self.records += 1;
+        let all: u64 = tokens.iter().sum();
+        let cost = u.cost.as_ref();
+        let Some(total) = usd(cost.and_then(|c| c.total)) else {
+            self.uncosted += 1;
+            self.uncosted_tokens += all;
+            return;
+        };
+        self.total += total;
+        let parts = cost.map(|c| [c.input, c.output, c.cache_read, c.cache_write].map(usd));
+        match parts {
+            Some([Some(i), Some(o), Some(cr), Some(cw)]) => {
+                self.itemized += 1;
+                self.input.add(i, tokens[0]);
+                self.output.add(o, tokens[1]);
+                self.cache_read.add(cr, tokens[2]);
+                self.cache_write.add(cw, tokens[3]);
+            }
+            _ => {
+                self.unitemized_records += 1;
+                self.unitemized.add(total, all);
+            }
+        }
+    }
+}
+
+/// A recorded dollar amount omp could have written: finite and not negative.
+fn usd(v: Option<f64>) -> Option<f64> {
+    v.filter(|c| c.is_finite() && *c >= 0.0)
 }
 
 #[derive(Default)]
@@ -295,7 +388,9 @@ impl SessionStatsReader {
                 }
                 Some(self.apply_assistant(line))
             }
-            b"model_usage" => parse::<UsageEntry>(line).map(|e| self.add_usage(e.usage.as_ref())),
+            b"model_usage" => {
+                parse::<UsageEntry>(line).map(|e| self.add_usage(e.usage.as_ref(), true))
+            }
             b"model_change" => parse::<ModelChange>(line)
                 .map(|e| set(&mut self.stats.model, e.model.filter(|m| !m.is_empty()))),
             b"thinking_level_change" => parse::<ThinkingChange>(line).map(|e| {
@@ -331,17 +426,25 @@ impl SessionStatsReader {
         })
     }
 
-    fn add_usage(&mut self, usage: Option<&Usage>) -> bool {
+    /// Adds one `usage` record; `side` = a `model_usage` entry rather than an assistant reply.
+    fn add_usage(&mut self, usage: Option<&Usage>, side: bool) -> bool {
         let Some(u) = usage else { return false };
         let s = &mut self.stats;
         let (i, o, cr, cw) = (u.input(), u.output(), u.cache_read(), u.cache_write());
-        let cost = u.cost.as_ref().and_then(|c| c.total).unwrap_or(0.0);
+        let detail = &mut s.cost_detail;
+        let source = if side {
+            &mut detail.side
+        } else {
+            &mut detail.assistant
+        };
+        source.add(u, [i, o, cr, cw]);
+        s.cost = detail.assistant.total + detail.side.total;
         s.input_tokens += i;
         s.output_tokens += o;
         s.cache_read += cr;
         s.cache_write += cw;
-        s.cost += cost;
-        i != 0 || o != 0 || cr != 0 || cw != 0 || cost != 0.0
+        // A record always changes the counts in `cost_detail`.
+        true
     }
 
     fn apply_assistant(&mut self, line: &[u8]) -> bool {
@@ -353,7 +456,7 @@ impl SessionStatsReader {
             return false;
         };
         let msg = entry.message;
-        let mut changed = self.add_usage(msg.usage.as_ref());
+        let mut changed = self.add_usage(msg.usage.as_ref(), false);
         if let (Some(p), Some(m)) = (&msg.provider, &msg.model)
             && !p.is_empty()
             && !m.is_empty()
@@ -499,6 +602,8 @@ struct Usage {
     total_tokens: Option<f64>,
     #[serde(rename = "contextTokens")]
     context_tokens: Option<f64>,
+    /// Lenient: a non-object `cost` loses only the cost, not the line's tokens.
+    #[serde(default, deserialize_with = "lenient_cost")]
     cost: Option<UsageCost>,
 }
 
@@ -517,9 +622,28 @@ impl Usage {
     }
 }
 
+/// omp's per-component dollars (`usage.cost`); each field lenient so one odd value never drops
+/// the record.
 #[derive(Deserialize)]
 struct UsageCost {
+    #[serde(default, deserialize_with = "lenient_f64")]
     total: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_f64")]
+    input: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_f64")]
+    output: Option<f64>,
+    #[serde(default, rename = "cacheRead", deserialize_with = "lenient_f64")]
+    cache_read: Option<f64>,
+    #[serde(default, rename = "cacheWrite", deserialize_with = "lenient_f64")]
+    cache_write: Option<f64>,
+}
+
+fn lenient_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?.as_f64())
+}
+
+fn lenient_cost<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<UsageCost>, D::Error> {
+    Ok(serde_json::from_value(serde_json::Value::deserialize(d)?).ok())
 }
 
 #[derive(Deserialize)]
@@ -1546,6 +1670,156 @@ mod tests {
         // Back to: assistant (toolUse) + model_usage; the later error/compaction/reply are gone.
         assert_eq!(r.stats().input_tokens, 8537 + 6505);
         assert_eq!(r.stats().context_tokens, Some(8537));
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-12
+    }
+
+    fn usage_line(kind: &str, usage: &str) -> String {
+        match kind {
+            "side" => format!(r#"{{"type":"model_usage","id":"mu","usage":{usage}}}"#),
+            _ => format!(
+                r#"{{"type":"message","id":"a","message":{{"role":"assistant","content":[],"usage":{usage},"stopReason":"stop"}}}}"#
+            ),
+        }
+    }
+
+    #[test]
+    fn fixture_cost_detail_splits_sources_and_recorded_components() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        fs::write(&p, SESSION).unwrap();
+        let mut r = SessionStatsReader::new(p);
+        r.refresh().unwrap();
+        let s = r.stats();
+        let (a, side) = (s.cost_detail.assistant, s.cost_detail.side);
+        assert_eq!(
+            (a.records, a.itemized, a.unitemized_records, a.uncosted),
+            (3, 3, 0, 0)
+        );
+        assert_eq!((side.records, side.itemized), (1, 1));
+        assert!(close(a.total, 0.002_818_434), "{}", a.total);
+        assert!(close(side.total, 0.002_767_95), "{}", side.total);
+        assert!(close(a.total + side.total, s.cost));
+        assert!(close(a.input.usd, 0.001_614_45) && a.input.tokens == 8537 + 2226);
+        assert!(close(a.output.usd, 0.000_598_8) && a.output.tokens == 157 + 841);
+        assert!(close(a.cache_read.usd, 0.000_605_184) && a.cache_read.tokens == 201_728);
+        assert_eq!(
+            a.cache_write,
+            CostPart::default(),
+            "explicit zeros are recorded zeros"
+        );
+        assert!(close(side.input.usd, 0.000_975_75) && side.input.tokens == 6505);
+        assert!(close(side.output.usd, 0.001_792_2) && side.output.tokens == 2987);
+        assert!(close(a.unreconciled(), 0.0) && close(side.unreconciled(), 0.0));
+    }
+
+    #[test]
+    fn records_without_a_full_breakdown_keep_their_totals_and_tokens() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        let lines = [
+            // Older file: total only.
+            assistant_line("m", 10, 2, 0.25, "stop", "old"),
+            // No cost at all, a negative total, a non-object cost: tokens stay, total unknown.
+            usage_line("asst", r#"{"input":5,"output":1}"#),
+            usage_line(
+                "asst",
+                r#"{"input":7,"cost":{"total":-1,"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}"#,
+            ),
+            usage_line("side", r#"{"input":3,"cost":"n/a"}"#),
+            // Side call missing cacheWrite / with an odd component: unitemized, total kept.
+            usage_line(
+                "side",
+                r#"{"input":4,"output":6,"cost":{"total":0.5,"input":0.1,"output":0.4,"cacheRead":0}}"#,
+            ),
+            usage_line(
+                "side",
+                r#"{"output":2,"cost":{"total":0.125,"input":0,"output":"x","cacheRead":0,"cacheWrite":0}}"#,
+            ),
+            // Components that do not add up to the total.
+            usage_line(
+                "asst",
+                r#"{"input":100,"output":10,"cost":{"total":1.0,"input":0.25,"output":0.5,"cacheRead":0,"cacheWrite":0}}"#,
+            ),
+        ];
+        write_lines(&p, &lines.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut r = SessionStatsReader::new(p);
+        assert!(r.refresh().unwrap());
+        let s = r.stats();
+        assert_eq!(s.input_tokens, 10 + 5 + 7 + 3 + 4 + 100);
+        assert_eq!(s.output_tokens, 2 + 1 + 6 + 2 + 10);
+        assert!(close(s.cost, 0.25 + 0.5 + 0.125 + 1.0), "{}", s.cost);
+
+        let a = s.cost_detail.assistant;
+        assert_eq!(
+            (a.records, a.itemized, a.unitemized_records, a.uncosted),
+            (4, 1, 1, 2)
+        );
+        assert_eq!(a.uncosted_tokens, 5 + 1 + 7);
+        assert_eq!(
+            a.unitemized,
+            CostPart {
+                usd: 0.25,
+                tokens: 12
+            }
+        );
+        assert!(close(a.total, 1.25));
+        assert_eq!((a.input.tokens, a.output.tokens), (100, 10));
+        assert!(close(a.unreconciled(), 0.25), "{}", a.unreconciled());
+
+        let side = s.cost_detail.side;
+        assert_eq!(
+            (
+                side.records,
+                side.itemized,
+                side.unitemized_records,
+                side.uncosted
+            ),
+            (3, 0, 2, 1)
+        );
+        assert_eq!(side.uncosted_tokens, 3);
+        assert!(close(side.unitemized.usd, 0.625) && side.unitemized.tokens == 12);
+        assert!(close(side.components(), 0.0));
+        assert!(close(side.unreconciled(), 0.0));
+    }
+
+    #[test]
+    fn cost_detail_follows_appends_and_in_place_resets() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        let lines = fixture_lines();
+        let full = {
+            let q = d.path().join("full.jsonl");
+            fs::write(&q, SESSION).unwrap();
+            let mut r = SessionStatsReader::new(q);
+            r.refresh().unwrap();
+            r.stats().cost_detail
+        };
+        write_lines(&p, &lines[..lines.len() - 4]);
+        let mut r = SessionStatsReader::new(p.clone());
+        r.refresh().unwrap();
+        let prefix = r.stats().cost_detail;
+        assert_eq!((prefix.assistant.records, prefix.side.records), (1, 1));
+
+        let mut rest = lines[lines.len() - 4..].join("\n");
+        rest.push('\n');
+        append(&p, rest.as_bytes());
+        assert!(r.refresh().unwrap());
+        assert_eq!(r.stats().cost_detail, full, "appended records add once");
+
+        write_lines(&p, &lines[..lines.len() - 4]);
+        assert!(r.refresh().unwrap());
+        assert_eq!(
+            r.stats().cost_detail,
+            prefix,
+            "a shrunk file is re-summed from scratch"
+        );
+        assert!(close(
+            r.stats().cost,
+            prefix.assistant.total + prefix.side.total
+        ));
     }
 
     #[test]

@@ -464,14 +464,21 @@ impl SessionsRoot { pub fn agent_dir(&self) -> PathBuf; }  // parent of the sess
 impl Tmux { pub fn pane_tty(&self, session: &str) -> Option<String>; } // `display -p -t <s> '#{pane_tty}'`
 
 // deck_core::omp
-impl Omp { pub fn models(&self) -> Result<Vec<ModelInfo>, OmpError>; }  // `omp models --json`
-#[derive(Clone, Debug, PartialEq)]
+// `omp models --json`, enriched with catalog `int`/`tps` from a concurrent headless RPC
+// `get_available_models` and measured speed from agent.db `model_perf` (either may be absent).
+impl Omp { pub fn models(&self) -> Result<Vec<ModelInfo>, OmpError>; }
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModelInfo {
     pub selector: String,            // "provider/id" (what `/switch` takes)
     pub provider: String, pub id: String, pub name: String,
-    pub context_window: Option<u64>,
+    pub context_window: Option<u64>, pub max_tokens: Option<u64>, pub reasoning: Option<bool>,
     pub thinking: Vec<String>,       // supported effort levels in order; empty = no thinking
-    pub cost_input: Option<f64>, pub cost_output: Option<f64>,   // $ per M tokens
+    pub input: Vec<String>,          // modalities: "text", "image"
+    pub cost_input: Option<f64>, pub cost_output: Option<f64>, pub cost_cache_read: Option<f64>, // $ per M
+    pub pricing: Option<Pricing>,    // pricingStatus: Fixed | Free | Included | Variable | Unknown
+    pub intelligence: Option<f64>,   // catalog `int`
+    pub catalog_tps: Option<f64>,    // catalog `tps`; non-positive = unmeasured → None
+    pub measured: Option<MeasuredSpeed>, // { tps, ttft_ms: Option<f64>, samples, tier: Option<String> }
 }
 
 // deck_core::status (new)
@@ -499,10 +506,19 @@ pub struct SessionStats {
     pub thinking_configured: Option<String>, // e.g. "auto"
     pub input_tokens: u64, pub output_tokens: u64, pub cache_read: u64, pub cache_write: u64,
     pub cost: f64,                           // Σ assistant usage.cost.total + model_usage (omp's rule)
+    pub cost_detail: CostDetail,             // recorded costs and matching token counts, by source/type
     pub context_tokens: Option<u64>,         // last good assistant input+cacheRead+cacheWrite
     pub last_turn_failed: bool,              // last assistant stopReason is error (Retry button)
     pub last_assistant_text: Option<String>, // text parts of the last assistant message (≤ 256 KiB)
 }
+pub struct CostDetail { pub assistant: CostSource, pub side: CostSource }
+pub struct CostPart { pub usd: f64, pub tokens: u64 }
+pub struct CostSource {
+    pub records: u64, pub total: f64, pub itemized: u64,
+    pub input: CostPart, pub output: CostPart, pub cache_read: CostPart, pub cache_write: CostPart,
+    pub unitemized_records: u64, pub unitemized: CostPart,
+    pub uncosted: u64, pub uncosted_tokens: u64,
+} // Components include only records with all four usable components and a usable total.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitInfo { pub branch: String, pub ahead: u32, pub behind: u32, pub staged: u32, pub unstaged: u32, pub untracked: u32, pub pr: Option<PrInfo> }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -542,6 +558,11 @@ impl StatusWatcher {
   `π > …` idle, braille spinner busy, `!` attention), model chip + thinking glyph (dropdown), path,
   git branch + `*N +N ?N` + PR, context-usage meter (tokens / window from `ModelInfo`), ↑in ↓out
   tokens, cost; right side action buttons. Repaint only on data change (spinner animates only while busy).
+- Cost hover: recorded input/output/cache-read/cache-write dollars and token counts, separately for
+  assistant replies and `model_usage` calls. Missing components retain the total as unitemized;
+  missing costs retain tokens as uncosted. Gaps between components and totals are shown explicitly.
+  No historical tokens are repriced with today's catalog. Scope: all branches, no compaction reset;
+  task/subagent runs and spend not yet written to the file are excluded.
 - Model dropdown: models from `Omp::models()` (cached; refresh button), searchable, grouped by provider,
   current marked; thinking-level selector limited to `off`, `auto` + the model's levels.
   Apply with `/switch <selector>[:level]` and `/effort <level>` injection.
@@ -817,6 +838,7 @@ pub enum NodeKind {                     // mirrors omp entry types (session-tree
     CustomMessage(String), Compaction, BranchSummary, ModelChange, ModelUsage, ThinkingChange,
     Label, Custom(String), Setting(String) /* service_tier_change, title_change, mode_change, credential_pin, session_init, ttsr_injection, reset_boundary, other */,
 }
+pub struct RecordedCost { pub total: f64, pub incomplete: bool } // USD; default 0 / false
 pub struct TreeNode {
     pub id: String, pub parent: Option<String>, pub kind: NodeKind,
     pub timestamp: Option<String>,     // ISO as written
@@ -825,6 +847,7 @@ pub struct TreeNode {
     pub has_text: bool,                // assistant visibility rule input (non-whitespace text block)
     pub stop_reason: Option<String>,
     pub active_leaf: Option<Option<String>>,  // `activeLeafId` if present (Some(None) = explicit null)
+    pub cost_before: RecordedCost,     // exclusive journal-order prefix, independent of tree layout
 }
 pub struct SessionTree {
     pub nodes: Vec<TreeNode>,                 // file order
@@ -850,6 +873,15 @@ impl TreeWatcher {
     pub fn error(&self) -> Option<String>;
 }  // Drop stops + joins promptly.
 ```
+
+`cost_before` sums recorded `usage.cost.total` from assistant messages, hidden `model_usage` entries,
+and legacy `task` tool results with `details.usage`. It includes earlier spend on other branches,
+does not reset at compaction, and excludes the current entry. Live subagent spend absent from the
+journal cannot be reconstructed. Missing/invalid costs, malformed skipped lines, and oversized
+potential usage records mark later prefixes incomplete while retaining the known subtotal; the
+view displays `Before ≥$…` and explains the limitation in the row tooltip. Appends preserve old
+node snapshots; replacing or shrinking the journal resets the prefix. Unlike this legacy-task-aware
+tree prefix, the status bar's cost breakdown covers assistant and side-model usage only.
 
 ### deck_core::ctl additions
 - `LiveSnapshot.leaf: Option<String>` (main session's in-memory leaf, `ctx.sessionManager.getLeafId()`).

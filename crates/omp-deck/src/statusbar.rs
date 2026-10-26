@@ -15,7 +15,7 @@ use crate::icons::{
 };
 use deck_core::ctl::{ContextBreakdown, LiveModel};
 use deck_core::omp::ModelInfo;
-use deck_core::status::{GitInfo, SessionStats, SessionStatus};
+use deck_core::status::{CostDetail, CostSource, GitInfo, SessionStats, SessionStatus};
 use egui::{
     Align, Align2, Color32, CursorIcon, Frame, Layout, Margin, Painter, Pos2, Rect, Response,
     RichText, Sense, Shape, Stroke, Ui, UiBuilder, pos2, vec2,
@@ -298,10 +298,7 @@ impl BarView {
         self.show_cost = st.cost > 0.0;
         self.last_turn_failed = st.last_turn_failed;
         self.has_reply = st.last_assistant_text.is_some();
-        self.cost_tip = format!(
-            "Session cost ${:.4}\nSum of every assistant reply and side-model call in this session file",
-            st.cost
-        );
+        self.cost_tip = cost_tooltip(st.cost, &st.cost_detail);
     }
 
     /// Selector + level the dropdown highlights.
@@ -439,6 +436,104 @@ fn tokens_tooltip(input: u64, output: u64, cache_read: u64, cache_write: u64) ->
         group_digits(cache_read),
         group_digits(cache_write)
     )
+}
+
+/// The cost chip's tooltip: omp's recorded dollars per source and token type. Nothing is priced
+/// from the model catalog; records lacking a breakdown or a cost are listed, never shown as $0.
+fn cost_tooltip(total: f64, d: &CostDetail) -> String {
+    let sources = [
+        ("Assistant replies", ("reply", "replies"), &d.assistant),
+        ("Side-model calls", ("call", "calls"), &d.side),
+    ];
+    let partial = sources.iter().any(|(_, _, s)| source_partial(s));
+    let mut t = format!("Session cost ${total:.4}");
+    if partial {
+        t.push_str(" · breakdown partial");
+    }
+    for (title, noun, s) in sources {
+        if s.records > 0 {
+            cost_source_lines(&mut t, title, noun, s);
+        }
+    }
+    t.push_str(
+        "\n\nAs recorded in the session file: every branch, before and after compaction.\
+         \nNot included: subagent (task) runs, and anything omp has not written to the file yet.",
+    );
+    t
+}
+
+/// Some of the source's dollars cannot be split by token type, or some tokens have no cost.
+fn source_partial(s: &CostSource) -> bool {
+    shows_unitemized(s) || s.uncosted_tokens > 0 || shows_unreconciled(s)
+}
+
+fn shows_unitemized(s: &CostSource) -> bool {
+    s.unitemized_records > 0 && (s.unitemized.usd > 0.0 || s.unitemized.tokens > 0)
+}
+
+/// Visible at the tooltip's 4 decimals.
+fn shows_unreconciled(s: &CostSource) -> bool {
+    s.itemized > 0 && s.unreconciled().abs() >= 0.000_05
+}
+
+fn cost_source_lines(t: &mut String, title: &str, noun: (&str, &str), s: &CostSource) {
+    use std::fmt::Write;
+    let count = |n: u64| {
+        format!(
+            "{} {}",
+            group_digits(n),
+            if n == 1 { noun.0 } else { noun.1 }
+        )
+    };
+    let _ = write!(t, "\n\n{title} · {} · ${:.4}", count(s.records), s.total);
+    if s.itemized > 0 {
+        if s.itemized < s.records {
+            let _ = write!(
+                t,
+                "\n  By token type ({} of {}):",
+                group_digits(s.itemized),
+                count(s.records),
+            );
+        }
+        for (label, p) in [
+            ("↑ input", s.input),
+            ("↓ output", s.output),
+            ("cache read", s.cache_read),
+            ("cache write", s.cache_write),
+        ] {
+            let _ = write!(
+                t,
+                "\n  {label} {} tokens · ${:.4}",
+                group_digits(p.tokens),
+                p.usd
+            );
+        }
+    }
+    if shows_unreconciled(s) {
+        let u = s.unreconciled();
+        let _ = if u > 0.0 {
+            write!(t, "\n  not split by token type · ${u:.4}")
+        } else {
+            write!(t, "\n  token types exceed the recorded total by ${:.4}", -u)
+        };
+    }
+    if shows_unitemized(s) {
+        let _ = write!(
+            t,
+            "\n  no token-type breakdown recorded · {} · {} tokens · ${:.4}",
+            count(s.unitemized_records),
+            group_digits(s.unitemized.tokens),
+            s.unitemized.usd
+        );
+    }
+    if s.uncosted_tokens > 0 {
+        let _ = write!(
+            t,
+            "\n  no cost recorded · {} · {} tokens (not in the total)",
+            count(s.uncosted),
+            group_digits(s.uncosted_tokens)
+        );
+    }
 }
 
 // ------------------------------------------------------------------ actions out
@@ -1403,7 +1498,7 @@ fn bar_button(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deck_core::status::PrInfo;
+    use deck_core::status::{CostPart, PrInfo};
     use std::path::PathBuf;
 
     fn catalog() -> ModelsCache {
@@ -1417,6 +1512,7 @@ mod tests {
             thinking: vec!["low".into(), "high".into()],
             cost_input: Some(5.0),
             cost_output: Some(25.0),
+            ..Default::default()
         }]));
         c
     }
@@ -1478,6 +1574,68 @@ mod tests {
         );
         assert!(g.dirty);
         assert!(v.path_full.ends_with("proj"));
+    }
+
+    #[test]
+    fn cost_tip_shows_recorded_components_and_flags_missing_breakdowns() {
+        let part = |usd, tokens| CostPart { usd, tokens };
+        let detailed = CostDetail {
+            assistant: CostSource {
+                records: 2,
+                total: 1.5,
+                itemized: 2,
+                input: part(0.25, 1_000),
+                output: part(1.25, 50),
+                ..CostSource::default()
+            },
+            side: CostSource {
+                records: 1,
+                total: 0.0625,
+                itemized: 1,
+                cache_read: part(0.0625, 70_000),
+                ..CostSource::default()
+            },
+        };
+        let tip = cost_tooltip(1.5625, &detailed);
+        for want in [
+            "$1.5625", "$1.5000", "$0.2500", "1,000", "$1.2500", "$0.0625", "70,000",
+        ] {
+            assert!(tip.contains(want), "{want} missing:\n{tip}");
+        }
+        assert!(!tip.contains("partial"), "{tip}");
+
+        // An older file: totals only, one reply without any cost.
+        let older = CostDetail {
+            assistant: CostSource {
+                records: 4,
+                total: 0.75,
+                unitemized_records: 3,
+                unitemized: part(0.75, 1_234),
+                uncosted: 1,
+                uncosted_tokens: 9,
+                ..CostSource::default()
+            },
+            side: CostSource::default(),
+        };
+        let tip = cost_tooltip(0.75, &older);
+        assert!(tip.contains("partial") && tip.contains("$0.7500") && tip.contains("1,234"));
+        assert!(!tip.contains("input"), "no invented $0 components:\n{tip}");
+        assert!(!tip.contains("Side-model"), "{tip}");
+
+        // Components short of the recorded totals: the gap is shown, not hidden.
+        let short = CostDetail {
+            assistant: CostSource {
+                records: 1,
+                total: 1.0,
+                itemized: 1,
+                input: part(0.25, 10),
+                output: part(0.5, 5),
+                ..CostSource::default()
+            },
+            side: CostSource::default(),
+        };
+        let tip = cost_tooltip(1.0, &short);
+        assert!(tip.contains("partial") && tip.contains("$0.2500"), "{tip}");
     }
 
     #[test]

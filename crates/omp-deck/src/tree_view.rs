@@ -12,7 +12,7 @@ use crate::icons::{
     ICON_CROSSHAIR, ICON_FOLD_VERTICAL, ICON_GIT_FORK, ICON_KEY_ROUND, ICON_LIST_TREE,
     ICON_SCROLL_TEXT, ICON_SPARKLES, ICON_USER, ICON_WRENCH, ICON_X,
 };
-use deck_core::tree::{NodeKind, SessionTree};
+use deck_core::tree::{NodeKind, RecordedCost, SessionTree};
 use egui::Galley;
 use egui::epaint::CubicBezierShape;
 use egui::text::{LayoutJob, TextFormat};
@@ -146,7 +146,7 @@ struct GalleyKey<'a> {
 }
 
 /// Laid-out row texts, so a frame does not rebuild a `LayoutJob` per visible row. Valid for one
-/// (tree revision, pixel ratio, theme, search tokens); keyed per row by (node, on path, width).
+/// (tree revision, pixel ratio, theme, search tokens); keys: (node, on path, width, cost line).
 #[derive(Default)]
 struct GalleyCache {
     valid: bool,
@@ -154,7 +154,7 @@ struct GalleyCache {
     ppp: u32,
     theme: [Color32; 6],
     tokens: Vec<String>,
-    map: HashMap<(usize, bool, u32), Arc<Galley>>,
+    map: HashMap<(usize, bool, u32, bool), Arc<Galley>>,
 }
 
 /// More laid-out rows than a long scroll through a big tree needs.
@@ -178,7 +178,11 @@ impl GalleyCache {
         self.map.clear();
     }
 
-    fn row(&mut self, key: (usize, bool, u32), build: impl FnOnce() -> Arc<Galley>) -> Arc<Galley> {
+    fn row(
+        &mut self,
+        key: (usize, bool, u32, bool),
+        build: impl FnOnce() -> Arc<Galley>,
+    ) -> Arc<Galley> {
         if let Some(g) = self.map.get(&key) {
             return Arc::clone(g);
         }
@@ -1215,6 +1219,18 @@ fn row_tip(ui: &mut Ui, tree: &SessionTree, row: &Row, now: i64) {
     if let Some(l) = tree.labels.get(&n.id) {
         ui.label(RichText::new(format!("label: {l}")).color(pal.warn));
     }
+    ui.label(format!(
+        "Recorded cost before entry: {}${:.6}",
+        if n.cost_before.incomplete { "≥" } else { "" },
+        n.cost_before.total,
+    ));
+    ui.weak("Journal order across all branches; excludes this entry and unrecorded live subagent spend.");
+    if n.cost_before.incomplete {
+        ui.colored_label(
+            pal.warn,
+            "Some earlier usage could not be read or priced; this is the known subtotal.",
+        );
+    }
     if let Some(ts) = row.ts {
         ui.weak(format!(
             "{} · {} ago",
@@ -1482,7 +1498,7 @@ fn paint_content(
     } else {
         &node.text
     };
-    let g = gc.row((row.node, row.on_path, max_w.to_bits()), || {
+    let g = gc.row((row.node, row.on_path, max_w.to_bits(), false), || {
         let spans = if cx.tokens.is_empty() {
             Vec::new()
         } else {
@@ -1490,7 +1506,28 @@ fn paint_content(
         };
         p.layout_job(text_job(shown, font, color, pal, &spans, max_w))
     });
-    p.galley(pos2(text_left, cy - g.size().y / 2.0), g, color);
+    p.galley(pos2(text_left, cy - 7.0 - g.size().y / 2.0), g, color);
+
+    let cost_color = tone(if node.cost_before.incomplete {
+        pal.warn
+    } else {
+        pal.weak
+    });
+    let cost = gc.row((row.node, row.on_path, max_w.to_bits(), true), || {
+        p.layout_job(text_job(
+            &cost_label(node.cost_before),
+            crate::theme::font(11.0),
+            cost_color,
+            pal,
+            &[],
+            max_w,
+        ))
+    });
+    p.galley(
+        pos2(text_left, cy + 9.0 - cost.size().y / 2.0),
+        cost,
+        cost_color,
+    );
 
     // Age, or the hover actions in its place.
     if cx.show_actions {
@@ -1507,6 +1544,14 @@ fn paint_content(
         );
     }
     None
+}
+
+fn cost_label(cost: RecordedCost) -> String {
+    format!(
+        "Before {}{}",
+        if cost.incomplete { "≥" } else { "" },
+        deck_service::statusfmt::fmt_cost(cost.total),
+    )
 }
 
 fn clip(s: &str, max: usize) -> String {

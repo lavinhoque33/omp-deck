@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use deck_core::tree::{NodeKind, SessionTree, TreeNode, TreeWatcher};
+use deck_core::tree::{NodeKind, RecordedCost, SessionTree, TreeNode, TreeWatcher};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -47,10 +47,22 @@ fn msg(id: &str, parent: Option<&str>, role: &str, extra: &str) -> String {
     )
 }
 
-fn leaf_id(lines: &[String]) -> Option<String> {
+/// A message whose `message` object gets `message_extra` (e.g. `,"usage":{…}`) after its content.
+fn msg_with(id: &str, parent: Option<&str>, role: &str, message_extra: &str) -> String {
+    msg(id, parent, role, "").replace(
+        r#""content":"x"}"#,
+        &format!(r#""content":"x"{message_extra}}}"#),
+    )
+}
+
+fn load_lines(lines: &[String]) -> SessionTree {
     let tmp = tempfile::tempdir().unwrap();
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-    let t = SessionTree::load(&session(tmp.path(), "s.jsonl", &refs)).unwrap();
+    SessionTree::load(&session(tmp.path(), "s.jsonl", &refs)).unwrap()
+}
+
+fn leaf_id(lines: &[String]) -> Option<String> {
+    let t = load_lines(lines);
     t.file_leaf.map(|i| t.nodes[i].id.clone())
 }
 
@@ -390,6 +402,229 @@ fn oversized_entry_keeps_its_top_level_active_leaf() {
     assert_eq!(t.file_leaf.map(|i| t.nodes[i].id.as_str()), Some("big"));
 }
 
+// ---- recorded cost -----------------------------------------------------------------------------
+
+/// `,"usage":{…}` with the given `cost.total` JSON (token fields and cost parts are ignored).
+fn usage(total: &str) -> String {
+    format!(r#","usage":{{"input":3,"output":4,"cost":{{"input":9,"total":{total}}}}}"#)
+}
+
+fn bot(id: &str, parent: Option<&str>, message_extra: &str) -> String {
+    msg_with(id, parent, "assistant", message_extra)
+}
+
+fn before(t: &SessionTree, id: &str) -> RecordedCost {
+    node(t, id).cost_before
+}
+
+fn rc(total: f64, incomplete: bool) -> RecordedCost {
+    RecordedCost { total, incomplete }
+}
+
+#[test]
+fn cost_before_is_an_exclusive_file_order_prefix_over_all_branches() {
+    let t = load_lines(&[
+        msg("u", None, "user", ""),
+        bot("a1", Some("u"), &usage("1")),
+        // hidden usage record on the a1 branch
+        entry(
+            "model_usage",
+            "mu",
+            Some("a1"),
+            r#","purpose":"title","usage":{"cost":{"total":0.5}}"#,
+        ),
+        // a sibling branch still counts: physical order, not the active path
+        bot("b1", Some("u"), &usage("0.25")),
+        entry("compaction", "cp", Some("b1"), r#","tokensBefore":1000"#),
+        bot("a3", Some("cp"), &usage("2")),
+        msg("end", Some("a3"), "user", ""),
+    ]);
+    assert_eq!(before(&t, "u"), rc(0.0, false));
+    assert_eq!(before(&t, "a1"), rc(0.0, false), "own usage excluded");
+    assert_eq!(before(&t, "mu"), rc(1.0, false));
+    assert_eq!(before(&t, "b1"), rc(1.5, false));
+    assert_eq!(before(&t, "cp"), rc(1.75, false));
+    assert_eq!(
+        before(&t, "a3"),
+        rc(1.75, false),
+        "compaction does not reset"
+    );
+    assert_eq!(before(&t, "end"), rc(3.75, false));
+}
+
+#[test]
+fn cost_before_ignores_costs_outside_usage_records() {
+    let t = load_lines(&[
+        msg_with("u", None, "user", r#","usage":{"cost":{"total":100}}"#),
+        bot(
+            "a1",
+            Some("u"),
+            r#","usage":{"nested":{"cost":{"total":50}},"cost":{"total":1,"parts":{"total":40}}}"#,
+        ),
+        // ordinary tool results never bill, whatever their details say
+        msg_with(
+            "tr",
+            Some("a1"),
+            "toolResult",
+            r#","toolName":"read","details":{"usage":{"cost":{"total":100}}}"#,
+        ),
+        // a duplicate id is skipped, its usage with it
+        bot("a1", Some("u"), &usage("64")),
+        entry(
+            "custom_message",
+            "cm",
+            Some("tr"),
+            r#","customType":"x","content":"y","details":{"usage":{"cost":{"total":7}}},"usage":{"cost":{"total":7}}"#,
+        ),
+        entry(
+            "model_usage",
+            "mu",
+            Some("cm"),
+            r#","details":{"usage":{"cost":{"total":8}}},"usage":{"cost":{"total":0.5}}"#,
+        ),
+        msg("end", Some("mu"), "user", ""),
+    ]);
+    assert_eq!(ids(&t), ["u", "a1", "tr", "cm", "mu", "end"]);
+    assert_eq!(before(&t, "a1"), rc(0.0, false), "user usage ignored");
+    assert_eq!(before(&t, "tr"), rc(1.0, false), "only usage.cost.total");
+    assert_eq!(before(&t, "cm"), rc(1.0, false));
+    assert_eq!(before(&t, "mu"), rc(1.0, false));
+    assert_eq!(before(&t, "end"), rc(1.5, false));
+}
+
+#[test]
+fn legacy_task_results_count_their_details_usage_once() {
+    let task = |id: &str, details: &str| {
+        // `details` before `toolName`: field order must not matter
+        msg_with(
+            id,
+            Some("a"),
+            "toolResult",
+            &format!(r#"{details},"toolName":"task""#),
+        )
+    };
+    let t = load_lines(&[
+        bot("a", None, &usage("1")),
+        task(
+            "t1",
+            r#","details":{"output":"done","usage":{"cost":{"total":0.5}}}"#,
+        ),
+        task("t2", ""), // async-style result: no details at all
+        task("t3", r#","details":{"async":true}"#),
+        task("t4", r#","details":{"usage":null}"#),
+        msg("end", Some("t4"), "user", ""),
+        task("t5", r#","details":{"usage":{"input":3}}"#), // usage without a cost
+        msg("end2", Some("t5"), "user", ""),
+    ]);
+    assert_eq!(before(&t, "t1"), rc(1.0, false));
+    assert_eq!(before(&t, "t2"), rc(1.5, false));
+    assert_eq!(before(&t, "end"), rc(1.5, false), "no usage is not unknown");
+    assert_eq!(before(&t, "end2"), rc(1.5, true));
+}
+
+/// `cost_before` of a probe entry after a 1.0 assistant and `record`.
+fn cost_after(record: &str) -> RecordedCost {
+    let t = load_lines(&[
+        bot("a0", None, &usage("1")),
+        record.to_owned(),
+        msg("end", Some("a0"), "user", ""),
+    ]);
+    before(&t, "end")
+}
+
+#[test]
+fn unknown_costs_mark_the_prefix_incomplete_without_losing_the_known_sum() {
+    let a = |extra: &str| bot("x", Some("a0"), extra);
+    let mu = |extra: &str| entry("model_usage", "x", Some("a0"), extra);
+    let unknown = [
+        a(""),
+        a(r#","usage":null"#),
+        a(r#","usage":"lots""#),
+        a(r#","usage":{"input":5}"#),
+        a(r#","usage":{"cost":null}"#),
+        a(r#","usage":{"cost":3}"#),
+        a(r#","usage":{"cost":{"input":0.5}}"#),
+        a(&usage("null")),
+        a(&usage(r#""0.5""#)),
+        a(&usage("-1")),
+        a(&usage(r#"{"usd":1}"#)),
+        mu(""),
+        mu(r#","usage":{"cost":{"total":[1]}}"#),
+        // malformed complete line: skipped, may have been billed
+        r#"{"type":"message","id":"bad","message":"#.to_owned(),
+    ];
+    for record in &unknown {
+        assert_eq!(cost_after(record), rc(1.0, true), "{record}");
+    }
+    let known = [
+        (a(&usage("0")), 1.0),
+        (a(&usage("2")), 3.0),
+        (mu(&usage("0.5")), 1.5),
+        (msg("x", Some("a0"), "user", ""), 1.0),
+        (msg("x", Some("a0"), "toolResult", ""), 1.0),
+        (msg("x", Some("a0"), "bashExecution", ""), 1.0),
+        (entry("title_change", "x", Some("a0"), ""), 1.0),
+    ];
+    for (record, total) in &known {
+        assert_eq!(cost_after(record), rc(*total, false), "{record}");
+    }
+
+    // incomplete is sticky while later known costs keep adding
+    let t = load_lines(&[
+        bot("a0", None, &usage("1")),
+        bot("x", Some("a0"), ""),
+        bot("y", Some("x"), &usage("0.5")),
+        msg("end", Some("y"), "user", ""),
+    ]);
+    assert_eq!(before(&t, "y"), rc(1.0, true));
+    assert_eq!(before(&t, "end"), rc(1.5, true));
+}
+
+#[test]
+fn cost_overflow_keeps_the_known_sum_and_marks_incomplete() {
+    let t = load_lines(&[
+        bot("a0", None, &usage("1.5e308")),
+        bot("a1", Some("a0"), &usage("1.5e308")),
+        bot("a2", Some("a1"), &usage("0.5")),
+        msg("end", Some("a2"), "user", ""),
+    ]);
+    assert_eq!(before(&t, "a1"), rc(1.5e308, false));
+    let end = before(&t, "end");
+    assert!(end.total.is_finite() && end.total >= 1.5e308, "{end:?}");
+    assert!(end.incomplete);
+}
+
+#[test]
+fn oversized_lines_are_unknown_cost_only_when_they_may_be_usage_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pad = "z".repeat(5 * 1024 * 1024);
+    let big = |id: &str, message: &str| {
+        format!(
+            r#"{{"type":"message","id":"{id}","parentId":"a0","timestamp":"2026-03-03T10:00:01.000Z","message":{{{message},"content":[{{"type":"text","text":"{pad}"}}]}}}}"#
+        )
+    };
+    let p = session(
+        tmp.path(),
+        "s.jsonl",
+        &[
+            &bot("a0", None, &usage("1")),
+            &big("bu", r#""role":"user""#),
+            &big(
+                "bt",
+                r#""role":"toolResult","toolCallId":"c","toolName":"read""#,
+            ),
+            &msg("p1", Some("a0"), "user", ""),
+            &big("ba", r#""role":"assistant""#),
+            &msg("p2", Some("a0"), "user", ""),
+        ],
+    );
+    let t = SessionTree::load(&p).unwrap();
+    assert_eq!(ids(&t), ["a0", "bu", "bt", "p1", "ba", "p2"]);
+    assert_eq!(before(&t, "p1"), rc(1.0, false));
+    assert_eq!(before(&t, "ba"), rc(1.0, false));
+    assert_eq!(before(&t, "p2"), rc(1.0, true));
+}
+
 // ---- watcher -----------------------------------------------------------------------------------
 
 fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
@@ -567,4 +802,77 @@ fn incremental_appends_equal_a_fresh_load_including_late_parents_and_ties() {
             .collect::<Vec<_>>(),
         ["a", "dang", "self"]
     );
+}
+
+#[test]
+fn watcher_cost_prefix_matches_a_fresh_load_and_restarts_on_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = session(
+        tmp.path(),
+        "s.jsonl",
+        &[
+            &msg("u", None, "user", ""),
+            &bot("a", Some("u"), &usage("1")),
+        ],
+    );
+    let w = TreeWatcher::spawn(path.clone(), || {});
+    wait_for("first tree", || w.latest().is_some());
+    let first = w.latest().unwrap();
+
+    // hidden usage on another branch, then a billable line written in two halves
+    let mu = entry("model_usage", "mu", Some("u"), &usage("0.5"));
+    let b = bot("b", Some("a"), &usage("0.25"));
+    let (head, tail) = b.split_at(b.len() / 2);
+    append(&path, &format!("{mu}\n{head}"));
+    wait_for("model usage", || {
+        w.latest().is_some_and(|t| t.nodes.len() == 3)
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    append(
+        &path,
+        &format!("{tail}\n{}\n", msg("end", Some("b"), "user", "")),
+    );
+    wait_for("rest", || w.latest().is_some_and(|t| t.nodes.len() == 5));
+    let second = w.latest().unwrap();
+    assert_eq!(*second, SessionTree::load(&path).unwrap());
+    assert_eq!(before(&second, "b"), rc(1.5, false));
+    assert_eq!(
+        before(&second, "end"),
+        rc(1.75, false),
+        "a half-written line is not a skipped one"
+    );
+    assert!(Arc::ptr_eq(&first.nodes[1], &second.nodes[1]));
+    assert_eq!(ids(&first), ["u", "a"]);
+
+    // a malformed complete line: later entries become incomplete, as in a fresh load
+    append(
+        &path,
+        &format!(
+            "{{\"type\":\"message\",\n{}\n",
+            msg("late", Some("end"), "user", "")
+        ),
+    );
+    wait_for("late", || w.latest().is_some_and(|t| t.nodes.len() == 6));
+    let third = w.latest().unwrap();
+    assert_eq!(*third, SessionTree::load(&path).unwrap());
+    assert_eq!(before(&third, "late"), rc(1.75, true));
+
+    // replaced: the prefix restarts from the new file, old snapshots keep theirs
+    let other = session(
+        tmp.path(),
+        "other.jsonl",
+        &[
+            &bot("x", None, &usage("2")),
+            &msg("y", Some("x"), "user", ""),
+        ],
+    );
+    fs::rename(&other, &path).unwrap();
+    wait_for("replace", || {
+        w.latest().is_some_and(|t| ids(&t) == ["x", "y"])
+    });
+    let t = w.latest().unwrap();
+    assert_eq!(*t, SessionTree::load(&path).unwrap());
+    assert_eq!(before(&t, "y"), rc(2.0, false));
+    assert_eq!(before(&second, "end"), rc(1.75, false));
+    assert_eq!(before(&third, "late"), rc(1.75, true));
 }

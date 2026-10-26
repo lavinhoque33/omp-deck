@@ -9,7 +9,11 @@
 //! (first 200 characters of text blocks; `toolResult` bodies are skipped; tool-call arguments stay
 //! borrowed `RawValue`s that are rendered once). Lines above [`MAX_LINE`] are never buffered
 //! beyond that size and are read by their prefix only (`type`, `id`, `parentId`, `timestamp`,
-//! `role`).
+//! `role`, `toolName`).
+//!
+//! Every node carries the recorded cost of the file before it ([`TreeNode::cost_before`]): omp's
+//! `entryUsage` records (assistant `message.usage`, `model_usage.usage`, a `task` tool result's
+//! `details.usage`) summed in file order over all branches, never reset by compaction.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -102,6 +106,48 @@ pub struct TreeNode {
     pub stop_reason: Option<String>,
     /// `activeLeafId` when present (`Some(None)` = explicit null).
     pub active_leaf: Option<Option<String>>,
+    /// Recorded cost of every entry before this one in the file (all branches, hidden
+    /// `model_usage` records included); this entry's own usage is not in it.
+    pub cost_before: RecordedCost,
+}
+
+/// A sum of omp's recorded `usage.cost.total` (USD) over a prefix of the session file.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RecordedCost {
+    /// Sum of the costs that could be read.
+    pub total: f64,
+    /// Some record in the prefix has an unknown cost (missing / invalid `cost.total`, a malformed
+    /// line, an oversized usage record) or the sum overflowed: `total` is a lower bound.
+    pub incomplete: bool,
+}
+
+impl RecordedCost {
+    fn add(&mut self, bill: Bill) {
+        match bill {
+            Bill::Nothing => {}
+            Bill::Unknown => self.incomplete = true,
+            Bill::Known(c) => {
+                let t = self.total + c;
+                if t.is_finite() {
+                    self.total = t;
+                } else {
+                    self.incomplete = true; // keep the known sum rather than show infinity
+                }
+            }
+        }
+    }
+}
+
+/// What one entry adds to the recorded cost (omp `entryUsage`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Bill {
+    /// Not a usage record.
+    #[default]
+    Nothing,
+    /// A usage record's `cost.total`.
+    Known(f64),
+    /// A usage record whose cost cannot be read.
+    Unknown,
 }
 
 /// The tree of one session file.
@@ -566,6 +612,172 @@ struct Recovery {
     note: Option<String>,
 }
 
+/// Visitor methods reading any bool / string / null / array (and with `numbers`, any number) as
+/// `Default::default()`: a usage field of the wrong shape is an unknown cost, not a broken line.
+macro_rules! non_object_default {
+    ($de:lifetime) => {
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_seq<A: SeqAccess<$de>>(self, mut s: A) -> Result<Self::Value, A::Error> {
+            while s.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(Default::default())
+        }
+    };
+    ($de:lifetime, numbers) => {
+        non_object_default!($de);
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+    };
+}
+
+/// A USD amount: a finite, non-negative number; anything else is unknown (`None`).
+#[derive(Default)]
+struct Amount(Option<f64>);
+
+impl Amount {
+    fn of(v: f64) -> Amount {
+        Amount((v.is_finite() && v >= 0.0).then_some(v))
+    }
+}
+
+impl<'de> Deserialize<'de> for Amount {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Amount;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a cost amount")
+            }
+            fn visit_f64<E>(self, v: f64) -> Result<Amount, E> {
+                Ok(Amount::of(v))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Amount, E> {
+                Ok(Amount::of(v as f64))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Amount, E> {
+                Ok(Amount::of(v as f64))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Amount, A::Error> {
+                while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Amount(None))
+            }
+            non_object_default!('de);
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// A `usage` value: `object` = it is an object; `total` = its readable `cost.total`. Every other
+/// field (tokens, nested objects) is skipped unread.
+#[derive(Default)]
+struct UsageVal {
+    object: bool,
+    total: Option<f64>,
+}
+
+impl UsageVal {
+    fn bill(&self) -> Bill {
+        self.total.map_or(Bill::Unknown, Bill::Known)
+    }
+}
+
+impl<'de> Deserialize<'de> for UsageVal {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        /// `usage.cost`: its `total` amount.
+        struct CostV;
+        impl<'de> Visitor<'de> for CostV {
+            type Value = Option<f64>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a cost object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Option<f64>, A::Error> {
+                let mut total = None;
+                while let Some(Key(key)) = m.next_key::<Key<'de>>()? {
+                    if &*key == "total" {
+                        total = m.next_value::<Amount>()?.0;
+                    } else {
+                        m.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(total)
+            }
+            non_object_default!('de, numbers);
+        }
+        struct Cost(Option<f64>);
+        impl<'de> Deserialize<'de> for Cost {
+            fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                d.deserialize_any(CostV).map(Cost)
+            }
+        }
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = UsageVal;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a usage object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<UsageVal, A::Error> {
+                let mut u = UsageVal {
+                    object: true,
+                    total: None,
+                };
+                while let Some(Key(key)) = m.next_key::<Key<'de>>()? {
+                    if &*key == "cost" {
+                        u.total = m.next_value::<Cost>()?.0;
+                    } else {
+                        m.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(u)
+            }
+            non_object_default!('de, numbers);
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// A tool result's `details`: only its `usage` (omp `taskUsageFrom`) is read.
+#[derive(Default)]
+struct TaskDetails(Option<UsageVal>);
+
+impl<'de> Deserialize<'de> for TaskDetails {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = TaskDetails;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("tool result details")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<TaskDetails, A::Error> {
+                let mut usage = None;
+                while let Some(Key(key)) = m.next_key::<Key<'de>>()? {
+                    if &*key == "usage" {
+                        usage = Some(m.next_value::<UsageVal>()?);
+                    } else {
+                        m.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(TaskDetails(usage))
+            }
+            non_object_default!('de, numbers);
+        }
+        d.deserialize_any(V)
+    }
+}
+
 #[derive(Default)]
 struct Msg {
     role: Option<String>,
@@ -576,6 +788,10 @@ struct Msg {
     tool_name: Option<String>,
     command: Option<String>,
     recovery: Option<Recovery>,
+    /// `usage` (counted for assistants only).
+    usage: Option<UsageVal>,
+    /// `details` (counted for `task` tool results only).
+    details: Option<TaskDetails>,
 }
 
 impl<'de> Deserialize<'de> for Msg {
@@ -604,6 +820,8 @@ impl<'de> Deserialize<'de> for Msg {
                         "toolName" => msg.tool_name = m.next_value()?,
                         "command" => msg.command = m.next_value()?,
                         "retryRecovery" => msg.recovery = m.next_value()?,
+                        "usage" => msg.usage = m.next_value()?,
+                        "details" => msg.details = m.next_value()?,
                         _ => {
                             m.next_value::<IgnoredAny>()?;
                         }
@@ -670,6 +888,9 @@ struct Line<'a> {
     title: Option<Cow<'a, str>>,
     #[serde(default, borrow)]
     mode: Option<Cow<'a, str>>,
+    /// `model_usage` usage record.
+    #[serde(default)]
+    usage: Option<UsageVal>,
 }
 
 #[derive(Deserialize)]
@@ -748,6 +969,8 @@ struct Parsed {
     label: Option<(String, Option<String>)>,
     /// toolCall id → rendered row, from an assistant message.
     calls: Vec<(String, String)>,
+    /// The entry's own recorded cost.
+    bill: Bill,
 }
 
 fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Parsed>, String> {
@@ -764,6 +987,7 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
     let mut calls = Vec::new();
     let mut has_text = false;
     let mut stop_reason = None;
+    let mut bill = Bill::Nothing;
     let (kind, text) = match line.ty.as_ref() {
         "message" => {
             let mut msg = line.message.unwrap_or_default();
@@ -807,6 +1031,16 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
                 _ => format!("[{role}]"),
             };
             calls = content.calls;
+            bill = match kind {
+                NodeKind::Assistant => msg.usage.as_ref().map_or(Bill::Unknown, UsageVal::bill),
+                // Ordinary (async) task results carry no `details.usage`: nothing recorded.
+                NodeKind::ToolResult if msg.tool_name.as_deref() == Some("task") => msg
+                    .details
+                    .and_then(|d| d.0)
+                    .filter(|u| u.object)
+                    .map_or(Bill::Nothing, |u| u.bill()),
+                _ => Bill::Nothing,
+            };
             (kind, text)
         }
         "custom_message" => {
@@ -842,6 +1076,7 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
             format!("[model: {}]", str_or(&line.model, "")),
         ),
         "model_usage" => {
+            bill = line.usage.as_ref().map_or(Bill::Unknown, UsageVal::bill);
             let role = line.role.as_deref().map(clean).filter(|r| !r.is_empty());
             (
                 NodeKind::ModelUsage,
@@ -919,9 +1154,11 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
             has_text,
             stop_reason,
             active_leaf: line.active_leaf,
+            cost_before: RecordedCost::default(),
         },
         label,
         calls,
+        bill,
     }))
 }
 
@@ -939,11 +1176,20 @@ fn head_field<'a>(head: &'a [u8], key: &str) -> Option<Option<&'a str>> {
     std::str::from_utf8(&rest[..end]).ok().map(Some)
 }
 
-/// Node for a line too large to parse: type, ids and role from its prefix only.
-fn parse_oversize(head: &[u8], total: usize, leaf: Option<Option<String>>) -> Option<Parsed> {
+/// Node for a line too large to parse: type, ids, role and tool name from its prefix only. A
+/// line without a readable type is an error (it may have been a usage record).
+fn parse_oversize(
+    head: &[u8],
+    total: usize,
+    leaf: Option<Option<String>>,
+) -> Result<Option<Parsed>, String> {
     let head = &head[..head.len().min(PREFIX_SCAN)];
-    let ty = head_field(head, "type")??;
-    let id = head_field(head, "id")??;
+    let Some(Some(ty)) = head_field(head, "type") else {
+        return Err("oversized line without a type".to_owned());
+    };
+    let Some(Some(id)) = head_field(head, "id") else {
+        return Ok(None);
+    };
     let parent = head_field(head, "parentId").flatten();
     let timestamp = head_field(head, "timestamp").flatten();
     let kind = match ty {
@@ -960,12 +1206,22 @@ fn parse_oversize(head: &[u8], total: usize, leaf: Option<Option<String>>) -> Op
         "custom" => NodeKind::Custom(String::new()),
         other => NodeKind::Setting(other.to_owned()),
     };
+    // The cost of an unread usage record is unknown; other entries record nothing.
+    let bill = match &kind {
+        NodeKind::Assistant | NodeKind::ModelUsage | NodeKind::OtherRole(_) => Bill::Unknown,
+        // a `task` result may carry `details.usage`
+        NodeKind::ToolResult => match head_field(head, "toolName") {
+            Some(Some(name)) if name != "task" => Bill::Nothing,
+            _ => Bill::Unknown,
+        },
+        _ => Bill::Nothing,
+    };
     let mb = total as f64 / (1024.0 * 1024.0);
     let shown = matches!(
         kind,
         NodeKind::User | NodeKind::Assistant | NodeKind::Developer
     );
-    Some(Parsed {
+    Ok(Some(Parsed {
         node: TreeNode {
             id: id.to_owned(),
             parent: parent.map(str::to_owned),
@@ -975,10 +1231,12 @@ fn parse_oversize(head: &[u8], total: usize, leaf: Option<Option<String>>) -> Op
             timestamp: timestamp.map(str::to_owned),
             stop_reason: None,
             active_leaf: leaf,
+            cost_before: RecordedCost::default(),
         },
         label: None,
         calls: Vec::new(),
-    })
+        bill,
+    }))
 }
 
 // ---- builder -----------------------------------------------------------------------------------
@@ -1004,6 +1262,8 @@ struct Builder {
     ident: Option<FileId>,
     /// Something changed since the last snapshot.
     dirty: bool,
+    /// Recorded cost of the entries consumed so far (the next node's `cost_before`).
+    cost: RecordedCost,
 }
 
 enum LineRead {
@@ -1192,7 +1452,7 @@ impl Builder {
             return true;
         }
         let parsed = match over {
-            Some((total, leaf)) => Ok(parse_oversize(bytes, total, leaf)),
+            Some((total, leaf)) => parse_oversize(bytes, total, leaf),
             None => parse_line(bytes, &self.tools),
         };
         match parsed {
@@ -1208,11 +1468,13 @@ impl Builder {
         }
     }
 
-    fn add(&mut self, p: Parsed) {
+    fn add(&mut self, mut p: Parsed) {
         if self.index.contains_key(p.node.id.as_str()) {
             log::debug!("tree: duplicate entry id {}", p.node.id);
             return;
         }
+        p.node.cost_before = self.cost;
+        self.cost.add(p.bill);
         for (id, rendered) in p.calls {
             self.tools.insert(id, rendered);
         }
@@ -1287,7 +1549,9 @@ impl Builder {
                 } => {
                     let over = over.then_some((bytes, leaf));
                     if complete {
-                        self.ingest(&buf, over);
+                        if !self.ingest(&buf, over) {
+                            self.cost.incomplete = true; // the skipped line may have been billed
+                        }
                     } else if over.is_none() && self.ingest(&buf, None) {
                         // a valid last line without its newline yet
                     } else {
@@ -1557,12 +1821,60 @@ mod tests {
     #[test]
     fn oversize_prefix_scan_reads_ids_and_role() {
         let head = br#"{"type":"message","id":"ab12","parentId":"cd34","timestamp":"2026-01-01T00:00:00Z","message":{"role":"toolResult","content":[{"type":"text","text":"xxx"#;
-        let p = parse_oversize(head, 9 * 1024 * 1024, None).unwrap();
+        let p = parse_oversize(head, 9 * 1024 * 1024, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(p.node.id, "ab12");
         assert_eq!(p.node.parent.as_deref(), Some("cd34"));
         assert_eq!(p.node.kind, NodeKind::ToolResult);
         assert_eq!(p.node.text, "[large entry: 9.0 MB]");
+        assert_eq!(
+            p.bill,
+            Bill::Unknown,
+            "tool name unseen: may be a billed task"
+        );
         let root = br#"{"type":"model_change","id":"r","parentId":null,"timestamp":"t""#;
-        assert_eq!(parse_oversize(root, 1, None).unwrap().node.parent, None);
+        let p = parse_oversize(root, 1, None).unwrap().unwrap();
+        assert_eq!(p.node.parent, None);
+        assert_eq!(p.bill, Bill::Nothing);
+    }
+
+    #[test]
+    fn oversize_bill_is_unknown_only_for_possible_usage_records() {
+        let bill = |head: &str| {
+            parse_oversize(head.as_bytes(), 1, None)
+                .unwrap()
+                .unwrap()
+                .bill
+        };
+        let msg = |rest: &str| format!(r#"{{"type":"message","id":"m","message":{{{rest}"#);
+        assert_eq!(
+            bill(&msg(r#""role":"assistant","content":"#)),
+            Bill::Unknown
+        );
+        assert_eq!(bill(&msg(r#""role":"weird","content":"#)), Bill::Unknown);
+        assert_eq!(bill(&msg(r#""content":"#)), Bill::Unknown, "role unseen");
+        assert_eq!(bill(&msg(r#""role":"user","content":"#)), Bill::Nothing);
+        assert_eq!(
+            bill(&msg(r#""role":"toolResult","toolName":"read","content":"#)),
+            Bill::Nothing
+        );
+        assert_eq!(
+            bill(&msg(r#""role":"toolResult","toolName":"task","content":"#)),
+            Bill::Unknown
+        );
+        assert_eq!(
+            bill(r#"{"type":"model_usage","id":"u","usage":"#),
+            Bill::Unknown
+        );
+        assert_eq!(
+            bill(r#"{"type":"compaction","id":"c","summary":"#),
+            Bill::Nothing
+        );
+        assert!(parse_oversize(br#"{"id":"x","pad":"#, 1, None).is_err());
+        assert!(matches!(
+            parse_oversize(br#"{"type":"custom","x":"#, 1, None),
+            Ok(None)
+        ));
     }
 }

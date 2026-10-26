@@ -11,7 +11,7 @@ use crate::icons::{
     ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_UP, ICON_CIRCLE_ALERT, ICON_REFRESH_CW,
     ICON_SEARCH, ICON_STAR,
 };
-use deck_core::omp::ModelInfo;
+use deck_core::omp::{ModelInfo, Pricing};
 use egui::{
     Align2, Color32, CursorIcon, FontId, Margin, Response, RichText, Sense, Stroke, StrokeKind,
     TextEdit, Ui, pos2, vec2,
@@ -31,7 +31,7 @@ pub enum LoadState {
     Failed(String),
 }
 
-/// `omp models --json`, loaded once on a worker and shared by every tab.
+/// The `Omp::models` catalog (with omp's metrics), loaded once on a worker and shared by every tab.
 pub struct ModelsCache {
     pub state: LoadState,
     list: Vec<ModelInfo>,
@@ -203,6 +203,113 @@ pub fn level_for_switch(target: &ModelInfo, staged: Option<&str>) -> Option<Stri
         .iter()
         .any(|l| l == level)
         .then(|| level.to_owned())
+}
+
+/// Tokens per second as omp's model browser prints them: whole from 10, one decimal below.
+fn fmt_tps(tps: f64) -> String {
+    if tps >= 10.0 {
+        format!("{}", tps.round())
+    } else {
+        format!("{tps:.1}")
+    }
+}
+
+/// A row's speed: measured on this machine (`118 t/s`), else omp's catalog estimate
+/// (`~118 t/s`); `None` when neither exists.
+fn speed_label(m: &ModelInfo) -> Option<String> {
+    match (&m.measured, m.catalog_tps) {
+        (Some(s), _) => Some(format!("{} t/s", fmt_tps(s.tps))),
+        (None, Some(tps)) => Some(format!("~{} t/s", fmt_tps(tps))),
+        (None, None) => None,
+    }
+}
+
+/// omp's word for a rate card the `$` rates do not describe (`fixed` / unreported: `None`).
+fn pricing_word(p: Option<Pricing>) -> Option<&'static str> {
+    match p? {
+        Pricing::Fixed => None,
+        Pricing::Free => Some("free"),
+        Pricing::Included => Some("included"),
+        Pricing::Variable => Some("price varies"),
+        Pricing::Unknown => Some("pricing unknown"),
+    }
+}
+
+/// A row's price: `$in / $out` per million tokens, or omp's word for a card without rates;
+/// `None` when omp does not know it (the tooltip says so).
+fn price_label(m: &ModelInfo) -> Option<String> {
+    if m.pricing == Some(Pricing::Unknown) {
+        return None;
+    }
+    if let Some(word) = pricing_word(m.pricing) {
+        return Some(word.to_owned());
+    }
+    let (i, o) = (m.cost_input?, m.cost_output?);
+    Some(format!("${} / ${}", fmt_price(i), fmt_price(o)))
+}
+
+/// A row's tooltip: name, `/switch` target, then the facts omp's model browser details (only
+/// those omp reports).
+fn model_details(m: &ModelInfo) -> String {
+    let mut facts: Vec<(&str, String)> = Vec::new();
+    if let Some(w) = m.context_window {
+        facts.push(("Context", format!("{} tokens", fmt_tokens(w))));
+    }
+    if let Some(t) = m.max_tokens {
+        facts.push(("Max output", format!("{} tokens", fmt_tokens(t))));
+    }
+    let price = match pricing_word(m.pricing) {
+        Some(word) => Some(word.to_owned()),
+        None => m.cost_input.zip(m.cost_output).map(|(i, o)| {
+            let mut s = format!("${} in · ${} out", fmt_price(i), fmt_price(o));
+            if let Some(c) = m.cost_cache_read.filter(|c| *c > 0.0) {
+                s.push_str(&format!(" · ${} cache read", fmt_price(c)));
+            }
+            s + " per M tokens"
+        }),
+    };
+    if let Some(price) = price {
+        facts.push(("Price", price));
+    }
+    if let Some(s) = &m.measured {
+        let mut speed = format!("{} t/s", fmt_tps(s.tps));
+        if let Some(tier) = &s.tier {
+            speed.push_str(&format!(" ({tier} tier)"));
+        }
+        if let Some(ms) = s.ttft_ms {
+            let secs = ms / 1000.0;
+            if secs >= 10.0 {
+                speed.push_str(&format!(" · {secs:.0} s to first token"));
+            } else {
+                speed.push_str(&format!(" · {secs:.1} s to first token"));
+            }
+        }
+        let n = s.samples.round().max(1.0);
+        speed.push_str(&format!(
+            " · measured here, {n:.0} sample{}",
+            if n == 1.0 { "" } else { "s" }
+        ));
+        facts.push(("Speed", speed));
+    } else if let Some(tps) = m.catalog_tps {
+        facts.push(("Speed", format!("~{} t/s (catalog estimate)", fmt_tps(tps))));
+    }
+    if let Some(iq) = m.intelligence {
+        facts.push(("Intelligence", format!("{} (catalog score)", iq.round())));
+    }
+    if !m.input.is_empty() {
+        facts.push(("Input", m.input.join(" · ")));
+    }
+    if let Some(r) = m.reasoning {
+        facts.push(("Reasoning", if r { "yes" } else { "no" }.to_owned()));
+    }
+    let mut out = format!("{}\n/switch {}", m.name, m.selector);
+    if !facts.is_empty() {
+        out.push('\n');
+    }
+    for (k, v) in facts {
+        out.push_str(&format!("\n{k}: {v}"));
+    }
+    out
 }
 
 // ------------------------------------------------------------------ UI
@@ -495,7 +602,7 @@ fn option_row(ui: &mut Ui, text: &str, selected: bool) -> bool {
     resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
 }
 
-const POPUP_W: f32 = 430.0;
+const POPUP_W: f32 = 500.0;
 /// Space kept free at the window edges when the popup is clamped.
 const POPUP_MARGIN: f32 = 16.0;
 const ROW_H: f32 = 36.0;
@@ -842,40 +949,63 @@ fn model_row(
     }
     let name_x = left + 24.0;
     let mid = rect.center().y;
-    // Right side first (star, then context window and $/M in/out): its left edge bounds the text.
-    let mut x = star_rect.left() - 4.0;
-    if let (Some(i), Some(o)) = (m.cost_input, m.cost_output) {
-        let price = format!("${} / ${}", fmt_price(i), fmt_price(o));
+    let (top_y, bottom_y) = (mid - 7.0, mid + 8.0);
+    let meta = crate::theme::font(11.0);
+    let right = star_rect.left() - 4.0;
+    // Right side first, one block per text line; each block's left edge bounds that line.
+    // Top: speed, then the intelligence pill (beside the name).
+    let mut top_x = right;
+    if let Some(speed) = speed_label(m) {
         let g = p.text(
-            pos2(x, mid),
+            pos2(top_x, top_y),
             Align2::RIGHT_CENTER,
-            price,
-            crate::theme::font(11.0),
+            speed,
+            meta.clone(),
             pal.weak,
         );
-        x = g.left() - 10.0;
+        top_x = g.left() - 8.0;
+    }
+    if let Some(iq) = m.intelligence {
+        let g = p.layout_no_wrap(format!("IQ {}", iq.round()), meta.clone(), pal.text);
+        let pill = egui::Rect::from_min_size(
+            pos2(top_x - g.size().x - 10.0, top_y - 8.0),
+            vec2(g.size().x + 10.0, 16.0),
+        );
+        p.rect_filled(pill, theme::rad(5, 8), pal.surface);
+        p.galley(pill.center() - g.size() / 2.0, g, pal.text);
+        top_x = pill.left() - 10.0;
+    }
+    // Bottom: $/M in/out, then the context window (beside the id).
+    let mut bottom_x = right;
+    if let Some(price) = price_label(m) {
+        let g = p.text(
+            pos2(bottom_x, bottom_y),
+            Align2::RIGHT_CENTER,
+            price,
+            meta.clone(),
+            pal.weak,
+        );
+        bottom_x = g.left() - 10.0;
     }
     if let Some(w) = m.context_window {
-        let label = fmt_tokens(w);
-        let g = p.layout_no_wrap(label.clone(), crate::theme::font(11.0), pal.text);
-        let pill = egui::Rect::from_min_size(
-            pos2(x - g.size().x - 12.0, mid - 9.0),
-            vec2(g.size().x + 12.0, 18.0),
+        let g = p.text(
+            pos2(bottom_x, bottom_y),
+            Align2::RIGHT_CENTER,
+            format!("{} ctx", fmt_tokens(w)),
+            meta,
+            pal.text,
         );
-        p.rect_filled(pill, theme::rad(6, 9), pal.surface);
-        p.galley(pill.center() - g.size() / 2.0, g, pal.text);
-        x = pill.left() - 10.0;
+        bottom_x = g.left() - 10.0;
     }
-    let limit = x;
     let g = fitted(
         p,
         short_model_name(&m.name),
         crate::theme::font(13.5),
         if current { pal.text_strong } else { pal.text },
-        limit - name_x,
+        top_x - name_x,
     );
     p.galley(
-        pos2(name_x, mid - 7.0 - g.size().y / 2.0),
+        pos2(name_x, top_y - g.size().y / 2.0),
         g,
         Color32::PLACEHOLDER,
     );
@@ -887,10 +1017,10 @@ fn model_row(
             &m.provider,
             crate::theme::font(10.0),
             if theme::flat() { pal.text } else { pal.accent },
-            (limit - name_x - 10.0).min(120.0),
+            (bottom_x - name_x - 10.0).min(120.0),
         );
         let tag =
-            egui::Rect::from_min_size(pos2(name_x, mid + 8.0 - 7.0), vec2(g.size().x + 10.0, 14.0));
+            egui::Rect::from_min_size(pos2(name_x, bottom_y - 7.0), vec2(g.size().x + 10.0, 14.0));
         p.rect_filled(
             tag,
             theme::rad(5, 7),
@@ -907,9 +1037,15 @@ fn model_row(
         );
         id_x = tag.right() + 6.0;
     }
-    let g = fitted(p, &m.id, crate::theme::font(10.5), pal.weak, limit - id_x);
+    let g = fitted(
+        p,
+        &m.id,
+        crate::theme::font(10.5),
+        pal.weak,
+        bottom_x - id_x,
+    );
     p.galley(
-        pos2(id_x, mid + 8.0 - g.size().y / 2.0),
+        pos2(id_x, bottom_y - g.size().y / 2.0),
         g,
         Color32::PLACEHOLDER,
     );
@@ -947,7 +1083,7 @@ fn model_row(
         .on_hover_cursor(CursorIcon::PointingHand);
     let star_clicked = star.clicked();
     let clicked = resp
-        .on_hover_text(format!("{}\n/switch {}", m.name, m.selector))
+        .on_hover_text(model_details(m))
         .on_hover_cursor(CursorIcon::PointingHand)
         .clicked()
         && !star_clicked;
@@ -1026,8 +1162,7 @@ mod tests {
             name: name.to_owned(),
             context_window: Some(100_000),
             thinking: thinking.iter().map(|s| (*s).to_owned()).collect(),
-            cost_input: None,
-            cost_output: None,
+            ..Default::default()
         }
     }
 
@@ -1109,6 +1244,28 @@ mod tests {
             provider_counts(&c),
             vec![("anthropic".to_owned(), 2), ("zeta".to_owned(), 1)]
         );
+    }
+
+    #[test]
+    fn row_metadata_omits_unknowns_and_prefers_measured_speed() {
+        let mut m = model("p", "m", "M", &[]);
+        // omp's all-zero card it cannot call free: no "$0 / $0", no speed or IQ.
+        m.cost_input = Some(0.0);
+        m.cost_output = Some(0.0);
+        m.pricing = Some(Pricing::Unknown);
+        assert_eq!((price_label(&m), speed_label(&m)), (None, None));
+        assert!(!model_details(&m).contains("Intelligence"));
+        m.pricing = Some(Pricing::Fixed);
+        assert_eq!(price_label(&m).as_deref(), Some("$0 / $0"));
+        m.catalog_tps = Some(7.26);
+        assert_eq!(speed_label(&m).as_deref(), Some("~7.3 t/s"));
+        m.measured = Some(deck_core::omp::MeasuredSpeed {
+            tps: 118.4,
+            ttft_ms: Some(900.0),
+            samples: 1.0,
+            tier: None,
+        });
+        assert_eq!(speed_label(&m).as_deref(), Some("118 t/s"));
     }
 
     #[test]
