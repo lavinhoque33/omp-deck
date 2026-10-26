@@ -2415,3 +2415,25 @@ ledger. Later gateway/relay slices must bind process-local generations to a serv
 preserve refusal/outcome distinctions and recover accepted work without blind replay. They must also
 implement long-job and explicit native-effect transport; no mobile capability is implied by merely
 having a shared executor.
+
+## Metric badges and the provider quota chip
+
+`badge.rs` (`Badge`, `Hue`) paints every numeric fact that used to be one run of grey text as its own tinted
+badge (fill 16 % + 1 px outline of the hue, radius from `theme::ui_rad`). Hues are fixed per meaning and
+independent of the style (most styles have one accent, so neighbouring accent-coloured badges would blur):
+cost green, time amber, requests blue, tools orange, tokens teal, model violet, thinking rose; token types in the
+cost tooltip: input blue, output teal, cache read violet, cache write amber. Users: subagent cards
+(`agent_hub::card`: model badge top right, `agent_model::metrics` → one badge per `Metric`, dropped from the end
+when narrow), session cards (`dashboard`: model, thinking, cost, `↑`/`↓`), the agent popup header, the session
+tree (`before $x` badge per row and in the row tooltip, amber `≥` when `RecordedCost.incomplete`) and the status
+bar. The cost tooltip is `cost_tip::CostTip` (formatted once in `BarView::build`, painted by `cost_tip::show`):
+total badge, one section per source (assistant replies / side-model calls) with a per-token-type table and amber
+notes for gaps; the data rules of the earlier text version are unchanged.
+
+Status-bar usage chip (not hovered) shows the **selected model's provider**, not the tightest quota overall:
+`Summary::quota_of(provider)` (provider id = the selector's `provider/` prefix) → `ProviderQuota.pills`, the fullest
+window of ~5 h length (`5h`, blue tag) and of ~a week (`wk`, violet tag), lengths from `CardWindow.window_ms`
+(`durationMs`, else the id: `5h`/`7d`/`1w`). A warning/exhausted window turns its pill amber/red. A provider with
+neither window shows its two shortest measured windows (`1d`, `mo`, …, teal); a provider with no measurable window
+(or no model selected) falls back to the old tightest-overall chip, prefixed with that provider's name. The hover
+card is unchanged (all providers).

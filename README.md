@@ -35,6 +35,7 @@ host), so closing a tab or the whole app leaves omp running.
   assistant replies and side-model calls; older records without itemized costs are marked partial.
 - **Usage**: omp's `/usage` as a native view (Ctrl+Shift+U or the status-bar usage chip): remaining quota
   per provider and window with reset times, a year of activity as a heatmap, and top models by cost.
+  The chip itself shows the selected model's provider: its 5-hour and weekly quota as two colored pills.
 - **Session manager** (Ctrl+Shift+S, the ⋯ menu, the sidebar button or a project's "Manage sessions…"): every
   omp session on the machine, including empty ones the sidebar hides, in a sortable table with its disk size
   (session file plus attachments and subagent transcripts, i.e. what deleting it frees), prompts and turns, tokens,

@@ -384,15 +384,25 @@ fn header_rows(
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
         if let Some(m) = &a.model {
-            chip_text(ui, &short_model(m), pal.text, pal.raised).on_hover_text(m);
+            crate::badge::Badge::single(
+                ui.painter(),
+                Some(crate::icons::ICON_CPU),
+                &short_model(m),
+                crate::badge::Hue::Violet.color(pal),
+                12.0,
+            )
+            .show(ui)
+            .on_hover_text(m);
         }
         if let Some(t) = &a.thinking {
-            chip_text(
-                ui,
+            crate::badge::Badge::single(
+                ui.painter(),
+                Some(crate::icons::ICON_BRAIN),
                 &format!("thinking · {t}"),
-                if theme::flat() { pal.text } else { pal.accent },
-                theme::accent_fill(pal, 0.14),
-            );
+                crate::badge::Hue::Rose.color(pal),
+                12.0,
+            )
+            .show(ui);
         }
         lineage(ui, input, a, out);
         ctl_buttons(ui, input, a, out);
@@ -825,16 +835,6 @@ fn badge(ui: &mut Ui, text: &str, color: Color32) {
         .rect_filled(rect, 10, color.gamma_multiply(0.16));
     ui.painter()
         .galley(rect.center() - g.size() / 2.0, g, color);
-}
-
-fn chip_text(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> egui::Response {
-    let g = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), crate::theme::font(12.0), fg);
-    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 18.0, 22.0), Sense::hover());
-    ui.painter().rect_filled(rect, 11, bg);
-    ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
-    resp
 }
 
 fn fact_tile(ui: &mut Ui, label: &str, value: &str) {

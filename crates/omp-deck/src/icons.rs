@@ -66,6 +66,7 @@ pub const ICON_COLUMNS_2: Icon = Icon::new("\u{e098}");
 pub const ICON_CLOUD: Icon = Icon::new("\u{e088}");
 pub const ICON_CLOUD_UPLOAD: Icon = Icon::new("\u{e091}");
 pub const ICON_COPY: Icon = Icon::new("\u{e09e}");
+pub const ICON_COINS: Icon = Icon::new("\u{e097}");
 pub const ICON_CORNER_DOWN_RIGHT: Icon = Icon::new("\u{e0a2}");
 pub const ICON_CPU: Icon = Icon::new("\u{e0a9}");
 pub const ICON_CROSSHAIR: Icon = Icon::new("\u{e0ac}");

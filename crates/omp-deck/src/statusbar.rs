@@ -15,16 +15,19 @@ use crate::icons::{
 };
 use deck_core::ctl::{ContextBreakdown, LiveModel};
 use deck_core::omp::ModelInfo;
-use deck_core::status::{CostDetail, CostSource, GitInfo, SessionStats, SessionStatus};
+use deck_core::status::{GitInfo, SessionStats, SessionStatus};
 use egui::{
     Align, Align2, Color32, CursorIcon, Frame, Layout, Margin, Painter, Pos2, Rect, Response,
     RichText, Sense, Shape, Stroke, Ui, UiBuilder, pos2, vec2,
 };
 
 use crate::agent_model::Counts;
+use crate::badge::{Badge, Hue};
+use crate::cost_tip::{self, CostTip};
 use crate::ctx_tip::{self, CtxTip};
-use crate::usage_state::Summary;
+use crate::usage_state::{Chip, PillKind, QuotaPill, Summary};
 use crate::usage_view;
+use deck_core::usage::LimitStatus;
 
 use crate::model_picker::{self, ModelsCache, PickerAction, PickerInput, PickerState};
 use crate::theme::{self, Palette};
@@ -109,7 +112,7 @@ pub struct BarView {
     pub tokens_tip: String,
     pub show_tokens: bool,
     pub cost: String,
-    pub cost_tip: String,
+    pub cost_tip: CostTip,
     pub show_cost: bool,
     pub last_turn_failed: bool,
     pub has_reply: bool,
@@ -298,7 +301,7 @@ impl BarView {
         self.show_cost = st.cost > 0.0;
         self.last_turn_failed = st.last_turn_failed;
         self.has_reply = st.last_assistant_text.is_some();
-        self.cost_tip = cost_tooltip(st.cost, &st.cost_detail);
+        self.cost_tip = CostTip::build(st.cost, &st.cost_detail);
     }
 
     /// Selector + level the dropdown highlights.
@@ -436,104 +439,6 @@ fn tokens_tooltip(input: u64, output: u64, cache_read: u64, cache_write: u64) ->
         group_digits(cache_read),
         group_digits(cache_write)
     )
-}
-
-/// The cost chip's tooltip: omp's recorded dollars per source and token type. Nothing is priced
-/// from the model catalog; records lacking a breakdown or a cost are listed, never shown as $0.
-fn cost_tooltip(total: f64, d: &CostDetail) -> String {
-    let sources = [
-        ("Assistant replies", ("reply", "replies"), &d.assistant),
-        ("Side-model calls", ("call", "calls"), &d.side),
-    ];
-    let partial = sources.iter().any(|(_, _, s)| source_partial(s));
-    let mut t = format!("Session cost ${total:.4}");
-    if partial {
-        t.push_str(" · breakdown partial");
-    }
-    for (title, noun, s) in sources {
-        if s.records > 0 {
-            cost_source_lines(&mut t, title, noun, s);
-        }
-    }
-    t.push_str(
-        "\n\nAs recorded in the session file: every branch, before and after compaction.\
-         \nNot included: subagent (task) runs, and anything omp has not written to the file yet.",
-    );
-    t
-}
-
-/// Some of the source's dollars cannot be split by token type, or some tokens have no cost.
-fn source_partial(s: &CostSource) -> bool {
-    shows_unitemized(s) || s.uncosted_tokens > 0 || shows_unreconciled(s)
-}
-
-fn shows_unitemized(s: &CostSource) -> bool {
-    s.unitemized_records > 0 && (s.unitemized.usd > 0.0 || s.unitemized.tokens > 0)
-}
-
-/// Visible at the tooltip's 4 decimals.
-fn shows_unreconciled(s: &CostSource) -> bool {
-    s.itemized > 0 && s.unreconciled().abs() >= 0.000_05
-}
-
-fn cost_source_lines(t: &mut String, title: &str, noun: (&str, &str), s: &CostSource) {
-    use std::fmt::Write;
-    let count = |n: u64| {
-        format!(
-            "{} {}",
-            group_digits(n),
-            if n == 1 { noun.0 } else { noun.1 }
-        )
-    };
-    let _ = write!(t, "\n\n{title} · {} · ${:.4}", count(s.records), s.total);
-    if s.itemized > 0 {
-        if s.itemized < s.records {
-            let _ = write!(
-                t,
-                "\n  By token type ({} of {}):",
-                group_digits(s.itemized),
-                count(s.records),
-            );
-        }
-        for (label, p) in [
-            ("↑ input", s.input),
-            ("↓ output", s.output),
-            ("cache read", s.cache_read),
-            ("cache write", s.cache_write),
-        ] {
-            let _ = write!(
-                t,
-                "\n  {label} {} tokens · ${:.4}",
-                group_digits(p.tokens),
-                p.usd
-            );
-        }
-    }
-    if shows_unreconciled(s) {
-        let u = s.unreconciled();
-        let _ = if u > 0.0 {
-            write!(t, "\n  not split by token type · ${u:.4}")
-        } else {
-            write!(t, "\n  token types exceed the recorded total by ${:.4}", -u)
-        };
-    }
-    if shows_unitemized(s) {
-        let _ = write!(
-            t,
-            "\n  no token-type breakdown recorded · {} · {} tokens · ${:.4}",
-            count(s.unitemized_records),
-            group_digits(s.unitemized.tokens),
-            s.unitemized.usd
-        );
-    }
-    if s.uncosted_tokens > 0 {
-        let _ = write!(
-            t,
-            "\n  no cost recorded · {} · {} tokens (not in the total)",
-            count(s.uncosted),
-            group_digits(s.uncosted_tokens)
-        );
-    }
 }
 
 // ------------------------------------------------------------------ actions out
@@ -801,20 +706,15 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
             chip(ui, "cost", Sense::hover(), |ui| {
                 ui.label(RichText::new(&v.cost).size(14.4).color(pal.ok));
             })
-            .on_hover_text(&v.cost_tip);
+            .on_hover_ui(|ui| cost_tip::show(ui, &v.cost_tip));
         }
         Seg::Usage => {
             if let Some(u) = &v.usage
                 && let Some(c) = &u.chip
             {
                 divider(ui);
-                let color = match c.status {
-                    deck_core::usage::LimitStatus::Ok => pal.text,
-                    s => usage_view::status_color(pal, s),
-                };
                 let r = chip(ui, "usage", Sense::click(), |ui| {
-                    ui.label(icon_text(ICON_GAUGE, 15.6, pal.weak));
-                    ui.add(text(&c.text, 14.4, color));
+                    usage_chip_content(ui, pal, v, u, c);
                 });
                 let r = r
                     .on_hover_cursor(CursorIcon::PointingHand)
@@ -825,6 +725,59 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
             }
         }
     }
+}
+
+/// The usage chip's content: the selected model's provider quota as one pill per window (5 h,
+/// weekly), each in its own colour; a provider without a measurable window falls back to the
+/// tightest quota overall, named so it is not mistaken for the selected provider's.
+fn usage_chip_content(ui: &mut Ui, pal: &Palette, v: &BarView, u: &Summary, c: &Chip) {
+    ui.label(icon_text(ICON_GAUGE, 15.6, pal.weak));
+    let quota = v
+        .model_selector
+        .as_deref()
+        .and_then(|s| s.split_once('/'))
+        .and_then(|(provider, _)| u.quota_of(provider));
+    if let Some(q) = quota {
+        for p in &q.pills {
+            quota_pill(ui, pal, p);
+        }
+        return;
+    }
+    let tint = match c.status {
+        LimitStatus::Ok => Hue::Teal.color(pal),
+        s => usage_view::status_color(pal, s),
+    };
+    let who = c.tight.split(" · ").next().unwrap_or_default();
+    let parts: &[(&str, Color32)] = if who.is_empty() {
+        &[(&c.text, tint)]
+    } else {
+        &[(who, pal.weak), (&c.text, tint)]
+    };
+    Badge::new(ui.painter(), None, parts, tint, 13.0).show(ui);
+}
+
+/// `5h 63% left`: the window tag in the window's hue, the figure strong; a warning or exhausted
+/// window turns the whole pill amber or red.
+fn quota_pill(ui: &mut Ui, pal: &Palette, p: &QuotaPill) {
+    let hue = match p.kind {
+        PillKind::FiveHour => Hue::Blue,
+        PillKind::Weekly => Hue::Violet,
+        PillKind::Other => Hue::Teal,
+    }
+    .color(pal);
+    let (tint, figure) = match p.status {
+        LimitStatus::Warning => (pal.warn, pal.warn),
+        LimitStatus::Exhausted => (pal.danger, pal.danger),
+        _ => (hue, pal.text_strong),
+    };
+    Badge::new(
+        ui.painter(),
+        None,
+        &[(&p.tag, tint), (&p.text, figure)],
+        tint,
+        13.0,
+    )
+    .show(ui);
 }
 
 fn text(s: &str, size: f32, color: Color32) -> egui::Label {
@@ -1498,7 +1451,7 @@ fn bar_button(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deck_core::status::{CostPart, PrInfo};
+    use deck_core::status::PrInfo;
     use std::path::PathBuf;
 
     fn catalog() -> ModelsCache {
@@ -1574,68 +1527,6 @@ mod tests {
         );
         assert!(g.dirty);
         assert!(v.path_full.ends_with("proj"));
-    }
-
-    #[test]
-    fn cost_tip_shows_recorded_components_and_flags_missing_breakdowns() {
-        let part = |usd, tokens| CostPart { usd, tokens };
-        let detailed = CostDetail {
-            assistant: CostSource {
-                records: 2,
-                total: 1.5,
-                itemized: 2,
-                input: part(0.25, 1_000),
-                output: part(1.25, 50),
-                ..CostSource::default()
-            },
-            side: CostSource {
-                records: 1,
-                total: 0.0625,
-                itemized: 1,
-                cache_read: part(0.0625, 70_000),
-                ..CostSource::default()
-            },
-        };
-        let tip = cost_tooltip(1.5625, &detailed);
-        for want in [
-            "$1.5625", "$1.5000", "$0.2500", "1,000", "$1.2500", "$0.0625", "70,000",
-        ] {
-            assert!(tip.contains(want), "{want} missing:\n{tip}");
-        }
-        assert!(!tip.contains("partial"), "{tip}");
-
-        // An older file: totals only, one reply without any cost.
-        let older = CostDetail {
-            assistant: CostSource {
-                records: 4,
-                total: 0.75,
-                unitemized_records: 3,
-                unitemized: part(0.75, 1_234),
-                uncosted: 1,
-                uncosted_tokens: 9,
-                ..CostSource::default()
-            },
-            side: CostSource::default(),
-        };
-        let tip = cost_tooltip(0.75, &older);
-        assert!(tip.contains("partial") && tip.contains("$0.7500") && tip.contains("1,234"));
-        assert!(!tip.contains("input"), "no invented $0 components:\n{tip}");
-        assert!(!tip.contains("Side-model"), "{tip}");
-
-        // Components short of the recorded totals: the gap is shown, not hidden.
-        let short = CostDetail {
-            assistant: CostSource {
-                records: 1,
-                total: 1.0,
-                itemized: 1,
-                input: part(0.25, 10),
-                output: part(0.5, 5),
-                ..CostSource::default()
-            },
-            side: CostSource::default(),
-        };
-        let tip = cost_tooltip(1.0, &short);
-        assert!(tip.contains("partial") && tip.contains("$0.2500"), "{tip}");
     }
 
     #[test]
