@@ -143,12 +143,27 @@ jobs:
           $shot = Join-Path $PWD 'shot.png'
           Remove-Item -Force -ErrorAction SilentlyContinue $shot
           New-Item -ItemType Directory -Force -Path app-logs | Out-Null
+          # The app takes its screenshot and exits 45 s after its own start; typing below must land well before.
           $p = Start-Process -FilePath (Resolve-Path 'target/debug/omp-deck.exe').Path `
-            -ArgumentList @('--sessions-root', $root, '--screenshot', $shot, '--screenshot-after', '24') `
+            -ArgumentList @('--sessions-root', $root, '--screenshot', $shot, '--screenshot-after', '45') `
             -RedirectStandardOutput app-logs/stdout.txt -RedirectStandardError app-logs/stderr.txt -PassThru
           # Real Windows key events into the focused terminal tab: they travel egui -> win32-input-mode records ->
           # omp-deck-host -> ConPTY -> omp. Shift+Enter must insert a newline in omp's editor, not submit.
-          Start-Sleep -Seconds 14
+          # Keys typed before the tab's view is attached are dropped (by design), so wait until the restored omp has
+          # drawn its session (the resumed message on screen) instead of a fixed delay; runner start-up varies widely.
+          $readyBy = (Get-Date).AddSeconds(40)
+          $ready = $false
+          while ((Get-Date) -lt $readyBy -and -not $p.HasExited) {
+            $dump = (& target/debug/omp-deck-host.exe dump "omp-$id" 2>$null | Out-String)
+            $global:LASTEXITCODE = 0
+            if ($dump -match 'hello from CI') { $ready = $true; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ($p.HasExited) { throw "omp-deck exited (code $($p.ExitCode)) before the restored omp tab was ready" }
+          if (-not $ready) { throw "the restored omp tab did not draw its session within 40 s" }
+          Write-Host ("restored omp drawn {0:N1} s after launch" -f ((Get-Date) - $p.StartTime).TotalSeconds)
+          # The view attaches right after the session; leave it a moment.
+          Start-Sleep -Seconds 3
           $ws = New-Object -ComObject WScript.Shell
           Write-Host ("AppActivate: {0}" -f $ws.AppActivate($p.Id))
           Start-Sleep -Milliseconds 500
