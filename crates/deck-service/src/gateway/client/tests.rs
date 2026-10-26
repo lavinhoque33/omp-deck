@@ -210,20 +210,34 @@ fn a_dead_owner_fails_pending_requests_and_the_next_owner_gets_the_interests_bac
     assert!(links.iter().any(|l| matches!(l, Link::Down { .. })));
 }
 
-/// An autostarting GUI asks an owner of an older build to exit once it is drained (never
-/// while it has work), and only once: an owner that comes back still older is kept.
-#[test]
-fn an_older_owner_is_asked_to_exit_once_drained_and_only_once() {
-    let (_dir, profile) = test_profile("outdated");
-    let listener = Arc::new(Listener::bind(&endpoint(&profile)).expect("bind"));
-    let mut o = options(&profile, Role::Gui);
+fn outdated_gui(profile: &Profile) -> GatewayClient {
+    let mut o = options(profile, Role::Gui);
     o.autostart = true;
     // Never launched: the mock owner stays reachable.
     o.gateway_exe = Some(PathBuf::from("/nonexistent/omp-deck-gateway"));
-    let client = GatewayClient::start(o);
-    let is_maintenance = |r: &Request| matches!(r, Request::Maintenance(_));
+    GatewayClient::start(o)
+}
 
-    // Busy: polled, not told to exit.
+fn up_epochs(client: &GatewayClient) -> Vec<ServiceEpoch> {
+    client
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            ClientEvent::Link(Link::Up(w)) => Some(w.epoch),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An autostarting GUI replaces a drained owner of an older build before the link comes up on
+/// it (so tab restore and first queries never reach it), and tries only once: the owner that
+/// comes back still older (another installation's) is used.
+#[test]
+fn a_drained_older_owner_is_replaced_before_the_link_comes_up() {
+    let (_dir, profile) = test_profile("outdated");
+    let listener = Arc::new(Listener::bind(&endpoint(&profile)).expect("bind"));
+    let client = outdated_gui(&profile);
+
     let mut s = accept(&listener);
     hello(&mut s);
     welcome_as(&mut s, ServiceEpoch([1; 16]), &profile, "0.0.1");
@@ -234,55 +248,88 @@ fn an_older_owner_is_asked_to_exit_once_drained_and_only_once() {
         "{:?}",
         env.body
     );
-    let busy = DrainState::Draining {
-        jobs: 1,
-        controllers_busy: 0,
-        direct_programs: 0,
-    };
-    reply(&mut s, env.id, &Ok(Answer::Maintenance(busy)));
-    wait_until("link up", || matches!(client.link(), Link::Up(_)));
-    let _sentinel = client.query(Query::OmpVersion);
-    let env = until(&mut s, &mut asm, |r| {
-        is_maintenance(r) || matches!(r, Request::Query(Query::OmpVersion))
-    });
-    assert!(!is_maintenance(&env.body), "{:?}", env.body);
-    s.shutdown();
-    drop(s);
-
-    // Drained: told to exit.
-    let mut s = accept(&listener);
-    hello(&mut s);
-    welcome_as(&mut s, ServiceEpoch([2; 16]), &profile, "0.0.1");
-    let mut asm = Assembly::default();
-    let env = request(&mut s, &mut asm).expect("request");
     assert!(
-        matches!(env.body, Request::Maintenance(MaintenanceOp::Poll)),
-        "{:?}",
-        env.body
+        !matches!(client.link(), Link::Up(_)),
+        "published while replacing"
     );
     reply(
         &mut s,
         env.id,
         &Ok(Answer::Maintenance(DrainState::Drained)),
     );
-    let env = until(&mut s, &mut asm, is_maintenance);
+    let env = request(&mut s, &mut asm).expect("request");
     assert!(
         matches!(env.body, Request::Maintenance(MaintenanceOp::Exit)),
-        "{:?}",
+        "nothing else reaches the outdated owner: {:?}",
         env.body
     );
     reply(&mut s, env.id, &Ok(Answer::Done));
     s.shutdown();
     drop(s);
 
-    // The owner that comes back is still older (another installation's): kept.
     let mut s = accept(&listener);
     hello(&mut s);
-    welcome_as(&mut s, ServiceEpoch([3; 16]), &profile, "0.0.1");
+    welcome_as(&mut s, ServiceEpoch([2; 16]), &profile, "0.0.1");
     let mut asm = Assembly::default();
     let env = request(&mut s, &mut asm).expect("request");
-    assert!(!is_maintenance(&env.body), "{:?}", env.body);
-    drop(client);
+    assert!(
+        !matches!(env.body, Request::Maintenance(_)),
+        "{:?}",
+        env.body
+    );
+    wait_until("link up", || client.epoch() == Some(ServiceEpoch([2; 16])));
+    assert_eq!(up_epochs(&client), [ServiceEpoch([2; 16])]);
+}
+
+/// An older owner that stays busy is never told to exit: once the wait is over the link comes
+/// up on it, and it is not polled again.
+#[test]
+fn a_busy_older_owner_is_kept_and_never_told_to_exit() {
+    let (_dir, profile) = test_profile("outdated-busy");
+    let listener = Arc::new(Listener::bind(&endpoint(&profile)).expect("bind"));
+    let client = outdated_gui(&profile);
+
+    let mut s = accept(&listener);
+    hello(&mut s);
+    welcome_as(&mut s, ServiceEpoch([1; 16]), &profile, "0.0.1");
+    let mut asm = Assembly::default();
+    let busy = DrainState::Draining {
+        jobs: 0,
+        controllers_busy: 1,
+        direct_programs: 0,
+    };
+    let mut polls = 0;
+    loop {
+        let env = request(&mut s, &mut asm).expect("request");
+        if !matches!(env.body, Request::Maintenance(MaintenanceOp::Poll)) {
+            assert!(
+                !matches!(env.body, Request::Maintenance(_)),
+                "{:?}",
+                env.body
+            );
+            break;
+        }
+        assert!(
+            !matches!(client.link(), Link::Up(_)),
+            "published while replacing"
+        );
+        polls += 1;
+        reply(&mut s, env.id, &Ok(Answer::Maintenance(busy.clone())));
+    }
+    assert!(polls >= 2, "polled until the wait was over ({polls})");
+    wait_until("link up", || matches!(client.link(), Link::Up(_)));
+    let _sentinel = client.query(Query::OmpVersion);
+    let env = until(&mut s, &mut asm, |r| {
+        matches!(
+            r,
+            Request::Maintenance(_) | Request::Query(Query::OmpVersion)
+        )
+    });
+    assert!(
+        !matches!(env.body, Request::Maintenance(_)),
+        "{:?}",
+        env.body
+    );
 }
 
 fn inbox(badge: usize) -> Reply {

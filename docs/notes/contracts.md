@@ -2616,6 +2616,17 @@ only passed the `cargo xwin clippy` compile gate.
   still older (another installation) is kept. Only newer clients replace, so an older GUI never downgrades the owner and
   two installs never fight. A gateway with no desktop GUI stays old until one connects. Verified: an isolated real 0.15.2
   owner was replaced by the dev 0.15.3 build within ~140 ms (one `Down` blip), no marker left.
+- **Replacement before the link is published (0.16.1).** 0.15.3 published `Link::Up` to the outdated owner first, so after
+  "Update and restart" the new GUI restored its tabs (`Mutation::Launch`) and loaded omp's settings/models against the
+  owner it was about to retire: launches after the `Exit` failed with `Maintenance`, accepted ones and the one-shot
+  `Query::OmpSettings` died with it (`Disconnected` → settings "Could not load"), and the reduced tab list was then
+  persisted. Now `greet` replaces it on the fresh stream before `Attempt::Up`: synchronous `Poll` (events skipped) every
+  1 s for up to 10 s; `Drained` → `Exit`, `Attempt::Replaced`, link stays `Connecting` (its barrier/shutdown refusals for
+  10 s too); still busy → the link comes up on it for this client's lifetime (no mid-run retirement, which would end
+  every tab's view) and the GUI shows a one-time toast to restart when idle. The GUI also re-runs the models + settings
+  catalog loads on every `Link::Up`. Tests `a_drained_older_owner_is_replaced_before_the_link_comes_up`,
+  `a_busy_older_owner_is_kept_and_never_told_to_exit`. Verified: real 0.15.3 owner → dev client: one `Up 0.16.0` at
+  128 ms, no `Up` to 0.15.3, old process gone.
 - **GUI client.** `omp-deck` owns no controller/settings/notification/worker state: `gw.rs` (`Gw` facade, jobs as typed
   requests), `activate.rs` (`--activate <ticket>`), frontend terminals via `deck_term::Frontend`. Tab close sends
   `Mutation::Close` (view detach); kill is explicit. Drive login cancel is typed `GatewayError::Cancelled` in the protocol;

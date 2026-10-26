@@ -374,8 +374,10 @@ pub struct App {
     update: UpdateTracker,
     /// Revision of the omp update topic last adopted.
     omp_update_rev: u64,
-    /// omp was found and its catalogs were requested.
+    /// omp was found and its catalogs were requested from the gateway linked now.
     omp_ready: bool,
+    /// Told once that a busy gateway of an older build was kept after an update.
+    told_old_gateway: bool,
     /// An installer run finished: waiting for the gateway to report the new omp.
     install_wait: Option<Instant>,
     /// Session files with a move in flight.
@@ -583,6 +585,7 @@ impl App {
             update: UpdateTracker::default(),
             omp_update_rev: 0,
             omp_ready: false,
+            told_old_gateway: false,
             install_wait: None,
             moving: HashSet::new(),
             sidebar_cache: SidebarCache::default(),
@@ -674,7 +677,28 @@ impl App {
     fn on_client_event(&mut self, event: ClientEvent) {
         match event {
             // The gateway keeps no view state across a lost connection: report it all again.
-            ClientEvent::Link(_) | ClientEvent::Resync => {
+            ClientEvent::Link(link) => {
+                self.notify.forget_report();
+                self.model_sent = None;
+                if let deck_service::gateway::client::Link::Up(w) = link {
+                    // One-shot loads (models, omp settings) are asked again of the gateway linked
+                    // now: one sent to a previous gateway may have died with it.
+                    self.omp_ready = false;
+                    let gui = deck_service::gateway::GATEWAY_VERSION;
+                    if !self.told_old_gateway && deck_core::selfupdate::is_newer(gui, &w.version) {
+                        self.told_old_gateway = true;
+                        self.toasts.info(
+                            &self.ctx,
+                            format!(
+                                "OmpDeck's gateway still runs {} because it was busy. Restart OmpDeck \
+                                 when your sessions are idle to finish updating it to {gui}.",
+                                w.version
+                            ),
+                        );
+                    }
+                }
+            }
+            ClientEvent::Resync => {
                 self.notify.forget_report();
                 self.model_sent = None;
             }
