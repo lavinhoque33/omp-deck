@@ -2759,3 +2759,14 @@ styles through the palette; per-style character kept where it fits.
 - **Subagent rows** (agents hub / dashboard accordion) show the thinking level (Rose brain badge, omp's short names)
   right of the model chip: `agent_model::agent_thinking` = latest `thinking_level_change`, else the model selector's
   `:level` suffix; `off` is hidden; dropped before the model chip when the row is narrow.
+- **Sidebar sections** (`sidebar.rs` `section_header`, `sidebar/running.rs`): "Open tabs" (collapsed by default) and
+  **"Running sessions"** (expanded by default; egui memory is not persisted, so defaults apply every launch) are
+  pinned above the scope chip, headers in the UI font (`theme::font`, never `label_font`). Running sessions = every
+  name in `RunningSnapshot.alive` (hidden when empty or `blind`): status (tab status, else `activity_of`), title via
+  the session file's entry, else the mux name, folder, tab marker. Order (`running::order`, tested): tab-strip order,
+  then newest session file, then unmapped by name; per-folder scope applies. Click: activate the tab, else
+  `Open(entry)`, else `SidebarAction::AttachRunning { name, title }` (attaches the existing mux session, never starts
+  omp). Menus: `tab_menu` / `session_menu`; unmapped rows Open + Stop (`StopRunning` → the usual confirm).
+- **Close buttons**: every modal/window header ✕ is `card::close_button` (26 / 14) or `card::close_button_sized`
+  (30 / 18 for Sessions, Usage, Session tree) — hover fill + outline. Dialog bodies must not widen past the dialog
+  width (unwrapped labels in `horizontal` rows → `.truncate()`), else the header ✕ ends short of the corner.

@@ -36,6 +36,7 @@ use crate::transfer::{self, TransferKind};
 use crate::widgets::{empty_state, icon_text, menu_item, paint_icon};
 use crate::worktree_ui::{self, Family, Finishing, Head};
 use crate::{card, tips};
+mod running;
 use deck_service::gateway::running::RunningSnapshot;
 use deck_service::status::TabStatus;
 
@@ -164,6 +165,17 @@ pub enum SidebarAction {
     SplitOpen {
         entry: SessionEntry,
         side: Side,
+    },
+    /// Open a tab on the live session `name` that has no session file the sidebar lists (a fresh
+    /// omp): attaches to it, never starts one.
+    AttachRunning {
+        name: String,
+        title: String,
+    },
+    /// Ask to stop the live session `name` (no listed session file); `label` names it.
+    StopRunning {
+        name: String,
+        label: String,
     },
 }
 
@@ -420,6 +432,7 @@ pub struct SidebarCache {
     expansion: Expansion,
     layout: LayoutCache,
     pub scope_ui: ScopeState,
+    running: running::RunningCache,
 }
 
 fn row_h() -> f32 {
@@ -439,6 +452,7 @@ pub fn show(
     let pal = Palette::of_ui(ui);
     let mut out = SidebarOutput::default();
     open_tabs_section(ui, input, &mut out);
+    running::section(ui, input, &mut cache.running, &mut out);
 
     let scope_actions = scope_bar::chip(
         ui,
@@ -1411,17 +1425,22 @@ const OPEN_TABS_MAX_ROWS: f32 = 6.0;
 /// Icon slot of the status indicators in sidebar rows.
 const STATUS_SIZE: f32 = 14.0;
 
-/// "Open tabs": every tab in strip order with its status indicator; a click activates, the ✕ or a
-/// middle click closes. Pinned above the session list (its own capped scroll area).
-fn open_tabs_section(ui: &mut Ui, input: &SidebarInput<'_>, out: &mut SidebarOutput) {
-    if input.tabs.is_empty() {
-        return;
-    }
+/// Header of a pinned section ("Open tabs", "Running sessions"): chevron, title in the UI font,
+/// the count and, while `waiting > 0` sessions need the user, the attention badge (the body may
+/// be collapsed). A click toggles; the returned state shows the body. `default_open` applies
+/// until the user toggles (egui memory is not persisted, so it applies on every launch).
+fn section_header(
+    ui: &mut Ui,
+    out: &mut SidebarOutput,
+    (salt, title): (&str, &str),
+    count: usize,
+    waiting: usize,
+    default_open: bool,
+) -> CollapsingState {
     let pal = Palette::of_ui(ui);
-    let id = ui.make_persistent_id("open-tabs");
-    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let id = ui.make_persistent_id(salt);
+    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
     let open_t = state.openness(ui.ctx());
-
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), header_h()), Sense::click());
     let hov = ui
@@ -1436,23 +1455,16 @@ fn open_tabs_section(ui: &mut Ui, input: &SidebarInput<'_>, out: &mut SidebarOut
         p.text(
             pos2(x, y),
             Align2::LEFT_CENTER,
-            "Open tabs",
-            theme::label_font(size),
+            title,
+            theme::font(size),
             pal.text_strong,
         );
-        // Count, plus how many wait for input (the section may be collapsed).
-        let waiting = input
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(i, t)| t.status(*i == input.active_tab) == TabStatus::Attention)
-            .count();
         let mut right = rect.right() - 10.0;
         let count = p.text(
             pos2(right, y),
             Align2::RIGHT_CENTER,
-            input.tabs.len().to_string(),
-            theme::label_font(size - 2.0),
+            count.to_string(),
+            theme::font(size - 2.0),
             pal.weak,
         );
         right = count.left() - 10.0;
@@ -1466,6 +1478,30 @@ fn open_tabs_section(ui: &mut Ui, input: &SidebarInput<'_>, out: &mut SidebarOut
         out.interacted = true;
     }
     state.store(ui.ctx());
+    state
+}
+
+/// "Open tabs": every tab in strip order with its status indicator; a click activates, the ✕ or a
+/// middle click closes. Pinned above the session list (its own capped scroll area).
+fn open_tabs_section(ui: &mut Ui, input: &SidebarInput<'_>, out: &mut SidebarOutput) {
+    if input.tabs.is_empty() {
+        return;
+    }
+    let pal = Palette::of_ui(ui);
+    let waiting = input
+        .tabs
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| t.status(*i == input.active_tab) == TabStatus::Attention)
+        .count();
+    let mut state = section_header(
+        ui,
+        out,
+        ("open-tabs", "Open tabs"),
+        input.tabs.len(),
+        waiting,
+        false,
+    );
     state.show_body_unindented(ui, |ui| {
         egui::ScrollArea::vertical()
             .id_salt("open-tabs-list")

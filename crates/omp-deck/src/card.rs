@@ -407,8 +407,13 @@ pub fn modal(
 
 /// The header ✕ of a modal.
 pub fn close_button(ui: &mut Ui) -> Response {
+    close_button_sized(ui, 26.0, 14.0)
+}
+
+/// [`close_button`] at another size (the large windows' headers: 30 / 18).
+pub fn close_button_sized(ui: &mut Ui, side: f32, icon: f32) -> Response {
     let pal = Palette::of_ui(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click());
     let hov = ui
         .ctx()
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
@@ -428,7 +433,7 @@ pub fn close_button(ui: &mut Ui) -> Response {
         rect.center(),
         Align2::CENTER_CENTER,
         ICON_X,
-        14.0,
+        icon,
         theme::mix(pal.weak, pal.text_strong, hov),
     );
     resp.on_hover_cursor(CursorIcon::PointingHand)

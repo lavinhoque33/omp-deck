@@ -2170,7 +2170,12 @@ fn manager_body(
                                 Hue::Teal,
                                 10.5,
                             );
-                            ui.label(RichText::new(&v.summary).small().color(pal.weak));
+                            // Truncated: an unwrapped summary widened the dialog past its header,
+                            // leaving the ✕ short of the top-right corner.
+                            ui.add(
+                                egui::Label::new(RichText::new(&v.summary).small().color(pal.weak))
+                                    .truncate(),
+                            );
                         });
                     }
                 });

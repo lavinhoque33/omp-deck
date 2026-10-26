@@ -652,11 +652,7 @@ fn header(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<
         },
         |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            let close = ui.add_sized(
-                [30.0, 30.0],
-                egui::Button::new(icon(ICON_X, 20.0, pal.weak)).frame(false),
-            );
-            if close.on_hover_text("Close (Esc)").clicked() {
+            if card::close_button_sized(ui, 30.0, 18.0).clicked() {
                 out.push(TreeAction::Close);
             }
         },

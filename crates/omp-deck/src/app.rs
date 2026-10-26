@@ -1499,7 +1499,11 @@ impl App {
                 .info(&self.ctx, "That session is not running anymore.");
             return;
         };
-        let label = entry.label().to_owned();
+        self.confirm_stop(mux_name, entry.label().to_owned());
+    }
+
+    /// Ask before stopping the live session `mux_name`, called `label` in the question.
+    fn confirm_stop(&mut self, mux_name: String, label: String) {
         self.confirm = Some((
             Confirm {
                 title: "Stop session process?".to_owned(),
@@ -1511,6 +1515,26 @@ impl App {
             },
             PendingConfirm::StopSession { mux_name, label },
         ));
+    }
+
+    /// Show the live session `name` that has no listed session file: focus its tab, else open a
+    /// tab that attaches to it (the launch never starts omp for an alive name).
+    fn attach_running(&mut self, name: String, title: String) {
+        if let Some(i) = self
+            .tabs
+            .iter()
+            .position(|t| t.mux_name() == Some(name.as_str()))
+        {
+            self.activate(i);
+            return;
+        }
+        let cwd = self.home.clone().unwrap_or_else(platform::home_or_root);
+        self.open_resolved(ClosedTab {
+            mux_name: Some(name),
+            cwd,
+            session_path: None,
+            title,
+        });
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -1819,6 +1843,8 @@ impl App {
             SidebarAction::CopyText { text, what } => self.copy_text(&text, what),
             SidebarAction::OpenFolder(dir) => self.open_folder(dir),
             SidebarAction::Stop(entry) => self.request_stop(&entry),
+            SidebarAction::AttachRunning { name, title } => self.attach_running(name, title),
+            SidebarAction::StopRunning { name, label } => self.confirm_stop(name, label),
             SidebarAction::Restart(entry) => self.request_restart_session(&entry),
             SidebarAction::Delete(entry) => self.request_delete(entry),
             SidebarAction::Tree(entry) => {

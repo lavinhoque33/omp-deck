@@ -336,15 +336,7 @@ fn header(
         },
         |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            if ui
-                .add_sized(
-                    [30.0, 30.0],
-                    egui::Button::new(icon_text(ICON_X, 20.0, pal.weak)).frame(false),
-                )
-                .on_hover_text("Close (Esc)")
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .clicked()
-            {
+            if crate::card::close_button_sized(ui, 30.0, 18.0).clicked() {
                 out.push(SessionsAction::Close);
             }
             if input.scanning {

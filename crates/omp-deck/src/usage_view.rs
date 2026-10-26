@@ -15,7 +15,7 @@ use egui::{
 
 use crate::icons::{
     ICON_ACTIVITY, ICON_CIRCLE_ALERT, ICON_GAUGE, ICON_KEY_ROUND, ICON_LIST_TREE, ICON_REFRESH_CW,
-    ICON_SPARKLES, ICON_TERMINAL, ICON_X,
+    ICON_SPARKLES, ICON_TERMINAL,
 };
 use crate::theme::{self, Palette};
 use crate::usage_fmt::{long_date, money, requests};
@@ -169,14 +169,7 @@ fn header(ui: &mut Ui, input: &ViewInput<'_>, out: &mut Vec<UsageAction>) {
         },
         |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            if ui
-                .add_sized(
-                    [30.0, 30.0],
-                    egui::Button::new(icon_text(ICON_X, 20.0, pal.weak)).frame(false),
-                )
-                .on_hover_text("Close (Esc)")
-                .clicked()
-            {
+            if crate::card::close_button_sized(ui, 30.0, 18.0).clicked() {
                 out.push(UsageAction::Close);
             }
             if input.fetching {
