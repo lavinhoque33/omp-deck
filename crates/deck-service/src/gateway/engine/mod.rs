@@ -409,6 +409,9 @@ impl Engine {
                 .map_err(|e| log::warn!("live control extension unavailable: {e}"))
                 .ok()
         });
+        if ctl_ext.is_none() && dirs::data_dir().is_none() {
+            log::warn!("live control extension unavailable: no per-user data directory");
+        }
         let omp = super::resolve_omp(context.omp.as_deref());
         let drive = deck_core::gdrive::Credentials::detect()
             .map(|c| Arc::new(Service::new(c, root.agent_dir())));

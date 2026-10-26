@@ -2488,13 +2488,16 @@ gateway detachment.
 `deck_core::platform::gateway` owns `Startup`, `Registration`, `AutostartError` and register/start/
 inspect/remove operations. Linux uses a user systemd unit; Windows uses an interactive-user logon
 scheduled task, least privilege, no before-login execution, no battery/network execution cutoff,
-and restart-on-failure. Registration is idempotent and does not enable access during installation.
+a logon trigger plus a five-minute repeating time trigger (the Task Scheduler does not rerun a task
+that exits non-zero or is killed, measured on Windows 11; `IgnoreNew` makes the repeat a no-op while
+a supervisor runs). Registration is idempotent and does not enable access during installation.
 Unavailability/failure is surfaced, not reported as successful background operation.
 
 The OS registration starts `omp-deck-gateway supervise`. The supervisor monitors the singleton
 owner and starts a replacement after an owner crash; it can supervise an already running,
 GUI-launched owner without replacing it or interrupting accepted work. The OS also restarts a
-crashed supervisor. Supervisors are not GUI clients and hold no session controller/input rights.
+crashed supervisor (systemd `Restart=`; on Windows the repeating trigger, within five minutes).
+Supervisors are not GUI clients and hold no session controller/input rights.
 They exit when Background is disabled and honor update maintenance barriers.
 
 Linux uses `KillMode=process`: stopping the supervisor must not kill host/omp descendants that

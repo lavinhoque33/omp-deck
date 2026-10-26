@@ -248,6 +248,14 @@ fn entry_ids(file: &Path) -> Vec<String> {
         .collect()
 }
 
+/// omp joins `PI_CONFIG_DIR` onto the home directory: the sandbox is the home and `cfg` its
+/// config directory (an absolute value is an invalid path on Windows).
+fn isolate_home(omp: Omp, home: &Path) -> Omp {
+    omp.with_env("PI_CONFIG_DIR", "cfg")
+        .with_env("HOME", home)
+        .with_env("USERPROFILE", home)
+}
+
 #[test]
 fn fork_at_creates_a_new_file_ending_at_the_entry_and_keeps_the_source() {
     let tmp = tempfile::tempdir().unwrap();
@@ -257,7 +265,7 @@ fn fork_at_creates_a_new_file_ending_at_the_entry_and_keeps_the_source() {
     let Some(omp) = sandboxed(&agent) else {
         return;
     };
-    let omp = omp.with_env("PI_CONFIG_DIR", tmp.path().join("cfg"));
+    let omp = isolate_home(omp, tmp.path());
     let src = write_session(&agent, &cwd);
     let before = fs::read(&src).unwrap();
 
@@ -282,7 +290,7 @@ fn copy_session_copies_the_whole_session_with_artifacts_into_the_destination() {
     let Some(omp) = sandboxed(&agent) else {
         return;
     };
-    let omp = omp.with_env("PI_CONFIG_DIR", tmp.path().join("cfg"));
+    let omp = isolate_home(omp, tmp.path());
     let src = write_session(&agent, &cwd);
     let artifacts = src.with_extension("");
     fs::create_dir_all(artifacts.join("artifacts")).unwrap();
@@ -340,7 +348,7 @@ fn copy_session_finds_the_fork_omp_wrote_before_failing_to_restore_the_model() {
     let Some(omp) = sandboxed(&agent) else {
         return;
     };
-    let omp = omp.with_env("PI_CONFIG_DIR", tmp.path().join("cfg"));
+    let omp = isolate_home(omp, tmp.path());
     let src = write_session(&agent, &cwd);
     // No provider for `fake/fake-1`: nothing to restore the model with.
     fs::remove_file(agent.join("models.yml")).unwrap();

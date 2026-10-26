@@ -2110,23 +2110,26 @@ mod project_sync {
 
     // ------------------------------------------------------------ real omp
 
-    /// A sandbox for the real `omp`: its own agent dir, HOME and config dir. `None` (with a
-    /// message) when omp is not installed.
+    /// A sandbox for the real `omp`: its own agent dir and home (with omp's default `.omp` config
+    /// directory). `None` (with a message) when omp is not installed.
     fn real_omp(base: &Path, name: &str) -> Option<(Omp, PathBuf)> {
         let Some(omp) = Omp::detect() else {
             eprintln!("omp not found on PATH; skipping the session restore test");
             return None;
         };
         let base = base.join(name);
-        let (agent, home, config) = (base.join("agent"), base.join("home"), base.join("config"));
-        for d in [&agent, &home, &config] {
+        let (agent, home) = (base.join("agent"), base.join("home"));
+        for d in [&agent, &home] {
             fs::create_dir_all(d).unwrap();
         }
         link_natives(&home);
+        // `PI_CONFIG_DIR` is relative to the home directory (the default `.omp`, where the natives
+        // live); Windows omp reads the home from `USERPROFILE`.
         let omp = omp
             .with_env("PI_CODING_AGENT_DIR", &agent)
-            .with_env("PI_CONFIG_DIR", &config)
-            .with_env("HOME", &home);
+            .with_env("PI_CONFIG_DIR", ".omp")
+            .with_env("HOME", &home)
+            .with_env("USERPROFILE", &home);
         Some((omp, agent))
     }
 

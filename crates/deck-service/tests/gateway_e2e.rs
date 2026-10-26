@@ -33,28 +33,48 @@ impl Sandbox {
         let ns = format!("omp-deck-test-gwe2e-{}", std::process::id());
         let root = std::env::temp_dir().join(&ns);
         let _ = std::fs::remove_dir_all(&root);
-        for d in ["home", "config", "data", "state", "run", "proj"] {
+        for d in [
+            "home",
+            "home/AppData/Roaming",
+            "home/AppData/Local",
+            "config",
+            "data",
+            "state",
+            "run",
+            "proj",
+        ] {
             std::fs::create_dir_all(root.join(d)).expect("sandbox dir");
         }
-        let envs: [(&str, PathBuf); 5] = [
+        let agent = root.join("home/.omp/agent");
+        let envs: [(&str, PathBuf); 7] = [
             ("HOME", root.join("home")),
+            ("USERPROFILE", root.join("home")),
             ("XDG_CONFIG_HOME", root.join("config")),
             ("XDG_DATA_HOME", root.join("data")),
             ("XDG_STATE_HOME", root.join("state")),
             ("XDG_RUNTIME_DIR", root.join("run")),
+            // omp's own store: never the real one, on any platform.
+            ("PI_CODING_AGENT_DIR", agent.clone()),
         ];
         // SAFETY: the only test of this binary; set before any thread exists.
         unsafe {
             for (k, v) in envs {
                 std::env::set_var(k, v);
             }
-            std::env::remove_var("PI_CODING_AGENT_DIR");
             std::env::set_var("OMP_DECK_HOST_NS", &ns);
             std::env::set_var("OMP_DECK_TMUX_SOCKET", &ns);
             std::env::set_var("PI_NOTIFICATIONS", "off");
+            // The session host binary sits beside the gateway in the target directory.
+            let host = PathBuf::from(GATEWAY).with_file_name(if cfg!(windows) {
+                "omp-deck-host.exe"
+            } else {
+                "omp-deck-host"
+            });
+            if host.is_file() {
+                std::env::set_var("OMP_DECK_HOST_EXE", host);
+            }
         }
         // No first-run wizard, no collab: omp starts straight into its editor.
-        let agent = root.join("home/.omp/agent");
         std::fs::create_dir_all(&agent).expect("agent dir");
         std::fs::write(
             agent.join("config.yml"),
@@ -64,16 +84,30 @@ impl Sandbox {
         let profile = Profile {
             host_namespace: ns.clone(),
             settings: root.join("config/omp-deck/state.json"),
-            sessions_root: root.join("home/.omp/agent/sessions"),
+            sessions_root: agent.join("sessions"),
         };
         Sandbox { root, ns, profile }
     }
 
+    /// Runs the gateway CLI against this sandbox's profile (explicit on every platform: the
+    /// default settings path does not follow `XDG_CONFIG_HOME` on Windows).
     fn gateway<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> Output {
         Command::new(GATEWAY)
             .args(args)
+            .args(self.profile_args())
             .output()
             .expect("run omp-deck-gateway")
+    }
+
+    fn profile_args(&self) -> Vec<std::ffi::OsString> {
+        vec![
+            "--ns".into(),
+            self.ns.clone().into(),
+            "--settings".into(),
+            self.profile.settings.clone().into(),
+            "--sessions-root".into(),
+            self.profile.sessions_root.clone().into(),
+        ]
     }
 
     fn owner_pid(&self) -> Option<u32> {
@@ -83,6 +117,18 @@ impl Sandbox {
         }
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
         v["status"]["pid"].as_u64().map(|p| p as u32)
+    }
+
+    /// The owner's `gateway.log` (for failure messages).
+    fn owner_log(&self) -> String {
+        let dir = self.profile.settings.with_file_name("gateway");
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path().join("gateway.log")).ok())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn client(&self) -> GatewayClient {
@@ -98,15 +144,45 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        // Our own test server only (never the default server, never the real `omp-deck` one).
-        let _ = Command::new("tmux")
-            .args(["-L", &self.ns, "kill-server"])
-            .output();
+        // Our own test backend only (never the default tmux server, never the real `omp-deck`
+        // namespace).
+        if cfg!(windows) {
+            let host = PathBuf::from(GATEWAY).with_file_name("omp-deck-host.exe");
+            let _ = Command::new(host)
+                .args(["kill", "omp-new-gwe2e", "--ns", &self.ns])
+                .output();
+        } else {
+            let _ = Command::new("tmux")
+                .args(["-L", &self.ns, "kill-server"])
+                .output();
+        }
         if let Some(pid) = self.owner_pid() {
-            let _ = Command::new("kill").arg(pid.to_string()).output();
+            kill_process(pid, cfg!(windows));
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// Ends a process: `force` is SIGKILL / `taskkill /F` (no chance to clean up).
+fn kill_process(pid: u32, force: bool) {
+    let out = if cfg!(windows) {
+        let mut c = Command::new("taskkill");
+        c.args(["/PID", &pid.to_string()]);
+        if force {
+            c.arg("/F");
+        }
+        c.output()
+    } else {
+        let mut c = Command::new("kill");
+        if force {
+            c.arg("-9");
+        }
+        c.arg(pid.to_string()).output()
+    };
+    assert!(
+        out.is_ok_and(|o| o.status.success()) || !force,
+        "killing {pid}"
+    );
 }
 
 fn wait_for<T>(what: &str, timeout: Duration, mut f: impl FnMut() -> Option<T>) -> T {
@@ -151,43 +227,62 @@ fn screen_text(client: &GatewayClient, info: &ControllerInfo) -> String {
 
 #[test]
 fn headless_gateway_controls_real_omp_without_a_gui() {
-    if which("omp").is_none() {
+    if which(if cfg!(windows) { "omp.exe" } else { "omp" }).is_none() {
         eprintln!("skipped: omp is not installed");
         return;
     }
     let sb = Sandbox::new();
-    let ns = sb.ns.clone();
-    let gw = |extra: &[&str]| -> Vec<String> {
-        let mut args = vec!["--ns".to_owned(), ns.clone()];
-        args.extend(extra.iter().map(|s| (*s).to_owned()));
-        args
-    };
 
     // Not running yet.
-    assert_eq!(sb.gateway(&gw(&["status"])).status.code(), Some(3));
+    assert_eq!(sb.gateway(&["status"]).status.code(), Some(3));
 
-    // Concurrent starts: every one succeeds, exactly one owner serves.
-    let starts: Vec<_> = (0..6)
-        .map(|_| {
-            let args = gw(&["serve"]);
-            std::thread::spawn(move || Command::new(GATEWAY).args(args).output().expect("serve"))
-        })
-        .collect();
-    for s in starts {
-        let out = s.join().expect("serve thread");
-        assert!(out.status.success(), "serve: {out:?}");
-    }
-    let first_owner = wait_for("the owner", Duration::from_secs(15), || sb.owner_pid());
-    let already = sb.gateway(&gw(&["serve"]));
-    assert!(already.status.success());
-    assert!(
-        String::from_utf8_lossy(&already.stdout).contains(&format!("pid={first_owner}")),
-        "a later start must report the one owner: {already:?}"
-    );
-
-    // A GUI-role client: no GUI process involved, only the IPC.
-    let client = sb.client();
+    // Concurrent starts: every one succeeds, exactly one owner serves. A GUI-role client is the
+    // product's own path: no GUI process involved, only the IPC.
+    let (client, others) = if cfg!(windows) {
+        // `serve` runs in the calling console on Windows (the launchers detach it), so the
+        // concurrent starters are clients, each launching the owner detached when none answers.
+        let mut all: Vec<_> = (0..6).map(|_| sb.client()).collect();
+        for c in &all {
+            up(c);
+        }
+        let epoch = all[0].epoch().expect("epoch");
+        assert!(
+            all.iter().all(|c| c.epoch() == Some(epoch)),
+            "one owner serves every starter"
+        );
+        let first = all.pop().expect("a client");
+        (first, all)
+    } else {
+        let starts: Vec<_> = (0..6)
+            .map(|_| {
+                let args = [
+                    vec!["serve".into()],
+                    sb.profile_args()
+                        .into_iter()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .collect::<Vec<String>>(),
+                ]
+                .concat();
+                std::thread::spawn(move || {
+                    Command::new(GATEWAY).args(args).output().expect("serve")
+                })
+            })
+            .collect();
+        for s in starts {
+            let out = s.join().expect("serve thread");
+            assert!(out.status.success(), "serve: {out:?}");
+        }
+        let owner = wait_for("the owner", Duration::from_secs(15), || sb.owner_pid());
+        let already = sb.gateway(&["serve"]);
+        assert!(already.status.success());
+        assert!(
+            String::from_utf8_lossy(&already.stdout).contains(&format!("pid={owner}")),
+            "a later start must report the one owner: {already:?}"
+        );
+        (sb.client(), Vec::new())
+    };
     up(&client);
+    let first_owner = wait_for("the owner", Duration::from_secs(15), || sb.owner_pid());
     let epoch1 = client.epoch().expect("epoch");
 
     // Launch a real omp session in a sandbox project.
@@ -226,7 +321,10 @@ fn headless_gateway_controls_real_omp_without_a_gui() {
         }
         if Instant::now() > deadline {
             let screens: Vec<String> = all.iter().map(|c| screen_text(&client, c)).collect();
-            panic!("no idle live-control session: {all:#?}\nscreens: {screens:#?}");
+            panic!(
+                "no idle live-control session: {all:#?}\nscreens: {screens:#?}\nowner log:\n{}",
+                sb.owner_log()
+            );
         }
         std::thread::sleep(Duration::from_millis(250));
     };
@@ -274,11 +372,8 @@ fn headless_gateway_controls_real_omp_without_a_gui() {
 
     // The owner is lost (SIGKILL): the backend session survives and a new owner adopts it.
     drop(client);
-    let out = Command::new("kill")
-        .args(["-9", &first_owner.to_string()])
-        .output()
-        .expect("kill");
-    assert!(out.status.success());
+    drop(others);
+    kill_process(first_owner, true);
     wait_for("the old owner to be gone", Duration::from_secs(10), || {
         (sb.owner_pid() != Some(first_owner)).then_some(())
     });

@@ -109,15 +109,18 @@ impl Profile {
         gateway_root(&self.app_root()).join(self.id().as_str())
     }
 
-    /// `true` when both name the same files (paths compared as given and canonicalized when they
-    /// exist).
+    /// `true` when both name the same files (paths compared as given and canonicalized; a file
+    /// that does not exist yet, like a fresh `state.json`, is compared through its directory).
     pub fn same_as(&self, other: &Profile) -> bool {
+        fn resolved(p: &Path) -> Option<PathBuf> {
+            std::fs::canonicalize(p).ok().or_else(|| {
+                let name = p.file_name()?;
+                let parent = p.parent().filter(|d| !d.as_os_str().is_empty())?;
+                Some(std::fs::canonicalize(parent).ok()?.join(name))
+            })
+        }
         fn same(a: &Path, b: &Path) -> bool {
-            a == b
-                || matches!(
-                    (std::fs::canonicalize(a), std::fs::canonicalize(b)),
-                    (Ok(x), Ok(y)) if x == y
-                )
+            a == b || matches!((resolved(a), resolved(b)), (Some(x), Some(y)) if x == y)
         }
         self.host_namespace == other.host_namespace
             && same(&self.settings, &other.settings)
@@ -515,6 +518,25 @@ mod tests {
             p("/a/state.json").state_dir(),
             PathBuf::from("/a/gateway").join(a.as_str())
         );
+    }
+
+    #[test]
+    fn a_settings_file_that_does_not_exist_yet_matches_through_its_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::create_dir_all(dir.path().join("cfg")).expect("cfg");
+        let at = |settings: PathBuf| Profile {
+            host_namespace: "omp-deck".into(),
+            settings,
+            sessions_root: sessions.clone(),
+        };
+        let plain = at(dir.path().join("cfg/state.json"));
+        // The same not-yet-written file, spelled through `.` and `..`.
+        let spelled = at(dir.path().join("cfg/../cfg/./state.json"));
+        assert!(plain.same_as(&spelled));
+        assert!(!plain.same_as(&at(dir.path().join("other/state.json"))));
+        assert!(!plain.same_as(&at(dir.path().join("cfg/settings.json"))));
     }
 
     #[test]

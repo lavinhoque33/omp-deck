@@ -16,7 +16,8 @@ const USAGE: &str = "\
 usage: omp-deck-gateway <command> [options]
 
 commands:
-  serve [--foreground]          run the gateway owner (detaches unless --foreground)
+  serve [--foreground]          run the gateway owner (detaches unless --foreground; on
+                                Windows it always runs in this process: clients start it detached)
   supervise                     run the OS-started supervisor (foreground)
   status [--json]               show the running owner (exit 3: not running)
   request '<json Request>' [--timeout-secs N]

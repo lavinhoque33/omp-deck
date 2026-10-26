@@ -1,5 +1,10 @@
 //! The Windows scheduled task that supervises the gateway: an interactive-user logon task with
-//! least privilege, restart-on-failure and no battery, network, idle or runtime cutoffs.
+//! least privilege and no battery, network, idle or runtime cutoffs.
+//!
+//! The Task Scheduler does not rerun a task whose process exits non-zero or is killed (its
+//! `RestartOnFailure` only covers a task that fails to start; measured on Windows 11), so a
+//! second, repeating time trigger starts the supervisor again within five minutes when none runs:
+//! `IgnoreNew` makes the trigger a no-op while an instance exists.
 //!
 //! Deleting the task never uses `/End` and the task disallows hard termination, so no process
 //! tree (session hosts, omp children) is ever taken down by managing the registration. A startup
@@ -139,6 +144,13 @@ pub(super) fn render(startup: &Startup, sid: &str) -> Result<String, AutostartEr
       <Enabled>true</Enabled>
       <UserId>{sid}</UserId>
     </LogonTrigger>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT5M</Interval>
+      </Repetition>
+      <StartBoundary>2000-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
@@ -382,6 +394,8 @@ mod tests {
             "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
             "<AllowHardTerminate>false</AllowHardTerminate>",
             "<Count>999</Count>",
+            "<TimeTrigger>",
+            "<Interval>PT5M</Interval>",
             "<UserId>S-1-5-21-111-222-333-1001</UserId>",
             // Escaped, with the quoted-argument rules applied before XML escaping.
             r"<Command>C:\Users\A &amp; B\AppData\Local\OmpDeck\omp-deck-gateway.exe</Command>",

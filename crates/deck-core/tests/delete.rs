@@ -33,9 +33,13 @@ fn sandbox() -> Option<Sandbox> {
     let dir = agent.join("sessions/--tmp-x--");
     fs::create_dir_all(&dir).unwrap();
     fs::create_dir_all(&config).unwrap();
+    // omp joins `PI_CONFIG_DIR` onto the home directory: home is the sandbox and the config
+    // directory is its `config` child (an absolute value is an invalid path on Windows).
     let omp = omp
         .with_env("PI_CODING_AGENT_DIR", &agent)
-        .with_env("PI_CONFIG_DIR", &config);
+        .with_env("PI_CONFIG_DIR", "config")
+        .with_env("HOME", tmp.path())
+        .with_env("USERPROFILE", tmp.path());
     Some(Sandbox {
         _tmp: tmp,
         agent,
@@ -302,10 +306,10 @@ fn refuses_a_session_held_by_a_live_omp_then_deletes_after_it_exits() {
     .unwrap();
     let server = TmuxServer(format!("omp-deck-test-del{}", std::process::id()));
     let cmd = format!(
-        "exec env PI_CODING_AGENT_DIR={} PI_CONFIG_DIR={} {} \
+        "exec env PI_CODING_AGENT_DIR={} PI_CONFIG_DIR=config HOME={} {} \
          --model fake/fake-1 --no-extensions --resume {}",
         sb.agent.display(),
-        sb.config.display(),
+        sb.config.parent().unwrap_or(&sb.config).display(),
         sb.omp.program().display(),
         target.display()
     );
