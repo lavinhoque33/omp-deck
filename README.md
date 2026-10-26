@@ -397,7 +397,7 @@ when a `v*` tag is pushed (the tag must match the version in `Cargo.toml`).
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
 
-Bundled third-party assets: the [Geist](https://github.com/vercel/geist-font) font (SIL Open Font License
-1.1, `crates/omp-deck/assets/fonts/Geist-OFL.txt`) and [lucide](https://lucide.dev) icons (ISC,
+Bundled third-party assets: the [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) font (SIL Open
+Font License 1.1, `crates/omp-deck/assets/fonts/JetBrainsMono-OFL.txt`) and [lucide](https://lucide.dev) icons (ISC,
 `crates/omp-deck/assets/fonts/lucide-LICENSE.txt`). The Windows build ships Microsoft's ConPTY
 (`conpty.dll`, `OpenConsole.exe` from the `Microsoft.Windows.Console.ConPTY` package, MIT).

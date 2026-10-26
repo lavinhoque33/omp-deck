@@ -1059,6 +1059,13 @@ impl App {
                 why,
             );
             add(
+                "drive.manage",
+                "Drive: Manage settings backups…",
+                None,
+                ICON_LIST_CHECKS,
+                why,
+            );
+            add(
                 "sync.restore",
                 "Drive: Restore a project backup…",
                 None,
@@ -1316,6 +1323,7 @@ impl App {
             "notify.test" => self.send_test_notification(),
             "drive.backup_now" => self.apply_drive_action(DriveAction::BackupNow),
             "drive.restore" => self.apply_drive_action(DriveAction::OpenRestore),
+            "drive.manage" => self.apply_drive_action(DriveAction::OpenManager),
             "sync.restore" => self.apply_sync_action(SyncAction::OpenRestore),
             "sync.manage" => self.apply_sync_action(SyncAction::OpenManager),
             "app.refresh" => self.refresh_sessions(),

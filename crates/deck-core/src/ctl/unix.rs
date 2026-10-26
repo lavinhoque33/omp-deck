@@ -319,7 +319,12 @@ mod tests {
 
     #[test]
     fn prune_returns_within_budget_with_stuck_probe_and_keeps_leaves() {
-        let tmp = tempfile::tempdir().unwrap();
+        // Explicit 0700: under a group-writable umask (0002) a default tempdir is 0775, which
+        // `prune_with` rightly refuses, so nothing would be probed.
+        let tmp = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let ns = tmp.path().join("ns");
         let leaves: Vec<PathBuf> = (0..4).map(|i| ns.join(format!("{i:016x}"))).collect();
         for l in &leaves {

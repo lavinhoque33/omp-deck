@@ -73,6 +73,7 @@ fn uses_lane(op: &Mutation) -> bool {
             | Mutation::DriveSignOut
             | Mutation::DriveBackup { .. }
             | Mutation::DrivePrepareRestore(_)
+            | Mutation::DriveDeleteBackup(_)
             | Mutation::DriveApplyRestore(_)
             | Mutation::ProjectBackup { .. }
             | Mutation::ProjectDeleteBackup(_)
@@ -834,6 +835,17 @@ impl Engine {
                     false,
                     Post::Refresh,
                     move |ctx, _, _| jobs::drive_apply_restore(ctx, handle),
+                );
+            }
+            Mutation::DriveDeleteBackup(file) => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "drive-delete-backup",
+                    true,
+                    false,
+                    Post::DriveAccount,
+                    move |ctx, _, _| jobs::drive_delete_backup(ctx, &file),
                 );
             }
             Mutation::DriveDiscardRestore(handle) => {

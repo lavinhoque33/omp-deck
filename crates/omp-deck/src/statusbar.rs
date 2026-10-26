@@ -794,13 +794,23 @@ fn chip(ui: &mut Ui, id: &'static str, sense: Sense, add: impl FnOnce(&mut Ui)) 
     let pal = Palette::of_ui(ui);
     let bg = ui.painter().add(Shape::Noop);
     let rect = ui
-        .horizontal(|ui| {
-            ui.set_height(CHIP_H);
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.add_space(CHIP_PAD);
-            add(ui);
-            ui.add_space(CHIP_PAD);
-        })
+        .allocate_ui_with_layout(
+            vec2(ui.available_width(), CHIP_H),
+            // `ui.horizontal` would reserve only `interact_size.y` (24 px in Compact) centred in
+            // the row and let the 29 px chip grow downwards from there, sitting 2.5 px low.
+            if ui.layout().prefer_right_to_left() {
+                Layout::right_to_left(Align::Center)
+            } else {
+                Layout::left_to_right(Align::Center)
+            },
+            |ui| {
+                ui.set_min_height(CHIP_H);
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.add_space(CHIP_PAD);
+                add(ui);
+                ui.add_space(CHIP_PAD);
+            },
+        )
         .response
         .rect;
     let r = ui.interact(rect, ui.scope_id().with(("bar-chip", id)), sense);
@@ -1787,5 +1797,91 @@ mod tests {
             fit_segments(&widths, &present, 150.0, 6.0),
             [true, false, false, false, false]
         );
+    }
+}
+
+#[cfg(test)]
+mod centering_tests {
+    use super::*;
+    use deck_core::config::{Density, UiStyle};
+    use deck_core::status::{GitInfo, PrInfo, SessionStats, SessionStatus};
+
+    /// Every text/icon painted by the bar is vertically centred on the bar (the chips used to sit
+    /// `(CHIP_H - interact_size.y) / 2` low when the density's interact height was below the chip).
+    fn assert_centered(style: UiStyle, density: Density) {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, style, density, true);
+        let mut v = BarView::default();
+        let st = SessionStatus {
+            cwd: "/tmp/proj".into(),
+            stats: SessionStats {
+                model: Some("anthropic/claude-opus-5-5".into()),
+                thinking: Some("high".into()),
+                input_tokens: 50_000,
+                output_tokens: 200,
+                cost: 7.0,
+                context_tokens: Some(173_000),
+                ..SessionStats::default()
+            },
+            git: Some(GitInfo {
+                branch: "feat/x".into(),
+                ahead: 2,
+                staged: 1,
+                unstaged: 3,
+                pr: Some(PrInfo {
+                    number: 12,
+                    url: "u".into(),
+                }),
+                ..GitInfo::default()
+            }),
+            ..SessionStatus::default()
+        };
+        let cat = ModelsCache::default();
+        v.update(Some(&Arc::new(st)), Path::new("/x"), &cat);
+        let mut picker = PickerState::default();
+        let input = BarInput {
+            catalog: &cat,
+            favorites: &[],
+            provider: None,
+            activity: Activity::Idle,
+            pending: None,
+            assumed: None,
+            actions: ActionCtx::default(),
+            agents: AgentsChip::default(),
+        };
+        let screen_h = 700.0;
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, screen_h))),
+            ..Default::default()
+        };
+        let mut texts = 0;
+        for i in 0..3 {
+            let mut out = ctx.run_ui(raw.clone(), |ui| {
+                show(ui, &v, &mut picker, &input);
+            });
+            out.textures_delta.clear();
+            if i == 2 {
+                for cs in &out.shapes {
+                    if let Shape::Text(t) = &cs.shape {
+                        let y = t.galley.rect.translate(t.pos.to_vec2()).center().y;
+                        let off = y - (screen_h - BAR_H / 2.0);
+                        assert!(
+                            off.abs() <= 0.5,
+                            "{style:?}/{density:?}: {:?} off by {off}",
+                            t.galley.text()
+                        );
+                        texts += 1;
+                    }
+                }
+            }
+        }
+        assert!(texts > 10, "bar painted {texts} texts");
+    }
+
+    #[test]
+    fn bar_segments_are_vertically_centered() {
+        assert_centered(UiStyle::Blueprint, Density::Compact);
+        assert_centered(UiStyle::Neutral, Density::Compact);
+        assert_centered(UiStyle::Neon, Density::Comfortable);
     }
 }

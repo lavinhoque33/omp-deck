@@ -294,6 +294,53 @@ impl Service {
         Ok(report)
     }
 
+    /// Permanently deletes the config backup `file` from Drive (`files.delete` bypasses the
+    /// trash); a file that is already gone counts as deleted. What Drive holds under `file.id` is
+    /// checked first: only a config backup of this app named `file.name` (the files [`Self::list`]
+    /// returns) is deleted, never a project backup or anything else in the app folder.
+    ///
+    /// When the deleted file is this computer's last backup, or carries the fingerprint recorded
+    /// as synced (uploaded or restored here), that record is dropped so the next automatic pass
+    /// uploads the current config again.
+    pub fn delete_backup(&self, file: &BackupFile) -> Result<()> {
+        let refuse = |name: &str| {
+            Err(Error::InvalidBackup(format!(
+                "{name} is not a config backup; refusing to delete it"
+            )))
+        };
+        if !drive::is_config_backup(file) {
+            return refuse(&file.name);
+        }
+        let account = self.signed_in()?;
+        let mut drive = self.drive(&account);
+        if let Some(actual) = drive.metadata(&file.id)? {
+            if !drive::is_config_backup(&actual) || actual.name != file.name {
+                return refuse(&actual.name);
+            }
+            drive.delete_permanently(&file.id)?;
+        }
+        // Reload: the account may have changed while Drive answered (e.g. a refreshed sign-in).
+        let Some(mut account) = self.store.load()? else {
+            return Ok(());
+        };
+        let was_last = account
+            .last_backup
+            .as_ref()
+            .is_some_and(|l| l.name == file.name);
+        let was_synced = account
+            .synced_fingerprint
+            .as_deref()
+            .is_some_and(|fp| file.props.get("fingerprint").map(String::as_str) == Some(fp));
+        if was_last || was_synced {
+            if was_last {
+                account.last_backup = None;
+            }
+            account.synced_fingerprint = None;
+            self.store.save(&account)?;
+        }
+        Ok(())
+    }
+
     fn signed_in(&self) -> Result<Account> {
         self.store.load()?.ok_or(Error::NotSignedIn)
     }

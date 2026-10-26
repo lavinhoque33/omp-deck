@@ -45,6 +45,14 @@ impl Sandbox {
         ] {
             std::fs::create_dir_all(root.join(d)).expect("sandbox dir");
         }
+        // A real XDG_RUNTIME_DIR is 0700 whatever the umask; under a group-writable umask (0002)
+        // `create_dir_all` yields 0775, which ctl rejects (fallback socket path exceeds sun_path).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join("run"), std::fs::Permissions::from_mode(0o700))
+                .expect("private runtime dir");
+        }
         let agent = root.join("home/.omp/agent");
         let envs: [(&str, PathBuf); 7] = [
             ("HOME", root.join("home")),

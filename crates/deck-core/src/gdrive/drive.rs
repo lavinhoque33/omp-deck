@@ -84,6 +84,13 @@ pub fn to_delete(files: &[BackupFile], keep: usize) -> Vec<&BackupFile> {
     sorted.split_off(keep.min(sorted.len()))
 }
 
+/// A config backup of this app, as [`Drive::list`] keeps them: an [`BACKUP_PREFIX`] name and no
+/// `kind` appProperty (project backups carry `kind = project`; config uploads set only `host` and
+/// `fingerprint`).
+pub(super) fn is_config_backup(f: &BackupFile) -> bool {
+    f.name.starts_with(BACKUP_PREFIX) && !f.props.contains_key("kind")
+}
+
 /// Which HTTP agent a request uses: the API agent has a global timeout; the transfer agents
 /// only a stall timeout (a multi-GB transfer is legitimately long).
 #[derive(Clone, Copy)]
@@ -194,7 +201,7 @@ impl<'a> Drive<'a> {
     pub(super) fn list(&mut self) -> Result<Vec<BackupFile>> {
         let query = format!("name contains '{BACKUP_PREFIX}' and trashed = false");
         let mut files = self.list_where(&query, "Listing backups")?;
-        files.retain(|f| f.name.starts_with(BACKUP_PREFIX));
+        files.retain(is_config_backup);
         Ok(files)
     }
 
@@ -284,6 +291,27 @@ impl<'a> Drive<'a> {
             .limit(MAX_DOWNLOAD)
             .read_to_vec()
             .map_err(network)
+    }
+
+    /// The metadata Drive holds for `id`; `None` when the file no longer exists (404).
+    pub(super) fn metadata(&mut self, id: &str) -> Result<Option<BackupFile>> {
+        const WHAT: &str = "Reading the backup's details";
+        let url = self.file_url(id)?;
+        let mut resp = self.raw(Lane::Api, |http, auth| {
+            http.get(&url)
+                .header("Authorization", auth)
+                .query("fields", FILE_FIELDS)
+                .call()
+        })?;
+        let status = resp.status().as_u16();
+        if status == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&status) {
+            let body = resp.body_mut().read_to_string().unwrap_or_default();
+            return Err(google_error(WHAT, status, &body));
+        }
+        read_json(resp, WHAT).map(Some)
     }
 
     pub(super) fn delete(&mut self, id: &str) -> Result<()> {

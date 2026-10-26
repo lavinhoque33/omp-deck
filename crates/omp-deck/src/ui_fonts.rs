@@ -1,7 +1,7 @@
-//! UI font setup. Neutral style: bundled Geist (variable, OFL) as the primary face of the
+//! UI font setup. Flat styles: bundled JetBrains Mono (variable, OFL) as the primary face of the
 //! [`NEUTRAL_FAMILY`] family. Neon style: Adwaita Sans (fallback Cantarell, Noto Sans) as the
-//! Proportional family. The Neutral family is rebuilt by [`finalize`] as Geist followed by the
-//! whole Proportional chain, so its glyph coverage is a superset of Neon's. The bundled
+//! Proportional family. The Neutral family is rebuilt by [`finalize`] as JetBrains Mono followed
+//! by the whole Proportional chain, so its glyph coverage is a superset of Neon's. The bundled
 //! Lucide icon font backs the `lucide` family (and is a Proportional fallback so glyphs in
 //! label strings render). Must run after `deck_term::install_fonts`, which replaces the whole
 //! definition set and owns the `term*` families.
@@ -13,10 +13,12 @@ use std::process::Command;
 use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
 use egui::{Context, FontData, FontDefinitions, FontFamily};
 
-/// Named family of the Neutral style's UI text (Geist first, then the system faces).
+/// Named family of the flat styles' UI text (JetBrains Mono first, then the system faces).
 pub const NEUTRAL_FAMILY: &str = "ui-neutral";
 
-static GEIST: &[u8] = include_bytes!("../assets/fonts/Geist-VariableFont.ttf");
+/// Font-data key of the bundled UI face.
+const UI_FACE_KEY: &str = "jetbrains-mono";
+static UI_FACE: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-VariableFont.ttf");
 static LUCIDE: &[u8] = include_bytes!("../assets/fonts/lucide.ttf");
 
 /// Candidates in preference order: (family, well-known file paths).
@@ -102,12 +104,13 @@ fn neutral_family() -> FontFamily {
     FontFamily::Name(NEUTRAL_FAMILY.into())
 }
 
-/// Installs Geist, the icon font and the preloaded system UI faces (no I/O). The first system
-/// face becomes the primary Proportional face; the rest are appended as extra glyph fallbacks.
+/// Installs JetBrains Mono, the icon font and the preloaded system UI faces (no I/O). The first
+/// system face becomes the primary Proportional face; the rest are appended as extra glyph
+/// fallbacks.
 pub fn install(ctx: &Context, fonts: UiFonts) {
     ctx.add_font(FontInsert::new(
-        "geist",
-        FontData::from_static(GEIST),
+        UI_FACE_KEY,
+        FontData::from_static(UI_FACE),
         vec![InsertFontFamily {
             family: neutral_family(),
             priority: FontPriority::Highest,
@@ -147,15 +150,15 @@ pub fn install(ctx: &Context, fonts: UiFonts) {
     ));
 }
 
-/// Makes the Neutral family's coverage a superset of Proportional's: Geist first, then every
+/// Makes the Neutral family's coverage a superset of Proportional's: JetBrains Mono first, then every
 /// Proportional face in order (system UI faces, egui's emoji faces, deck-term's symbol / CJK /
 /// color-emoji fallbacks, Lucide). Call once from the first frame, when the final definitions
 /// (after every queued `add_font`) are readable.
 pub fn finalize(ctx: &Context) {
     let mut defs: FontDefinitions = ctx.fonts(|f| f.definitions().clone());
-    let mut chain = vec!["geist".to_owned()];
+    let mut chain = vec![UI_FACE_KEY.to_owned()];
     if let Some(prop) = defs.families.get(&FontFamily::Proportional) {
-        chain.extend(prop.iter().filter(|k| *k != "geist").cloned());
+        chain.extend(prop.iter().filter(|k| *k != UI_FACE_KEY).cloned());
     }
     if defs.families.get(&neutral_family()) == Some(&chain) {
         return;

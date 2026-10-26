@@ -54,7 +54,7 @@ pub fn look_of(style: UiStyle) -> Look {
     look::look_of(style)
 }
 
-/// Whether a flat-family look is active: every style but Neon (flat, hairlines, Geist).
+/// Whether a flat-family look is active: every style but Neon (flat, hairlines, JetBrains Mono).
 pub fn flat() -> bool {
     style() != UiStyle::Neon
 }
@@ -73,7 +73,7 @@ pub fn dens(compact_px: f32, comfortable_px: f32) -> f32 {
     }
 }
 
-/// Family of the chrome's proportional text: Geist in the flat styles, the system UI font in
+/// Family of the chrome's UI text: JetBrains Mono in the flat styles, the system UI font in
 /// Neon, the monospace family for the whole chrome in Phosphor.
 pub fn ui_family() -> FontFamily {
     static NEUTRAL_NAMED: LazyLock<FontFamily> =
@@ -217,7 +217,13 @@ fn build(style: &mut Style, p: &Palette, dark: bool, neutral: bool, density: Den
     sp.item_spacing = item;
     sp.button_padding = pad;
     sp.interact_size = interact;
-    sp.menu_margin = Margin::same(if compact { 4 } else { 6 });
+    // `menu_margin` is the inner margin egui gives every `Frame::popup`: tooltips and hover cards.
+    // Menus get their own tighter margin in [`menu_style`].
+    sp.menu_margin = if compact {
+        Margin::symmetric(10, 8)
+    } else {
+        Margin::symmetric(12, 10)
+    };
     sp.window_margin = Margin::same(if compact { 12 } else { 16 });
     sp.menu_width = 200.0;
     sp.tooltip_width = 420.0;
@@ -341,6 +347,7 @@ pub fn menu_style(style: &mut Style) {
     style.spacing.button_padding = vec2(dens(8.0, 10.0), dens(4.0, 6.0));
     style.spacing.item_spacing.y = 2.0;
     style.spacing.interact_size.y = dens(24.0, 28.0);
+    style.spacing.menu_margin = Margin::same(if compact() { 6 } else { 8 });
 }
 
 /// Context menu for `resp` (right click) with the chrome menu style.
@@ -501,6 +508,17 @@ pub fn on_accent(p: &Palette) -> Color32 {
 /// `neutral_px` in the flat styles, `neon_px` in Neon (corner radii that differ between the looks).
 pub fn rad(neutral_px: u8, neon_px: u8) -> u8 {
     if flat() { ui_rad(neutral_px) } else { neon_px }
+}
+
+/// Inner margin of modal dialogs (spacing, not a radius: never derive it from [`rad`]).
+pub fn dialog_margin() -> Margin {
+    Margin::same(if !flat() {
+        22
+    } else if compact() {
+        18
+    } else {
+        20
+    })
 }
 
 /// Popup radius of a style's look: its card radius where tighter than 10 (Blueprint 3, Phosphor 2,

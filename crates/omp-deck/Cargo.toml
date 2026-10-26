@@ -80,7 +80,7 @@ assets = [
     ["../../README.md", "usr/share/doc/omp-deck/README.md", "644"],
     ["../../LICENSE-MIT", "usr/share/doc/omp-deck/LICENSE-MIT", "644"],
     ["../../LICENSE-APACHE", "usr/share/doc/omp-deck/LICENSE-APACHE", "644"],
-    ["assets/fonts/Geist-OFL.txt", "usr/share/doc/omp-deck/Geist-OFL.txt", "644"],
+    ["assets/fonts/JetBrainsMono-OFL.txt", "usr/share/doc/omp-deck/JetBrainsMono-OFL.txt", "644"],
     ["assets/fonts/lucide-LICENSE.txt", "usr/share/doc/omp-deck/lucide-LICENSE.txt", "644"],
 ]
 
@@ -105,7 +105,7 @@ assets = [
     { source = "../../README.md", dest = "/usr/share/doc/omp-deck/README.md", mode = "644", doc = true },
     { source = "../../LICENSE-MIT", dest = "/usr/share/doc/omp-deck/LICENSE-MIT", mode = "644", doc = true },
     { source = "../../LICENSE-APACHE", dest = "/usr/share/doc/omp-deck/LICENSE-APACHE", mode = "644", doc = true },
-    { source = "assets/fonts/Geist-OFL.txt", dest = "/usr/share/licenses/omp-deck/Geist-OFL.txt", mode = "644", doc = true },
+    { source = "assets/fonts/JetBrainsMono-OFL.txt", dest = "/usr/share/licenses/omp-deck/JetBrainsMono-OFL.txt", mode = "644", doc = true },
     { source = "assets/fonts/lucide-LICENSE.txt", dest = "/usr/share/licenses/omp-deck/lucide-LICENSE.txt", mode = "644", doc = true },
 ]
 

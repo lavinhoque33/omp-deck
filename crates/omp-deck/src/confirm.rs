@@ -1,6 +1,6 @@
 //! Modal dialogs: the shared chrome ([`show_dialog`]) and the yes/no confirmation built on it.
 
-use egui::{Button, Context, Frame, Id, Key, Margin, Modal, RichText, Sides, Ui, vec2};
+use egui::{Button, Context, Frame, Id, Key, Modal, RichText, Sides, Ui, vec2};
 
 use crate::theme::{self, Palette};
 
@@ -50,7 +50,7 @@ pub fn show_dialog_labeled(
                 })
                 .stroke(egui::Stroke::new(1.0, pal.stroke))
                 .corner_radius(theme::popup_radius())
-                .inner_margin(Margin::same(theme::rad(20, 22) as i8))
+                .inner_margin(theme::dialog_margin())
                 .shadow(theme::modal_shadow(ctx.global_style().visuals.dark_mode)),
         )
         .show(ctx, |ui| {

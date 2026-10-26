@@ -2666,3 +2666,36 @@ window of ~5 h length (`5h`, blue tag) and of ~a week (`wk`, violet tag), length
 neither window shows its two shortest measured windows (`1d`, `mo`, …, teal); a provider with no measurable window
 (or no model selected) falls back to the old tightest-overall chip, prefixed with that provider's name. The hover
 card is unchanged (all providers).
+
+## Settings-backup manager, dialog padding, UI font
+
+User request (four items): status-bar contents sat low; modals/hover popups had no inner padding; the Drive
+**settings** (config) backup needs a manager like project sync's "Manage cloud backups"; new default UI font
+chosen by the user from 10 rendered mockups.
+
+- **Status bar**: `statusbar::chip` used `ui.horizontal`, which reserves `interact_size.y` (24 px Compact) and
+  let the 29 px chip grow downward (~2.5 px low). It now allocates `CHIP_H` with `Layout::*(Align::Center)`.
+  Pinned by `centering_tests::bar_segments_are_vertically_centered` (every painted text within 0.5 px of the bar
+  centre in Blueprint/Compact, Neutral/Compact, Neon/Comfortable).
+- **Padding**: `confirm::show_dialog*` used `theme::rad(20, 22)` (a radius helper, 3 px in Blueprint) as the inner
+  margin. Now `theme::dialog_margin()` = 18 px flat Compact, 20 px flat Comfortable, 22 px Neon. Rule: never derive
+  spacing from `rad`/`ui_rad`/`popup_radius`. `spacing.menu_margin` (all `Frame::popup`: tooltips, hover cards)
+  = 10×8 Compact / 12×10 Comfortable; `theme::menu_style` keeps 6/8 for context menus, dropdowns, notification and
+  scope popovers.
+- **Settings-backup manager**:
+  - `deck_core::gdrive::Service::delete_backup(&self, &BackupFile) -> Result<()>`: permanent `files.delete`;
+    re-reads the file's metadata and refuses anything that is not a config backup (`drive::is_config_backup`,
+    the same rule as `list()`: `omp-backup-` name, no `kind` property) or whose name changed; 404 = deleted.
+    Deleting the recorded `last_backup` clears it and `synced_fingerprint`; deleting a file with the synced
+    fingerprint clears that; the next automatic pass then uploads again.
+  - Gateway: `Mutation::DriveDeleteBackup(BackupFile)`, journal key `drive-delete-backup`, Drive lane, `Done::Unit`,
+    not allowed in maintenance, never replayed when uncertain (like `ProjectDeleteBackup`);
+    `jobs::drive_delete_backup`.
+  - UI (`drive_view::{BackupManager, manager_dialog}`, `app/drive.rs`): "Manage backups…" on the Backup card and
+    palette `drive.manage` "Drive: Manage settings backups…" (disabled while signed out / a Drive job runs);
+    host → versions newest first (this PC first, date, age, size, "this PC"/"latest"), row + group checkboxes,
+    totals, confirm, sequential delete with progress and per-file errors, Cancel stops after the file in flight,
+    reload afterwards; `RestorePick::Delete` trash per row in the restore picker.
+- **UI font**: bundled `assets/fonts/JetBrainsMono-VariableFont.ttf` (OFL, `JetBrainsMono-OFL.txt` shipped in every
+  package) is the primary face of `ui_fonts::NEUTRAL_FAMILY` (all flat styles); Geist and its license are removed.
+  Neon keeps Adwaita Sans; `mono_labels`/`mono_ui` keep egui's Monospace family.

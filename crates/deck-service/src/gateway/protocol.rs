@@ -766,6 +766,8 @@ pub enum Mutation {
     DrivePrepareRestore(BackupFile),
     DriveApplyRestore(u64),
     DriveDiscardRestore(u64),
+    /// Permanently deletes a config backup (only config backups are accepted).
+    DriveDeleteBackup(BackupFile),
     ProjectBackup {
         project: PathBuf,
         parts: Parts,
@@ -838,6 +840,7 @@ impl Mutation {
             Mutation::DrivePrepareRestore(_) => "drive-prepare-restore",
             Mutation::DriveApplyRestore(_) => "drive-restore",
             Mutation::DriveDiscardRestore(_) => "drive-discard-restore",
+            Mutation::DriveDeleteBackup(_) => "drive-delete-backup",
             Mutation::ProjectBackup { .. } => "project-backup",
             Mutation::ProjectDeleteBackup(_) => "project-delete-backup",
             Mutation::ProjectPrepareRestore { .. } => "project-prepare-restore",
@@ -1213,5 +1216,28 @@ mod tests {
         pal[18] = [1, 2, 3];
         assert_eq!(decode_palette(&encode_palette(&pal)), Some(pal));
         assert_eq!(decode_palette(&[0; 56]), None);
+    }
+
+    #[test]
+    fn drive_delete_backup_round_trips_with_its_journal_key() {
+        let file = BackupFile {
+            id: "1AbC-x_9".into(),
+            name: "omp-backup-20261022T135201Z-host.tar.gz".into(),
+            size: 12_345,
+            created: "2026-10-22T13:52:01.000Z".into(),
+            props: [("host".to_owned(), "host".to_owned())].into(),
+        };
+        let op = Mutation::DriveDeleteBackup(file.clone());
+        assert_eq!(op.label(), "drive-delete-backup");
+        assert!(op.target().is_none());
+        assert!(!op.allowed_in_maintenance());
+        let back: Mutation = serde_json::from_slice(&serde_json::to_vec(&op).unwrap()).unwrap();
+        match back {
+            Mutation::DriveDeleteBackup(f) => assert_eq!(f, file),
+            other => panic!("decoded as {}", other.label()),
+        }
+        // The reply mirrors ProjectDeleteBackup's.
+        let done: Done = serde_json::from_slice(&serde_json::to_vec(&Done::Unit).unwrap()).unwrap();
+        assert!(matches!(done, Done::Unit));
     }
 }

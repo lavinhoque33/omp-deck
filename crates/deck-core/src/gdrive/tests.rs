@@ -773,6 +773,13 @@ fn drive(mock: &mut Mock, req: &Request) -> (u16, Vec<u8>) {
         (method, path) => {
             let id = path.strip_prefix("/drive/v3/files/").unwrap_or_default();
             match (method, mock.files.get(id)) {
+                ("GET", Some((f, _))) if !req.query.contains_key("alt") => {
+                    assert_eq!(
+                        req.query["fields"],
+                        "id,name,size,createdTime,appProperties"
+                    );
+                    json(meta_json(f))
+                }
                 ("GET", Some((_, data))) => {
                     assert_eq!(req.query["alt"], "media");
                     if let Some(status) = mock.get_faults.pop_front() {
@@ -976,6 +983,133 @@ fn a_revoked_grant_signs_out() {
         .unwrap();
     assert!(matches!(service.list(), Err(Error::SignedOut)));
     assert!(service.store.load().unwrap().is_none());
+}
+
+/// A signed-in service over a fresh mock holding `files`.
+fn signed_in_with(files: &[BackupFile]) -> (tempfile::TempDir, Service, Arc<Mutex<Mock>>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = tmp.path().join("agent");
+    sample_agent(&agent);
+    let mut mock = Mock::default();
+    for f in files {
+        mock.files.insert(f.id.clone(), (f.clone(), vec![1]));
+    }
+    let mock = Arc::new(Mutex::new(mock));
+    let service = Service {
+        creds: creds(),
+        endpoints: endpoints(&serve(mock.clone())),
+        store: AccountStore::at(tmp.path().join("cfg/google-drive.json")),
+        agent_dir: agent,
+        safety_root: tmp.path().join("safety"),
+        cache_root: tmp.path().join("cache"),
+    };
+    service
+        .store
+        .save(&Account {
+            refresh_token: "refresh-1".into(),
+            ..Account::default()
+        })
+        .unwrap();
+    (tmp, service, mock)
+}
+
+#[test]
+fn deleting_a_config_backup_removes_it_and_404_counts_as_deleted() {
+    let older = file("older", "2020-01-01T00:00:00.000Z");
+    let (_tmp, service, mock) = signed_in_with(std::slice::from_ref(&older));
+    let newest = service.backup(true).unwrap().unwrap().file;
+    assert_eq!(service.list().unwrap().len(), 2);
+
+    service.delete_backup(&older).unwrap();
+    let left = service.list().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].id, newest.id);
+    {
+        let m = mock.lock().unwrap();
+        assert!(m.log.contains(&"GET /drive/v3/files/older".to_owned()));
+        assert!(m.log.contains(&"DELETE /drive/v3/files/older".to_owned()));
+    }
+    // An older backup leaves the recorded state alone: nothing is due.
+    let account = service.store.load().unwrap().unwrap();
+    assert_eq!(account.last_backup.unwrap().name, newest.name);
+    assert!(service.backup(false).unwrap().is_none());
+
+    // Already gone: success, nothing else is deleted.
+    service.delete_backup(&older).unwrap();
+    assert_eq!(service.list().unwrap().len(), 1);
+    assert_eq!(
+        mock.lock()
+            .unwrap()
+            .log
+            .iter()
+            .filter(|l| l.starts_with("DELETE"))
+            .count(),
+        1,
+        "a file that is gone is not deleted again"
+    );
+}
+
+#[test]
+fn deleting_the_last_backup_makes_the_next_automatic_pass_upload_again() {
+    let (_tmp, service, _mock) = signed_in_with(&[]);
+    let first = service.backup(true).unwrap().unwrap().file;
+    assert!(service.backup(false).unwrap().is_none());
+
+    service.delete_backup(&first).unwrap();
+    let account = service.store.load().unwrap().unwrap();
+    assert!(
+        account.last_backup.is_none(),
+        "the deleted backup is no longer shown as the last one"
+    );
+    assert!(account.synced_fingerprint.is_none());
+    assert!(service.list().unwrap().is_empty());
+    let again = service.backup(false).unwrap();
+    assert!(again.is_some(), "unchanged config is uploaded again");
+}
+
+#[test]
+fn deleting_a_backup_of_the_synced_content_from_another_pc_forgets_the_sync() {
+    let mut other = file("other", "2030-01-01T00:00:00.000Z");
+    other
+        .props
+        .insert("fingerprint".into(), "restored-fp".into());
+    let (_tmp, service, _mock) = signed_in_with(std::slice::from_ref(&other));
+    let mut account = service.store.load().unwrap().unwrap();
+    account.synced_fingerprint = Some("restored-fp".into());
+    service.store.save(&account).unwrap();
+
+    service.delete_backup(&other).unwrap();
+    let account = service.store.load().unwrap().unwrap();
+    assert!(account.synced_fingerprint.is_none());
+    assert!(account.last_backup.is_none());
+}
+
+#[test]
+fn only_config_backups_can_be_deleted() {
+    let mut project = file("proj", "2030-01-01T00:00:00.000Z");
+    project.name = format!("{PROJECT_PREFIX}proj.tar.gz");
+    project.props = BTreeMap::from([
+        ("kind".into(), "project".into()),
+        ("host".into(), "h".into()),
+    ]);
+    let mut foreign = file("foreign", "2030-01-01T00:00:00.000Z");
+    foreign.name = "notes.txt".into();
+    // Named like a config backup but marked as something else.
+    let mut marked = file("marked", "2030-01-01T00:00:00.000Z");
+    marked.props.insert("kind".into(), "project".into());
+    // A request that claims a config backup for an id holding a project backup.
+    let mut disguised = project.clone();
+    disguised.name = file("x", "2030-01-01T00:00:00.000Z").name;
+    disguised.props.clear();
+
+    let (_tmp, service, mock) = signed_in_with(&[project.clone(), foreign.clone(), marked.clone()]);
+    for f in [&project, &foreign, &marked, &disguised] {
+        let err = service.delete_backup(f).unwrap_err();
+        assert!(matches!(err, Error::InvalidBackup(_)), "{}: {err}", f.name);
+    }
+    let m = mock.lock().unwrap();
+    assert_eq!(m.files.len(), 3);
+    assert!(!m.log.iter().any(|l| l.starts_with("DELETE")));
 }
 
 // ---------------------------------------------------------------- project sync

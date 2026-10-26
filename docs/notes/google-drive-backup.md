@@ -47,9 +47,10 @@ synced dirs, `node_modules/` and `.git/` are skipped.
   (`q=name contains 'omp-backup-' and trashed = false`, paginated); upload
   `POST /upload/drive/v3/files?uploadType=multipart` (`multipart/related`, metadata
   `parents: ["appDataFolder"]` and `appProperties: {host, fingerprint}`); download
-  `GET /drive/v3/files/{id}?alt=media`; delete `DELETE /drive/v3/files/{id}`. `size` arrives as a
-  string. A 401 triggers one token refresh and a retry. 429/5xx map to "busy or unavailable"; other
-  errors surface Google's `error.message`.
+  `GET /drive/v3/files/{id}?alt=media`; metadata `GET /drive/v3/files/{id}?fields=…` (404 = gone);
+  delete `DELETE /drive/v3/files/{id}` (`files.delete` is permanent, it bypasses the trash). `size`
+  arrives as a string. A 401 triggers one token refresh and a retry. 429/5xx map to "busy or
+  unavailable"; other errors surface Google's `error.message`.
 
 ## Archive
 
@@ -83,3 +84,30 @@ The first check runs 45 s after startup, sign-in, or turning the toggle on; late
 confirmed (one job at a time). An automatic failure shows one toast, and later automatic failures
 only log until a backup succeeds. Retention runs after every successful upload: the newest 30
 backups by `createdTime` are kept, ties broken by name.
+
+## Deleting backups
+
+Settings → OmpDeck → Backup → *Manage backups…* (and the palette command *Drive: Manage settings
+backups…*) opens a dialog listing every config backup `list()` returns, grouped by the uploading PC
+(`host` appProperty; this PC first, then by name) with versions newest first. Each row shows the
+date, relative age, size, and *this PC* / *latest* markers. Rows and whole groups have checkboxes;
+the footer totals the selection. *Delete selected…* asks once (count, size, "permanent"), then the
+app sends one gateway `Mutation::DriveDeleteBackup` (journal key `drive-delete-backup`) per file,
+strictly one after the other, with a progress bar; Cancel stops after the request in flight. Per-file
+failures are listed in the dialog and summarised in a toast, and the list is reloaded afterwards. The
+restore picker has a per-row trash button that runs the same deletion for one file after a
+confirmation. Both are disabled while signed out or while any Drive job runs; the gateway job takes
+the Drive lane, so it never overlaps a backup, restore or project-sync job, and an uncertain
+deletion is not replayed after a gateway restart.
+
+`Service::delete_backup(&BackupFile)` refuses anything that is not a config backup: the name must
+start with `omp-backup-` and there must be no `kind` appProperty (project backups carry
+`kind = project`). It first reads what Drive holds under the id and refuses when that file is not a
+config backup or has another name, so a forged request cannot delete a project backup or a foreign
+file. A file Drive no longer has (404 on the metadata read or on the delete) counts as deleted.
+
+Account state rule (mirrors project sync, which forgets a project when its last recorded backup is
+deleted): when the deleted file is `last_backup`, that record is cleared; when it is `last_backup`
+or its `fingerprint` appProperty equals `synced_fingerprint`, `synced_fingerprint` is cleared too.
+The next automatic pass then uploads the current config again instead of believing Drive still holds
+it. Deleting an older backup leaves the account untouched.

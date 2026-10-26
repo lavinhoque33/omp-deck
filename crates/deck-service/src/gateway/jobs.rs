@@ -538,6 +538,13 @@ pub fn drive_apply_restore(ctx: &JobCtx, handle: u64) -> Result<Done, GatewayErr
         .map_err(failed)
 }
 
+pub fn drive_delete_backup(ctx: &JobCtx, file: &gdrive::BackupFile) -> Result<Done, GatewayError> {
+    ctx.drive()?
+        .delete_backup(file)
+        .map(|()| Done::Unit)
+        .map_err(failed)
+}
+
 fn progress_of(p: gdrive::Progress) -> Progress {
     Progress {
         stage: format!("{:?}", p.stage),
