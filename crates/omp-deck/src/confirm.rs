@@ -1,10 +1,14 @@
 //! Modal dialogs: the shared chrome ([`show_dialog`]) and the yes/no confirmation built on it.
+//! Both are gradient-rule cards ([`crate::card`]) with Drafted buttons.
 
-use egui::{Button, Context, Frame, Id, Key, Modal, RichText, Sides, Ui, vec2};
+use egui::{Color32, Context, Id, Key, RichText, Ui};
 
-use crate::theme::{self, Palette};
+use crate::card;
+use crate::icons::{ICON_INFO, ICON_TRIANGLE_ALERT, Icon};
+use crate::theme::Palette;
+use crate::widgets::{DraftButton, DraftKind};
 
-/// What to ask. `danger` paints the confirm button red.
+/// What to ask. `danger` paints the confirm button red and gives the header an alert tile.
 pub struct Confirm {
     pub title: String,
     pub body: String,
@@ -12,7 +16,8 @@ pub struct Confirm {
     pub danger: bool,
 }
 
-/// Chrome of a form dialog: title, body supplied by the caller, Cancel / confirm footer.
+/// Chrome of a form dialog: header, body supplied by the caller, Cancel / confirm footer.
+#[derive(Default)]
 pub struct Dialog<'a> {
     /// Stable per dialog kind (text fields inside need a stable widget id).
     pub id: &'a str,
@@ -23,6 +28,32 @@ pub struct Dialog<'a> {
     pub danger: bool,
     /// Pressing Enter confirms (leave off when the body has a multiline editor).
     pub enter_confirms: bool,
+    /// Header glyph; `None` = an alert for danger / toned dialogs, else info. A danger dialog's
+    /// confirm button carries the same glyph.
+    pub icon: Option<Icon>,
+    /// Weak line under the title.
+    pub subtitle: Option<&'a str>,
+    /// Header tone (icon tile, wash, rule), e.g. `pal.warn`; `None` = `pal.danger` when
+    /// `danger`, else the accent pair.
+    pub tone: Option<Color32>,
+}
+
+impl Dialog<'_> {
+    fn tone(&self, pal: &Palette) -> Color32 {
+        self.tone.unwrap_or(if self.danger {
+            pal.danger
+        } else {
+            Color32::TRANSPARENT
+        })
+    }
+
+    fn icon(&self) -> Icon {
+        self.icon.unwrap_or(if self.danger || self.tone.is_some() {
+            ICON_TRIANGLE_ALERT
+        } else {
+            ICON_INFO
+        })
+    }
 }
 
 /// Shows the modal; `Some(true)` = confirmed, `Some(false)` = cancelled / dismissed.
@@ -38,67 +69,51 @@ pub fn show_dialog_labeled(
     body: impl FnOnce(&mut Ui),
 ) -> Option<bool> {
     let pal = Palette::of_ctx(ctx);
+    let icon = d.icon();
+    let mut head = card::Header::new(icon, d.title).tone(d.tone(pal));
+    if let Some(s) = d.subtitle {
+        head = head.subtitle(s);
+    }
+    let hints: &[(&str, &str)] = if d.enter_confirms && d.confirm_enabled {
+        &[("Enter", "confirms")]
+    } else {
+        &[("Esc", "cancels")]
+    };
     let mut result = None;
-    let modal = Modal::new(Id::unique(("omp-deck-dialog", d.id)))
-        .backdrop_color(theme::backdrop(ctx.global_style().visuals.dark_mode))
-        .frame(
-            Frame::popup(&ctx.global_style())
-                .fill(if theme::flat() {
-                    ctx.global_style().visuals.window_fill
-                } else {
-                    pal.raised
-                })
-                .stroke(egui::Stroke::new(1.0, pal.stroke))
-                .corner_radius(theme::popup_radius())
-                .inner_margin(theme::dialog_margin())
-                .shadow(theme::modal_shadow(ctx.global_style().visuals.dark_mode)),
-        )
-        .show(ctx, |ui| {
-            ui.set_width(d.width);
-            ui.label(theme::strong(d.title).size(18.0).color(pal.text_strong));
-            ui.add_space(8.0);
+    let dismissed = card::modal(
+        ctx,
+        Id::unique(("omp-deck-dialog", d.id)),
+        d.width,
+        &head,
+        |ui| {
             body(ui);
-            ui.add_space(20.0);
-            Sides::new().show(
-                ui,
-                |_| {},
-                |ui| {
-                    let (fill, fg) = if d.danger {
-                        (
-                            pal.danger
-                                .gamma_multiply(if theme::flat() { 1.0 } else { 0.85 }),
-                            if theme::flat() {
-                                theme::ink_on(pal.danger)
-                            } else {
-                                egui::Color32::WHITE
-                            },
-                        )
-                    } else {
-                        (pal.accent, theme::on_accent(pal))
-                    };
-                    let confirm = ui.add_enabled(
-                        d.confirm_enabled,
-                        Button::new(RichText::new(d.confirm_label).color(fg))
-                            .fill(fill)
-                            .min_size(vec2(96.0, 32.0))
-                            .corner_radius(theme::rad(8, 10)),
-                    );
-                    if confirm.clicked() {
-                        result = Some(true);
-                    }
-                    if ui
-                        .add(
-                            Button::new(cancel_label)
-                                .min_size(vec2(84.0, 32.0))
-                                .corner_radius(theme::rad(8, 10)),
-                        )
-                        .clicked()
-                    {
-                        result = Some(false);
-                    }
-                },
-            );
-        });
+            card::footer(ui, hints, |ui| {
+                let kind = if d.danger {
+                    DraftKind::Danger
+                } else {
+                    DraftKind::Primary
+                };
+                let mut confirm = DraftButton::new(d.confirm_label)
+                    .kind(kind)
+                    .enabled(d.confirm_enabled)
+                    .min_width(96.0);
+                if d.danger {
+                    confirm = confirm.icon(icon);
+                }
+                let confirm = confirm.show(ui);
+                if confirm.clicked() {
+                    result = Some(true);
+                }
+                if DraftButton::new(cancel_label)
+                    .min_width(84.0)
+                    .show(ui)
+                    .clicked()
+                {
+                    result = Some(false);
+                }
+            });
+        },
+    );
     if result.is_none()
         && d.enter_confirms
         && d.confirm_enabled
@@ -106,7 +121,7 @@ pub fn show_dialog_labeled(
     {
         result = Some(true);
     }
-    if result.is_none() && modal.should_close() {
+    if result.is_none() && dismissed {
         result = Some(false);
     }
     result
@@ -120,15 +135,15 @@ pub fn show(ctx: &Context, id: &str, confirm: &Confirm) -> Option<bool> {
         &Dialog {
             id,
             title: &confirm.title,
-            width: 400.0,
+            width: 420.0,
             confirm_label: &confirm.confirm_label,
             confirm_enabled: true,
             danger: confirm.danger,
-            enter_confirms: false,
+            ..Dialog::default()
         },
         |ui| {
             ui.add(
-                egui::Label::new(RichText::new(&confirm.body).color(pal.weak))
+                egui::Label::new(RichText::new(&confirm.body).color(pal.text))
                     .wrap_mode(egui::TextWrapMode::Wrap),
             );
         },

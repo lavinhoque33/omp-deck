@@ -451,3 +451,302 @@ impl egui::Widget for Spin {
         resp
     }
 }
+
+/// Role of a [`DraftButton`]: neutral, the accent action, or a destructive one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DraftKind {
+    #[default]
+    Secondary,
+    Primary,
+    Danger,
+}
+
+/// "Drafted" push button: uppercase tracked label, hairline border, an outer rule 2 px outside
+/// it and a hard base shadow that the body sinks into when pressed. Primary / Danger add a
+/// tinted gradient fill, an inner top highlight, a deep tone base and a soft glow. Focusable:
+/// Enter / Space click it like a pointer click.
+#[must_use = "call `.show(ui)` or `ui.add(..)`"]
+pub struct DraftButton<'a> {
+    label: &'a str,
+    kind: DraftKind,
+    icon: Option<Icon>,
+    enabled: bool,
+    min_width: f32,
+}
+
+impl<'a> DraftButton<'a> {
+    pub fn new(label: &'a str) -> Self {
+        DraftButton {
+            label,
+            kind: DraftKind::Secondary,
+            icon: None,
+            enabled: true,
+            min_width: 0.0,
+        }
+    }
+
+    pub fn kind(mut self, kind: DraftKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Leading glyph.
+    pub fn icon(mut self, icon: Icon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn min_width(mut self, width: f32) -> Self {
+        self.min_width = width;
+        self
+    }
+
+    pub fn show(self, ui: &mut Ui) -> Response {
+        ui.add(self)
+    }
+}
+
+/// Horizontal padding of a [`DraftButton`].
+const DRAFT_PAD_X: f32 = 16.0;
+/// Gap between a [`DraftButton`]'s icon and label.
+const DRAFT_ICON_GAP: f32 = 8.0;
+const DRAFT_ICON: f32 = 14.0;
+
+/// Height of a [`DraftButton`] at the active density.
+pub fn draft_height() -> f32 {
+    theme::dens(34.0, 36.0)
+}
+
+/// Room a [`DraftButton`] paints below its rect (hard base shadow and outer rule).
+pub const DRAFT_BELOW: f32 = 4.0;
+
+impl egui::Widget for DraftButton<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let pal = Palette::of_ui(ui);
+        let dark = ui.visuals().dark_mode;
+        let enabled = self.enabled && ui.is_enabled();
+        let job = egui::text::LayoutJob::single_section(
+            self.label.to_uppercase(),
+            egui::TextFormat {
+                font_id: theme::label_font(12.0),
+                extra_letter_spacing: 1.0,
+                color: Color32::PLACEHOLDER,
+                ..Default::default()
+            },
+        );
+        let galley = ui.painter().layout_job(job);
+        let icon_w = if self.icon.is_some() {
+            DRAFT_ICON + DRAFT_ICON_GAP
+        } else {
+            0.0
+        };
+        let size = vec2(
+            (DRAFT_PAD_X * 2.0 + icon_w + galley.size().x).max(self.min_width),
+            draft_height(),
+        );
+        let sense = if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        };
+        let (rect, resp) = ui.allocate_exact_size(size, sense);
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, self.label));
+        if ui.is_rect_visible(rect.expand(4.0)) {
+            let look = draft_look(pal, dark, self.kind, enabled);
+            let hov = ui.ctx().animate_bool_with_time(
+                resp.id.with("hov"),
+                enabled && resp.hovered(),
+                0.1,
+            );
+            let pressed = enabled && resp.is_pointer_button_down_on();
+            paint_draft(
+                ui,
+                rect,
+                &look,
+                DraftState {
+                    hov,
+                    pressed,
+                    focus: resp.has_focus(),
+                    enabled,
+                },
+                self.icon,
+                galley,
+            );
+        }
+        if enabled {
+            resp.on_hover_cursor(CursorIcon::PointingHand)
+        } else {
+            resp
+        }
+    }
+}
+
+/// Resting colours of a [`DraftButton`] (hover blends toward `border_hov` / `rule_hov`).
+#[derive(Clone, Copy, Debug)]
+struct DraftLook {
+    fill: Color32,
+    /// Gradient fill over `fill` (`top`, `bottom`), `None` for Secondary.
+    tint: Option<(Color32, Color32)>,
+    text: Color32,
+    text_hov: Color32,
+    border: Color32,
+    border_hov: Color32,
+    rule: Color32,
+    rule_hov: Color32,
+    /// Hard base shadow; transparent when disabled.
+    base: Color32,
+    /// Inner top highlight and glow (tinted kinds only).
+    highlight: Color32,
+    glow: Color32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DraftState {
+    hov: f32,
+    pressed: bool,
+    focus: bool,
+    enabled: bool,
+}
+
+fn draft_look(pal: &Palette, dark: bool, kind: DraftKind, enabled: bool) -> DraftLook {
+    let fill = theme::mix(pal.window, pal.raised, if dark { 0.35 } else { 0.2 });
+    let tone = match kind {
+        DraftKind::Secondary => None,
+        DraftKind::Primary => Some(pal.accent),
+        DraftKind::Danger => Some(pal.danger),
+    };
+    let rest_border = theme::mix(pal.stroke, pal.hover_line, 0.15);
+    if !enabled {
+        return DraftLook {
+            fill,
+            tint: None,
+            text: pal.weak,
+            text_hov: pal.weak,
+            border: tone.map_or(rest_border, |t| theme::mix(pal.stroke, t, 0.35)),
+            border_hov: tone.map_or(rest_border, |t| theme::mix(pal.stroke, t, 0.35)),
+            rule: pal.stroke.gamma_multiply(0.35),
+            rule_hov: pal.stroke.gamma_multiply(0.35),
+            base: Color32::TRANSPARENT,
+            highlight: Color32::TRANSPARENT,
+            glow: Color32::TRANSPARENT,
+        };
+    }
+    match tone {
+        None => DraftLook {
+            fill,
+            tint: None,
+            text: pal.text,
+            text_hov: pal.text_strong,
+            border: rest_border,
+            border_hov: pal.hover_line,
+            rule: pal.stroke.gamma_multiply(0.7),
+            rule_hov: pal.hover_line.gamma_multiply(0.5),
+            base: Color32::from_black_alpha(if dark { 140 } else { 46 }),
+            highlight: Color32::TRANSPARENT,
+            glow: Color32::TRANSPARENT,
+        },
+        Some(t) => DraftLook {
+            fill,
+            tint: Some((theme::mix(fill, t, 0.28), theme::mix(fill, t, 0.12))),
+            text: pal.text_strong,
+            text_hov: pal.text_strong,
+            border: t,
+            border_hov: theme::mix(t, pal.text_strong, 0.25),
+            rule: t.gamma_multiply(0.45),
+            rule_hov: t.gamma_multiply(0.7),
+            base: theme::mix(t, Color32::BLACK, 0.75).gamma_multiply(0.9),
+            highlight: theme::mix(t, Color32::WHITE, 0.4).gamma_multiply(0.35),
+            glow: t.gamma_multiply(0.18),
+        },
+    }
+}
+
+fn paint_draft(
+    ui: &Ui,
+    rect: egui::Rect,
+    look: &DraftLook,
+    st: DraftState,
+    icon: Option<Icon>,
+    galley: std::sync::Arc<egui::Galley>,
+) {
+    let pal = Palette::of_ui(ui);
+    let p = ui.painter();
+    let r = theme::look().ui_r.min(4);
+    let border_w = if theme::style() == deck_core::config::UiStyle::NeoBrutal {
+        2.0
+    } else {
+        1.0
+    };
+    let (sink, base_dy) = if st.pressed { (2.0, 1.0) } else { (0.0, 3.0) };
+    let body = rect.translate(vec2(0.0, sink));
+
+    if look.base.a() > 0 {
+        p.rect_filled(body.translate(vec2(0.0, base_dy)), r, look.base);
+    }
+    if look.glow.a() > 0 {
+        crate::deco::glow(p, body, r, look.glow.gamma_multiply(1.0 + 0.5 * st.hov), 16);
+    }
+    p.rect_filled(body, r, look.fill);
+    if let Some((top, bottom)) = look.tint {
+        let lift = 0.06 * st.hov;
+        crate::deco::fill_vertical(
+            p,
+            &crate::deco::rounded_rect(body, f32::from(r)),
+            theme::mix(top, look.border, lift),
+            theme::mix(bottom, look.border, lift),
+        );
+    }
+    if look.highlight.a() > 0 {
+        let y = body.top() + border_w + 0.5;
+        p.line_segment(
+            [
+                egui::pos2(body.left() + f32::from(r) + 1.0, y),
+                egui::pos2(body.right() - f32::from(r) - 1.0, y),
+            ],
+            Stroke::new(1.0, look.highlight),
+        );
+    }
+    p.rect_stroke(
+        body,
+        r,
+        Stroke::new(border_w, theme::mix(look.border, look.border_hov, st.hov)),
+        StrokeKind::Inside,
+    );
+    let rule = if st.focus && st.enabled {
+        pal.accent.gamma_multiply(0.9)
+    } else {
+        theme::mix(look.rule, look.rule_hov, st.hov)
+    };
+    p.rect_stroke(
+        body.expand(2.0 + border_w),
+        r + 2 + border_w as u8,
+        Stroke::new(1.0, rule),
+        StrokeKind::Inside,
+    );
+
+    let text = theme::mix(look.text, look.text_hov, st.hov);
+    let icon_w = if icon.is_some() {
+        DRAFT_ICON + DRAFT_ICON_GAP
+    } else {
+        0.0
+    };
+    let content_w = icon_w + galley.size().x;
+    let left = body.center().x - content_w / 2.0;
+    if let Some(i) = icon {
+        paint_icon(
+            p,
+            egui::pos2(left + DRAFT_ICON / 2.0, body.center().y),
+            Align2::CENTER_CENTER,
+            i,
+            DRAFT_ICON,
+            text,
+        );
+    }
+    let pos = egui::pos2(left + icon_w, body.center().y - galley.size().y / 2.0);
+    p.galley(pos, galley, text);
+}

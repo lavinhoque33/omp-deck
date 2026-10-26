@@ -30,7 +30,8 @@ use std::thread::JoinHandle;
 
 use deck_core::config::{
     AppConfig, Density, FolderTabs, GatewayMode, NotifyConfig, RemovedWorktree, SplitState,
-    SyncInterval, SyncRow, TabState, Theme, UiStyle, WindowGeometry, config_dir, parse_config,
+    SyncInterval, SyncRow, TabState, Theme, UiFont, UiStyle, WindowGeometry, clamp_ui_scale,
+    config_dir, parse_config,
 };
 use deck_core::mux::BackendChoice;
 use serde::{Deserialize, Serialize};
@@ -276,6 +277,8 @@ settings! {
     Style(style: UiStyle) = Shared,
     StyleRev(style_rev: u32) = Shared,
     Density(density: Density) = Shared,
+    UiFont(ui_font: UiFont) = Shared,
+    UiScale(ui_scale: f32) = Shared,
     NativeDecorations(native_decorations: bool) = Device,
     CheckUpdates(check_updates: bool) = Shared,
     FavoriteModels(favorite_models: Vec<String>) = Shared,
@@ -647,6 +650,8 @@ fn commit(writer: &Writer, edit: Edit) -> Result<Snapshot, SettingsError> {
     for c in edit.changes {
         c.apply(&mut merged);
     }
+    // The app scale is a hard range for every writer (not just this window), kept at the owner.
+    merged.ui_scale = clamp_ui_scale(merged.ui_scale);
     if merged != stored {
         merged
             .save_to(path)
@@ -738,6 +743,22 @@ mod tests {
         rebase(&mut local, &old, &new);
         assert_eq!(local.font_size, 20.0);
         assert_eq!(local.sidebar_width, 111.0);
+    }
+
+    #[test]
+    fn app_scale_is_clamped_at_the_owner() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a = open(&dir);
+        let base = a.snapshot().config;
+        let mut edited = (*base).clone();
+        edited.ui_scale = 4.0;
+        let snap = a
+            .submit(Edit::between(base, &edited))
+            .wait()
+            .expect("commits");
+        assert_eq!(snap.config.ui_scale, deck_core::config::MAX_UI_SCALE);
+        let stored = AppConfig::load_from(&dir.path().join("state.json"));
+        assert_eq!(stored.ui_scale, deck_core::config::MAX_UI_SCALE);
     }
 
     fn tab(name: &str) -> TabState {

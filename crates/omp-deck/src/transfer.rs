@@ -3,13 +3,15 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::icons::{ICON_FOLDER_OPEN, ICON_TRIANGLE_ALERT};
-use deck_core::sessions::{ProjectGroup, SessionEntry};
-use egui::{Id, RichText, TextEdit, Ui, vec2};
+use crate::icons::{ICON_COPY, ICON_FOLDER_INPUT, ICON_FOLDER_OPEN, ICON_TRIANGLE_ALERT};
+use deck_core::sessions::{ProjectGroup, SessionEntry, abbreviate_home};
+use egui::{Id, RichText, TextEdit, Ui};
 
+use crate::badge::{self, Hue};
+use crate::card;
 use crate::confirm::{Dialog, show_dialog};
 use crate::theme::Palette;
-use crate::widgets::icon_text;
+use crate::widgets::{DraftButton, icon_text};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferKind {
@@ -304,6 +306,7 @@ impl FolderDialog {
         let title = format!("{} to folder", self.kind.verb());
         let confirm_label = self.kind.verb();
         let ok = matches!(self.checked, Checked::Valid(_));
+        let subtitle = self.subject.label();
         let answer = show_dialog(
             ctx,
             &Dialog {
@@ -314,19 +317,48 @@ impl FolderDialog {
                 confirm_enabled: ok,
                 danger: false,
                 enter_confirms: true,
+                icon: Some(match self.kind {
+                    TransferKind::Copy => ICON_COPY,
+                    TransferKind::Move => ICON_FOLDER_INPUT,
+                }),
+                subtitle: Some(&subtitle),
+                ..Default::default()
             },
             |ui: &mut Ui| {
+                match &self.subject {
+                    Subject::One(e) => {
+                        card::kv(ui, 84.0, "Session", |ui| {
+                            ui.label(RichText::new(e.label()).color(pal.text_strong));
+                        });
+                        card::kv(ui, 84.0, "From", |ui| {
+                            ui.label(RichText::new(abbreviate_home(&e.cwd)).monospace().small());
+                        });
+                    }
+                    Subject::Many { paths, cwd } => {
+                        card::kv(ui, 84.0, "Sessions", |ui| {
+                            badge::show(
+                                ui,
+                                None,
+                                &format!("{} selected", paths.len()),
+                                Hue::Amber,
+                                11.0,
+                            );
+                        });
+                        if let Some(cwd) = cwd {
+                            card::kv(ui, 84.0, "From", |ui| {
+                                ui.label(RichText::new(abbreviate_home(cwd)).monospace().small());
+                            });
+                        }
+                    }
+                }
+                ui.add_space(8.0);
                 ui.add(
                     egui::Label::new(
-                        RichText::new(format!(
-                            "Choose the project folder for {}.",
-                            self.subject.label()
-                        ))
-                        .color(pal.weak),
+                        RichText::new("Choose the project folder to receive them.").color(pal.weak),
                     )
                     .wrap_mode(egui::TextWrapMode::Wrap),
                 );
-                ui.add_space(12.0);
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     let browse_w = if has_picker { 108.0 } else { 0.0 };
@@ -347,17 +379,18 @@ impl FolderDialog {
                         new_text = Some(text);
                     }
                     if has_picker {
-                        let label = if self.browsing {
-                            RichText::new("Waiting…")
+                        let text = if self.browsing {
+                            "Waiting…"
                         } else {
-                            RichText::new("Browse…")
+                            "Browse…"
                         };
-                        let btn = egui::Button::new((
-                            icon_text(ICON_FOLDER_OPEN, 17.0, pal.glyph),
-                            label,
-                        ))
-                        .min_size(vec2(browse_w, 34.0));
-                        if ui.add_enabled(!self.browsing, btn).clicked() {
+                        if DraftButton::new(text)
+                            .icon(ICON_FOLDER_OPEN)
+                            .enabled(!self.browsing)
+                            .min_width(browse_w)
+                            .show(ui)
+                            .clicked()
+                        {
                             outcome = FolderOutcome::Browse;
                         }
                     }

@@ -2710,3 +2710,44 @@ chosen by the user from 10 rendered mockups.
 - **UI font**: bundled `assets/fonts/JetBrainsMono-VariableFont.ttf` (OFL, `JetBrainsMono-OFL.txt` shipped in every
   package) is the primary face of `ui_fonts::NEUTRAL_FAMILY` (all flat styles); Geist and its license are removed.
   Neon keeps Adwaita Sans; `mono_labels`/`mono_ui` keep egui's Monospace family.
+
+## Signal-edge chrome, Drafted buttons, UI font picker, app font size
+
+User request; directions picked from six rendered mockups (`~/omp-deck-style-mockups/{A..F}.png`, source `mock.html`):
+tabs **E "Signal edge"**, buttons **B "Drafted"**, modals + hover cards **E "Gradient rule"**. Applies to all 18
+styles through the palette; per-style character kept where it fits.
+
+- **Primitives** (`deco.rs`): `accent_pair(p)` = `accent_a → accent_b`, or for single-accent styles the accent and a
+  softer partner (hue +45°, saturation ×0.6, value ≥ 0.95: Blueprint cyan → lavender); `tone_pair` for status tones;
+  `rounded_polygon`/`rounded_rect`/`slanted` outlines; gradient outlines via epaint `ColorMode::UV`; gradient rules,
+  glows, drop shadows (`*_shape` variants for the placeholder-shape pattern).
+- **Tabs**: row `tab_hit_h()` = `dens(42, 46)`, pill inset 5 (32 / 36 px tabs). One painter for every style
+  (`skin::paint_tab`): parallelogram slanted by tan 12°, radius `tab_r.clamp(2, 6)`; plain = outline only; hovered =
+  `hover_bg` + `mix(stroke, hover_line, .35)` (also while over ✕); active = dark plate, 1 px left→right accent-pair
+  outline, two-layer glow (α .18 blur 22 + α .22 blur 8; half on light) over a drop shadow (dy 6, blur 14); split
+  "shown" tabs = 45 % outline. Brutal: 2 px + hard (3,3) accent shadow; Glass, Tint, Filled, Outlined, Folder keep
+  their fills (`tab_joins_canvas` removed). Pinned by `titlebar::tests::tab_row_content_is_vertically_centered`.
+- **Drafted button** (`widgets::DraftButton`, `DraftKind::{Secondary, Primary, Danger}`): uppercase tracked label,
+  1 px border + outer rule 2 px outside + hard 3 px base shadow; Primary/Danger = tinted gradient fill, inner
+  highlight, deep base, glow; pressed sinks 2 px; Enter/Space activate when focused. Used for every text button in
+  modals, popovers and the large windows; icon-only buttons, list rows and inline row pills stay as they were.
+- **Cards** (`card.rs`): `chrome` (gradient border 135° accent_a → stroke → stroke → partner, glow + drop shadow),
+  `Header { icon, title, subtitle, tone }` with gradient icon tile + tone wash + gradient rule, `kv` ("▸ KEY" column +
+  coloured value/badges), `section`, `kbd`, `footer_hints`, `footer`; entry points `show`, `modal`, `hover` (built on
+  `egui::Tooltip::for_enabled` with a frameless popup). `confirm::Dialog` gains `icon`, `subtitle`, `tone` (all
+  `Default`); every dialog sets them. `tips.rs` holds shared hover pieces (status badge/tone, `~` paths, id badges
+  showing the last 8 chars). Plain one-line tooltips keep egui's frame with accent-tinted stroke, card radius and an
+  8/24 shadow.
+- **UI font**: `deck_core::config::UiFont` (`AppConfig.ui_font`, kebab keys, default `Auto`; settings row `UiFont`,
+  Shared): Auto (today's per-style choice), System, and 18 bundled faces (JetBrains Mono variable + 17 static
+  Regular instances in `assets/fonts/ui/`: Geist, Inter, IBM Plex Sans, Manrope, Space Grotesk, Plus Jakarta Sans,
+  Onest, Outfit, Sora, Bricolage Grotesque, Lexend, Figtree, Urbanist, Geist Mono, Red Hat Mono, Martian Mono,
+  Victor Mono). Licenses in one `assets/fonts/UI-FONTS-OFL.txt` shipped by every package. `ui_fonts::finalize` builds
+  one family per face once (face + full fallback chain); switching only selects a family (`ctx.set_fonts` at runtime
+  garbled cached galleys), and cached-galley keys include the font. Explicit fonts apply to every style; Blueprint and
+  Phosphor labels stay monospace.
+- **App font size**: `AppConfig.ui_scale` (0.8–1.6, default 1.0, clamped at load and by the settings owner; row
+  `UiScale`, Shared) → `ctx.set_zoom_factor`. Terminals get `font_size / zoom` so their on-screen size depends only on
+  "Terminal font size". Window geometry is persisted in native logical points (zoom-independent).
+  Settings → Appearance "App font size" (pt at %, 5 % slider, reset); palette Larger/Smaller/Reset (10 % steps).
+- **Sidebar**: session rows are one step below their project header (flat 12 vs 13 px, Neon 13 vs 14 px).

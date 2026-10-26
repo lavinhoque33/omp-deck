@@ -24,7 +24,7 @@ use egui::{
 use crate::agent_ctl::{CtlView, Link, Restart};
 use crate::agent_hub::{self, RowAction, RowsInput, RowsState};
 use crate::agent_model::AgentsView;
-use crate::badge::{Badge, Hue};
+use crate::badge::{self, Badge, Hue};
 use crate::dashboard_model::{
     Card, CardKey, FILTERS, GAP, Grid, Item, PAD, Query, REPLY_LINE_H, REPLY_LINES, ROW_AGENTS,
     ROW_CTX, ROW_FILES, ROW_HEAD, ROW_MODEL, ROW_PROJECT, SECTION_GAP, Status, StatusFilter,
@@ -33,12 +33,13 @@ use crate::dashboard_model::{
 use crate::icons::{
     ICON_BRAIN, ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CPU, ICON_FOLDER,
     ICON_FOLDER_GIT_2, ICON_GIT_BRANCH, ICON_LIST, ICON_LIST_TREE, ICON_NETWORK, ICON_SEARCH,
-    ICON_X, Icon,
+    ICON_SPARKLES, ICON_TERMINAL, ICON_X, Icon,
 };
 use crate::statusbar::level_color;
 use crate::tabs::paint_status;
 use crate::theme::{self, Palette, acc, skin};
 use crate::widgets::{Spin, empty_state, icon_text, paint_icon};
+use crate::{card, tips};
 use deck_core::config::UiStyle;
 use deck_service::statusfmt::ContextLevel;
 
@@ -553,6 +554,7 @@ fn grid(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>, out: &mut Vec<Da
                 note.is_some(),
                 ui.visuals().dark_mode,
                 theme::style().key(),
+                theme::ui_font().key(),
             ));
             if *grid_key != Some(key) {
                 let items: Vec<Item> = order
@@ -1213,21 +1215,56 @@ fn paint_card(
         }
     }
 
-    if resp
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_ui(|ui| {
-            ui.label(RichText::new(&card.title).strong());
-            ui.label(format!("id {}", card.id));
-            ui.label(&card.project);
-            if let Some(s) = &card.session {
-                ui.label(s.display().to_string());
-            }
-        })
-        .clicked()
-    {
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    card_hover(&resp, card);
+    if resp.clicked() {
         out.push(DashAction::OpenCard(card.key.clone()));
     }
     toggled
+}
+
+/// Hover card of a session card: id, folder, branch, model and session file.
+fn card_hover(resp: &egui::Response, c: &Card) {
+    const KEY_W: f32 = 76.0;
+    let pal = Palette::of_ctx(&resp.ctx);
+    let tab = c.status.as_tab();
+    let tone = match c.status {
+        Status::Running => Color32::TRANSPARENT,
+        _ => tips::status_tone(pal, tab),
+    };
+    card::hover(
+        resp,
+        340.0,
+        false,
+        &card::Header::new(ICON_TERMINAL, &c.title).tone(tone),
+        |ui| match c.status {
+            Status::Running => {
+                badge::show(ui, None, "running", Hue::Green, tips::VALUE);
+            }
+            _ => tips::status_badge(ui, tab, None),
+        },
+        |ui| {
+            card::kv(ui, KEY_W, "Id", |ui| tips::id_badge(ui, &c.id));
+            card::kv(ui, KEY_W, "Folder", |ui| tips::mono(ui, &c.project));
+            if let Some(b) = &c.branch {
+                card::kv(ui, KEY_W, "Branch", |ui| {
+                    badge::show(ui, Some(ICON_GIT_BRANCH), b, Hue::Blue, tips::VALUE);
+                });
+            }
+            if let Some(m) = &c.metrics {
+                card::kv(ui, KEY_W, "Model", |ui| {
+                    badge::show(ui, Some(ICON_SPARKLES), &m.model, Hue::Violet, tips::VALUE);
+                    if let Some(t) = &m.thinking {
+                        badge::show(ui, Some(ICON_BRAIN), t, Hue::Blue, tips::VALUE);
+                    }
+                });
+            }
+            if let Some(s) = &c.session {
+                card::kv(ui, KEY_W, "File", |ui| tips::path(ui, s));
+            }
+            card::footer_hints(ui, &[("click", "open")]);
+        },
+    );
 }
 
 /// The one-line live-control note of the active card; true when "Restart" was pressed.

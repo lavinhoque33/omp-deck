@@ -11,10 +11,10 @@ use crate::icons::{
     ICON_ARCHIVE_RESTORE, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CHEVRONS_DOWN_UP,
     ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_STOP, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_COLUMNS_2,
     ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS, ICON_FOLDER,
-    ICON_FOLDER_GIT_2, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_GIT_BRANCH_PLUS,
-    ICON_GIT_MERGE, ICON_HARD_DRIVE, ICON_KEY_ROUND, ICON_LIST_TREE, ICON_PLAY, ICON_PLUS,
-    ICON_POWER, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_ROWS_2, ICON_SEARCH, ICON_SEARCH_X,
-    ICON_TERMINAL, ICON_TRASH_2, ICON_X,
+    ICON_FOLDER_GIT_2, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_GIT_BRANCH,
+    ICON_GIT_BRANCH_PLUS, ICON_GIT_MERGE, ICON_HARD_DRIVE, ICON_HISTORY, ICON_KEY_ROUND,
+    ICON_LIST_TREE, ICON_MESSAGES_SQUARE, ICON_PLAY, ICON_PLUS, ICON_POWER, ICON_REFRESH_CW,
+    ICON_ROTATE_CCW, ICON_ROWS_2, ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL, ICON_TRASH_2, ICON_X,
 };
 use deck_core::config::RemovedWorktree;
 use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot};
@@ -22,10 +22,11 @@ use deck_core::worktree::Worktree;
 use egui::collapsing_header::CollapsingState;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Align2, CursorIcon, Frame, Id, Margin, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui,
-    pos2, vec2,
+    Align2, Color32, CursorIcon, Frame, Id, Margin, Rect, RichText, Sense, Shape, Stroke,
+    StrokeKind, Ui, pos2, vec2,
 };
 
+use crate::badge::{self, Hue};
 use crate::folder_scope;
 use crate::panes::Side;
 use crate::scope_bar::{self, ScopeAction, ScopeInput, ScopeState};
@@ -34,6 +35,7 @@ use crate::theme::{self, Palette};
 use crate::transfer::{self, TransferKind};
 use crate::widgets::{empty_state, icon_text, menu_item, paint_icon};
 use crate::worktree_ui::{self, Family, Finishing, Head};
+use crate::{card, tips};
 use deck_service::gateway::running::RunningSnapshot;
 use deck_service::status::TabStatus;
 
@@ -1080,9 +1082,9 @@ fn group_header(
         badge: badge_rect,
     };
 
+    let (name, hint) = header_text(spec);
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        let (name, hint) = header_text(spec);
         if theme::flat() {
             paint_header_neutral(p, pal, spec, (&name, &hint), &geom, open_t, &hover);
         } else {
@@ -1090,14 +1092,8 @@ fn group_header(
         }
         paint_header_extras(p, pal, &geom, &hover);
     }
-    let resp = resp
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_ui(|ui| {
-            ui.label(group.cwd.display().to_string());
-            if let Some(w) = &group.worktree {
-                ui.weak(format!("Worktree of {}", w.primary.display()));
-            }
-        });
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    group_hover(&resp, spec, &name, open_t);
     for (btn, tip) in [
         (&Some(plus.clone()), "New omp session in this project"),
         (&wt_btn, "New session in a new git worktree"),
@@ -1138,6 +1134,47 @@ fn group_header(
     }
     let toggle = resp.clicked() && !over(&wt_btn) && !over(&badge_btn) && !plus.hovered();
     HeaderResult { resp, toggle }
+}
+
+/// Hover card of a project header: folder, worktree branch and primary checkout, session count.
+fn group_hover(resp: &egui::Response, spec: &HeaderSpec<'_>, name: &str, open_t: f32) {
+    const KEY_W: f32 = 100.0;
+    let group = spec.group;
+    let mut head = card::Header::new(header_icon(spec.look, open_t), name);
+    if spec.look == Look::Removed {
+        head = head.subtitle("Worktree removed by OmpDeck");
+    } else if matches!(spec.look, Look::Worktree { finishing: true }) {
+        head = head.subtitle("Finishing: waiting for the agent to merge");
+    }
+    card::hover(
+        resp,
+        340.0,
+        false,
+        &head,
+        |ui| {
+            let n = group.sessions.len();
+            let text = if n == 1 {
+                "1 session".to_owned()
+            } else {
+                format!("{n} sessions")
+            };
+            badge::show(ui, None, &text, Hue::Amber, tips::VALUE);
+        },
+        |ui| {
+            card::kv(ui, KEY_W, "Folder", |ui| tips::path(ui, &group.cwd));
+            if let Some(w) = &group.worktree {
+                card::kv(ui, KEY_W, "Branch", |ui| {
+                    let branch = w.branch.as_deref().unwrap_or("detached HEAD");
+                    badge::show(ui, Some(ICON_GIT_BRANCH), branch, Hue::Blue, tips::VALUE);
+                });
+                card::kv(ui, KEY_W, "Worktree of", |ui| tips::path(ui, &w.primary));
+            }
+            card::footer_hints(
+                ui,
+                &[("click", "fold / unfold"), ("right-click", "actions")],
+            );
+        },
+    );
 }
 
 /// Name (medium) and hint (faint) on one line, cut at `max_width`.
@@ -1545,17 +1582,8 @@ fn open_tab_row(
         }
     }
     let close = close.on_hover_text("Close tab");
-    let resp = resp
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_ui(|ui| {
-            ui.label(label);
-            if let Some(hint) = status.hint() {
-                ui.weak(hint);
-            }
-            if let Some(t) = tab.term() {
-                ui.weak(t.cwd.display().to_string());
-            }
-        });
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    tabs::hover_card(&resp, pal, tab, label, status);
     if close.clicked() || resp.middle_clicked() {
         out.actions.push(SidebarAction::CloseTab(i));
     } else if resp.clicked() {
@@ -1631,7 +1659,8 @@ fn session_row(
             let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.5));
             let mut job = LayoutJob::simple_singleline(
                 entry.label().to_owned(),
-                crate::theme::font(13.5),
+                // One step below the project header's 14 px name.
+                crate::theme::font(13.0),
                 color,
             );
             job.wrap.max_width = (chip.left() - pill.left() - 32.0 - 8.0).max(10.0);
@@ -1666,15 +1695,41 @@ fn session_row(
     theme::context_menu(&resp, 230.0, |ui| {
         session_menu(ui, entry, running, true, &env, out)
     });
-    resp.on_hover_ui(|ui| {
-        ui.label(entry.label());
-        if let Some(hint) = live.and_then(TabStatus::hint) {
-            ui.weak(hint);
-        }
-        ui.weak(format!("id: {}", entry.id));
-        ui.weak(format!("cwd: {}", entry.cwd.display()));
-        ui.weak(format!("file: {}", entry.path.display()));
-    });
+    const KEY_W: f32 = 76.0;
+    let tone = live.map_or(Color32::TRANSPARENT, |s| tips::status_tone(pal, s));
+    let mut head = card::Header::new(ICON_MESSAGES_SQUARE, entry.label()).tone(tone);
+    if let Some(hint) = live.and_then(TabStatus::hint) {
+        head = head.subtitle(hint);
+    }
+    card::hover(
+        &resp,
+        340.0,
+        false,
+        &head,
+        |ui| {
+            if busy {
+                badge::show(ui, None, "working on file", Hue::Blue, tips::VALUE);
+            } else if let Some(s) = live {
+                tips::status_badge(ui, s, None);
+            } else if running {
+                badge::show(ui, None, "running", Hue::Green, tips::VALUE);
+            }
+        },
+        |ui| {
+            card::kv(ui, KEY_W, "Id", |ui| tips::id_badge(ui, &entry.id));
+            card::kv(ui, KEY_W, "Folder", |ui| tips::path(ui, &entry.cwd));
+            card::kv(ui, KEY_W, "File", |ui| tips::path(ui, &entry.path));
+            card::kv(ui, KEY_W, "Updated", |ui| {
+                let ago = if age_text == "now" {
+                    "just now".to_owned()
+                } else {
+                    format!("{age_text} ago")
+                };
+                badge::show(ui, Some(ICON_HISTORY), &ago, Hue::Amber, tips::VALUE);
+            });
+            card::footer_hints(ui, &[("click", "open"), ("right-click", "actions")]);
+        },
+    );
 }
 
 /// Neutral session row: status dot at the left, age at the right (background: [`paint_row_bg`]).
@@ -1700,7 +1755,8 @@ fn paint_row_neutral(
     let age = p.layout_no_wrap(age_text.to_owned(), crate::theme::font(11.0), pal.weak);
     let age_x = pill.right() - 10.0 - age.size().x;
     let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.6));
-    let mut job = LayoutJob::simple_singleline(label.to_owned(), crate::theme::font(13.0), color);
+    // One step below the project header's 13 px name.
+    let mut job = LayoutJob::simple_singleline(label.to_owned(), crate::theme::font(12.0), color);
     job.wrap.max_width = (age_x - pill.left() - 28.0 - 8.0).max(10.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;

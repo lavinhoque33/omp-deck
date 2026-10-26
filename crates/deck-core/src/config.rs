@@ -59,6 +59,7 @@ pub fn parse_config(bytes: &[u8]) -> Result<AppConfig, serde_json::Error> {
     }
     let mut cfg: AppConfig = serde_json::from_value(value)?;
     cfg.plain_folder_paths();
+    cfg.ui_scale = clamp_ui_scale(cfg.ui_scale);
     Ok(cfg)
 }
 
@@ -75,6 +76,11 @@ pub struct AppConfig {
     /// Style-set version this file was written with (see [`STYLE_REV`]).
     pub style_rev: u32,
     pub density: Density,
+    /// Typeface of the chrome's UI text (`Auto` = the style's own font).
+    pub ui_font: UiFont,
+    /// Scale of the whole app (egui zoom: 1.0 = 100 %). The terminal compensates so its own
+    /// font size stays absolute.
+    pub ui_scale: f32,
     /// false → OmpDeck draws its own title bar; true → the window manager's frame.
     pub native_decorations: bool,
     /// Run `omp update --check` at startup and every 6 h.
@@ -216,6 +222,8 @@ impl Default for AppConfig {
             style: UiStyle::default(),
             style_rev: STYLE_REV,
             density: Density::default(),
+            ui_font: UiFont::default(),
+            ui_scale: 1.0,
             native_decorations: false,
             check_updates: true,
             favorite_models: Vec::new(),
@@ -330,6 +338,19 @@ pub enum Theme {
 /// Version of the style set; configs saved before it existed are migrated in `parse_config`.
 pub const STYLE_REV: u32 = 1;
 
+/// Smallest and largest [`AppConfig::ui_scale`] (80 %–160 %).
+pub const MIN_UI_SCALE: f32 = 0.8;
+pub const MAX_UI_SCALE: f32 = 1.6;
+
+/// `scale` limited to [`MIN_UI_SCALE`]..=[`MAX_UI_SCALE`]; non-finite values mean 100 %.
+pub fn clamp_ui_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)
+    } else {
+        1.0
+    }
+}
+
 /// Visual style axis (second to light/dark `Theme`).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum UiStyle {
@@ -435,6 +456,134 @@ pub enum Density {
     #[default]
     Compact,
     Comfortable,
+}
+
+/// Typeface of the chrome's UI text. `Auto` keeps each style's own font (JetBrains Mono for
+/// the flat styles, the system sans for Neon, monospace for Phosphor); `System` is the platform
+/// UI sans; every other variant is a bundled face used for every style.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum UiFont {
+    #[default]
+    Auto,
+    System,
+    #[serde(rename = "jetbrains-mono")]
+    JetBrainsMono,
+    Geist,
+    Inter,
+    IbmPlexSans,
+    Manrope,
+    SpaceGrotesk,
+    PlusJakartaSans,
+    Onest,
+    GeistMono,
+    RedHatMono,
+    MartianMono,
+    Outfit,
+    Sora,
+    BricolageGrotesque,
+    Lexend,
+    Figtree,
+    Urbanist,
+    VictorMono,
+}
+
+/// Grouping of a [`UiFont`] in the picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiFontKind {
+    /// `Auto` and `System`: not one fixed bundled face.
+    Default,
+    Sans,
+    Mono,
+}
+
+impl UiFont {
+    /// Every choice in picker order: the defaults, then sans faces, then mono faces.
+    pub const ALL: [UiFont; 20] = [
+        UiFont::Auto,
+        UiFont::System,
+        UiFont::Inter,
+        UiFont::Geist,
+        UiFont::IbmPlexSans,
+        UiFont::Manrope,
+        UiFont::SpaceGrotesk,
+        UiFont::PlusJakartaSans,
+        UiFont::Onest,
+        UiFont::Outfit,
+        UiFont::Sora,
+        UiFont::BricolageGrotesque,
+        UiFont::Lexend,
+        UiFont::Figtree,
+        UiFont::Urbanist,
+        UiFont::JetBrainsMono,
+        UiFont::GeistMono,
+        UiFont::RedHatMono,
+        UiFont::MartianMono,
+        UiFont::VictorMono,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UiFont::Auto => "Style default",
+            UiFont::System => "System",
+            UiFont::JetBrainsMono => "JetBrains Mono",
+            UiFont::Geist => "Geist",
+            UiFont::Inter => "Inter",
+            UiFont::IbmPlexSans => "IBM Plex Sans",
+            UiFont::Manrope => "Manrope",
+            UiFont::SpaceGrotesk => "Space Grotesk",
+            UiFont::PlusJakartaSans => "Plus Jakarta Sans",
+            UiFont::Onest => "Onest",
+            UiFont::GeistMono => "Geist Mono",
+            UiFont::RedHatMono => "Red Hat Mono",
+            UiFont::MartianMono => "Martian Mono",
+            UiFont::Outfit => "Outfit",
+            UiFont::Sora => "Sora",
+            UiFont::BricolageGrotesque => "Bricolage Grotesque",
+            UiFont::Lexend => "Lexend",
+            UiFont::Figtree => "Figtree",
+            UiFont::Urbanist => "Urbanist",
+            UiFont::VictorMono => "Victor Mono",
+        }
+    }
+
+    /// Stable kebab-case identifier (the on-disk value).
+    pub fn key(self) -> &'static str {
+        match self {
+            UiFont::Auto => "auto",
+            UiFont::System => "system",
+            UiFont::JetBrainsMono => "jetbrains-mono",
+            UiFont::Geist => "geist",
+            UiFont::Inter => "inter",
+            UiFont::IbmPlexSans => "ibm-plex-sans",
+            UiFont::Manrope => "manrope",
+            UiFont::SpaceGrotesk => "space-grotesk",
+            UiFont::PlusJakartaSans => "plus-jakarta-sans",
+            UiFont::Onest => "onest",
+            UiFont::GeistMono => "geist-mono",
+            UiFont::RedHatMono => "red-hat-mono",
+            UiFont::MartianMono => "martian-mono",
+            UiFont::Outfit => "outfit",
+            UiFont::Sora => "sora",
+            UiFont::BricolageGrotesque => "bricolage-grotesque",
+            UiFont::Lexend => "lexend",
+            UiFont::Figtree => "figtree",
+            UiFont::Urbanist => "urbanist",
+            UiFont::VictorMono => "victor-mono",
+        }
+    }
+
+    pub fn kind(self) -> UiFontKind {
+        match self {
+            UiFont::Auto | UiFont::System => UiFontKind::Default,
+            UiFont::JetBrainsMono
+            | UiFont::GeistMono
+            | UiFont::RedHatMono
+            | UiFont::MartianMono
+            | UiFont::VictorMono => UiFontKind::Mono,
+            _ => UiFontKind::Sans,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -753,6 +902,23 @@ mod tests {
     }
 
     #[test]
+    fn ui_font_defaults_to_auto_and_roundtrips_under_its_key() {
+        let old =
+            parse_config(br#"{"style": "Neon", "style_rev": 1, "density": "Compact"}"#).unwrap();
+        assert_eq!(old.ui_font, UiFont::Auto);
+        for font in UiFont::ALL {
+            let cfg = AppConfig {
+                ui_font: font,
+                ..AppConfig::default()
+            };
+            let json = serde_json::to_value(&cfg).unwrap();
+            assert_eq!(json["ui_font"], font.key());
+            let back = parse_config(json.to_string().as_bytes()).unwrap();
+            assert_eq!(back.ui_font, font);
+        }
+    }
+
+    #[test]
     fn toggle_favorite_twice_restores() {
         let mut cfg = AppConfig::default();
         assert!(cfg.toggle_favorite("a/x"));
@@ -971,6 +1137,31 @@ mod tests {
         let p = dir.path().join("state.json");
         fs::write(&p, json).unwrap();
         AppConfig::load_from(&p)
+    }
+
+    #[test]
+    fn ui_scale_defaults_to_100_percent_and_clamps_on_load() {
+        assert_eq!(load_str("{}").ui_scale, 1.0);
+        assert_eq!(load_str(r#"{"font_size": 12.0}"#).ui_scale, 1.0);
+        assert_eq!(load_str(r#"{"ui_scale": 1.25}"#).ui_scale, 1.25);
+        assert_eq!(load_str(r#"{"ui_scale": 3.0}"#).ui_scale, MAX_UI_SCALE);
+        assert_eq!(load_str(r#"{"ui_scale": 0.1}"#).ui_scale, MIN_UI_SCALE);
+        assert_eq!(clamp_ui_scale(f32::NAN), 1.0);
+        assert_eq!(clamp_ui_scale(f32::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn ui_scale_round_trips() {
+        let c = AppConfig {
+            ui_scale: 1.15,
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains(r#""ui_scale":1.15"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<AppConfig>(&json).unwrap().ui_scale,
+            1.15
+        );
     }
 
     #[test]

@@ -17,11 +17,13 @@ use egui::{
     ViewportCommand, pos2, vec2,
 };
 
+use crate::badge::{self, Hue};
 use crate::notify_panel;
 use crate::tabs::{self, TabAction, TabBarInput};
 use crate::theme::{self, Palette};
 use crate::update::{Channel, UpdateState, status_line};
 use crate::widgets::{icon_button, icon_text, menu_item, paint_icon, win_button};
+use crate::{card, tips};
 
 const EDGE: f32 = 6.0;
 const CORNER: f32 = 10.0;
@@ -139,6 +141,7 @@ struct StripGalley {
     max_w: f32,
     ppp: f32,
     color: egui::Color32,
+    font: egui::FontId,
     galley: std::sync::Arc<egui::Galley>,
 }
 
@@ -152,19 +155,17 @@ fn strip_galley(
 ) -> std::sync::Arc<egui::Galley> {
     let id = egui::Id::unique("titlestrip-galley");
     let ppp = ui.ctx().pixels_per_point();
+    let font = crate::theme::font(STRIP_FONT_SIZE);
     if let Some(c) = ui.data(|d| d.get_temp::<StripGalley>(id))
         && c.title == text
         && c.max_w == max_w
         && c.ppp == ppp
         && c.color == color
+        && c.font == font
     {
         return c.galley;
     }
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        text.to_owned(),
-        crate::theme::font(STRIP_FONT_SIZE),
-        color,
-    );
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font.clone(), color);
     job.wrap.max_width = max_w;
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -177,6 +178,7 @@ fn strip_galley(
                 max_w,
                 ppp,
                 color,
+                font,
                 galley: galley.clone(),
             },
         );
@@ -262,14 +264,25 @@ fn title_strip(ui: &mut egui::Ui, input: &BarInput<'_>) {
             let pos = rect.center() - galley.size() / 2.0;
             ui.painter().galley(pos, galley, pal.text_strong);
             if strip.cwd.is_some() || strip.session.is_some() {
-                drag.on_hover_ui(|ui| {
-                    if let Some(c) = strip.cwd {
-                        ui.label(format!("cwd: {}", c.display()));
-                    }
-                    if let Some(s) = strip.session {
-                        ui.label(format!("session: {}", s.display()));
-                    }
-                });
+                card::hover(
+                    &drag,
+                    360.0,
+                    false,
+                    &card::Header::new(ICON_TERMINAL, text).subtitle("Active tab"),
+                    |_| {},
+                    |ui| {
+                        if let Some(c) = strip.cwd {
+                            card::kv(ui, 76.0, "Folder", |ui| tips::path(ui, c));
+                        }
+                        if let Some(s) = strip.session {
+                            card::kv(ui, 76.0, "Session", |ui| tips::path(ui, s));
+                        }
+                        card::footer_hints(
+                            ui,
+                            &[("drag", "move"), ("double-click", "maximize / restore")],
+                        );
+                    },
+                );
             }
         });
 }
@@ -349,13 +362,14 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                         action = Some(BarAction::Inbox(a));
                     }
                     if let Some(o) = &input.omp
-                        && let Some((_, latest)) = o.available
+                        && let Some((current, latest)) = o.available
                     {
                         ui.add_space(4.0);
                         let badge = update_badge(
                             ui,
                             &format!("Update {latest}"),
-                            "An omp update is available",
+                            "omp update available",
+                            (current, latest),
                         );
                         if let Some(a) = update_popover(&badge, o) {
                             action = Some(a);
@@ -363,7 +377,12 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                     }
                     if let (Some(p), Some(label)) = (&input.app_update, &pill_label) {
                         ui.add_space(4.0);
-                        let badge = update_badge(ui, label, &p.tip());
+                        let badge = update_badge(
+                            ui,
+                            label,
+                            "OmpDeck update available",
+                            (crate::app_update::CURRENT, &p.release.version),
+                        );
                         if let Some(a) = theme::dropdown_menu(&badge, 300.0, |ui| {
                             crate::app_update::popover(ui, p)
                         })
@@ -629,8 +648,14 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
     action
 }
 
-/// Pill-shaped accent-gradient badge announcing an available update.
-fn update_badge(ui: &mut egui::Ui, label: &str, tip: &str) -> egui::Response {
+/// Pill-shaped accent-gradient badge announcing an available update; its hover card names the
+/// installed and the available version.
+fn update_badge(
+    ui: &mut egui::Ui,
+    label: &str,
+    title: &str,
+    (current, latest): (&str, &str),
+) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let galley = badge_galley(ui, label);
     let (rect, resp) = ui.allocate_exact_size(
@@ -684,8 +709,24 @@ fn update_badge(ui: &mut egui::Ui, label: &str, tip: &str) -> egui::Response {
         galley,
         label_fg,
     );
-    resp.on_hover_text(tip)
-        .on_hover_cursor(CursorIcon::PointingHand)
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    card::hover(
+        &resp,
+        260.0,
+        false,
+        &card::Header::new(ICON_DOWNLOAD, title),
+        |_| {},
+        |ui| {
+            card::kv(ui, 84.0, "Installed", |ui| {
+                badge::show(ui, None, current, Hue::Amber, tips::VALUE);
+            });
+            card::kv(ui, 84.0, "Available", |ui| {
+                badge::show(ui, Some(ICON_DOWNLOAD), latest, Hue::Green, tips::VALUE);
+            });
+            card::footer_hints(ui, &[("click", "update options")]);
+        },
+    );
+    resp
 }
 
 fn badge_galley(ui: &egui::Ui, label: &str) -> std::sync::Arc<egui::Galley> {
@@ -953,5 +994,124 @@ mod tests {
         );
         assert_eq!(window_title(None, None), "OmpDeck");
         assert_eq!(window_title(Some(""), Some("work")), "OmpDeck — work");
+    }
+
+    /// Every text and glyph of the tab row (logo, tab icons and titles, ✕, the update badge, the
+    /// bell, settings and menu buttons) is vertically centred on the row, in every density.
+    fn assert_row_centered(style: deck_core::config::UiStyle, density: deck_core::config::Density) {
+        use std::collections::{HashMap, HashSet};
+        let ctx = Context::default();
+        crate::ui_fonts::install(&ctx, crate::ui_fonts::UiFonts::none());
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .textures_delta
+            .clear();
+        crate::ui_fonts::finalize(&ctx);
+        let font = deck_core::config::UiFont::Auto;
+        let compact = density == deck_core::config::Density::Compact;
+        let tabs = [crate::tabs::Tab::Settings, crate::tabs::Tab::Settings];
+        let labels = HashMap::new();
+        let busy = HashSet::new();
+        let state = UpdateState::default();
+        let input = BarInput {
+            tabs: TabBarInput {
+                tabs: &tabs,
+                labels: &labels,
+                active: 0,
+                scroll_to_active: false,
+                menu: crate::sidebar::MenuEnv {
+                    groups: &[],
+                    omp_available: true,
+                    can_stop: true,
+                    busy: &busy,
+                    drive: crate::sidebar::DriveMenu::Hidden,
+                    live_tabs: &[],
+                },
+                modal_open: false,
+                shown: &[],
+                dashboard: false,
+            },
+            csd: false,
+            maximized: false,
+            settings_active: true,
+            can_reopen: false,
+            font_size: 13.0,
+            theme: Theme::Dark,
+            dark_only: None,
+            native_decorations: true,
+            strip: StripInput {
+                title: "",
+                cwd: None,
+                session: None,
+            },
+            omp: Some(OmpBar {
+                version: Some("1.0.0"),
+                state: &state,
+                available: Some(("1.0.0", "1.1.0")),
+                channel: Channel::Stable,
+            }),
+            app_update: None,
+            notifications: notify_panel::PanelInput {
+                entries: &[],
+                badge: None,
+                warn: false,
+                now: std::time::SystemTime::UNIX_EPOCH,
+            },
+        };
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                pos2(0.0, 0.0),
+                vec2(1200.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        // The style is process-global and other tests switch it too: a frame counts only when
+        // the style and density were ours from before the first pass to after the last.
+        let ours = || theme::style() == style && theme::compact() == compact;
+        for _ in 0..50 {
+            theme::apply(&ctx, style, density, font, true);
+            let row_mid = tabs::tab_hit_h() / 2.0;
+            let mut shapes = Vec::new();
+            for _ in 0..3 {
+                let mut out = ctx.run_ui(raw.clone(), |ui| {
+                    show(ui, &input);
+                });
+                out.textures_delta.clear();
+                shapes = out.shapes;
+            }
+            if !ours() {
+                continue;
+            }
+            let mut texts = 0;
+            for cs in &shapes {
+                if let egui::Shape::Text(t) = &cs.shape {
+                    let y = t.galley.rect.translate(t.pos.to_vec2()).center().y;
+                    let off = y - row_mid;
+                    assert!(
+                        off.abs() <= 0.5,
+                        "{style:?}/{density:?}: {:?} off by {off}",
+                        t.galley.text()
+                    );
+                    texts += 1;
+                }
+            }
+            // Logo glyph + name, 2 × (icon, title), the active ✕, badge icon + label, bell,
+            // gear, menu.
+            assert!(
+                texts >= 11,
+                "{style:?}/{density:?}: row painted {texts} texts"
+            );
+            return;
+        }
+        panic!("{style:?}/{density:?}: the global style kept changing under the test");
+    }
+
+    #[test]
+    fn tab_row_content_is_vertically_centered() {
+        use deck_core::config::{Density, UiStyle};
+        for style in UiStyle::ALL {
+            for density in [Density::Compact, Density::Comfortable] {
+                assert_row_centered(style, density);
+            }
+        }
     }
 }

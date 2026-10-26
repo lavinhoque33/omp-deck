@@ -15,7 +15,8 @@ use crate::icons::{
 };
 use deck_core::agents::AgentsTarget;
 use deck_core::config::{
-    AppConfig, Density, FolderTabs, GatewayMode, TabState, Theme, UiStyle, WindowGeometry,
+    AppConfig, Density, FolderTabs, GatewayMode, TabState, Theme, UiFont, UiStyle, WindowGeometry,
+    clamp_ui_scale,
 };
 use deck_core::mux::{BackendChoice, MuxKind, new_session_name, session_name_for};
 use deck_core::omp::{DeleteTarget, MoveKind, MoveOutcome, Setting, UpdateKind, fork_argv};
@@ -305,7 +306,8 @@ impl TabsProj {
 #[derive(Clone, PartialEq)]
 struct Applied {
     rows: Vec<deck_core::config::SyncRow>,
-    look: (Theme, UiStyle, Density),
+    look: (Theme, UiStyle, Density, UiFont),
+    ui_scale: f32,
 }
 
 pub struct App {
@@ -351,6 +353,10 @@ pub struct App {
     scope_gen: u64,
     /// Process working directory at startup (base of relative typed paths).
     start_dir: PathBuf,
+    /// Zoom factor the current input's viewport rects are expressed with. It lags the active
+    /// zoom by the pass in which that changed (egui applies the new zoom after the input was
+    /// gathered), so window geometry is converted with it, not with `Context::zoom_factor`.
+    viewport_zoom: f32,
 
     pending_restore: Option<(Vec<TabState>, Option<usize>)>,
     focus_pending: bool,
@@ -496,7 +502,9 @@ impl App {
             cfg.font_size = DEFAULT_FONT;
         }
         cfg.font_size = cfg.font_size.clamp(MIN_FONT, MAX_FONT);
-        theme::apply(&ctx, cfg.style, cfg.density, cfg.dark());
+        cfg.ui_scale = clamp_ui_scale(cfg.ui_scale);
+        ctx.set_zoom_factor(cfg.ui_scale);
+        theme::apply(&ctx, cfg.style, cfg.density, cfg.ui_font, cfg.dark());
 
         let root = deck_core::sessions::SessionsRoot::at(profile.sessions_root.clone());
         let gw = Gw::start(
@@ -568,6 +576,7 @@ impl App {
             picking_scope: false,
             scope_gen: 0,
             start_dir,
+            viewport_zoom: 1.0,
             pending_restore,
             split: Split::default(),
             restore_split,
@@ -1243,9 +1252,35 @@ impl App {
         }
     }
 
-    /// Re-applies theme × style × density to egui and every open terminal.
+    /// App-wide scale (egui zoom, 1.0 = 100 %): text, icons and fixed chrome all scale together.
+    /// The terminal compensates via [`Self::terminal_font_size`], so its size stays absolute.
+    fn set_ui_scale(&mut self, scale: f32) {
+        let scale = clamp_ui_scale((scale * 100.0).round() / 100.0);
+        if (scale - self.cfg.ui_scale).abs() > f32::EPSILON {
+            self.cfg.ui_scale = scale;
+            self.ctx.set_zoom_factor(scale);
+            self.dirty = true;
+        }
+    }
+
+    /// Points handed to the terminal view: the chosen terminal font size compensated for the app
+    /// scale, so the grid's on-screen size depends only on "Terminal font size". The scale egui
+    /// renders this pass with is used, not [`AppConfig::ui_scale`], so the frame in which a new
+    /// scale was set does not compute metrics against the old `pixels_per_point` (a spurious
+    /// resize round trip).
+    fn terminal_font_size(&self) -> f32 {
+        self.cfg.font_size / self.ctx.zoom_factor()
+    }
+
+    /// Re-applies theme × style × density × UI font to egui and every open terminal.
     fn restyle(&mut self) {
-        theme::apply(&self.ctx, self.cfg.style, self.cfg.density, self.cfg.dark());
+        theme::apply(
+            &self.ctx,
+            self.cfg.style,
+            self.cfg.density,
+            self.cfg.ui_font,
+            self.cfg.dark(),
+        );
         let tt = deck_service::gateway::terminal_theme(self.cfg.theme, self.cfg.style);
         for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
             tab.terminal_mut().set_theme(tt);
@@ -1279,6 +1314,13 @@ impl App {
     fn set_density(&mut self, density: Density) {
         if self.cfg.density != density {
             self.cfg.density = density;
+            self.restyle();
+        }
+    }
+
+    fn set_ui_font(&mut self, font: UiFont) {
+        if self.cfg.ui_font != font {
+            self.cfg.ui_font = font;
             self.restyle();
         }
     }
@@ -1857,9 +1899,11 @@ impl App {
                     font_size: self.cfg.font_size,
                     font_range: (MIN_FONT, MAX_FONT),
                     font_default: DEFAULT_FONT,
+                    ui_scale: self.cfg.ui_scale,
                     theme: self.cfg.theme,
                     style: self.cfg.style,
                     density: self.cfg.density,
+                    ui_font: self.cfg.ui_font,
                     native_decorations: self.cfg.native_decorations,
                     omp_found: self.omp_found(),
                     omp_version: self.update.version.as_deref(),
@@ -1890,9 +1934,11 @@ impl App {
                 for a in actions {
                     match a {
                         SettingsAction::FontSize(s) => self.set_font_size(s),
+                        SettingsAction::UiScale(s) => self.set_ui_scale(s),
                         SettingsAction::Theme(t) => self.set_theme(t),
                         SettingsAction::Style(v) => self.set_style(v),
                         SettingsAction::Density(v) => self.set_density(v),
+                        SettingsAction::UiFont(v) => self.set_ui_font(v),
                         SettingsAction::SessionBackend(v) => self.set_session_backend(v),
                         SettingsAction::NativeDecorations(v) => self.set_native_decorations(v),
                         SettingsAction::SetCheckUpdates(v) => {
@@ -1927,6 +1973,7 @@ impl App {
         let mut open_url = None;
         let mut copy_link = None;
         let pal = Palette::of_ui(ui);
+        let font_size = self.terminal_font_size();
         theme::skin::central(ui, pal, true, |ui| {
             let Some(Tab::Terminal(tab)) = self.tabs.get_mut(self.active) else {
                 return;
@@ -1942,7 +1989,7 @@ impl App {
             let uid = tab.uid;
             let out = TerminalView::new(tab.terminal_mut())
                 .id_salt(uid)
-                .font_size(self.cfg.font_size)
+                .font_size(font_size)
                 .show(ui);
             ctx.options_mut(|o| o.input_options.surrender_focus_on = surrender);
             if self.focus_pending {
@@ -2038,6 +2085,9 @@ impl App {
     // ---------------------------------------------------------------- housekeeping
 
     fn track_geometry(&mut self, ctx: &egui::Context) {
+        // egui gathered the viewport rects before this pass applied a queued zoom, so they are
+        // in the points of `viewport_zoom`; `viewport_rect()` is already in this pass's points.
+        let viewport_zoom = self.viewport_zoom;
         let (inner, outer, size, maximized) = ctx.input(|i| {
             let v = i.viewport();
             (
@@ -2047,7 +2097,17 @@ impl App {
                 v.maximized.unwrap_or(false),
             )
         });
-        let g = update_geometry(self.cfg.window, inner, outer, size, maximized);
+        let inner = inner.map(|r| native_points(r, viewport_zoom));
+        let outer = outer.map(|r| native_points(r, viewport_zoom));
+        let g = update_geometry(
+            self.cfg.window,
+            inner,
+            outer,
+            size * ctx.zoom_factor(),
+            maximized,
+        );
+        // Next frame's viewport rects are gathered with the zoom this pass settled on.
+        self.viewport_zoom = ctx.zoom_factor();
         if self.cfg.window != Some(g) {
             self.cfg.window = Some(g);
             self.dirty = true;
@@ -2217,7 +2277,13 @@ impl App {
     /// The settings whose change needs more than a new value in `cfg`.
     fn applied_settings(&self) -> Applied {
         Applied {
-            look: (self.cfg.theme, self.cfg.style, self.cfg.density),
+            look: (
+                self.cfg.theme,
+                self.cfg.style,
+                self.cfg.density,
+                self.cfg.ui_font,
+            ),
+            ui_scale: self.cfg.ui_scale,
             rows: self.cfg.project_sync.clone(),
         }
     }
@@ -2226,14 +2292,18 @@ impl App {
     /// adoption, as their settings-page handlers would: restyle, and the project-sync rows.
     /// Everything else (backend choice, schedules) is applied by the gateway from the commit.
     fn reconcile_settings(&mut self, before: Applied) {
-        // A committed font size is trusted no further than the one typed in the settings page.
+        // A committed font size or app scale is trusted no further than the settings page's.
         if !self.cfg.font_size.is_finite() {
             self.cfg.font_size = DEFAULT_FONT;
         }
         self.cfg.font_size = self.cfg.font_size.clamp(MIN_FONT, MAX_FONT);
+        self.cfg.ui_scale = clamp_ui_scale(self.cfg.ui_scale);
         let now = self.applied_settings();
         if before.look != now.look {
             self.restyle();
+        }
+        if before.ui_scale != now.ui_scale {
+            self.ctx.set_zoom_factor(now.ui_scale);
         }
         if before.rows != now.rows {
             self.reconcile_sync_rows(&before.rows);
@@ -3205,6 +3275,13 @@ fn write_png(path: &Path, img: &egui::ColorImage) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Viewport rects reach egui in egui points (physical / (zoom × native scale)); stored geometry
+/// is in native logical points, so a non-1.0 app scale does not shrink or grow the restored
+/// window.
+fn native_points(r: egui::Rect, zoom: f32) -> egui::Rect {
+    egui::Rect::from_min_size(r.min * zoom, r.size() * zoom)
+}
+
 /// Pure geometry update. `inner`/`outer` are absent on Wayland, where only the viewport
 /// `size` is known; position then stays as previously stored.
 fn update_geometry(
@@ -3251,7 +3328,7 @@ pub(crate) fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TabsProj, WindowGeometry, is_openable_url, update_geometry};
+    use super::{TabsProj, WindowGeometry, is_openable_url, native_points, update_geometry};
     use deck_core::config::{AppConfig, FolderTabs};
     use deck_service::settings::Field;
     use std::path::PathBuf;
@@ -3354,6 +3431,38 @@ mod tests {
         assert_eq!((g2.width, g2.height), (1000.0, 600.0));
         let g3 = update_geometry(Some(g2), None, None, egui::vec2(1920.0, 1080.0), true);
         assert_eq!((g3.width, g3.height, g3.maximized), (1000.0, 600.0, true));
+    }
+
+    #[test]
+    fn window_geometry_is_stored_independent_of_the_app_zoom() {
+        // One 1280×800-pixel window reaches egui as fewer points as the zoom grows; both
+        // conversions store the same native size and position.
+        let inner_100 =
+            egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(1280.0, 800.0));
+        let inner_130 = egui::Rect::from_min_size(
+            egui::pos2(100.0 / 1.3, 50.0 / 1.3),
+            egui::vec2(1280.0 / 1.3, 800.0 / 1.3),
+        );
+        let at_100 = update_geometry(
+            None,
+            Some(native_points(inner_100, 1.0)),
+            Some(native_points(inner_100, 1.0)),
+            egui::Vec2::ZERO,
+            false,
+        );
+        let at_130 = update_geometry(
+            None,
+            Some(native_points(inner_130, 1.3)),
+            Some(native_points(inner_130, 1.3)),
+            egui::Vec2::ZERO,
+            false,
+        );
+        for g in [&at_100, &at_130] {
+            assert!((g.width - 1280.0).abs() < 0.01, "{g:?}");
+            assert!((g.height - 800.0).abs() < 0.01, "{g:?}");
+            assert!((g.x.unwrap() - 100.0).abs() < 0.01, "{g:?}");
+            assert!((g.y.unwrap() - 50.0).abs() < 0.01, "{g:?}");
+        }
     }
 
     #[test]

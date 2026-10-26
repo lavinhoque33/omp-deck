@@ -370,23 +370,19 @@ impl PaletteState {
         let modal = Modal::new(self.id)
             .backdrop_color(theme::backdrop(dark))
             .area(Modal::default_area(self.id).anchor(Align2::CENTER_TOP, vec2(0.0, 72.0)))
-            .frame(
-                Frame::popup(&ctx.global_style())
-                    .fill(if theme::flat() {
-                        ctx.global_style().visuals.window_fill
-                    } else {
-                        pal.raised
-                    })
-                    .stroke(Stroke::new(1.0, pal.stroke))
-                    .corner_radius(theme::popup_radius())
-                    .inner_margin(Margin::same(10))
-                    .shadow(theme::modal_shadow(dark)),
-            )
+            .frame(Frame::NONE.inner_margin(Margin::same(10)))
             .show(ctx, |ui| {
-                ui.set_width(width);
-                if let Some(t) = self.body(ui, pal) {
-                    outcome = Outcome::Run(t);
-                }
+                let fill = if theme::flat() {
+                    ctx.global_style().visuals.window_fill
+                } else {
+                    pal.raised
+                };
+                crate::card::chrome(ui, Margin::same(10), fill, |ui| {
+                    ui.set_width(width);
+                    if let Some(t) = self.body(ui, pal) {
+                        outcome = Outcome::Run(t);
+                    }
+                });
             });
         // After the body ran: keys typed in the same frame as Enter have updated the query and ranking.
         if enter
@@ -420,7 +416,13 @@ impl PaletteState {
         });
         ui.add_space(6.0);
         let (sep, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-        ui.painter().rect_filled(sep, 0, pal.stroke);
+        crate::card::header_rule(
+            ui,
+            sep.left(),
+            sep.right(),
+            sep.center().y,
+            Color32::TRANSPARENT,
+        );
         ui.add_space(4.0);
 
         // The query changed this frame: rank before drawing so the list never lags a keystroke.

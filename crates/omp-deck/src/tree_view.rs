@@ -12,6 +12,7 @@ use crate::icons::{
     ICON_CORNER_DOWN_RIGHT, ICON_CROSSHAIR, ICON_FOLD_VERTICAL, ICON_GIT_FORK, ICON_KEY_ROUND,
     ICON_LIST_TREE, ICON_SCROLL_TEXT, ICON_SPARKLES, ICON_USER, ICON_WRENCH, ICON_X,
 };
+use deck_core::config::UiFont;
 use deck_core::tree::{NodeKind, RecordedCost, SessionTree};
 use egui::Galley;
 use egui::epaint::CubicBezierShape;
@@ -22,6 +23,7 @@ use egui::{
 };
 
 use crate::badge::{Badge, Hue};
+use crate::card;
 use crate::theme::{self, Palette};
 use crate::tree_layout::{self, Filter, Layout, Row, RowClass};
 use crate::widgets::{empty_state, menu_item, paint_icon};
@@ -143,6 +145,7 @@ struct GalleyKey<'a> {
     revision: u64,
     ppp: u32,
     theme: [Color32; 6],
+    font: UiFont,
     tokens: &'a [String],
 }
 
@@ -153,6 +156,7 @@ struct GalleyCache {
     valid: bool,
     revision: u64,
     ppp: u32,
+    font: UiFont,
     theme: [Color32; 6],
     tokens: Vec<String>,
     map: HashMap<(usize, bool, u32), Arc<Galley>>,
@@ -166,6 +170,7 @@ impl GalleyCache {
         if self.valid
             && self.revision == k.revision
             && self.ppp == k.ppp
+            && self.font == k.font
             && self.theme == k.theme
             && self.tokens == k.tokens
         {
@@ -174,6 +179,7 @@ impl GalleyCache {
         self.valid = true;
         self.revision = k.revision;
         self.ppp = k.ppp;
+        self.font = k.font;
         self.theme = k.theme;
         self.tokens = k.tokens.to_vec();
         self.map.clear();
@@ -286,16 +292,11 @@ pub fn show(ctx: &egui::Context, st: &mut TreeState, input: &TreeInput<'_>) -> V
             .clamp(420.0, 1150.0)
             .min(screen.height() - 24.0),
     );
-    let style = ctx.global_style();
-    let frame = Frame::NONE
-        .fill(pal.bar)
-        .stroke(theme::popup_stroke(pal))
-        .corner_radius(theme::popup_radius())
-        .shadow(style.visuals.window_shadow);
+
     egui::Window::new("tree-window")
         .id(Id::unique("tree-window"))
         .title_bar(false)
-        .frame(frame)
+        .frame(Frame::NONE)
         .resizable(true)
         .movable(true)
         .collapsible(false)
@@ -303,7 +304,11 @@ pub fn show(ctx: &egui::Context, st: &mut TreeState, input: &TreeInput<'_>) -> V
         .min_size(vec2(560.0, 360.0))
         .default_size(size)
         .default_pos(screen.center() - size / 2.0)
-        .show(ctx, |ui| body(ui, st, input, &mut out));
+        .show(ctx, |ui| {
+            card::chrome(ui, Margin::ZERO, pal.bar, |ui| {
+                body(ui, st, input, &mut out)
+            });
+        });
     st.search_focused = ctx.memory(|m| m.has_focus(st.search_id));
     out
 }
@@ -584,10 +589,12 @@ fn body(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<Tr
             header(ui, st, input, out);
         });
     let y = ui.cursor().top();
-    ui.painter().hline(
-        ui.max_rect().left()..=ui.max_rect().right(),
+    card::header_rule(
+        ui,
+        ui.max_rect().left(),
+        ui.max_rect().right(),
         y,
-        Stroke::new(1.0, pal.stroke.gamma_multiply(0.9)),
+        Color32::TRANSPARENT,
     );
 
     let Some(tree) = input.tree else {
@@ -630,24 +637,7 @@ fn header(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<
         ui,
         |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-            ui.painter().rect_filled(
-                rect,
-                theme::rad(8, 10),
-                if theme::flat() {
-                    pal.surface
-                } else {
-                    pal.accent.gamma_multiply(0.18)
-                },
-            );
-            paint_icon(
-                ui.painter(),
-                rect.center(),
-                Align2::CENTER_CENTER,
-                ICON_LIST_TREE,
-                19.0,
-                pal.glyph,
-            );
+            card::icon_tile(ui, 30.0, ICON_LIST_TREE, Color32::TRANSPARENT, true);
             ui.label(
                 theme::strong("Session tree")
                     .size(19.0)
@@ -920,6 +910,7 @@ fn list(
             pal.ok,
             pal.accent,
         ],
+        font: crate::theme::ui_font(),
         tokens: dim_hits.map_or(&[], |h| &h.tokens[..]),
     });
 
@@ -976,7 +967,7 @@ fn list(
                     let over_actions =
                         hover_pos.is_some_and(|p| p.x >= rr.right() - 18.0 - ACTIONS_W);
                     if hovered && !over_actions && !resp.context_menu_opened() {
-                        resp.on_hover_ui(|ui| row_tip(ui, tree, &c.layout.rows[r], input.now));
+                        row_tip(&resp, tree, &c.layout.rows[r], input.now);
                     }
                 }
                 st.scratch.push(RowUi {
@@ -1201,57 +1192,85 @@ fn row_menu(
     });
 }
 
-fn row_tip(ui: &mut Ui, tree: &SessionTree, row: &Row, now: i64) {
-    let pal = Palette::of_ui(ui);
+fn row_tip(resp: &egui::Response, tree: &SessionTree, row: &Row, now: i64) {
+    let pal = Palette::of_ctx(&resp.ctx);
     let n = &tree.nodes[row.node];
-    ui.set_max_width(460.0);
-    ui.label(
-        RichText::new(tree_layout::kind_name(&n.kind))
-            .small()
-            .color(class_color(pal, row.class)),
+    let kind = tree_layout::kind_name(&n.kind);
+    let title = {
+        let mut cs = kind.chars();
+        cs.next()
+            .map(|c| c.to_uppercase().chain(cs).collect::<String>())
+            .unwrap_or_default()
+    };
+    let tip_icon = match row.class {
+        RowClass::User => ICON_USER,
+        RowClass::Assistant => ICON_SPARKLES,
+        RowClass::Tool => ICON_WRENCH,
+        RowClass::Compaction => ICON_FOLD_VERTICAL,
+        RowClass::Summary => ICON_SCROLL_TEXT,
+        RowClass::Other => ICON_LIST_TREE,
+    };
+    let head = card::Header::new(tip_icon, &title).tone(class_color(pal, row.class));
+    card::hover(
+        resp,
+        460.0,
+        false,
+        &head,
+        |ui| {
+            if let Some(ts) = row.ts {
+                crate::badge::show(
+                    ui,
+                    None,
+                    &format!("{} ago", tree_layout::age(now, ts)),
+                    Hue::Teal,
+                    11.5,
+                );
+            }
+        },
+        |ui| {
+            const KEY_W: f32 = 112.0;
+            if !n.text.is_empty() {
+                card::kv(ui, KEY_W, "Text", |ui| {
+                    ui.label(RichText::new(&n.text).color(pal.text_strong));
+                });
+            }
+            if let Some(l) = tree.labels.get(&n.id) {
+                card::kv(ui, KEY_W, "Label", |ui| {
+                    crate::badge::show(ui, Some(ICON_BOOKMARK), l, Hue::Amber, 11.5);
+                });
+            }
+            card::kv(ui, KEY_W, "Cost before", |ui| {
+                let hue = if n.cost_before.incomplete {
+                    Hue::Amber
+                } else {
+                    Hue::Green
+                };
+                let amount = format!(
+                    "{}${:.6}",
+                    if n.cost_before.incomplete { "≥" } else { "" },
+                    n.cost_before.total
+                );
+                ui.vertical(|ui| {
+                    crate::badge::show(ui, Some(ICON_COINS), &amount, hue, 11.5);
+                    ui.label(RichText::new("Journal order across all branches; excludes this entry and unrecorded live subagent spend.").color(pal.weak));
+                    if n.cost_before.incomplete {
+                        ui.label(
+                            RichText::new("Some earlier usage could not be read or priced; this is the known subtotal.")
+                                .color(pal.warn),
+                        );
+                    }
+                });
+            });
+            if let Some(ts) = row.ts {
+                card::kv(ui, KEY_W, "Time", |ui| {
+                    ui.label(RichText::new(tree_layout::clock(ts)).color(pal.text_strong));
+                });
+            }
+            card::kv(ui, KEY_W, "Entry id", |ui| {
+                crate::badge::show(ui, Some(ICON_KEY_ROUND), &n.id, Hue::Teal, 11.5);
+            });
+        },
     );
-    if !n.text.is_empty() {
-        ui.label(&n.text);
-    }
-    if let Some(l) = tree.labels.get(&n.id) {
-        ui.label(RichText::new(format!("label: {l}")).color(pal.warn));
-    }
-    ui.horizontal(|ui| {
-        let hue = if n.cost_before.incomplete {
-            Hue::Amber
-        } else {
-            Hue::Green
-        }
-        .color(pal);
-        let amount = format!(
-            "{}${:.6}",
-            if n.cost_before.incomplete { "≥" } else { "" },
-            n.cost_before.total
-        );
-        Badge::new(
-            ui.painter(),
-            Some(ICON_COINS),
-            &[("cost before entry", pal.weak), (&amount, hue)],
-            hue,
-            11.5,
-        )
-        .show(ui);
-    });
-    ui.weak("Journal order across all branches; excludes this entry and unrecorded live subagent spend.");
-    if n.cost_before.incomplete {
-        ui.colored_label(
-            pal.warn,
-            "Some earlier usage could not be read or priced; this is the known subtotal.",
-        );
-    }
-    if let Some(ts) = row.ts {
-        ui.weak(format!(
-            "{} · {} ago",
-            tree_layout::clock(ts),
-            tree_layout::age(now, ts)
-        ));
-    }
-    ui.weak(format!("id {}", n.id));
 }
 
 // ------------------------------------------------------------------ painting

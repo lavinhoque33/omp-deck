@@ -8,10 +8,12 @@ use std::sync::Arc;
 
 use crate::icons::ICON_GAUGE;
 use crate::icons::{
-    ICON_CHART_PIE, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_STOP,
-    ICON_COPY, ICON_DOWNLOAD, ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_FOLDER_GIT_2,
-    ICON_GIT_BRANCH, ICON_GIT_FORK, ICON_HANDSHAKE, ICON_LIST_TREE, ICON_MAP, ICON_NETWORK,
-    ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE, ICON_TERMINAL,
+    ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_BRAIN, ICON_CHART_PIE,
+    ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_STOP, ICON_COPY,
+    ICON_DOWNLOAD, ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_FOLDER_GIT_2,
+    ICON_GIT_BRANCH, ICON_GIT_FORK, ICON_GIT_MERGE, ICON_HANDSHAKE, ICON_HISTORY, ICON_LIST_TREE,
+    ICON_MAP, ICON_NETWORK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE,
+    ICON_TERMINAL,
 };
 use deck_core::ctl::{ContextBreakdown, LiveModel};
 use deck_core::omp::ModelInfo;
@@ -22,11 +24,12 @@ use egui::{
 };
 
 use crate::agent_model::Counts;
-use crate::badge::{Badge, Hue};
+use crate::badge::{self, Badge, Hue};
 use crate::cost_tip::{self, CostTip};
 use crate::ctx_tip::{self, CtxTip};
 use crate::usage_state::{Chip, PillKind, QuotaPill, Summary};
 use crate::usage_view;
+use crate::{card, tips};
 use deck_core::usage::LimitStatus;
 
 use crate::model_picker::{self, ModelsCache, PickerAction, PickerInput, PickerState};
@@ -62,10 +65,44 @@ pub struct GitView {
     pub unstaged: String,
     pub staged: String,
     pub untracked: String,
-    pub tooltip: String,
+    /// The counts behind the chip, for its hover card.
+    pub counts: GitCounts,
     pub pr: Option<(String, String)>,
     /// The cwd is a linked worktree of this primary checkout.
     pub worktree_of: Option<std::path::PathBuf>,
+}
+
+/// Upstream distance and working-tree counts of the git chip.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GitCounts {
+    pub ahead: u32,
+    pub behind: u32,
+    pub staged: u32,
+    pub unstaged: u32,
+    pub untracked: u32,
+}
+
+/// The model chip's hover card, formatted once per rebuild.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelTip {
+    /// Taken from omp's settings: the session has not used a model yet.
+    pub is_default: bool,
+    /// Catalog name, else the selector, else `None` (nothing recorded yet).
+    pub title: Option<String>,
+    pub selector: Option<String>,
+    /// `high`, `auto · high`, `auto`.
+    pub thinking: Option<String>,
+    /// Context window, `1M`.
+    pub window: Option<String>,
+}
+
+/// The tokens chip's hover card: `group_digits` of input, output, cache read, cache write.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TokensTip {
+    pub input: String,
+    pub output: String,
+    pub cache_read: String,
+    pub cache_write: String,
 }
 
 /// Everything the bar shows, formatted. Rebuilt when the snapshot or the model catalog changes.
@@ -88,7 +125,7 @@ pub struct BarView {
     /// Effective thinking level (None = the model has none / unknown).
     pub level: Option<String>,
     pub configured: Option<String>,
-    pub model_tip: String,
+    pub model_tip: ModelTip,
 
     pub path_text: String,
     pub path_full: String,
@@ -109,7 +146,7 @@ pub struct BarView {
 
     pub tokens_in: String,
     pub tokens_out: String,
-    pub tokens_tip: String,
+    pub tokens_tip: TokensTip,
     pub show_tokens: bool,
     pub cost: String,
     pub cost_tip: CostTip,
@@ -271,7 +308,7 @@ impl BarView {
             self.level = state.thinking.map(str::to_owned);
             self.configured = state.configured.map(str::to_owned);
         }
-        self.model_tip = model_tooltip(
+        self.model_tip = model_tip(
             selector.as_deref(),
             info,
             self.level.as_deref(),
@@ -291,12 +328,12 @@ impl BarView {
         self.tokens_in = fmt_tokens(st.input_tokens);
         self.tokens_out = fmt_tokens(st.output_tokens);
         self.show_tokens = st.input_tokens + st.output_tokens + st.cache_read + st.cache_write > 0;
-        self.tokens_tip = tokens_tooltip(
-            st.input_tokens,
-            st.output_tokens,
-            st.cache_read,
-            st.cache_write,
-        );
+        self.tokens_tip = TokensTip {
+            input: group_digits(st.input_tokens),
+            output: group_digits(st.output_tokens),
+            cache_read: group_digits(st.cache_read),
+            cache_write: group_digits(st.cache_write),
+        };
         self.cost = fmt_cost(st.cost);
         self.show_cost = st.cost > 0.0;
         self.last_turn_failed = st.last_turn_failed;
@@ -324,25 +361,6 @@ fn git_view(g: &GitInfo) -> GitView {
             String::new()
         }
     };
-    let mut parts = vec![format!("Branch {}", g.branch)];
-    if let Some(primary) = &g.worktree_of {
-        parts.push(format!("Worktree of {}", primary.display()));
-    }
-    if g.ahead > 0 || g.behind > 0 {
-        parts.push(format!("{} ahead, {} behind upstream", g.ahead, g.behind));
-    }
-    for (n, what) in [
-        (g.staged, "staged"),
-        (g.unstaged, "modified (unstaged)"),
-        (g.untracked, "untracked"),
-    ] {
-        if n > 0 {
-            parts.push(format!("{n} {what}"));
-        }
-    }
-    if parts.len() == 1 + usize::from(g.worktree_of.is_some()) {
-        parts.push("Working tree clean".to_owned());
-    }
     GitView {
         branch: g.branch.clone(),
         dirty: g.staged + g.unstaged + g.untracked > 0,
@@ -350,7 +368,13 @@ fn git_view(g: &GitInfo) -> GitView {
         unstaged: count('*', g.unstaged),
         staged: count('+', g.staged),
         untracked: count('?', g.untracked),
-        tooltip: parts.join("\n"),
+        counts: GitCounts {
+            ahead: g.ahead,
+            behind: g.behind,
+            staged: g.staged,
+            unstaged: g.unstaged,
+            untracked: g.untracked,
+        },
         pr: g
             .pr
             .as_ref()
@@ -372,35 +396,28 @@ pub fn group_digits(n: u64) -> String {
     out
 }
 
-fn model_tooltip(
+fn model_tip(
     selector: Option<&str>,
     info: Option<&ModelInfo>,
     level: Option<&str>,
     configured: Option<&str>,
     is_default: bool,
-) -> String {
-    let mut t = String::new();
-    if is_default {
-        t.push_str("Default model (from omp's settings)\n");
+) -> ModelTip {
+    let thinking = match (configured, level) {
+        (Some("auto"), Some(l)) => Some(format!("auto · {l}")),
+        (Some("auto"), None) => Some("auto".to_owned()),
+        (_, Some(l)) => Some(l.to_owned()),
+        _ => None,
+    };
+    ModelTip {
+        is_default,
+        title: info
+            .map(|i| i.name.clone())
+            .or_else(|| selector.map(str::to_owned)),
+        selector: selector.map(str::to_owned),
+        thinking,
+        window: info.and_then(|i| i.context_window).map(fmt_tokens),
     }
-    match (selector, info) {
-        (Some(sel), Some(i)) => {
-            t.push_str(&format!("{}\n{sel}", i.name));
-        }
-        (Some(sel), None) => t.push_str(sel),
-        _ => t.push_str("Model not recorded yet"),
-    }
-    match (configured, level) {
-        (Some("auto"), Some(l)) => t.push_str(&format!("\nThinking: auto (currently {l})")),
-        (Some("auto"), None) => t.push_str("\nThinking: auto"),
-        (_, Some(l)) => t.push_str(&format!("\nThinking: {l}")),
-        _ => {}
-    }
-    if is_default {
-        t.push_str("\nThe session has not used a model yet.");
-    }
-    t.push_str("\n\nClick to switch model or thinking level");
-    t
 }
 
 /// What the chip shows: the live breakdown's `(computed_at, used_tokens, context_window)` when
@@ -429,16 +446,6 @@ fn context_tooltip(tokens: Option<u64>, window: Option<u64>, pct: Option<f64>) -
         (None, Some(w), _) => format!("Context window: {} tokens\nNo reply yet", group_digits(w)),
         _ => "Context usage appears after the first reply".to_owned(),
     }
-}
-
-fn tokens_tooltip(input: u64, output: u64, cache_read: u64, cache_write: u64) -> String {
-    format!(
-        "Tokens for the whole session\n↑ input {}\n↓ output {}\ncache read {}\ncache write {}",
-        group_digits(input),
-        group_digits(output),
-        group_digits(cache_read),
-        group_digits(cache_write)
-    )
 }
 
 // ------------------------------------------------------------------ actions out
@@ -556,7 +563,7 @@ const SEGS: [Seg; 6] = [
 /// revision and pixel density.
 #[derive(Clone, Copy)]
 struct SegWidths {
-    key: (u64, u32),
+    key: (u64, u32, deck_core::config::UiFont),
     w: [f32; 6],
 }
 
@@ -575,7 +582,11 @@ fn measure(ui: &mut Ui, f: impl FnOnce(&mut Ui)) -> f32 {
 }
 
 fn seg_widths(ui: &mut Ui, v: &BarView) -> [f32; 6] {
-    let key = (v.rev, ui.ctx().pixels_per_point().to_bits());
+    let key = (
+        v.rev,
+        ui.ctx().pixels_per_point().to_bits(),
+        theme::ui_font(),
+    );
     let id = ui.scope_id().with("seg-widths");
     if let Some(c) = ui.data(|d| d.get_temp::<SegWidths>(id))
         && c.key == key
@@ -673,10 +684,9 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
                 ui.label(icon_text(ICON_FOLDER, 14.4, pal.weak));
                 ui.add(text(&v.path_text, 14.4, pal.text));
             });
-            if r.on_hover_text(format!("{}\nClick to copy", v.path_full))
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .clicked()
-            {
+            let r = r.on_hover_cursor(CursorIcon::PointingHand);
+            path_hover(&r, &v.path_full);
+            if r.clicked() {
                 out.push(BarAction::CopyPath(v.path_full.clone()));
             }
         }
@@ -692,21 +702,21 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
         }
         Seg::Tokens => {
             divider(ui);
-            chip(ui, "tokens", Sense::hover(), |ui| {
+            let r = chip(ui, "tokens", Sense::hover(), |ui| {
                 ui.add(text("↑", 14.4, pal.weak));
                 ui.add(text(&v.tokens_in, 14.4, pal.text));
                 ui.add_space(4.0);
                 ui.add(text("↓", 14.4, pal.weak));
                 ui.add(text(&v.tokens_out, 14.4, pal.text));
-            })
-            .on_hover_text(&v.tokens_tip);
+            });
+            tokens_hover(&r, &v.tokens_tip);
         }
         Seg::Cost => {
             divider(ui);
-            chip(ui, "cost", Sense::hover(), |ui| {
+            let r = chip(ui, "cost", Sense::hover(), |ui| {
                 ui.label(RichText::new(&v.cost).size(14.4).color(pal.ok));
-            })
-            .on_hover_ui(|ui| cost_tip::show(ui, &v.cost_tip));
+            });
+            cost_tip::hover(&r, &v.cost_tip);
         }
         Seg::Usage => {
             if let Some(u) = &v.usage
@@ -716,9 +726,8 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
                 let r = chip(ui, "usage", Sense::click(), |ui| {
                     usage_chip_content(ui, pal, v, u, c);
                 });
-                let r = r
-                    .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_ui(|ui| usage_view::hover_ui(ui, u));
+                let r = r.on_hover_cursor(CursorIcon::PointingHand);
+                usage_view::hover(&r, u);
                 if r.clicked() {
                     out.push(BarAction::OpenUsage);
                 }
@@ -841,7 +850,7 @@ fn divider(ui: &mut Ui) {
 fn activity_dot(ui: &mut Ui, activity: Activity) {
     let pal = Palette::of_ui(ui);
     let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-    let (tip, color) = match activity {
+    match activity {
         Activity::Busy => {
             // Spinner only while a turn runs; it schedules its own repaints.
             let spinner = crate::widgets::Spin::new(15.6, pal.accent);
@@ -849,23 +858,238 @@ fn activity_dot(ui: &mut Ui, activity: Activity) {
                 Rect::from_center_size(rect.center(), vec2(16.0, 16.0)),
                 spinner,
             );
-            return void_tip(resp, "omp is working");
         }
-        Activity::Idle => ("omp is idle", pal.ok),
-        Activity::Attention => ("omp needs your attention", pal.warn),
-        Activity::Unknown => ("Waiting for omp…", pal.weak.gamma_multiply(0.6)),
-    };
-    if activity == Activity::Unknown {
-        ui.painter()
-            .circle_stroke(rect.center(), 4.2, Stroke::new(1.6, color));
-    } else {
-        theme::glow_dot(ui.painter(), rect.center(), 4.2, color, theme::GLOW_REST);
+        Activity::Unknown => {
+            ui.painter().circle_stroke(
+                rect.center(),
+                4.2,
+                Stroke::new(1.6, pal.weak.gamma_multiply(0.6)),
+            );
+        }
+        Activity::Idle | Activity::Attention => {
+            let color = if activity == Activity::Idle {
+                pal.ok
+            } else {
+                pal.warn
+            };
+            theme::glow_dot(ui.painter(), rect.center(), 4.2, color, theme::GLOW_REST);
+        }
     }
-    void_tip(resp, tip);
+    activity_hover(&resp, activity);
 }
 
-fn void_tip(resp: Response, tip: &str) {
-    resp.on_hover_text(tip);
+/// Hover card of the activity dot: omp's state as a badge plus one sentence.
+fn activity_hover(resp: &Response, activity: Activity) {
+    let pal = Palette::of_ctx(&resp.ctx);
+    let (badge_text, color, note) = match activity {
+        Activity::Busy => ("working", Hue::Blue.color(pal), "omp is running a turn"),
+        Activity::Idle => (
+            "idle",
+            Hue::Green.color(pal),
+            "omp waits for your next prompt",
+        ),
+        Activity::Attention => (
+            "needs input",
+            Hue::Amber.color(pal),
+            "omp needs your attention",
+        ),
+        Activity::Unknown => ("waiting", pal.weak, "Waiting for omp…"),
+    };
+    let tone = if activity == Activity::Attention {
+        pal.warn
+    } else {
+        Color32::TRANSPARENT
+    };
+    card::hover(
+        resp,
+        240.0,
+        false,
+        &card::Header::new(ICON_ACTIVITY, "omp").tone(tone),
+        |ui| {
+            Badge::single(ui.painter(), None, badge_text, color, tips::VALUE).show(ui);
+        },
+        |ui| tips::note(ui, note),
+    );
+}
+
+/// Hover card of the path chip: the folder's full path; a click copies it.
+fn path_hover(resp: &Response, full: &str) {
+    let name = Path::new(full)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(full);
+    card::hover(
+        resp,
+        340.0,
+        false,
+        &card::Header::new(ICON_FOLDER, name).subtitle("Working directory"),
+        |_| {},
+        |ui| {
+            card::kv(ui, 56.0, "Path", |ui| tips::mono(ui, full));
+            card::footer_hints(ui, &[("click", "copy the path")]);
+        },
+    );
+}
+
+/// Hover card of the tokens chip: the whole session's token counts by type.
+fn tokens_hover(resp: &Response, tip: &TokensTip) {
+    card::hover(
+        resp,
+        260.0,
+        false,
+        &card::Header::new(ICON_CHART_PIE, "Tokens").subtitle("Whole session"),
+        |_| {},
+        |ui| {
+            for (key, icon, value, hue) in [
+                ("Input", ICON_ARROW_UP, &tip.input, Hue::Blue),
+                ("Output", ICON_ARROW_DOWN, &tip.output, Hue::Green),
+                ("Cache read", ICON_HISTORY, &tip.cache_read, Hue::Teal),
+                ("Cache write", ICON_PENCIL, &tip.cache_write, Hue::Amber),
+            ] {
+                card::kv(ui, 104.0, key, |ui| {
+                    badge::show(ui, Some(icon), value, hue, tips::VALUE);
+                });
+            }
+        },
+    );
+}
+
+/// Hover card of the model chip: name, selector, thinking level and context window.
+fn model_hover(resp: &Response, tip: &ModelTip) {
+    let mut head = card::Header::new(
+        ICON_SPARKLES,
+        tip.title.as_deref().unwrap_or("Model not recorded yet"),
+    );
+    if tip.is_default {
+        head = head.subtitle("Default model (from omp's settings)");
+    }
+    card::hover(
+        resp,
+        370.0,
+        false,
+        &head,
+        |ui| {
+            if let Some(t) = &tip.thinking {
+                badge::show(ui, Some(ICON_BRAIN), t, Hue::Blue, tips::VALUE);
+            }
+        },
+        |ui| {
+            const KEY_W: f32 = 84.0;
+            if let Some(s) = &tip.selector {
+                card::kv(ui, KEY_W, "Model", |ui| {
+                    badge::show(ui, Some(ICON_SPARKLES), s, Hue::Violet, tips::VALUE);
+                });
+            }
+            if let Some(t) = &tip.thinking {
+                card::kv(ui, KEY_W, "Thinking", |ui| {
+                    badge::show(ui, Some(ICON_BRAIN), t, Hue::Blue, tips::VALUE);
+                });
+            }
+            if let Some(w) = &tip.window {
+                card::kv(ui, KEY_W, "Context", |ui| {
+                    badge::show(ui, None, w, Hue::Teal, tips::VALUE);
+                });
+            }
+            if tip.is_default {
+                tips::note(ui, "The session has not used a model yet.");
+            }
+            card::footer_hints(ui, &[("click", "switch model or thinking level")]);
+        },
+    );
+}
+
+/// Hover card of the git chip: branch, upstream distance, working-tree counts, worktree.
+fn git_hover(resp: &Response, g: &GitView) {
+    let pal = Palette::of_ctx(&resp.ctx);
+    let c = g.counts;
+    let icon = if g.worktree_of.is_some() {
+        ICON_FOLDER_GIT_2
+    } else {
+        ICON_GIT_BRANCH
+    };
+    let tone = if g.dirty {
+        pal.warn
+    } else {
+        Color32::TRANSPARENT
+    };
+    card::hover(
+        resp,
+        320.0,
+        false,
+        &card::Header::new(icon, &g.branch).tone(tone),
+        |ui| {
+            if g.dirty {
+                badge::show(ui, None, "changes", Hue::Amber, tips::VALUE);
+            } else {
+                badge::show(
+                    ui,
+                    Some(ICON_CIRCLE_CHECK),
+                    "clean",
+                    Hue::Green,
+                    tips::VALUE,
+                );
+            }
+        },
+        |ui| {
+            const KEY_W: f32 = 100.0;
+            if c.ahead > 0 || c.behind > 0 {
+                card::kv(ui, KEY_W, "Upstream", |ui| {
+                    if c.ahead > 0 {
+                        let t = format!("↑{} ahead", c.ahead);
+                        badge::show(ui, None, &t, Hue::Green, tips::VALUE);
+                    }
+                    if c.behind > 0 {
+                        let t = format!("↓{} behind", c.behind);
+                        badge::show(ui, None, &t, Hue::Amber, tips::VALUE);
+                    }
+                });
+            }
+            if g.dirty {
+                card::kv(ui, KEY_W, "Working tree", |ui| {
+                    for (n, what, hue) in [
+                        (c.staged, "staged", Hue::Green),
+                        (c.unstaged, "modified", Hue::Amber),
+                        (c.untracked, "untracked", Hue::Teal),
+                    ] {
+                        if n > 0 {
+                            badge::show(ui, None, &format!("{n} {what}"), hue, tips::VALUE);
+                        }
+                    }
+                });
+            } else {
+                card::kv(ui, KEY_W, "Working tree", |ui| tips::strong(ui, "clean"));
+            }
+            if let Some(primary) = &g.worktree_of {
+                card::kv(ui, KEY_W, "Worktree of", |ui| tips::path(ui, primary));
+            }
+            if let Some((label, _)) = &g.pr {
+                card::kv(ui, KEY_W, "Pull request", |ui| {
+                    badge::show(ui, Some(ICON_GIT_MERGE), label, Hue::Violet, tips::VALUE);
+                });
+            }
+            card::footer_hints(
+                ui,
+                &[("click", "review changes"), ("Ctrl+Shift+G", "toggle")],
+            );
+        },
+    );
+}
+
+/// Hover card of the PR chip: number and URL; a click opens it.
+fn pr_hover(resp: &Response, label: &str, url: &str) {
+    card::hover(
+        resp,
+        340.0,
+        false,
+        &card::Header::new(ICON_GIT_MERGE, "Pull request"),
+        |ui| {
+            badge::show(ui, None, label, Hue::Violet, tips::VALUE);
+        },
+        |ui| {
+            card::kv(ui, 48.0, "URL", |ui| tips::mono(ui, url));
+            card::footer_hints(ui, &[("click", "open in the browser")]);
+        },
+    );
 }
 
 fn model_chip(
@@ -978,11 +1202,9 @@ fn model_chip(
         ui.label(icon_text(ICON_CHEVRONS_UP_DOWN, 16.8, pal.weak));
     });
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    let resp = if egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp)) {
-        resp
-    } else {
-        resp.on_hover_text(&v.model_tip)
-    };
+    if !egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp)) {
+        model_hover(&resp, &v.model_tip);
+    }
     let acts = model_picker::show(
         &resp,
         picker,
@@ -1050,13 +1272,9 @@ fn git_chip(ui: &mut Ui, g: &GitView, out: &mut Vec<BarAction>) {
             ui.add(text(&g.untracked, 13.8, pal.weak));
         }
     });
-    if r.on_hover_text(format!(
-        "{}\nClick to review changes (Ctrl+Shift+G)",
-        g.tooltip
-    ))
-    .on_hover_cursor(CursorIcon::PointingHand)
-    .clicked()
-    {
+    let r = r.on_hover_cursor(CursorIcon::PointingHand);
+    git_hover(&r, g);
+    if r.clicked() {
         out.push(BarAction::ToggleChanges);
     }
     if let Some((label, url)) = &g.pr {
@@ -1069,11 +1287,9 @@ fn git_chip(ui: &mut Ui, g: &GitView, out: &mut Vec<BarAction>) {
                     .underline(),
             );
         });
-        if pr
-            .on_hover_text(format!("{url}\nClick to open"))
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .clicked()
-        {
+        let pr = pr.on_hover_cursor(CursorIcon::PointingHand);
+        pr_hover(&pr, label, url);
+        if pr.clicked() {
             out.push(BarAction::OpenUrl(url.clone()));
         }
     }
@@ -1092,7 +1308,7 @@ pub(crate) fn level_color(pal: &Palette, level: Option<ContextLevel>) -> Color32
 fn context_meter(ui: &mut Ui, v: &BarView) {
     let pal = Palette::of_ui(ui);
     let color = level_color(pal, v.ctx_level);
-    chip(ui, "ctx", Sense::hover(), |ui| {
+    let r = chip(ui, "ctx", Sense::hover(), |ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(81.0, 16.8), Sense::hover());
         let bar = Rect::from_center_size(rect.center(), vec2(65.0, 5.0));
         let p = ui.painter();
@@ -1108,16 +1324,8 @@ fn context_meter(ui: &mut Ui, v: &BarView) {
             pal.text
         };
         ui.add(text(&v.ctx_label, 14.4, label_color));
-    })
-    .on_hover_ui(|ui| match &v.ctx_detail {
-        Some((_, tip)) => ctx_tip::show(ui, tip),
-        None => {
-            ui.set_max_width(320.0);
-            ui.label(&v.ctx_tip);
-            ui.add_space(2.0);
-            ui.label(RichText::new(ctx_tip::NEEDS_LIVE).small().color(pal.weak));
-        }
     });
+    ctx_tip::hover(&r, v.ctx_detail.as_ref().map(|(_, t)| &**t), &v.ctx_tip);
 }
 
 /// The glyph of one count in the Agents chip.
@@ -1186,28 +1394,33 @@ fn agents_chip(ui: &mut Ui, v: &AgentsChip, out: &mut Vec<BarAction>) {
             egui::StrokeKind::Inside,
         );
     }
-    let r = r
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_ui(|ui| {
-            ui.label(RichText::new("Agents dashboard  (Ctrl+Shift+A)").strong());
+    let r = r.on_hover_cursor(CursorIcon::PointingHand);
+    crate::card::hover(
+        &r,
+        260.0,
+        false,
+        &crate::card::Header::new(ICON_NETWORK, "Agents").subtitle("Subagents of this session"),
+        |_| {},
+        |ui| {
             if total == 0 {
-                ui.label("No subagents in this session yet");
-            } else {
-                let mut parts = Vec::new();
-                for (n, what) in [
-                    (c.running, "running"),
-                    (c.done, "done"),
-                    (c.failed, "failed"),
-                    (c.aborted, "aborted"),
-                    (c.interrupted, "interrupted"),
-                ] {
-                    if n > 0 {
-                        parts.push(format!("{n} {what}"));
-                    }
-                }
-                ui.label(parts.join(" · "));
+                ui.label(RichText::new("No subagents in this session yet").color(pal.weak));
             }
-        });
+            for (n, what, hue) in [
+                (c.running, "running", Hue::Blue),
+                (c.done, "done", Hue::Green),
+                (c.failed, "failed", Hue::Rose),
+                (c.aborted, "aborted", Hue::Amber),
+                (c.interrupted, "interrupted", Hue::Amber),
+            ] {
+                if n > 0 {
+                    crate::card::kv(ui, 104.0, what, |ui| {
+                        crate::badge::show(ui, None, &n.to_string(), hue, 12.0);
+                    });
+                }
+            }
+            crate::card::footer_hints(ui, &[("Ctrl+Shift+A", "toggles the dashboard")]);
+        },
+    );
     if r.clicked() {
         out.push(BarAction::ToggleAgents);
     }
@@ -1547,7 +1760,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_chip_names_the_primary_and_keeps_the_clean_note() {
+    fn worktree_chip_names_the_primary_and_reads_clean() {
         let g = GitInfo {
             branch: "wt/x".into(),
             worktree_of: Some(PathBuf::from("/work/repo")),
@@ -1555,10 +1768,8 @@ mod tests {
         };
         let v = git_view(&g);
         assert_eq!(v.worktree_of.as_deref(), Some(Path::new("/work/repo")));
-        assert_eq!(
-            v.tooltip,
-            "Branch wt/x\nWorktree of /work/repo\nWorking tree clean"
-        );
+        assert!(!v.dirty);
+        assert_eq!(v.counts, GitCounts::default());
         assert_eq!(git_view(&GitInfo::default()).worktree_of, None);
     }
 
@@ -1622,7 +1833,9 @@ mod tests {
         assert!(v.model_is_default);
         assert_eq!(v.model_name, "Claude Opus 5.5");
         assert_eq!(v.current_level(), Some("high"));
-        assert!(v.model_tip.contains("Default model"));
+        assert!(v.model_tip.is_default);
+        assert_eq!(v.model_tip.title.as_deref(), Some("Claude Opus 5.5"));
+        assert_eq!(v.model_tip.thinking.as_deref(), Some("high"));
         // The session's own model replaces the default.
         let snap = Arc::new(status());
         assert!(v.update(Some(&snap), Path::new("/x"), &catalog()));
@@ -1803,14 +2016,20 @@ mod tests {
 #[cfg(test)]
 mod centering_tests {
     use super::*;
-    use deck_core::config::{Density, UiStyle};
+    use deck_core::config::{Density, UiFont, UiStyle};
     use deck_core::status::{GitInfo, PrInfo, SessionStats, SessionStatus};
 
     /// Every text/icon painted by the bar is vertically centred on the bar (the chips used to sit
     /// `(CHIP_H - interact_size.y) / 2` low when the density's interact height was below the chip).
-    fn assert_centered(style: UiStyle, density: Density) {
+    /// An explicit `font` is installed with its real face, whose metrics differ from the default.
+    fn assert_centered(style: UiStyle, density: Density, font: UiFont) {
         let ctx = egui::Context::default();
-        theme::apply(&ctx, style, density, true);
+        crate::ui_fonts::install(&ctx, crate::ui_fonts::UiFonts::none());
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .textures_delta
+            .clear();
+        crate::ui_fonts::finalize(&ctx);
+        theme::apply(&ctx, style, density, font, true);
         let mut v = BarView::default();
         let st = SessionStatus {
             cwd: "/tmp/proj".into(),
@@ -1867,7 +2086,7 @@ mod centering_tests {
                         let off = y - (screen_h - BAR_H / 2.0);
                         assert!(
                             off.abs() <= 0.5,
-                            "{style:?}/{density:?}: {:?} off by {off}",
+                            "{style:?}/{density:?}/{font:?}: {:?} off by {off}",
                             t.galley.text()
                         );
                         texts += 1;
@@ -1880,8 +2099,16 @@ mod centering_tests {
 
     #[test]
     fn bar_segments_are_vertically_centered() {
-        assert_centered(UiStyle::Blueprint, Density::Compact);
-        assert_centered(UiStyle::Neutral, Density::Compact);
-        assert_centered(UiStyle::Neon, Density::Comfortable);
+        assert_centered(UiStyle::Blueprint, Density::Compact, UiFont::Auto);
+        assert_centered(UiStyle::Neutral, Density::Compact, UiFont::Auto);
+        assert_centered(UiStyle::Neon, Density::Comfortable, UiFont::Auto);
+        assert_centered(UiStyle::Blueprint, Density::Compact, UiFont::MartianMono);
+        assert_centered(
+            UiStyle::Neutral,
+            Density::Comfortable,
+            UiFont::BricolageGrotesque,
+        );
+        assert_centered(UiStyle::Neon, Density::Compact, UiFont::Inter);
+        assert_centered(UiStyle::Phosphor, Density::Compact, UiFont::VictorMono);
     }
 }

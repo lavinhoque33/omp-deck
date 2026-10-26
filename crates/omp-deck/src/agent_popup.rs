@@ -11,7 +11,7 @@ use crate::icons::Icon;
 use crate::icons::{
     ICON_ARROW_DOWN_TO_LINE, ICON_CHEVRON_DOWN, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT,
     ICON_CHEVRONS_DOWN, ICON_CLIPBOARD_LIST, ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT,
-    ICON_MESSAGES_SQUARE, ICON_PLAY, ICON_SEND, ICON_SQUARE, ICON_X,
+    ICON_MESSAGES_SQUARE, ICON_NETWORK, ICON_PLAY, ICON_SEND, ICON_SQUARE, ICON_X,
 };
 use deck_core::agents::{AgentStatus, AgentSummary, TranscriptItem};
 use deck_core::ctl::LiveStatus;
@@ -26,10 +26,11 @@ use crate::agent_model::{
     AgentsView, fmt_agent_cost, fmt_duration, live_duration, short_model, status_label,
 };
 use crate::agent_output::{MdPane, OutputPane};
+use crate::card;
 use crate::sidebar::format_age;
 use crate::theme::{self, Palette};
 use crate::transcript_view::TranscriptView;
-use crate::widgets::{Spin, empty_state, icon_text, paint_icon};
+use crate::widgets::{DraftButton, DraftKind, Spin, empty_state, icon_text, paint_icon};
 use deck_service::statusfmt::fmt_tokens;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,16 +193,10 @@ pub fn show(ctx: &egui::Context, st: &mut PopupState, input: &PopupInput<'_>) ->
             .clamp(380.0, 1100.0)
             .min(screen.height() - 24.0),
     );
-    let style = ctx.global_style();
-    let frame = Frame::NONE
-        .fill(pal.bar)
-        .stroke(theme::popup_stroke(pal))
-        .corner_radius(theme::popup_radius())
-        .shadow(style.visuals.window_shadow);
     egui::Window::new("agent-popup")
         .id(Id::unique("agent-popup-window"))
         .title_bar(false)
-        .frame(frame)
+        .frame(Frame::NONE)
         .resizable(true)
         .movable(true)
         .collapsible(false)
@@ -210,7 +205,9 @@ pub fn show(ctx: &egui::Context, st: &mut PopupState, input: &PopupInput<'_>) ->
         .default_size(size)
         .default_pos(screen.center() - size / 2.0)
         .show(ctx, |ui| {
-            popup_body(ui, st, input, agent, &mut out);
+            card::chrome(ui, Margin::ZERO, pal.bar, |ui| {
+                popup_body(ui, st, input, agent, &mut out);
+            });
         });
     out
 }
@@ -256,6 +253,13 @@ fn popup_body(
             ui.set_width(ui.available_width());
             header_rows(ui, st, input, a, out);
         });
+    card::header_rule(
+        ui,
+        ui.max_rect().left(),
+        ui.max_rect().right(),
+        ui.cursor().top(),
+        Color32::TRANSPARENT,
+    );
 
     // ---- tabs
     tab_bar(ui, st, a, out);
@@ -339,6 +343,7 @@ fn header_rows(
         ui,
         |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
+            card::icon_tile(ui, 30.0, ICON_NETWORK, Color32::TRANSPARENT, true);
             status_pill(ui, &sh);
             ui.label(theme::strong(&a.id).size(19.0).color(pal.text_strong));
             if let Some(t) = &a.agent {
@@ -565,7 +570,7 @@ fn ctl_buttons(ui: &mut Ui, input: &PopupInput<'_>, a: &AgentSummary, out: &mut 
             ui,
             ICON_SQUARE,
             "Kill",
-            pal.danger,
+            DraftKind::Danger,
             "Abort this agent and release it (it keeps its transcript)",
         )
         .clicked()
@@ -577,7 +582,7 @@ fn ctl_buttons(ui: &mut Ui, input: &PopupInput<'_>, a: &AgentSummary, out: &mut 
             ui,
             ICON_PLAY,
             "Revive",
-            pal.ok,
+            DraftKind::Primary,
             "Bring this parked agent back so it can be messaged",
         )
         .clicked()
@@ -590,40 +595,14 @@ fn action_button(
     ui: &mut Ui,
     icon: Icon,
     label: &str,
-    color: Color32,
+    kind: DraftKind,
     tip: &str,
 ) -> egui::Response {
-    let pal = Palette::of_ui(ui);
-    let g =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), crate::theme::font(12.5), pal.text_strong);
-    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 40.0, 24.0), Sense::click());
-    let p = ui.painter();
-    p.rect_filled(
-        rect,
-        12,
-        color.gamma_multiply(if resp.hovered() { 0.3 } else { 0.14 }),
-    );
-    p.rect_stroke(
-        rect,
-        12,
-        Stroke::new(1.0, color.gamma_multiply(0.6)),
-        StrokeKind::Inside,
-    );
-    paint_icon(
-        p,
-        pos2(rect.left() + 15.0, rect.center().y),
-        Align2::CENTER_CENTER,
-        icon,
-        15.0,
-        color,
-    );
-    p.galley(
-        pos2(rect.left() + 27.0, rect.center().y - g.size().y / 2.0),
-        g,
-        pal.text_strong,
-    );
-    resp.on_hover_text(tip)
+    DraftButton::new(label)
+        .kind(kind)
+        .icon(icon)
+        .show(ui)
+        .on_hover_text(tip)
         .on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -821,8 +800,10 @@ fn open_session_panel(ui: &mut Ui, out: &mut Vec<PopupAction>) {
                     .color(pal.weak),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button("Open session for live control")
+                    if DraftButton::new("Open session for live control")
+                        .kind(DraftKind::Primary)
+                        .icon(ICON_EXTERNAL_LINK)
+                        .show(ui)
                         .on_hover_text(
                             "Attach a tab to this session; chat, kill and revive work there",
                         )

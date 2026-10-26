@@ -13,7 +13,7 @@ pub mod skin;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use deck_core::config::{Density, UiStyle};
+use deck_core::config::{Density, UiFont, UiStyle};
 use egui::epaint::Mesh;
 use egui::style::{HandleShape, ScrollStyle};
 use egui::{
@@ -32,6 +32,8 @@ use palettes::rgb;
 /// Index into [`UiStyle::ALL`] of the active style.
 static STYLE: AtomicU8 = AtomicU8::new(0);
 static COMPACT: AtomicU8 = AtomicU8::new(1);
+/// Index into [`UiFont::ALL`] of the chosen UI font.
+static UI_FONT: AtomicU8 = AtomicU8::new(0);
 
 /// The structure of every style, in [`UiStyle::ALL`] order.
 static LOOKS: LazyLock<[Look; 18]> = LazyLock::new(|| UiStyle::ALL.map(look::look_of));
@@ -73,17 +75,29 @@ pub fn dens(compact_px: f32, comfortable_px: f32) -> f32 {
     }
 }
 
-/// Family of the chrome's UI text: JetBrains Mono in the flat styles, the system UI font in
-/// Neon, the monospace family for the whole chrome in Phosphor.
+/// The chosen UI font.
+pub fn ui_font() -> UiFont {
+    UiFont::ALL
+        .get(usize::from(UI_FONT.load(Ordering::Relaxed)))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Family of the chrome's UI text: the chosen UI font, or with [`UiFont::Auto`] the style's own
+/// (JetBrains Mono in the flat styles, the system UI font in Neon, monospace in Phosphor).
 pub fn ui_family() -> FontFamily {
+    family_for(look(), flat(), ui_font())
+}
+
+/// Family that `font` gives the UI text of a style with `look` (`neutral` = flat style).
+pub fn family_for(look: &Look, neutral: bool, font: UiFont) -> FontFamily {
     static NEUTRAL_NAMED: LazyLock<FontFamily> =
         LazyLock::new(|| FontFamily::Name(crate::ui_fonts::NEUTRAL_FAMILY.into()));
-    if look().mono_ui {
-        FontFamily::Monospace
-    } else if flat() {
-        NEUTRAL_NAMED.clone()
-    } else {
-        FontFamily::Proportional
+    match font {
+        UiFont::Auto if look.mono_ui => FontFamily::Monospace,
+        UiFont::Auto if neutral => NEUTRAL_NAMED.clone(),
+        UiFont::Auto | UiFont::System => FontFamily::Proportional,
+        _ => crate::ui_fonts::text_family(font).unwrap_or(FontFamily::Proportional),
     }
 }
 
@@ -157,17 +171,25 @@ impl Palette {
     }
 }
 
-/// Applies style × density × theme: rebuilds both egui style slots and selects the variant.
-/// `dark` is `AppConfig::dark()` (always true for dark-only styles).
-pub fn apply(ctx: &Context, style: UiStyle, density: Density, dark: bool) {
+/// Applies style × density × UI font × theme: rebuilds both egui style slots and selects the
+/// variant. `dark` is `AppConfig::dark()` (always true for dark-only styles). The family of
+/// every explicit `ui_font` is prepared once by [`crate::ui_fonts::finalize`].
+pub fn apply(ctx: &Context, style: UiStyle, density: Density, ui_font: UiFont, dark: bool) {
     let idx = UiStyle::ALL.iter().position(|s| *s == style).unwrap_or(0);
     STYLE.store(idx as u8, Ordering::Relaxed);
     COMPACT.store(u8::from(density == Density::Compact), Ordering::Relaxed);
+    let font_idx = UiFont::ALL.iter().position(|f| *f == ui_font).unwrap_or(0);
+    UI_FONT.store(font_idx as u8, Ordering::Relaxed);
     let flat = style != UiStyle::Neon;
     let look = look::look_of(style);
+    let family = family_for(&look, flat, ui_font);
     let (pd, pl) = (palettes::of(style, true), palettes::of(style, false));
-    ctx.style_mut_of(Theme::Dark, |s| build(s, pd, true, flat, density, &look));
-    ctx.style_mut_of(Theme::Light, |s| build(s, pl, false, flat, density, &look));
+    ctx.style_mut_of(Theme::Dark, |s| {
+        build(s, pd, true, flat, density, &look, &family)
+    });
+    ctx.style_mut_of(Theme::Light, |s| {
+        build(s, pl, false, flat, density, &look, &family)
+    });
     ctx.set_theme(if dark || style.dark_only() {
         ThemePreference::Dark
     } else {
@@ -175,23 +197,35 @@ pub fn apply(ctx: &Context, style: UiStyle, density: Density, dark: bool) {
     });
 }
 
-fn build(style: &mut Style, p: &Palette, dark: bool, neutral: bool, density: Density, look: &Look) {
-    let compact = density == Density::Compact;
-    let family = if look.mono_ui {
-        FontFamily::Monospace
-    } else if neutral {
-        FontFamily::Name(crate::ui_fonts::NEUTRAL_FAMILY.into())
-    } else {
-        FontFamily::Proportional
-    };
-    let prop = |size| FontId::new(size, family.clone());
-    let (body, small, section, title, heading) = if look.mono_ui {
+/// Body, small, section, title and heading text sizes of a style in points.
+fn text_sizes(look: &Look, flat: bool) -> (f32, f32, f32, f32, f32) {
+    if look.mono_ui {
         (11.5, 10.5, 10.0, 12.5, 16.0)
-    } else if neutral {
+    } else if flat {
         (13.0, 12.0, 10.5, 14.0, 18.0)
     } else {
         (14.0, 12.0, 11.5, 15.0, 22.0)
-    };
+    }
+}
+
+/// Body text size of `style` in points before the app scale (what the Appearance row shows).
+pub fn body_size(style: UiStyle) -> f32 {
+    let look = look_of(style);
+    text_sizes(&look, style != UiStyle::Neon).0
+}
+
+fn build(
+    style: &mut Style,
+    p: &Palette,
+    dark: bool,
+    neutral: bool,
+    density: Density,
+    look: &Look,
+    family: &FontFamily,
+) {
+    let compact = density == Density::Compact;
+    let prop = |size| FontId::new(size, family.clone());
+    let (body, small, section, title, heading) = text_sizes(look, neutral);
     style.text_styles = [
         (TextStyle::Small, prop(small)),
         (TextStyle::Body, prop(body)),
@@ -266,21 +300,23 @@ fn build(style: &mut Style, p: &Palette, dark: bool, neutral: bool, density: Den
     v.slider_trailing_fill = true;
     v.handle_shape = HandleShape::Circle;
     v.window_corner_radius = CornerRadius::same(if neutral { popup_radius_of(look) } else { 14 });
-    v.menu_corner_radius = CornerRadius::same(popup_radius_of(look).min(10));
-    v.window_stroke = Stroke::new(look.card.border_w.min(2.0), p.stroke);
+    // Tooltips and menus (`Frame::popup` / `Frame::menu`) share these: the radius of
+    // [`popup_radius`], an accent-tinted border and the card's deep drop shadow, so a plain tooltip
+    // reads as the same surface as a `card::hover`.
+    v.menu_corner_radius = CornerRadius::same(if neutral { popup_radius_of(look) } else { 16 });
+    v.window_stroke = Stroke::new(look.card.border_w.min(2.0), mix(p.stroke, p.accent, 0.35));
     let shadow = |dy: i8, blur: u8, a: u8| Shadow {
         offset: [0, dy],
         blur,
         spread: 0,
         color: Color32::from_black_alpha(if dark { a } else { a / 3 }),
     };
-    if neutral {
-        v.window_shadow = shadow(8, 24, 120);
-        v.popup_shadow = shadow(4, 16, 100);
+    v.popup_shadow = shadow(8, 24, 128);
+    v.window_shadow = if neutral {
+        shadow(8, 24, 120)
     } else {
-        v.window_shadow = shadow(12, 32, 150);
-        v.popup_shadow = shadow(6, 22, 130);
-    }
+        shadow(12, 32, 150)
+    };
 
     let r = CornerRadius::same(if neutral { 8.min(look.ui_r) } else { 8 });
     let w = &mut v.widgets;
@@ -533,15 +569,6 @@ pub fn popup_radius() -> u8 {
     if flat() { popup_radius_of(look()) } else { 16 }
 }
 
-/// Border of a floating surface: the plain hairline in Neutral, an accent wash in Neon.
-pub fn popup_stroke(p: &Palette) -> Stroke {
-    if flat() {
-        Stroke::new(1.0, p.stroke)
-    } else {
-        Stroke::new(1.0, p.accent.gamma_multiply(0.45))
-    }
-}
-
 /// Border of a status-coloured card (toast, banner): hairline in Neutral, `color` wash in Neon.
 pub fn status_stroke(p: &Palette, color: Color32, neon_alpha: f32) -> Stroke {
     if flat() {
@@ -564,17 +591,6 @@ pub fn backdrop(dark: bool) -> Color32 {
         (false, true) => 150,
         (false, false) => 70,
     })
-}
-
-/// Shadow under modal dialogs and large popups (soft and short in Neutral).
-pub fn modal_shadow(dark: bool) -> Shadow {
-    let (dy, blur, a) = if flat() { (10, 32, 150) } else { (20, 48, 180) };
-    Shadow {
-        offset: [0, dy],
-        blur,
-        spread: 0,
-        color: Color32::from_black_alpha(if dark { a } else { a / 3 }),
-    }
 }
 
 /// Axis-aligned two-colour gradient.
@@ -675,6 +691,7 @@ mod tests {
                         ui_style != UiStyle::Neon,
                         density,
                         &look,
+                        &FontFamily::Proportional,
                     );
                     assert_ne!(
                         style.visuals.window_fill, style.visuals.widgets.hovered.weak_bg_fill,
@@ -723,8 +740,9 @@ mod tests {
         let mut f = Style::default();
         let look = look::look_of(UiStyle::Neutral);
         let pal = palette_of(UiStyle::Neutral, true);
-        build(&mut c, pal, true, true, Density::Compact, &look);
-        build(&mut f, pal, true, true, Density::Comfortable, &look);
+        let fam = FontFamily::Proportional;
+        build(&mut c, pal, true, true, Density::Compact, &look, &fam);
+        build(&mut f, pal, true, true, Density::Comfortable, &look, &fam);
         assert!(c.spacing.interact_size.y < f.spacing.interact_size.y);
         assert!(c.spacing.item_spacing.y < f.spacing.item_spacing.y);
     }

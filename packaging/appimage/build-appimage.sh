@@ -34,7 +34,7 @@ cp "$appdir/omp-deck.png" "$appdir/.DirIcon"
 install -m 0644 packaging/icons/omp-deck.svg "$appdir/usr/share/icons/hicolor/scalable/apps/omp-deck.svg"
 # Project and bundled-asset licenses travel with the AppImage.
 install -m 0644 LICENSE-MIT LICENSE-APACHE README.md "$appdir/usr/share/doc/omp-deck/"
-install -m 0644 crates/omp-deck/assets/fonts/JetBrainsMono-OFL.txt \
+install -m 0644 crates/omp-deck/assets/fonts/UI-FONTS-OFL.txt \
     crates/omp-deck/assets/fonts/lucide-LICENSE.txt "$appdir/usr/share/doc/omp-deck/"
 for s in 16 24 32 48 64 128 256 512; do
     mkdir -p "$appdir/usr/share/icons/hicolor/${s}x${s}/apps"

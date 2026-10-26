@@ -69,7 +69,7 @@ if [ "$uninstall" -eq 1 ]; then
         rmdir "$icon_root/${s}x${s}/apps" "$icon_root/${s}x${s}" 2>/dev/null || true
     done
     rmdir "$icon_root/scalable/apps" "$icon_root/scalable" "$icon_root" 2>/dev/null || true
-    rm -f "$doc_dir/JetBrainsMono-OFL.txt" "$doc_dir/Geist-OFL.txt" "$doc_dir/lucide-LICENSE.txt"
+    rm -f "$doc_dir/UI-FONTS-OFL.txt" "$doc_dir/JetBrainsMono-OFL.txt" "$doc_dir/Geist-OFL.txt" "$doc_dir/lucide-LICENSE.txt"
     rmdir "$doc_dir" "$prefix/share/doc" 2>/dev/null || true
     rmdir "$(dirname "$icon_root")" 2>/dev/null || true
     refresh_caches
@@ -182,10 +182,10 @@ if [ -f "$src/icons/$APP.svg" ]; then
     install -m 0644 "$src/icons/$APP.svg" "$icon_root/scalable/apps/$APP.svg"
 fi
 
-# Bundled font licenses; older release tarballs predate licenses/ and are skipped. Geist (the UI
-# font before JetBrains Mono) is no longer shipped.
-rm -f "$doc_dir/Geist-OFL.txt"
-for lic in JetBrainsMono-OFL.txt lucide-LICENSE.txt; do
+# Bundled font licenses; older release tarballs predate licenses/ and are skipped. The UI fonts
+# share one combined OFL file; the per-font files of older installs (Geist, JetBrains Mono) go.
+rm -f "$doc_dir/Geist-OFL.txt" "$doc_dir/JetBrainsMono-OFL.txt"
+for lic in UI-FONTS-OFL.txt lucide-LICENSE.txt; do
     for cand in "$src/licenses/$lic" "$src/$lic"; do
         if [ -f "$cand" ]; then
             mkdir -p "$doc_dir"

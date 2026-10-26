@@ -15,14 +15,16 @@ use egui::{
     TextStyle, Ui, pos2, vec2,
 };
 
+use crate::badge::{self, Hue};
 use crate::icons::{
-    ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_COPY, ICON_FOLDER_OPEN, ICON_GIT_BRANCH,
-    ICON_MINUS, ICON_PENCIL, ICON_PLUS, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_TRASH_2, ICON_X,
-    Icon,
+    ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_COPY, ICON_FOLDER_GIT_2, ICON_FOLDER_OPEN,
+    ICON_GIT_BRANCH, ICON_MESSAGES_SQUARE, ICON_MINUS, ICON_PENCIL, ICON_PLUS, ICON_REFRESH_CW,
+    ICON_ROTATE_CCW, ICON_TRASH_2, ICON_X, Icon,
 };
 use crate::review::{Comment, Loc, MAX_QUOTE_LINES, Review, Reviews, Side, Span};
 use crate::theme::{self, Palette};
 use crate::widgets::{icon_text, paint_icon};
+use crate::{card, tips};
 
 /// Columns of a diff line that are laid out; the rest is cut with an ellipsis (minified files).
 const MAX_COLS: usize = 1000;
@@ -738,12 +740,26 @@ pub fn show(ui: &mut Ui, st: &mut ViewState) -> Vec<ChangesAction> {
         });
     });
     if let Some(root) = &st.root {
-        ui.label(
+        let r = ui.label(
             RichText::new(deck_core::sessions::abbreviate_home(root))
                 .small()
                 .color(pal.weak),
-        )
-        .on_hover_text(root.display().to_string());
+        );
+        card::hover(
+            &r,
+            320.0,
+            false,
+            &card::Header::new(ICON_FOLDER_GIT_2, "Repository"),
+            |_| {},
+            |ui| {
+                card::kv(ui, 64.0, "Root", |ui| tips::path(ui, root));
+                if let Some(b) = &st.branch {
+                    card::kv(ui, 64.0, "Branch", |ui| {
+                        badge::show(ui, Some(ICON_GIT_BRANCH), b, Hue::Blue, tips::VALUE);
+                    });
+                }
+            },
+        );
     }
     if let Some(busy) = &st.busy {
         ui.horizontal(|ui| {
@@ -1381,12 +1397,45 @@ fn show_rows(ui: &mut Ui, model: &mut DiffModel, mut cx: DiffCtx<'_>) {
                 }
                 if n_marks > 0 {
                     let review = &*cx.review;
-                    resp.on_hover_ui(|ui| {
-                        ui.set_max_width(340.0);
-                        for c in review.comments().iter().filter(marks) {
-                            ui.label(c.body.as_str());
-                        }
-                    });
+                    let head = card::Header::new(
+                        ICON_MESSAGES_SQUARE,
+                        if n_marks == 1 {
+                            "Review comment"
+                        } else {
+                            "Review comments"
+                        },
+                    )
+                    .subtitle(&cx.key.path);
+                    card::hover(
+                        &resp,
+                        360.0,
+                        false,
+                        &head,
+                        |ui| {
+                            let n = n_marks.to_string();
+                            badge::show(ui, None, &n, Hue::Amber, tips::VALUE);
+                        },
+                        |ui| {
+                            for c in review.comments().iter().filter(marks) {
+                                if let Some(lc) = &c.loc {
+                                    card::kv(ui, 64.0, "Lines", |ui| {
+                                        badge::show(
+                                            ui,
+                                            None,
+                                            &lc.span.label(),
+                                            Hue::Teal,
+                                            tips::VALUE,
+                                        );
+                                    });
+                                }
+                                tips::strong(ui, &c.body);
+                            }
+                            card::footer_hints(
+                                ui,
+                                &[("click", "comment"), ("shift+click", "extend the range")],
+                            );
+                        },
+                    );
                 }
             }
             if slots > 0 {

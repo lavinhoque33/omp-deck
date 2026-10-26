@@ -12,10 +12,13 @@ use deck_service::session_actions::ActionCtx;
 use deck_service::statusfmt::Activity;
 use deck_term::Terminal;
 
+use crate::badge::{self, Hue};
 use crate::icons::{
-    ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_SETTINGS, ICON_TERMINAL, ICON_X, Icon,
+    ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_SETTINGS, ICON_SPARKLES, ICON_TERMINAL,
+    ICON_X, Icon,
 };
 use crate::titlebar::strip_omp_prefix;
+use crate::{card, tips};
 use deck_service::status::TabStatus;
 use egui::{
     Align2, Color32, CursorIcon, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
@@ -380,13 +383,16 @@ fn paint_attention_badge(p: &Painter, pal: &Palette, c: Pos2, size: f32) {
 
 /// Warn wash and outline over a row/pill whose tab waits for the user.
 pub fn paint_attention_pill(p: &Painter, pal: &Palette, rect: Rect, radius: u8) {
-    p.rect(
-        rect,
-        radius,
+    let (fill, stroke) = attention_tone(pal);
+    p.rect(rect, radius, fill, stroke, StrokeKind::Inside);
+}
+
+/// Fill and outline of the attention wash.
+fn attention_tone(pal: &Palette) -> (Color32, Stroke) {
+    (
         pal.warn.gamma_multiply(0.13),
         Stroke::new(1.0, pal.warn.gamma_multiply(0.7)),
-        StrokeKind::Inside,
-    );
+    )
 }
 
 /// The tab that was open on a session being moved.
@@ -535,12 +541,11 @@ pub struct TabBarInput<'a> {
 
 /// Height of a tab's hit area (the full bar height); the pill is painted inset.
 pub fn tab_hit_h() -> f32 {
-    theme::dens(32.0, 36.0)
+    theme::dens(42.0, 46.0)
 }
 
-fn pill_inset_y() -> f32 {
-    if theme::flat() { 3.0 } else { 4.0 }
-}
+/// Gap between the tab row's edges and a tab pill (above and below).
+const PILL_INSET_Y: f32 = 5.0;
 const MAX_TEXT_W: f32 = 170.0;
 const CLOSE_W: f32 = 20.0;
 const ICON_W: f32 = 16.0;
@@ -575,7 +580,8 @@ pub fn show_tab_strip(
                     ui.scroll_with_delta(vec2(dy, 0.0));
                 }
             }
-            ui.spacing_mut().item_spacing.x = 2.0;
+            // The slanted outlines sit inside each tab's rect: the slant itself spaces them.
+            ui.spacing_mut().item_spacing.x = 0.0;
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                 for (i, tab) in input.tabs.iter().enumerate() {
                     if let Some(a) = show_tab(ui, input, i, tab)
@@ -609,7 +615,6 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     let title = tab.label(input.labels);
     let active = i == input.active;
     let shown = tab.uid().is_some_and(|u| input.shown.contains(&Some(u)));
-    let term = tab.term();
     let status = tab.status((active || shown) && !input.dashboard);
 
     let text_color = if active { pal.text_strong } else { pal.text };
@@ -623,14 +628,18 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     job.wrap.break_anywhere = true;
     let galley = ui.painter().layout_job(job);
 
-    let width = 12.0 + ICON_W + 8.0 + galley.size().x + 6.0 + CLOSE_W + 6.0;
+    let pill_h = tab_hit_h() - 2.0 * PILL_INSET_Y;
+    // Content stays upright between the slanted edges: the slant widens the padding at both ends.
+    let slant = skin::tab_slant(pill_h);
+    let width = slant + 12.0 + ICON_W + 8.0 + galley.size().x + 6.0 + CLOSE_W + 6.0 + slant;
     let (rect, resp) = ui.allocate_exact_size(vec2(width, tab_hit_h()), Sense::click());
     if input.scroll_to_active && active {
         ui.scroll_to_rect(rect.expand2(vec2(12.0, 0.0)), None);
     }
-    let pill = rect.shrink2(vec2(0.0, pill_inset_y()));
+    let pill = rect.shrink2(vec2(0.0, PILL_INSET_Y));
+    let inner = pill.shrink2(vec2(slant, 0.0));
     let close_rect = egui::Rect::from_center_size(
-        pos2(pill.right() - 6.0 - CLOSE_W / 2.0, pill.center().y),
+        pos2(inner.right() - 6.0 - CLOSE_W / 2.0, inner.center().y),
         vec2(CLOSE_W, CLOSE_W),
     );
     let close = ui.interact(close_rect, resp.id.with("close"), Sense::click());
@@ -642,97 +651,32 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     let sel = ctx.animate_bool_with_time(resp.id.with("sel"), active, 0.18);
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        // Hover / active pill.
-        let neutral = theme::flat();
-        let gallery = theme::is_gallery();
-        let radius = if gallery {
-            theme::look().tab_r
-        } else if neutral {
-            6
-        } else {
-            10
-        };
-        if gallery {
-            let tab_pill = if skin::tab_joins_canvas() {
-                egui::Rect::from_min_max(pill.min, pos2(pill.max.x, rect.bottom()))
-            } else {
-                pill
-            };
-            skin::paint_tab(p, tab_pill, pal, skin::TabState { hov, sel });
-        } else {
-            p.rect_filled(
-                pill,
-                radius,
-                theme::hover_fill(pal).gamma_multiply(0.8 * hov * (1.0 - sel)),
-            );
-            if hov > 0.01 {
-                p.rect_stroke(
-                    pill,
-                    radius,
-                    Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(hov)),
-                    StrokeKind::Inside,
-                );
-            }
-        }
-        if sel > 0.01 && !gallery {
-            p.rect(
-                pill,
-                radius,
-                pal.surface.gamma_multiply(sel),
-                Stroke::new(1.0, pal.stroke.gamma_multiply(sel)),
-                StrokeKind::Inside,
-            );
-            if neutral {
-                // Flat accent indicator along the pill's bottom edge.
-                let line = egui::Rect::from_min_max(
-                    pos2(pill.left() + 10.0, pill.bottom() - 2.0),
-                    pos2(pill.right() - 10.0, pill.bottom()),
-                );
-                p.rect_filled(line, 1, pal.accent.gamma_multiply(sel));
-            } else {
-                // Glowing accent underline.
-                let line = egui::Rect::from_min_max(
-                    pos2(pill.left() + 12.0, pill.bottom() - 3.0),
-                    pos2(pill.right() - 12.0, pill.bottom() - 1.0),
-                );
-                let glow = egui::Shadow {
-                    offset: [0, 0],
-                    blur: 12,
-                    spread: 0,
-                    color: pal.accent_a.gamma_multiply(0.55 * sel),
-                };
-                p.add(glow.as_shape(line, egui::CornerRadius::same(1)));
-                theme::gradient_rounded(
-                    p,
-                    line,
-                    1.0,
-                    pal.accent_a.gamma_multiply(sel),
-                    pal.accent_b.gamma_multiply(sel),
-                );
-            }
-        }
-        if shown && !active {
-            // Visible in another pane of the split: a faint plate and a dim accent line.
-            p.rect_filled(pill, radius, pal.surface.gamma_multiply(0.55));
-            let line = egui::Rect::from_min_max(
-                pos2(pill.left() + 12.0, pill.bottom() - 2.0),
-                pos2(pill.right() - 12.0, pill.bottom()),
-            );
-            p.rect_filled(line, 1, pal.accent.gamma_multiply(0.5));
-        }
+        let outline = skin::paint_tab(
+            p,
+            pill,
+            pal,
+            skin::TabState {
+                hov,
+                sel,
+                shown: shown && !active,
+                dark: ui.visuals().dark_mode,
+            },
+        );
         if status == TabStatus::Attention {
-            paint_attention_pill(p, pal, pill, radius);
+            let (fill, stroke) = attention_tone(pal);
+            crate::deco::fill(p, outline.clone(), fill);
+            crate::deco::outline(p, outline, stroke);
         }
         // Leading icon / status.
-        let ic = pos2(pill.left() + 12.0 + ICON_W / 2.0, pill.center().y);
+        let ic = pos2(inner.left() + 12.0 + ICON_W / 2.0, inner.center().y);
         if !paint_status(ui, ic, ICON_W, status) {
             let (icon, col) = tab.kind_icon(pal, sel);
             paint_icon(p, ic, Align2::CENTER_CENTER, icon, 16.0, col);
         }
         p.galley(
             pos2(
-                pill.left() + 12.0 + ICON_W + 8.0,
-                pill.center().y - galley.size().y / 2.0,
+                inner.left() + 12.0 + ICON_W + 8.0,
+                inner.center().y - galley.size().y / 2.0,
             ),
             galley,
             text_color,
@@ -758,22 +702,9 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     }
 
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    let resp = if input.modal_open {
-        resp
-    } else {
-        resp.on_hover_ui(|ui| {
-            ui.label(title);
-            if let Some(hint) = status.hint() {
-                ui.weak(hint);
-            }
-            if let Some(p) = tab.session_path() {
-                ui.weak(p.display().to_string());
-            }
-            if let Some(code) = term.and_then(|t| t.terminal().exit_code()) {
-                ui.weak(format!("process exited: {code}"));
-            }
-        })
-    };
+    if !input.modal_open {
+        hover_card(&resp, pal, tab, title, status);
+    }
 
     let mut action = None;
     if close.clicked() || (resp.middle_clicked() && !close.hovered()) {
@@ -789,6 +720,55 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
         }
     });
     action
+}
+
+/// Hover card of a tab (the tab strip and the sidebar's "Open tabs" rows): title and live state
+/// in the header, folder / session file / model / backend session in the body.
+pub fn hover_card(resp: &egui::Response, pal: &Palette, tab: &Tab, title: &str, status: TabStatus) {
+    const KEY_W: f32 = 76.0;
+    let term = tab.term();
+    let exit = term.and_then(|t| t.terminal().exit_code());
+    let mut head =
+        card::Header::new(tab.kind_icon(pal, 1.0).0, title).tone(tips::status_tone(pal, status));
+    if let Some(hint) = status.hint() {
+        head = head.subtitle(hint);
+    }
+    card::hover(
+        resp,
+        390.0,
+        false,
+        &head,
+        |ui| {
+            if term.is_some() {
+                tips::status_badge(ui, status, exit);
+            }
+        },
+        |ui| {
+            if let Some(t) = term {
+                card::kv(ui, KEY_W, "Folder", |ui| tips::path(ui, &t.cwd));
+                if let Some(p) = t.session_path() {
+                    card::kv(ui, KEY_W, "Session", |ui| tips::path(ui, p));
+                }
+                if let Some(m) = t.info().and_then(|i| i.current_model.as_deref()) {
+                    card::kv(ui, KEY_W, "Model", |ui| {
+                        let name = m.rsplit('/').next().unwrap_or(m);
+                        badge::show(ui, Some(ICON_SPARKLES), name, Hue::Violet, tips::VALUE);
+                    });
+                }
+                if let Some(n) = &t.mux_name {
+                    card::kv(ui, KEY_W, "tmux", |ui| tips::mono(ui, n));
+                }
+            }
+            card::footer_hints(
+                ui,
+                &[
+                    ("click", "focus"),
+                    ("middle-click", "close"),
+                    ("right-click", "actions"),
+                ],
+            );
+        },
+    );
 }
 
 #[cfg(test)]

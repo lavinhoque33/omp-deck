@@ -649,20 +649,18 @@ pub fn show(
         .gap(8.0)
         .width(popup_w)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .frame(
-            egui::Frame::popup(&ctx.global_style())
-                .fill(if theme::flat() {
-                    ctx.global_style().visuals.window_fill
-                } else {
-                    Palette::of_ctx(&ctx).raised
-                })
-                .stroke(Stroke::new(1.0, Palette::of_ctx(&ctx).stroke))
-                .corner_radius(theme::rad(10, 14))
-                .inner_margin(egui::Margin::same(12)),
-        )
+        .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(12)))
         .show(|ui| {
-            ui.set_width(popup_w - 24.0);
-            body(ui, state, input, just_opened, &mut actions);
+            let pal = Palette::of_ctx(&ctx);
+            let fill = if theme::flat() {
+                ctx.global_style().visuals.window_fill
+            } else {
+                pal.raised
+            };
+            crate::card::chrome(ui, egui::Margin::same(12), fill, |ui| {
+                ui.set_width(popup_w - 24.0);
+                body(ui, state, input, just_opened, &mut actions);
+            });
         });
     state.refocus_search |= actions.iter().any(|a| {
         matches!(
@@ -687,7 +685,7 @@ fn body(
     ui.spacing_mut().item_spacing = vec2(6.0, 8.0);
 
     // Search + refresh.
-    ui.horizontal(|ui| {
+    let search_row = ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         let w = ui.available_width() - 34.0;
         let edit = TextEdit::singleline(&mut state.search)
@@ -724,6 +722,19 @@ fn body(
             actions.push(PickerAction::Refresh);
         }
     });
+    {
+        let r = search_row.response.rect;
+        ui.add_space(4.0);
+        let (sep, _) = ui.allocate_exact_size(vec2(r.width(), 1.0), Sense::hover());
+        crate::card::header_rule(
+            ui,
+            sep.left(),
+            sep.right(),
+            sep.center().y,
+            Color32::TRANSPARENT,
+        );
+        ui.add_space(4.0);
+    }
     state.refresh_providers(input.catalog);
     provider_dropdown(ui, state, input);
 

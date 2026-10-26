@@ -10,7 +10,9 @@ use crate::icons::{
     ICON_SEARCH, ICON_SEARCH_X, ICON_SETTINGS_2, ICON_SLIDERS_HORIZONTAL, ICON_SPARKLES, ICON_SUN,
     ICON_TERMINAL, ICON_TRIANGLE_ALERT, ICON_WRENCH,
 };
-use deck_core::config::{Density, GatewayMode, Theme, UiStyle};
+use deck_core::config::{
+    Density, GatewayMode, MAX_UI_SCALE, MIN_UI_SCALE, Theme, UiFont, UiFontKind, UiStyle,
+};
 use deck_core::mux::BackendChoice;
 use deck_core::omp::{Setting, SettingsCatalog};
 use deck_service::gateway::protocol::{Effective, GatewayStatus, Supervision};
@@ -91,7 +93,9 @@ impl OmpDeckPage {
     fn subtitle(self) -> &'static str {
         match self {
             Self::General => "Where sessions run and how the window behaves",
-            Self::Appearance => "Font size, theme, style and density of this app",
+            Self::Appearance => {
+                "App and terminal font size, theme, style, UI font and density of this app"
+            }
             Self::Notifications => "What the bell and desktop pop-ups tell you about your sessions",
             Self::Updates => "Keep OmpDeck and omp up to date",
             Self::Backup => "Back up your omp configuration to Google Drive",
@@ -204,9 +208,12 @@ pub struct SettingsInput<'a> {
     pub font_size: f32,
     pub font_range: (f32, f32),
     pub font_default: f32,
+    /// App-wide scale (egui zoom, 1.0 = 100 %).
+    pub ui_scale: f32,
     pub theme: Theme,
     pub style: UiStyle,
     pub density: Density,
+    pub ui_font: UiFont,
     pub native_decorations: bool,
     pub omp_found: bool,
     pub omp_version: Option<&'a str>,
@@ -231,9 +238,12 @@ pub struct BackendCard {
 #[derive(Debug, PartialEq)]
 pub enum SettingsAction {
     FontSize(f32),
+    /// App-wide zoom factor (1.0 = 100 %).
+    UiScale(f32),
     Theme(Theme),
     Style(UiStyle),
     Density(Density),
+    UiFont(UiFont),
     NativeDecorations(bool),
     SetCheckUpdates(bool),
     CheckUpdates,
@@ -841,11 +851,50 @@ fn ompdeck_page(
 fn appearance_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<SettingsAction>) {
     let pal = Palette::of_ui(ui);
     card(ui, "Appearance", |ui| {
+        // The whole app zooms; the terminal row below compensates, so its size stays absolute.
+        let mut percent = (input.ui_scale * 100.0).round() as i32;
+        let effective = theme::body_size(input.style) * input.ui_scale;
+        let effective = if (effective - effective.round()).abs() < 0.05 {
+            format!("{effective:.0} pt")
+        } else {
+            format!("{effective:.1} pt")
+        };
+        setting_row(
+            ui,
+            "App font size",
+            &format!(
+                "{effective} at {percent} % — menus, tabs, sidebar and dialogs; the terminal has its own size"
+            ),
+            |ui| {
+                ui.spacing_mut().slider_width = 120.0;
+                if ui
+                    .add(
+                        egui::Button::new(icon_text(crate::icons::ICON_ROTATE_CCW, 16.0, pal.text))
+                            .min_size(vec2(30.0, 28.0)),
+                    )
+                    .on_hover_text("Reset to 100 %")
+                    .clicked()
+                {
+                    actions.push(SettingsAction::UiScale(1.0));
+                }
+                let slider = egui::Slider::new(
+                    &mut percent,
+                    (MIN_UI_SCALE * 100.0).round() as i32..=(MAX_UI_SCALE * 100.0).round() as i32,
+                )
+                .step_by(5.0)
+                .show_value(false);
+                if ui.add(slider).changed() {
+                    actions.push(SettingsAction::UiScale(percent as f32 / 100.0));
+                }
+            },
+        );
+        ui.add_space(4.0);
         setting_row(
             ui,
             "Terminal font size",
             "Ctrl+Shift+= / - / 0 also work",
             |ui| {
+                ui.spacing_mut().slider_width = 120.0;
                 if ui
                     .add(
                         egui::Button::new(icon_text(crate::icons::ICON_ROTATE_CCW, 16.0, pal.text))
@@ -896,6 +945,8 @@ fn appearance_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Se
         ui.add_space(8.0);
         style_gallery(ui, input.style, actions);
         ui.add_space(4.0);
+        ui_font_row(ui, input.ui_font, actions);
+        ui.add_space(4.0);
         setting_row(
             ui,
             "Density",
@@ -919,6 +970,58 @@ fn appearance_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Se
             },
         );
     });
+}
+
+/// The UI font picker: every choice set in its own face, grouped Default / Sans / Mono.
+fn ui_font_row(ui: &mut Ui, current: UiFont, actions: &mut Vec<SettingsAction>) {
+    let pal = Palette::of_ui(ui);
+    setting_row(
+        ui,
+        "UI font",
+        "Menus, tabs, sidebar and dialogs (not the terminal)",
+        |ui| {
+            ui.add_enabled_ui(current != UiFont::Auto, |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(icon_text(crate::icons::ICON_ROTATE_CCW, 16.0, pal.text))
+                            .min_size(vec2(30.0, 28.0)),
+                    )
+                    .on_hover_text("Reset to the style default")
+                    .clicked()
+                {
+                    actions.push(SettingsAction::UiFont(UiFont::Auto));
+                }
+            });
+            egui::ComboBox::from_id_salt("ui-font")
+                .selected_text(
+                    RichText::new(current.label())
+                        .family(crate::ui_fonts::preview_family(current))
+                        .color(pal.text_strong),
+                )
+                .width(220.0)
+                .height(520.0)
+                .show_ui(ui, |ui| {
+                    for (kind, caption) in [
+                        (UiFontKind::Default, "Default"),
+                        (UiFontKind::Sans, "Sans"),
+                        (UiFontKind::Mono, "Mono"),
+                    ] {
+                        ui.add_space(4.0);
+                        ui.label(theme::section_caption(caption, pal.weak));
+                        for font in UiFont::ALL.into_iter().filter(|f| f.kind() == kind) {
+                            let text = RichText::new(font.label())
+                                .family(crate::ui_fonts::preview_family(font))
+                                .size(14.0);
+                            if ui.selectable_label(font == current, text).clicked()
+                                && font != current
+                            {
+                                actions.push(SettingsAction::UiFont(font));
+                            }
+                        }
+                    }
+                });
+        },
+    );
 }
 
 fn general_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<SettingsAction>) {

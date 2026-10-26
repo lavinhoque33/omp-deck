@@ -94,7 +94,7 @@ pub struct RowsState {
     offsets: Vec<f32>,
     /// Measured gist galleys by snapshot index; valid for `gist_key`.
     gists: Vec<Option<Arc<Galley>>>,
-    gist_key: Option<(u64, i32, bool, bool)>,
+    gist_key: Option<(u64, i32, bool, bool, deck_core::config::UiFont)>,
     /// Height of all rows as last prepared.
     total: f32,
 }
@@ -111,6 +111,7 @@ impl RowsState {
             width.round() as i32,
             tree,
             ui.visuals().dark_mode,
+            crate::theme::ui_font(),
         );
         if self.order_key == Some(key) && self.gist_key == Some(gist_key) {
             return self.total;

@@ -384,7 +384,7 @@ impl App {
             let surrender = ctx.options(|o| o.input_options.surrender_focus_on);
             ctx.options_mut(|o| o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never);
             let pressed = ui.input(|i| i.pointer.primary_pressed());
-            let font_size = self.cfg.font_size;
+            let font_size = self.terminal_font_size();
             let focused_slot = self.split.focused();
             let mut any_focus = false;
             let mut focus_taken = false;

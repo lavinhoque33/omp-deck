@@ -1,25 +1,154 @@
 //! UI font setup. Flat styles: bundled JetBrains Mono (variable, OFL) as the primary face of the
 //! [`NEUTRAL_FAMILY`] family. Neon style: Adwaita Sans (fallback Cantarell, Noto Sans) as the
-//! Proportional family. The Neutral family is rebuilt by [`finalize`] as JetBrains Mono followed
-//! by the whole Proportional chain, so its glyph coverage is a superset of Neon's. The bundled
-//! Lucide icon font backs the `lucide` family (and is a Proportional fallback so glyphs in
-//! label strings render). Must run after `deck_term::install_fonts`, which replaces the whole
-//! definition set and owns the `term*` families.
+//! Proportional family. Every bundled face heads a UI text family of its own ([`text_family`]),
+//! used by every style when that [`UiFont`] is chosen. [`finalize`] completes the Neutral family
+//! and every text family with the whole Proportional chain, so their glyph coverage is a
+//! superset of Neon's. Every bundled face also has a face-only preview family
+//! ([`preview_family`]). The bundled Lucide icon font backs the `lucide` family (and is a
+//! Proportional fallback so glyphs in label strings render). Must run after
+//! `deck_term::install_fonts`, which replaces the whole definition set and owns the `term*`
+//! families.
 
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Command;
+use std::sync::LazyLock;
 
+use deck_core::config::UiFont;
 use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
 use egui::{Context, FontData, FontDefinitions, FontFamily};
 
 /// Named family of the flat styles' UI text (JetBrains Mono first, then the system faces).
 pub const NEUTRAL_FAMILY: &str = "ui-neutral";
 
-/// Font-data key of the bundled UI face.
-const UI_FACE_KEY: &str = "jetbrains-mono";
-static UI_FACE: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-VariableFont.ttf");
+/// Every bundled UI face: (choice, font-data key = name of its preview family, bytes).
+static FACES: [(UiFont, &str, &[u8]); 18] = [
+    (
+        UiFont::JetBrainsMono,
+        "ui-font-jetbrains-mono",
+        include_bytes!("../assets/fonts/JetBrainsMono-VariableFont.ttf"),
+    ),
+    (
+        UiFont::Geist,
+        "ui-font-geist",
+        include_bytes!("../assets/fonts/ui/Geist-Regular.ttf"),
+    ),
+    (
+        UiFont::Inter,
+        "ui-font-inter",
+        include_bytes!("../assets/fonts/ui/Inter-Regular.ttf"),
+    ),
+    (
+        UiFont::IbmPlexSans,
+        "ui-font-ibm-plex-sans",
+        include_bytes!("../assets/fonts/ui/IBMPlexSans-Regular.ttf"),
+    ),
+    (
+        UiFont::Manrope,
+        "ui-font-manrope",
+        include_bytes!("../assets/fonts/ui/Manrope-Regular.ttf"),
+    ),
+    (
+        UiFont::SpaceGrotesk,
+        "ui-font-space-grotesk",
+        include_bytes!("../assets/fonts/ui/SpaceGrotesk-Regular.ttf"),
+    ),
+    (
+        UiFont::PlusJakartaSans,
+        "ui-font-plus-jakarta-sans",
+        include_bytes!("../assets/fonts/ui/PlusJakartaSans-Regular.ttf"),
+    ),
+    (
+        UiFont::Onest,
+        "ui-font-onest",
+        include_bytes!("../assets/fonts/ui/Onest-Regular.ttf"),
+    ),
+    (
+        UiFont::GeistMono,
+        "ui-font-geist-mono",
+        include_bytes!("../assets/fonts/ui/GeistMono-Regular.ttf"),
+    ),
+    (
+        UiFont::RedHatMono,
+        "ui-font-red-hat-mono",
+        include_bytes!("../assets/fonts/ui/RedHatMono-Regular.ttf"),
+    ),
+    (
+        UiFont::MartianMono,
+        "ui-font-martian-mono",
+        include_bytes!("../assets/fonts/ui/MartianMono-Regular.ttf"),
+    ),
+    (
+        UiFont::Outfit,
+        "ui-font-outfit",
+        include_bytes!("../assets/fonts/ui/Outfit-Regular.ttf"),
+    ),
+    (
+        UiFont::Sora,
+        "ui-font-sora",
+        include_bytes!("../assets/fonts/ui/Sora-Regular.ttf"),
+    ),
+    (
+        UiFont::BricolageGrotesque,
+        "ui-font-bricolage-grotesque",
+        include_bytes!("../assets/fonts/ui/BricolageGrotesque-Regular.ttf"),
+    ),
+    (
+        UiFont::Lexend,
+        "ui-font-lexend",
+        include_bytes!("../assets/fonts/ui/Lexend-Regular.ttf"),
+    ),
+    (
+        UiFont::Figtree,
+        "ui-font-figtree",
+        include_bytes!("../assets/fonts/ui/Figtree-Regular.ttf"),
+    ),
+    (
+        UiFont::Urbanist,
+        "ui-font-urbanist",
+        include_bytes!("../assets/fonts/ui/Urbanist-Regular.ttf"),
+    ),
+    (
+        UiFont::VictorMono,
+        "ui-font-victor-mono",
+        include_bytes!("../assets/fonts/ui/VictorMono-Regular.ttf"),
+    ),
+];
+
+/// Font-data key of the face of the flat styles' default UI font.
+const NEUTRAL_FACE_KEY: &str = "ui-font-jetbrains-mono";
 static LUCIDE: &[u8] = include_bytes!("../assets/fonts/lucide.ttf");
+
+/// Name of the UI text family of `FACES[i]`: that face, then the whole Proportional chain.
+fn text_family_name(i: usize) -> String {
+    format!("ui-text-{}", FACES[i].0.key())
+}
+
+/// Index into [`FACES`] of `font`'s bundled face (`None` for `Auto` and `System`).
+fn face(font: UiFont) -> Option<usize> {
+    FACES.iter().position(|(f, ..)| *f == font)
+}
+
+/// UI text family of an explicitly chosen bundled `font` (`None` for `Auto` and `System`).
+pub fn text_family(font: UiFont) -> Option<FontFamily> {
+    static TEXT: LazyLock<Vec<FontFamily>> = LazyLock::new(|| {
+        (0..FACES.len())
+            .map(|i| FontFamily::Name(text_family_name(i).into()))
+            .collect()
+    });
+    face(font).map(|i| TEXT[i].clone())
+}
+
+/// Family to set `font`'s name in for the picker: its bundled face alone, else (`Auto`,
+/// `System`) the family that choice gives the active style.
+pub fn preview_family(font: UiFont) -> FontFamily {
+    static PREVIEWS: LazyLock<[FontFamily; 18]> =
+        LazyLock::new(|| FACES.map(|(_, key, _)| FontFamily::Name(key.into())));
+    match face(font) {
+        Some(i) => PREVIEWS[i].clone(),
+        None => crate::theme::family_for(crate::theme::look(), crate::theme::flat(), font),
+    }
+}
 
 /// Candidates in preference order: (family, well-known file paths).
 #[cfg(unix)]
@@ -98,24 +227,42 @@ impl UiFonts {
             .collect();
         UiFonts { faces }
     }
+
+    /// No system faces (headless tests: the bundled faces only).
+    #[cfg(test)]
+    pub fn none() -> UiFonts {
+        UiFonts { faces: Vec::new() }
+    }
 }
 
 fn neutral_family() -> FontFamily {
     FontFamily::Name(NEUTRAL_FAMILY.into())
 }
 
-/// Installs JetBrains Mono, the icon font and the preloaded system UI faces (no I/O). The first
-/// system face becomes the primary Proportional face; the rest are appended as extra glyph
-/// fallbacks.
+/// Installs every bundled UI face (heading its preview family and its UI text family, so both
+/// exist from the first frame; JetBrains Mono also heads the Neutral family), the icon font and
+/// the preloaded system UI faces (no I/O). The first system face becomes the primary
+/// Proportional face; the rest are appended as extra glyph fallbacks.
 pub fn install(ctx: &Context, fonts: UiFonts) {
-    ctx.add_font(FontInsert::new(
-        UI_FACE_KEY,
-        FontData::from_static(UI_FACE),
-        vec![InsertFontFamily {
-            family: neutral_family(),
-            priority: FontPriority::Highest,
-        }],
-    ));
+    for (i, (_, key, bytes)) in FACES.iter().enumerate() {
+        let mut families = vec![
+            InsertFontFamily {
+                family: FontFamily::Name((*key).into()),
+                priority: FontPriority::Highest,
+            },
+            InsertFontFamily {
+                family: FontFamily::Name(text_family_name(i).into()),
+                priority: FontPriority::Highest,
+            },
+        ];
+        if i == 0 {
+            families.push(InsertFontFamily {
+                family: neutral_family(),
+                priority: FontPriority::Highest,
+            });
+        }
+        ctx.add_font(FontInsert::new(key, FontData::from_static(bytes), families));
+    }
     for (i, (family, bytes)) in fonts.faces.into_iter().enumerate() {
         let priority = if i == 0 {
             FontPriority::Highest
@@ -150,19 +297,87 @@ pub fn install(ctx: &Context, fonts: UiFonts) {
     ));
 }
 
-/// Makes the Neutral family's coverage a superset of Proportional's: JetBrains Mono first, then every
+/// `first` followed by every other face of the Proportional chain `prop`, in order.
+fn chain(first: &str, prop: &[String]) -> Vec<String> {
+    std::iter::once(first.to_owned())
+        .chain(prop.iter().filter(|k| *k != first).cloned())
+        .collect()
+}
+
+/// Makes the Neutral family and every bundled face's UI text family that face followed by every
 /// Proportional face in order (system UI faces, egui's emoji faces, deck-term's symbol / CJK /
-/// color-emoji fallbacks, Lucide). Call once from the first frame, when the final definitions
-/// (after every queued `add_font`) are readable.
+/// color-emoji fallbacks, Lucide), so none covers fewer glyphs than Neon. Call once from the
+/// first frame, when the final definitions (after every queued `add_font`) are readable.
+/// Every UI font choice is prepared here, so switching fonts later only selects another family:
+/// a runtime `set_fonts` would rebuild the glyph atlas under every cached galley.
 pub fn finalize(ctx: &Context) {
     let mut defs: FontDefinitions = ctx.fonts(|f| f.definitions().clone());
-    let mut chain = vec![UI_FACE_KEY.to_owned()];
-    if let Some(prop) = defs.families.get(&FontFamily::Proportional) {
-        chain.extend(prop.iter().filter(|k| *k != UI_FACE_KEY).cloned());
+    let prop = defs
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let mut changed = false;
+    let wanted = std::iter::once((neutral_family(), NEUTRAL_FACE_KEY)).chain(
+        FACES
+            .iter()
+            .enumerate()
+            .map(|(i, (_, key, _))| (FontFamily::Name(text_family_name(i).into()), *key)),
+    );
+    for (family, first) in wanted {
+        let chain = chain(first, &prop);
+        if defs.families.get(&family) != Some(&chain) {
+            defs.families.insert(family, chain);
+            changed = true;
+        }
     }
-    if defs.families.get(&neutral_family()) == Some(&chain) {
-        return;
+    if changed {
+        ctx.set_fonts(defs);
     }
-    defs.families.insert(neutral_family(), chain);
-    ctx.set_fonts(defs);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_bundled_choice_has_one_face() {
+        for font in UiFont::ALL {
+            let bundled = FACES.iter().filter(|(f, ..)| *f == font).count();
+            let expected = usize::from(!matches!(font, UiFont::Auto | UiFont::System));
+            assert_eq!(bundled, expected, "{font:?}");
+        }
+        assert_eq!(
+            (FACES[0].0, FACES[0].1),
+            (UiFont::JetBrainsMono, NEUTRAL_FACE_KEY)
+        );
+    }
+
+    /// Every bundled face leads its UI text family and the whole Proportional chain follows it,
+    /// so an explicit font never covers fewer glyphs than the style default.
+    #[test]
+    fn text_families_are_the_face_then_the_proportional_chain() {
+        let ctx = Context::default();
+        install(&ctx, UiFonts::none());
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .textures_delta
+            .clear();
+        finalize(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .textures_delta
+            .clear();
+        let defs = ctx.fonts(|f| f.definitions().clone());
+        let prop = &defs.families[&FontFamily::Proportional];
+        let neutral = &defs.families[&neutral_family()];
+        assert_eq!(neutral[0], NEUTRAL_FACE_KEY);
+        assert_eq!(&neutral[1..], prop.as_slice());
+        for (font, key, _) in &FACES {
+            let Some(family) = text_family(*font) else {
+                panic!("{font:?} has no text family");
+            };
+            let chain = &defs.families[&family];
+            assert_eq!(chain[0], *key);
+            assert_eq!(&chain[1..], prop.as_slice(), "{font:?}");
+        }
+    }
 }

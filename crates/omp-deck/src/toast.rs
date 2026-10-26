@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use egui::{Align2, Area, Context, Frame, Id, Margin, Order, RichText, vec2};
 
-use crate::icons::{ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_INFO, ICON_X};
+use crate::icons::{ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_COPY, ICON_INFO, ICON_X};
 use crate::summary::summarize;
 use crate::theme::{self, Palette};
-use crate::widgets::{icon_text, paint_icon};
+use crate::widgets::{DraftButton, DraftKind, icon_text, paint_icon};
 
 const FADE_IN: f32 = 0.18;
 const FADE_OUT: f32 = 0.35;
@@ -168,15 +168,9 @@ impl Toasts {
                                                     .wrap_mode(egui::TextWrapMode::Wrap),
                                                 );
                                                 if let Some(full) = &t.detail
-                                                    && ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                RichText::new("Copy details")
-                                                                    .small()
-                                                                    .color(pal.weak),
-                                                            )
-                                                            .frame(false),
-                                                        )
+                                                    && DraftButton::new("Copy details")
+                                                        .icon(ICON_COPY)
+                                                        .show(ui)
                                                         .on_hover_text(
                                                             "Copy the full message to the clipboard",
                                                         )
@@ -208,22 +202,9 @@ impl Toasts {
                                                 dismissed = Some(t.id);
                                             }
                                             if let Some(act) = &t.action
-                                                && ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            theme::strong(&act.label)
-                                                                .color(pal.text_strong),
-                                                        )
-                                                        .fill(if theme::flat() {
-                                                            pal.surface
-                                                        } else {
-                                                            color.gamma_multiply(0.25)
-                                                        })
-                                                        .stroke(theme::status_stroke(
-                                                            pal, color, 0.7,
-                                                        ))
-                                                        .corner_radius(8),
-                                                    )
+                                                && DraftButton::new(&act.label)
+                                                    .kind(DraftKind::Primary)
+                                                    .show(ui)
                                                     .clicked()
                                             {
                                                 clicked = Some(ToastClick::Action(act.id));

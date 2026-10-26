@@ -23,13 +23,16 @@ use deck_service::gateway::protocol::{
 };
 use deck_service::inject::Requires;
 use deck_service::session_actions::{self, Action, ActionCtx, CompactMode};
-use egui::{TextEdit, Ui};
+use egui::{RichText, TextEdit, Ui};
 
 use super::{App, PendingConfirm};
+use crate::card;
 use crate::confirm::{self, Confirm, Dialog};
+use crate::icons::{ICON_FOLD_VERTICAL, ICON_HANDSHAKE, ICON_PENCIL};
 use crate::model_picker::PickerAction;
 use crate::statusbar::{self, BarAction, BarInput};
 use crate::tabs::{Tab, TabRole, TermTab};
+use crate::theme::Palette;
 
 /// Terminal input is dropped for this long (renewed every frame) while a dialog is open.
 const MODAL_HOLD: Duration = Duration::from_millis(250);
@@ -619,6 +622,29 @@ impl App {
         let Some(dialog) = self.dialog.as_mut() else {
             return;
         };
+        // The tab the dialog acts on (it was active when the dialog opened; modals keep it so).
+        let active = self.tabs.get(self.active);
+        let session = active.map_or("", |t| {
+            crate::titlebar::strip_omp_prefix(t.title(&self.labels))
+        });
+        let project = active
+            .and_then(Tab::term)
+            .map(|t| abbreviate_home(&t.cwd))
+            .unwrap_or_default();
+        let facts = |ui: &mut Ui| {
+            let pal = Palette::of_ui(ui);
+            card::kv(ui, 84.0, "Session", |ui| {
+                ui.add(
+                    egui::Label::new(crate::theme::strong(session).color(pal.text_strong))
+                        .truncate(),
+                );
+            });
+            if !project.is_empty() {
+                card::kv(ui, 84.0, "Project", |ui| {
+                    ui.add(egui::Label::new(RichText::new(&project).color(pal.text)).truncate());
+                });
+            }
+        };
         let result = match dialog {
             ActionDialog::Handoff { focus, first } => confirm::show_dialog(
                 ctx,
@@ -630,9 +656,17 @@ impl App {
                     confirm_enabled: true,
                     danger: false,
                     enter_confirms: false,
+                    icon: Some(ICON_HANDSHAKE),
+                    subtitle: Some("Continues in a new context from a summary"),
+                    ..Default::default()
                 },
                 |ui| {
-                    ui.label("omp summarizes the session into a handoff document and continues from it. Optionally tell it what to focus on.");
+                    facts(ui);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("omp summarizes the session into a handoff document and continues from it. Optionally tell it what to focus on.")
+                            .color(Palette::of_ui(ui).weak),
+                    );
                     focus_editor(ui, focus, first, true, "Focus instructions (optional)");
                 },
             ),
@@ -646,9 +680,17 @@ impl App {
                     confirm_enabled: !focus.trim().is_empty(),
                     danger: false,
                     enter_confirms: false,
+                    icon: Some(ICON_FOLD_VERTICAL),
+                    subtitle: Some("Summarizes older turns, keeps what you name"),
+                    ..Default::default()
                 },
                 |ui| {
-                    ui.label("What should the compacted context keep?");
+                    facts(ui);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("What should the compacted context keep?")
+                            .color(Palette::of_ui(ui).weak),
+                    );
                     focus_editor(ui, focus, first, true, "e.g. the auth refactor decisions");
                 },
             ),
@@ -662,8 +704,12 @@ impl App {
                     confirm_enabled: !title.trim().is_empty(),
                     danger: false,
                     enter_confirms: true,
+                    icon: Some(ICON_PENCIL),
+                    subtitle: Some("Shown in tabs and session lists"),
+                    ..Default::default()
                 },
                 |ui| {
+                    facts(ui);
                     focus_editor(ui, title, first, false, "New title");
                 },
             ),

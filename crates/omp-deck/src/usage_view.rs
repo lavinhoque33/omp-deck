@@ -23,7 +23,7 @@ use crate::usage_state::{
     ActivityView, CARD_ROWS, CardView, DetailBlock, Load, ModelRow, NoDataWarning, QuotaRow,
     Summary, Tile,
 };
-use crate::widgets::{Spin, empty_state, icon_text, paint_icon};
+use crate::widgets::{DraftButton, Spin, empty_state, icon_text};
 
 const GRID_GAP: f32 = 2.5;
 const DAY_LETTERS: [&str; 7] = ["M", "T", "W", "T", "F", "S", "S"];
@@ -111,13 +111,8 @@ pub fn show(ctx: &egui::Context, st: &mut ViewState, input: &ViewInput<'_>) -> V
             .clamp(440.0, 900.0)
             .min(screen.height() - 24.0),
     );
-    let style = ctx.global_style();
-    let frame = Frame::NONE
-        .fill(pal.bar)
-        .stroke(theme::popup_stroke(pal))
-        .corner_radius(theme::popup_radius())
-        .inner_margin(Margin::symmetric(20, 16))
-        .shadow(style.visuals.window_shadow);
+    let margin = Margin::symmetric(20, 16);
+    let frame = Frame::NONE.inner_margin(margin);
     egui::Window::new("usage-window")
         .id(Id::unique("usage-window"))
         .title_bar(false)
@@ -129,7 +124,11 @@ pub fn show(ctx: &egui::Context, st: &mut ViewState, input: &ViewInput<'_>) -> V
         .min_size(vec2(600.0, 380.0))
         .default_size(size)
         .default_pos(screen.center() - size / 2.0)
-        .show(ctx, |ui| body(ui, st, input, &mut out));
+        .show(ctx, |ui| {
+            crate::card::chrome(ui, margin, pal.bar, |ui| {
+                body(ui, st, input, &mut out);
+            });
+        });
     out
 }
 
@@ -157,24 +156,7 @@ fn header(ui: &mut Ui, input: &ViewInput<'_>, out: &mut Vec<UsageAction>) {
         ui,
         |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-            ui.painter().rect_filled(
-                rect,
-                theme::rad(8, 10),
-                if theme::flat() {
-                    pal.surface
-                } else {
-                    pal.accent.gamma_multiply(0.18)
-                },
-            );
-            paint_icon(
-                ui.painter(),
-                rect.center(),
-                Align2::CENTER_CENTER,
-                ICON_GAUGE,
-                19.0,
-                pal.glyph,
-            );
+            crate::card::icon_tile(ui, 30.0, ICON_GAUGE, Color32::TRANSPARENT, true);
             ui.label(theme::strong("Usage").size(19.0).color(pal.text_strong));
             let when = crate::usage_fmt::header_when(
                 input.fetching,
@@ -213,6 +195,12 @@ fn header(ui: &mut Ui, input: &ViewInput<'_>, out: &mut Vec<UsageAction>) {
             }
         },
     );
+    let (left, right, y) = (
+        ui.min_rect().left(),
+        ui.min_rect().left() + ui.available_width(),
+        ui.min_rect().bottom() + 3.0,
+    );
+    crate::card::header_rule(ui, left, right, y, Color32::TRANSPARENT);
 }
 
 fn tabs(ui: &mut Ui, st: &mut ViewState) {
@@ -505,7 +493,7 @@ fn warning_state(ui: &mut Ui, w: &NoDataWarning, out: &mut Vec<UsageAction>) {
     }
     ui.add_space(4.0);
     ui.vertical_centered(|ui| {
-        if ui.button("Retry").clicked() {
+        if DraftButton::new("Retry").show(ui).clicked() {
             out.push(UsageAction::Refresh);
         }
     });
@@ -521,7 +509,7 @@ fn error_state(ui: &mut Ui, msg: &str, out: &mut Vec<UsageAction>) {
         msg,
     );
     ui.vertical_centered(|ui| {
-        if ui.button("Retry").clicked() {
+        if DraftButton::new("Retry").show(ui).clicked() {
             out.push(UsageAction::Refresh);
         }
     });
@@ -547,7 +535,7 @@ fn error_strip(ui: &mut Ui, msg: &str, out: &mut Vec<UsageAction>) {
                     .truncate(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("Retry").clicked() {
+                    if DraftButton::new("Retry").min_width(72.0).show(ui).clicked() {
                         out.push(UsageAction::Refresh);
                     }
                 });
@@ -681,38 +669,37 @@ fn remaining_bar(ui: &mut Ui, width: f32, left: f32, color: Color32) {
 
 // ------------------------------------------------------------------ chip hover
 
-/// The compact tooltip of the status-bar chip.
-pub fn hover_ui(ui: &mut Ui, summary: &Summary) {
-    let pal = Palette::of_ui(ui);
-    ui.set_width(312.0);
-    ui.spacing_mut().item_spacing.y = 6.0;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 7.0;
-        ui.label(icon_text(ICON_GAUGE, 16.0, pal.glyph));
-        ui.label(theme::strong("Usage").color(pal.text_strong));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new("Ctrl+Shift+U").small().color(pal.weak));
-        });
-    });
-    let mut first = true;
-    for c in summary.cards.iter().filter(|c| !c.idle) {
-        if !first {
-            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-            ui.painter().rect_filled(rect, 0, pal.stroke);
-        }
-        first = false;
-        provider_card(ui, c, true);
-    }
-    if first {
-        ui.label(RichText::new("Nothing used yet").small().color(pal.weak));
-    }
-    if !summary.untouched.is_empty() {
-        ui.label(RichText::new(&summary.untouched).small().color(pal.weak));
-    }
-    ui.label(
-        RichText::new("Click for the full Usage view")
-            .small()
-            .color(pal.weak),
+/// The compact hover card of the status-bar chip, shown while `resp` is hovered.
+pub fn hover(resp: &egui::Response, summary: &Summary) {
+    crate::card::hover(
+        resp,
+        312.0,
+        false,
+        &crate::card::Header::new(ICON_GAUGE, "Usage"),
+        |ui| {
+            crate::card::kbd(ui, "Ctrl+Shift+U");
+        },
+        |ui| {
+            let pal = Palette::of_ui(ui);
+            ui.spacing_mut().item_spacing.y = 6.0;
+            let mut first = true;
+            for c in summary.cards.iter().filter(|c| !c.idle) {
+                if !first {
+                    let (rect, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                    ui.painter().rect_filled(rect, 0, pal.stroke);
+                }
+                first = false;
+                provider_card(ui, c, true);
+            }
+            if first {
+                ui.label(RichText::new("Nothing used yet").small().color(pal.weak));
+            }
+            if !summary.untouched.is_empty() {
+                ui.label(RichText::new(&summary.untouched).small().color(pal.weak));
+            }
+            crate::card::footer_hints(ui, &[("click", "full Usage view")]);
+        },
     );
 }
 
@@ -836,7 +823,7 @@ fn heatmap(ui: &mut Ui, hm: &Heatmap) {
             Stroke::new(1.5, pal.text_strong),
             StrokeKind::Outside,
         );
-        resp.on_hover_ui_at_pointer(|ui| cell_tip(ui, hm, row, week));
+        cell_tip(&resp, hm, row, week);
     }
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -860,23 +847,45 @@ fn heatmap(ui: &mut Ui, hm: &Heatmap) {
     });
 }
 
-fn cell_tip(ui: &mut Ui, hm: &Heatmap, row: usize, week: usize) {
-    let pal = Palette::of_ui(ui);
+fn cell_tip(resp: &egui::Response, hm: &Heatmap, row: usize, week: usize) {
+    use crate::badge::{self, Hue};
+    use crate::card::{self, Header};
+    const KEY_W: f32 = 84.0;
     let t = hm.totals[row][week];
-    ui.spacing_mut().item_spacing.y = 2.0;
-    ui.label(theme::strong(long_date(hm.date_at(row, week))).color(pal.text_strong));
-    if t.requests == 0 && t.cost <= 0.0 {
-        ui.label(RichText::new("No activity").color(pal.weak));
-        return;
-    }
-    ui.label(RichText::new(money(t.cost)).color(pal.text));
-    ui.label(RichText::new(requests(t.requests)).color(pal.text));
-    ui.label(
-        RichText::new(format!(
-            "{} tokens",
-            crate::statusbar::group_digits(t.tokens)
-        ))
-        .color(pal.weak),
+    let date = long_date(hm.date_at(row, week));
+    let head = Header::new(ICON_ACTIVITY, &date);
+    card::hover(
+        resp,
+        260.0,
+        true,
+        &head,
+        |ui| {
+            if t.requests == 0 && t.cost <= 0.0 {
+                badge::show(ui, None, "Idle", Hue::Blue, 12.0);
+            }
+        },
+        |ui| {
+            let pal = Palette::of_ui(ui);
+            if t.requests == 0 && t.cost <= 0.0 {
+                ui.label(RichText::new("No activity").color(pal.weak));
+                return;
+            }
+            card::kv(ui, KEY_W, "Cost", |ui| {
+                badge::show(ui, None, &money(t.cost), Hue::Amber, 12.0);
+            });
+            card::kv(ui, KEY_W, "Requests", |ui| {
+                ui.label(RichText::new(requests(t.requests)).color(pal.text_strong));
+            });
+            card::kv(ui, KEY_W, "Tokens", |ui| {
+                badge::show(
+                    ui,
+                    None,
+                    &crate::statusbar::group_digits(t.tokens),
+                    Hue::Teal,
+                    12.0,
+                );
+            });
+        },
     );
 }
 

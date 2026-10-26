@@ -8,13 +8,13 @@ use std::sync::Mutex;
 
 use deck_core::selfupdate::{self, Applied, InstallKind, Release};
 use deck_service::gateway::protocol::{AppUpdateView, UpdatePhase};
-use egui::{ProgressBar, RichText, Ui};
+use egui::{Color32, ProgressBar, RichText, Ui};
 
 use crate::icons::{
     ICON_CIRCLE_ARROW_UP, ICON_COPY, ICON_DOWNLOAD, ICON_EXTERNAL_LINK, ICON_REFRESH_CW, ICON_X,
 };
 use crate::theme::{self, Palette};
-use crate::widgets::{Spin, card, icon_text, menu_item, setting_row, toggle};
+use crate::widgets::{DraftButton, DraftKind, Spin, card, menu_item, setting_row, toggle};
 
 /// The running OmpDeck's version.
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
@@ -308,13 +308,6 @@ impl PillView<'_> {
             Phase::Idle => format!("OmpDeck {}", self.release.version),
         }
     }
-
-    pub fn tip(&self) -> String {
-        format!(
-            "OmpDeck {} is available (you have {CURRENT})",
-            self.release.version
-        )
-    }
 }
 
 fn is_package(kind: &InstallKind) -> bool {
@@ -342,8 +335,11 @@ pub fn popover(ui: &mut Ui, v: &PillView<'_>) -> Option<UpdateAction> {
     ui.set_min_width(300.0);
     ui.add_space(2.0);
     ui.horizontal(|ui| {
-        ui.add_space(10.0);
+        ui.add_space(4.0);
+        ui.spacing_mut().item_spacing.x = 10.0;
+        crate::card::icon_tile(ui, 30.0, ICON_CIRCLE_ARROW_UP, Color32::TRANSPARENT, true);
         ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
             ui.label(
                 theme::strong(format!("OmpDeck {} is available", v.release.version))
                     .size(14.5)
@@ -356,8 +352,16 @@ pub fn popover(ui: &mut Ui, v: &PillView<'_>) -> Option<UpdateAction> {
             );
         });
     });
-    ui.add_space(2.0);
-    ui.separator();
+    ui.add_space(6.0);
+    let left = ui.min_rect().left();
+    crate::card::header_rule(
+        ui,
+        left,
+        left + ui.min_rect().width().max(300.0),
+        ui.cursor().top(),
+        Color32::TRANSPARENT,
+    );
+    ui.add_space(4.0);
     match v.phase {
         Phase::Downloading { done, total } => {
             ui.add_space(4.0);
@@ -367,7 +371,12 @@ pub fn popover(ui: &mut Ui, v: &PillView<'_>) -> Option<UpdateAction> {
                 mib(*done),
                 total.map_or_else(|| "?".to_owned(), mib)
             )));
-            if menu_item(ui, ICON_X, "Cancel download", None, true, false).clicked() {
+            ui.add_space(4.0);
+            if DraftButton::new("Cancel download")
+                .icon(ICON_X)
+                .show(ui)
+                .clicked()
+            {
                 action = Some(UpdateAction::Cancel);
             }
         }
@@ -408,7 +417,11 @@ pub fn popover(ui: &mut Ui, v: &PillView<'_>) -> Option<UpdateAction> {
                         .selectable(true)
                         .wrap(),
                 );
-                if menu_item(ui, ICON_COPY, "Copy command", None, true, false).clicked() {
+                if DraftButton::new("Copy command")
+                    .icon(ICON_COPY)
+                    .show(ui)
+                    .clicked()
+                {
                     action = Some(UpdateAction::CopyCommand(command.clone()));
                 }
             }
@@ -437,7 +450,12 @@ pub fn popover(ui: &mut Ui, v: &PillView<'_>) -> Option<UpdateAction> {
                         } else {
                             (ICON_CIRCLE_ARROW_UP, "Update and restart")
                         };
-                        if menu_item(ui, icon, label, None, true, false).clicked() {
+                        if DraftButton::new(label)
+                            .kind(DraftKind::Primary)
+                            .icon(icon)
+                            .show(ui)
+                            .clicked()
+                        {
                             action = Some(UpdateAction::Install);
                         }
                     }
@@ -526,14 +544,10 @@ pub fn settings_card(ui: &mut Ui, c: &SettingsCard<'_>) -> Vec<SettingsAction> {
         setting_row(ui, &format!("OmpDeck {CURRENT}"), &line, |ui| {
             if matches!(c.phase, Phase::Downloading { .. }) {
                 ui.add(Spin::new(18.0, pal.accent_b));
-                if ui
-                    .add(
-                        egui::Button::new((
-                            icon_text(ICON_X, 16.0, pal.glyph),
-                            RichText::new("Cancel"),
-                        ))
-                        .min_size(egui::vec2(0.0, 30.0)),
-                    )
+                if DraftButton::new("Cancel")
+                    .icon(ICON_X)
+                    .min_width(88.0)
+                    .show(ui)
                     .clicked()
                 {
                     out.push(SettingsAction::Cancel);
@@ -546,26 +560,18 @@ pub fn settings_card(ui: &mut Ui, c: &SettingsCard<'_>) -> Vec<SettingsAction> {
             }
             if let Some(r) = c.available
                 && c.kind.is_some_and(|k| cannot_update(k).is_none())
-                && ui
-                    .add(
-                        egui::Button::new((
-                            icon_text(ICON_CIRCLE_ARROW_UP, 16.0, pal.glyph),
-                            RichText::new(format!("Update to {}", r.version)),
-                        ))
-                        .min_size(egui::vec2(0.0, 30.0)),
-                    )
+                && DraftButton::new(&format!("Update to {}", r.version))
+                    .kind(DraftKind::Primary)
+                    .icon(ICON_CIRCLE_ARROW_UP)
+                    .show(ui)
                     .clicked()
             {
                 out.push(SettingsAction::Install);
             }
-            if ui
-                .add(
-                    egui::Button::new((
-                        icon_text(ICON_REFRESH_CW, 16.0, pal.glyph),
-                        RichText::new("Check now"),
-                    ))
-                    .min_size(egui::vec2(0.0, 30.0)),
-                )
+            if DraftButton::new("Check now")
+                .icon(ICON_REFRESH_CW)
+                .min_width(104.0)
+                .show(ui)
                 .clicked()
             {
                 out.push(SettingsAction::CheckNow);

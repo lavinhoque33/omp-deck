@@ -397,7 +397,16 @@ when a `v*` tag is pushed (the tag must match the version in `Cargo.toml`).
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
 
-Bundled third-party assets: the [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) font (SIL Open
-Font License 1.1, `crates/omp-deck/assets/fonts/JetBrainsMono-OFL.txt`) and [lucide](https://lucide.dev) icons (ISC,
+Bundled third-party assets: the UI fonts [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono),
+[Inter](https://github.com/rsms/inter), [Geist and Geist Mono](https://github.com/vercel/geist-font),
+[IBM Plex Sans](https://github.com/IBM/plex), [Manrope](https://github.com/googlefonts/manrope),
+[Space Grotesk](https://github.com/floriankarsten/space-grotesk),
+[Plus Jakarta Sans](https://github.com/tokotype/PlusJakartaSans), [Onest](https://github.com/googlefonts/onest),
+[Outfit](https://github.com/Outfitio/Outfit-Fonts), [Sora](https://github.com/sora-xor/sora-font),
+[Bricolage Grotesque](https://github.com/ateliertriay/bricolage), [Lexend](https://github.com/googlefonts/lexend),
+[Figtree](https://github.com/erikdkennedy/figtree), [Urbanist](https://github.com/coreyhu/Urbanist),
+[Red Hat Mono](https://github.com/RedHatOfficial/RedHatFont), [Martian Mono](https://github.com/evilmartians/mono)
+and [Victor Mono](https://github.com/rubjo/victor-mono-font) (SIL Open Font License 1.1, all license texts in
+`crates/omp-deck/assets/fonts/UI-FONTS-OFL.txt`) and [lucide](https://lucide.dev) icons (ISC,
 `crates/omp-deck/assets/fonts/lucide-LICENSE.txt`). The Windows build ships Microsoft's ConPTY
 (`conpty.dll`, `OpenConsole.exe` from the `Microsoft.Windows.Console.ConPTY` package, MIT).

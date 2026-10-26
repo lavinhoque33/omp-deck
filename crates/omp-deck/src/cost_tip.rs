@@ -6,13 +6,13 @@
 //! [`CostTip::build`] formats everything once per status snapshot; [`show`] only paints.
 
 use deck_core::status::{CostDetail, CostSource};
-use egui::{Align, Layout, Rect, RichText, Sense, Ui, vec2};
+use egui::{Align, Layout, Rect, Response, RichText, Sense, Ui, vec2};
 
 use crate::badge::{self, Badge, Hue};
+use crate::card;
 use crate::icons::ICON_COINS;
 use crate::statusbar::group_digits;
 use crate::theme::{self, Palette};
-use crate::widgets::icon_text;
 
 const WIDTH: f32 = 340.0;
 
@@ -155,30 +155,35 @@ fn source_tip(title: &'static str, hue: Hue, noun: (&str, &str), s: &CostSource)
     }
 }
 
-/// Paints the tooltip body (call from `on_hover_ui`).
-pub fn show(ui: &mut Ui, tip: &CostTip) {
-    let pal = Palette::of_ui(ui);
-    ui.set_width(WIDTH);
-    ui.spacing_mut().item_spacing.y = 6.0;
-
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 7.0;
-        ui.label(icon_text(ICON_COINS, 15.0, pal.glyph));
-        ui.label(theme::strong("Session cost").color(pal.text_strong));
-        if tip.partial {
-            badge::show(ui, None, "breakdown partial", Hue::Amber, 10.5);
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+/// Shows the tooltip card while `resp` is hovered.
+pub fn hover(resp: &Response, tip: &CostTip) {
+    card::hover(
+        resp,
+        WIDTH,
+        false,
+        &card::Header::new(ICON_COINS, "Session cost"),
+        |ui| {
             badge::show(ui, None, &tip.total, Hue::Green, 13.0);
-        });
-    });
+            if tip.partial {
+                badge::show(ui, None, "breakdown partial", Hue::Amber, 10.5);
+            }
+        },
+        |ui| body(ui, tip),
+    );
+}
 
-    for s in &tip.sources {
-        rule(ui, pal);
+fn body(ui: &mut Ui, tip: &CostTip) {
+    let pal = Palette::of_ui(ui);
+    ui.spacing_mut().item_spacing.y = 6.0;
+    for (i, s) in tip.sources.iter().enumerate() {
+        if i > 0 {
+            rule(ui, pal);
+        }
         source(ui, pal, s);
     }
-
-    rule(ui, pal);
+    if !tip.sources.is_empty() {
+        rule(ui, pal);
+    }
     for line in [
         "As recorded in the session file: every branch, before and after compaction.",
         "Not included: subagent (task) runs, and anything omp has not written to the file yet.",

@@ -214,23 +214,24 @@ pub struct AccLook {
     pub sub: Sub,
 }
 
+/// The style's touch on top of the slanted signal-edge tab (see `skin::paint_tab`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TabKind {
-    /// Raised pill with an accent underline.
+    /// The plain signal edge: dark active plate, accent gradient outline, glow.
     Plain,
-    /// Active tab filled with the sidebar tone (+ highlight).
+    /// Active tab filled with the sidebar tone (+ top highlight).
     Filled,
-    /// Teal tint and border.
+    /// Accent-tinted active plate.
     Tint,
-    /// Inactive tabs outlined.
+    /// Inactive tabs outlined at full stroke strength.
     Outlined,
-    /// Gradient underline.
+    /// Gradient outline (the signal edge itself is the look).
     Grad,
-    /// Translucent glass pill.
+    /// Translucent glass plate with a top highlight.
     Glass,
-    /// 2 px boxes, hard accent shadow on the active one.
+    /// 2 px outlines, hard accent offset shadow on the active one.
     Brutal,
-    /// Folder tab joined to the canvas.
+    /// Active tab filled with the canvas tone.
     Folder,
 }
 

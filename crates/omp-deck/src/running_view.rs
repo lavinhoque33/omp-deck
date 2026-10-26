@@ -12,8 +12,11 @@ use egui::{
 };
 
 use crate::app::human_size;
+use crate::badge::{self, Hue};
 use crate::col_alloc::{self, CELL_PAD};
-use crate::icons::{ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CIRCLE_STOP};
+use crate::icons::{
+    ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CIRCLE_STOP, ICON_CPU, ICON_TERMINAL,
+};
 use crate::paint_cache;
 use crate::running_model::{RunCol, RunModel, RunRow};
 use crate::sessions_model::{Check, plural, split_project_label};
@@ -23,6 +26,7 @@ use crate::sessions_view::{
 };
 use crate::theme::{self, Palette};
 use crate::widgets::{Spin, empty_state, paint_icon};
+use crate::{card, tips};
 use deck_service::backend::kind_label;
 
 const TITLE_MIN: f32 = 190.0;
@@ -415,10 +419,7 @@ fn rows(
                     && !kill_rect.contains(at)
                 {
                     let col = column_at(inner.left() + CHECK_W, cols, widths, at.x);
-                    resp.on_hover_ui_at_pointer(|ui| {
-                        ui.set_max_width(380.0);
-                        tip(ui, row, col);
-                    });
+                    tip(&resp, row, col);
                 }
             }
         });
@@ -579,36 +580,72 @@ fn paint_kill_button(
     }
 }
 
-fn tip(ui: &mut Ui, row: &RunRow, col: Option<RunCol>) {
-    let weak = Palette::of_ui(ui).weak;
-    match col {
-        Some(RunCol::Ram) => match row.raw.memory {
-            Some(m) => {
-                ui.label(format!("{} of memory", human_size(m.bytes)));
-                ui.label(format!(
-                    "{} in the process tree",
-                    plural(m.processes as usize, "process", "processes")
-                ));
-                if let Some(pid) = row.raw.pid {
-                    ui.label(RichText::new(format!("pid {pid}")).color(weak));
+/// Hover card of a row (at the pointer): the memory breakdown over the RAM column, else the
+/// session's backend name, uptime, folder and files.
+fn tip(resp: &egui::Response, row: &RunRow, col: Option<RunCol>) {
+    const KEY_W: f32 = 84.0;
+    if col == Some(RunCol::Ram) {
+        card::hover(
+            resp,
+            300.0,
+            true,
+            &card::Header::new(ICON_CPU, "Memory").subtitle(&row.title),
+            |ui| {
+                if let Some(m) = row.raw.memory {
+                    badge::show(ui, None, &human_size(m.bytes), Hue::Teal, tips::VALUE);
                 }
-                ui.label(RichText::new("Shared pages are split between their users").color(weak));
-            }
-            None => {
-                ui.label("Memory could not be read");
+            },
+            |ui| match row.raw.memory {
+                Some(m) => {
+                    card::kv(ui, KEY_W, "Processes", |ui| {
+                        let n = m.processes.to_string();
+                        badge::show(ui, None, &n, Hue::Amber, tips::VALUE);
+                    });
+                    if let Some(pid) = row.raw.pid {
+                        card::kv(ui, KEY_W, "Pid", |ui| {
+                            badge::show(ui, None, &pid.to_string(), Hue::Blue, tips::VALUE);
+                        });
+                    }
+                    tips::note(ui, "Shared pages are split between their users");
+                }
+                None => tips::note(ui, "Memory could not be read"),
+            },
+        );
+        return;
+    }
+    card::hover(
+        resp,
+        380.0,
+        true,
+        &card::Header::new(ICON_TERMINAL, &row.title),
+        |ui| {
+            if row.flags.attention {
+                badge::show(ui, None, "needs input", Hue::Amber, tips::VALUE);
+            } else if row.flags.busy {
+                badge::show(ui, None, "working", Hue::Blue, tips::VALUE);
+            } else {
+                badge::show(ui, None, "running", Hue::Green, tips::VALUE);
             }
         },
-        _ => {
-            ui.label(RichText::new(&row.title).strong());
-            ui.label(RichText::new(format!("session {}", row.name())).color(weak));
+        |ui| {
+            card::kv(ui, KEY_W, "Session", |ui| tips::mono(ui, row.name()));
+            card::kv(ui, KEY_W, "Uptime", |ui| {
+                badge::show(ui, None, &row.uptime, Hue::Amber, tips::VALUE);
+            });
+            if row.flags.in_tab {
+                card::kv(ui, KEY_W, "Shown", |ui| {
+                    badge::show(ui, None, "open in a tab", Hue::Violet, tips::VALUE);
+                });
+            }
             if let Some(cwd) = &row.raw.cwd {
-                ui.label(RichText::new(cwd.display().to_string()).color(weak));
+                card::kv(ui, KEY_W, "Folder", |ui| tips::path(ui, cwd));
             }
             for f in &row.raw.files {
-                ui.label(RichText::new(f.display().to_string()).color(weak));
+                card::kv(ui, KEY_W, "File", |ui| tips::path(ui, f));
             }
-        }
-    }
+            card::footer_hints(ui, &[("click", "select"), ("shift+click", "range")]);
+        },
+    );
 }
 
 /// Totals / selection on the left, the bulk kill button on the right.

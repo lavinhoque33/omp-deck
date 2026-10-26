@@ -5,15 +5,17 @@
 use deck_core::config::SyncInterval;
 use egui::{Button, Context, Frame, Id, Margin, RichText, ScrollArea, Stroke, Ui, vec2};
 
+use crate::badge::{self, Hue};
+use crate::card as deck_card;
 use crate::confirm::{Dialog, show_dialog, show_dialog_labeled};
 use crate::drive_view::{DriveAction, DriveCard};
 use crate::icons::{
-    ICON_ARCHIVE_RESTORE, ICON_CLOUD_UPLOAD, ICON_FOLDER, ICON_FOLDER_OPEN, ICON_FOLDER_PLUS,
-    ICON_LIST_CHECKS, ICON_LOG_IN, ICON_PENCIL, ICON_REFRESH_CW, ICON_TRASH_2, ICON_TRIANGLE_ALERT,
-    ICON_X,
+    ICON_ARCHIVE_RESTORE, ICON_CIRCLE_CHECK, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_FOLDER,
+    ICON_FOLDER_OPEN, ICON_FOLDER_PLUS, ICON_LIST_CHECKS, ICON_LOG_IN, ICON_PENCIL,
+    ICON_REFRESH_CW, ICON_TRASH_2, ICON_TRIANGLE_ALERT, ICON_X,
 };
 use crate::theme::{self, Palette};
-use crate::widgets::{Spin, card, icon_text, setting_row, toggle};
+use crate::widgets::{DraftButton, DraftKind, Spin, card, icon_text, setting_row, toggle};
 
 const PLAN_LIST_MAX: usize = 8;
 
@@ -169,12 +171,19 @@ fn weak_note(ui: &mut Ui, text: &str) {
     );
 }
 
-fn button(ui: &mut Ui, enabled: bool, icon: crate::icons::Icon, label: &str) -> egui::Response {
-    let pal = Palette::of_ui(ui);
+fn button(
+    ui: &mut Ui,
+    enabled: bool,
+    kind: DraftKind,
+    icon: crate::icons::Icon,
+    label: &str,
+) -> egui::Response {
     ui.add_enabled(
         enabled,
-        Button::new((icon_text(icon, 16.0, pal.glyph), RichText::new(label)))
-            .min_size(vec2(0.0, theme::dens(28.0, 30.0))),
+        DraftButton::new(label)
+            .kind(kind)
+            .icon(icon)
+            .enabled(enabled),
     )
 }
 
@@ -263,7 +272,15 @@ fn account_strip(ui: &mut Ui, account: &DriveCard, actions: &mut Vec<SyncAction>
             "Sign in to back up projects",
             "Uses the same Google account as the config backup",
             |ui| {
-                if button(ui, true, ICON_LOG_IN, "Sign in with Google").clicked() {
+                if button(
+                    ui,
+                    true,
+                    DraftKind::Primary,
+                    ICON_LOG_IN,
+                    "Sign in with Google",
+                )
+                .clicked()
+                {
                     actions.push(SyncAction::Drive(DriveAction::SignIn));
                 }
             },
@@ -273,7 +290,7 @@ fn account_strip(ui: &mut Ui, account: &DriveCard, actions: &mut Vec<SyncAction>
             "Waiting for the browser…",
             "Finish signing in on the Google page that just opened.",
             |ui| {
-                if button(ui, true, ICON_X, "Cancel").clicked() {
+                if button(ui, true, DraftKind::Secondary, ICON_X, "Cancel").clicked() {
                     actions.push(SyncAction::Drive(DriveAction::CancelSignIn));
                 }
                 ui.add(Spin::new(18.0, pal.accent_b));
@@ -335,7 +352,15 @@ pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
             } else {
                 "Add folder…"
             };
-            if button(ui, !page.picking, ICON_FOLDER_PLUS, label).clicked() {
+            if button(
+                ui,
+                !page.picking,
+                DraftKind::Secondary,
+                ICON_FOLDER_PLUS,
+                label,
+            )
+            .clicked()
+            {
                 actions.push(SyncAction::Add);
             }
         });
@@ -368,12 +393,24 @@ pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
             "Restore a project from Google Drive",
             "Pick a backup, a folder on this computer and what to bring back",
             |ui| {
-                let resp = button(ui, idle, ICON_ARCHIVE_RESTORE, "Restore…");
+                let resp = button(
+                    ui,
+                    idle,
+                    DraftKind::Primary,
+                    ICON_ARCHIVE_RESTORE,
+                    "Restore…",
+                );
                 if resp.clicked() {
                     actions.push(SyncAction::OpenRestore);
                 }
                 resp.on_disabled_hover_text(why_not);
-                let resp = button(ui, idle, ICON_LIST_CHECKS, "Manage cloud backups…");
+                let resp = button(
+                    ui,
+                    idle,
+                    DraftKind::Secondary,
+                    ICON_LIST_CHECKS,
+                    "Manage cloud backups…",
+                );
                 if resp.clicked() {
                     actions.push(SyncAction::OpenManager);
                 }
@@ -435,7 +472,13 @@ fn project_row(
                             let any = (row.omp_on && row.cells.omp_usable())
                                 || (row.sessions_on && row.cells.sessions_usable())
                                 || (row.memory_on && row.cells.memory_usable());
-                            let resp = button(ui, idle && any, ICON_CLOUD_UPLOAD, "Back up now");
+                            let resp = button(
+                                ui,
+                                idle && any,
+                                DraftKind::Primary,
+                                ICON_CLOUD_UPLOAD,
+                                "Back up now",
+                            );
                             if resp.clicked() {
                                 actions.push(SyncAction::BackUp(i));
                             }
@@ -446,7 +489,15 @@ fn project_row(
                             });
                         }
                     }
-                    if button(ui, row.busy.is_none(), ICON_PENCIL, "Change…").clicked() {
+                    if button(
+                        ui,
+                        row.busy.is_none(),
+                        DraftKind::Secondary,
+                        ICON_PENCIL,
+                        "Change…",
+                    )
+                    .clicked()
+                    {
                         actions.push(SyncAction::Change(i));
                     }
                 },
@@ -476,12 +527,14 @@ fn project_row(
                     row.cells.sessions_usable(),
                     &s_text,
                     s_why,
-                    Some(small_button_width(ui, "Choose…")),
+                    Some(CHOOSE_W),
                     |ui| {
                         choose = ui
                             .add_enabled(
                                 sessions_choose,
-                                Button::new(RichText::new("Choose…").small()),
+                                DraftButton::new("Choose…")
+                                    .enabled(sessions_choose)
+                                    .min_width(CHOOSE_W),
                             )
                             .on_hover_text(
                                 "Pick which sessions are backed up (new ones are included)",
@@ -511,26 +564,36 @@ fn project_row(
             ui.add_space(2.0);
             match &row.last {
                 LastView::Never => {
-                    ui.label(RichText::new("Last backup: never").small().color(pal.weak));
+                    deck_card::kv(ui, 84.0, "Last backup", |ui| {
+                        ui.label(RichText::new("never").small().color(pal.weak));
+                    });
                 }
                 LastView::At { text, tip, skipped } => {
-                    let mut line = format!("Last backup: {text}");
                     let mut hover = tip.clone();
                     if !skipped.is_empty() {
-                        line += &format!(
-                            " · {} file{} skipped",
-                            skipped.len(),
-                            if skipped.len() == 1 { "" } else { "s" }
-                        );
                         hover += &format!("\nSkipped:\n{}", skipped.join("\n"));
                     }
-                    let color = if skipped.is_empty() {
-                        pal.weak
-                    } else {
-                        pal.warn
-                    };
-                    ui.label(RichText::new(line).small().color(color))
-                        .on_hover_text(hover);
+                    deck_card::kv(ui, 84.0, "Last backup", |ui| {
+                        let hue = if skipped.is_empty() {
+                            Hue::Green
+                        } else {
+                            Hue::Amber
+                        };
+                        badge::show(ui, None, text, hue, 10.5).on_hover_text(hover);
+                        if !skipped.is_empty() {
+                            badge::show(
+                                ui,
+                                None,
+                                &format!(
+                                    "{} file{} skipped",
+                                    skipped.len(),
+                                    if skipped.len() == 1 { "" } else { "s" }
+                                ),
+                                Hue::Amber,
+                                10.5,
+                            );
+                        }
+                    });
                 }
                 LastView::Failed(e) => {
                     ui.horizontal(|ui| {
@@ -578,29 +641,8 @@ fn part_switch(
     }
 }
 
-/// Width of a small button labelled `text`.
-fn small_button_width(ui: &Ui, text: &'static str) -> f32 {
-    let font = egui::TextStyle::Small.resolve(ui.style());
-    let key = egui::Id::unique((
-        "small_button_text_w",
-        text,
-        font.size.to_bits(),
-        ui.ctx().pixels_per_point().to_bits(),
-    ));
-    let text_w = match ui.data(|d| d.get_temp::<f32>(key)) {
-        Some(w) => w,
-        None => {
-            let w = ui
-                .painter()
-                .layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE)
-                .size()
-                .x;
-            ui.data_mut(|d| d.insert_temp(key, w));
-            w
-        }
-    };
-    text_w + 2.0 * ui.spacing().button_padding.x
-}
+/// Width reserved for (and minimum width of) the "Choose…" button in a part cell.
+const CHOOSE_W: f32 = 104.0;
 
 /// A part cell (`[switch] label size` plus an optional trailing widget of known width) that is
 /// never split: when it does not fit on the current line of a wrapped row, the whole cell moves
@@ -712,6 +754,12 @@ pub fn path_dialog(ctx: &Context, p: &mut PathPrompt) -> PathAnswer {
             confirm_enabled: ok,
             danger: false,
             enter_confirms: true,
+            icon: Some(match p.purpose {
+                PathPurpose::Add => ICON_FOLDER_PLUS,
+                PathPurpose::Change(_) => ICON_PENCIL,
+            }),
+            subtitle: Some("No folder picker found: type the path"),
+            ..Default::default()
         },
         |ui| {
             ui.add(
@@ -722,14 +770,16 @@ pub fn path_dialog(ctx: &Context, p: &mut PathPrompt) -> PathAnswer {
                 .wrap_mode(egui::TextWrapMode::Wrap),
             );
             ui.add_space(10.0);
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut p.text)
-                    .id(Id::unique("omp-deck-sync-path"))
-                    .hint_text("~/projects/app")
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(ui.available_width())
-                    .margin(Margin::symmetric(10, 8)),
-            );
+            let resp = deck_card::kv(ui, 70.0, "Folder", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut p.text)
+                        .id(Id::unique("omp-deck-sync-path"))
+                        .hint_text("~/projects/app")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(ui.available_width())
+                        .margin(Margin::symmetric(10, 8)),
+                )
+            });
             if p.focus_first {
                 resp.request_focus();
                 p.focus_first = false;
@@ -798,15 +848,18 @@ pub fn backup_dialog(
             confirm_enabled: any && !busy,
             danger: false,
             enter_confirms: false,
+            icon: Some(ICON_CLOUD_UPLOAD),
+            subtitle: Some("Project folder to OmpDeck's private Drive folder"),
+            ..Default::default()
         },
         |ui| {
-            ui.horizontal(|ui| {
-                ui.add(icon_label(ICON_FOLDER, pal.glyph));
+            deck_card::kv(ui, 84.0, "Folder", |ui| {
                 ui.add(
                     egui::Label::new(RichText::new(&d.display).color(pal.text_strong)).truncate(),
                 );
             });
-            ui.add_space(10.0);
+            ui.add_space(8.0);
+            deck_card::section(ui, "WHAT TO BACK UP");
             ui.horizontal_wrapped(|ui| {
                 let (t, why) = cells.omp_text();
                 part_switch(
@@ -829,12 +882,14 @@ pub fn backup_dialog(
                     cells.sessions_usable(),
                     &t,
                     why,
-                    Some(small_button_width(ui, "Choose…")),
+                    Some(CHOOSE_W),
                     |ui| {
                         if ui
                             .add_enabled(
                                 cells.sessions_choosable() && !busy,
-                                Button::new(RichText::new("Choose…").small()),
+                                DraftButton::new("Choose…")
+                                    .enabled(cells.sessions_choosable() && !busy)
+                                    .min_width(CHOOSE_W),
                             )
                             .on_hover_text(
                                 "Pick which sessions are backed up (new ones are included)",
@@ -864,14 +919,19 @@ pub fn backup_dialog(
             });
             if d.excluded > 0 {
                 ui.add_space(4.0);
-                weak_note(
-                    ui,
-                    &format!(
-                        "{} session{} left out",
-                        d.excluded,
-                        if d.excluded == 1 { "" } else { "s" }
-                    ),
-                );
+                deck_card::kv(ui, 84.0, "Left out", |ui| {
+                    badge::show(
+                        ui,
+                        None,
+                        &format!(
+                            "{} session{}",
+                            d.excluded,
+                            if d.excluded == 1 { "" } else { "s" }
+                        ),
+                        Hue::Amber,
+                        10.5,
+                    );
+                });
             }
             ui.add_space(10.0);
             ui.checkbox(&mut d.keep, "Keep this folder in Sync")
@@ -1101,6 +1161,25 @@ pub fn restore_dialog(
             confirm_enabled: enabled,
             danger,
             enter_confirms: false,
+            icon: match &d.step {
+                Step::Confirm(p) if p.danger() => None,
+                Step::Report(r) if report_has_problems(r) => Some(ICON_TRIANGLE_ALERT),
+                Step::Report(_) => Some(ICON_CIRCLE_CHECK),
+                _ => Some(ICON_ARCHIVE_RESTORE),
+            },
+            subtitle: Some(match &d.step {
+                Step::Pick => "Pick a backup, a folder and what to bring back",
+                Step::Preparing => "Downloading and checking the backup",
+                Step::Confirm(p) if p.danger() => "Existing files will be overwritten",
+                Step::Confirm(_) => "Review before anything is written",
+                Step::Applying => "Writing files to the target folder",
+                Step::Report(r) if report_has_problems(r) => "Restored with problems",
+                Step::Report(_) => "Restore finished",
+            }),
+            tone: match &d.step {
+                Step::Report(r) if report_has_problems(r) => Some(pal.warn),
+                _ => None,
+            },
         },
         |ui| match &d.step {
             Step::Pick => pick_body(ui, d, lane_busy, &mut act),
@@ -1195,6 +1274,13 @@ pub fn restore_dialog(
     }
 }
 
+fn report_has_problems(r: &ReportView) -> bool {
+    !r.failures.is_empty()
+        || !r.notes.is_empty()
+        || !r.memory_notes.is_empty()
+        || r.memory_error.is_some()
+}
+
 fn progress_or_wait(ui: &mut Ui, p: Option<&ProgView>, fallback: &str) {
     match p {
         Some(p) => progress(ui, p),
@@ -1234,7 +1320,7 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
                     .wrap_mode(egui::TextWrapMode::Wrap),
             );
             ui.add_space(8.0);
-            if ui.button("Retry").clicked() {
+            if button(ui, true, DraftKind::Secondary, ICON_REFRESH_CW, "Retry").clicked() {
                 *act = Some(RestoreAction::Retry);
             }
             return;
@@ -1315,13 +1401,26 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
             }
         }
     });
-    ui.add_space(12.0);
-    ui.label(theme::section_caption("Restore into", pal.weak));
+    ui.add_space(8.0);
+    if let Some(v) = d.version() {
+        deck_card::section(ui, "SELECTED BACKUP");
+        deck_card::kv(ui, 84.0, "Version", |ui| {
+            ui.label(RichText::new(&v.when).color(pal.text_strong));
+        });
+        deck_card::kv(ui, 84.0, "Size", |ui| {
+            badge::show(ui, None, &crate::app::human_size(v.bytes), Hue::Teal, 11.0);
+        });
+        deck_card::kv(ui, 84.0, "Contents", |ui| {
+            ui.add(egui::Label::new(RichText::new(&v.summary).small().color(pal.weak)).truncate());
+        });
+        ui.add_space(8.0);
+    }
+    deck_card::section(ui, "RESTORE INTO");
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         let browse_w = if d.picker && !d.target_fixed {
-            108.0
+            124.0
         } else {
             0.0
         };
@@ -1343,11 +1442,10 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
         }
         if browse_w > 0.0 {
             let label = if d.picking { "Waiting…" } else { "Browse…" };
-            let btn = Button::new((
-                icon_text(ICON_FOLDER_OPEN, 17.0, pal.glyph),
-                RichText::new(label),
-            ))
-            .min_size(vec2(browse_w, 34.0));
+            let btn = DraftButton::new(label)
+                .icon(ICON_FOLDER_OPEN)
+                .enabled(!d.picking)
+                .min_width(browse_w);
             if ui.add_enabled(!d.picking, btn).clicked() {
                 *act = Some(RestoreAction::Browse);
             }
@@ -1390,17 +1488,18 @@ fn confirm_body(ui: &mut Ui, plan: &PlanView) {
     let wrap = |ui: &mut Ui, text: RichText| {
         ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Wrap));
     };
-    wrap(
-        ui,
-        RichText::new(format!("Restore into {}", plan.target)).color(pal.text_strong),
-    );
-    if plan.create_target {
+    deck_card::kv(ui, 84.0, "Target", |ui| {
         wrap(
             ui,
-            RichText::new("The folder does not exist and will be created.")
-                .small()
-                .color(pal.weak),
+            RichText::new(&plan.target)
+                .monospace()
+                .color(pal.text_strong),
         );
+    });
+    if plan.create_target {
+        deck_card::kv(ui, 84.0, "Folder", |ui| {
+            badge::show(ui, None, "will be created", Hue::Amber, 11.0);
+        });
     }
     if plan.omp_danger() {
         overwrite_warning(
@@ -1422,16 +1521,19 @@ fn confirm_body(ui: &mut Ui, plan: &PlanView) {
             ),
         );
     } else if plan.omp_added > 0 {
-        ui.add_space(6.0);
-        wrap(
-            ui,
-            RichText::new(format!(
-                ".omp: {} file{} will be added.",
-                plan.omp_added,
-                if plan.omp_added == 1 { "" } else { "s" }
-            ))
-            .color(pal.text),
-        );
+        deck_card::kv(ui, 84.0, ".omp", |ui| {
+            badge::show(
+                ui,
+                None,
+                &format!(
+                    "{} file{} added",
+                    plan.omp_added,
+                    if plan.omp_added == 1 { "" } else { "s" }
+                ),
+                Hue::Green,
+                11.0,
+            );
+        });
     }
     if plan.omp_danger() && plan.omp_added > 0 {
         ui.add_space(4.0);
@@ -1458,29 +1560,48 @@ fn confirm_body(ui: &mut Ui, plan: &PlanView) {
             &format!("Overwritten files are first copied to {}.", plan.safety),
         );
     } else if plan.memory_added > 0 {
-        ui.add_space(6.0);
-        wrap(
-            ui,
-            RichText::new(format!(
-                "{} memory file{} will be added.",
-                plan.memory_added,
-                if plan.memory_added == 1 { "" } else { "s" }
-            ))
-            .color(pal.text),
-        );
+        deck_card::kv(ui, 84.0, "Memory", |ui| {
+            badge::show(
+                ui,
+                None,
+                &format!(
+                    "{} file{} added",
+                    plan.memory_added,
+                    if plan.memory_added == 1 { "" } else { "s" }
+                ),
+                Hue::Green,
+                11.0,
+            );
+        });
     }
     if let Some((n, new_ids)) = plan.sessions {
-        ui.add_space(8.0);
-        let mut t = format!(
-            "{n} session{} will be added alongside the existing ones",
-            if n == 1 { "" } else { "s" }
-        );
+        ui.add_space(6.0);
+        deck_card::kv(ui, 84.0, "Sessions", |ui| {
+            badge::show(
+                ui,
+                None,
+                &format!("{n} session{} added", if n == 1 { "" } else { "s" }),
+                Hue::Teal,
+                11.0,
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("alongside the existing ones")
+                    .small()
+                    .color(pal.weak),
+            );
+        });
         if new_ids > 0 {
-            t +=
-                &format!(" ({new_ids} get a new id because a session with that id already exists)");
+            deck_card::kv(ui, 84.0, "New ids", |ui| {
+                badge::show(ui, None, &new_ids.to_string(), Hue::Amber, 11.0);
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("a session with that id already exists")
+                        .small()
+                        .color(pal.weak),
+                );
+            });
         }
-        t.push('.');
-        wrap(ui, RichText::new(t).color(pal.text));
     }
     warn_list(
         ui,
@@ -1654,10 +1775,12 @@ pub fn sessions_dialog(ctx: &Context, d: &mut SessionsDialog) -> SessionsAnswer 
             confirm_enabled: true,
             danger: false,
             enter_confirms: false,
+            icon: Some(ICON_LIST_CHECKS),
+            subtitle: Some("New sessions are included automatically"),
+            ..Default::default()
         },
         |ui| {
-            ui.horizontal(|ui| {
-                ui.add(icon_label(ICON_FOLDER, pal.glyph));
+            deck_card::kv(ui, 84.0, "Folder", |ui| {
                 ui.add(
                     egui::Label::new(RichText::new(&d.display).color(pal.text_strong)).truncate(),
                 );
@@ -1669,17 +1792,17 @@ pub fn sessions_dialog(ctx: &Context, d: &mut SessionsDialog) -> SessionsAnswer 
                     egui::TextEdit::singleline(&mut d.filter)
                         .id(Id::unique("omp-deck-sync-sessions-filter"))
                         .hint_text("Filter sessions")
-                        .desired_width(ui.available_width() - 120.0)
+                        .desired_width(ui.available_width() - 168.0)
                         .margin(Margin::symmetric(10, 6)),
                 );
                 if d.focus_filter {
                     resp.request_focus();
                     d.focus_filter = false;
                 }
-                if ui.button("All").clicked() {
+                if DraftButton::new("All").min_width(60.0).show(ui).clicked() {
                     d.set_visible(true);
                 }
-                if ui.button("None").clicked() {
+                if DraftButton::new("None").min_width(60.0).show(ui).clicked() {
                     d.set_visible(false);
                 }
             });
@@ -1714,14 +1837,16 @@ pub fn sessions_dialog(ctx: &Context, d: &mut SessionsDialog) -> SessionsAnswer 
             });
             ui.add_space(8.0);
             let (n, bytes) = d.selected();
-            ui.label(
-                RichText::new(format!(
-                    "{n} of {} selected · {}",
-                    d.items.len(),
-                    crate::app::human_size(bytes)
-                ))
-                .color(pal.text),
-            );
+            deck_card::kv(ui, 84.0, "Selected", |ui| {
+                badge::show(
+                    ui,
+                    None,
+                    &format!("{n} of {}", d.items.len()),
+                    Hue::Teal,
+                    11.0,
+                );
+                badge::show(ui, None, &crate::app::human_size(bytes), Hue::Amber, 11.0);
+            });
             weak_note(ui, "New sessions are backed up automatically.");
         },
     );
@@ -1859,6 +1984,17 @@ pub fn manager_dialog(
             confirm_enabled: enabled,
             danger,
             enter_confirms: false,
+            icon: Some(if danger {
+                ICON_TRASH_2
+            } else {
+                ICON_LIST_CHECKS
+            }),
+            subtitle: Some(match d.step {
+                ManagerStep::Browse => "Delete old versions or another PC's project backups",
+                ManagerStep::Confirm => "Permanent — cannot be undone",
+                ManagerStep::Deleting => "Deleting from Google Drive…",
+            }),
+            ..Default::default()
         },
         cancel_label,
         |ui| match d.step {
@@ -1869,13 +2005,19 @@ pub fn manager_dialog(
                 };
                 wrap(
                     ui,
-                    RichText::new(format!(
-                        "Permanently delete {selected} backup{} ({}) from Google Drive?",
-                        if selected == 1 { "" } else { "s" },
-                        crate::app::human_size(bytes)
-                    ))
-                    .color(pal.text_strong),
+                    RichText::new("Permanently delete these backups from Google Drive?")
+                        .color(pal.text_strong),
                 );
+                ui.add_space(6.0);
+                deck_card::kv(ui, 84.0, "Backups", |ui| {
+                    badge::show(ui, None, &selected.to_string(), Hue::Amber, 11.0);
+                });
+                deck_card::kv(ui, 84.0, "Size", |ui| {
+                    badge::show(ui, None, &crate::app::human_size(bytes), Hue::Teal, 11.0);
+                });
+                deck_card::kv(ui, 84.0, "Target", |ui| {
+                    badge::show(ui, Some(ICON_CLOUD), "Google Drive", Hue::Blue, 11.0);
+                });
                 ui.add_space(4.0);
                 wrap(
                     ui,
@@ -1884,6 +2026,7 @@ pub fn manager_dialog(
                 );
                 if let ListState::Ready(groups) = &d.list {
                     ui.add_space(8.0);
+                    deck_card::section(ui, "BACKUPS TO DELETE");
                     ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
                         for g in groups {
                             let host = if g.this_pc {
@@ -1956,7 +2099,7 @@ fn manager_body(
                     .wrap_mode(egui::TextWrapMode::Wrap),
             );
             ui.add_space(8.0);
-            if ui.button("Retry").clicked() {
+            if button(ui, true, DraftKind::Secondary, ICON_REFRESH_CW, "Retry").clicked() {
                 *act = Some(ManagerAction::Refresh);
             }
             return;
@@ -1966,7 +2109,15 @@ fn manager_body(
     if groups.is_empty() {
         ui.label(RichText::new("No project backups on Google Drive.").color(pal.weak));
         ui.add_space(8.0);
-        if ui.button("Refresh").clicked() {
+        if button(
+            ui,
+            !lane_busy,
+            DraftKind::Secondary,
+            ICON_REFRESH_CW,
+            "Refresh",
+        )
+        .clicked()
+        {
             *act = Some(ManagerAction::Refresh);
         }
         return;
@@ -2012,10 +2163,12 @@ fn manager_body(
                             {
                                 *act = Some(ManagerAction::Toggle(v.backup, on));
                             }
-                            ui.label(
-                                RichText::new(crate::app::human_size(v.bytes))
-                                    .small()
-                                    .color(pal.text),
+                            badge::show(
+                                ui,
+                                None,
+                                &crate::app::human_size(v.bytes),
+                                Hue::Teal,
+                                10.5,
                             );
                             ui.label(RichText::new(&v.summary).small().color(pal.weak));
                         });
@@ -2026,18 +2179,18 @@ fn manager_body(
     });
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                !lane_busy,
-                Button::new((
-                    icon_text(ICON_REFRESH_CW, 14.0, pal.glyph),
-                    RichText::new("Refresh"),
-                )),
-            )
-            .clicked()
+        if button(
+            ui,
+            !lane_busy,
+            DraftKind::Secondary,
+            ICON_REFRESH_CW,
+            "Refresh",
+        )
+        .clicked()
         {
             *act = Some(ManagerAction::Refresh);
         }
+        ui.add_space(4.0);
         ui.label(
             RichText::new(format!(
                 "{selected} selected · {}",
@@ -2217,6 +2370,7 @@ mod render_tests {
             &ctx,
             deck_core::config::UiStyle::Neutral,
             deck_core::config::Density::Compact,
+            deck_core::config::UiFont::Auto,
             true,
         );
         for _ in 0..3 {

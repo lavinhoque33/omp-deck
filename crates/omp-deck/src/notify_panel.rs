@@ -5,17 +5,18 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use egui::{
-    Align, Align2, CursorIcon, Galley, Id, Layout, Rect, RichText, ScrollArea, Sense, Stroke,
-    StrokeKind, TextStyle, TextWrapMode, Ui, WidgetText, pos2, vec2,
+    Align, Align2, Color32, CursorIcon, Galley, Id, Layout, Rect, RichText, ScrollArea, Sense,
+    Stroke, StrokeKind, TextStyle, TextWrapMode, Ui, WidgetText, pos2, vec2,
 };
 
+use crate::badge::{self, Hue};
 use crate::icons::{
     ICON_BELL, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_POWER, ICON_SETTINGS,
     ICON_X, Icon,
 };
 use crate::sidebar::format_age;
 use crate::theme::{self, Palette};
-use crate::widgets::{icon_button, icon_text, paint_icon};
+use crate::widgets::{DraftButton, icon_button, icon_text, paint_icon};
 use deck_service::controller::SessionTarget;
 use deck_service::gateway::protocol::InboxEntry;
 use deck_service::notifications::inbox::Kind;
@@ -131,17 +132,22 @@ fn popover(ui: &mut Ui, input: &PanelInput<'_>) -> Option<PanelAction> {
     ui.spacing_mut().item_spacing.y = 6.0;
     ui.horizontal(|ui| {
         ui.add_space(PAD - 2.0);
+        ui.spacing_mut().item_spacing.x = 10.0;
+        crate::card::icon_tile(ui, 30.0, ICON_BELL, Color32::TRANSPARENT, true);
         ui.label(
             theme::strong("Notifications")
                 .size(14.5)
                 .color(pal.text_strong),
         );
+        if !input.entries.is_empty() {
+            badge::show(ui, None, &input.entries.len().to_string(), Hue::Amber, 11.0);
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(PAD - 2.0);
-            let clear = ui.add_enabled(
-                !input.entries.is_empty(),
-                egui::Button::new(RichText::new("Clear all").small()).min_size(vec2(0.0, 22.0)),
-            );
+            let clear = DraftButton::new("Clear all")
+                .enabled(!input.entries.is_empty())
+                .min_width(76.0)
+                .show(ui);
             if clear.clicked() {
                 action = Some(PanelAction::ClearAll);
             }
@@ -151,7 +157,14 @@ fn popover(ui: &mut Ui, input: &PanelInput<'_>) -> Option<PanelAction> {
             }
         });
     });
-    ui.separator();
+    let left = ui.min_rect().left();
+    crate::card::header_rule(
+        ui,
+        left,
+        left + WIDTH,
+        ui.cursor().top(),
+        Color32::TRANSPARENT,
+    );
     if input.entries.is_empty() {
         ui.add_space(14.0);
         ui.vertical_centered(|ui| {
@@ -174,6 +187,7 @@ fn popover(ui: &mut Ui, input: &PanelInput<'_>) -> Option<PanelAction> {
                 width: width.to_bits(),
                 pixels_per_point: ui.ctx().pixels_per_point().to_bits(),
                 colors: [pal.text_strong, pal.weak, pal.text],
+                font: theme::ui_font(),
             };
             let id = popup_id().with("rows");
             let mut cache: RowCache = ui.ctx().data_mut(|d| d.remove_temp(id)).unwrap_or_default();
@@ -248,6 +262,7 @@ struct LayoutKey {
     width: u32,
     pixels_per_point: u32,
     colors: [egui::Color32; 3],
+    font: deck_core::config::UiFont,
 }
 
 /// One entry's laid-out text. `entry` is the revision it was built from (an entry is replaced as

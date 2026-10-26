@@ -18,9 +18,10 @@ use egui::{
 use crate::app::human_size;
 use crate::col_alloc::{self, CELL_PAD};
 use crate::icons::{
-    ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHECK, ICON_CIRCLE_STOP, ICON_COPY, ICON_EXTERNAL_LINK,
-    ICON_FOLDER, ICON_FOLDER_INPUT, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X,
-    ICON_HARD_DRIVE, ICON_MINUS, ICON_REFRESH_CW, ICON_SEARCH, ICON_TRASH_2, ICON_X, Icon,
+    ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHECK, ICON_CIRCLE_STOP, ICON_COINS,
+    ICON_COPY, ICON_CPU, ICON_EXTERNAL_LINK, ICON_FOLDER, ICON_FOLDER_INPUT, ICON_FOLDER_OPEN,
+    ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_HARD_DRIVE, ICON_INFO, ICON_MESSAGES_SQUARE,
+    ICON_MINUS, ICON_REFRESH_CW, ICON_SEARCH, ICON_SPARKLES, ICON_TRASH_2, ICON_X, Icon,
 };
 use crate::running_model::{HubMode, RunModel};
 use crate::sessions_model::{
@@ -32,6 +33,7 @@ use crate::theme::{self, Palette};
 use crate::transfer::TransferKind;
 use crate::usage_fmt::money;
 use crate::usage_view::tab_chip;
+use crate::widgets::{DraftButton, DraftKind};
 use crate::widgets::{Spin, empty_state, icon_text, paint_icon};
 
 pub(crate) const ROW_H: f32 = 34.0;
@@ -169,13 +171,8 @@ pub fn show(
             .clamp(520.0, 980.0)
             .min(screen.height() - 24.0),
     );
-    let style = ctx.global_style();
-    let frame = Frame::NONE
-        .fill(pal.bar)
-        .stroke(theme::popup_stroke(pal))
-        .corner_radius(theme::popup_radius())
-        .inner_margin(Margin::symmetric(18, 14))
-        .shadow(style.visuals.window_shadow);
+    let margin = Margin::symmetric(18, 14);
+    let frame = Frame::NONE.inner_margin(margin);
     egui::Window::new("sessions-window")
         .id(Id::unique("sessions-window"))
         .title_bar(false)
@@ -187,7 +184,11 @@ pub fn show(
         .min_size(vec2(720.0, 420.0))
         .default_size(size)
         .default_pos(screen.center() - size / 2.0)
-        .show(ctx, |ui| body(ui, model, run, st, input, &mut out));
+        .show(ctx, |ui| {
+            crate::card::chrome(ui, margin, pal.bar, |ui| {
+                body(ui, model, run, st, input, &mut out);
+            });
+        });
     out
 }
 
@@ -284,24 +285,7 @@ fn header(
         ui,
         |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-            ui.painter().rect_filled(
-                rect,
-                theme::rad(8, 10),
-                if theme::flat() {
-                    pal.surface
-                } else {
-                    pal.accent.gamma_multiply(0.18)
-                },
-            );
-            paint_icon(
-                ui.painter(),
-                rect.center(),
-                Align2::CENTER_CENTER,
-                ICON_HARD_DRIVE,
-                19.0,
-                pal.glyph,
-            );
+            crate::card::icon_tile(ui, 30.0, ICON_HARD_DRIVE, Color32::TRANSPARENT, true);
             ui.label(
                 theme::strong("Session manager")
                     .size(19.0)
@@ -379,6 +363,12 @@ fn header(
             }
         },
     );
+    let (left, right, y) = (
+        ui.min_rect().left(),
+        ui.min_rect().left() + ui.available_width(),
+        ui.min_rect().bottom() + 3.0,
+    );
+    crate::card::header_rule(ui, left, right, y, Color32::TRANSPARENT);
     if let Some(m) = set_mode {
         out.push(SessionsAction::SetMode(m));
     }
@@ -1076,10 +1066,7 @@ fn table_rows(
                     && inner.contains(at)
                 {
                     let col = column_at(inner.left() + CHECK_W, cols, widths, at.x);
-                    resp.on_hover_ui_at_pointer(|ui| {
-                        ui.set_max_width(380.0);
-                        row_tip(ui, row, col, model.error(row.path()));
-                    });
+                    row_tip(&resp, row, col, model.error(row.path()));
                 }
             }
         });
@@ -1318,101 +1305,217 @@ fn badges_cell(
     }
 }
 
-fn row_tip(ui: &mut Ui, row: &Row, col: Option<Column>, error: Option<&str>) {
+/// Hover card of a table row; the rows depend on the column under the pointer.
+fn row_tip(resp: &egui::Response, row: &Row, col: Option<Column>, error: Option<&str>) {
+    use crate::badge::{self, Hue};
+    use crate::card::{self, Header};
+    const KEY_W: f32 = 132.0;
     let e = &row.entry;
-    let weak = Palette::of_ui(ui).weak;
-    let line = |ui: &mut Ui, t: String| {
-        ui.label(t);
+    let (icon, title, sub) = match col {
+        Some(Column::Size) => (ICON_HARD_DRIVE, "Disk usage", row.label()),
+        Some(Column::Ram) => (ICON_CPU, "Memory", row.label()),
+        Some(Column::Messages) => (ICON_MESSAGES_SQUARE, "Conversation", row.label()),
+        Some(Column::Tokens) => (ICON_ACTIVITY, "Tokens", row.label()),
+        Some(Column::Cost) => (ICON_COINS, "Cost", row.label()),
+        Some(Column::Model) => (ICON_SPARKLES, "Models", row.label()),
+        Some(Column::Status) => (ICON_INFO, "Status", row.label()),
+        _ => (ICON_FOLDER, row.label(), "Session"),
     };
-    match col {
-        Some(Column::Size) => {
-            line(ui, format!("Session file: {}", human_size(e.jsonl_bytes)));
-            line(
-                ui,
-                format!(
-                    "Artifacts + subagent transcripts: {} in {} files",
-                    human_size(e.artifact_bytes),
-                    e.artifact_files
-                ),
-            );
-            line(
-                ui,
-                format!("Deleting frees {}", human_size(e.total_bytes())),
-            );
-        }
-        Some(Column::Ram) => match row.ram {
-            Some(m) => {
-                line(ui, format!("{} of memory", human_size(m.bytes)));
-                line(
-                    ui,
-                    format!(
-                        "{} in the process tree",
-                        plural(m.processes as usize, "process", "processes")
-                    ),
-                );
-                line(ui, "Shared pages are split between their users".to_owned());
+    let head = Header::new(icon, title).subtitle(sub);
+    card::hover(
+        resp,
+        380.0,
+        true,
+        &head,
+        |ui| {
+            if row.live.running {
+                badge::show(ui, None, "Running", Hue::Green, 12.0);
+            } else if error.is_some() {
+                badge::show(ui, None, "Error", Hue::Rose, 12.0);
             }
-            None => line(ui, "Not running, or no reading yet".to_owned()),
         },
-        Some(Column::Messages) => match row.stats() {
-            Some(s) => {
-                line(ui, format!("{} prompts from you", s.user_messages));
-                line(ui, format!("{} assistant turns", s.assistant_turns));
-                line(ui, plural(e.subagents as usize, "subagent", "subagents"));
-                if s.compactions > 0 {
-                    line(ui, format!("{} compactions", s.compactions));
+        |ui| {
+            let pal = Palette::of_ui(ui);
+            let val = |ui: &mut Ui, t: &str| {
+                ui.label(RichText::new(t).color(pal.text_strong));
+            };
+            let note = |ui: &mut Ui, t: &str| {
+                ui.label(RichText::new(t).size(12.0).color(pal.weak));
+            };
+            let tag = |ui: &mut Ui, t: &str, hue: Hue| {
+                badge::show(ui, None, t, hue, 12.0);
+            };
+            match col {
+                Some(Column::Size) => {
+                    card::kv(ui, KEY_W, "Session file", |ui| {
+                        tag(ui, &human_size(e.jsonl_bytes), Hue::Amber);
+                    });
+                    card::kv(ui, KEY_W, "Artifacts", |ui| {
+                        ui.horizontal(|ui| {
+                            tag(ui, &human_size(e.artifact_bytes), Hue::Teal);
+                            note(
+                                ui,
+                                &format!(
+                                    "in {} files (incl. subagent transcripts)",
+                                    e.artifact_files
+                                ),
+                            );
+                        });
+                    });
+                    card::kv(ui, KEY_W, "Deleting frees", |ui| {
+                        tag(ui, &human_size(e.total_bytes()), Hue::Green);
+                    });
+                }
+                Some(Column::Ram) => match row.ram {
+                    Some(m) => {
+                        card::kv(ui, KEY_W, "Memory", |ui| {
+                            tag(ui, &human_size(m.bytes), Hue::Amber);
+                        });
+                        card::kv(ui, KEY_W, "Processes", |ui| {
+                            val(
+                                ui,
+                                &format!(
+                                    "{} in the process tree",
+                                    plural(m.processes as usize, "process", "processes")
+                                ),
+                            );
+                        });
+                        note(ui, "Shared pages are split between their users");
+                    }
+                    None => note(ui, "Not running, or no reading yet"),
+                },
+                Some(Column::Messages) => match row.stats() {
+                    Some(s) => {
+                        card::kv(ui, KEY_W, "Prompts", |ui| {
+                            val(ui, &format!("{} from you", s.user_messages));
+                        });
+                        card::kv(ui, KEY_W, "Turns", |ui| {
+                            val(ui, &format!("{} assistant turns", s.assistant_turns));
+                        });
+                        card::kv(ui, KEY_W, "Subagents", |ui| {
+                            val(ui, &plural(e.subagents as usize, "subagent", "subagents"));
+                        });
+                        if s.compactions > 0 {
+                            card::kv(ui, KEY_W, "Compactions", |ui| {
+                                val(ui, &format!("{} compactions", s.compactions));
+                            });
+                        }
+                    }
+                    None => note(ui, "Still reading…"),
+                },
+                Some(Column::Tokens) => match row.stats() {
+                    Some(s) => {
+                        card::kv(ui, KEY_W, "Input", |ui| {
+                            tag(ui, &compact(s.input_tokens), Hue::Blue);
+                        });
+                        card::kv(ui, KEY_W, "Output", |ui| {
+                            tag(ui, &compact(s.output_tokens), Hue::Teal);
+                        });
+                        card::kv(ui, KEY_W, "Cache", |ui| {
+                            val(
+                                ui,
+                                &format!(
+                                    "read {} · write {}",
+                                    compact(s.cache_read_tokens),
+                                    compact(s.cache_write_tokens)
+                                ),
+                            );
+                        });
+                    }
+                    None => note(ui, "Still reading…"),
+                },
+                Some(Column::Cost) => match row.stats() {
+                    Some(s) => {
+                        card::kv(ui, KEY_W, "Session", |ui| {
+                            tag(ui, &money(s.cost), Hue::Amber);
+                        });
+                        card::kv(ui, KEY_W, "Subagents", |ui| {
+                            val(ui, &money(s.subagent_cost));
+                        });
+                    }
+                    None => note(ui, "Still reading…"),
+                },
+                Some(Column::Model) => match row.stats() {
+                    Some(s) if !s.models.is_empty() => {
+                        card::kv(ui, KEY_W, "Models", |ui| {
+                            ui.vertical(|ui| {
+                                for m in &s.models {
+                                    tag(ui, m, Hue::Violet);
+                                }
+                            });
+                        });
+                    }
+                    Some(_) => note(ui, "No model recorded"),
+                    None => note(ui, "Still reading…"),
+                },
+                Some(Column::Status) => {
+                    if let Some(err) = error {
+                        card::kv(ui, KEY_W, "Error", |ui| {
+                            ui.label(RichText::new(err).color(pal.danger));
+                        });
+                    }
+                    if !row.badges.is_empty() {
+                        card::kv(ui, KEY_W, "Flags", |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                for b in &row.badges {
+                                    tag(ui, &b.text(), badge_hue(b));
+                                }
+                            });
+                        });
+                    }
+                    if row.badges.is_empty() && error.is_none() {
+                        note(ui, "No flags");
+                    }
+                }
+                _ => {
+                    let c = &row.cells;
+                    if !c.project.is_empty() {
+                        card::kv(ui, KEY_W, "Project", |ui| val(ui, &c.project));
+                    }
+                    if !c.size.is_empty() {
+                        card::kv(ui, KEY_W, "Size", |ui| tag(ui, &c.size, Hue::Amber));
+                    }
+                    if !c.model.is_empty() {
+                        card::kv(ui, KEY_W, "Model", |ui| tag(ui, &c.model, Hue::Violet));
+                    }
+                    if !c.activity.is_empty() {
+                        card::kv(ui, KEY_W, "Updated", |ui| val(ui, &c.activity));
+                    }
+                    card::kv(ui, KEY_W, "Id", |ui| tag(ui, &e.id, Hue::Teal));
+                    card::kv(ui, KEY_W, "Folder", |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(e.cwd.display().to_string()).color(pal.weak),
+                            )
+                            .truncate(),
+                        );
+                    });
+                    card::kv(ui, KEY_W, "File", |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(e.path.display().to_string()).color(pal.weak),
+                            )
+                            .truncate(),
+                        );
+                    });
                 }
             }
-            None => line(ui, "Still reading…".to_owned()),
         },
-        Some(Column::Tokens) => match row.stats() {
-            Some(s) => {
-                line(ui, format!("Input {}", compact(s.input_tokens)));
-                line(ui, format!("Output {}", compact(s.output_tokens)));
-                line(
-                    ui,
-                    format!(
-                        "Cache read {} · write {}",
-                        compact(s.cache_read_tokens),
-                        compact(s.cache_write_tokens)
-                    ),
-                );
-            }
-            None => line(ui, "Still reading…".to_owned()),
-        },
-        Some(Column::Cost) => match row.stats() {
-            Some(s) => {
-                line(ui, format!("Session {}", money(s.cost)));
-                line(ui, format!("Subagents {}", money(s.subagent_cost)));
-            }
-            None => line(ui, "Still reading…".to_owned()),
-        },
-        Some(Column::Model) => match row.stats() {
-            Some(s) if !s.models.is_empty() => {
-                for m in &s.models {
-                    line(ui, m.clone());
-                }
-            }
-            Some(_) => line(ui, "No model recorded".to_owned()),
-            None => line(ui, "Still reading…".to_owned()),
-        },
-        Some(Column::Status) => {
-            if let Some(err) = error {
-                ui.label(RichText::new(err).color(Palette::of_ui(ui).danger));
-            }
-            for b in &row.badges {
-                line(ui, b.text().into_owned());
-            }
-            if row.badges.is_empty() && error.is_none() {
-                ui.label(RichText::new("No flags").color(weak));
-            }
-        }
-        _ => {
-            ui.label(RichText::new(row.label()).strong());
-            ui.label(RichText::new(format!("id {}", e.id)).color(weak));
-            ui.label(RichText::new(e.path.display().to_string()).color(weak));
-            ui.label(RichText::new(e.cwd.display().to_string()).color(weak));
-        }
+    );
+}
+
+/// Badge colour family of a status flag.
+fn badge_hue(b: &Badge) -> crate::badge::Hue {
+    use crate::badge::Hue;
+    match b {
+        Badge::Running => Hue::Green,
+        Badge::InTab => Hue::Blue,
+        Badge::Busy => Hue::Amber,
+        Badge::Error => Hue::Rose,
+        Badge::Aborted => Hue::Orange,
+        Badge::Fork(_) => Hue::Violet,
+        Badge::FolderMissing => Hue::Orange,
+        Badge::Stub => Hue::Teal,
     }
 }
 
@@ -1990,7 +2093,7 @@ fn transfer_button(
     });
 }
 
-/// Bordered button; hover pops the outline; `danger` colours it red.
+/// Drafted button; `danger` makes it the destructive kind.
 pub(crate) fn action_button(
     ui: &mut Ui,
     icon: Icon,
@@ -1998,67 +2101,13 @@ pub(crate) fn action_button(
     enabled: bool,
     danger: bool,
 ) -> egui::Response {
-    let pal = Palette::of_ui(ui);
-    let g = ui.painter().layout_no_wrap(
-        label.to_owned(),
-        theme::font(13.0),
-        if danger { pal.danger } else { pal.text },
-    );
-    let size = vec2(g.size().x + 44.0, 32.0);
-    let (rect, resp) = ui.allocate_exact_size(
-        size,
-        if enabled {
-            Sense::click()
+    DraftButton::new(label)
+        .icon(icon)
+        .kind(if danger {
+            DraftKind::Danger
         } else {
-            Sense::hover()
-        },
-    );
-    let hov = ui
-        .ctx()
-        .animate_bool_with_time(resp.id.with("hov"), resp.hovered() && enabled, 0.08);
-    let p = ui.painter();
-    let r = theme::rad(7, 10);
-    let tone = if danger { pal.danger } else { pal.text };
-    let alpha = if enabled { 1.0 } else { 0.4 };
-    p.rect_filled(rect, r, pal.raised.gamma_multiply(alpha));
-    p.rect_stroke(
-        rect,
-        r,
-        Stroke::new(
-            1.0 + 0.5 * hov,
-            theme::mix(
-                if danger {
-                    pal.danger.gamma_multiply(0.55)
-                } else {
-                    pal.stroke
-                },
-                if danger {
-                    pal.danger
-                } else {
-                    theme::hover_stroke(pal)
-                },
-                hov,
-            )
-            .gamma_multiply(alpha),
-        ),
-        StrokeKind::Inside,
-    );
-    paint_icon(
-        p,
-        pos2(rect.left() + 18.0, rect.center().y),
-        Align2::CENTER_CENTER,
-        icon,
-        16.0,
-        tone.gamma_multiply(alpha),
-    );
-    p.galley(
-        pos2(rect.left() + 32.0, rect.center().y - g.size().y / 2.0),
-        g,
-        tone.gamma_multiply(alpha),
-    );
-    resp.on_hover_cursor(if enabled {
-        CursorIcon::PointingHand
-    } else {
-        CursorIcon::Default
-    })
+            DraftKind::Secondary
+        })
+        .enabled(enabled)
+        .show(ui)
 }

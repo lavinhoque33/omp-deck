@@ -7,13 +7,15 @@ use std::collections::HashSet;
 use deck_core::config::SyncInterval;
 use egui::{Button, Context, RichText, ScrollArea, Ui, vec2};
 
+use crate::badge::{self, Hue};
+use crate::card;
 use crate::confirm::{Dialog, show_dialog, show_dialog_labeled};
 use crate::icons::{
-    ICON_ARCHIVE_RESTORE, ICON_CLOUD_UPLOAD, ICON_HARD_DRIVE, ICON_LIST_CHECKS, ICON_LOG_IN,
-    ICON_LOG_OUT, ICON_REFRESH_CW, ICON_TRASH_2, ICON_X,
+    ICON_ARCHIVE_RESTORE, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_HARD_DRIVE, ICON_LIST_CHECKS,
+    ICON_LOG_IN, ICON_LOG_OUT, ICON_REFRESH_CW, ICON_TRASH_2, ICON_X,
 };
 use crate::theme::{self, Palette};
-use crate::widgets::{Spin, icon_text, setting_row};
+use crate::widgets::{DraftButton, DraftKind, Spin, icon_text, setting_row};
 
 /// What the card shows.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,12 +58,19 @@ pub enum DriveAction {
     SignOut,
 }
 
-fn button(ui: &mut Ui, enabled: bool, icon: crate::icons::Icon, label: &str) -> egui::Response {
-    let pal = Palette::of_ui(ui);
+fn button(
+    ui: &mut Ui,
+    enabled: bool,
+    kind: DraftKind,
+    icon: crate::icons::Icon,
+    label: &str,
+) -> egui::Response {
     ui.add_enabled(
         enabled,
-        Button::new((icon_text(icon, 16.0, pal.glyph), RichText::new(label)))
-            .min_size(vec2(0.0, 30.0)),
+        DraftButton::new(label)
+            .kind(kind)
+            .icon(icon)
+            .enabled(enabled),
     )
 }
 
@@ -100,7 +109,15 @@ pub fn card(ui: &mut Ui, state: &DriveCard) -> Vec<DriveAction> {
                 "Back up your omp config to Google Drive",
                 "Settings, models, custom agents, skills, … and prompt history",
                 |ui| {
-                    if button(ui, true, ICON_LOG_IN, "Sign in with Google").clicked() {
+                    if button(
+                        ui,
+                        true,
+                        DraftKind::Primary,
+                        ICON_LOG_IN,
+                        "Sign in with Google",
+                    )
+                    .clicked()
+                    {
                         actions.push(DriveAction::SignIn);
                     }
                 },
@@ -112,8 +129,14 @@ pub fn card(ui: &mut Ui, state: &DriveCard) -> Vec<DriveAction> {
             );
             ui.add_space(4.0);
             setting_row(ui, MANAGE_TITLE, MANAGE_SUB, |ui| {
-                button(ui, false, ICON_LIST_CHECKS, "Manage backups…")
-                    .on_disabled_hover_text("Sign in with Google first");
+                button(
+                    ui,
+                    false,
+                    DraftKind::Secondary,
+                    ICON_LIST_CHECKS,
+                    "Manage backups…",
+                )
+                .on_disabled_hover_text("Sign in with Google first");
             });
         }
         DriveCard::Waiting => setting_row(
@@ -121,7 +144,7 @@ pub fn card(ui: &mut Ui, state: &DriveCard) -> Vec<DriveAction> {
             "Waiting for the browser…",
             "Finish signing in on the Google page that just opened.",
             |ui| {
-                if button(ui, true, ICON_X, "Cancel").clicked() {
+                if button(ui, true, DraftKind::Secondary, ICON_X, "Cancel").clicked() {
                     actions.push(DriveAction::CancelSignIn);
                 }
                 ui.add(Spin::new(18.0, pal.accent_b));
@@ -144,7 +167,9 @@ pub fn card(ui: &mut Ui, state: &DriveCard) -> Vec<DriveAction> {
                 |ui| {
                     if *busy == Some(Busy::SigningOut) {
                         ui.add(Spin::new(18.0, pal.accent_b));
-                    } else if button(ui, idle, ICON_LOG_OUT, "Sign out").clicked() {
+                    } else if button(ui, idle, DraftKind::Secondary, ICON_LOG_OUT, "Sign out")
+                        .clicked()
+                    {
                         actions.push(DriveAction::SignOut);
                     }
                 },
@@ -179,12 +204,28 @@ pub fn card(ui: &mut Ui, state: &DriveCard) -> Vec<DriveAction> {
                 );
                 if restoring {
                     ui.add(Spin::new(18.0, pal.accent_b));
-                } else if button(ui, idle, ICON_ARCHIVE_RESTORE, "Restore…").clicked() {
+                } else if button(
+                    ui,
+                    idle,
+                    DraftKind::Secondary,
+                    ICON_ARCHIVE_RESTORE,
+                    "Restore…",
+                )
+                .clicked()
+                {
                     actions.push(DriveAction::OpenRestore);
                 }
                 if *busy == Some(Busy::BackingUp) {
                     ui.add(Spin::new(18.0, pal.accent_b));
-                } else if button(ui, idle, ICON_CLOUD_UPLOAD, "Back up now").clicked() {
+                } else if button(
+                    ui,
+                    idle,
+                    DraftKind::Primary,
+                    ICON_CLOUD_UPLOAD,
+                    "Back up now",
+                )
+                .clicked()
+                {
                     actions.push(DriveAction::BackupNow);
                 }
             });
@@ -192,9 +233,15 @@ pub fn card(ui: &mut Ui, state: &DriveCard) -> Vec<DriveAction> {
             setting_row(ui, MANAGE_TITLE, MANAGE_SUB, |ui| {
                 if *busy == Some(Busy::Deleting) {
                     ui.add(Spin::new(18.0, pal.accent_b));
-                } else if button(ui, idle, ICON_LIST_CHECKS, "Manage backups…")
-                    .on_disabled_hover_text("Wait for the running Google Drive job to finish")
-                    .clicked()
+                } else if button(
+                    ui,
+                    idle,
+                    DraftKind::Secondary,
+                    ICON_LIST_CHECKS,
+                    "Manage backups…",
+                )
+                .on_disabled_hover_text("Wait for the running Google Drive job to finish")
+                .clicked()
                 {
                     actions.push(DriveAction::OpenManager);
                 }
@@ -246,6 +293,9 @@ pub fn restore_dialog(
             confirm_enabled: selected.is_some() && !preparing,
             danger: false,
             enter_confirms: false,
+            icon: Some(ICON_ARCHIVE_RESTORE),
+            subtitle: Some("Your omp config backups on Google Drive"),
+            ..Default::default()
         },
         |ui| {
             let pal = Palette::of_ui(ui);
@@ -262,20 +312,38 @@ pub fn restore_dialog(
                             .wrap_mode(egui::TextWrapMode::Wrap),
                     );
                     ui.add_space(8.0);
-                    retry = ui.button("Retry").clicked();
+                    retry =
+                        button(ui, true, DraftKind::Secondary, ICON_REFRESH_CW, "Retry").clicked();
                 }
                 RestoreList::Rows([]) => {
                     ui.label(RichText::new("No backups on Google Drive yet.").color(pal.weak));
                 }
                 RestoreList::Rows(rows) => {
+                    card::kv(ui, 84.0, "Backups", |ui| {
+                        badge::show(ui, None, &rows.len().to_string(), Hue::Teal, 11.0);
+                    });
+                    ui.add_space(4.0);
                     ui.label(
                         RichText::new("Newest first. Pick the backup to restore.").color(pal.weak),
                     );
                     ui.add_space(6.0);
                     ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                         for (i, r) in rows.iter().enumerate() {
-                            let text = format!("{}    {}    {}", r.when, r.host, r.size);
-                            let label = RichText::new(text).color(pal.text);
+                            let font = egui::TextStyle::Body.resolve(ui.style());
+                            let mut label = egui::text::LayoutJob::default();
+                            for (text, color) in [
+                                (r.when.as_str(), pal.text_strong),
+                                ("   ", pal.weak),
+                                (r.host.as_str(), pal.weak),
+                                ("   ", pal.weak),
+                                (r.size.as_str(), Hue::Amber.color(pal)),
+                            ] {
+                                label.append(
+                                    text,
+                                    0.0,
+                                    egui::TextFormat::simple(font.clone(), color),
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 if ui
@@ -520,6 +588,17 @@ pub fn manager_dialog(
             confirm_enabled: enabled,
             danger,
             enter_confirms: false,
+            icon: Some(if danger {
+                ICON_TRASH_2
+            } else {
+                ICON_LIST_CHECKS
+            }),
+            subtitle: Some(match d.step {
+                ManagerStep::Browse => "Old versions and other PCs' backups (newest 30 kept)",
+                ManagerStep::Confirm => "Permanent — cannot be undone",
+                ManagerStep::Deleting => "Deleting from Google Drive…",
+            }),
+            ..Default::default()
         },
         cancel_label,
         |ui| match d.step {
@@ -567,13 +646,19 @@ fn confirm_body(ui: &mut Ui, d: &BackupManager, selected: usize, bytes: u64) {
     let pal = Palette::of_ui(ui);
     wrapped(
         ui,
-        RichText::new(format!(
-            "Permanently delete {selected} settings backup{} ({}) from Google Drive?",
-            if selected == 1 { "" } else { "s" },
-            crate::app::human_size(bytes)
-        ))
-        .color(pal.text_strong),
+        RichText::new("Permanently delete these settings backups from Google Drive?")
+            .color(pal.text_strong),
     );
+    ui.add_space(6.0);
+    card::kv(ui, 84.0, "Backups", |ui| {
+        badge::show(ui, None, &selected.to_string(), Hue::Amber, 11.0);
+    });
+    card::kv(ui, 84.0, "Size", |ui| {
+        badge::show(ui, None, &crate::app::human_size(bytes), Hue::Teal, 11.0);
+    });
+    card::kv(ui, 84.0, "Target", |ui| {
+        badge::show(ui, Some(ICON_CLOUD), "Google Drive", Hue::Blue, 11.0);
+    });
     ui.add_space(4.0);
     wrapped(
         ui,
@@ -583,6 +668,7 @@ fn confirm_body(ui: &mut Ui, d: &BackupManager, selected: usize, bytes: u64) {
         return;
     };
     ui.add_space(8.0);
+    card::section(ui, "BACKUPS TO DELETE");
     ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
         for v in groups
             .iter()
@@ -609,7 +695,7 @@ fn manager_body(ui: &mut Ui, d: &BackupManager, busy: bool, act: &mut Option<Man
         ManagerList::Failed(e) => {
             wrapped(ui, RichText::new(e).color(pal.danger));
             ui.add_space(8.0);
-            if ui.button("Retry").clicked() {
+            if button(ui, true, DraftKind::Secondary, ICON_REFRESH_CW, "Retry").clicked() {
                 *act = Some(ManagerAction::Refresh);
             }
             return;
@@ -634,7 +720,7 @@ fn manager_body(ui: &mut Ui, d: &BackupManager, busy: bool, act: &mut Option<Man
     if groups.is_empty() {
         ui.label(RichText::new("No settings backups on Google Drive.").color(pal.weak));
         ui.add_space(8.0);
-        if ui.add_enabled(!busy, Button::new("Refresh")).clicked() {
+        if button(ui, !busy, DraftKind::Secondary, ICON_REFRESH_CW, "Refresh").clicked() {
             *act = Some(ManagerAction::Refresh);
         }
         return;
@@ -662,7 +748,17 @@ fn manager_body(ui: &mut Ui, d: &BackupManager, busy: bool, act: &mut Option<Man
                 ui.label(icon_text(ICON_HARD_DRIVE, 16.0, pal.glyph));
                 ui.label(theme::strong(&g.host).color(pal.text_strong));
                 if g.this_pc {
-                    ui.label(RichText::new("this PC").small().color(pal.accent_b));
+                    badge::show(ui, None, "this PC", Hue::Blue, 10.5);
+                }
+                {
+                    let n = g.versions.len();
+                    badge::show(
+                        ui,
+                        None,
+                        &format!("{n} version{}", if n == 1 { "" } else { "s" }),
+                        Hue::Teal,
+                        10.5,
+                    );
                 }
             });
             ui.indent(("drive-mgr-versions", gi), |ui| {
@@ -677,10 +773,10 @@ fn manager_body(ui: &mut Ui, d: &BackupManager, busy: bool, act: &mut Option<Man
                         }
                         ui.label(RichText::new(&v.age).small().color(pal.weak));
                         if !v.size.is_empty() {
-                            ui.label(RichText::new(&v.size).small().color(pal.text));
+                            badge::show(ui, None, &v.size, Hue::Teal, 10.5);
                         }
                         if v.latest {
-                            ui.label(RichText::new("latest").small().color(pal.accent_b))
+                            badge::show(ui, None, "latest", Hue::Green, 10.5)
                                 .on_hover_text("The newest settings backup on Google Drive");
                         }
                     });
@@ -690,18 +786,10 @@ fn manager_body(ui: &mut Ui, d: &BackupManager, busy: bool, act: &mut Option<Man
     });
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                !busy,
-                Button::new((
-                    icon_text(ICON_REFRESH_CW, 14.0, pal.glyph),
-                    RichText::new("Refresh"),
-                )),
-            )
-            .clicked()
-        {
+        if button(ui, !busy, DraftKind::Secondary, ICON_REFRESH_CW, "Refresh").clicked() {
             *act = Some(ManagerAction::Refresh);
         }
+        ui.add_space(4.0);
         ui.label(RichText::new(&d.totals_label).color(pal.text));
     });
     if busy {

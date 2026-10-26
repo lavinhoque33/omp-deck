@@ -4,22 +4,23 @@
 
 use deck_core::ctl::ContextBreakdown;
 use egui::{
-    Align, Align2, Color32, CornerRadius, Layout, Rect, RichText, Sense, Stroke, StrokeKind, Ui,
+    Align, Color32, CornerRadius, Layout, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui,
     pos2, vec2,
 };
 
+use crate::card;
 use crate::icons::ICON_CHART_PIE;
 use crate::statusbar::{group_digits, level_color};
 use crate::theme::{self, Palette};
-use crate::widgets::paint_icon;
 use deck_service::statusfmt::{ContextLevel, context_level, fmt_tokens};
 
 /// Tool schemas listed before "N more".
 pub const MAX_TOOLS: usize = 8;
 const WIDTH: f32 = 340.0;
 const METER_H: f32 = 9.0;
-/// Screen height kept clear of the tooltip: the status bar plus the tooltip frame and its gap.
-const RESERVED_H: f32 = 90.0;
+/// Screen height kept clear of the card's body: the status bar, the card header with its rule,
+/// the body padding and the gap to the chip.
+const RESERVED_H: f32 = 140.0;
 /// The "Tool schemas" caption row plus the rule above it.
 const CAPTION_H: f32 = 28.0;
 
@@ -220,34 +221,51 @@ impl CtxTip {
     }
 }
 
-/// Paints the tooltip body (call from `on_hover_ui`).
-pub fn show(ui: &mut Ui, tip: &CtxTip) {
-    let pal = Palette::of_ui(ui);
-    ui.set_width(WIDTH);
-    ui.spacing_mut().item_spacing.y = 4.0;
-
-    // Header: model + window.
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 7.0;
-        let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-        paint_icon(
-            ui.painter(),
-            rect.center(),
-            Align2::CENTER_CENTER,
+/// Shows the tooltip card while `resp` is hovered: the breakdown when `tip` is known, else the
+/// plain `fallback` summary and a note that the breakdown needs a live session.
+pub fn hover(resp: &Response, tip: Option<&CtxTip>, fallback: &str) {
+    let Some(tip) = tip else {
+        card::hover(
+            resp,
+            WIDTH,
+            false,
+            &card::Header::new(ICON_CHART_PIE, "Context window"),
+            |_| {},
+            |ui| {
+                let pal = Palette::of_ui(ui);
+                ui.label(RichText::new(fallback).color(pal.text_strong));
+                ui.label(RichText::new(NEEDS_LIVE).small().color(pal.weak));
+            },
+        );
+        return;
+    };
+    let pal = Palette::of_ctx(&resp.ctx);
+    let tone = if tip.level == ContextLevel::Normal {
+        Color32::TRANSPARENT
+    } else {
+        level_color(pal, Some(tip.level))
+    };
+    card::hover(
+        resp,
+        WIDTH,
+        false,
+        &card::Header::new(
             ICON_CHART_PIE,
-            15.0,
-            pal.glyph,
-        );
-        let name = tip.model.as_deref().unwrap_or("Context window");
-        ui.add(
-            egui::Label::new(theme::strong(name).color(pal.text_strong))
-                .truncate()
-                .selectable(false),
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            tip.model.as_deref().unwrap_or("Context window"),
+        )
+        .tone(tone),
+        |ui| {
+            let pal = Palette::of_ui(ui);
             ui.label(RichText::new(&tip.window_label).small().color(pal.weak));
-        });
-    });
+        },
+        |ui| show(ui, tip),
+    );
+}
+
+/// Paints the card body.
+fn show(ui: &mut Ui, tip: &CtxTip) {
+    let pal = Palette::of_ui(ui);
+    ui.spacing_mut().item_spacing.y = 4.0;
 
     // Headline: used / window (pct).
     ui.horizontal_wrapped(|ui| {
@@ -289,7 +307,7 @@ pub fn show(ui: &mut Ui, tip: &CtxTip) {
     }
 
     ui.add_space(4.0);
-    rule(ui, pal);
+    card::section(ui, "Breakdown");
     legend(ui, pal, tip);
 
     if let Some(s) = &tip.snapcompact {

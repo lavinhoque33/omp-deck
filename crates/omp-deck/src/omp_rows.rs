@@ -1,7 +1,10 @@
 //! Widgets of the omp settings editor: one row per setting with its editor, the JSON / secret
 //! modals, the loading skeleton and the info banner.
 
-use crate::icons::{ICON_INFO, ICON_LOCK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_TRASH_2};
+use crate::icons::{
+    ICON_CIRCLE_CHECK, ICON_INFO, ICON_KEY_ROUND, ICON_LOCK, ICON_PENCIL, ICON_ROTATE_CCW,
+    ICON_SLIDERS_HORIZONTAL, ICON_TRASH_2,
+};
 use deck_core::omp::{Setting, SettingKind};
 use egui::{
     Align2, CursorIcon, Frame, Id, Key, Margin, Rect, RichText, Sense, Stroke, TextEdit, Ui, pos2,
@@ -9,6 +12,8 @@ use egui::{
 };
 use serde_json::Value;
 
+use crate::badge::{self, Hue};
+use crate::card;
 use crate::confirm::{Dialog, show_dialog};
 use crate::omp_settings::{Row, parse_json_for, parse_number, pretty_json, preview, value_text};
 use crate::summary::summarize;
@@ -391,10 +396,18 @@ pub fn show_json_modal(ctx: &egui::Context, m: &mut JsonModal) -> ModalOutcome {
             confirm_enabled: ok,
             danger: false,
             enter_confirms: false,
+            icon: Some(ICON_SLIDERS_HORIZONTAL),
+            subtitle: Some("Writes via omp config set"),
+            ..Default::default()
         },
         |ui| {
-            ui.label(RichText::new(&m.key).monospace().small().color(pal.weak));
-            ui.add_space(2.0);
+            card::kv(ui, 84.0, "Setting", |ui| {
+                ui.label(RichText::new(&m.key).monospace().color(pal.text_strong));
+            });
+            card::kv(ui, 84.0, "Type", |ui| {
+                badge::show(ui, None, what, Hue::Violet, 11.0);
+            });
+            ui.add_space(6.0);
             ui.label(RichText::new(format!("Edit the value as a {what}.")).color(pal.weak));
             ui.add_space(10.0);
             let mut changed = false;
@@ -428,7 +441,7 @@ pub fn show_json_modal(ctx: &egui::Context, m: &mut JsonModal) -> ModalOutcome {
                     );
                 }
                 None => {
-                    ui.label(RichText::new("Valid JSON").small().color(pal.ok));
+                    badge::show(ui, Some(ICON_CIRCLE_CHECK), "Valid JSON", Hue::Green, 11.0);
                 }
             }
         },
@@ -497,10 +510,18 @@ pub fn show_secret_modal(ctx: &egui::Context, m: &mut SecretModal) -> ModalOutco
             confirm_enabled: ok,
             danger: false,
             enter_confirms: true,
+            icon: Some(ICON_KEY_ROUND),
+            subtitle: Some("Writes via omp config set"),
+            tone: Some(pal.warn),
         },
         |ui| {
-            ui.label(RichText::new(&m.key).monospace().small().color(pal.weak));
-            ui.add_space(2.0);
+            card::kv(ui, 84.0, "Setting", |ui| {
+                ui.label(RichText::new(&m.key).monospace().color(pal.text_strong));
+            });
+            card::kv(ui, 84.0, "Storage", |ui| {
+                badge::show(ui, Some(ICON_LOCK), "write-only", Hue::Amber, 11.0);
+            });
+            ui.add_space(6.0);
             ui.add(
                 egui::Label::new(
                     RichText::new("The value is passed to omp and never shown again.")

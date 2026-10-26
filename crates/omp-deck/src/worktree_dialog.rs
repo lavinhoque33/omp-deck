@@ -6,12 +6,16 @@ use std::time::{Duration, Instant};
 
 use deck_core::worktree::{self, RepoInfo};
 use deck_service::controller::SessionTarget;
-use egui::{Id, RichText, TextEdit, Ui, vec2};
+use egui::{Id, RichText, TextEdit, Ui};
 
+use crate::badge::{self, Hue};
+use crate::card;
 use crate::confirm::{Dialog as Chrome, show_dialog};
-use crate::icons::{ICON_FOLDER_OPEN, ICON_TRIANGLE_ALERT};
+use crate::icons::{
+    ICON_FOLDER_OPEN, ICON_GIT_BRANCH, ICON_GIT_BRANCH_PLUS, ICON_GIT_FORK, ICON_TRIANGLE_ALERT,
+};
 use crate::theme::Palette;
-use crate::widgets::icon_text;
+use crate::widgets::{DraftButton, icon_text};
 use crate::worktree_ui::{base_to_record, branch_stamp};
 
 /// Typing is checked this long after the last key stroke (each check runs git).
@@ -381,9 +385,22 @@ impl WorktreeDialog {
     pub fn show(&mut self, ctx: &egui::Context, has_picker: bool) -> Outcome {
         let pal = Palette::of_ctx(ctx);
         let mut outcome = Outcome::Open;
-        let (title, label) = match &self.kind {
-            Kind::New { .. } => ("New session in worktree", "Create"),
-            Kind::Move { .. } => ("Move to a new worktree", "Move"),
+        let (title, label, icon, subtitle) = match &self.kind {
+            Kind::New { dir } => (
+                "New session in worktree",
+                "Create",
+                ICON_GIT_BRANCH_PLUS,
+                format!(
+                    "Clean checkout of {}",
+                    crate::folder_scope::folder_name(dir)
+                ),
+            ),
+            Kind::Move { title, .. } => (
+                "Move to a new worktree",
+                "Move",
+                ICON_GIT_FORK,
+                format!("Moves “{title}”"),
+            ),
         };
         let enabled = self.confirmable();
         let mut branch_edited = false;
@@ -398,6 +415,9 @@ impl WorktreeDialog {
                 confirm_enabled: enabled,
                 danger: false,
                 enter_confirms: true,
+                icon: Some(icon),
+                subtitle: Some(&subtitle),
+                ..Default::default()
             },
             |ui: &mut Ui| {
                 self.intro(ui, pal);
@@ -427,7 +447,7 @@ impl WorktreeDialog {
                     Repo::Ready(_) => {}
                 }
                 ui.add_space(12.0);
-                ui.label(RichText::new("Branch").color(pal.weak));
+                card::section(ui, "Branch");
                 let resp = ui.add(
                     TextEdit::singleline(&mut self.branch)
                         .id(Id::unique("omp-deck-worktree-branch"))
@@ -447,10 +467,10 @@ impl WorktreeDialog {
                     return;
                 }
                 ui.add_space(10.0);
-                ui.label(RichText::new("Based on").color(pal.weak));
+                card::section(ui, "Based on");
                 self.base_picker(ui);
                 ui.add_space(10.0);
-                ui.label(RichText::new("Folder").color(pal.weak));
+                card::section(ui, "Folder");
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     let browse_w = if has_picker { 108.0 } else { 0.0 };
@@ -468,13 +488,11 @@ impl WorktreeDialog {
                         } else {
                             "Browse…"
                         };
-                        let btn = egui::Button::new((
-                            icon_text(ICON_FOLDER_OPEN, 17.0, pal.glyph),
-                            RichText::new(text),
-                        ))
-                        .min_size(vec2(browse_w, 34.0));
-                        if ui
-                            .add_enabled(!self.browsing, btn)
+                        if DraftButton::new(text)
+                            .icon(ICON_FOLDER_OPEN)
+                            .enabled(!self.browsing)
+                            .min_width(browse_w)
+                            .show(ui)
                             .on_hover_text("Choose the folder to create the worktree in")
                             .clicked()
                         {
@@ -520,6 +538,15 @@ impl WorktreeDialog {
             return;
         };
         ui.add_space(8.0);
+        card::kv(ui, 92.0, "Merges into", |ui| match &info.current_branch {
+            Some(b) => {
+                badge::show(ui, Some(ICON_GIT_BRANCH), b, Hue::Teal, 11.0);
+            }
+            None => {
+                badge::show(ui, None, "detached HEAD", Hue::Amber, 11.0);
+            }
+        });
+        ui.add_space(4.0);
         let text = match &info.current_branch {
             Some(b) => format!("Based on the current branch “{b}”, which is also where it is merged back."),
             None => "The repository is on a detached HEAD: OmpDeck will look for the merge target when you finish the worktree.".to_owned(),

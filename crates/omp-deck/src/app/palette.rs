@@ -4,7 +4,9 @@
 
 use std::path::PathBuf;
 
-use deck_core::config::{Density, MAX_PALETTE_RECENT, Theme, UiStyle};
+use deck_core::config::{
+    Density, MAX_PALETTE_RECENT, MAX_UI_SCALE, MIN_UI_SCALE, Theme, UiFont, UiStyle,
+};
 use deck_core::omp::UpdateKind;
 use deck_core::sessions::abbreviate_home;
 use egui::{Key, Modifiers};
@@ -829,6 +831,27 @@ impl App {
             None,
         );
         add(
+            "appscale.larger",
+            "App font size: Larger",
+            None,
+            ICON_A_LARGE_SMALL,
+            need(cfg.ui_scale < MAX_UI_SCALE, "Already at the maximum"),
+        );
+        add(
+            "appscale.smaller",
+            "App font size: Smaller",
+            None,
+            ICON_A_LARGE_SMALL,
+            need(cfg.ui_scale > MIN_UI_SCALE, "Already at the minimum"),
+        );
+        add(
+            "appscale.reset",
+            "App font size: Reset",
+            None,
+            ICON_A_LARGE_SMALL,
+            need((cfg.ui_scale - 1.0).abs() > 0.001, "Already at 100 %"),
+        );
+        add(
             "theme.dark",
             "Theme: Dark",
             None,
@@ -870,6 +893,15 @@ impl App {
             ICON_CHEVRONS_UP_DOWN,
             need(cfg.density != Density::Comfortable, "Already active"),
         );
+        for font in UiFont::ALL {
+            add(
+                &format!("ui_font.{}", font.key()),
+                &format!("UI font: {}", font.label()),
+                None,
+                ICON_A_LARGE_SMALL,
+                need(cfg.ui_font != font, "Already active"),
+            );
+        }
         let native = if cfg.native_decorations {
             "Window: Use OmpDeck's own title bar"
         } else {
@@ -1278,6 +1310,9 @@ impl App {
             "font.larger" => self.set_font_size(self.cfg.font_size + 1.0),
             "font.smaller" => self.set_font_size(self.cfg.font_size - 1.0),
             "font.reset" => self.set_font_size(DEFAULT_FONT),
+            "appscale.larger" => self.set_ui_scale(self.cfg.ui_scale + 0.1),
+            "appscale.smaller" => self.set_ui_scale(self.cfg.ui_scale - 0.1),
+            "appscale.reset" => self.set_ui_scale(1.0),
             "theme.dark" => self.set_theme(Theme::Dark),
             "theme.light" => self.set_theme(Theme::Light),
             other if other.starts_with("style.") => {
@@ -1286,6 +1321,14 @@ impl App {
                     .find(|s| other.strip_prefix("style.") == Some(s.key()))
                 {
                     self.set_style(style);
+                }
+            }
+            other if other.starts_with("ui_font.") => {
+                if let Some(font) = UiFont::ALL
+                    .into_iter()
+                    .find(|f| other.strip_prefix("ui_font.") == Some(f.key()))
+                {
+                    self.set_ui_font(font);
                 }
             }
             "density.compact" => self.set_density(Density::Compact),

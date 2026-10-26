@@ -981,189 +981,138 @@ pub fn card_opacity(st: CardState) -> f32 {
 pub struct TabState {
     pub hov: f32,
     pub sel: f32,
+    /// Shown in another pane of the split without having the focus.
+    pub shown: bool,
+    pub dark: bool,
 }
 
-/// Paints the tab pill: hover, active fill/border and the active indicator. Returns the radius.
-pub fn paint_tab(painter: &Painter, pill: Rect, pal: &Palette, st: TabState) -> u8 {
-    let lk = look();
-    let radius = lk.tab_r;
-    let TabState { hov, sel } = st;
-    let kind = lk.tab;
-    let r = f32::from(radius);
-    let cr = CornerRadius::same(radius);
-    let underline = |color: Color32, inset: f32, h: f32| {
-        painter.rect_filled(
-            Rect::from_min_max(
-                pos2(pill.left() + inset, pill.bottom() - h),
-                pos2(pill.right() - inset, pill.bottom()),
-            ),
-            1,
-            color,
-        );
-    };
-    // Outlined / Brutal tabs carry a resting border.
-    match kind {
-        TabKind::Outlined => {
-            painter.rect_stroke(
-                pill,
-                cr,
-                Stroke::new(1.0, mix(pal.stroke, pal.bg, 0.25).gamma_multiply(1.0 - sel)),
-                StrokeKind::Inside,
-            );
-        }
-        TabKind::Brutal => {
-            painter.rect_stroke(
-                pill,
-                cr,
-                Stroke::new(2.0, rgb_of(0x2e2e2e).gamma_multiply(1.0 - sel)),
-                StrokeKind::Inside,
-            );
-        }
-        _ => {}
-    }
-    // Hover.
-    painter.rect_filled(
-        pill,
-        cr,
-        super::hover_fill(pal).gamma_multiply(0.8 * hov * (1.0 - sel)),
-    );
-    if hov > 0.01 {
-        let w = if kind == TabKind::Brutal { 2.0 } else { 1.0 };
-        painter.rect_stroke(
-            pill,
-            cr,
-            Stroke::new(
-                w,
-                super::hover_stroke(pal).gamma_multiply(hov * (1.0 - sel)),
-            ),
-            StrokeKind::Inside,
-        );
-    }
-    if sel <= 0.01 {
-        return radius;
-    }
-    match kind {
-        TabKind::Plain | TabKind::Outlined => {
-            let fill = if kind == TabKind::Outlined {
-                mix(pal.bg, pal.surface, 0.6)
-            } else {
-                pal.surface
-            };
-            // The active outline is at least as bright as the hover outline.
-            let border = pal.hover_line;
-            painter.rect(
-                pill,
-                cr,
-                fill.gamma_multiply(sel),
-                Stroke::new(1.0, border.gamma_multiply(sel)),
-                StrokeKind::Inside,
-            );
-            underline(pal.accent.gamma_multiply(sel), 10.0_f32.max(r), 2.0);
-        }
-        TabKind::Filled => {
-            painter.rect(
-                pill,
-                cr,
-                pal.panel.gamma_multiply(sel),
-                Stroke::new(1.0, pal.hover_line.gamma_multiply(sel)),
-                StrokeKind::Inside,
-            );
-            top_highlight(painter, pill, r, (20.0 * sel) as u8);
-            underline(pal.accent.gamma_multiply(sel), 10.0_f32.max(r), 2.0);
-        }
-        TabKind::Tint => {
-            painter.rect(
-                pill,
-                cr,
-                alpha(pal.accent, (20.0 * sel) as u8),
-                Stroke::new(1.0, alpha(pal.accent, (115.0 * sel) as u8)),
-                StrokeKind::Inside,
-            );
-            underline(pal.accent.gamma_multiply(sel), 10.0_f32.max(r), 2.0);
-        }
-        TabKind::Grad => {
-            painter.rect(
-                pill,
-                cr,
-                rgb_of(0x12121c).gamma_multiply(sel),
-                Stroke::new(1.0, pal.tray_line.gamma_multiply(sel)),
-                StrokeKind::Inside,
-            );
-            let line = Rect::from_min_max(
-                pos2(pill.left() + 10.0, pill.bottom() - 2.0),
-                pos2(pill.right() - 10.0, pill.bottom()),
-            );
-            gradient_card(
+/// Corner radius of the signal-edge tabs: the style's tab radius, kept tight (2..=6 px) so the
+/// slanted corners stay crisp.
+pub fn tab_radius() -> f32 {
+    f32::from(look().tab_r.clamp(2, 6))
+}
+
+/// Horizontal room the slant takes at each end of a tab pill `h` px tall: the outline meets the
+/// pill's left edge at the bottom and its right edge at the top.
+pub fn tab_slant(h: f32) -> f32 {
+    h * crate::deco::SLANT_PER_PX / 2.0
+}
+
+/// Paints the signal-edge tab inside `pill` (a slanted parallelogram that never leaves the pill's
+/// width): resting outline, hover plate, and for the active tab a dark plate with the accent
+/// gradient outline, glow and drop shadow, plus the style's own touch. Returns the outline, for
+/// overlays such as the attention wash.
+pub fn paint_tab(painter: &Painter, pill: Rect, pal: &Palette, st: TabState) -> Vec<Pos2> {
+    use crate::deco;
+    let kind = look().tab;
+    let TabState {
+        hov,
+        sel,
+        shown,
+        dark,
+    } = st;
+    let r = tab_radius();
+    let s = tab_slant(pill.height());
+    // The parallelogram's central rectangle: shadows and glows hug it.
+    let body = pill.shrink2(vec2(s, 0.0));
+    let pts = deco::slanted(body, r);
+    let brutal = kind == TabKind::Brutal;
+    let w = if brutal { 2.0 } else { 1.0 };
+    // How much of the accent edge shows: fully when active, dimmed for a split pane's tab.
+    let lit = if shown { sel + (1.0 - sel) * 0.45 } else { sel };
+    let rest_edge = 1.0 - if shown { 1.0 } else { sel };
+    let plate = mix(pal.bar, pal.surface, 0.5);
+
+    // Depth under the active tab.
+    if sel > 0.01 {
+        if brutal {
+            deco::fill(
                 painter,
-                Id::unique(("skin-tab-grad", pill.min.x.to_bits())),
-                line,
-                1.0,
-                (
-                    pal.accent_a.gamma_multiply(sel),
-                    pal.accent_b.gamma_multiply(sel),
-                ),
-                Dir::Right,
-            );
-        }
-        TabKind::Glass => {
-            painter.rect(
-                pill,
-                cr,
-                white((20.0 * sel) as u8),
-                Stroke::new(1.0, white((80.0 * sel) as u8)),
-                StrokeKind::Inside,
-            );
-            top_highlight(painter, pill, r, (31.0 * sel) as u8);
-            underline(pal.accent.gamma_multiply(sel), 10.0_f32.max(r), 2.0);
-        }
-        TabKind::Brutal => {
-            painter.rect_filled(
-                pill.translate(vec2(3.0, 3.0)),
-                cr,
-                alpha(pal.accent, (128.0 * sel) as u8),
-            );
-            painter.rect(
-                pill,
-                cr,
-                pal.surface.gamma_multiply(sel),
-                Stroke::new(2.0, pal.accent.gamma_multiply(sel)),
-                StrokeKind::Inside,
-            );
-        }
-        TabKind::Folder => {
-            // Joined to the canvas below: canvas fill, borders on the sides and top only.
-            let top = CornerRadius {
-                nw: 8,
-                ne: 8,
-                sw: 0,
-                se: 0,
-            };
-            painter.rect_filled(pill, top, pal.bg.gamma_multiply(sel));
-            let edge = rgb_of(0x34343c).gamma_multiply(sel);
-            let s = Stroke::new(1.0, edge);
-            painter.vline(pill.left() + 0.5, (pill.top() + 8.0)..=pill.bottom(), s);
-            painter.vline(pill.right() - 0.5, (pill.top() + 8.0)..=pill.bottom(), s);
-            painter.hline(
-                (pill.left() + 8.0)..=(pill.right() - 8.0),
-                pill.top() + 0.5,
-                s,
-            );
-            painter.rect_filled(
-                Rect::from_min_size(
-                    pos2(pill.left() + 3.0, pill.top() + 1.0),
-                    vec2(pill.width() - 6.0, 2.0),
-                ),
-                1,
+                pts.iter().map(|p| *p + vec2(3.0, 3.0)).collect(),
                 pal.accent.gamma_multiply(sel),
             );
+        } else {
+            let ri = r as u8;
+            if kind != TabKind::Glass {
+                deco::drop_shadow(painter, body, ri, 6, 14, dark, (153.0 * sel) as u8);
+            }
+            // Halo over the shadow: a tight core and a wide bloom.
+            let k = sel * if dark { 1.0 } else { 0.5 };
+            let (a, _) = deco::accent_pair(pal);
+            deco::glow(painter, body, ri, a.gamma_multiply(0.18 * k), 22);
+            deco::glow(painter, body, ri, a.gamma_multiply(0.22 * k), 8);
         }
     }
-    radius
-}
 
-/// Whether the active tab extends to the bottom of the tab row (the folder tab).
-pub fn tab_joins_canvas() -> bool {
-    look().tab == TabKind::Folder
+    // Hover plate, fading out as the tab becomes active.
+    deco::fill(
+        painter,
+        pts.clone(),
+        pal.hover_bg.gamma_multiply(hov * (1.0 - sel)),
+    );
+    // Split pane's tab: a faint plate.
+    if shown {
+        deco::fill(
+            painter,
+            pts.clone(),
+            plate.gamma_multiply(0.5 * (1.0 - sel)),
+        );
+    }
+    // Active plate.
+    if sel > 0.01 {
+        let fill = match kind {
+            TabKind::Filled => pal.panel,
+            TabKind::Tint => mix(plate, pal.accent, 0.12),
+            TabKind::Glass => {
+                // The bar under the glass, so the glow stays outside the tab.
+                deco::fill(painter, pts.clone(), pal.bar.gamma_multiply(sel));
+                white(20)
+            }
+            TabKind::Folder => pal.bg,
+            TabKind::Plain | TabKind::Outlined | TabKind::Grad | TabKind::Brutal => plate,
+        };
+        deco::fill(painter, pts.clone(), fill.gamma_multiply(sel));
+        let hi = match kind {
+            TabKind::Glass => 31.0,
+            TabKind::Filled => 20.0,
+            _ => 0.0,
+        };
+        if hi > 0.0 {
+            // 1 px highlight along the slanted top edge (it runs from `left + 2s` to `right`).
+            painter.hline(
+                (body.left() + s + r)..=(body.right() + s - r),
+                body.top() + 1.0,
+                Stroke::new(1.0, white((hi * sel) as u8)),
+            );
+        }
+    }
+
+    // Resting / hover outline.
+    if rest_edge > 0.01 {
+        // Clearly visible at rest (light strokes sit close to the bar: full strength there).
+        let rest = match kind {
+            TabKind::Outlined | TabKind::Brutal => pal.stroke,
+            _ => mix(pal.bar, pal.stroke, if dark { 0.8 } else { 1.0 }),
+        };
+        let hover = mix(pal.stroke, pal.hover_line, 0.35);
+        deco::outline(
+            painter,
+            pts.clone(),
+            Stroke::new(w, mix(rest, hover, hov).gamma_multiply(rest_edge)),
+        );
+    }
+    // Accent gradient outline.
+    if lit > 0.01 {
+        let (a, b) = deco::accent_pair(pal);
+        deco::gradient_outline(
+            painter,
+            pts.clone(),
+            w,
+            &[(0.0, a.gamma_multiply(lit)), (1.0, b.gamma_multiply(lit))],
+            vec2(1.0, 0.0),
+        );
+    }
+    pts
 }
 
 // ------------------------------------------------------------------ chips and fields
