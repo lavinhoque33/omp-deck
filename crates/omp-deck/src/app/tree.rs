@@ -1,18 +1,19 @@
-//! App-side glue for the session tree window: the watcher that reads the session file, the
-//! gates for "Go here" / "Fork", and the two operations — through the control socket when the
-//! active tab has live control, headless `omp --mode rpc` otherwise.
+//! App-side glue for the session tree window: the gateway topic that follows the session file,
+//! the gates for "Go here" / "Fork", and the two operations — through the live-control request
+//! when the active tab has live control, through the gateway's fork otherwise.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Arc;
+use std::time::SystemTime;
 
-use deck_core::ctl::{CtlClient, CtlCommand, CtlReply, ctl_dir};
+use deck_core::ctl::{CtlCommand, CtlReply};
 use deck_core::mux::{new_session_name, session_name_for};
-use deck_core::tree::TreeWatcher;
+use deck_core::tree::SessionTree;
+use deck_service::gateway::protocol::{Done, Mutation, Topic, TopicValue};
 use egui::{Key, Modifiers};
 
-use super::ctl::CtlLink;
+use super::App;
 use super::spawn::Focus;
-use super::{App, AppEvent};
 use crate::agent_ctl::Link;
 use crate::tabs::{ClosedTab, Tab, TabRole};
 use crate::titlebar;
@@ -23,7 +24,6 @@ use deck_service::statusfmt::Activity;
 /// The open tree window.
 pub(super) struct TreeUi {
     state: TreeState,
-    watcher: TreeWatcher,
     /// The session file shown.
     session: PathBuf,
     /// Working directory a forked tab starts in.
@@ -31,6 +31,13 @@ pub(super) struct TreeUi {
     /// The session id (running checks against tmux names).
     id: Option<String>,
     title: String,
+    /// The gateway's parsed tree, shared with the view between revisions.
+    tree: Option<Arc<SessionTree>>,
+    error: Option<String>,
+    /// The tree's own revision (the view re-reads when it moves).
+    revision: u64,
+    /// The cache revision of the topic last taken.
+    seen: u64,
 }
 
 /// What the open tabs say about the session being forked.
@@ -69,9 +76,6 @@ struct ForkFacts {
 
 const RUNNING: &str = "Session is running in the background without live control — open it and restart with live control to fork";
 
-/// How long a background fork waits for the control socket before giving up.
-const BG_CONNECT: Duration = Duration::from_secs(3);
-
 /// How a fork must run: over the live link of its tab, or headless when nothing runs the file
 /// (two omp processes on one file are unsafe).
 fn fork_route(f: &ForkFacts) -> Result<ForkRoute, &'static str> {
@@ -108,29 +112,14 @@ pub(super) enum TreeOp {
     Fork,
     Navigate { user: bool },
 }
-
 /// The one operation in flight (a second one is refused until it settles).
 pub(super) struct TreeBusy {
-    /// Control request id; `None` = a headless worker runs it.
-    rid: Option<u64>,
     op: TreeOp,
     cwd: PathBuf,
     title: String,
     what: String,
-    /// The control client the request went over, when its tab stopped being the active one:
-    /// the extension still performs the request, so the reply is awaited here.
-    keep: Option<CtlLink>,
-    /// Background fork waiting for its client to connect: the entry to fork and since when.
-    bg: Option<(String, PathBuf, Instant)>,
     /// `activation_seq` when requested: the result may take focus only if still unchanged.
     seq: u64,
-}
-
-impl TreeBusy {
-    /// Waiting for a control reply (not a headless worker).
-    pub(super) fn over_ctl(&self) -> bool {
-        self.rid.is_some()
-    }
 }
 
 impl App {
@@ -142,21 +131,31 @@ impl App {
         title: String,
         id: Option<String>,
     ) {
-        let ctx = self.ctx.clone();
-        let watcher = TreeWatcher::spawn(session.clone(), move || ctx.request_repaint());
+        self.close_tree_topic();
+        self.gw.subscribe(Topic::Tree(session.clone()));
         self.tree = Some(TreeUi {
             state: TreeState::new(title.clone()),
-            watcher,
             session,
             cwd,
             id,
             title,
+            tree: None,
+            error: None,
+            revision: 0,
+            seen: 0,
         });
         self.ctx.request_repaint();
     }
 
+    /// Stops following the open tree's session file.
+    fn close_tree_topic(&mut self) {
+        if let Some(t) = self.tree.take() {
+            self.gw.unsubscribe(&Topic::Tree(t.session));
+        }
+    }
+
     pub(super) fn close_tree(&mut self) {
-        self.tree = None;
+        self.close_tree_topic();
         self.focus_pending = true;
     }
 
@@ -177,7 +176,7 @@ impl App {
         };
         let cwd = t.cwd.clone();
         let title = titlebar::strip_omp_prefix(t.title(&self.labels)).to_owned();
-        let id = self.watcher.latest().and_then(|groups| {
+        let id = self.groups().and_then(|groups| {
             groups
                 .iter()
                 .flat_map(|g| &g.sessions)
@@ -254,7 +253,6 @@ impl App {
             Err("omp is busy — wait for it to finish")
         }
     }
-
     /// How a fork of `session` must run (see [`fork_route`]).
     fn tree_fork_route(&self, session: &Path) -> Result<ForkRoute, &'static str> {
         let tab = self
@@ -268,47 +266,75 @@ impl App {
             Some((i, _)) if i == self.active && self.tree_link(session).is_ok() => {
                 TabFact::ActiveLive
             }
-            Some((i, t)) if i != self.active && t.ctl_key.is_some() => TabFact::Background,
+            Some((i, t)) if i != self.active && t.info().is_some_and(|i| i.live_control) => {
+                TabFact::Background
+            }
             Some(_) => TabFact::NoControl,
         };
-        let run = match (self.running.latest(), &self.tree) {
-            (Some(snap), ui) => {
-                let id = ui.as_ref().and_then(|u| u.id.as_deref());
+        let run = match self.gw.running() {
+            Some(snap) => {
+                let id = self.tree.as_ref().and_then(|u| u.id.as_deref());
                 if snap.holder(session).is_some()
                     || id.is_some_and(|id| snap.is_running(id, session))
                 {
                     RunFact::Running {
-                        control: self.tree_bg_key(session).is_some(),
+                        control: self.tree_bg_control(session),
                     }
                 } else {
                     RunFact::Stopped
                 }
             }
-            (None, _) if self.running.is_blind() => RunFact::Blind,
-            (None, _) => RunFact::Unknown,
+            None if self.gw.running_blind() => RunFact::Blind,
+            None => RunFact::Unknown,
         };
         fork_route(&ForkFacts {
             busy: self.tree_busy.is_some(),
             tab,
-            omp: self.omp.is_some(),
+            omp: self.omp_found(),
             run,
         })
     }
 
-    /// The session running `session` in a backend while no tab shows it, when its control
-    /// endpoint exists.
-    fn tree_bg_key(&self, session: &Path) -> Option<String> {
-        let snap = self.running.latest()?;
+    /// The session running `session` in a backend while no tab shows it has a live control
+    /// endpoint (the gateway forks over it).
+    fn tree_bg_control(&self, session: &Path) -> bool {
+        let snap = self.running_snapshot();
         let name = snap.holder(session).map(str::to_owned).or_else(|| {
             let id = self.tree.as_ref()?.id.as_deref()?;
             let canonical = session_name_for(id);
             (snap.is_alive(&canonical) && snap.files_of(&canonical).is_empty()).then_some(canonical)
-        })?;
-        ctl_endpoint_exists(&ctl_dir(&self.ctl_ns, &name)).then_some(name)
+        });
+        name.is_some_and(|n| snap.has_ctl(&n))
     }
 
     fn tree_fork_gate(&self, session: &Path) -> Result<(), &'static str> {
         self.tree_fork_route(session).map(drop)
+    }
+
+    /// Takes a newer tree of the open window's session from the gateway's cache.
+    fn take_tree(&mut self) {
+        let Some(session) = self.tree.as_ref().map(|t| t.session.clone()) else {
+            return;
+        };
+        let topic = Topic::Tree(session);
+        let rev = self.gw.revision(&topic);
+        if self.tree.as_ref().is_none_or(|t| t.seen == rev) {
+            return;
+        }
+        let Some(TopicValue::Tree {
+            revision,
+            tree,
+            error,
+        }) = self.gw.topic(&topic)
+        else {
+            return;
+        };
+        if let Some(t) = self.tree.as_mut() {
+            t.seen = rev;
+            t.revision = revision;
+            t.tree = tree.map(Arc::new);
+            t.error = error;
+        }
     }
 
     /// Per frame: draw the window and run what it asks for.
@@ -316,6 +342,7 @@ impl App {
         let Some(session) = self.tree.as_ref().map(|t| t.session.clone()) else {
             return;
         };
+        self.take_tree();
         let navigate = self.tree_navigate_gate(&session);
         let fork = self.tree_fork_gate(&session);
         let live = self
@@ -327,15 +354,13 @@ impl App {
         let Some(ui_state) = self.tree.as_mut() else {
             return;
         };
-        let tree = ui_state.watcher.latest();
-        let error = ui_state.watcher.error();
         let actions = tree_view::show(
             ctx,
             &mut ui_state.state,
             &TreeInput {
-                tree: tree.as_ref(),
-                revision: ui_state.watcher.revision(),
-                error: error.as_deref(),
+                tree: ui_state.tree.as_ref(),
+                revision: ui_state.revision,
+                error: ui_state.error.as_deref(),
                 live_leaf: live.as_ref().and_then(|s| s.leaf.as_deref()),
                 navigate,
                 fork,
@@ -361,159 +386,76 @@ impl App {
         if self.tree_busy.is_some() {
             return;
         }
-        let mut busy = TreeBusy {
-            rid: None,
+        let Ok(route) = self.tree_fork_route(session) else {
+            return;
+        };
+        let busy = TreeBusy {
             op: TreeOp::Fork,
             cwd,
             title,
             what,
-            keep: None,
-            bg: None,
             seq: self.activation_seq,
         };
-        let Ok(route) = self.tree_fork_route(session) else {
-            return;
-        };
-        if route == ForkRoute::Live
-            && let Some(link) = &self.ctl
-        {
-            busy.rid = Some(link.client.send(CtlCommand::ForkAt {
+        if route == ForkRoute::Live {
+            let command = CtlCommand::ForkAt {
                 root: session.to_path_buf(),
                 entry_id: entry,
-            }));
-            self.tree_busy = Some(busy);
-            self.toasts.info(&self.ctx, "Forking…");
-            return;
-        }
-        if route == ForkRoute::Background {
-            let Some(key) = self.tree_bg_key(session) else {
-                return;
             };
-            let ctx = self.ctx.clone();
-            busy.keep = Some(CtlLink::new(
-                key.clone(),
-                CtlClient::spawn(ctl_dir(&self.ctl_ns, &key), move || ctx.request_repaint()),
-            ));
-            busy.bg = Some((entry, session.to_path_buf(), Instant::now()));
-            self.tree_busy = Some(busy);
-            self.toasts.info(&self.ctx, "Forking…");
-            return;
-        }
-        let Some(omp) = self.omp.clone() else {
-            return;
-        };
-        let file = session.to_path_buf();
-        let started = crate::omp_worker::try_spawn(&self.ctx, &self.events_tx, move || {
-            AppEvent::TreeForked(omp.fork_at(&file, &entry).map_err(|e| e.to_string()))
-        });
-        match started {
-            Ok(()) => {
+            if self.ctl_command(command, |app, r| app.on_tree_reply(r)) {
                 self.tree_busy = Some(busy);
                 self.toasts.info(&self.ctx, "Forking…");
             }
-            Err(e) => self
-                .toasts
-                .error(&self.ctx, format!("Could not start the fork: {e}")),
+            return;
         }
+        // The gateway forks over the running session's control socket when there is one, and
+        // headless otherwise.
+        self.tree_busy = Some(busy);
+        self.toasts.info(&self.ctx, "Forking…");
+        self.gw.mutate(
+            Mutation::ForkAt {
+                file: session.to_path_buf(),
+                entry_id: entry,
+            },
+            |app, r| {
+                let result = r.and_then(|d| match d {
+                    Done::Path(file) => Ok(file),
+                    _ => Err("the gateway answered with something else".to_owned()),
+                });
+                app.on_tree_forked(result);
+            },
+        );
     }
 
     fn tree_navigate(&mut self, session: &Path, entry: String, user: bool) {
         if self.tree_navigate_gate(session).is_err() {
             return;
         }
-        let Some(link) = &self.ctl else {
-            return;
-        };
-        let rid = link.client.send(CtlCommand::Navigate {
+        let command = CtlCommand::Navigate {
             root: session.to_path_buf(),
             entry_id: entry,
-        });
-        self.tree_busy = Some(TreeBusy {
-            rid: Some(rid),
-            op: TreeOp::Navigate { user },
-            cwd: PathBuf::new(),
-            title: String::new(),
-            what: String::new(),
-            keep: None,
-            bg: None,
-            seq: self.activation_seq,
-        });
-    }
-
-    /// The active tab's client is about to change: a tree request in flight over it keeps its
-    /// client (the extension performs the request whatever tab is shown).
-    pub(super) fn tree_detach(&mut self, old: Option<CtlLink>) {
-        if let Some(b) = self
-            .tree_busy
-            .as_mut()
-            .filter(|b| b.over_ctl() && b.keep.is_none())
-        {
-            b.keep = old;
-        }
-    }
-
-    /// A background fork sends its request once its client is connected, or gives up.
-    fn poll_tree_bg(&mut self) {
-        let Some(busy) = self.tree_busy.as_mut() else {
-            return;
         };
-        let (Some((entry, root, since)), Some(link)) = (busy.bg.as_ref(), busy.keep.as_ref())
-        else {
-            return;
-        };
-        if link.client.connected() {
-            let rid = link.client.send(CtlCommand::ForkAt {
-                root: root.clone(),
-                entry_id: entry.clone(),
+        if self.ctl_command(command, |app, r| app.on_tree_reply(r)) {
+            self.tree_busy = Some(TreeBusy {
+                op: TreeOp::Navigate { user },
+                cwd: PathBuf::new(),
+                title: String::new(),
+                what: String::new(),
+                seq: self.activation_seq,
             });
-            busy.rid = Some(rid);
-            busy.bg = None;
-        } else if since.elapsed() > BG_CONNECT {
-            self.tree_busy = None;
-            self.tree_failed(
-                TreeOp::Fork,
-                "could not reach the running session's control socket",
-            );
-        } else {
-            self.ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 
-    /// Per frame: replies (or a lost link) of the client a tree request was left on.
-    pub(super) fn poll_tree_kept(&mut self) {
-        self.poll_tree_bg();
-        let Some((replies, connected)) = self
-            .tree_busy
-            .as_ref()
-            .and_then(|b| b.keep.as_ref())
-            .map(|l| (l.client.take_replies(), l.client.connected()))
-        else {
+    /// The live-control reply that settles the tree operation.
+    fn on_tree_reply(&mut self, reply: Result<CtlReply, String>) {
+        let Some(busy) = self.tree_busy.take() else {
             return;
         };
-        for (rid, reply) in replies {
-            self.on_tree_reply(rid, &reply, true);
-        }
-        if !connected
-            && let Some(busy) = self
-                .tree_busy
-                .take_if(|b| b.keep.is_some() && b.rid.is_some())
-        {
-            self.tree_failed(busy.op, "the control link to that tab was lost");
-        }
-    }
-
-    /// A control reply: true when it settled the tree operation. `kept` = it came from the
-    /// client left behind by a tab switch rather than the active one (request ids are per client).
-    pub(super) fn on_tree_reply(&mut self, rid: u64, reply: &CtlReply, kept: bool) -> bool {
-        if self
-            .tree_busy
-            .as_ref()
-            .is_none_or(|b| b.rid != Some(rid) || b.keep.is_some() != kept)
-        {
-            return false;
-        }
-        let Some(busy) = self.tree_busy.take() else {
-            return false;
+        let reply = match reply {
+            Ok(r) => r,
+            Err(e) => {
+                self.tree_failed(busy.op, &e);
+                return;
+            }
         };
         if !reply.ok {
             let why = reply
@@ -521,7 +463,7 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| "omp refused".to_owned());
             self.tree_failed(busy.op, &why);
-            return true;
+            return;
         }
         match busy.op {
             TreeOp::Fork => match &reply.new_file {
@@ -540,11 +482,10 @@ impl App {
                 );
             }
         }
-        true
     }
 
-    /// The headless fork finished.
-    pub(super) fn on_tree_forked(&mut self, result: Result<PathBuf, String>) {
+    /// The gateway's fork finished.
+    fn on_tree_forked(&mut self, result: Result<PathBuf, String>) {
         let Some(busy) = self.tree_busy.take() else {
             return;
         };
@@ -557,9 +498,7 @@ impl App {
     fn tree_forked(&mut self, busy: &TreeBusy, file: PathBuf) {
         self.close_tree();
         let name = self
-            .backends
-            .primary()
-            .is_some()
+            .backends_available()
             .then(|| new_session_name(SystemTime::now()));
         // Like every queued launch: focus only while the user has not switched tabs since asking.
         let focus = if busy.seq == self.activation_seq {
@@ -596,16 +535,6 @@ impl App {
             ToastKind::Error,
             format!("Could not {what}: {text}"),
         );
-    }
-}
-
-/// Whether a tab's control endpoint is up: its `ctl.sock` (Unix) or its named pipe (Windows,
-/// where the pipe name is the endpoint itself).
-fn ctl_endpoint_exists(dir: &Path) -> bool {
-    if cfg!(windows) {
-        dir.exists()
-    } else {
-        dir.join("ctl.sock").exists()
     }
 }
 

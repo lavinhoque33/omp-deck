@@ -1,105 +1,71 @@
-//! App-side glue for OmpDeck self-update: the startup sweep + install detection, the release
-//! check (startup, every 6 h, manual), the download/verify/apply worker and the restart.
+//! App-side glue for OmpDeck self-update. The gateway detects the install kind, checks for
+//! releases on its schedule, downloads and installs; this window asks for checks and installs,
+//! shows the state the gateway publishes and restarts into the new version once it is in place.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use deck_core::selfupdate::{Applied, InstallKind};
+use deck_service::controller::RequestKey;
+use deck_service::gateway::protocol::{Mutation, Topic};
 
-use deck_core::selfupdate::{self, Applied, InstallKind, Release, UpdateError};
-
-use super::{App, AppEvent};
+use super::App;
 use crate::app_update::{
-    self as au, AppUpdateTracker, CheckState, Phase, PillView, SettingsAction, SettingsCard,
+    self as au, Adopted, AppUpdateTracker, Checked, Phase, PillView, SettingsAction, SettingsCard,
     UpdateAction,
 };
-use crate::omp_worker;
-
-/// Minimum time between two repaints requested by download progress.
-const PROGRESS_REPAINT_MS: u64 = 100;
-
-/// What a self-update worker reports.
-pub(super) enum AppUpdateEvent {
-    /// How this copy was installed (and the Windows leftovers were swept).
-    Detected(InstallKind),
-    Checked(Result<Release, String>),
-    /// The download is verified; installing now.
-    Applying,
-    Finished(Result<Applied, UpdateError>, Option<tempfile::TempDir>),
-}
-
-/// Download progress shared with the worker (read once per frame).
-#[derive(Default)]
-struct Progress {
-    done: AtomicU64,
-    /// 0 = unknown.
-    total: AtomicU64,
-    last_repaint_ms: AtomicU64,
-}
 
 pub(super) struct AppUpdateUi {
     pub(super) tracker: AppUpdateTracker,
-    started: bool,
-    cancel: Arc<AtomicBool>,
-    progress: Arc<Progress>,
-    /// The window was asked to close while the worker ran; close once it reports.
+    /// The gateway revision of the update topic last adopted.
+    revision: u64,
+    /// The download this window started (cancelled with it).
+    download: Option<RequestKey>,
+    /// The window was asked to close while the install ran; close once it reports.
     close_after: bool,
-    /// The verified package a shown manual install command points to.
-    payload: Option<tempfile::TempDir>,
 }
 
 impl AppUpdateUi {
     pub(super) fn new() -> AppUpdateUi {
         AppUpdateUi {
             tracker: AppUpdateTracker::default(),
-            started: false,
-            cancel: Arc::new(AtomicBool::new(false)),
-            progress: Arc::new(Progress::default()),
+            revision: 0,
+            download: None,
             close_after: false,
-            payload: None,
         }
     }
 }
 
 impl App {
-    /// Per frame: startup work, download progress and the 6 h schedule.
+    /// Per frame: adopt the gateway's update state and guard a close during an install.
     pub(super) fn tick_app_update(&mut self, ctx: &egui::Context) {
-        if !self.app_update.started {
-            self.app_update.started = true;
-            omp_worker::spawn(&self.ctx, &self.events_tx, || {
-                selfupdate::sweep_leftovers();
-                au::sweep_stale_update_dirs(&std::env::temp_dir(), au::STALE_AFTER);
-                AppEvent::AppUpdate(AppUpdateEvent::Detected(selfupdate::detect()))
-            });
-        }
-        if let Phase::Downloading { .. } = self.app_update.tracker.phase {
-            let p = &self.app_update.progress;
-            let total = p.total.load(Ordering::Relaxed);
-            self.app_update.tracker.phase = Phase::Downloading {
-                done: p.done.load(Ordering::Relaxed),
-                total: (total > 0).then_some(total),
-            };
-        }
-        // Checks wait for the install detection, and a development build never checks.
-        let may_check = matches!(&self.app_update.tracker.kind, Some(k) if *k != InstallKind::Dev);
-        if may_check
-            && self
-                .app_update
-                .tracker
-                .due(Instant::now(), self.cfg.check_app_updates)
-        {
-            self.begin_app_check(false);
+        let revision = self.gw.revision(&Topic::AppUpdate);
+        if revision != self.app_update.revision {
+            self.app_update.revision = revision;
+            if let Some(view) = self.gw.app_update() {
+                let adopted = self.app_update.tracker.adopt(&view);
+                self.on_app_adopted(adopted);
+            }
         }
         self.guard_close_during_update(ctx);
-        ctx.request_repaint_after(Duration::from_secs(60));
     }
 
-    fn begin_app_check(&mut self, manual: bool) {
-        self.app_update.tracker.begin(Instant::now(), manual);
-        omp_worker::spawn(&self.ctx, &self.events_tx, || {
-            AppEvent::AppUpdate(AppUpdateEvent::Checked(
-                selfupdate::latest().map_err(|e| e.to_string()),
-            ))
-        });
+    fn on_app_adopted(&mut self, adopted: Adopted) {
+        match adopted {
+            Adopted::Nothing => {}
+            Adopted::Checked(checked) => self.on_app_checked(checked),
+            Adopted::Applied(applied) => self.restart_into(&applied),
+        }
+    }
+
+    /// The new version is in place: close through the normal path (`on_exit` flushes the state
+    /// and `main` starts the successor once the terminals are detached). A close the user
+    /// requested while the install ran just closes: the new version starts next time.
+    fn restart_into(&mut self, applied: &Applied) {
+        if !std::mem::take(&mut self.app_update.close_after) {
+            au::set_restart((
+                applied.executable.clone(),
+                std::env::args_os().skip(1).collect(),
+            ));
+        }
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     /// "Check for OmpDeck updates" (menu, Settings, palette). A development build never checks.
@@ -107,16 +73,24 @@ impl App {
         match &self.app_update.tracker.kind {
             None => self.toasts.info(
                 &self.ctx,
-                "Still detecting how OmpDeck was installed; try again in a moment",
+                "Waiting for the gateway to report how OmpDeck was installed; try again in a moment",
             ),
             Some(InstallKind::Dev) => {
                 let why = au::cannot_update(&InstallKind::Dev).unwrap_or_default();
                 self.toasts.info(&self.ctx, why);
             }
             Some(_) => {
-                if !self.app_update.tracker.is_checking() {
-                    self.begin_app_check(true);
+                if self.app_update.tracker.is_checking() {
+                    return;
                 }
+                self.app_update.tracker.ask();
+                self.gw.mutate(Mutation::AppUpdateCheck, |app, result| {
+                    if let Err(e) = result {
+                        app.app_update.tracker.abandon_ask();
+                        app.toasts
+                            .error(&app.ctx, format!("OmpDeck update check failed: {e}"));
+                    }
+                });
             }
         }
     }
@@ -127,11 +101,14 @@ impl App {
         if t.phase.is_busy() {
             return Some("An OmpDeck update is already running");
         }
+        if !self.gw.is_up() {
+            return Some("The gateway is not connected");
+        }
         if t.available().is_none() {
             return Some("No newer OmpDeck version is known; check for updates first");
         }
         match &t.kind {
-            None => Some("Still detecting how OmpDeck was installed"),
+            None => Some("Waiting for the gateway to report how OmpDeck was installed"),
             Some(k) if au::cannot_update(k).is_some() => {
                 Some("This copy of OmpDeck cannot update itself")
             }
@@ -139,78 +116,47 @@ impl App {
         }
     }
 
-    /// "Update and restart": download, verify, install, then restart into the new version.
+    /// "Update and restart": the gateway downloads, verifies and installs; this window restarts
+    /// into the new version once it is in place.
     pub(super) fn start_app_update(&mut self) {
         if self.app_update_blocked().is_some() {
             return;
         }
-        let t = &self.app_update.tracker;
-        let (Some(release), Some(kind)) = (t.available().cloned(), t.kind.clone()) else {
-            return;
-        };
-        if au::cannot_update(&kind).is_some() {
-            return;
-        }
-        self.app_update.cancel.store(false, Ordering::Relaxed);
-        self.app_update.progress.done.store(0, Ordering::Relaxed);
-        self.app_update.progress.total.store(0, Ordering::Relaxed);
-        self.app_update.tracker.phase = Phase::Downloading {
+        let t = &mut self.app_update.tracker;
+        t.installing = true;
+        t.phase = Phase::Downloading {
             done: 0,
             total: None,
         };
-        let (cancel, progress) = (
-            self.app_update.cancel.clone(),
-            self.app_update.progress.clone(),
-        );
-        let (ctx, tx) = (self.ctx.clone(), self.events_tx.clone());
-        self.app_update.payload = None;
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            let (result, keep) = install(&kind, &release, &cancel, &progress, &ctx, &tx);
-            AppEvent::AppUpdate(AppUpdateEvent::Finished(result, keep))
-        });
-    }
-
-    pub(super) fn on_app_update_event(&mut self, ev: AppUpdateEvent) {
-        match ev {
-            AppUpdateEvent::Detected(kind) => {
-                log::info!("OmpDeck install kind: {kind:?}");
-                self.app_update.tracker.kind = Some(kind);
-            }
-            AppUpdateEvent::Checked(result) => self.on_app_checked(result),
-            AppUpdateEvent::Applying => self.app_update.tracker.phase = Phase::Applying,
-            AppUpdateEvent::Finished(Ok(applied), _) => {
-                // A close requested while it ran just closes: no successor, the new version
-                // starts next time.
-                if !std::mem::take(&mut self.app_update.close_after) {
-                    au::set_restart(applied.restart);
+        let key = self
+            .gw
+            .mutate(Mutation::AppUpdateDownload, |app, result| match result {
+                Ok(_) => {
+                    app.app_update.download = None;
+                    app.app_update.tracker.phase = Phase::Applying;
+                    app.gw.mutate(Mutation::AppUpdateApply, |app, result| {
+                        if let Err(e) = result {
+                            app.on_app_update_failed(e);
+                        }
+                    });
                 }
-                self.app_update.tracker.phase = Phase::Restarting;
-                // The normal close path: `on_exit` flushes the state, `main` starts the successor
-                // once the terminals are detached.
-                self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            AppUpdateEvent::Finished(Err(UpdateError::Cancelled), _) => {
-                self.app_update.tracker.phase = Phase::Idle;
-                self.finish_deferred_close();
-            }
-            AppUpdateEvent::Finished(Err(UpdateError::NeedsManual { command }), keep) => {
-                self.app_update.payload = keep;
-                self.app_update.tracker.phase = Phase::NeedsManual { command };
-                self.finish_deferred_close();
-            }
-            AppUpdateEvent::Finished(Err(e), _) => {
-                let text = e.to_string();
-                log::warn!("OmpDeck update failed: {text}");
-                self.toasts
-                    .error(&self.ctx, format!("OmpDeck update failed: {text}"));
-                self.app_update.tracker.phase = Phase::Failed(text);
-                self.finish_deferred_close();
-            }
-        }
+                Err(e) => app_download_failed(app, e),
+            });
+        self.app_update.download = Some(key);
     }
 
-    /// Per frame: a window close while the update worker runs is held back until it reports, so
-    /// the thread is never killed halfway through replacing the installed files. A download is
+    fn on_app_update_failed(&mut self, text: String) {
+        log::warn!("OmpDeck update failed: {text}");
+        self.toasts
+            .error(&self.ctx, format!("OmpDeck update failed: {text}"));
+        let t = &mut self.app_update.tracker;
+        t.installing = false;
+        t.phase = Phase::Failed(text);
+        self.finish_deferred_close();
+    }
+
+    /// Per frame: a window close while the install runs is held back until it reports, so the
+    /// installer is never killed halfway through replacing the installed files. A download is
     /// cancelled; an install is awaited.
     fn guard_close_during_update(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.viewport().close_requested()) {
@@ -218,7 +164,9 @@ impl App {
         }
         match self.app_update.tracker.phase {
             Phase::Downloading { .. } => {
-                self.app_update.cancel.store(true, Ordering::Relaxed);
+                if let Some(key) = self.app_update.download.clone() {
+                    self.gw.cancel(key);
+                }
             }
             Phase::Applying => {
                 if !self.app_update.close_after {
@@ -231,55 +179,53 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
     }
 
-    /// The worker reported without restarting: close now when the user asked to while it ran.
+    /// The install reported without restarting: close now when the user asked to while it ran.
     fn finish_deferred_close(&mut self) {
         if std::mem::take(&mut self.app_update.close_after) {
             self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
-    fn on_app_checked(&mut self, result: Result<Release, String>) {
-        let manual = std::mem::take(&mut self.app_update.tracker.manual);
-        self.app_update.tracker.finish(result, au::CURRENT);
-        let state = self.app_update.tracker.check.clone();
-        match &state {
-            CheckState::Available(r) => {
-                if manual && self.cfg.skipped_app_version.as_deref() == Some(r.version.as_str()) {
+    fn on_app_checked(&mut self, checked: Checked) {
+        match checked {
+            Checked::Available(r) => {
+                if self.cfg.skipped_app_version.as_deref() == Some(r.version.as_str()) {
                     // Asking explicitly brings a skipped version back.
                     self.cfg.skipped_app_version = None;
                     self.dirty = true;
                 }
-                if manual {
-                    self.toasts
-                        .info(&self.ctx, format!("OmpDeck {} is available", r.version));
-                }
+                self.toasts
+                    .info(&self.ctx, format!("OmpDeck {} is available", r.version));
             }
-            CheckState::UpToDate if manual => {
+            Checked::UpToDate => {
                 self.toasts
                     .success(&self.ctx, format!("OmpDeck {} is up to date", au::CURRENT));
             }
-            CheckState::Error(e) => {
+            Checked::Error(e) => {
                 log::warn!("OmpDeck update check failed: {e}");
-                if manual {
-                    self.toasts
-                        .error(&self.ctx, format!("OmpDeck update check failed: {e}"));
-                }
+                self.toasts
+                    .error(&self.ctx, format!("OmpDeck update check failed: {e}"));
             }
-            _ => {}
+        }
+    }
+
+    fn cancel_app_download(&mut self) {
+        if let Some(key) = self.app_update.download.clone() {
+            self.gw.cancel(key);
         }
     }
 
     pub(super) fn apply_app_update_action(&mut self, action: UpdateAction) {
         match action {
             UpdateAction::Install => self.start_app_update(),
-            UpdateAction::Cancel => self.app_update.cancel.store(true, Ordering::Relaxed),
+            UpdateAction::Cancel => self.cancel_app_download(),
             UpdateAction::OpenPage(url) => self.open_external(url),
-            UpdateAction::CopyCommand(c) => self.copy_text(&c, "command"),
             UpdateAction::Skip(version) => {
                 self.cfg.skipped_app_version = Some(version);
                 self.dirty = true;
             }
             UpdateAction::Check => self.check_app_update_manually(),
+            UpdateAction::CopyCommand(text) => self.copy_text(&text, "update command"),
         }
     }
 
@@ -291,7 +237,7 @@ impl App {
             }
             SettingsAction::CheckNow => self.check_app_update_manually(),
             SettingsAction::Install => self.start_app_update(),
-            SettingsAction::Cancel => self.app_update.cancel.store(true, Ordering::Relaxed),
+            SettingsAction::Cancel => self.cancel_app_download(),
         }
     }
 
@@ -307,6 +253,19 @@ impl App {
     }
 }
 
+/// A download that did not finish: cancelled by the user, or failed.
+fn app_download_failed(app: &mut App, e: String) {
+    app.app_update.download = None;
+    if e == "cancelled" {
+        let t = &mut app.app_update.tracker;
+        t.installing = false;
+        t.phase = Phase::Idle;
+        app.finish_deferred_close();
+    } else {
+        app.on_app_update_failed(e);
+    }
+}
+
 impl AppUpdateUi {
     /// The Settings card input, borrowing only this state (the page also borrows other `App` fields).
     pub(super) fn card(&self, check: bool) -> SettingsCard<'_> {
@@ -319,58 +278,4 @@ impl AppUpdateUi {
             kind: t.kind.as_ref(),
         }
     }
-}
-
-/// Worker body: download + verify into a temporary folder, then install. The folder is removed
-/// when this returns, except when the install needs a manual step: the verified package stays
-/// there for the command that is shown, and the guard travels back with the result.
-fn install(
-    kind: &InstallKind,
-    release: &Release,
-    cancel: &AtomicBool,
-    progress: &Progress,
-    ctx: &egui::Context,
-    tx: &std::sync::mpsc::Sender<AppEvent>,
-) -> (Result<Applied, UpdateError>, Option<tempfile::TempDir>) {
-    let Some(asset) = selfupdate::asset_for(kind, &release.version) else {
-        return (
-            Err(UpdateError::NoAsset(format!(
-                "{} has no download for this system",
-                release.tag
-            ))),
-            None,
-        );
-    };
-    let dir = match tempfile::Builder::new()
-        .prefix("omp-deck-update-")
-        .tempdir()
-    {
-        Ok(d) => d,
-        Err(e) => return (Err(UpdateError::Io(e)), None),
-    };
-    let began = Instant::now();
-    let file = match selfupdate::download(
-        release,
-        &asset,
-        dir.path(),
-        &|done, total| {
-            progress.done.store(done, Ordering::Relaxed);
-            progress.total.store(total.unwrap_or(0), Ordering::Relaxed);
-            let now = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let last = progress.last_repaint_ms.load(Ordering::Relaxed);
-            if now.saturating_sub(last) >= PROGRESS_REPAINT_MS {
-                progress.last_repaint_ms.store(now, Ordering::Relaxed);
-                ctx.request_repaint();
-            }
-        },
-        cancel,
-    ) {
-        Ok(f) => f,
-        Err(e) => return (Err(e), None),
-    };
-    let _ = tx.send(AppEvent::AppUpdate(AppUpdateEvent::Applying));
-    ctx.request_repaint();
-    let result = selfupdate::apply(kind, &file);
-    let keep = matches!(result, Err(UpdateError::NeedsManual { .. })).then_some(dir);
-    (result, keep)
 }

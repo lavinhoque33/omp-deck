@@ -13,12 +13,16 @@ alacritty_terminal.workspace = true
 arboard.workspace = true
 thiserror.workspace = true
 log.workspace = true
+serde.workspace = true
+# VT snapshot encoder + side-state scanner for output subscribers.
+deck-host.workspace = true
 # Kitty graphics decoding; the versions eframe already pulls in.
 png = "0.18"
 miniz_oxide = "0.8"
 
 [target.'cfg(unix)'.dependencies]
-# Same version alacritty_terminal 0.26 uses: its EventedReadWrite trait takes polling types.
+# Same version alacritty_terminal 0.26 uses: its EventedReadWrite trait takes polling types
+# (the PTY loop polls the PTY and the child-signal pipe with them).
 polling = "3.11"
 
 [target.'cfg(windows)'.dependencies]

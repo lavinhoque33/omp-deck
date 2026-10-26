@@ -1,124 +1,71 @@
-//! App-side glue for desktop notifications: feeds tab states to the trigger rules, sends the
-//! notifications, and turns clicks into "activate that tab and raise the window".
-
-use std::time::Instant;
+//! App-side glue for notifications. The gateway classifies turns, keeps the inbox and shows the
+//! desktop pop-ups; this window reports whether it is focused and which sessions it shows, draws
+//! the inbox and the bells, and raises itself when a pop-up was clicked.
 
 use deck_service::controller::SessionTarget;
-use deck_service::notifications::{Effect, NotificationCenter, Observation};
+use deck_service::gateway::protocol::{ClientState, Mutation};
 use egui::{UserAttentionType, ViewportCommand};
 
 use super::App;
-use crate::notify::{Notifier, Request, Signal};
+#[cfg(target_os = "linux")]
+use crate::notify::Signal;
+use crate::notify::WindowRaiser;
 use crate::notify_panel::{self, PanelAction};
 use crate::notify_view::NotifyAction;
 use crate::settings_page::OmpDeckPage;
-use crate::tabs::{Tab, TabRole};
+use crate::tabs::{ClosedTab, Tab, TabRole};
 
 pub(super) struct NotifyUi {
-    notifier: Notifier,
-    /// The canonical transition tracker, inbox and turn classifier (shared with every client).
-    pub(super) center: NotificationCenter,
-    /// Why notifications cannot be shown (once the notifier thread found out).
-    pub(super) unavailable: Option<String>,
+    raiser: WindowRaiser,
     window_attached: bool,
-    /// The user pressed "Send test notification" and no result came back yet.
-    test_pending: bool,
+    /// What the gateway was last told about this window.
+    reported: Option<ClientState>,
 }
 
 impl NotifyUi {
     pub(super) fn new(ctx: &egui::Context) -> NotifyUi {
         NotifyUi {
-            notifier: Notifier::start(ctx.clone()),
-            center: NotificationCenter::new({
-                let ctx = ctx.clone();
-                std::sync::Arc::new(move || ctx.request_repaint())
-            }),
-            unavailable: None,
+            raiser: WindowRaiser::start(ctx.clone()),
             window_attached: false,
-            test_pending: false,
+            reported: None,
         }
+    }
+
+    /// The link came back up: the gateway keeps no view state of a lost connection.
+    pub(super) fn forget_report(&mut self) {
+        self.reported = None;
     }
 }
 
 impl App {
     /// Per tick (from `App::logic`, so also while the window is minimized or on another
-    /// desktop): show the sessions to the notification center and carry out what it decides:
-    /// desktop pop-ups, withdrawals and the tabs' bell markers.
+    /// desktop): tell the gateway whether this window is focused and which sessions it shows.
     pub(super) fn drive_notifications(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if !self.notify.window_attached {
             self.notify.window_attached = true;
-            self.notify.notifier.attach_window(frame);
+            self.notify.raiser.attach_window(frame);
         }
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         let visible = self.visible_uids();
-        let projects: Vec<(String, String)> = self
-            .tabs
-            .iter()
-            .filter_map(|tab| {
-                let t = tab.term().filter(|t| t.role == TabRole::Session)?;
-                let project = t
-                    .cwd
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_owned();
-                Some((tab.label(&self.labels).to_owned(), project))
-            })
-            .collect();
-        let sessions: Vec<Observation<'_>> = self
-            .tabs
-            .iter()
-            .filter_map(Tab::term)
-            .filter(|t| t.role == TabRole::Session)
-            .zip(&projects)
-            .map(|(t, (title, project))| Observation {
-                target: t.ctl.target(),
-                status: t.ctl.status(false),
-                exit_code: t.terminal().exit_code(),
-                session: t.session_path(),
-                title,
-                project,
-                visible: visible.contains(&t.uid),
-            })
-            .collect();
-        let ticked = self
-            .notify
-            .center
-            .tick(Instant::now(), &sessions, focused, &self.cfg.notify);
-        self.apply_notify_effects(ticked.effects);
-        if let Some(d) = ticked.watch_in {
-            ctx.request_repaint_after(d);
+        let state = ClientState {
+            focused,
+            visible: self
+                .tabs
+                .iter()
+                .filter_map(Tab::term)
+                .filter(|t| t.role == TabRole::Session && visible.contains(&t.uid))
+                .map(|t| t.target().clone())
+                .collect(),
+            active: self.active_target(),
+        };
+        if self.notify.reported.as_ref() != Some(&state) {
+            self.gw.set_client_state(state.clone());
+            self.notify.reported = Some(state);
         }
-        for signal in self.notify.notifier.drain() {
-            self.on_notify_signal(signal);
-        }
-    }
-
-    /// Carries out the center's decisions with this client's platform channels.
-    fn apply_notify_effects(&mut self, effects: Vec<Effect>) {
-        for effect in effects {
-            match effect {
-                Effect::Show {
-                    target,
-                    title,
-                    body,
-                } => self.notify.notifier.show(Request {
-                    tab: Some(target),
-                    title,
-                    body,
-                }),
-                Effect::Withdraw(target) => self.notify.notifier.close(Some(target)),
-                Effect::WithdrawAll => self.notify.notifier.close_all(),
-                Effect::Bell(target) => {
-                    if let Some(t) = self
-                        .tabs
-                        .iter_mut()
-                        .filter_map(Tab::term_mut)
-                        .find(|t| *t.ctl.target() == target)
-                    {
-                        t.bell = true;
-                    }
-                }
+        #[cfg(target_os = "linux")]
+        for signal in self.notify.raiser.drain() {
+            match signal {
+                Signal::RaiseFailed => self.raise_attention(),
             }
         }
     }
@@ -128,50 +75,57 @@ impl App {
     fn tab_of_target(&self, target: &SessionTarget) -> Option<usize> {
         self.tabs
             .iter()
-            .position(|t| t.term().is_some_and(|t| t.ctl.target() == target))
+            .position(|t| t.term().is_some_and(|t| t.target() == target))
     }
 
-    fn on_notify_signal(&mut self, signal: Signal) {
-        match signal {
-            Signal::Clicked { tab, token } => {
-                log::debug!(
-                    "notification clicked: tab {tab:?}, token {}",
-                    token.is_some()
-                );
-                self.notify.test_pending = false;
-                if let Some(target) = tab {
-                    self.notify.center.clicked(&target);
-                    if let Some(i) = self.tab_of_target(&target) {
-                        self.activate(i);
-                    }
-                }
-                self.raise_window(token.as_deref());
-            }
-            Signal::Gone { tab } => {
-                self.notify.test_pending = false;
-                if let Some(target) = tab {
-                    self.notify.center.gone(&target);
-                }
-            }
-            Signal::Unavailable(why) => {
-                if std::mem::take(&mut self.notify.test_pending) {
-                    self.toasts
-                        .error(&self.ctx, format!("Notifications are unavailable: {why}"));
-                }
-                self.notify.unavailable = Some(why);
-            }
-            #[cfg(target_os = "linux")]
-            Signal::RaiseFailed => self.raise_attention(),
+    /// A finished turn of `target`: the tab's bell marker.
+    pub(super) fn on_bell(&mut self, target: &SessionTarget) {
+        if let Some(t) = self
+            .tabs
+            .iter_mut()
+            .filter_map(Tab::term_mut)
+            .find(|t| t.target() == target)
+        {
+            t.bell = true;
         }
+    }
+
+    /// The gateway reports a click on a desktop notification of `target` (or of the inbox):
+    /// show that session's tab, then bring the window to the front.
+    pub(super) fn on_activate(&mut self, target: &SessionTarget, token: Option<&str>) {
+        self.show_session_of(target);
+        self.raise_window(token);
+    }
+
+    /// Activates the tab of `target`; when this window has none, opens a view of the session
+    /// the gateway runs (if it still runs it).
+    fn show_session_of(&mut self, target: &SessionTarget) {
+        if let Some(i) = self.tab_of_target(target) {
+            self.activate(i);
+            return;
+        }
+        let Some(info) = self.gw.controller(target) else {
+            return;
+        };
+        let mux_name = match &info.backend {
+            deck_service::gateway::protocol::BackendRef::Mux { name, .. } => Some(name.clone()),
+            deck_service::gateway::protocol::BackendRef::Direct => None,
+        };
+        self.open_resolved(ClosedTab {
+            mux_name,
+            cwd: info.cwd.clone(),
+            session_path: info.session_path.clone(),
+            title: info.label.clone(),
+        });
     }
 
     /// Bring the window to the front: the compositor's activation token on Wayland, else the
     /// windowing system's focus request.
-    fn raise_window(&mut self, token: Option<&str>) {
+    pub(super) fn raise_window(&mut self, token: Option<&str>) {
         self.ctx
             .send_viewport_cmd(ViewportCommand::Minimized(false));
         self.ctx.send_viewport_cmd(ViewportCommand::Focus);
-        let tried = token.is_some_and(|t| self.notify.notifier.raise_with_token(t));
+        let tried = token.is_some_and(|t| self.notify.raiser.raise_with_token(t));
         if !tried {
             self.raise_attention();
         }
@@ -209,23 +163,36 @@ impl App {
     pub(super) fn apply_inbox_action(&mut self, action: PanelAction) {
         match action {
             PanelAction::Open(target) => {
-                let effects = self.notify.center.open(&target);
-                self.apply_notify_effects(effects);
-                if let Some(i) = self.tab_of_target(&target) {
-                    self.activate(i);
-                }
+                // The gateway drops the entry and withdraws its pop-up; this window shows it.
+                self.gw
+                    .mutate(Mutation::InboxOpen(target.clone()), |app, result| {
+                        if let Err(e) = result {
+                            app.toasts
+                                .error(&app.ctx, format!("Could not open the entry: {e}"));
+                        }
+                    });
+                self.show_session_of(&target);
                 self.raise_window(None);
             }
             PanelAction::Dismiss(target) => {
-                let effects = self.notify.center.dismiss(&target);
-                self.apply_notify_effects(effects);
+                self.gw
+                    .mutate(Mutation::InboxDismiss(target), |app, result| {
+                        if let Err(e) = result {
+                            app.toasts
+                                .error(&app.ctx, format!("Could not dismiss the entry: {e}"));
+                        }
+                    });
             }
             PanelAction::Settings => {
                 self.open_settings_page(OmpDeckPage::Notifications);
             }
             PanelAction::ClearAll => {
-                let effects = self.notify.center.clear_all();
-                self.apply_notify_effects(effects);
+                self.gw.mutate(Mutation::InboxClear, |app, result| {
+                    if let Err(e) = result {
+                        app.toasts
+                            .error(&app.ctx, format!("Could not clear the inbox: {e}"));
+                    }
+                });
             }
         }
     }
@@ -235,13 +202,15 @@ impl App {
         egui::Popup::open_id(&self.ctx, notify_panel::popup_id());
     }
 
+    /// Asks the gateway for a sample desktop notification.
     pub(super) fn send_test_notification(&mut self) {
-        self.notify.test_pending = true;
-        self.notify.notifier.show(Request {
-            tab: None,
-            title: "OmpDeck test notification".to_owned(),
-            body: "Notifications work. Click to bring OmpDeck to the front.".to_owned(),
-        });
-        self.toasts.info(&self.ctx, "Test notification sent");
+        self.gw
+            .mutate(Mutation::InboxTest, |app, result| match result {
+                Ok(_) => app.toasts.info(&app.ctx, "Test notification sent"),
+                Err(e) => app.toasts.error(
+                    &app.ctx,
+                    format!("The test notification could not be sent: {e}"),
+                ),
+            });
     }
 }

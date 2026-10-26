@@ -1,5 +1,5 @@
 //! Linux notifier: `org.freedesktop.Notifications` over one session-bus connection. One thread
-//! runs the commands (Notify / CloseNotification / the Wayland raise), a second reads the server's
+//! runs the commands (Notify / CloseNotification), a second reads the server's
 //! signals in arrival order so `ActivationToken` is always seen before its `ActionInvoked`.
 
 use std::collections::HashMap;
@@ -7,13 +7,12 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use deck_service::controller::SessionTarget;
+use crate::controller::SessionTarget;
 use futures_lite::StreamExt;
 use zbus::message::Type;
 use zbus::zvariant::Value;
 use zbus::{Connection, MatchRule, Message, MessageStream};
 
-use super::wayland::Raiser;
 use super::{Cmd, Out, Request, Signal};
 
 const SERVICE: &str = "org.freedesktop.Notifications";
@@ -67,7 +66,6 @@ pub fn run(cmds: Receiver<Cmd>, out: &Out) {
             log::warn!("starting the notification signal thread failed: {e}");
         }
     }
-    let mut raiser: Option<Raiser> = None;
     let mut reported = false;
     while let Ok(first) = cmds.recv() {
         // Whatever piled up behind a slow call: only the newest notification per tab is worth showing.
@@ -88,21 +86,6 @@ pub fn run(cmds: Receiver<Cmd>, out: &Out) {
                         lock(&state).by_tab.keys().flatten().cloned().collect();
                     for tab in tabs {
                         zbus::block_on(close(&conn, &state, Some(tab)));
-                    }
-                }
-                Cmd::Window { display, surface } => match Raiser::new(display, surface) {
-                    Ok(r) => raiser = Some(r),
-                    Err(e) => log::info!("Wayland window raise unavailable: {e}"),
-                },
-                Cmd::Raise(token) => {
-                    let done = raiser.as_ref().map(|r| r.activate(&token));
-                    match done {
-                        Some(Ok(())) => {}
-                        Some(Err(e)) => {
-                            log::warn!("xdg-activation failed: {e}");
-                            out.send(Signal::RaiseFailed);
-                        }
-                        None => out.send(Signal::RaiseFailed),
                     }
                 }
             }
@@ -266,7 +249,8 @@ mod tests {
 
     fn key(n: u64) -> SessionTarget {
         SessionTarget {
-            key: deck_service::controller::SessionKey::tmux("test", &n.to_string()),
+            epoch: crate::controller::ServiceEpoch::current(),
+            key: crate::controller::SessionKey::tmux("test", &n.to_string()),
             generation: 1,
         }
     }

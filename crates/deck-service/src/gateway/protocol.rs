@@ -1,0 +1,1216 @@
+//! The gateway wire protocol: handshake, typed requests and results, events and the binary
+//! terminal frames of a frontend link. See [`super::wire`] for the framing.
+//!
+//! Connection kinds, chosen by [`Hello::attach`]:
+//! - control: `Hello` → `Welcome`/`Refuse`, then [`Envelope`] requests answered by chunked
+//!   [`Reply`]s (same id), interleaved with [`ServerEvent`]s. Events are small; state is fetched
+//!   by query after a `Changed` (a lagging client gets one `Resync`, never an unbounded queue).
+//! - frontend: `Hello{attach}` → `Welcome`/`Refuse`, then the terminal frames below. One
+//!   connection per view, so a slow view only slows itself.
+//!
+//! Distinct failure classes: unsupported protocol / other profile / maintenance (handshake
+//! [`Refusal`]), stale epoch or target, a closed transport (the client's own `Disconnected`), a
+//! controller rejection ([`GatewayError::Rejected`]), an execution refusal
+//! ([`GatewayError::Refused`]), a failed operation ([`GatewayError::Failed`]) and an uncertain
+//! outcome after an owner crash ([`GatewayError::Uncertain`]).
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
+use deck_core::agents::{AgentsSnapshot, AgentsTarget, TranscriptItem};
+use deck_core::changes::{ChangedFile, Changes, DiffSide, FileDiff};
+use deck_core::config::GatewayMode;
+use deck_core::ctl::{CtlCommand, LiveSnapshot};
+use deck_core::fleet::{FleetSnapshot, FleetTarget};
+use deck_core::gdrive::{
+    BackupFile, BackupOutcome, LastBackup, Parts, ProjectBackup, ProjectBackupOutcome,
+    ProjectRestorePlan, ProjectRestoreReport, ProjectSizes, ProjectSyncState, RestoreReport,
+};
+use deck_core::inventory::{InventoryEntry, SessionStats};
+use deck_core::mux::MuxKind;
+use deck_core::omp::{
+    DeleteTarget, ModelInfo, MoveOutcome, SettingsCatalog, UpdateKind, UpdateStatus,
+};
+use deck_core::selfupdate::{Applied, InstallKind, Release};
+use deck_core::sessions::ProjectGroup;
+use deck_core::status::SessionStatus;
+use deck_core::usage::{Activity as UsageActivity, UsageSnapshot};
+use deck_core::worktree::{MergeTarget, Removed, RepoInfo, Worktree, WorktreeStatus};
+use deck_term::InputMeta;
+use serde::{Deserialize, Serialize};
+
+use super::running::RunningSnapshot;
+use super::{MaintenanceMarker, MaintenancePurpose, Profile};
+use crate::controller::{
+    Command, ControllerEvent, Rejected, RequestId, RequestKey, RequestRecord, ServiceEpoch,
+    SessionKey, SessionTarget, Submitted,
+};
+use crate::notifications::inbox::Kind as InboxKind;
+use crate::settings::{Edit, SettingsError, Snapshot};
+use crate::status::TabStatus;
+use crate::statusfmt::Activity;
+
+/// Version of this protocol. A different version is refused at the handshake.
+pub const PROTOCOL: u32 = 1;
+
+/// Frame kinds.
+pub mod kind {
+    pub const HELLO: u8 = 1;
+    pub const WELCOME: u8 = 2;
+    pub const REFUSE: u8 = 3;
+    /// Client → gateway: chunked [`super::Envelope`] JSON.
+    pub const REQUEST: u8 = 10;
+    /// Gateway → client: chunked [`super::Reply`] JSON (chunk id = request id).
+    pub const REPLY: u8 = 11;
+    /// Gateway → client: one [`super::ServerEvent`] JSON.
+    pub const EVENT: u8 = 12;
+    /// Client → gateway: leaving cleanly (its unwritten confirmations may be cancelled).
+    pub const BYE: u8 = 13;
+
+    // Frontend, gateway → client.
+    /// Chunked replay (kitty + grid snapshot bytes; chunk id = snapshot sequence).
+    pub const F_SNAPSHOT: u8 = 20;
+    /// Raw output bytes.
+    pub const F_OUTPUT: u8 = 21;
+    /// `cols, rows, cell_width, cell_height` as u16 LE.
+    pub const F_RESIZE: u8 = 22;
+    /// [`deck_term::FrontendState`] JSON.
+    pub const F_STATE: u8 = 23;
+    /// Exit code JSON (`Option<i32>`): the process really ended.
+    pub const F_EXITED: u8 = 24;
+    /// [`super::InputRefused`] JSON: one write was refused; the view goes on.
+    pub const F_REFUSED: u8 = 25;
+    /// [`super::ViewEnd`] JSON: the view ended without a process exit.
+    pub const F_ENDED: u8 = 26;
+
+    // Frontend, client → gateway.
+    /// `ctrl_c u8 | has_mods u8 | mods u32 LE | bytes`.
+    pub const U_INPUT: u8 = 30;
+    /// The exact OSC 52 reply for the outstanding clipboard read.
+    pub const U_CLIP: u8 = 31;
+    /// `u8` focused.
+    pub const U_FOCUS: u8 = 32;
+    /// `cols, rows, cell_width, cell_height` as u16 LE.
+    pub const U_RESIZE: u8 = 33;
+    /// 19 × RGB.
+    pub const U_PALETTE: u8 = 34;
+    /// Kill the session's process (this session only).
+    pub const U_KILL: u8 = 35;
+    /// End this view only.
+    pub const U_DETACH: u8 = 36;
+}
+
+/// Who connects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Role {
+    /// A native desktop window: counts for the lifetime, reports focus/visibility.
+    Gui,
+    /// A command-line client (`omp-deck-gateway request|status|drain…`).
+    Cli,
+    /// The OS-started supervisor: not a GUI, no session rights, never a mutation owner.
+    Supervisor,
+}
+
+/// What a frontend view may do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewRole {
+    /// Types, and owns focus, geometry and the clipboard (one per session; a new one takes over
+    /// from the previous controlling view, which keeps typing rights).
+    Controlling,
+    /// Types; geometry, focus and clipboard stay with the controlling view.
+    Input,
+    /// Follows the output only.
+    Observer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attach {
+    pub target: SessionTarget,
+    pub view: ViewRole,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    pub protocol: u32,
+    pub version: String,
+    pub role: Role,
+    /// Stable for the client process; the `client` of its [`RequestKey`]s. A frontend link
+    /// uses its parent client's id.
+    pub client_id: String,
+    pub pid: u32,
+    /// The profile the client expects; a different served profile is refused.
+    pub profile: Profile,
+    /// `Some` = a frontend link for this session view.
+    pub attach: Option<Attach>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Welcome {
+    pub protocol: u32,
+    pub version: String,
+    pub epoch: ServiceEpoch,
+    pub pid: u32,
+    pub profile: Profile,
+    pub mode: GatewayMode,
+    pub maintenance: Option<MaintenanceMarker>,
+}
+
+/// Why a handshake was refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum Refusal {
+    #[error("gateway protocol {theirs} is not supported by this client (protocol {ours})")]
+    Unsupported { ours: u32, theirs: u32 },
+    #[error("the running gateway serves another profile (settings {}, sessions {})", served.settings.display(), served.sessions_root.display())]
+    ProfileMismatch { served: Profile },
+    #[error("OmpDeck is being updated or removed")]
+    Maintenance(MaintenanceMarker),
+    /// A frontend attach for a target this instance does not hold (another epoch, a restarted
+    /// session or a closed one).
+    #[error("the session changed")]
+    Stale { current: Option<SessionTarget> },
+    /// This frontend may not attach (an observer-only session, a refused role).
+    #[error("{0}")]
+    NotAllowed(String),
+    #[error("the gateway is shutting down")]
+    ShuttingDown,
+}
+
+/// One request on a control link.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Envelope {
+    pub id: u64,
+    pub body: Request,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Request {
+    /// Focus/visibility of a GUI (notification policy input). Replaces the previous state.
+    ClientState(ClientState),
+    Subscribe(Topic),
+    Unsubscribe(Topic),
+    /// Read-only; never journaled.
+    Query(Query),
+    /// A journaled, epoch-bound mutation.
+    Mutate {
+        key: RequestKey,
+        epoch: ServiceEpoch,
+        op: Box<Mutation>,
+    },
+    /// The record of an earlier mutation; never executes anything.
+    Outcome(RequestKey),
+    /// Wait until every earlier settings edit is committed.
+    Flush,
+    /// Bundle maintenance (CLI): raise the barrier and drain, or lower it.
+    Maintenance(MaintenanceOp),
+    /// The sessions this client's agents dashboard follows ([`Topic::Fleet`]); replaces the
+    /// client's previous list. The gateway follows the union of every client's lists.
+    SetFleetTargets(Vec<FleetTarget>),
+    /// The session whose subagents this client shows ([`Topic::Agents`]).
+    SetAgentsTarget(Option<AgentsTarget>),
+    /// What this client's status bar shows about a session's model: resolves that session's
+    /// optimistic model switch in the gateway ([`crate::controller::SessionController::observe_model`]).
+    /// A switch that did not take is reported as [`ServerEvent::ModelUnconfirmed`].
+    ObserveModel {
+        target: SessionTarget,
+        facts: ModelFactsView,
+    },
+}
+
+/// [`crate::controller::ModelFacts`] as sent by a client.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFactsView {
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub configured: Option<String>,
+    pub shown: Option<String>,
+    pub shown_is_default: bool,
+}
+
+/// A model/thinking switch ([`crate::model_switch::Pending`] without its clock).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchInfo {
+    pub selector: Option<String>,
+    pub level: Option<String>,
+}
+
+impl From<&crate::model_switch::Pending> for SwitchInfo {
+    fn from(p: &crate::model_switch::Pending) -> SwitchInfo {
+        SwitchInfo {
+            selector: p.selector.clone(),
+            level: p.level.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaintenanceOp {
+    /// Raise the barrier (refuse new mutations and launches) and report the drain state.
+    Begin(MaintenancePurpose),
+    /// Current drain state (`Drained` once nothing accepted is left).
+    Poll,
+    /// Barrier stays (the CLI removes the marker); the owner exits once drained.
+    Exit,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientState {
+    pub focused: bool,
+    /// Sessions a view of this client shows.
+    pub visible: Vec<SessionTarget>,
+    /// The session of the client's active tab ([`Topic::Status`] follows the focused client's).
+    pub active: Option<SessionTarget>,
+}
+
+/// Live state a client caches. Always-on topics are kept current by the gateway; the
+/// interest-driven ones run their watchers only while someone subscribes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Topic {
+    Gateway,
+    Settings,
+    Sessions,
+    Running,
+    Controllers,
+    Notifications,
+    Status,
+    Usage,
+    AppUpdate,
+    Drive,
+    Inventory,
+    Changes(PathBuf),
+    Tree(PathBuf),
+    /// The sessions of [`Request::SetFleetTargets`].
+    Fleet,
+    /// The session of [`Request::SetAgentsTarget`].
+    Agents,
+    /// A subagent transcript file.
+    Transcript(PathBuf),
+    /// The live-control state of a controlled session.
+    Live(SessionKey),
+    /// omp's version and update check.
+    OmpUpdate,
+}
+
+impl Topic {
+    /// Watchers run only while subscribed.
+    pub fn interest_driven(&self) -> bool {
+        matches!(
+            self,
+            Topic::Inventory
+                | Topic::Changes(_)
+                | Topic::Tree(_)
+                | Topic::Fleet
+                | Topic::Agents
+                | Topic::Transcript(_)
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Query {
+    Topic(Topic),
+    /// The visible screen text of a controlled session.
+    Screen(SessionTarget),
+    /// `deck_core::usage::activity` over `days`.
+    UsageActivity {
+        days: u32,
+    },
+    OmpVersion,
+    OmpCheckUpdate,
+    Models,
+    /// omp's settings catalog with secret values replaced by `SECRET_PLACEHOLDER`.
+    OmpSettings,
+    Diff {
+        root: PathBuf,
+        file: ChangedFile,
+        side: DiffSide,
+    },
+    Patch {
+        root: PathBuf,
+    },
+    RepoInfo(PathBuf),
+    CheckBranch {
+        repo: PathBuf,
+        name: String,
+    },
+    ResolveWorktree(PathBuf),
+    WorktreeStatus {
+        worktree: Worktree,
+        base: String,
+    },
+    InferBase(Worktree),
+    MergeTarget {
+        primary: PathBuf,
+        base: String,
+    },
+    /// Which controlled sessions run inside `worktree` (target and label).
+    WorktreeSessions(Worktree),
+    DriveList,
+    DriveProjects,
+    DriveProjectState,
+    DriveMeasure {
+        project: PathBuf,
+    },
+    Stats(Vec<PathBuf>),
+    FindFork {
+        parent_id: String,
+        since_unix_ms: u64,
+    },
+    FindCopy {
+        parents: Vec<String>,
+        dest_cwd: PathBuf,
+        since_unix_ms: u64,
+    },
+    /// Every live backend session with its memory, and the tmux server's own (the session
+    /// manager's Running view and RAM column).
+    RunningDetail,
+}
+
+/// A query's result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Answer {
+    /// Boxed: topic values are large next to the other answers (JSON is unchanged).
+    Topic(Box<TopicValue>),
+    Screen(ScreenView),
+    UsageActivity(UsageActivity),
+    OmpVersion(String),
+    OmpCheckUpdate(UpdateStatus),
+    Models(Vec<ModelInfo>),
+    OmpSettings(SettingsCatalog),
+    Diff(FileDiff),
+    Patch(String),
+    RepoInfo(RepoInfo),
+    CheckBranch,
+    ResolveWorktree(Option<Worktree>),
+    WorktreeStatus(WorktreeStatus),
+    InferBase(Option<String>),
+    MergeTarget(MergeTarget),
+    WorktreeSessions(Vec<(SessionTarget, String)>),
+    DriveList(Vec<BackupFile>),
+    DriveProjects(Vec<ProjectBackup>),
+    DriveProjectState(ProjectSyncState),
+    DriveMeasure(ProjectSizes),
+    Stats(Vec<(PathBuf, Option<SessionStats>)>),
+    Path(Option<PathBuf>),
+    Flushed,
+    Maintenance(DrainState),
+    /// A mutation was accepted (see [`Accepted`]).
+    Accepted(Accepted),
+    /// [`Request::Outcome`].
+    Outcome(Outcome),
+    /// Subscribe/Unsubscribe/ClientState done.
+    Done,
+    RunningDetail(RunningDetail),
+}
+
+/// [`Query::RunningDetail`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningDetail {
+    /// A name listed by several backends belongs to the first.
+    pub sessions: Vec<deck_core::mux::RunningSession>,
+    /// The tmux backend is available.
+    pub tmux: bool,
+    /// Memory of the tmux server process alone.
+    pub tmux_server: Option<deck_core::platform::TreeMemory>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenView {
+    pub lines: Vec<String>,
+    pub cursor_row: usize,
+    pub cursor_col: usize,
+}
+
+/// The state of one topic.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TopicValue {
+    Gateway(GatewayStatus),
+    Settings(Snapshot),
+    Sessions(SessionsView),
+    Running(RunningSnapshot),
+    Controllers(Vec<ControllerInfo>),
+    Notifications(InboxView),
+    /// The status of the focused client's active session.
+    Status(Option<(SessionTarget, SessionStatus)>),
+    Usage(UsageView),
+    AppUpdate(AppUpdateView),
+    Drive(DriveView),
+    Inventory(Vec<InventoryEntry>),
+    Changes(Result<Option<Changes>, String>),
+    Tree {
+        revision: u64,
+        tree: Option<deck_core::tree::SessionTree>,
+        error: Option<String>,
+    },
+    Fleet(Option<FleetSnapshot>),
+    Agents(Option<AgentsSnapshot>),
+    Transcript {
+        revision: u64,
+        items: Vec<TranscriptItem>,
+    },
+    Live {
+        target: Option<SessionTarget>,
+        connected: bool,
+        snapshot: Option<LiveSnapshot>,
+    },
+    OmpUpdate(OmpUpdateView),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OmpUpdateView {
+    pub version: Option<String>,
+    pub status: Option<Result<UpdateStatus, String>>,
+    pub checked_unix_ms: Option<u64>,
+    pub checking: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Effective {
+    /// Runs while a GUI or accepted work needs it.
+    OnDemand,
+    /// Supervised and kept alive across logins.
+    Background,
+    /// Maintenance barrier up: draining, refusing new work.
+    Maintenance(MaintenancePurpose),
+    /// No GUI and no work left: exiting.
+    Stopping,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Supervision {
+    /// Not requested (mode is not Background).
+    None,
+    /// Registered with the OS and its supervisor is connected.
+    Active { registration: String },
+    /// Registered, but no supervisor has connected (yet).
+    Registered { registration: String },
+    /// Background requested but registering or starting failed: the mode was rolled back.
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobInfo {
+    pub key: RequestKey,
+    pub label: String,
+    pub progress: Option<Progress>,
+    pub cancellable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayStatus {
+    pub epoch: ServiceEpoch,
+    pub pid: u32,
+    pub version: String,
+    pub profile: Profile,
+    pub mode: GatewayMode,
+    pub effective: Effective,
+    pub supervision: Supervision,
+    pub gui_clients: usize,
+    pub cli_clients: usize,
+    pub supervisor: bool,
+    pub jobs: Vec<JobInfo>,
+    /// Direct-PTY programs still running (they hold an owner until they exit).
+    pub direct_programs: usize,
+    pub backend_banner: Option<String>,
+    /// Every backend kind found.
+    pub backends: Vec<MuxKind>,
+    /// The kind new sessions use.
+    pub primary_backend: Option<MuxKind>,
+    pub omp_found: bool,
+    pub live_control: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionsView {
+    pub generation: u64,
+    pub root: PathBuf,
+    pub root_exists: bool,
+    pub groups: std::sync::Arc<Vec<ProjectGroup>>,
+}
+
+/// Where a controlled session runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackendRef {
+    Mux {
+        kind: MuxKind,
+        name: String,
+    },
+    /// A direct child of the gateway (ends with it): a draining job until it exits.
+    Direct,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionRole {
+    /// An omp session.
+    Session,
+    /// An omp/plugin update or install run.
+    Tool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ControllerInfo {
+    pub target: SessionTarget,
+    pub role: SessionRole,
+    pub label: String,
+    pub cwd: PathBuf,
+    pub session_path: Option<PathBuf>,
+    pub backend: BackendRef,
+    pub title: Option<String>,
+    pub activity: Activity,
+    pub exit_code: Option<i32>,
+    /// The indicator without the client's own bell marker ([`ServerEvent::Bell`]).
+    pub status: TabStatus,
+    pub busy: bool,
+    pub current_model: Option<String>,
+    pub pending_switch: Option<SwitchInfo>,
+    pub assumed_switch: Option<SwitchInfo>,
+    /// The launch created the session with the live-control extension: its socket is expected.
+    pub ctl_expect: bool,
+    /// Live control socket connected.
+    pub live_control: bool,
+    pub spawned_unix_ms: u64,
+    pub ctl_key: Option<String>,
+    /// The folder omp last reported for the session (its terminal breadcrumb), when it belongs
+    /// to the session's current process; `None` when unknown or direct.
+    pub live_cwd: Option<PathBuf>,
+    /// Newest last.
+    pub requests: Vec<RequestRecord>,
+    /// Views attached now.
+    pub views: usize,
+    /// A controlling view owns geometry.
+    pub controlled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxEntry {
+    pub target: SessionTarget,
+    pub kind: InboxKind,
+    pub title: String,
+    pub project: String,
+    pub body: String,
+    pub at_unix_ms: u64,
+    pub armed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxView {
+    /// Newest first.
+    pub entries: Vec<InboxEntry>,
+    pub warns: bool,
+    pub badge: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UsageView {
+    pub snapshot: Option<UsageSnapshot>,
+    pub fetched_unix_ms: Option<u64>,
+    pub error: Option<String>,
+    pub fetching: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdatePhase {
+    Idle,
+    Checking,
+    Downloading {
+        done: u64,
+        total: Option<u64>,
+    },
+    /// Installed; the client restarts into it after flushing.
+    Applied(Applied),
+    /// Could not be installed automatically (e.g. a package without pkexec): the user runs
+    /// `command`. The download is kept.
+    NeedsManual {
+        command: String,
+    },
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppUpdateView {
+    pub install: InstallKind,
+    pub current: String,
+    /// A newer release (and its asset for this install) when one was found.
+    pub latest: Option<Release>,
+    pub asset: Option<String>,
+    pub checked_unix_ms: Option<u64>,
+    pub phase: UpdatePhase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveView {
+    /// Google client credentials are built in / configured.
+    pub available: bool,
+    pub signed_in: bool,
+    pub email: Option<String>,
+    pub last_backup: Option<LastBackup>,
+    /// A Drive job is running (only one at a time).
+    pub busy: Option<String>,
+    pub last_error: Option<String>,
+    pub last_auto_unix_ms: Option<u64>,
+}
+
+/// A mutation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Mutation {
+    /// Open (attach or create) a session; the result is its target.
+    Launch(LaunchSpec),
+    /// Kill and relaunch the session with the same identity request.
+    Restart(SessionTarget),
+    /// Graceful stop of this session's backend process only.
+    Stop(SessionTarget),
+    /// Kill this session's process only.
+    Kill(SessionTarget),
+    /// Kill exactly these backend sessions (`wait`: graceful stop, then wait until gone); any
+    /// controller of one ends like [`Mutation::Kill`].
+    KillNames {
+        names: Vec<String>,
+        wait: bool,
+    },
+    /// Close the gateway's controller (backend sessions keep running; a direct program is
+    /// killed only if `kill_direct`).
+    Close {
+        target: SessionTarget,
+        kill_direct: bool,
+    },
+    /// An injected command through the controller.
+    Submit {
+        target: SessionTarget,
+        command: Command,
+    },
+    /// The answer to a draft confirmation.
+    Answer {
+        target: SessionTarget,
+        id: RequestId,
+        clear: bool,
+    },
+    /// Set (or clear) the session file of a controlled session the client resolved.
+    SetSessionPath {
+        target: SessionTarget,
+        path: Option<PathBuf>,
+    },
+    ForkAt {
+        file: PathBuf,
+        entry_id: String,
+    },
+    Copy {
+        file: PathBuf,
+        dest_cwd: PathBuf,
+    },
+    /// Stop the listed backend sessions, then move.
+    Move {
+        file: PathBuf,
+        dest_cwd: PathBuf,
+        stop: Vec<String>,
+    },
+    /// Stop the listed backend sessions, then delete.
+    Delete {
+        targets: Vec<DeleteTarget>,
+        stop: Vec<String>,
+    },
+    ExportHtml {
+        file: PathBuf,
+        dest: PathBuf,
+    },
+    Ctl {
+        target: SessionTarget,
+        command: CtlCommand,
+    },
+    Stage {
+        root: PathBuf,
+        files: Vec<ChangedFile>,
+    },
+    Unstage {
+        root: PathBuf,
+        files: Vec<ChangedFile>,
+    },
+    Discard {
+        root: PathBuf,
+        files: Vec<ChangedFile>,
+    },
+    DeleteUntracked {
+        root: PathBuf,
+        files: Vec<ChangedFile>,
+    },
+    WorktreeCreate {
+        repo: PathBuf,
+        branch: String,
+        base_ref: String,
+        dest: PathBuf,
+    },
+    /// Stops the listed sessions running in it first; refused while another one runs there.
+    WorktreeRemove {
+        worktree: Worktree,
+        base: String,
+        delete_branch: bool,
+        stop: Vec<SessionTarget>,
+    },
+    OmpSet {
+        key: String,
+        value: serde_json::Value,
+    },
+    OmpReset {
+        key: String,
+    },
+    /// An omp update/install run in a session of its own; the result is its target.
+    RunTool(Tool),
+    Settings(Edit),
+    SetGatewayMode(GatewayMode),
+    DriveLoginBegin,
+    DriveLoginFinish(u64),
+    DriveLoginCancel(u64),
+    DriveSignOut,
+    DriveBackup {
+        force: bool,
+    },
+    DrivePrepareRestore(BackupFile),
+    DriveApplyRestore(u64),
+    DriveDiscardRestore(u64),
+    ProjectBackup {
+        project: PathBuf,
+        parts: Parts,
+        excluded: BTreeSet<String>,
+        force: bool,
+    },
+    ProjectDeleteBackup(ProjectBackup),
+    ProjectPrepareRestore {
+        backup: ProjectBackup,
+        target: PathBuf,
+        parts: Parts,
+    },
+    ProjectApplyRestore(u64),
+    ProjectDiscardRestore(u64),
+    AppUpdateCheck,
+    AppUpdateDownload,
+    AppUpdateApply,
+    InboxOpen(SessionTarget),
+    InboxDismiss(SessionTarget),
+    InboxClear,
+    /// A sample desktop notification.
+    InboxTest,
+    /// Cancel a running job.
+    CancelJob(RequestKey),
+    /// Fetch usage now (`force`: even if fresh).
+    UsageRefresh {
+        force: bool,
+    },
+    /// Check omp for an update now.
+    OmpUpdateCheck,
+    /// Rescan the sessions and poll the backends now.
+    RefreshSessions,
+}
+
+impl Mutation {
+    /// Short label for job lists and the journal (no payload values).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Mutation::Launch(_) => "launch",
+            Mutation::Restart(_) => "restart",
+            Mutation::Stop(_) => "stop",
+            Mutation::Kill(_) => "kill",
+            Mutation::KillNames { .. } => "kill-names",
+            Mutation::Close { .. } => "close",
+            Mutation::Submit { .. } => "submit",
+            Mutation::Answer { .. } => "answer",
+            Mutation::SetSessionPath { .. } => "set-session-path",
+            Mutation::ForkAt { .. } => "fork",
+            Mutation::Copy { .. } => "copy",
+            Mutation::Move { .. } => "move",
+            Mutation::Delete { .. } => "delete",
+            Mutation::ExportHtml { .. } => "export-html",
+            Mutation::Ctl { .. } => "ctl",
+            Mutation::Stage { .. } => "git-stage",
+            Mutation::Unstage { .. } => "git-unstage",
+            Mutation::Discard { .. } => "git-discard",
+            Mutation::DeleteUntracked { .. } => "git-delete-untracked",
+            Mutation::WorktreeCreate { .. } => "worktree-create",
+            Mutation::WorktreeRemove { .. } => "worktree-remove",
+            Mutation::OmpSet { .. } => "omp-set",
+            Mutation::OmpReset { .. } => "omp-reset",
+            Mutation::RunTool(_) => "run-tool",
+            Mutation::Settings(_) => "settings",
+            Mutation::SetGatewayMode(_) => "gateway-mode",
+            Mutation::DriveLoginBegin => "drive-login",
+            Mutation::DriveLoginFinish(_) => "drive-login-finish",
+            Mutation::DriveLoginCancel(_) => "drive-login-cancel",
+            Mutation::DriveSignOut => "drive-sign-out",
+            Mutation::DriveBackup { .. } => "drive-backup",
+            Mutation::DrivePrepareRestore(_) => "drive-prepare-restore",
+            Mutation::DriveApplyRestore(_) => "drive-restore",
+            Mutation::DriveDiscardRestore(_) => "drive-discard-restore",
+            Mutation::ProjectBackup { .. } => "project-backup",
+            Mutation::ProjectDeleteBackup(_) => "project-delete-backup",
+            Mutation::ProjectPrepareRestore { .. } => "project-prepare-restore",
+            Mutation::ProjectApplyRestore(_) => "project-restore",
+            Mutation::ProjectDiscardRestore(_) => "project-discard-restore",
+            Mutation::AppUpdateCheck => "app-update-check",
+            Mutation::AppUpdateDownload => "app-update-download",
+            Mutation::AppUpdateApply => "app-update-apply",
+            Mutation::InboxOpen(_) => "inbox-open",
+            Mutation::InboxDismiss(_) => "inbox-dismiss",
+            Mutation::InboxClear => "inbox-clear",
+            Mutation::InboxTest => "inbox-test",
+            Mutation::CancelJob(_) => "cancel-job",
+            Mutation::UsageRefresh { .. } => "usage-refresh",
+            Mutation::OmpUpdateCheck => "omp-update-check",
+            Mutation::RefreshSessions => "refresh-sessions",
+        }
+    }
+
+    /// The session it addresses, if any (journal target; stale checks).
+    pub fn target(&self) -> Option<&SessionTarget> {
+        match self {
+            Mutation::Restart(t)
+            | Mutation::Stop(t)
+            | Mutation::Kill(t)
+            | Mutation::Close { target: t, .. }
+            | Mutation::Submit { target: t, .. }
+            | Mutation::Answer { target: t, .. }
+            | Mutation::SetSessionPath { target: t, .. }
+            | Mutation::Ctl { target: t, .. }
+            | Mutation::InboxOpen(t)
+            | Mutation::InboxDismiss(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Allowed while the maintenance barrier is up (they end or inspect work, start none).
+    pub fn allowed_in_maintenance(&self) -> bool {
+        matches!(
+            self,
+            Mutation::Answer { .. }
+                | Mutation::Close { .. }
+                | Mutation::Stop(_)
+                | Mutation::Kill(_)
+                | Mutation::KillNames { .. }
+                | Mutation::Settings(_)
+                | Mutation::InboxOpen(_)
+                | Mutation::InboxDismiss(_)
+                | Mutation::InboxClear
+                | Mutation::CancelJob(_)
+                | Mutation::RefreshSessions
+                | Mutation::DriveLoginCancel(_)
+                | Mutation::DriveDiscardRestore(_)
+                | Mutation::ProjectDiscardRestore(_)
+        )
+    }
+}
+
+/// What a launch opens.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchSpec {
+    /// Backend session name (tmux/host); `None` = a direct child (Unix) or a fresh host session.
+    pub mux_name: Option<String>,
+    pub cwd: PathBuf,
+    pub session_path: Option<PathBuf>,
+    pub label: String,
+    /// `argv[0] == "omp"` runs the detected omp (with the live-control extension).
+    pub argv: Vec<String>,
+    pub role: SessionRole,
+    /// `omp --fork` copy of the session with this id: the gateway finds the new file and
+    /// reports [`ServerEvent::CopyResult`].
+    pub copy_of: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tool {
+    Update(UpdateKind),
+    Install,
+}
+
+/// A mutation was accepted (journaled) — not that it ran.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Accepted {
+    pub key: RequestKey,
+    /// The key was accepted before (the earlier record is returned).
+    pub duplicate: bool,
+    /// `Submit` only: the controller's identity of the request.
+    pub submitted: Option<Submitted>,
+}
+
+/// Progress of a running job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    pub stage: String,
+    pub done: u64,
+    pub total: Option<u64>,
+}
+
+/// The record of a mutation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Outcome {
+    /// Accepted; still executing.
+    Running,
+    /// Boxed: the result is large next to the other outcomes (JSON is unchanged).
+    Done(Box<Done>),
+    Failed(String),
+    Rejected(Rejected),
+    Cancelled,
+    /// Accepted before an owner crash: it may or may not have run. Never replayed.
+    Uncertain,
+    /// Finished under an earlier gateway instance; only whether it succeeded is kept.
+    Recorded {
+        succeeded: bool,
+    },
+}
+
+impl Outcome {
+    pub fn is_final(&self) -> bool {
+        !matches!(self, Outcome::Running)
+    }
+}
+
+/// A successful mutation's result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Done {
+    Unit,
+    /// A session opened (or restarted): its target.
+    Session(SessionTarget),
+    /// The injected request reached its final delivery (see the controller record).
+    Submitted(RequestRecord),
+    /// `answer` applied (`false`: no such outstanding confirmation).
+    Answered(bool),
+    Path(PathBuf),
+    Moved(MoveOutcome),
+    /// Per file: `None` = deleted, else the error text.
+    Deleted(Vec<(PathBuf, Option<String>)>),
+    Setting(serde_json::Value),
+    Removed(Removed),
+    Settings(Snapshot),
+    Gateway(GatewayStatus),
+    DriveLogin {
+        handle: u64,
+        url: String,
+    },
+    DriveAccount {
+        email: Option<String>,
+    },
+    DriveBackup(Option<BackupOutcome>),
+    DrivePrepared {
+        handle: u64,
+        plan: RestorePlanView,
+    },
+    DriveRestored(RestoreReport),
+    ProjectBackup(Option<ProjectBackupOutcome>),
+    ProjectPrepared {
+        handle: u64,
+        plan: ProjectRestorePlan,
+    },
+    ProjectRestored(ProjectRestoreReport),
+    AppUpdate(AppUpdateView),
+    Ctl(deck_core::ctl::CtlReply),
+    /// [`Mutation::KillNames`]: the sessions that failed, with why.
+    Killed(Vec<(String, String)>),
+}
+
+/// What a Drive restore would change ([`deck_core::gdrive::RestorePlan`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestorePlanView {
+    pub name: String,
+    pub created: String,
+    pub host: String,
+    pub replaced: Vec<String>,
+    pub added: Vec<String>,
+    pub dirs: Vec<String>,
+    pub removed: Vec<String>,
+    pub safety_dir: PathBuf,
+}
+
+/// Errors a request returns.
+#[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error)]
+pub enum GatewayError {
+    #[error("gateway protocol {theirs} is not supported (this build speaks {ours})")]
+    Unsupported { ours: u32, theirs: u32 },
+    #[error("the running gateway serves another profile")]
+    ProfileMismatch { served: Profile },
+    #[error("OmpDeck is being updated or removed; try again afterwards")]
+    Maintenance(MaintenanceMarker),
+    #[error("the gateway restarted since this was requested")]
+    StaleEpoch { current: ServiceEpoch },
+    #[error("not connected to the OmpDeck gateway")]
+    Disconnected,
+    #[error("{0}")]
+    Refused(String),
+    #[error("{0}")]
+    Rejected(Rejected),
+    #[error("the gateway stopped before this finished; it may or may not have run")]
+    Uncertain,
+    #[error("this request is too old to be looked up")]
+    Expired,
+    #[error("this request key was already used for different work")]
+    KeyReused,
+    #[error("{0}")]
+    Failed(String),
+    #[error("settings: {0}")]
+    Settings(SettingsError),
+    #[error("the reply is too large")]
+    TooLarge,
+    #[error("no such job")]
+    NoSuchJob,
+    /// The job was cancelled (its final outcome is [`Outcome::Cancelled`]).
+    #[error("cancelled")]
+    Cancelled,
+}
+
+/// One reply (the payload of a `REPLY` message).
+pub type Reply = Result<Answer, GatewayError>;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DrainState {
+    /// Work is still running.
+    Draining {
+        jobs: usize,
+        controllers_busy: usize,
+        direct_programs: usize,
+    },
+    /// Nothing accepted is left; settings are flushed.
+    Drained,
+}
+
+/// Events on a control link.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ServerEvent {
+    Changed {
+        topic: Topic,
+        revision: u64,
+    },
+    Controller {
+        target: SessionTarget,
+        event: ControllerEvent,
+    },
+    Outcome {
+        key: RequestKey,
+        outcome: Outcome,
+    },
+    Progress {
+        key: RequestKey,
+        progress: Progress,
+    },
+    /// A finished turn for a session (the tab's bell marker).
+    Bell(SessionTarget),
+    /// A desktop notification for `target` was clicked: raise and show it. `token` is the
+    /// desktop's activation token (Wayland `xdg-activation`) when the notification server sent
+    /// one; the window raise uses it.
+    Activate {
+        target: SessionTarget,
+        token: Option<String>,
+    },
+    /// omp reported another model than a switch asked for, within the timeout.
+    ModelUnconfirmed {
+        target: SessionTarget,
+        switch: SwitchInfo,
+    },
+    /// A tab copy ([`LaunchSpec::copy_of`]) found its new session file (now the session's
+    /// file), or failed.
+    CopyResult {
+        target: SessionTarget,
+        result: Result<PathBuf, String>,
+    },
+    /// Events were dropped (the client lagged): refetch every cached topic.
+    Resync,
+}
+
+/// Why one frontend write was refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputRefused {
+    Rejected(Rejected),
+    /// This view may not type (observer).
+    NotAllowed,
+    /// The clipboard reply did not match an outstanding read.
+    NoClipboardRead,
+}
+
+/// Why a view ended without a process exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewEnd {
+    /// The gateway closed the session's controller.
+    Closed,
+    /// The session restarted / changed generation.
+    Stale,
+    /// The view lagged beyond its output budget: re-attach for a fresh snapshot.
+    Overflow,
+    /// The owner lost its backend link (host connection lost) without an exit.
+    Disconnected,
+    /// The gateway is shutting down.
+    Shutdown,
+}
+
+/// `cols, rows, cell_width, cell_height` frames.
+pub fn encode_geometry(cols: u16, rows: u16, cw: u16, ch: u16) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[..2].copy_from_slice(&cols.to_le_bytes());
+    out[2..4].copy_from_slice(&rows.to_le_bytes());
+    out[4..6].copy_from_slice(&cw.to_le_bytes());
+    out[6..].copy_from_slice(&ch.to_le_bytes());
+    out
+}
+
+pub fn decode_geometry(b: &[u8]) -> Option<(u16, u16, u16, u16)> {
+    let b: &[u8; 8] = b.try_into().ok()?;
+    let u = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+    Some((u(0), u(2), u(4), u(6)))
+}
+
+pub fn encode_input(bytes: &[u8], meta: InputMeta) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + bytes.len());
+    out.push(u8::from(meta.ctrl_c));
+    out.push(u8::from(meta.win32_modifiers.is_some()));
+    out.extend_from_slice(&meta.win32_modifiers.unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
+pub fn decode_input(b: &[u8]) -> Option<(InputMeta, &[u8])> {
+    if b.len() < 6 {
+        return None;
+    }
+    let mods = u32::from_le_bytes(b[2..6].try_into().ok()?);
+    let meta = InputMeta {
+        ctrl_c: b[0] != 0,
+        win32_modifiers: (b[1] != 0).then_some(mods),
+    };
+    Some((meta, &b[6..]))
+}
+
+pub fn encode_palette(p: &[[u8; 3]; 19]) -> Vec<u8> {
+    p.iter().flatten().copied().collect()
+}
+
+pub fn decode_palette(b: &[u8]) -> Option<[[u8; 3]; 19]> {
+    if b.len() != 57 {
+        return None;
+    }
+    let mut out = [[0u8; 3]; 19];
+    for (i, c) in out.iter_mut().enumerate() {
+        c.copy_from_slice(&b[i * 3..i * 3 + 3]);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binary_frontend_payloads_round_trip() {
+        let meta = InputMeta {
+            ctrl_c: true,
+            win32_modifiers: Some(4),
+        };
+        let enc = encode_input(b"\x1b[99;5u", meta);
+        assert_eq!(decode_input(&enc), Some((meta, &b"\x1b[99;5u"[..])));
+        let plain = encode_input(b"a", InputMeta::default());
+        assert_eq!(
+            decode_input(&plain),
+            Some((InputMeta::default(), &b"a"[..]))
+        );
+        assert_eq!(decode_input(b"short"), None);
+        assert_eq!(
+            decode_geometry(&encode_geometry(120, 40, 9, 18)),
+            Some((120, 40, 9, 18))
+        );
+        let mut pal = [[0u8; 3]; 19];
+        pal[18] = [1, 2, 3];
+        assert_eq!(decode_palette(&encode_palette(&pal)), Some(pal));
+        assert_eq!(decode_palette(&[0; 56]), None);
+    }
+}

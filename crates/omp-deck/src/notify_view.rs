@@ -22,8 +22,6 @@ pub enum NotifyAction {
 /// What the card shows besides the stored toggles.
 pub struct NotifyInput<'a> {
     pub cfg: &'a NotifyConfig,
-    /// Why the platform cannot show notifications (reported by the notifier thread).
-    pub unavailable: Option<&'a str>,
 }
 
 pub fn card_ui(ui: &mut Ui, input: &NotifyInput<'_>) -> Vec<NotifyAction> {
@@ -104,11 +102,8 @@ pub fn card_ui(ui: &mut Ui, input: &NotifyInput<'_>) -> Vec<NotifyAction> {
             );
         });
         ui.add_space(4.0);
-        let sub = match input.unavailable {
-            Some(why) => format!("Notifications are unavailable: {why}"),
-            None => "Clicking the notification brings the tab to the front".to_owned(),
-        };
-        setting_row(ui, "Test notification", &sub, |ui| {
+        let sub = "Clicking the notification brings the tab to the front";
+        setting_row(ui, "Test notification", sub, |ui| {
             let button = Button::new((
                 icon_text(ICON_BELL, 16.0, pal.glyph),
                 RichText::new("Send test notification"),

@@ -1,6 +1,6 @@
-//! The single path of every byte to the child ([`PtyOut`]), its two sinks (the local PTY
-//! event loop, a remote host's writer thread) and the detach bookkeeping of dropped
-//! terminals ([`wait_detached`]).
+//! The single path of every byte to the child ([`PtyOut`]), its sinks (the local PTY loop, a
+//! remote host's writer thread, a gateway frontend's writer thread) and the detach bookkeeping
+//! of dropped terminals ([`wait_detached`]).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,13 +9,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::borrow::Cow;
-
 use alacritty_terminal::event::WindowSize;
-#[cfg(unix)]
-use alacritty_terminal::event_loop::{EventLoopSender, Msg};
 
+use crate::frontend::{FrontendCmd, InputMeta};
+#[cfg(unix)]
+use crate::pty::{LoopSender, Msg};
 use crate::remote::RemoteCmd;
 use crate::wake::Wake;
 
@@ -153,32 +151,48 @@ impl WriteProgress {
             .unwrap_or_else(PoisonError::into_inner);
         w.bytes >= target
     }
+
+    /// Input the frontend's owner refused: handled (for the detach flush), never acknowledged,
+    /// and not a connection failure.
+    pub(crate) fn record_refused(&self, n: usize) {
+        let mut w = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        w.bytes += n as u64;
+        w.last_at = Some(Instant::now());
+        self.changed.notify_all();
+    }
 }
 
-/// Where [`PtyOut`] delivers bytes and control messages. Both sinks are ordered queues
+/// Where [`PtyOut`] delivers bytes and control messages. Every sink is an ordered queue
 /// drained by another thread, so the UI thread never blocks on child I/O.
 pub(crate) enum Sink {
-    /// alacritty's PTY event loop (Unix local terminals).
+    /// The PTY loop (Unix local terminals).
     #[cfg(unix)]
-    Local(EventLoopSender),
+    Local(LoopSender),
     /// The writer thread of a remote terminal (see [`crate::remote`]).
     Remote(mpsc::Sender<RemoteCmd>),
+    /// The writer thread of a gateway frontend (see [`crate::frontend`]).
+    Frontend(mpsc::Sender<FrontendCmd>),
 }
 
 impl Sink {
-    fn input(&self, bytes: Vec<u8>) -> bool {
+    /// `meta` travels only to a frontend's owner; the other sinks write the child directly.
+    fn input(&self, bytes: Vec<u8>, meta: InputMeta) -> bool {
         match self {
             #[cfg(unix)]
-            Sink::Local(s) => s.send(Msg::Input(Cow::Owned(bytes))).is_ok(),
+            Sink::Local(s) => s.send(Msg::Input(bytes)),
             Sink::Remote(s) => s.send(RemoteCmd::Input(bytes)).is_ok(),
+            Sink::Frontend(s) => s.send(FrontendCmd::Input(bytes, meta)).is_ok(),
         }
     }
 
     fn resize(&self, size: WindowSize) {
         match self {
             #[cfg(unix)]
-            Sink::Local(s) => drop(s.send(Msg::Resize(size))),
+            Sink::Local(s) => {
+                s.send(Msg::Resize(size));
+            }
             Sink::Remote(s) => drop(s.send(RemoteCmd::Resize(size))),
+            Sink::Frontend(s) => drop(s.send(FrontendCmd::Resize(size))),
         }
     }
 
@@ -188,25 +202,32 @@ impl Sink {
             #[cfg(unix)]
             Sink::Local(_) => {}
             Sink::Remote(s) => drop(s.send(RemoteCmd::Palette(palette))),
+            Sink::Frontend(s) => drop(s.send(FrontendCmd::Palette(palette))),
         }
     }
 
     /// Ends the connection, keeping the child: local `Msg::Shutdown` (the PTY thread drops
-    /// the Pty, which hangs up a tmux client), remote detach.
+    /// the Pty, which hangs up a tmux client), remote and frontend detach.
     fn detach(&self) {
         match self {
             #[cfg(unix)]
-            Sink::Local(s) => drop(s.send(Msg::Shutdown)),
+            Sink::Local(s) => {
+                s.send(Msg::Shutdown);
+            }
             Sink::Remote(s) => drop(s.send(RemoteCmd::Detach)),
+            Sink::Frontend(s) => drop(s.send(FrontendCmd::Detach)),
         }
     }
 
-    /// Ends the child: local `Msg::Shutdown` (SIGHUP), remote kill.
+    /// Ends the child: local `Msg::Shutdown` (SIGHUP), remote kill, frontend kill request.
     fn kill(&self) {
         match self {
             #[cfg(unix)]
-            Sink::Local(s) => drop(s.send(Msg::Shutdown)),
+            Sink::Local(s) => {
+                s.send(Msg::Shutdown);
+            }
             Sink::Remote(s) => drop(s.send(RemoteCmd::Kill)),
+            Sink::Frontend(s) => drop(s.send(FrontendCmd::Kill)),
         }
     }
 }
@@ -279,13 +300,13 @@ impl PtyOut {
         }
     }
 
-    fn send(&self, st: &mut OutState, bytes: Vec<u8>) {
+    fn send(&self, st: &mut OutState, bytes: Vec<u8>, meta: InputMeta) {
         if self.progress.failed.load(Ordering::Acquire) {
             return;
         }
         if let Some(sink) = self.sink.get() {
             st.sent += bytes.len() as u64;
-            if !sink.input(bytes) {
+            if !sink.input(bytes, meta) {
                 st.closed = true;
                 self.progress.record(0, false);
             }
@@ -294,7 +315,7 @@ impl PtyOut {
 
     fn flush_deferred(&self, st: &mut OutState) {
         while let Some(d) = st.deferred.pop_front() {
-            self.send(st, d.bytes);
+            self.send(st, d.bytes, InputMeta::default());
         }
     }
 
@@ -310,12 +331,12 @@ impl PtyOut {
         left
     }
 
-    pub(crate) fn write(&self, bytes: &[u8]) {
+    pub(crate) fn write(&self, bytes: &[u8], meta: InputMeta) {
         let mut st = self.lock();
         if st.closed || self.progress.failed.load(Ordering::Acquire) {
             return;
         }
-        self.send(&mut st, bytes.to_vec());
+        self.send(&mut st, bytes.to_vec(), meta);
         if bytes.last() == Some(&0x1b) {
             st.lone_esc_at = Some(Instant::now());
         } else {
@@ -338,6 +359,24 @@ impl PtyOut {
         self.emit(Deferred { bytes, focus: true });
     }
 
+    /// Frontend: the view's focus, for the owner to report in its child's modes.
+    pub(crate) fn frontend_focus(&self, focused: bool) {
+        if !self.lock().closed
+            && let Some(Sink::Frontend(s)) = self.sink.get()
+        {
+            let _ = s.send(FrontendCmd::Focus(focused));
+        }
+    }
+
+    /// Frontend: the reply to the owner's outstanding OSC 52 read.
+    pub(crate) fn clipboard_reply(&self, bytes: Vec<u8>) {
+        if !self.lock().closed
+            && let Some(Sink::Frontend(s)) = self.sink.get()
+        {
+            let _ = s.send(FrontendCmd::ClipboardReply(bytes));
+        }
+    }
+
     fn emit(&self, d: Deferred) {
         let mut st = self.lock();
         if st.closed {
@@ -355,7 +394,7 @@ impl PtyOut {
             }
             None => {
                 self.flush_deferred(&mut st);
-                self.send(&mut st, d.bytes);
+                self.send(&mut st, d.bytes, InputMeta::default());
             }
         }
     }

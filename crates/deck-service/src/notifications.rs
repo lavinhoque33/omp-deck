@@ -366,7 +366,11 @@ mod tests {
     }
 
     fn target(key: SessionKey, generation: u64) -> SessionTarget {
-        SessionTarget { key, generation }
+        SessionTarget {
+            epoch: crate::controller::ServiceEpoch::current(),
+            key,
+            generation,
+        }
     }
 
     fn obs<'a>(

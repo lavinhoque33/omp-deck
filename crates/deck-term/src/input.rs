@@ -57,6 +57,17 @@ impl Mods {
     pub fn is_empty(self) -> bool {
         !(self.shift || self.alt || self.ctrl)
     }
+
+    /// Wire form for [`crate::InputMeta::win32_modifiers`] / [`crate::FrontendState`]:
+    /// shift = 1, alt = 2, ctrl = 4.
+    pub fn bits(self) -> u32 {
+        u32::from(self.shift) | (2 * u32::from(self.alt)) | (4 * u32::from(self.ctrl))
+    }
+
+    /// Inverse of [`Self::bits`]; other bits are ignored.
+    pub fn from_bits(bits: u32) -> Mods {
+        Mods::new(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0)
+    }
 }
 
 /// A logical key. `Char` carries the unshifted base character (lowercase letter, digit,

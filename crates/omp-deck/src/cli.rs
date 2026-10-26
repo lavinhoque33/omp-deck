@@ -14,6 +14,8 @@ ARGS:
 OPTIONS:
     --folder <dir>          Same as the FOLDER argument
     --sessions-root <dir>   Read omp sessions from <dir> instead of the default store
+    --activate <file>       Used by the OmpDeck gateway: open the session of a clicked
+                            notification (the file is a private one-use ticket)
     -h, --help              Print this help
 
 ENVIRONMENT:
@@ -32,6 +34,9 @@ pub struct Cli {
     pub screenshot: Option<PathBuf>,
     /// Hidden: seconds to wait before taking the screenshot.
     pub screenshot_after: f64,
+    /// Set by the gateway when a notification was clicked with no window open: the private
+    /// activation ticket to consume (see `deck_service::gateway::activation`).
+    pub activate: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -62,6 +67,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--sessions-root" => cli.sessions_root = Some(PathBuf::from(value("--sessions-root")?)),
             "--folder" => cli.folder = Some(PathBuf::from(value("--folder")?)),
             "--screenshot" => cli.screenshot = Some(PathBuf::from(value("--screenshot")?)),
+            "--activate" => cli.activate = Some(PathBuf::from(value("--activate")?)),
             "--screenshot-after" => {
                 let v = value("--screenshot-after")?;
                 cli.screenshot_after = v

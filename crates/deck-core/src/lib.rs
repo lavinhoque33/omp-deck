@@ -16,6 +16,7 @@ pub mod selfupdate;
 pub mod sessions;
 pub mod sharpshooter;
 pub mod status;
+pub mod theme;
 pub mod tmux;
 pub mod tree;
 pub mod usage;

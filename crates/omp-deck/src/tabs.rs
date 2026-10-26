@@ -2,11 +2,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
-use deck_core::mux::{Mux, is_noise_title};
+use deck_core::mux::is_noise_title;
 use deck_core::omp::UpdateKind;
-use deck_service::controller::SessionController;
+use deck_service::controller::{ActionFacts, SessionTarget};
+use deck_service::gateway::protocol::{BackendRef, ControllerInfo, SwitchInfo};
+use deck_service::session_actions::ActionCtx;
+use deck_service::statusfmt::Activity;
 use deck_term::Terminal;
 
 use crate::icons::{
@@ -33,16 +36,20 @@ pub enum TabRole {
     InstallOmp,
 }
 
-/// A terminal tab: an omp process (usually in a tmux or host session) rendered by deck-term.
+/// A terminal tab: a view of one session the gateway controls, rendered by deck-term.
 pub struct TermTab {
-    /// Owns the tab's terminal, its session identity (session file, generation) and every injected
-    /// command (status-bar actions, review, worktree): the only path that writes into the pty on
-    /// behalf of the app.
-    pub ctl: SessionController,
+    /// This window's own view; dropping it only detaches (the session lives on in the gateway).
+    term: Terminal,
+    /// The session this window's view is attached to. A new generation (omp moved to another
+    /// file, a restart) ends the view: [`TermTab::needs_reattach`] tells the app to attach anew.
+    target: SessionTarget,
+    info: Option<ControllerInfo>,
+    /// A session file this window resolved and sent to the gateway, until the record shows it.
+    path_hint: Option<PathBuf>,
+    /// The file the tab was launched on.
+    launch_path: Option<PathBuf>,
     /// Session name in the backend; `None` for direct tabs (update/installer, or no backend).
     pub mux_name: Option<String>,
-    /// The backend running the session (`None` with `mux_name`).
-    pub mux: Option<Mux>,
     pub cwd: PathBuf,
     /// Label used until the sidebar knows this session (restored state / click time).
     pub fallback_title: String,
@@ -50,35 +57,53 @@ pub struct TermTab {
     pub role: TabRole,
     /// The exit of an update tab has been acted upon.
     pub exit_handled: bool,
-    /// Set while this tab runs `omp --fork` and the copy's session file is not known yet.
+    /// Set while this tab runs `omp --fork` and the gateway has not reported the copy's file.
     pub copy: Option<CopyPending>,
     /// Stable identity of the tab (indices shift when tabs close).
     pub uid: u64,
-    /// Key of this tab's control socket (`deck_core::ctl::ctl_dir(key)`) when it was launched
-    /// with the control extension; `None` for update tabs and when no extension is installed.
-    pub ctl_key: Option<String>,
-    /// This launch created the session with the extension, so its socket is expected soon
-    /// (attaching to an existing session ignores the argv: no expectation).
-    pub ctl_expect: bool,
     /// The control socket was connected at least once.
     pub ctl_seen: bool,
     /// When the tab was spawned (a freshly launched omp needs a moment to open its socket).
     pub spawned: Instant,
 }
 
-/// A copy in progress: the tab runs `omp --fork <src>`; the new session file is found by
-/// polling the sessions root (see `deck_core::sessions::find_fork`).
+/// A copy in progress: the tab runs `omp --fork <src>`; the gateway finds the new session file
+/// and reports it.
 pub struct CopyPending {
-    /// Identifies the copy in worker results.
-    pub id: u64,
-    /// Session id of the source (the fork's `parentSession`).
-    pub src_id: String,
-    /// Wall-clock start, the lower bound for the new file's mtime.
-    pub started_at: SystemTime,
-    pub started: Instant,
-    pub next_poll: Instant,
-    /// A poll is running on a worker.
-    pub polling: bool,
+    /// Where the copy goes (shown in the success toast).
+    pub dest: PathBuf,
+}
+
+impl TermTab {
+    /// A tab on the gateway's session `target`, shown through `term`.
+    pub fn new(term: Terminal, target: SessionTarget, uid: u64, launch: TabLaunch) -> TermTab {
+        TermTab {
+            term,
+            target,
+            info: None,
+            path_hint: None,
+            launch_path: launch.session_path,
+            mux_name: launch.mux_name,
+            cwd: launch.cwd,
+            fallback_title: launch.title,
+            bell: false,
+            role: launch.role,
+            exit_handled: false,
+            copy: None,
+            uid,
+            ctl_seen: false,
+            spawned: Instant::now(),
+        }
+    }
+}
+
+/// What a launch told the tab about itself.
+pub struct TabLaunch {
+    pub mux_name: Option<String>,
+    pub cwd: PathBuf,
+    pub session_path: Option<PathBuf>,
+    pub title: String,
+    pub role: TabRole,
 }
 
 pub enum Tab {
@@ -148,7 +173,7 @@ impl Tab {
     /// The leading indicator; the bell only counts on a background tab.
     pub fn status(&self, active: bool) -> TabStatus {
         match self.term() {
-            Some(t) => t.ctl.status(t.bell && !active),
+            Some(t) => t.status(t.bell && !active),
             None => TabStatus::Idle,
         }
     }
@@ -169,21 +194,130 @@ impl Tab {
 impl TermTab {
     /// The terminal, for rendering, user input and read-only queries.
     pub fn terminal(&self) -> &Terminal {
-        self.ctl.terminal()
+        &self.term
     }
 
     pub fn terminal_mut(&mut self) -> &mut Terminal {
-        self.ctl.terminal_mut()
+        &mut self.term
     }
 
-    /// The session file behind the tab (the controller owns it: it starts a new generation when
-    /// another file takes over).
+    /// The session this tab shows now: the newest generation known (the gateway starts a new one
+    /// when another file takes over or the session restarts).
+    pub fn target(&self) -> &SessionTarget {
+        match &self.info {
+            Some(i) if i.target.generation >= self.target.generation => &i.target,
+            _ => &self.target,
+        }
+    }
+
+    /// The gateway's latest record of the session, `None` until it appeared in the cache.
+    pub fn info(&self) -> Option<&ControllerInfo> {
+        self.info.as_ref()
+    }
+
+    /// Takes the gateway's record. A recorded file catches up with a hint sent by this window; a
+    /// record of an older generation than the attached view is ignored. The backend session name
+    /// follows the record.
+    pub fn set_info(&mut self, info: &ControllerInfo) {
+        if info.target.key == self.target.key && info.target.generation < self.target.generation {
+            return;
+        }
+        if self.path_hint.is_some() && self.path_hint == info.session_path {
+            self.path_hint = None;
+        }
+        if info.live_control {
+            self.ctl_seen = true;
+        }
+        if let BackendRef::Mux { name, .. } = &info.backend {
+            self.mux_name = Some(name.clone());
+        }
+        self.info = Some(info.clone());
+    }
+
+    /// The gateway started a newer generation of the session than the one this view is attached
+    /// to: the view ended and must be replaced.
+    pub fn needs_reattach(&self) -> bool {
+        self.info.as_ref().is_some_and(|i| {
+            i.target.key == self.target.key && i.target.generation > self.target.generation
+        })
+    }
+
+    /// Replaces the view with one on `target`, the session's current generation (same tab).
+    pub fn reattach(&mut self, target: SessionTarget, term: Terminal) {
+        self.target = target;
+        self.term = term;
+        self.exit_handled = false;
+    }
+
+    /// This launch created the session with the control extension, so its socket is expected
+    /// (attaching to an existing session ignores the argv).
+    pub fn ctl_expect(&self) -> bool {
+        self.info.as_ref().is_some_and(|i| i.ctl_expect)
+    }
+
+    /// The session file behind the tab: what this window asked for until the gateway's record
+    /// shows it.
     pub fn session_path(&self) -> Option<&Path> {
-        self.ctl.session_path()
+        self.path_hint
+            .as_deref()
+            .or_else(|| self.info.as_ref().and_then(|i| i.session_path.as_deref()))
+            .or(self.launch_path.as_deref())
     }
 
     pub fn session_path_owned(&self) -> Option<PathBuf> {
-        self.ctl.session_path().map(Path::to_path_buf)
+        self.session_path().map(Path::to_path_buf)
+    }
+
+    /// Remembers a session file this window resolved; the caller sends it to the gateway.
+    pub fn hint_session_path(&mut self, path: Option<PathBuf>) {
+        self.path_hint.clone_from(&path);
+        if path.is_none() {
+            self.launch_path = None;
+        }
+    }
+
+    /// The indicator without the bell: the gateway's record, else the terminal's own state.
+    pub fn status(&self, bell: bool) -> TabStatus {
+        TabStatus::of(self.term.exit_code(), self.activity(), bell)
+    }
+
+    pub fn activity(&self) -> Activity {
+        self.info
+            .as_ref()
+            .map_or_else(|| Activity::from_title(self.term.title()), |i| i.activity)
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.info
+            .as_ref()
+            .is_some_and(|i| i.busy || i.requests.iter().any(|r| !r.delivery.is_final()))
+    }
+
+    pub fn pending_switch(&self) -> Option<&SwitchInfo> {
+        self.info.as_ref().and_then(|i| i.pending_switch.as_ref())
+    }
+
+    pub fn assumed_switch(&self) -> Option<&SwitchInfo> {
+        self.info.as_ref().and_then(|i| i.assumed_switch.as_ref())
+    }
+
+    /// The model the session runs as far as the gateway knows.
+    pub fn current_model(&self) -> Option<String> {
+        self.info.as_ref().and_then(|i| i.current_model.clone())
+    }
+
+    /// The availability inputs of the session actions.
+    pub fn action_ctx(&self, facts: ActionFacts) -> ActionCtx {
+        let activity = self.activity();
+        ActionCtx {
+            busy: activity.is_busy(),
+            idle: activity == Activity::Idle,
+            has_session_file: self.session_path().is_some(),
+            last_turn_failed: facts.last_turn_failed,
+            has_last_reply: facts.has_last_reply,
+            exited: self.term.is_exited(),
+            omp_found: facts.omp_found,
+        }
     }
 
     /// OSC title if non-empty, else the session label, else the stored title, else cwd basename.
@@ -253,6 +387,16 @@ pub fn paint_attention_pill(p: &Painter, pal: &Palette, rect: Rect, radius: u8) 
         Stroke::new(1.0, pal.warn.gamma_multiply(0.7)),
         StrokeKind::Inside,
     );
+}
+
+/// The tab that was open on a session being moved.
+pub struct MovedTab {
+    pub tab: ClosedTab,
+    /// Where it sat in the strip; it is reopened there.
+    pub anchor: Anchor,
+    /// `Some` when it was the active tab: the activation counter after it closed, so the
+    /// reopened tab only takes focus if the user has not switched since.
+    pub refocus: Option<u64>,
 }
 
 /// What to relaunch when a closed tab is reopened.
@@ -358,16 +502,6 @@ pub fn omp_argv(session_path: Option<&Path>) -> Vec<String> {
         argv.push(p.to_string_lossy().into_owned());
     }
     argv
-}
-
-/// The session file a tab should switch to given the files its session has open: the first one
-/// for a tab that knows none yet, or the only one when omp moved on (`/new`, `/fork`, `/resume`).
-pub fn followed_path<'a>(current: Option<&Path>, files: &'a [PathBuf]) -> Option<&'a PathBuf> {
-    match (current, files) {
-        (None, [first, ..]) => Some(first),
-        (Some(cur), [only]) if only != cur => Some(only),
-        _ => None,
-    }
 }
 
 /// Active index after removing tab `removed` from a list that had `len_before` tabs.
@@ -691,18 +825,6 @@ mod tests {
             }
         );
         assert_eq!(Anchor::at(&[], 0).index(&[]), 0);
-    }
-
-    #[test]
-    fn a_tab_follows_omp_to_its_only_open_session_file() {
-        let (a, b) = (PathBuf::from("/s/a.jsonl"), PathBuf::from("/s/b.jsonl"));
-        assert_eq!(followed_path(None, std::slice::from_ref(&a)), Some(&a));
-        assert_eq!(followed_path(Some(&a), std::slice::from_ref(&b)), Some(&b));
-        assert_eq!(followed_path(Some(&a), std::slice::from_ref(&a)), None);
-        assert_eq!(followed_path(Some(&a), &[]), None);
-        // Several files open (a subagent, a pending fork): no guess.
-        assert_eq!(followed_path(Some(&a), &[a.clone(), b.clone()]), None);
-        assert_eq!(followed_path(Some(&a), &[b.clone(), a.clone()]), None);
     }
 
     #[test]

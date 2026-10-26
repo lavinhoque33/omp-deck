@@ -56,7 +56,10 @@ refresh_caches() {
 }
 
 if [ "$uninstall" -eq 1 ]; then
-    rm -f "$bin_dir/$APP" "$bin_dir/$APP-host" "$apps_dir/$APP.desktop" "$icon_root/scalable/apps/$APP.svg"
+    if [ -x "$bin_dir/$APP-gateway" ]; then
+        "$bin_dir/$APP-gateway" uninstall || die "gateway could not drain; no installed files were removed. Finish or stop the listed jobs and retry."
+    fi
+    rm -f "$bin_dir/$APP" "$bin_dir/$APP-host" "$bin_dir/$APP-gateway" "$apps_dir/$APP.desktop" "$icon_root/scalable/apps/$APP.svg"
     for s in $SIZES; do
         rm -f "$icon_root/${s}x${s}/apps/$APP.png"
     done
@@ -84,8 +87,25 @@ esac
 # Source directory: the extracted tarball this script sits in, else a fresh download.
 src=""
 tmp=""
-cleanup() { [ -z "$tmp" ] || rm -rf "$tmp"; }
-trap cleanup EXIT INT TERM
+binary_stage=""
+gateway_drained=0
+bundle_committed=0
+gateway_resume_attempted=0
+cleanup() {
+    status=$?
+    if [ "$bundle_committed" -eq 1 ] && [ "$gateway_resume_attempted" -eq 0 ]; then
+        gateway_resume_attempted=1
+        "$bin_dir/$APP-gateway" resume || warn "background gateway repair failed; run '$bin_dir/$APP-gateway resume' after resolving the reported error"
+    elif [ "$gateway_drained" -eq 1 ] && [ "$bundle_committed" -eq 0 ]; then
+        warn "the gateway remains paused. Re-run this installer to finish the complete binary bundle before resuming it."
+    fi
+    [ -z "$binary_stage" ] || rm -rf "$binary_stage"
+    [ -z "$tmp" ] || rm -rf "$tmp"
+    return "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 script_dir=""
 case "$0" in
@@ -127,12 +147,24 @@ else
     [ -x "$src/$APP" ] || die "unexpected archive layout"
 fi
 
+# Stage the complete bundle before asking the old owner to drain. Atomic renames also work
+# while an older GUI/host executable is mapped; truncating a running executable does not.
+for executable in "$APP" "$APP-host" "$APP-gateway"; do
+    [ -x "$src/$executable" ] || die "$executable is missing from the release. For a pre-gateway release, use that release's bundled installer."
+done
 mkdir -p "$bin_dir" "$apps_dir"
-install -m 0755 "$src/$APP" "$bin_dir/$APP"
-# Session host daemon (no-tmux fallback); releases before it existed do not ship it.
-if [ -x "$src/$APP-host" ]; then
-    install -m 0755 "$src/$APP-host" "$bin_dir/$APP-host"
+binary_stage=$(mktemp -d "$bin_dir/.omp-deck-install.XXXXXX")
+for executable in "$APP" "$APP-host" "$APP-gateway"; do
+    install -m 0755 "$src/$executable" "$binary_stage/$executable"
+done
+if [ -x "$bin_dir/$APP-gateway" ]; then
+    "$bin_dir/$APP-gateway" drain --purpose update || die "gateway could not drain; no binaries were replaced. Finish or stop the listed jobs and retry."
+    gateway_drained=1
 fi
+for executable in "$APP-host" "$APP-gateway" "$APP"; do
+    mv -f "$binary_stage/$executable" "$bin_dir/$executable"
+done
+bundle_committed=1
 
 # The desktop entry needs an absolute Exec so launchers work even when ~/.local/bin is not on PATH.
 sed -e "s|^Exec=.*|Exec=$bin_dir/$APP %f|" -e "s|^TryExec=.*|TryExec=$bin_dir/$APP|" \
@@ -162,7 +194,6 @@ for lic in Geist-OFL.txt lucide-LICENSE.txt; do
 done
 refresh_caches
 
-say "Installed OmpDeck to $bin_dir/$APP"
 
 # omp: OmpDeck finds it on PATH or in ~/.local/bin (where omp's --binary installer puts it).
 if command -v omp >/dev/null 2>&1 || [ -x "$HOME/.local/bin/omp" ]; then
@@ -183,7 +214,15 @@ else
         warn "installing omp failed; OmpDeck offers an 'Install omp' button to retry"
     fi
 fi
-command -v tmux >/dev/null 2>&1 || warn "'tmux' was not found; OmpDeck still works but sessions will not persist after closing a tab. Install tmux for persistence."
+
+# Resume clears a prior maintenance barrier even in Off mode. It only repairs/enables
+# supervision when the user had already opted into Background.
+gateway_resume_attempted=1
+if ! "$bin_dir/$APP-gateway" resume; then
+    die "OmpDeck files were installed, but background gateway repair failed. Resolve the reported error and run '$bin_dir/$APP-gateway resume'."
+fi
+say "Installed OmpDeck to $bin_dir/$APP"
+command -v tmux >/dev/null 2>&1 || warn "'tmux' was not found; OmpDeck will use its session host."
 case ":$PATH:" in
     *":$bin_dir:"*) ;;
     *) warn "$bin_dir is not on your PATH; add it to launch 'omp-deck' from a shell" ;;

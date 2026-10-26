@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
-use deck_service::controller::SessionTarget;
+use crate::controller::SessionTarget;
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::Foundation::TypedEventHandler;
 use windows::UI::Notifications::{
@@ -143,13 +143,14 @@ mod tests {
     use super::*;
 
     /// Toasts need a desktop session that accepts them, which CI runners and headless boxes lack;
-    /// run on one with `cargo test -p omp-deck -- --ignored windows_toast`.
+    /// run on one with `cargo test -p deck-service -- --ignored windows_toast`.
     #[test]
     #[ignore = "needs an interactive Windows desktop (toast platform); run with --ignored"]
     fn windows_toast_show_then_withdraw_by_tag() {
         let app_id = POWERSHELL_APP_ID;
         let key = SessionTarget {
-            key: deck_service::controller::SessionKey::tmux("test", "987654321"),
+            epoch: crate::controller::ServiceEpoch::current(),
+            key: crate::controller::SessionKey::tmux("test", "987654321"),
             generation: 1,
         };
         let tab = Some(key);

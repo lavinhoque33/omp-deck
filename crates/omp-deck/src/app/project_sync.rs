@@ -1,28 +1,26 @@
 //! App-side glue for project sync (wave 10): per-folder `.omp` + sessions backups to Google Drive,
 //! the Settings "Sync" page, the restore flow and the sidebar entries.
 //!
-//! It runs on its own lane (one project job at a time, independent of the config backup lane in
-//! `drive.rs`). Network, packing and measuring all run on workers; the UI only reads shared
-//! progress and channel results.
+//! Packing, uploading, downloading and measuring run in the gateway, which also runs the
+//! automatic passes on its own schedule. This window sends the user's requests (one project job
+//! at a time, as before), shows the gateway's progress and results, and keeps the dialogs.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
-use deck_core::config::{SyncInterval, SyncRow};
+use deck_core::config::SyncRow;
 use deck_core::gdrive::{
-    Error, MemoryBank, OmpDir, Parts, PreparedProjectRestore, Progress, ProjectBackup,
-    ProjectBackupOutcome, ProjectRestoreReport, ProjectSizes, ProjectSyncState, Service, Stage,
-    hostname, measure, path_id,
+    MemoryBank, OmpDir, Parts, ProjectBackup, ProjectBackupOutcome, ProjectRestorePlan,
+    ProjectRestoreReport, ProjectSizes, ProjectSyncState, hostname, path_id,
 };
 use deck_core::sessions::abbreviate_home;
+use deck_service::controller::RequestKey;
+use deck_service::gateway::protocol::{Answer, Done, Mutation, Progress, Query, Topic};
 
-use super::{App, AppEvent, human_size};
+use super::{App, human_size};
 use crate::confirm::{self, Confirm};
 use crate::drive_view::DriveCard;
-use crate::omp_worker;
 use crate::sidebar::{DriveMenu, format_age};
 use crate::sync_view::{
     self, BackupAnswer, BackupDialog, Cells, CloudProject, LastView, ListState, ManagerAction,
@@ -34,84 +32,29 @@ use crate::sync_view::{
 use crate::transfer;
 use crate::tree_layout::clock;
 
-/// First automatic pass after startup and after signing in.
-const AUTO_FIRST: Duration = Duration::from_secs(2 * 60);
-/// Progress callbacks wake the UI at most this often.
-const REPAINT_EVERY: Duration = Duration::from_millis(100);
 /// The confirmation lists at most this many overwritten paths.
 const PLAN_LIST: usize = 8;
+/// The text of a job the user cancelled.
+const CANCELLED: &str = "cancelled";
+/// Shown when a second project job is started while one runs.
+const LANE_BUSY: &str = "Another project job is running; try again in a moment.";
 
 /// What the lane is doing.
 enum Kind {
-    Backup {
-        path: PathBuf,
-    },
+    Backup { path: PathBuf },
     Listing,
     Preparing,
     Restoring,
-    Deleting {
-        done: Arc<AtomicUsize>,
-        total: usize,
-    },
+    Deleting { done: usize, total: usize },
 }
 
-/// Latest progress of the running job, written by the worker, read each frame.
-struct Prog {
-    label: &'static str,
-    done: u64,
-    total: u64,
-}
-
-struct Shared {
-    prog: Mutex<Option<Prog>>,
-    last_repaint: Mutex<Instant>,
-}
-
-impl Shared {
-    fn report(&self, ctx: &egui::Context, p: Progress) {
-        let label = match p.stage {
-            Stage::Scanning => "Scanning",
-            Stage::Packing => "Packing",
-            Stage::Uploading => "Uploading",
-            Stage::Downloading => "Downloading",
-            Stage::Verifying => "Verifying",
-            Stage::RestoringOmp => "Restoring .omp",
-            Stage::RestoringSessions => "Restoring sessions",
-            Stage::RestoringMemory => "Restoring memory",
-        };
-        *self.prog.lock().unwrap_or_else(PoisonError::into_inner) = Some(Prog {
-            label,
-            done: p.done,
-            total: p.total,
-        });
-        let mut last = self
-            .last_repaint
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if last.elapsed() >= REPAINT_EVERY {
-            *last = Instant::now();
-            ctx.request_repaint();
-        }
-    }
-
-    fn view(&self) -> Option<ProgView> {
-        let g = self.prog.lock().unwrap_or_else(PoisonError::into_inner);
-        let p = g.as_ref()?;
-        let fraction = (p.total > 0).then(|| (p.done as f64 / p.total as f64) as f32);
-        Some(ProgView {
-            label: match fraction {
-                Some(f) => format!("{} {}%", p.label, (f.clamp(0.0, 1.0) * 100.0) as u32),
-                None => format!("{}…", p.label),
-            },
-            fraction,
-        })
-    }
-}
-
+/// The one project job this window has sent (the gateway runs one Drive job at a time).
 struct Job {
     kind: Kind,
-    cancel: Arc<AtomicBool>,
-    shared: Arc<Shared>,
+    /// The gateway request, to cancel it; `None` for queries and the locally sequenced deletion.
+    key: Option<RequestKey>,
+    /// Latest progress the gateway reported.
+    progress: Option<ProgView>,
 }
 
 /// What a folder pick is for.
@@ -122,52 +65,11 @@ pub(super) enum Pick {
     RestoreTarget,
 }
 
-/// A finished project-sync worker.
-pub(super) enum SyncEvent {
-    State(ProjectSyncState),
-    Sizes {
-        path: PathBuf,
-        result: Result<ProjectSizes, String>,
-    },
-    BackedUp {
-        path: PathBuf,
-        auto: bool,
-        result: Result<Option<Box<ProjectBackupOutcome>>, Error>,
-        state: ProjectSyncState,
-    },
-    Listed(Result<Vec<ProjectBackup>, Error>),
-    Prepared(Result<Box<PreparedProjectRestore>, Error>),
-    Restored(Result<ProjectRestoreReport, Error>),
-    /// Permanent deletion of cloud backups finished (or was cancelled part-way).
-    Deleted {
-        deleted: usize,
-        failed: Vec<(String, Error)>,
-        cancelled: bool,
-        state: ProjectSyncState,
-    },
-    Picked {
-        pick: Pick,
-        path: Option<PathBuf>,
-    },
-    /// A typed folder was checked on disk.
-    Checked {
-        purpose: PathPurpose,
-        path: PathBuf,
-        result: Result<(), String>,
-    },
-    /// Does the restore target exist? `preset` = the original path offered as the default.
-    Probed {
-        generation: u64,
-        path: PathBuf,
-        exists: bool,
-        preset: bool,
-    },
-}
-
 struct Restore {
     dlg: RestoreDialog,
     backups: Vec<ProjectBackup>,
-    prepared: Option<Box<PreparedProjectRestore>>,
+    /// The restore the gateway prepared and holds under this handle.
+    prepared: Option<u64>,
     /// Sessions in the prepared plan (for the "3 of 11" wording of a cancelled restore).
     session_total: usize,
     /// Sidebar restore: only this folder's backups are listed.
@@ -185,10 +87,21 @@ struct Manager {
     backups: Vec<ProjectBackup>,
 }
 
+/// Backups being deleted one after the other; each is its own request, so a cancel stops the
+/// sends that follow.
+struct Deletion {
+    queue: VecDeque<ProjectBackup>,
+    deleted: usize,
+    failed: Vec<(String, String)>,
+    cancelled: bool,
+}
+
 pub(super) struct SyncUi {
     job: Option<Job>,
+    deletion: Option<Deletion>,
     state: ProjectSyncState,
-    state_requested: bool,
+    /// The gateway's Drive revision the local sync state was read at.
+    state_rev: Option<u64>,
     /// Measured sizes by folder; absent = being measured for the first time.
     sizes: HashMap<PathBuf, Result<ProjectSizes, String>>,
     measuring: HashSet<PathBuf>,
@@ -196,11 +109,6 @@ pub(super) struct SyncUi {
     errors: HashMap<PathBuf, String>,
     /// `.omp` entries the last backup of each folder left out.
     skipped: HashMap<PathBuf, Vec<String>>,
-    next_auto: Instant,
-    /// Folders left in the running automatic pass.
-    pass: VecDeque<PathBuf>,
-    pass_failure_shown: bool,
-    was_signed_in: bool,
     /// The Sync page was drawn (this frame / last frame): sizes are measured when it appears.
     seen: bool,
     was_visible: bool,
@@ -215,33 +123,16 @@ pub(super) struct SyncUi {
 }
 
 impl SyncUi {
-    /// The sync interval changed from `was` to `now` (by the user, or adopted from another
-    /// window's commit): the next automatic pass is due after the new period, or after the
-    /// first-run delay when syncing was off.
-    pub(super) fn reschedule(&mut self, was: SyncInterval, now: SyncInterval) {
-        if let Some(period) = now.period() {
-            let wait = if was == SyncInterval::Off {
-                AUTO_FIRST
-            } else {
-                period
-            };
-            self.next_auto = Instant::now() + wait;
-        }
-    }
-
     pub(super) fn new() -> SyncUi {
         SyncUi {
             job: None,
+            deletion: None,
             state: ProjectSyncState::default(),
-            state_requested: false,
+            state_rev: None,
             sizes: HashMap::new(),
             measuring: HashSet::new(),
             errors: HashMap::new(),
             skipped: HashMap::new(),
-            next_auto: Instant::now() + AUTO_FIRST,
-            pass: VecDeque::new(),
-            pass_failure_shown: false,
-            was_signed_in: false,
             seen: false,
             was_visible: false,
             prompt: None,
@@ -262,6 +153,36 @@ impl SyncUi {
             || self.manager.is_some()
             || self.sessions.is_some()
     }
+}
+
+/// The progress line of a gateway progress report.
+fn prog_view(p: &Progress) -> ProgView {
+    let label = match p.stage.as_str() {
+        "Scanning" => "Scanning",
+        "Packing" => "Packing",
+        "Uploading" => "Uploading",
+        "Downloading" => "Downloading",
+        "Verifying" => "Verifying",
+        "RestoringOmp" => "Restoring .omp",
+        "RestoringSessions" => "Restoring sessions",
+        "RestoringMemory" => "Restoring memory",
+        other => other,
+    };
+    let fraction = p
+        .total
+        .filter(|t| *t > 0)
+        .map(|t| (p.done as f64 / t as f64) as f32);
+    ProgView {
+        label: match fraction {
+            Some(f) => format!("{label} {}%", (f.clamp(0.0, 1.0) * 100.0) as u32),
+            None => format!("{label}…"),
+        },
+        fraction,
+    }
+}
+
+fn is_cancelled(error: &str) -> bool {
+    error == CANCELLED
 }
 
 /// Sessions of `sizes` that are not opted out, with their bytes.
@@ -402,16 +323,16 @@ impl App {
     // ---------------------------------------------------------------- gating
 
     fn sync_signed_in(&self) -> bool {
-        self.drive.signed_in()
+        self.drive_signed_in()
     }
 
     /// The sidebar's "Google Drive" entries.
     pub(super) fn drive_menu(&self) -> DriveMenu {
-        if self.drive.service().is_none() {
+        if !self.drive_available() {
             DriveMenu::Hidden
         } else if !self.sync_signed_in() {
             DriveMenu::Off("Sign in to Google Drive in Settings → Sync first")
-        } else if self.sync.job.is_some() {
+        } else if self.sync.job.is_some() || self.drive_view().is_some_and(|v| v.busy.is_some()) {
             DriveMenu::Off("Another project backup or restore is running")
         } else {
             DriveMenu::On
@@ -420,50 +341,45 @@ impl App {
 
     // ---------------------------------------------------------------- jobs
 
-    /// Runs `job` on a worker unless the lane is busy or nobody is signed in.
-    fn lane_job<F>(&mut self, kind: Kind, job: F) -> bool
-    where
-        F: FnOnce(&Service, &AtomicBool, &(dyn Fn(Progress) + Sync)) -> SyncEvent + Send + 'static,
-    {
-        if self.sync.job.is_some() || !self.sync_signed_in() {
+    /// Claims the project lane for `kind`; false when it is busy, nobody is signed in or the
+    /// gateway is away.
+    fn begin_job(&mut self, kind: Kind) -> bool {
+        if self.sync.job.is_some() || !self.sync_signed_in() || !self.gw.is_up() {
             return false;
         }
-        let Some(service) = self.drive.service().cloned() else {
-            return false;
-        };
-        let cancel = Arc::new(AtomicBool::new(false));
-        let shared = Arc::new(Shared {
-            prog: Mutex::new(None),
-            last_repaint: Mutex::new(Instant::now()),
+        self.sync.job = Some(Job {
+            kind,
+            key: None,
+            progress: None,
         });
-        let (c, s, ctx) = (cancel.clone(), shared.clone(), self.ctx.clone());
-        let started = omp_worker::try_spawn(&self.ctx, &self.events_tx, move || {
-            let report = |p: Progress| s.report(&ctx, p);
-            AppEvent::Sync(job(&service, &c, &report))
-        });
-        match started {
-            Ok(()) => {
-                self.sync.job = Some(Job {
-                    kind,
-                    cancel,
-                    shared,
-                });
-                true
-            }
-            Err(e) => {
-                self.toasts
-                    .error(&self.ctx, format!("Cannot start the Drive job: {e}"));
-                false
-            }
+        true
+    }
+
+    /// Sends a long project mutation of the claimed job; `done` runs once with its result.
+    fn send_job(
+        &mut self,
+        op: Mutation,
+        done: impl FnOnce(&mut App, Result<Done, String>) + 'static,
+    ) {
+        let key = self.gw.mutate_with_progress(
+            op,
+            |app, p| {
+                if let Some(j) = &mut app.sync.job {
+                    j.progress = Some(prog_view(p));
+                }
+            },
+            done,
+        );
+        if let Some(j) = &mut self.sync.job {
+            j.key = Some(key);
         }
     }
 
-    fn row_parts(&self, path: &Path) -> Parts {
-        self.cfg
-            .project_sync
-            .iter()
-            .find(|r| r.path == path)
-            .map_or(Parts::default(), parts_of)
+    /// Asks the gateway to stop the running job (when it was sent as a request).
+    fn cancel_job(&mut self) {
+        if let Some(key) = self.sync.job.as_ref().and_then(|j| j.key.clone()) {
+            self.gw.cancel(key);
+        }
     }
 
     /// Measures, then backs up `path` with whichever of `want` exists, leaving out the sessions
@@ -472,45 +388,79 @@ impl App {
         &mut self,
         path: PathBuf,
         want: Parts,
-        auto: bool,
         excluded: BTreeSet<String>,
     ) -> bool {
-        let root = self.root.clone();
-        let kind = Kind::Backup { path: path.clone() };
-        self.lane_job(kind, move |service, cancel, report| {
-            let result = measure(&root, &path)
-                .map_err(|e| Error::Io(format!("reading {}: {e}", path.display())))
-                .and_then(|sizes| {
-                    service
-                        .backup_project(
-                            &root,
-                            &path,
-                            usable_parts(want, &sizes, &excluded),
-                            &excluded,
-                            !auto,
-                            cancel,
-                            report,
-                        )
-                        .map(|o| o.map(Box::new))
+        if !self.begin_job(Kind::Backup { path: path.clone() }) {
+            return false;
+        }
+        let project = path.clone();
+        self.gw
+            .query(Query::DriveMeasure { project }, move |app, r| {
+                let sizes = match r {
+                    Ok(Answer::DriveMeasure(s)) => Ok(s),
+                    Ok(_) => Err("the gateway answered with something else".to_owned()),
+                    Err(e) => Err(format!("reading {}: {e}", path.display())),
+                };
+                let sizes = match sizes {
+                    Ok(s) => s,
+                    Err(e) => {
+                        app.sync.job = None;
+                        app.on_project_backed_up(path, Err(e));
+                        return;
+                    }
+                };
+                let parts = usable_parts(want, &sizes, &excluded);
+                if !parts.any() {
+                    app.sync.job = None;
+                    let e = format!("nothing to back up in {}", abbreviate_home(&path));
+                    app.on_project_backed_up(path, Err(e));
+                    return;
+                }
+                let op = Mutation::ProjectBackup {
+                    project: path.clone(),
+                    parts,
+                    excluded,
+                    force: true,
+                };
+                app.send_job(op, move |app, r| {
+                    app.sync.job = None;
+                    let outcome = r.and_then(|d| match d {
+                        Done::ProjectBackup(o) => Ok(o),
+                        _ => Err("the gateway answered with something else".to_owned()),
+                    });
+                    app.on_project_backed_up(path, outcome);
                 });
-            SyncEvent::BackedUp {
-                path,
-                auto,
-                result,
-                state: service.project_state(),
-            }
-        })
+            });
+        true
     }
 
-    /// Measure `path` on a worker (never per frame).
+    /// Measure `path` through the gateway (never per frame).
     fn measure_path(&mut self, path: &Path) {
         if !self.sync.measuring.insert(path.to_path_buf()) {
             return;
         }
-        let (root, path) = (self.root.clone(), path.to_path_buf());
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            let result = measure(&root, &path).map_err(|e| e.to_string());
-            AppEvent::Sync(SyncEvent::Sizes { path, result })
+        let path = path.to_path_buf();
+        let project = path.clone();
+        self.gw
+            .query(Query::DriveMeasure { project }, move |app, r| {
+                let result = match r {
+                    Ok(Answer::DriveMeasure(s)) => Ok(s),
+                    Ok(_) => Err("the gateway answered with something else".to_owned()),
+                    Err(e) => Err(e),
+                };
+                app.sync.measuring.remove(&path);
+                app.sync.sizes.insert(path.clone(), result);
+                app.refresh_cells(&path);
+            });
+    }
+
+    /// Reads the gateway's record of what was backed up when.
+    fn refresh_sync_state(&mut self) {
+        self.sync.state_rev = Some(self.gw.revision(&Topic::Drive));
+        self.gw.query(Query::DriveProjectState, |app, r| {
+            if let Ok(Answer::DriveProjectState(s)) = r {
+                app.sync.state = s;
+            }
         });
     }
 
@@ -572,74 +522,6 @@ impl App {
         }
     }
 
-    /// Per frame: load the local state once, start the automatic pass when it is due.
-    pub(super) fn sync_tick(&mut self, ctx: &egui::Context) {
-        self.sync.was_visible = std::mem::take(&mut self.sync.seen);
-        let signed_in = self.sync_signed_in();
-        if signed_in && !self.sync.was_signed_in {
-            self.sync.next_auto = Instant::now() + AUTO_FIRST;
-            self.sync.pass.clear();
-            self.sync.pass_failure_shown = false;
-        }
-        self.sync.was_signed_in = signed_in;
-        if let Some(service) = self.drive.service().cloned()
-            && !self.sync.state_requested
-        {
-            self.sync.state_requested = true;
-            omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-                AppEvent::Sync(SyncEvent::State(service.project_state()))
-            });
-        }
-        if !signed_in {
-            self.sync.pass.clear();
-            return;
-        }
-        if self.sync.job.is_some()
-            || self.sync.restore.is_some()
-            || self.sync.backup.is_some()
-            || self.sync.manager.is_some()
-        {
-            return;
-        }
-        if let Some(path) = self.sync.pass.pop_front() {
-            let want = self.row_parts(&path);
-            let row = self.cfg.project_sync.iter().find(|r| r.path == path);
-            // Measured and nothing usable (nothing present, every session opted out): skip quietly.
-            let usable = match (row, self.sync.sizes.get(&path)) {
-                (Some(r), Some(Ok(s))) => usable_parts(want, s, &r.excluded_sessions).any(),
-                (Some(_), _) => true,
-                (None, _) => false,
-            };
-            if want.any() && usable {
-                let excluded = row.map_or_else(BTreeSet::new, |r| r.excluded_sessions.clone());
-                self.start_project_backup(path, want, true, excluded);
-            }
-            ctx.request_repaint();
-            return;
-        }
-        let Some(period) = self.cfg.project_sync_interval.period() else {
-            return;
-        };
-        if self.cfg.project_sync.is_empty() {
-            return;
-        }
-        let now = Instant::now();
-        if now >= self.sync.next_auto {
-            self.sync.next_auto = now + period;
-            self.sync.pass = self
-                .cfg
-                .project_sync
-                .iter()
-                .filter(|r| parts_of(r).any())
-                .map(|r| r.path.clone())
-                .collect();
-            self.sync.pass_failure_shown = false;
-            ctx.request_repaint();
-        } else {
-            ctx.request_repaint_after(self.sync.next_auto - now);
-        }
-    }
-
     // ---------------------------------------------------------------- the Sync page
 
     /// The page's view data.
@@ -651,7 +533,7 @@ impl App {
             .map(|r| {
                 let busy = self.sync.job.as_ref().and_then(|j| match &j.kind {
                     Kind::Backup { path, .. } if *path == r.path => {
-                        Some(j.shared.view().unwrap_or(ProgView {
+                        Some(j.progress.clone().unwrap_or(ProgView {
                             label: "Starting…".into(),
                             fraction: None,
                         }))
@@ -720,6 +602,11 @@ impl App {
                     self.measure_rows();
                 }
                 self.sync.seen = true;
+                // The gateway's own passes move the record: read it again when it did.
+                let rev = self.gw.revision(&Topic::Drive);
+                if self.sync.state_rev != Some(rev) && self.sync.job.is_none() {
+                    self.refresh_sync_state();
+                }
             }
             SyncAction::Drive(a) => self.apply_drive_action(a),
             SyncAction::Add => self.pick_folder(Pick::Add),
@@ -747,19 +634,14 @@ impl App {
                 if let Some(r) = self.cfg.project_sync.get(i) {
                     let (path, want) = (r.path.clone(), parts_of(r));
                     let excluded = r.excluded_sessions.clone();
-                    if !self.start_project_backup(path, want, false, excluded) {
-                        self.toasts.info(
-                            &self.ctx,
-                            "Another project job is running; try again in a moment.",
-                        );
+                    if !self.start_project_backup(path, want, excluded) {
+                        self.toasts.info(&self.ctx, LANE_BUSY);
                     }
                 }
             }
             SyncAction::SetInterval(v) => {
-                let was = self.cfg.project_sync_interval;
                 self.cfg.project_sync_interval = v;
                 self.dirty = true;
-                self.sync.reschedule(was, v);
             }
             SyncAction::OpenRestore => self.open_restore(None),
             SyncAction::ChooseSessions(i) => self.open_sessions_dialog(i),
@@ -782,10 +664,10 @@ impl App {
                 .home
                 .clone()
                 .unwrap_or_else(deck_core::platform::home_or_root);
-            omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-                let path = transfer::pick_folder(&start);
-                AppEvent::Sync(SyncEvent::Picked { pick, path })
-            });
+            self.gw.native(
+                move || transfer::pick_folder(&start),
+                move |app, path| app.on_picked(pick, path),
+            );
         } else {
             let purpose = match pick {
                 Pick::Add => PathPurpose::Add,
@@ -793,6 +675,27 @@ impl App {
                 Pick::RestoreTarget => return,
             };
             self.sync.prompt = Some(PathPrompt::new(purpose));
+        }
+    }
+
+    fn on_picked(&mut self, pick: Pick, path: Option<PathBuf>) {
+        self.sync.picking = false;
+        if let Some(r) = &mut self.sync.restore {
+            r.dlg.picking = false;
+        }
+        let Some(path) = path else {
+            return;
+        };
+        match pick {
+            Pick::Add => self.picked_row(PathPurpose::Add, path),
+            Pick::Change(i) => self.picked_row(PathPurpose::Change(i), path),
+            Pick::RestoreTarget => {
+                if let Some(r) = &mut self.sync.restore {
+                    r.dlg.target = path.to_string_lossy().into_owned();
+                    r.target_touched = true;
+                }
+                self.probe_target();
+            }
         }
     }
 
@@ -831,111 +734,10 @@ impl App {
         }
         self.dirty = true;
         if purpose == PathPurpose::Add {
-            // Adding never makes the automatic pass due right now.
-            let now = Instant::now();
-            if self.sync.next_auto <= now {
-                let period = self.cfg.project_sync_interval.period();
-                self.sync.next_auto = now + period.unwrap_or(AUTO_FIRST);
-            }
             self.refresh_cells(&path);
         }
         self.measure_path(&path);
         Ok(())
-    }
-
-    // ---------------------------------------------------------------- events
-
-    pub(super) fn on_sync_event(&mut self, ev: SyncEvent) {
-        match ev {
-            SyncEvent::State(s) => self.sync.state = s,
-            SyncEvent::Sizes { path, result } => {
-                self.sync.measuring.remove(&path);
-                self.sync.sizes.insert(path.clone(), result);
-                self.refresh_cells(&path);
-            }
-            SyncEvent::BackedUp {
-                path,
-                auto,
-                result,
-                state,
-            } => {
-                self.sync.job = None;
-                self.sync.state = state;
-                self.on_project_backed_up(path, auto, result);
-            }
-            SyncEvent::Listed(result) => {
-                self.sync.job = None;
-                self.on_listed(result);
-            }
-            SyncEvent::Prepared(result) => {
-                self.sync.job = None;
-                self.on_prepared(result);
-            }
-            SyncEvent::Restored(result) => {
-                self.sync.job = None;
-                self.on_restored(result);
-            }
-            SyncEvent::Deleted {
-                deleted,
-                failed,
-                cancelled,
-                state,
-            } => {
-                self.sync.job = None;
-                self.sync.state = state;
-                self.on_deleted(deleted, failed, cancelled);
-            }
-            SyncEvent::Picked { pick, path } => {
-                self.sync.picking = false;
-                if let Some(r) = &mut self.sync.restore {
-                    r.dlg.picking = false;
-                }
-                let Some(path) = path else {
-                    return;
-                };
-                match pick {
-                    Pick::Add => self.picked_row(PathPurpose::Add, path),
-                    Pick::Change(i) => self.picked_row(PathPurpose::Change(i), path),
-                    Pick::RestoreTarget => {
-                        if let Some(r) = &mut self.sync.restore {
-                            r.dlg.target = path.to_string_lossy().into_owned();
-                            r.target_touched = true;
-                        }
-                        self.probe_target();
-                    }
-                }
-            }
-            SyncEvent::Checked {
-                purpose,
-                path,
-                result,
-            } => self.on_checked(purpose, path, result),
-            SyncEvent::Probed {
-                generation,
-                path,
-                exists,
-                preset,
-            } => {
-                let Some(r) = &mut self.sync.restore else {
-                    return;
-                };
-                if generation != r.probe_generation {
-                    return;
-                }
-                if preset {
-                    if exists && !r.target_touched {
-                        r.dlg.target = path.to_string_lossy().into_owned();
-                        r.dlg.target_status = TargetStatus::Exists;
-                    }
-                } else {
-                    r.dlg.target_status = if exists {
-                        TargetStatus::Exists
-                    } else {
-                        TargetStatus::Missing
-                    };
-                }
-            }
-        }
     }
 
     fn picked_row(&mut self, purpose: PathPurpose, path: PathBuf) {
@@ -966,11 +768,11 @@ impl App {
     fn on_project_backed_up(
         &mut self,
         path: PathBuf,
-        auto: bool,
-        result: Result<Option<Box<ProjectBackupOutcome>>, Error>,
+        result: Result<Option<ProjectBackupOutcome>, String>,
     ) {
-        // The files changed or the sizes drifted: measure again.
+        // The files changed or the sizes drifted: measure again; the record moved too.
         self.measure_path(&path);
+        self.refresh_sync_state();
         let name = abbreviate_home(&path);
         match result {
             Ok(outcome) => {
@@ -989,53 +791,28 @@ impl App {
                         log::warn!("project sync: skipped {}", o.skipped.join("; "));
                         self.sync.skipped.insert(path.clone(), o.skipped);
                     }
-                    if !auto {
-                        let mut text = format!(
-                            "Backed up {name} to Google Drive ({})",
-                            human_size(o.backup.file.size)
+                    let mut text = format!(
+                        "Backed up {name} to Google Drive ({})",
+                        human_size(o.backup.file.size)
+                    );
+                    if skipped > 0 {
+                        text += &format!(
+                            "; {skipped} file{} skipped (details on the Sync page)",
+                            if skipped == 1 { "" } else { "s" }
                         );
-                        if skipped > 0 {
-                            text += &format!(
-                                "; {skipped} file{} skipped (details on the Sync page)",
-                                if skipped == 1 { "" } else { "s" }
-                            );
-                        }
-                        self.toasts.success(&self.ctx, text);
                     }
-                } else if !auto {
+                    self.toasts.success(&self.ctx, text);
+                } else {
                     self.toasts.info(
                         &self.ctx,
                         format!("{name} is unchanged since its last backup"),
                     );
                 }
             }
-            Err(e) => {
-                let signed_out = matches!(e, Error::SignedOut | Error::NotSignedIn);
-                let nothing = matches!(e, Error::NothingToBackUp(_));
-                let msg = self.drive_error(e);
-                if signed_out {
-                    self.sync.pass.clear();
-                }
-                if auto && nothing {
-                    // Nothing selected is usable (e.g. every session opted out): not a failure.
-                    self.sync.errors.remove(&path);
-                    log::info!("automatic project backup of {name}: nothing to back up");
-                } else if !auto {
-                    self.sync.errors.insert(path, msg.clone());
-                    self.toasts
-                        .error(&self.ctx, format!("Backup of {name} failed: {msg}"));
-                } else {
-                    self.sync.errors.insert(path, msg.clone());
-                    if !self.sync.pass_failure_shown {
-                        self.sync.pass_failure_shown = true;
-                        self.toasts.error(
-                            &self.ctx,
-                            format!("Automatic backup of {name} failed: {msg}"),
-                        );
-                    } else {
-                        log::warn!("automatic project backup of {name} failed: {msg}");
-                    }
-                }
+            Err(msg) => {
+                self.sync.errors.insert(path, msg.clone());
+                self.toasts
+                    .error(&self.ctx, format!("Backup of {name} failed: {msg}"));
             }
         }
     }
@@ -1110,11 +887,8 @@ impl App {
                     self.dirty = true;
                     self.refresh_cells(&d.path);
                 }
-                if !self.start_project_backup(d.path, want, false, d.excluded_ids) {
-                    self.toasts.info(
-                        &self.ctx,
-                        "Another project job is running; try again in a moment.",
-                    );
+                if !self.start_project_backup(d.path, want, d.excluded_ids) {
+                    self.toasts.info(&self.ctx, LANE_BUSY);
                 }
             }
         }
@@ -1139,7 +913,7 @@ impl App {
             dlg: RestoreDialog::new(
                 only.is_some(),
                 target,
-                self.omp.is_some(),
+                self.omp_found(),
                 self.picker_available,
             ),
             backups: Vec::new(),
@@ -1154,6 +928,24 @@ impl App {
         self.start_project_listing();
     }
 
+    /// Closes the restore dialog: a running download is told to stop, a prepared restore the
+    /// gateway still holds is discarded.
+    fn close_restore(&mut self) {
+        if let Some(r) = self.sync.restore.take()
+            && let Some(handle) = r.prepared
+        {
+            self.gw
+                .mutate(Mutation::ProjectDiscardRestore(handle), |_, _| {});
+        }
+        if matches!(
+            self.sync.job.as_ref().map(|j| &j.kind),
+            Some(Kind::Preparing | Kind::Restoring)
+        ) {
+            self.cancel_job();
+        }
+        self.focus_pending = true;
+    }
+
     /// (Re)loads the project backup list for whichever of the restore / manager dialogs is open.
     fn start_project_listing(&mut self) {
         if let Some(r) = &mut self.sync.restore {
@@ -1163,22 +955,27 @@ impl App {
         if let Some(m) = &mut self.sync.manager {
             m.dlg.set_list(ListState::Loading);
         }
-        let started = self.lane_job(Kind::Listing, |service, _, _| {
-            SyncEvent::Listed(service.list_projects())
-        });
-        if !started {
-            let busy = "Another project job is running; try again.";
+        if !self.begin_job(Kind::Listing) {
             if let Some(r) = &mut self.sync.restore {
-                r.dlg.list = ListState::Failed(busy.to_owned());
+                r.dlg.list = ListState::Failed(LANE_BUSY.to_owned());
             }
             if let Some(m) = &mut self.sync.manager {
-                m.dlg.set_list(ListState::Failed(busy.to_owned()));
+                m.dlg.set_list(ListState::Failed(LANE_BUSY.to_owned()));
             }
+            return;
         }
+        self.gw.query(Query::DriveProjects, |app, r| {
+            app.sync.job = None;
+            let result = match r {
+                Ok(Answer::DriveProjects(list)) => Ok(list),
+                Ok(_) => Err("the gateway answered with something else".to_owned()),
+                Err(e) => Err(e),
+            };
+            app.on_listed(result);
+        });
     }
 
-    fn on_listed(&mut self, result: Result<Vec<ProjectBackup>, Error>) {
-        let result = result.map_err(|e| self.drive_error(e));
+    fn on_listed(&mut self, result: Result<Vec<ProjectBackup>, String>) {
         let me = hostname();
         match result {
             Err(msg) => {
@@ -1239,20 +1036,16 @@ impl App {
                 r.probe_generation += 1;
                 let generation = r.probe_generation;
                 let path = PathBuf::from(path);
-                omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-                    let exists = path.is_dir();
-                    AppEvent::Sync(SyncEvent::Probed {
-                        generation,
-                        path,
-                        exists,
-                        preset: true,
-                    })
-                });
+                let probed = path.clone();
+                self.gw.native(
+                    move || probed.is_dir(),
+                    move |app, exists| app.on_probed(generation, path, exists, true),
+                );
             }
         }
     }
 
-    /// Does the typed restore target exist? Answered by a worker.
+    /// Does the typed restore target exist? Answered by a native worker.
     fn probe_target(&mut self) {
         let home = self.home.clone();
         let Some(r) = &mut self.sync.restore else {
@@ -1264,19 +1057,37 @@ impl App {
             return;
         };
         let generation = r.probe_generation;
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            let exists = path.is_dir();
-            AppEvent::Sync(SyncEvent::Probed {
-                generation,
-                path,
-                exists,
-                preset: false,
-            })
-        });
+        let probed = path.clone();
+        self.gw.native(
+            move || probed.is_dir(),
+            move |app, exists| app.on_probed(generation, path, exists, false),
+        );
+    }
+
+    /// `preset` = the original path offered as the default.
+    fn on_probed(&mut self, generation: u64, path: PathBuf, exists: bool, preset: bool) {
+        let Some(r) = &mut self.sync.restore else {
+            return;
+        };
+        if generation != r.probe_generation {
+            return;
+        }
+        if preset {
+            if exists && !r.target_touched {
+                r.dlg.target = path.to_string_lossy().into_owned();
+                r.dlg.target_status = TargetStatus::Exists;
+            }
+        } else {
+            r.dlg.target_status = if exists {
+                TargetStatus::Exists
+            } else {
+                TargetStatus::Missing
+            };
+        }
     }
 
     fn restore_progress(&self) -> Option<ProgView> {
-        self.sync.job.as_ref().and_then(|j| j.shared.view())
+        self.sync.job.as_ref().and_then(|j| j.progress.clone())
     }
 
     fn show_restore_dialog(&mut self, ctx: &egui::Context) {
@@ -1304,23 +1115,11 @@ impl App {
             RestoreAction::Cancel => match r.dlg.step {
                 Step::Applying => {
                     r.dlg.cancelling = true;
-                    if let Some(j) = &self.sync.job {
-                        j.cancel.store(true, Ordering::Relaxed);
-                    }
+                    self.cancel_job();
                 }
-                _ => {
-                    // A running list/prepare download is told to stop; its result is dropped.
-                    if let Some(j) = &self.sync.job {
-                        j.cancel.store(true, Ordering::Relaxed);
-                    }
-                    self.sync.restore = None;
-                    self.focus_pending = true;
-                }
+                _ => self.close_restore(),
             },
-            RestoreAction::Close => {
-                self.sync.restore = None;
-                self.focus_pending = true;
-            }
+            RestoreAction::Close => self.close_restore(),
         }
     }
 
@@ -1348,38 +1147,47 @@ impl App {
             sessions: r.dlg.sessions,
             memory: r.dlg.memory,
         };
-        let root = self.root.clone();
-        let started = self.lane_job(Kind::Preparing, move |service, cancel, report| {
-            SyncEvent::Prepared(
-                service
-                    .prepare_project_restore(&backup, &target, parts, &root, cancel, report)
-                    .map(Box::new),
-            )
-        });
-        if started && let Some(r) = &mut self.sync.restore {
-            r.dlg.step = Step::Preparing;
-        } else if !started {
-            self.toasts.info(
-                &self.ctx,
-                "Another project job is running; try again in a moment.",
-            );
+        if !self.begin_job(Kind::Preparing) {
+            self.toasts.info(&self.ctx, LANE_BUSY);
+            return;
         }
+        if let Some(r) = &mut self.sync.restore {
+            r.dlg.step = Step::Preparing;
+        }
+        self.send_job(
+            Mutation::ProjectPrepareRestore {
+                backup,
+                target,
+                parts,
+            },
+            |app, r| {
+                app.sync.job = None;
+                let prepared = r.and_then(|d| match d {
+                    Done::ProjectPrepared { handle, plan } => Ok((handle, plan)),
+                    _ => Err("the gateway answered with something else".to_owned()),
+                });
+                app.on_prepared(prepared);
+            },
+        );
     }
 
-    fn on_prepared(&mut self, result: Result<Box<PreparedProjectRestore>, Error>) {
-        let result = result.map_err(|e| (matches!(e, Error::Cancelled), self.drive_error(e)));
+    fn on_prepared(&mut self, result: Result<(u64, ProjectRestorePlan), String>) {
         let Some(r) = &mut self.sync.restore else {
+            // The dialog was closed while it was downloading: the gateway still holds the result.
+            if let Ok((handle, _)) = result {
+                self.gw
+                    .mutate(Mutation::ProjectDiscardRestore(handle), |_, _| {});
+            }
             return;
         };
         match result {
-            Err((cancelled, msg)) => {
+            Err(msg) => {
                 r.dlg.step = Step::Pick;
-                if !cancelled {
+                if !is_cancelled(&msg) {
                     r.dlg.error = Some(format!("Cannot restore that backup: {msg}"));
                 }
             }
-            Ok(prepared) => {
-                let plan = &prepared.plan;
+            Ok((handle, plan)) => {
                 let sessions = (!plan.sessions.is_empty()).then(|| {
                     (
                         plan.sessions.len(),
@@ -1411,40 +1219,37 @@ impl App {
                     sessions,
                     safety: "OmpDeck's restore-safety folder".to_owned(),
                 });
-                r.session_total = prepared.plan.sessions.len();
-                r.prepared = Some(prepared);
+                r.session_total = plan.sessions.len();
+                r.prepared = Some(handle);
             }
         }
     }
 
     fn restore_apply(&mut self) {
-        let omp = self.omp.clone();
-        let Some(r) = &mut self.sync.restore else {
+        let Some(handle) = self.sync.restore.as_ref().and_then(|r| r.prepared) else {
             return;
         };
-        let Some(prepared) = r.prepared.take() else {
+        if !self.begin_job(Kind::Restoring) {
+            self.toasts.info(&self.ctx, LANE_BUSY);
             return;
-        };
-        r.dlg.cancelling = false;
-        let started = self.lane_job(Kind::Restoring, move |service, cancel, report| {
-            SyncEvent::Restored(service.apply_project_restore(
-                *prepared,
-                omp.as_ref(),
-                cancel,
-                report,
-            ))
-        });
-        if started && let Some(r) = &mut self.sync.restore {
-            r.dlg.step = Step::Applying;
-        } else if !started {
-            self.toasts.info(
-                &self.ctx,
-                "Another project job is running; try again in a moment.",
-            );
         }
+        if let Some(r) = &mut self.sync.restore {
+            r.prepared = None;
+            r.dlg.cancelling = false;
+            r.dlg.step = Step::Applying;
+        }
+        self.send_job(Mutation::ProjectApplyRestore(handle), |app, r| {
+            app.sync.job = None;
+            let report = r.and_then(|d| match d {
+                Done::ProjectRestored(report) => Ok(report),
+                _ => Err("the gateway answered with something else".to_owned()),
+            });
+            app.on_restored(report);
+        });
     }
 
-    fn on_restored(&mut self, result: Result<ProjectRestoreReport, Error>) {
+    fn on_restored(&mut self, result: Result<ProjectRestoreReport, String>) {
+        self.refresh_sync_state();
         match result {
             Ok(report) => {
                 let total = self.sync.restore.as_ref().map_or(0, |r| r.session_total);
@@ -1517,10 +1322,8 @@ impl App {
                     self.toasts.error(&self.ctx, text);
                 }
             }
-            Err(e) => {
-                let cancelled = matches!(e, Error::Cancelled);
-                let msg = self.drive_error(e);
-                if cancelled {
+            Err(msg) => {
+                if is_cancelled(&msg) {
                     self.toasts.info(&self.ctx, "Restore cancelled");
                 } else {
                     self.toasts
@@ -1557,23 +1360,23 @@ impl App {
                     Ok(path) => {
                         p.checking = true;
                         p.error = None;
-                        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-                            let result = if path.is_dir() {
-                                Ok(())
-                            } else {
-                                Err("That folder does not exist".to_owned())
-                            };
-                            AppEvent::Sync(SyncEvent::Checked {
-                                purpose,
-                                path,
-                                result,
-                            })
-                        });
+                        let probed = path.clone();
+                        self.gw.native(
+                            move || {
+                                if probed.is_dir() {
+                                    Ok(())
+                                } else {
+                                    Err("That folder does not exist".to_owned())
+                                }
+                            },
+                            move |app, result| app.on_checked(purpose, path, result),
+                        );
                     }
                 }
             }
         }
     }
+
     // ---------------------------------------------------------------- sessions to back up
 
     /// Rebuilds the cached cells of `path` (sizes arrived, exclusions changed).
@@ -1655,40 +1458,65 @@ impl App {
 
     // ---------------------------------------------------------------- deleting cloud backups
 
-    /// Deletes `backups` permanently, one after the other, on the project lane.
+    /// Deletes `backups` permanently, one request after the other, on the project lane.
     fn start_delete(&mut self, backups: Vec<ProjectBackup>) -> bool {
         let total = backups.len();
-        let done = Arc::new(AtomicUsize::new(0));
-        let (counter, ctx) = (done.clone(), self.ctx.clone());
-        self.lane_job(Kind::Deleting { done, total }, move |service, cancel, _| {
-            let mut deleted = 0;
-            let mut failed = Vec::new();
-            let mut cancelled = false;
-            for b in &backups {
-                if cancel.load(Ordering::Relaxed) {
-                    cancelled = true;
-                    break;
-                }
-                match service.delete_project_backup(b) {
-                    Ok(()) => deleted += 1,
-                    Err(e) => {
-                        let when = b
-                            .file
-                            .created_unix()
-                            .map_or_else(|| b.file.created.clone(), clock);
-                        failed.push((format!("{} ({when})", b.name), e));
+        if !self.begin_job(Kind::Deleting { done: 0, total }) {
+            return false;
+        }
+        self.sync.deletion = Some(Deletion {
+            queue: backups.into(),
+            deleted: 0,
+            failed: Vec::new(),
+            cancelled: false,
+        });
+        self.delete_next();
+        true
+    }
+
+    /// Sends the next deletion, or reports when the queue is done (or cancelled).
+    fn delete_next(&mut self) {
+        let Some(d) = &mut self.sync.deletion else {
+            return;
+        };
+        let next = if d.cancelled {
+            None
+        } else {
+            d.queue.pop_front()
+        };
+        let Some(backup) = next else {
+            let Some(d) = self.sync.deletion.take() else {
+                return;
+            };
+            self.sync.job = None;
+            self.refresh_sync_state();
+            self.on_deleted(d.deleted, d.failed, d.cancelled);
+            return;
+        };
+        let label = {
+            let when = backup
+                .file
+                .created_unix()
+                .map_or_else(|| backup.file.created.clone(), clock);
+            format!("{} ({when})", backup.name)
+        };
+        self.gw
+            .mutate(Mutation::ProjectDeleteBackup(backup), move |app, r| {
+                if let Some(d) = &mut app.sync.deletion {
+                    match r {
+                        Ok(_) => d.deleted += 1,
+                        Err(e) => d.failed.push((label, e)),
                     }
                 }
-                counter.fetch_add(1, Ordering::Relaxed);
-                ctx.request_repaint();
-            }
-            SyncEvent::Deleted {
-                deleted,
-                failed,
-                cancelled,
-                state: service.project_state(),
-            }
-        })
+                if let Some(Job {
+                    kind: Kind::Deleting { done, .. },
+                    ..
+                }) = &mut app.sync.job
+                {
+                    *done += 1;
+                }
+                app.delete_next();
+            });
     }
 
     fn delete_progress(&self) -> Option<ProgView> {
@@ -1696,18 +1524,17 @@ impl App {
         let Kind::Deleting { done, total } = &j.kind else {
             return None;
         };
-        let done = done.load(Ordering::Relaxed);
         Some(ProgView {
             label: format!("Deleting {} of {total}", (done + 1).min(*total)),
-            fraction: Some(done as f32 / (*total).max(1) as f32),
+            fraction: Some(*done as f32 / (*total).max(1) as f32),
         })
     }
 
-    fn on_deleted(&mut self, deleted: usize, failed: Vec<(String, Error)>, cancelled: bool) {
+    fn on_deleted(&mut self, deleted: usize, failed: Vec<(String, String)>, cancelled: bool) {
         let s = |n: usize| if n == 1 { "" } else { "s" };
         let failures: Vec<String> = failed
             .into_iter()
-            .map(|(name, e)| format!("{name}: {}", self.drive_error(e)))
+            .map(|(name, e)| format!("{name}: {e}"))
             .collect();
         let stopped = if cancelled { " (stopped early)" } else { "" };
         if let Some(first) = failures.first() {
@@ -1779,11 +1606,12 @@ impl App {
             }
             ManagerAction::Back => m.dlg.step = ManagerStep::Browse,
             ManagerAction::Cancel => {
-                if let Some(j) = &self.sync.job {
-                    j.cancel.store(true, Ordering::Relaxed);
-                }
                 if m.dlg.step == ManagerStep::Deleting {
                     m.dlg.cancelling = true;
+                    // The deletion in flight finishes; none is sent after it.
+                    if let Some(d) = &mut self.sync.deletion {
+                        d.cancelled = true;
+                    }
                 } else {
                     self.sync.manager = None;
                     self.focus_pending = true;
@@ -1805,10 +1633,7 @@ impl App {
                         m.dlg.cancelling = false;
                     }
                 } else {
-                    self.toasts.info(
-                        &self.ctx,
-                        "Another project job is running; try again in a moment.",
-                    );
+                    self.toasts.info(&self.ctx, LANE_BUSY);
                 }
             }
         }
@@ -1851,10 +1676,7 @@ impl App {
                         }
                     }
                 } else {
-                    self.toasts.info(
-                        &self.ctx,
-                        "Another project job is running; try again in a moment.",
-                    );
+                    self.toasts.info(&self.ctx, LANE_BUSY);
                 }
             }
         }

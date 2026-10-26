@@ -105,9 +105,6 @@ impl Namespace {
     }
 
     pub(crate) fn endpoint(&self, name: &str) -> Result<Endpoint> {
-        if !valid_session_name(name) {
-            return Err(Error::InvalidSessionName(name.to_owned()));
-        }
         Endpoint::new(self, name)
     }
 

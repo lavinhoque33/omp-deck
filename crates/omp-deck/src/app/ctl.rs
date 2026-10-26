@@ -1,91 +1,89 @@
-//! App-side glue for live subagent control: the control client of the active tab, the commands
-//! the hub and popup send through it, and "restart with live control" for tabs that were started
-//! without the extension.
+//! App-side glue for live subagent control: the gateway's live-control state of the active tab,
+//! the commands the hub and popup send through it, and "restart with live control" for tabs that
+//! were started without the extension.
+//!
+//! The gateway owns the control sockets; this window only subscribes to the active session's
+//! `Topic::Live` and sends `Mutation::Ctl` commands, whose replies arrive as closures.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use deck_core::ctl::{CtlClient, CtlCommand, CtlReply, LiveSnapshot, ctl_dir};
-use std::path::PathBuf;
-
-use super::{App, AppEvent, Focus, PendingConfirm, Post, RestartTarget, SpawnReq};
-use crate::agent_ctl::{self, Link, LinkFacts, Req, ReqKind, Restart, RestartFacts};
-use crate::confirm::Confirm;
-use crate::tabs::{Anchor, ClosedTab, Tab, TabRole};
+use deck_core::ctl::{CtlCommand, CtlReply, LiveSnapshot};
 use deck_core::sessions::SessionEntry;
+use deck_service::controller::{SessionKey, SessionTarget};
+use deck_service::gateway::protocol::{Done, LaunchSpec, Mutation, SessionRole, Topic, TopicValue};
 use deck_service::statusfmt::Activity;
 
-/// The control client of the active session tab.
-pub(super) struct CtlLink {
-    key: String,
-    pub(super) client: CtlClient,
-}
+use super::{App, PendingConfirm, RestartTarget};
+use crate::agent_ctl::{self, Link, LinkFacts, Req, ReqKind, Restart, RestartFacts};
+use crate::confirm::Confirm;
+use crate::tabs::{ClosedTab, Tab, TabRole};
 
-impl CtlLink {
-    pub(super) fn new(key: String, client: CtlClient) -> CtlLink {
-        CtlLink { key, client }
-    }
+/// The session whose live-control state this window follows, and what was last read from it.
+#[derive(Default)]
+pub(super) struct LiveFollow {
+    key: Option<SessionKey>,
+    revision: u64,
+    snapshot: Option<Arc<LiveSnapshot>>,
 }
 
 impl App {
-    /// Per frame: follow the active tab's control socket (one client at a time) and settle the
-    /// replies that arrived.
+    /// Per frame: follow the active tab's live-control topic (one session at a time).
     pub(super) fn drive_ctl(&mut self) {
-        let want = match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) if t.role == TabRole::Session => t.ctl_key.as_deref(),
+        let want: Option<SessionKey> = match self.tabs.get(self.active) {
+            Some(Tab::Terminal(t))
+                if t.role == TabRole::Session && t.info().is_some_and(|i| i.ctl_key.is_some()) =>
+            {
+                Some(t.target().key.clone())
+            }
             _ => None,
         };
-        if want != self.ctl.as_ref().map(|l| l.key.as_str()) {
-            // Requests belong to the old client; their replies will never come.
+        if want != self.live.key {
+            // Requests belong to the old session; their replies are ignored from now on.
             self.ctl_reqs.clear();
             self.ctl_errors.clear();
-            // A tree request over the old client keeps it until its reply arrives.
-            let want = want.map(str::to_owned);
-            let old = self.ctl.take();
-            self.tree_detach(old);
-            self.ctl = want.map(|key| {
-                let ctx = self.ctx.clone();
-                let client =
-                    CtlClient::spawn(ctl_dir(&self.ctl_ns, &key), move || ctx.request_repaint());
-                CtlLink { key, client }
-            });
+            if let Some(old) = self.live.key.take() {
+                self.gw.unsubscribe(&Topic::Live(old));
+            }
+            self.live = LiveFollow::default();
+            if let Some(key) = &want {
+                self.gw.subscribe(Topic::Live(key.clone()));
+            }
+            self.live.key = want;
         }
-        if self.ctl.as_ref().is_some_and(|l| l.client.connected())
-            && let Some(Tab::Terminal(t)) = self.tabs.get_mut(self.active)
-        {
-            t.ctl_seen = true;
+        if let Some(key) = &self.live.key {
+            let topic = Topic::Live(key.clone());
+            let revision = self.gw.revision(&topic);
+            if revision != self.live.revision {
+                self.live.revision = revision;
+                self.live.snapshot = match self.gw.topic(&topic) {
+                    Some(TopicValue::Live {
+                        connected: true,
+                        snapshot: Some(snap),
+                        ..
+                    }) => Some(Arc::new(snap)),
+                    _ => None,
+                };
+            }
         }
-        let replies = self
-            .ctl
-            .as_ref()
-            .map(|l| l.client.take_replies())
-            .unwrap_or_default();
-        for (rid, reply) in replies {
-            self.on_ctl_reply(rid, reply);
-        }
-        self.poll_tree_kept();
         if self.ctl_link() == Link::Connecting {
             // The grace period ends without any other event.
             self.ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
 
-    /// omp's own agent states, while the socket of the active tab is up and reports the session
-    /// file the tab shows (a snapshot of another root session — `/new`, `/resume`, a stale
-    /// socket — must not be overlaid). A session that is not persisted yet (no message sent) has
-    /// no file of its own: then the file omp announced for this tab must match.
+    /// omp's own agent states, while the gateway's socket of the active tab is up and reports the
+    /// session file the tab shows (a snapshot of another root session — `/new`, `/resume`, a
+    /// stale socket — must not be overlaid). A session that is not persisted yet (no message
+    /// sent) has no file of its own: then the file omp announced for this tab must match.
     pub(super) fn live_snapshot(&self) -> Option<Arc<LiveSnapshot>> {
-        let snap = self
-            .ctl
-            .as_ref()
-            .filter(|l| l.client.connected())
-            .and_then(|l| l.client.latest())?;
+        let snap = self.live.snapshot.clone()?;
         let file = snap.session_file.as_deref()?;
         let ours = match self.ctl_root() {
             Some(root) => root == file,
             None => self
-                .status
-                .latest()
+                .status_snapshot()
                 .is_some_and(|s| s.fresh && s.session.as_deref() == Some(file)),
         };
         ours.then_some(snap)
@@ -100,15 +98,14 @@ impl App {
     }
 
     pub(super) fn ctl_link(&self) -> Link {
-        let connected = self.ctl.as_ref().is_some_and(|l| l.client.connected());
         let Some(Tab::Terminal(t)) = self.tabs.get(self.active) else {
             return Link::ReadOnly;
         };
         agent_ctl::link_state(&LinkFacts {
-            connected,
+            connected: t.info().is_some_and(|i| i.live_control),
             ended: t.terminal().is_exited(),
             seen: t.ctl_seen,
-            waited: t.ctl_expect.then(|| t.spawned.elapsed()),
+            waited: t.ctl_expect().then(|| t.spawned.elapsed()),
         })
     }
 
@@ -122,9 +119,9 @@ impl App {
         }
         agent_ctl::restart_offer(&RestartFacts {
             link: self.ctl_link(),
-            backend: !self.backends.is_empty() && t.mux_name.is_some(),
+            backend: self.backends_available() && t.mux_name.is_some(),
             has_session_file: t.session_path().is_some(),
-            extension: self.ctl_ext.is_some(),
+            extension: self.gw.gateway().is_some_and(|g| g.live_control),
             idle: Activity::from_title(t.terminal().title()) == Activity::Idle,
         })
     }
@@ -136,8 +133,8 @@ impl App {
         // Bind the question to the tab (and session) it is asked about.
         let Some((uid, key, session)) = (match self.tabs.get(self.active) {
             Some(Tab::Terminal(t)) if t.role == TabRole::Session => t
-                .ctl_key
-                .clone()
+                .info()
+                .and_then(|i| i.ctl_key.clone())
                 .map(|key| (t.uid, key, t.session_path_owned())),
             _ => None,
         }) else {
@@ -176,8 +173,8 @@ impl App {
         ));
     }
 
-    /// The user confirmed a kill: send it through the link of the tab it was asked in, but only
-    /// while that tab, its control key and its session file are unchanged.
+    /// The user confirmed a kill: send it for the tab it was asked in, but only while that tab,
+    /// its control key and its session file are unchanged.
     pub(super) fn confirm_kill_agent(
         &mut self,
         id: String,
@@ -191,10 +188,10 @@ impl App {
                 if t.uid == uid
                     && t.role == TabRole::Session
                     && !t.terminal().is_exited()
-                    && t.ctl_key.as_deref() == Some(key)
+                    && t.info().and_then(|i| i.ctl_key.as_deref()) == Some(key)
                     && t.session_path() == session
         );
-        if !same_tab || self.ctl.as_ref().is_none_or(|l| l.key != key) {
+        if !same_tab {
             self.toasts.error(
                 &self.ctx,
                 format!("Kill of “{id}” cancelled: the session it was asked about changed"),
@@ -219,6 +216,43 @@ impl App {
         });
     }
 
+    /// The active session tab's target, when live control can be addressed.
+    fn ctl_target(&self) -> Option<SessionTarget> {
+        match self.tabs.get(self.active) {
+            Some(Tab::Terminal(t))
+                if t.role == TabRole::Session && t.info().is_some_and(|i| i.ctl_key.is_some()) =>
+            {
+                Some(t.target().clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Sends `command` to the active session's live-control socket; `done` gets omp's reply (or
+    /// why none came). `false` (with a toast) when this tab has no live control.
+    pub(super) fn ctl_command(
+        &mut self,
+        command: CtlCommand,
+        done: impl FnOnce(&mut App, Result<CtlReply, String>) + 'static,
+    ) -> bool {
+        let Some(target) = self.ctl_target() else {
+            self.toasts
+                .error(&self.ctx, "Live control is not connected for this tab");
+            return false;
+        };
+        self.gw
+            .mutate(Mutation::Ctl { target, command }, move |app, result| {
+                done(
+                    app,
+                    result.and_then(|d| match d {
+                        Done::Ctl(reply) => Ok(reply),
+                        other => Err(format!("unexpected answer {other:?}")),
+                    }),
+                );
+            });
+        true
+    }
+
     /// Send a command addressed to the active tab's current session file.
     fn send_ctl(
         &mut self,
@@ -231,27 +265,29 @@ impl App {
                 .error(&self.ctx, "Live control is not connected for this tab");
             return;
         };
-        let Some(link) = &self.ctl else {
-            self.toasts
-                .error(&self.ctx, "Live control is not connected for this tab");
-            return;
-        };
         let cmd = build(agent.clone(), root);
         if kind == ReqKind::Chat {
             self.ctl_errors.remove(&agent);
         }
-        let rid = link.client.send(cmd);
-        self.ctl_reqs.insert(rid, Req { agent, kind });
+        self.ctl_seq += 1;
+        let seq = self.ctl_seq;
+        let sent = self.ctl_command(cmd, move |app, reply| app.on_ctl_reply(seq, reply));
+        if sent {
+            self.ctl_reqs.insert(seq, Req { agent, kind });
+        }
     }
 
-    fn on_ctl_reply(&mut self, rid: u64, reply: CtlReply) {
-        if self.on_tree_reply(rid, &reply, false) {
-            return;
-        }
-        let Some(Req { agent, kind }) = self.ctl_reqs.remove(&rid) else {
+    fn on_ctl_reply(&mut self, seq: u64, reply: Result<CtlReply, String>) {
+        // A reply for a request of a session this window no longer follows is dropped.
+        let Some(Req { agent, kind }) = self.ctl_reqs.remove(&seq) else {
             return;
         };
-        if reply.ok {
+        let failure = match reply {
+            Ok(r) if r.ok => None,
+            Ok(r) => Some(r.error.unwrap_or_else(|| "omp refused".to_owned())),
+            Err(e) => Some(e),
+        };
+        let Some(why) = failure else {
             match kind {
                 ReqKind::Chat => {
                     self.ctl_errors.remove(&agent);
@@ -263,8 +299,7 @@ impl App {
                 ReqKind::Revive => self.toasts.success(&self.ctx, format!("Revived “{agent}”")),
             }
             return;
-        }
-        let why = reply.error.unwrap_or_else(|| "omp refused".to_owned());
+        };
         let what = match kind {
             ReqKind::Kill => "kill",
             ReqKind::Revive => "revive",
@@ -305,7 +340,8 @@ impl App {
         ));
     }
 
-    /// Close the tab, stop its session on a worker, then relaunch `--resume` in its place.
+    /// The gateway kills the tab's session and relaunches it with the extension; the tab stays
+    /// where it is and takes a view of the new generation.
     pub(super) fn execute_restart_live(&mut self, uid: u64, session: &std::path::Path) {
         // The question was asked a while ago: the tab must still be the active, idle, read-only
         // session it was about.
@@ -321,62 +357,62 @@ impl App {
             );
             return;
         }
-        let Some(at) = self
+        self.restart_tab_in_place(uid);
+    }
+
+    /// `Mutation::Restart` of the tab's session; its view is replaced by one on the result.
+    fn restart_tab_in_place(&mut self, uid: u64) {
+        let Some(target) = self
             .tabs
             .iter()
-            .position(|t| matches!(t, Tab::Terminal(x) if x.uid == uid))
+            .filter_map(Tab::term)
+            .find(|t| t.uid == uid)
+            .map(|t| t.target().clone())
         else {
             return;
         };
-        if self.backends.is_empty() {
-            return;
-        }
-        let Some(Tab::Terminal(t)) = self.tabs.get(at) else {
-            return;
-        };
-        let (Some(name), Some(path)) = (t.mux_name.clone(), t.session_path_owned()) else {
-            return;
-        };
-        let tab = ClosedTab {
-            mux_name: Some(name.clone()),
-            cwd: t.cwd.clone(),
-            session_path: Some(path.clone()),
-            title: t.title(&self.labels).to_owned(),
-        };
-        let anchor = Anchor::at(&self.tab_uids(), at);
-        self.close_tab(at, false);
-        self.relaunch_after_stop(tab, Some(anchor));
+        self.toasts.info(&self.ctx, "Restarting session…");
+        self.gw
+            .mutate(Mutation::Restart(target), move |app, result| {
+                app.on_tab_restarted(uid, result);
+            });
     }
 
-    /// Stop `tab`'s session on a worker, then relaunch it with the control extension; the
-    /// session is reserved meanwhile so opening it from the sidebar does not start a second copy.
-    fn relaunch_after_stop(&mut self, tab: ClosedTab, anchor: Option<Anchor>) {
-        let Some(name) = tab.mux_name.clone() else {
-            return;
-        };
-        let slot = (tab.session_path_owned(), Some(name.clone()));
-        self.spawn.reserve(slot);
-        let relaunch = tab.clone();
-        let backends = self.backends.clone();
-        let started = crate::omp_worker::try_spawn(&self.ctx, &self.events_tx, move || {
-            let stopped = backends.stop(&name);
-            AppEvent::RestartReady {
-                anchor,
-                tab,
-                stopped,
+    fn on_tab_restarted(&mut self, uid: u64, result: Result<Done, String>) {
+        let target = match result {
+            Ok(Done::Session(target)) => target,
+            Ok(other) => {
+                self.toasts.error(
+                    &self.ctx,
+                    format!("Could not restart: unexpected answer {other:?}"),
+                );
+                return;
             }
-        });
-        self.running.poke();
-        match started {
-            Ok(()) => self.toasts.info(&self.ctx, "Restarting session…"),
-            // No worker will report back: reattach to the still-running session right away.
-            Err(e) => self.on_restart_ready(anchor, relaunch, Err(e.to_string())),
+            Err(e) => {
+                // The old process still runs (or is gone): the tab shows whichever it is.
+                self.toasts
+                    .error(&self.ctx, format!("Could not restart: {e}"));
+                return;
+            }
+        };
+        let Some(i) = self
+            .tabs
+            .iter()
+            .position(|t| t.term().is_some_and(|t| t.uid == uid))
+        else {
+            return; // the tab was closed meanwhile; the session lives on in the gateway
+        };
+        let term = self.open_view(&target);
+        if let Some(t) = self.tabs[i].term_mut() {
+            t.reattach(target, term);
         }
+        self.dirty = true;
+        self.focus_pending = true;
     }
 
     /// Sidebar "Restart session": ask first (an open tab may be mid-turn).
     pub(super) fn request_restart_session(&mut self, entry: &SessionEntry) {
-        if self.backends.is_empty() {
+        if !self.backends_available() {
             return;
         }
         let tab = self.tabs.iter().find_map(|t| match t {
@@ -430,72 +466,85 @@ impl App {
     }
 
     /// The user confirmed a sidebar restart: in place when the session has a tab, else open it
-    /// in a new tab once the old session is gone.
+    /// in a new tab once the gateway restarted it.
     pub(super) fn execute_restart_session(&mut self, target: RestartTarget) {
-        if self.backends.is_empty() {
+        if !self.backends_available() {
             return;
         }
         let at = self.tabs.iter().position(|t| {
             matches!(t, Tab::Terminal(x)
                 if x.session_path() == Some(target.session.as_path()) && !x.terminal().is_exited())
         });
-        let (tab, anchor) = match (target.uid, at) {
+        match (target.uid, at) {
             (Some(uid), Some(at)) if matches!(self.tabs.get(at), Some(Tab::Terminal(t)) if t.uid == uid) =>
             {
-                let Some(Tab::Terminal(t)) = self.tabs.get(at) else {
-                    return;
-                };
-                let tab = ClosedTab {
-                    mux_name: t.mux_name.clone(),
-                    cwd: t.cwd.clone(),
-                    session_path: Some(target.session),
-                    title: t.title(&self.labels).to_owned(),
-                };
-                let anchor = Anchor::at(&self.tab_uids(), at);
-                self.close_tab(at, false);
-                (tab, Some(anchor))
+                self.restart_tab_in_place(uid);
             }
-            (None, None) => (
-                ClosedTab {
+            (None, None) => {
+                self.restart_detached(ClosedTab {
                     mux_name: Some(target.mux_name),
                     cwd: target.cwd,
                     session_path: Some(target.session),
                     title: target.title,
-                },
-                None,
-            ),
-            _ => {
-                self.toasts
-                    .error(&self.ctx, "Restart cancelled: the session changed");
-                return;
+                });
             }
-        };
-        self.relaunch_after_stop(tab, anchor);
+            _ => self
+                .toasts
+                .error(&self.ctx, "Restart cancelled: the session changed"),
+        }
     }
 
-    pub(super) fn on_restart_ready(
-        &mut self,
-        anchor: Option<Anchor>,
-        tab: ClosedTab,
-        stopped: Result<(), String>,
-    ) {
-        self.spawn
-            .release(&(tab.session_path_owned(), tab.mux_name.clone()));
-        if let Err(e) = stopped {
-            // The old process still runs: attaching shows it again, without control.
-            self.toasts
-                .error(&self.ctx, format!("Could not restart: {e}"));
-        }
-        let argv = self.with_omp_program(crate::tabs::omp_argv(tab.session_path()));
-        self.spawn_tab_post(SpawnReq {
-            mux_name: tab.mux_name,
-            cwd: tab.cwd,
-            session_path: tab.session_path,
-            title: tab.title,
-            argv,
-            role: TabRole::Session,
-            post: anchor.map_or(Post::None, Post::Anchor),
-            focus: Focus::Always,
+    /// Restarts a running session no tab shows: the gateway attaches it, restarts it, and the
+    /// result opens as a new tab. The session is reserved meanwhile so opening it from the
+    /// sidebar does not start a second view of it.
+    fn restart_detached(&mut self, tab: ClosedTab) {
+        let slot = (tab.session_path_owned(), tab.mux_name.clone());
+        self.spawn.reserve(slot.clone());
+        self.toasts.info(&self.ctx, "Restarting session…");
+        let attach = Mutation::Launch(LaunchSpec {
+            mux_name: tab.mux_name.clone(),
+            cwd: tab.cwd.clone(),
+            session_path: tab.session_path.clone(),
+            label: tab.title.clone(),
+            argv: crate::tabs::omp_argv(tab.session_path()),
+            role: SessionRole::Session,
+            copy_of: None,
         });
+        self.gw.mutate(attach, move |app, attached| {
+            let restarted = match attached {
+                Ok(Done::Session(target)) => {
+                    app.gw
+                        .mutate(Mutation::Restart(target), move |app, result| {
+                            app.finish_restart_detached(slot, tab, result);
+                        });
+                    return;
+                }
+                Ok(other) => Err(format!("unexpected answer {other:?}")),
+                Err(e) => Err(e),
+            };
+            app.finish_restart_detached(slot, tab, restarted);
+        });
+    }
+
+    fn finish_restart_detached(
+        &mut self,
+        slot: (Option<PathBuf>, Option<String>),
+        tab: ClosedTab,
+        result: Result<Done, String>,
+    ) {
+        self.spawn.release(&slot);
+        match result {
+            Ok(Done::Session(_)) => {
+                // Opens (or focuses) the restarted session through the normal path.
+                self.open_resolved(tab);
+            }
+            Ok(other) => self.toasts.error(
+                &self.ctx,
+                format!("Could not restart: unexpected answer {other:?}"),
+            ),
+            Err(e) => self
+                .toasts
+                .error(&self.ctx, format!("Could not restart: {e}")),
+        }
     }
 }

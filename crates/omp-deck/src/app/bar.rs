@@ -1,36 +1,38 @@
-//! App-side glue for the status bar: status watcher target, the model-switch confirmation fed
-//! to each tab's controller, command submission and the small dialogs.
+//! App-side glue for the status bar: the status the gateway follows for the active tab, the
+//! model-switch observations, command submission and the small dialogs.
 //!
 //! Every command that writes into a session (status-bar actions, the palette, review text,
-//! worktree move/finish) is submitted to that session's [`SessionController`] with the
+//! worktree move/finish) is submitted to the gateway's controller of that session with the
 //! [`SessionTarget`] the user acted on; this module only turns the controller's events into
 //! dialogs and toasts.
 
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use deck_core::platform;
 use deck_core::sessions::{SessionEntry, abbreviate_home};
-use deck_core::status::{SessionStats, StatusTarget};
+use deck_core::status::SessionStats;
+use deck_core::status::SessionStatus;
 use deck_service::controller::{
-    ActionFacts, Command, CommandKind, ControllerEvent, Delivery, ModelFacts, Refusal, Rejected,
-    RequestId, SessionTarget, Submission,
+    ActionFacts, Command, CommandKind, ControllerEvent, Delivery, Refusal, Rejected, RequestId,
+    RequestKey, SessionTarget,
+};
+use deck_service::gateway::protocol::{
+    Answer, Done, GatewayError, ModelFactsView, Mutation, Query, Topic,
 };
 use deck_service::inject::Requires;
 use deck_service::session_actions::{self, Action, ActionCtx, CompactMode};
 use egui::{TextEdit, Ui};
-use std::path::PathBuf;
 
-use super::{App, AppEvent, PendingConfirm};
+use super::{App, PendingConfirm};
 use crate::confirm::{self, Confirm, Dialog};
 use crate::model_picker::PickerAction;
 use crate::statusbar::{self, BarAction, BarInput};
 use crate::tabs::{Tab, TabRole, TermTab};
-use crate::toast::ToastKind;
 
 /// Terminal input is dropped for this long (renewed every frame) while a dialog is open.
 const MODAL_HOLD: Duration = Duration::from_millis(250);
-/// How often a deferred tab close checks whether its controller reached a job boundary.
-const CLOSE_POLL: Duration = Duration::from_millis(50);
 
 /// A text prompt opened from the bar's menus.
 pub enum ActionDialog {
@@ -39,59 +41,48 @@ pub enum ActionDialog {
     Rename { title: String, first: bool },
 }
 
+/// The status the gateway follows for this client's active session, unwrapped once per gateway
+/// revision (the bar compares snapshots by identity).
+#[derive(Default)]
+pub(super) struct StatusView {
+    revision: u64,
+    snapshot: Option<(SessionTarget, Arc<SessionStatus>)>,
+}
+
+/// Runs on the UI thread once the gateway accepted a submitted command.
+type Accepted = Box<dyn FnOnce(&mut App, RequestId)>;
+
 impl App {
-    /// Per frame, before drawing: follow the active tab, feed the bar, resolve pending switches and
-    /// run the controllers' injection queues.
-    pub(super) fn drive_status(&mut self, ctx: &egui::Context) {
-        let want = match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) if t.role == TabRole::Session => Some(t),
+    /// The gateway's status of the active session tab (`None` while it is not the session the
+    /// gateway currently follows for this client).
+    pub(super) fn status_snapshot(&self) -> Option<Arc<SessionStatus>> {
+        let target = self.active_target()?;
+        let (t, s) = self.status.snapshot.as_ref()?;
+        (t.key == target.key).then(|| s.clone())
+    }
+
+    /// Per frame, before drawing: follow the active tab, feed the bar and report what it shows
+    /// about the model to the gateway (which resolves the optimistic switches).
+    pub(super) fn drive_status(&mut self) {
+        let want_uid = match self.tabs.get(self.active) {
+            Some(Tab::Terminal(t)) if t.role == TabRole::Session => Some(t.uid),
             _ => None,
         };
-        let want_uid = want.map(|t| t.uid);
         if want_uid != self.status_uid {
             self.status_uid = want_uid;
             self.bar_view = statusbar::BarView::default();
         }
-        // Submitted every frame so /new, /fork, /move (which update the session path) also move the
-        // watcher's fallback; rebuilt only when a field differs from the last submitted target.
-        let unchanged = match (want, &self.status_target) {
-            (None, None) => true,
-            (Some(t), Some(cur)) => {
-                cur.session.as_deref() == t.session_path()
-                    && cur.cwd == t.cwd
-                    && cur.mux.as_ref().map(|(_, n)| n) == t.mux_name.as_ref()
-            }
-            _ => false,
-        };
-        if !unchanged {
-            let target = want.map(|t| StatusTarget {
-                mux: t.mux.clone().zip(t.mux_name.clone()),
-                session: t.session_path_owned(),
-                cwd: t.cwd.clone(),
-            });
-            self.status.set_target(target.clone());
-            self.status_target = target;
+        let revision = self.gw.revision(&Topic::Status);
+        if revision != self.status.revision {
+            self.status.revision = revision;
+            self.status.snapshot = self.gw.status().map(|(t, s)| (t, Arc::new(s)));
         }
-
-        let snap = self.status.latest();
+        let snap = self.status_snapshot();
         let live = self.live_snapshot();
-        let now = Instant::now();
-        let mut toast = None;
-        if let Some(Tab::Terminal(tab)) = self.tabs.get_mut(self.active)
+        let mut observed = None;
+        if let Some(Tab::Terminal(tab)) = self.tabs.get(self.active)
             && tab.role == TabRole::Session
         {
-            if let Some(s) = &snap
-                && tab.copy.is_none()
-                && !s.fresh
-                && let Some(p) = &s.session
-                && tab.session_path() != Some(p.as_path())
-            {
-                // /new, /fork, /move … switched this tab's session file: the controller starts a
-                // new generation and drops what was queued for the old conversation.
-                tab.ctl.set_session_path(Some(p.clone()));
-                self.dirty = true;
-            }
-
             let live_model = live.as_deref().and_then(|l| l.model.as_ref());
             let no_stats = SessionStats::default();
             let stats = snap.as_deref().map_or(&no_stats, |s| &s.stats);
@@ -102,38 +93,53 @@ impl App {
                 .set_context(live.as_deref().and_then(|l| l.context.as_ref()));
             self.bar_view.set_usage(self.usage.summary());
             self.bar_view.update(snap.as_ref(), &tab.cwd, &self.models);
-            let progress = tab.ctl.observe_model(
-                now,
-                ModelFacts {
-                    model: state.model,
-                    thinking: state.thinking,
-                    configured: state.configured,
-                    shown: self.bar_view.model_selector.as_deref(),
-                    shown_is_default: self.bar_view.model_is_default,
-                },
-            );
-            if let Some(w) = progress.wake_in {
-                ctx.request_repaint_after(w);
-            }
-            if let Some(p) = progress.unconfirmed {
-                let desc = p.describe(&|s| self.models.get(s).map(|m| m.name.clone()));
-                toast = Some(format!(
-                    "omp did not confirm the switch to {desc} — it may be unavailable or omp is busy; check the terminal"
+            if tab.copy.is_none() {
+                observed = Some((
+                    tab.target().clone(),
+                    ModelFactsView {
+                        model: state.model.map(str::to_owned),
+                        thinking: state.thinking.map(str::to_owned),
+                        configured: state.configured.map(str::to_owned),
+                        shown: self.bar_view.model_selector.clone(),
+                        shown_is_default: self.bar_view.model_is_default,
+                    },
                 ));
             }
         }
-        if let Some(t) = toast {
-            self.toasts.error(&self.ctx, t);
+        // Sent when it changed (and again after the link came back up: the gateway keeps no
+        // observation across a reconnect).
+        if let Some((target, facts)) = observed
+            && self.model_sent.as_ref() != Some(&(target.clone(), facts.clone()))
+        {
+            self.gw.observe_model(target.clone(), facts.clone());
+            self.model_sent = Some((target, facts));
         }
-        self.drive_controllers(ctx);
+        self.hold_input_during_modals();
     }
 
-    /// Advance every tab's controller (never blocks: waits are repaint timers), then close the
-    /// tabs whose close was deferred until their controller reached a job boundary.
-    fn drive_controllers(&mut self, ctx: &egui::Context) {
-        let now = Instant::now();
-        // While a dialog or menu is up the terminal may still own the keyboard: Enter/Esc meant for the
-        // dialog must not reach omp. (Set first: a controller drive below replaces the deadline.)
+    /// The gateway reported that omp did not confirm a model switch.
+    pub(super) fn on_model_unconfirmed(
+        &mut self,
+        switch: &deck_service::gateway::protocol::SwitchInfo,
+    ) {
+        let pending = deck_service::model_switch::Pending {
+            selector: switch.selector.clone(),
+            level: switch.level.clone(),
+            since: std::time::Instant::now(),
+        };
+        let desc = pending.describe(&|s| self.models.get(s).map(|m| m.name.clone()));
+        self.toasts.error(
+            &self.ctx,
+            format!(
+                "omp did not confirm the switch to {desc} — it may be unavailable or omp is busy; check the terminal"
+            ),
+        );
+    }
+
+    /// While a dialog or menu is up the terminal may still own the keyboard: Enter/Esc meant for
+    /// the dialog must not reach omp.
+    fn hold_input_during_modals(&mut self) {
+        let now = std::time::Instant::now();
         if self.confirm.is_some()
             || self.folder_dialog.is_some()
             || self.wt.dialog.is_some()
@@ -142,7 +148,7 @@ impl App {
             || self.usage_open
             || self.sessions.open
             || self.palette.is_some()
-            || egui::Popup::is_any_open(ctx)
+            || egui::Popup::is_any_open(&self.ctx)
         {
             let visible = self.visible_uids();
             for t in self.tabs.iter().filter_map(Tab::term) {
@@ -151,71 +157,51 @@ impl App {
                 }
             }
         }
-        let mut events: Vec<(u64, ControllerEvent)> = Vec::new();
-        let mut wake: Option<Duration> = None;
-        for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
-            let driven = tab.ctl.drive(now);
-            events.extend(driven.events.into_iter().map(|e| (tab.uid, e)));
-            if let Some(d) = driven.wake_in {
-                wake = Some(wake.map_or(d, |w| w.min(d)));
-            }
-        }
-        if let Some(d) = wake {
-            ctx.request_repaint_after(d);
-        }
-        self.dispatch_controller_events(events);
-        self.finish_deferred_closes(ctx);
     }
 
-    /// Carries out what the controllers reported: the draft prompt, and the end of each command.
-    fn dispatch_controller_events(&mut self, events: Vec<(u64, ControllerEvent)>) {
-        for (uid, event) in events {
-            match event {
-                ControllerEvent::Confirm { id, label, draft } => {
-                    if self.confirm.is_none() {
-                        self.confirm = Some((
-                            Confirm {
-                                title: "Clear your unsent message?".to_owned(),
-                                body: format!(
-                                    "The composer holds “{}”. Running {} clears it first.",
-                                    deck_service::statusfmt::ellipsize_left(&draft, 80),
-                                    label
-                                ),
-                                confirm_label: "Clear and run".to_owned(),
-                                danger: true,
-                            },
-                            PendingConfirm::ClearDraft { uid, id },
-                        ));
-                    } else {
-                        self.answer_draft(uid, id, false);
-                    }
-                }
-                ControllerEvent::Ended {
-                    id,
-                    kind,
-                    label,
-                    delivery,
-                } => self.command_ended(uid, id, kind, &label, &delivery),
+    /// Carries out what a controller reported to this client: the draft prompt, and the end of
+    /// each command it submitted.
+    pub(super) fn on_controller_event(&mut self, target: &SessionTarget, event: ControllerEvent) {
+        let Some(uid) = self
+            .tabs
+            .iter()
+            .filter_map(Tab::term)
+            .find(|t| t.target().key == target.key)
+            .map(|t| t.uid)
+        else {
+            // The tab was closed since: a draft question no one can see is declined.
+            if let ControllerEvent::Confirm { id, .. } = event {
+                self.answer_target(target.clone(), id, false);
             }
-        }
-    }
-
-    /// The controller of tab `i` is ready to close: collect the outcomes it queued on the way
-    /// (`can_close` ends what was still waiting) and report them, before the tab, and with it
-    /// the controller, is destroyed. Nothing is written by this.
-    fn drain_before_close(&mut self, i: usize) {
-        let Some(Tab::Terminal(tab)) = self.tabs.get_mut(i) else {
             return;
         };
-        let uid = tab.uid;
-        let events: Vec<(u64, ControllerEvent)> = tab
-            .ctl
-            .drive(Instant::now())
-            .events
-            .into_iter()
-            .map(|e| (uid, e))
-            .collect();
-        self.dispatch_controller_events(events);
+        match event {
+            ControllerEvent::Confirm { id, label, draft } => {
+                if self.confirm.is_none() {
+                    self.confirm = Some((
+                        Confirm {
+                            title: "Clear your unsent message?".to_owned(),
+                            body: format!(
+                                "The composer holds “{}”. Running {} clears it first.",
+                                deck_service::statusfmt::ellipsize_left(&draft, 80),
+                                label
+                            ),
+                            confirm_label: "Clear and run".to_owned(),
+                            danger: true,
+                        },
+                        PendingConfirm::ClearDraft { uid, id },
+                    ));
+                } else {
+                    self.answer_draft(uid, id, false);
+                }
+            }
+            ControllerEvent::Ended {
+                id,
+                kind,
+                label,
+                delivery,
+            } => self.command_ended(uid, id, kind, &label, &delivery),
+        }
     }
 
     /// A command of tab `uid` reached its final delivery state. "Delivered" means the transport
@@ -280,79 +266,46 @@ impl App {
         }
     }
 
-    /// Close tab `i` (the user's close click). A tab whose controller is mid-command stays until
-    /// the command ends (queued ones are dropped): closing detaches the PTY client halfway
-    /// through a paste.
+    /// Close tab `i` (the user's close click): this window detaches its view. The gateway lets a
+    /// command that is mid-way finish and drops the queued ones before it closes the controller
+    /// (closing must not cut a paste in half).
     pub(super) fn request_close(&mut self, i: usize) {
-        let Some(Tab::Terminal(tab)) = self.tabs.get_mut(i) else {
-            self.close_tab(i, true);
-            return;
-        };
-        if tab.ctl.can_close(Instant::now()) {
-            self.drain_before_close(i);
-            self.close_tab(i, true);
-            return;
-        }
-        let uid = tab.uid;
-        if !self.closing.contains(&uid) {
-            self.closing.push(uid);
-        }
-        self.ctx.request_repaint_after(CLOSE_POLL);
-    }
-
-    fn finish_deferred_closes(&mut self, ctx: &egui::Context) {
-        if self.closing.is_empty() {
-            return;
-        }
-        let now = Instant::now();
-        let pending = std::mem::take(&mut self.closing);
-        for uid in pending {
-            let Some(i) = self
-                .tabs
-                .iter()
-                .position(|t| t.term().is_some_and(|t| t.uid == uid))
-            else {
-                continue;
-            };
-            let ready = match self.tabs.get_mut(i) {
-                Some(Tab::Terminal(t)) => t.ctl.can_close(now),
-                _ => true,
-            };
-            if ready {
-                self.drain_before_close(i);
-                self.close_tab(i, true);
-                // This runs after the tab strip was drawn: paint the closed state next frame.
-                ctx.request_repaint();
-            } else {
-                self.closing.push(uid);
-            }
-        }
-        if !self.closing.is_empty() {
-            ctx.request_repaint_after(CLOSE_POLL);
-        }
+        self.close_tab(i, true);
     }
 
     /// The user's answer to the draft prompt.
     pub(super) fn answer_draft(&mut self, uid: u64, id: RequestId, clear: bool) {
-        if let Some(tab) = self
+        let target = self
             .tabs
-            .iter_mut()
-            .filter_map(Tab::term_mut)
+            .iter()
+            .filter_map(Tab::term)
             .find(|t| t.uid == uid)
-        {
-            // An answer for a confirmation the controller no longer waits for (the session
-            // changed, the request was dropped) is ignored there.
-            tab.ctl.answer(id, clear);
+            .map(|t| t.target().clone());
+        if let Some(target) = target {
+            self.answer_target(target, id, clear);
         }
         self.ctx.request_repaint();
     }
 
+    /// An answer for a confirmation the controller no longer waits for (the session changed, the
+    /// request was dropped) is refused there.
+    fn answer_target(&mut self, target: SessionTarget, id: RequestId, clear: bool) {
+        self.gw.mutate(
+            Mutation::Answer { target, id, clear },
+            |_, result| match result {
+                Ok(Done::Answered(false)) => log::debug!("the draft question is gone"),
+                Ok(_) => {}
+                Err(e) => log::debug!("the draft answer was refused: {e}"),
+            },
+        );
+    }
+
     /// What the availability rules of the session actions see for `tab` (status bar and palette).
     pub(super) fn action_ctx(&self, tab: &TermTab) -> ActionCtx {
-        tab.ctl.action_ctx(ActionFacts {
+        tab.action_ctx(ActionFacts {
             last_turn_failed: self.bar_view.last_turn_failed,
             has_last_reply: self.bar_view.has_reply,
-            omp_found: self.omp.is_some(),
+            omp_found: self.omp_found(),
         })
     }
 
@@ -363,14 +316,13 @@ impl App {
         if tab.role != TabRole::Session {
             return;
         }
-        let activity = tab.ctl.activity();
         let input = BarInput {
             catalog: &self.models,
             favorites: &self.cfg.favorite_models,
             provider: self.cfg.model_provider_filter.as_deref(),
-            activity,
-            pending: tab.ctl.pending_switch(),
-            assumed: tab.ctl.assumed_switch(),
+            activity: tab.activity(),
+            pending: tab.pending_switch(),
+            assumed: tab.assumed_switch(),
             actions: self.action_ctx(tab),
             agents: statusbar::AgentsChip {
                 counts: self.agents_view.counts,
@@ -424,18 +376,19 @@ impl App {
         }
     }
 
+    /// Asks the gateway for omp's model catalog.
     pub(super) fn reload_models(&mut self) {
-        let Some(omp) = self.omp.clone() else {
-            return;
-        };
-        if self.models.is_loading() {
+        if !self.omp_found() || self.models.is_loading() {
             return;
         }
         self.models.begin();
-        crate::omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            AppEvent::Omp(crate::omp_worker::OmpEvent::Models(
-                omp.models().map_err(|e| e.to_string()),
-            ))
+        self.gw.query(Query::Models, |app, result| {
+            let models = result.and_then(|a| match a {
+                Answer::Models(m) => Ok(m),
+                other => Err(format!("unexpected answer {other:?}")),
+            });
+            app.models.finish(models);
+            app.ctx.request_repaint();
         });
     }
 
@@ -444,7 +397,7 @@ impl App {
     /// the bar can only show omp's defaults (the same rule as the model chip).
     pub(super) fn current_model(&self) -> Option<String> {
         match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) => t.ctl.current_model(),
+            Some(Tab::Terminal(t)) => t.current_model(),
             _ => self.bar_view.model_selector.clone(),
         }
     }
@@ -452,7 +405,7 @@ impl App {
     /// The session the status bar and palette act on now: the active session tab's current target.
     pub(super) fn active_target(&self) -> Option<SessionTarget> {
         match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) if t.role == TabRole::Session => Some(t.ctl.target().clone()),
+            Some(Tab::Terminal(t)) if t.role == TabRole::Session => Some(t.target().clone()),
             _ => None,
         }
     }
@@ -468,46 +421,61 @@ impl App {
         self.dialog_target = Some(target);
     }
 
-    /// Submits `command` to the session `target` names. Returns the accepted request, or tells
-    /// the user why not (a refusal that only restates a no-op stays silent).
+    /// Submits `command` to the session `target` names. Until the gateway accepted it the
+    /// request is only locally pending; `accepted` then runs with the controller's request id.
+    /// A refusal is told to the user (one that only restates a no-op stays silent) and
+    /// `accepted` never runs. The final delivery arrives as a controller event.
     pub(super) fn submit_command(
         &mut self,
         target: &SessionTarget,
         command: Command,
-    ) -> Option<RequestId> {
+        accepted: impl FnOnce(&mut App, RequestId) + 'static,
+    ) -> RequestKey {
+        self.submit_inner(target, command, Some(Box::new(accepted)))
+    }
+
+    /// [`Self::submit_command`] for commands whose request id nobody waits for.
+    pub(super) fn send_command(&mut self, target: &SessionTarget, command: Command) {
+        self.submit_inner(target, command, None);
+    }
+
+    fn submit_inner(
+        &mut self,
+        target: &SessionTarget,
+        command: Command,
+        accepted: Option<Accepted>,
+    ) -> RequestKey {
         // Actions and model switches that find omp gone stay silent, as the bar always did.
         let quiet_exit = matches!(
             command,
             Command::Action(_) | Command::SwitchModel { .. } | Command::SetEffort { .. }
         );
-        let key = self.request_keys.next_key();
-        let outcome = match self
-            .tabs
-            .iter_mut()
-            .filter_map(Tab::term_mut)
-            .find(|t| t.ctl.target().key == target.key)
-        {
-            Some(tab) => tab.ctl.submit(Submission {
-                key,
-                target: target.clone(),
-                command,
-            }),
-            None => {
-                self.toasts
-                    .error(&self.ctx, "The session's tab was closed — nothing was sent");
-                return None;
-            }
-        };
-        match outcome {
-            Ok(done) => {
-                self.ctx.request_repaint();
-                Some(done.id)
-            }
-            Err(why) => {
-                self.report_rejected(&why, quiet_exit);
-                None
-            }
-        }
+        self.gw.submit(
+            target.clone(),
+            command,
+            move |app, _key, result| match result {
+                Ok(done) => {
+                    app.ctx.request_repaint();
+                    if let Some(accepted) = accepted {
+                        accepted(app, done.id);
+                    }
+                }
+                Err(GatewayError::Rejected(why)) => app.report_rejected(&why, quiet_exit),
+                Err(e) => app.toasts.error(&app.ctx, format!("Nothing was sent: {e}")),
+            },
+            |app, result| {
+                // The delivery itself is reported by the controller's events; what is left is a
+                // request whose fate the gateway could not record.
+                if let Err(e) = result
+                    && e != "cancelled"
+                {
+                    app.toasts.info(
+                        &app.ctx,
+                        "A command may not have reached omp — check the session",
+                    );
+                }
+            },
+        )
     }
 
     fn report_rejected(&mut self, why: &Rejected, quiet_exit: bool) {
@@ -525,12 +493,12 @@ impl App {
         }
     }
 
-    /// Send `/switch` or `/effort` to the active tab; the controller shows the optimistic state.
+    /// Send `/switch` or `/effort` to the active tab; the gateway shows the optimistic state.
     pub(super) fn queue_change(&mut self, selector: &str, level: Option<&str>) {
         let Some(target) = self.active_target() else {
             return;
         };
-        self.submit_command(
+        self.send_command(
             &target,
             Command::SwitchModel {
                 selector: selector.to_owned(),
@@ -544,15 +512,14 @@ impl App {
         let Some(target) = self.active_target() else {
             return;
         };
-        self.submit_command(&target, Command::SetEffort { level });
+        self.send_command(&target, Command::SetEffort { level });
     }
 
     pub(super) fn run_action(&mut self, action: Action) {
         match action {
             Action::Fork => self.fork_active(),
             Action::CopyLast => match self
-                .status
-                .latest()
+                .status_snapshot()
                 .and_then(|s| s.stats.last_assistant_text.clone())
             {
                 Some(text) => self.copy_text(&text, "last response"),
@@ -563,7 +530,7 @@ impl App {
             Action::ExportHtml => self.export_active(),
             other => {
                 if let Some(target) = self.active_target() {
-                    self.submit_command(&target, Command::Action(other));
+                    self.send_command(&target, Command::Action(other));
                 }
             }
         }
@@ -577,7 +544,7 @@ impl App {
     }
 
     pub(super) fn find_entry(&self, path: &std::path::Path) -> Option<SessionEntry> {
-        let groups = self.watcher.latest()?;
+        let groups = self.groups()?;
         groups
             .iter()
             .flat_map(|g| g.sessions.iter())
@@ -587,7 +554,7 @@ impl App {
 
     /// Fork = `omp --fork <file>` in a new tab, linked like a copy once its file appears.
     fn fork_active(&mut self) {
-        if self.omp.is_none() {
+        if !self.omp_found() {
             return;
         }
         let Some(path) = self.active_session() else {
@@ -608,35 +575,42 @@ impl App {
         }
     }
 
-    /// `omp --export` on a worker, then open the HTML with the desktop's default handler.
+    /// The gateway exports the session to HTML; the result opens with the desktop's default
+    /// handler.
     fn export_active(&mut self) {
-        let (Some(omp), Some(jsonl)) = (&self.omp, self.active_session()) else {
+        let (true, Some(file)) = (self.omp_found(), self.active_session()) else {
             return;
         };
-        let program = omp.program().to_path_buf();
-        let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
         self.toasts.info(&self.ctx, "Exporting session to HTML…");
-        std::thread::spawn(move || {
-            let dest = session_actions::exports_dir();
-            let event = match session_actions::export_html(&program, &jsonl, &dest) {
-                Ok(path) => match platform::open_path(path.as_os_str()) {
-                    Ok(()) => AppEvent::Toast(
-                        ToastKind::Success,
-                        format!("Exported to {}", abbreviate_home(&path)),
-                    ),
-                    Err(e) => AppEvent::Toast(
-                        ToastKind::Error,
-                        format!(
-                            "Exported to {} but opening it failed: {e}",
-                            abbreviate_home(&path)
+        let dest = session_actions::exports_dir();
+        self.gw
+            .mutate(Mutation::ExportHtml { file, dest }, |app, result| {
+                let path = match result {
+                    Ok(Done::Path(p)) => p,
+                    Ok(other) => {
+                        app.toasts.error(
+                            &app.ctx,
+                            format!("Export failed: unexpected answer {other:?}"),
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        app.toasts.error(&app.ctx, e);
+                        return;
+                    }
+                };
+                let shown = abbreviate_home(&path);
+                app.gw.native(
+                    move || platform::open_path(path.as_os_str()).map_err(|e| e.to_string()),
+                    move |app, opened| match opened {
+                        Ok(()) => app.toasts.success(&app.ctx, format!("Exported to {shown}")),
+                        Err(e) => app.toasts.error(
+                            &app.ctx,
+                            format!("Exported to {shown} but opening it failed: {e}"),
                         ),
-                    ),
-                },
-                Err(e) => AppEvent::Toast(ToastKind::Error, e),
-            };
-            let _ = tx.send(event);
-            ctx.request_repaint();
-        });
+                    },
+                );
+            });
     }
 
     // ------------------------------------------------------------ dialogs
@@ -713,7 +687,7 @@ impl App {
             ActionDialog::Rename { title, .. } => Action::Rename(title),
         };
         if let Some(target) = target {
-            self.submit_command(&target, Command::Action(action));
+            self.send_command(&target, Command::Action(action));
         }
     }
 }

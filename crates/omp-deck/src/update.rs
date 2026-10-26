@@ -1,13 +1,10 @@
-//! omp update tracking: the check state machine, the 6 h schedule and channel inference.
-//! Pure data; the actual `omp update --check` runs on a worker (see `omp_worker`).
+//! omp update tracking: the check state machine as the window shows it, and channel inference.
+//! Pure data; the gateway runs the `omp update --check` and its 6 h schedule (`Topic::OmpUpdate`).
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
 
 use deck_core::omp::{UpdateKind, UpdateStatus};
-
-/// Background re-check cadence.
-pub const RECHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+use deck_service::gateway::protocol::OmpUpdateView;
 
 /// Where OmpDeck looks for omp, for messages ("not found on …").
 pub const OMP_LOOKUP: &str = if cfg!(windows) {
@@ -102,6 +99,18 @@ pub fn status_line(state: &UpdateState) -> String {
     }
 }
 
+/// A finished check, for the toast that reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Finished {
+    pub result: Result<UpdateStatus, String>,
+    /// The update this check follows (its outcome is announced).
+    pub announce: Option<UpdateKind>,
+    /// The user asked for this check.
+    pub manual: bool,
+}
+
+/// The window's picture of omp's version and updates. The gateway runs the checks and the
+/// 6 h schedule; this adopts its view and remembers why this window asked for a check.
 #[derive(Debug, Default)]
 pub struct UpdateTracker {
     /// What the UI shows (includes `Checking`).
@@ -110,13 +119,17 @@ pub struct UpdateTracker {
     settled: UpdateState,
     /// Installed omp version (from `--version` or a check).
     pub version: Option<String>,
-    last_started: Option<Instant>,
-    /// Announce this finished update with the result of the check now running (set when that
-    /// check starts, never earlier, so an older in-flight check cannot claim it).
-    pub announce: Option<UpdateKind>,
+    /// This window asked for the check now running; its outcome is reported.
+    waiting: Option<Asked>,
     /// Re-checks owed after finished update tabs (`Some(kind)` = announce its outcome), run one
     /// at a time once no check is in flight.
     pub recheck: VecDeque<Option<UpdateKind>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Asked {
+    announce: Option<UpdateKind>,
+    manual: bool,
 }
 
 impl UpdateTracker {
@@ -124,38 +137,56 @@ impl UpdateTracker {
         self.state == UpdateState::Checking
     }
 
-    /// A scheduled check is due (never ran, or the last one started ≥ 6 h ago).
-    pub fn due(&self, now: Instant) -> bool {
-        !self.is_checking()
-            && self
-                .last_started
-                .is_none_or(|t| now.saturating_duration_since(t) >= RECHECK_EVERY)
-    }
-
-    pub fn begin(&mut self, now: Instant) {
+    /// A check this window requested is running (the caller sends the request).
+    pub fn begin(&mut self, announce: Option<UpdateKind>) {
         self.state = UpdateState::Checking;
-        self.last_started = Some(now);
+        self.waiting = Some(Asked {
+            announce,
+            manual: announce.is_none(),
+        });
     }
 
-    /// Starts the next owed post-update check when none is running; it owns the announcement.
-    pub fn start_queued(&mut self, now: Instant) -> bool {
+    /// The request for the check was refused or lost: back to the last settled state.
+    pub fn abandon(&mut self) {
+        self.state = self.settled.clone();
+        self.waiting = None;
+    }
+
+    /// The next owed post-update check, when none is running: it owns the announcement.
+    pub fn next_queued(&mut self) -> Option<Option<UpdateKind>> {
         if self.is_checking() {
-            return false;
+            return None;
         }
-        let Some(announce) = self.recheck.pop_front() else {
-            return false;
-        };
-        self.announce = announce;
-        self.begin(now);
-        true
+        let announce = self.recheck.pop_front()?;
+        self.state = UpdateState::Checking;
+        self.waiting = Some(Asked {
+            announce,
+            manual: false,
+        });
+        Some(announce)
     }
 
-    pub fn finish(&mut self, result: Result<UpdateStatus, String>) {
+    /// Takes the gateway's view. Returns the check this window asked for when it just finished.
+    pub fn adopt(&mut self, view: &OmpUpdateView) -> Option<Finished> {
+        if let Some(v) = &view.version {
+            self.version = Some(v.clone());
+        }
+        if view.checking {
+            self.state = UpdateState::Checking;
+            return None;
+        }
+        let result = view.status.clone()?;
         if let Ok(s) = &result {
             self.version = Some(s.current.clone());
         }
-        self.settled = UpdateState::from_result(result);
+        self.settled = UpdateState::from_result(result.clone());
         self.state = self.settled.clone();
+        let asked = self.waiting.take()?;
+        Some(Finished {
+            result,
+            announce: asked.announce,
+            manual: asked.manual,
+        })
     }
 
     /// `(current, latest)` when an update is known.
@@ -184,6 +215,15 @@ mod tests {
         }
     }
 
+    fn view(status: Option<Result<UpdateStatus, String>>, checking: bool) -> OmpUpdateView {
+        OmpUpdateView {
+            version: None,
+            status,
+            checked_unix_ms: None,
+            checking,
+        }
+    }
+
     #[test]
     fn states_from_results() {
         assert_eq!(
@@ -206,58 +246,49 @@ mod tests {
     }
 
     #[test]
-    fn schedule_is_due_at_start_then_after_six_hours() {
-        let t0 = Instant::now();
-        let mut tr = UpdateTracker::default();
-        assert!(tr.due(t0));
-        tr.begin(t0);
-        assert!(!tr.due(t0 + RECHECK_EVERY * 2), "never while a check runs");
-        tr.finish(Ok(status(None)));
-        assert!(!tr.due(t0 + RECHECK_EVERY - Duration::from_secs(1)));
-        assert!(tr.due(t0 + RECHECK_EVERY));
-    }
-
-    #[test]
     fn badge_survives_a_recheck() {
-        let t0 = Instant::now();
         let mut tr = UpdateTracker::default();
-        tr.finish(Ok(status(Some("18.12.5"))));
+        tr.adopt(&view(Some(Ok(status(Some("18.12.5")))), false));
         assert_eq!(tr.available(), Some(("18.12.3", "18.12.5")));
-        tr.begin(t0);
+        tr.adopt(&view(Some(Ok(status(Some("18.12.5")))), true));
         assert!(tr.is_checking());
         assert_eq!(tr.available(), Some(("18.12.3", "18.12.5")));
-        tr.finish(Ok(status(None)));
+        tr.adopt(&view(Some(Ok(status(None))), false));
         assert_eq!(tr.available(), None);
     }
 
     #[test]
-    fn queued_recheck_waits_for_the_running_check_and_owns_the_announcement() {
-        let t0 = Instant::now();
+    fn a_finished_check_reports_once_with_the_owed_announcement() {
         let mut tr = UpdateTracker::default();
-        tr.begin(t0); // an older check is in flight
+        tr.begin(Some(UpdateKind::Omp));
+        assert!(tr.is_checking());
+        assert!(tr.adopt(&view(None, true)).is_none(), "still running");
+        let done = tr.adopt(&view(Some(Ok(status(None))), false));
+        let done = done.expect("the check finished");
+        assert_eq!(done.announce, Some(UpdateKind::Omp));
+        assert!(!done.manual);
+        assert!(tr.adopt(&view(Some(Ok(status(None))), false)).is_none());
+    }
+
+    #[test]
+    fn queued_rechecks_run_one_at_a_time() {
+        let mut tr = UpdateTracker::default();
         tr.recheck.push_back(Some(UpdateKind::Omp));
         tr.recheck.push_back(None);
-        assert!(!tr.start_queued(t0), "never while a check runs");
-        assert_eq!(tr.announce, None, "the older check must not claim it");
-
-        tr.finish(Ok(status(None)));
-        assert!(tr.start_queued(t0));
+        assert_eq!(tr.next_queued(), Some(Some(UpdateKind::Omp)));
         assert!(tr.is_checking());
-        assert_eq!(tr.announce, Some(UpdateKind::Omp));
-
-        tr.finish(Ok(status(None)));
-        tr.announce = None;
-        assert!(tr.start_queued(t0), "the second owed check runs next");
-        assert_eq!(tr.announce, None);
-        tr.finish(Ok(status(None)));
-        assert!(!tr.start_queued(t0), "queue drained");
+        assert_eq!(tr.next_queued(), None, "never while a check runs");
+        tr.adopt(&view(Some(Ok(status(None))), false));
+        assert_eq!(tr.next_queued(), Some(None));
+        tr.adopt(&view(Some(Ok(status(None))), false));
+        assert_eq!(tr.next_queued(), None, "queue drained");
     }
 
     #[test]
     fn failed_check_keeps_last_version() {
         let mut tr = UpdateTracker::default();
-        tr.finish(Ok(status(None)));
-        tr.finish(Err("offline".into()));
+        tr.adopt(&view(Some(Ok(status(None))), false));
+        tr.adopt(&view(Some(Err("offline".into())), false));
         assert_eq!(tr.version.as_deref(), Some("18.12.3"));
         assert_eq!(tr.state, UpdateState::Error("offline".into()));
     }

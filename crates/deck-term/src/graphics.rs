@@ -260,6 +260,11 @@ impl ApcScanner {
         }
     }
 
+    /// The chunked upload in progress (`m=1` seen, not yet completed).
+    pub(crate) fn pending(&self) -> Option<&Upload> {
+        self.upload.as_ref()
+    }
+
     fn push(&mut self, bytes: &[u8]) {
         if self.overflow || self.body.len() + bytes.len() > self.max_encoded + MAX_CONTROL {
             self.overflow = true;
@@ -366,7 +371,7 @@ impl ApcScanner {
 }
 
 /// Standard base64 (padding and line breaks ignored).
-fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3 + 3);
     let (mut acc, mut bits) = (0u32, 0u32);
     for &b in text {
@@ -683,19 +688,42 @@ pub(crate) struct Graphics {
     store: Mutex<Store>,
     ctx: egui::Context,
     wake: crate::wake::Wake,
+    /// Decode uploads into pixels. Off for headless owners: they never paint, and their
+    /// [`ImageReplay`] keeps the encoded data that renderers decode themselves.
+    decode: bool,
 }
 
 impl Graphics {
-    pub(crate) fn new(ctx: egui::Context, wake: crate::wake::Wake) -> Graphics {
+    /// `decode: false` keeps no pixels (a headless owner: its renderers decode the replay).
+    pub(crate) fn new(ctx: egui::Context, wake: crate::wake::Wake, decode: bool) -> Graphics {
         Graphics {
             store: Mutex::new(Store::new()),
             ctx,
             wake,
+            decode,
         }
     }
 
     fn store(&self) -> MutexGuard<'_, Store> {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Test view: decoded pixels of image `id` once ready.
+    #[cfg(test)]
+    pub(crate) fn ready_pixels(&self, id: u32) -> Option<Vec<egui::Color32>> {
+        match &self.store().images.get(&id)?.state {
+            ImageState::Ready {
+                pixels: Some(pixels),
+                ..
+            } => Some(pixels.pixels.clone()),
+            _ => None,
+        }
+    }
+
+    /// Test view: whether placement (`id`, `pid`) exists.
+    #[cfg(test)]
+    pub(crate) fn has_placement(&self, id: u32, pid: u32) -> bool {
+        self.store().placements.contains_key(&(id, pid))
     }
 
     /// Store for one paint pass (advances the LRU clock).
@@ -708,45 +736,207 @@ impl Graphics {
     /// Applies a command from the PTY thread; uploads decode on a worker thread.
     pub(crate) fn apply(self: &Arc<Self>, cmd: Command) {
         match cmd {
-            Command::Transmit(up) => {
-                let (id, generation) = {
-                    let mut store = self.store();
-                    let generation = store.begin(up.id);
-                    if let Some((pid, cols, rows)) = up.place {
-                        store.place(up.id, pid, cols, rows);
-                    }
-                    (up.id, generation)
-                };
-                let graphics = self.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("deck-image-decode".into())
-                    .spawn(move || {
-                        let max_side = graphics.ctx.input(|i| i.max_texture_side).min(MAX_SIDE);
-                        let result = decode(&up, max_side);
-                        if graphics.store().finish(id, generation, result) {
-                            graphics.wake.now();
-                        }
-                    });
-                if let Err(e) = spawned {
-                    log::warn!("kitty graphics: decode thread: {e}");
-                    self.store().remove_image(id);
-                }
-            }
+            Command::Transmit(up) => self.transmit(Arc::new(up)),
             Command::Place {
                 id,
                 pid,
                 cols,
                 rows,
             } => {
-                self.store().place(id, pid, cols, rows);
-                self.wake.now();
+                if self.decode {
+                    self.store().place(id, pid, cols, rows);
+                    self.wake.now();
+                }
             }
             Command::Delete { what, id, pid } => {
-                self.store().delete(what, id, pid);
-                self.wake.now();
+                if self.decode {
+                    self.store().delete(what, id, pid);
+                    self.wake.now();
+                }
             }
         }
     }
+
+    /// A completed upload (shared with an [`ImageReplay`] without copying the data).
+    pub(crate) fn transmit(self: &Arc<Self>, up: Arc<Upload>) {
+        if !self.decode {
+            return;
+        }
+        let (id, generation) = {
+            let mut store = self.store();
+            let generation = store.begin(up.id);
+            if let Some((pid, cols, rows)) = up.place {
+                store.place(up.id, pid, cols, rows);
+            }
+            (up.id, generation)
+        };
+        let graphics = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("deck-image-decode".into())
+            .spawn(move || {
+                let max_side = graphics.ctx.input(|i| i.max_texture_side).min(MAX_SIDE);
+                let result = decode(&up, max_side);
+                if graphics.store().finish(id, generation, result) {
+                    graphics.wake.now();
+                }
+            });
+        if let Err(e) = spawned {
+            log::warn!("kitty graphics: decode thread: {e}");
+            self.store().remove_image(id);
+        }
+    }
+}
+
+/// Encoded uploads retained by a terminal's owner, kept until deleted.
+const MAX_RETAINED: usize = 128 << 20;
+
+/// The owner's record of every live kitty image upload (encoded, as received) and virtual
+/// placement, mirroring [`Store`]'s delete semantics, so a renderer attaching later gets them
+/// replayed (see [`Self::encode`]). The upload data is shared with the decode worker, never
+/// copied; least recently uploaded images are dropped beyond [`MAX_RETAINED`] bytes.
+pub(crate) struct ImageReplay {
+    /// Upload and its order.
+    images: HashMap<u32, (Arc<Upload>, u64)>,
+    /// (id, pid) → (cols, rows, creation order).
+    placements: HashMap<(u32, u32), (u32, u32, u64)>,
+    tick: u64,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl Default for ImageReplay {
+    fn default() -> Self {
+        ImageReplay {
+            images: HashMap::new(),
+            placements: HashMap::new(),
+            tick: 0,
+            bytes: 0,
+            max_bytes: MAX_RETAINED,
+        }
+    }
+}
+
+impl ImageReplay {
+    fn next(&mut self) -> u64 {
+        self.tick += 1;
+        self.tick
+    }
+
+    fn remove_image(&mut self, id: u32) {
+        if let Some((up, _)) = self.images.remove(&id) {
+            self.bytes -= up.data.len();
+        }
+    }
+
+    pub(crate) fn transmit(&mut self, up: Arc<Upload>) {
+        let id = up.id;
+        self.remove_image(id);
+        let seq = self.next();
+        self.bytes += up.data.len();
+        if let Some((pid, cols, rows)) = up.place {
+            self.place(id, pid, cols, rows);
+        }
+        self.images.insert(id, (up, seq));
+        while self.bytes > self.max_bytes {
+            let victim = self
+                .images
+                .iter()
+                .filter(|(i, _)| **i != id)
+                .min_by_key(|(_, (_, seq))| *seq)
+                .map(|(i, _)| *i);
+            let Some(victim) = victim else { break };
+            log::debug!("kitty graphics: replay drops image {victim}");
+            self.remove_image(victim);
+            self.placements.retain(|(i, _), _| *i != victim);
+        }
+    }
+
+    fn place(&mut self, id: u32, pid: u32, cols: u32, rows: u32) {
+        let seq = self.next();
+        self.placements.insert((id, pid), (cols, rows, seq));
+    }
+
+    /// Placement and delete commands (uploads go through [`Self::transmit`]).
+    pub(crate) fn apply(&mut self, cmd: &Command) {
+        match *cmd {
+            Command::Transmit(_) => {}
+            Command::Place {
+                id,
+                pid,
+                cols,
+                rows,
+            } => self.place(id, pid, cols, rows),
+            // Same semantics as `Store::delete`.
+            Command::Delete { what, id, pid } => match what {
+                b'a' => self.placements.clear(),
+                b'A' => {
+                    self.placements.clear();
+                    self.images.clear();
+                    self.bytes = 0;
+                }
+                b'i' | b'I' => {
+                    self.placements
+                        .retain(|&(i, p), _| i != id || (pid != 0 && p != pid));
+                    if what == b'I' && !self.placements.keys().any(|&(i, _)| i == id) {
+                        self.remove_image(id);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Appends APC commands that turn a renderer's image store into this one: delete
+    /// everything, re-upload every image, re-create the placements in their original order,
+    /// then reopen `pending` (a chunked upload still in progress) so its remaining chunks,
+    /// which follow in the live output, complete it there too.
+    pub(crate) fn encode(&self, pending: Option<&Upload>, out: &mut Vec<u8>) {
+        use std::io::Write as _;
+        out.extend_from_slice(b"\x1b_Ga=d,d=A,q=2\x1b\\");
+        let mut images: Vec<&(Arc<Upload>, u64)> = self.images.values().collect();
+        images.sort_unstable_by_key(|(_, seq)| *seq);
+        for (up, _) in images {
+            upload_command(up, false, out);
+        }
+        let mut placements: Vec<_> = self.placements.iter().collect();
+        placements.sort_unstable_by_key(|(_, (_, _, seq))| *seq);
+        for ((id, pid), (cols, rows, _)) in placements {
+            let _ = write!(
+                out,
+                "\x1b_Ga=p,U=1,q=2,i={id},p={pid},c={cols},r={rows}\x1b\\"
+            );
+        }
+        if let Some(up) = pending {
+            upload_command(up, true, out);
+        }
+    }
+}
+
+/// One APC string transmitting `up` (`more`: a first chunk, `m=1`). A completed upload's
+/// placement is replayed separately, in placement order.
+fn upload_command(up: &Upload, more: bool, out: &mut Vec<u8>) {
+    use std::io::Write as _;
+    let _ = write!(out, "\x1b_G");
+    match up.place {
+        Some((pid, cols, rows)) if more => {
+            let _ = write!(out, "a=T,U=1,p={pid},c={cols},r={rows},");
+        }
+        _ => out.extend_from_slice(b"a=t,"),
+    }
+    let _ = write!(
+        out,
+        "q=2,i={},f={},s={},v={}",
+        up.id, up.format, up.width, up.height
+    );
+    if up.zlib {
+        out.extend_from_slice(b",o=z");
+    }
+    if more {
+        out.extend_from_slice(b",m=1");
+    }
+    out.push(b';');
+    out.extend_from_slice(&up.data);
+    out.extend_from_slice(b"\x1b\\");
 }
 
 /// One placeholder cell of the visible grid.
@@ -1194,6 +1384,7 @@ mod tests {
             crate::wake::Wake::Headless(Arc::new(move |delay| {
                 let _ = tx.send(delay);
             })),
+            true,
         ));
         graphics.apply(Command::Transmit(Upload {
             id: 11,

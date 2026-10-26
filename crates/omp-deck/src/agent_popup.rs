@@ -1,8 +1,10 @@
 //! The agent inspector popup: facts header plus Transcript / Output / Task tabs. The transcript
-//! watcher lives exactly as long as the popup; the output file is read on a worker thread.
+//! topic is followed exactly as long as the popup lives (the app subscribes and feeds it); the
+//! output file is read on a worker thread.
 
 use std::cell::Cell;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::icons::Icon;
@@ -11,7 +13,7 @@ use crate::icons::{
     ICON_CHEVRONS_DOWN, ICON_CLIPBOARD_LIST, ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT,
     ICON_MESSAGES_SQUARE, ICON_PLAY, ICON_SEND, ICON_SQUARE, ICON_X,
 };
-use deck_core::agents::{AgentStatus, AgentSummary, TranscriptWatcher};
+use deck_core::agents::{AgentStatus, AgentSummary, TranscriptItem};
 use deck_core::ctl::LiveStatus;
 use egui::{
     Align2, Color32, CursorIcon, Frame, Id, Key, KeyboardShortcut, Margin, Modifiers, Order,
@@ -62,7 +64,13 @@ pub struct PopupState {
     pub session: PathBuf,
     pub agent_id: String,
     pub tab: PopupTab,
-    watcher: TranscriptWatcher,
+    /// The transcript file followed through the gateway.
+    pub transcript_path: PathBuf,
+    /// The gateway's transcript, as last fed by the app.
+    items: Arc<Vec<TranscriptItem>>,
+    items_revision: u64,
+    /// The cache revision of the topic last taken (0 = nothing yet).
+    pub fed: u64,
     transcript: TranscriptView,
     output: OutputPane,
     task_md: MdPane,
@@ -78,22 +86,16 @@ pub struct PopupState {
 }
 
 impl PopupState {
-    /// Opens the inspector for `agent`; the transcript watcher starts here.
-    pub fn new(
-        ctx: &egui::Context,
-        session: PathBuf,
-        agent: &AgentSummary,
-        tab: PopupTab,
-    ) -> PopupState {
-        let repaint = {
-            let ctx = ctx.clone();
-            move || ctx.request_repaint()
-        };
+    /// Opens the inspector for `agent`; the app follows its transcript topic.
+    pub fn new(session: PathBuf, agent: &AgentSummary, tab: PopupTab) -> PopupState {
         PopupState {
             session,
             agent_id: agent.id.clone(),
             tab,
-            watcher: TranscriptWatcher::spawn(agent.path.clone(), repaint),
+            transcript_path: agent.path.clone(),
+            items: Arc::default(),
+            items_revision: 0,
+            fed: 0,
             transcript: TranscriptView::new(agent.status == AgentStatus::Running),
             output: OutputPane::new(),
             task_md: MdPane::default(),
@@ -104,6 +106,13 @@ impl PopupState {
             focus_composer: true,
             chat_was_pending: false,
         }
+    }
+
+    /// A newer transcript from the gateway (`fed` = its cache revision).
+    pub fn feed(&mut self, fed: u64, revision: u64, items: Vec<TranscriptItem>) {
+        self.fed = fed;
+        self.items_revision = revision;
+        self.items = Arc::new(items);
     }
 }
 
@@ -269,8 +278,8 @@ fn popup_body(
             ui.set_min_size(ui.available_size());
             match st.tab {
                 PopupTab::Transcript => {
-                    let w = &st.watcher;
-                    st.transcript.sync(w.revision(), || w.latest());
+                    let items = &st.items;
+                    st.transcript.sync(st.items_revision, || Arc::clone(items));
                     if st.transcript.is_empty() {
                         empty_state(
                             ui,

@@ -29,7 +29,7 @@ use crate::usage_view;
 use crate::model_picker::{self, ModelsCache, PickerAction, PickerInput, PickerState};
 use crate::theme::{self, Palette};
 use crate::widgets::{icon_text, menu_item, paint_icon};
-use deck_service::model_switch::Pending;
+use deck_service::gateway::protocol::SwitchInfo;
 use deck_service::session_actions::{self, Action, ActionCtx, Availability, CompactMode, Kind};
 use deck_service::statusfmt::{
     self, Activity, ContextLevel, context_label, context_level, context_percent, fmt_cost,
@@ -464,9 +464,9 @@ pub struct BarInput<'a> {
     pub provider: Option<&'a str>,
     pub activity: Activity,
     /// Optimistic switch awaiting confirmation.
-    pub pending: Option<&'a Pending>,
+    pub pending: Option<&'a SwitchInfo>,
     /// Last accepted switch of a session file that does not record models yet.
-    pub assumed: Option<&'a Pending>,
+    pub assumed: Option<&'a SwitchInfo>,
     pub actions: ActionCtx,
     pub agents: AgentsChip,
 }
@@ -832,7 +832,14 @@ fn model_chip(
             ui.add(text(
                 &format!(
                     "switching to {}…",
-                    p.describe(&|s| input.catalog.get(s).map(|m| m.name.clone()))
+                    match (&p.selector, &p.level) {
+                        (Some(s), _) => input
+                            .catalog
+                            .get(s)
+                            .map_or_else(|| s.clone(), |m| m.name.clone()),
+                        (None, Some(l)) => format!("thinking {l}"),
+                        (None, None) => String::new(),
+                    }
                 ),
                 15.2,
                 pal.accent,

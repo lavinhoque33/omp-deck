@@ -66,6 +66,7 @@ license-file = ["../../LICENSE-MIT", "0"]
 assets = [
     ["target/release/omp-deck", "usr/bin/omp-deck", "755"],
     ["target/release/omp-deck-host", "usr/bin/omp-deck-host", "755"],
+    ["target/release/omp-deck-gateway", "usr/bin/omp-deck-gateway", "755"],
     ["../../packaging/omp-deck.desktop", "usr/share/applications/omp-deck.desktop", "644"],
     ["../../packaging/icons/omp-deck.svg", "usr/share/icons/hicolor/scalable/apps/omp-deck.svg", "644"],
     ["../../packaging/icons/omp-deck-16.png", "usr/share/icons/hicolor/16x16/apps/omp-deck.png", "644"],
@@ -90,6 +91,7 @@ url = "https://github.com/lavinhoque33/omp-deck"
 assets = [
     { source = "../../target/release/omp-deck", dest = "/usr/bin/omp-deck", mode = "755" },
     { source = "../../target/release/omp-deck-host", dest = "/usr/bin/omp-deck-host", mode = "755" },
+    { source = "../../target/release/omp-deck-gateway", dest = "/usr/bin/omp-deck-gateway", mode = "755" },
     { source = "../../packaging/omp-deck.desktop", dest = "/usr/share/applications/omp-deck.desktop", mode = "644" },
     { source = "../../packaging/icons/omp-deck.svg", dest = "/usr/share/icons/hicolor/scalable/apps/omp-deck.svg", mode = "644" },
     { source = "../../packaging/icons/omp-deck-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/omp-deck.png", mode = "644" },

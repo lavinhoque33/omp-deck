@@ -2383,3 +2383,194 @@ ledger. Later gateway/relay slices must bind process-local generations to a serv
 preserve refusal/outcome distinctions and recover accepted work without blind replay. They must also
 implement long-job and explicit native-effect transport; no mobile capability is implied by merely
 having a shared executor.
+
+## Mobile companion step 2: local gateway and OS lifecycle
+
+### Ownership and process boundary
+
+`deck-service` contains the `omp-deck-gateway` binary and `gateway::{protocol,client,server,jobs}`.
+There is one gateway owner per logged-in user and application namespace. The native application
+is an asynchronous local client: it does not create another `SessionController`, settings writer,
+notification classifier, session launch owner or independent execution worker.
+
+The gateway owns backend detection, terminal/controller lifetime, ctl links, bounded session scans,
+running-process/RAM state, status/model observations, usage/update schedules, notifications/inbox,
+Drive/config-backup and project-sync schedules, and accepted work. Expensive view-only watchers
+(inventory statistics, agents dashboard, trees and diffs) are interest-driven, not always-on scans.
+Native workers may wait for RPC results; their execution takes place in the gateway.
+
+All existing action families in `mobile-companion.md` retain their real core/service executors:
+session launch/restart/kill/fork/copy/move/delete/bulk; injected commands/model/effort/review;
+tree/subagent control; git changes; worktrees; usage; omp config; Drive/project sync/memory;
+omp/plugin install/update/channel; OmpDeck update. The wire carries typed operations and actual
+results, not Rust closures or a second command implementation. Navigation, tabs/splits, rendering,
+dialogs, clipboard/download presentation, opening URLs/folders and window activation remain
+client effects. A request never changes another client's navigation or implicitly raises its GUI.
+
+### Private IPC, identities and outcomes
+
+The gateway reuses `deck_host::transport::{Endpoint,Listener,Stream,connect,prepare}` rather than
+duplicating the socket/pipe security implementation. It uses a gateway-specific derived namespace,
+separate from the session-host namespace, and one fixed endpoint. Unix directories remain real,
+owner-only 0700 directories, with the listener holding the exclusive instance lock. Windows pipes
+retain current-user + SYSTEM DACLs, first-instance exclusion and remote-client rejection.
+`deck_host::launch_detached` reuses the host's restricted Windows inherited-handle list.
+Unix daemon readiness uses the existing single-threaded detach/readiness primitive.
+
+`gateway::protocol` defines a versioned handshake, bounded control envelopes and binary terminal
+frames. Terminal bytes are not JSON integer arrays. Large snapshots/results are chunked or paged.
+Slow clients cannot create an unbounded queue or block another session. Unsupported protocol,
+stale epoch, closed transport, rejected input, execution refusal and uncertain outcome remain
+distinct. Disconnect does not fabricate a process exit.
+
+`controller::ServiceEpoch` is a random, process-instance identity. `SessionTarget` contains the epoch
+as well as its existing key and generation. The handshake exposes that same epoch, and non-session
+mutations also bind it. Reconnecting to a new instance cannot accidentally validate an old target.
+`RequestKey { client,seq }` remains the logical mutation identity; registration binds client identity
+to the connection. Keys are never reused for different work.
+
+Accepted mutation records are journaled privately before execution. Outcome lookup does not
+execute the operation. Duplicate requests recover the accepted record; evicted accepted sequences
+remain expired. After an owner crash, unfinished records are uncertain, never replayed automatically.
+Raw typing/paste is ephemeral: while disconnected or held, it is refused/dropped, never queued for
+a later connection. Reconnection restores subscriptions and desired view state only.
+
+`gateway::client::{GatewayClient,GatewayOptions}` supplies off-thread connect/start, a latest-state
+cache, asynchronous requests/events and per-session frontend connections. Native submission UI
+distinguishes local pending, server acceptance, confirmation, delivery and runtime observation.
+It must not manufacture an accepted `RequestId` before the server acknowledgement.
+
+### Full-fidelity native terminal transport
+
+The existing `deck_host::snapshot::encode<T>` remains the VT grid serializer. `deck-term` adds
+`OutputSubscription` and `Terminal::subscribe_output`: parsing, side-state advancement, output
+publication, and snapshot-plus-registration share one ordered critical section. A raw read tap
+followed by a later wake callback is not an atomic publication boundary. The local PTY engine must
+provide that boundary without wrapping tmux/direct sessions in another host/emulator.
+
+`deck_term::{Frontend,FrontendTx,InputMeta,FrontendState}` is the native-client link, separate from
+the raw backend `Remote` link. `Frontend::split` returns a `RemoteRx` and `FrontendTx`.
+`FrontendTx` routes input with metadata, clipboard replies, focus, resize, palette, selected-process
+kill and detach through the gateway. `Terminal::frontend` creates the native renderer for that link.
+`InputMeta` carries semantic Ctrl+C and win32 modifier state; kitty/win32 Ctrl+C must update the
+owner's quiet-time guard even when its encoding contains no raw 0x03.
+`SessionController::write_input(target,bytes,meta)` checks the full target and authoritative hold
+before accepting user input. Protocol replies are not user input and cannot bypass the hold as
+arbitrary bytes: forwarded replies are restricted to the outstanding clipboard query.
+
+The owner alone answers DA/DSR/color/keyboard queries. A frontend does not duplicate those replies.
+Clipboard reads/stores are routed to one designated native frontend, not every observer.
+`FrontendState` communicates tmux key rules, input hold, win32 modifiers and clipboard ownership.
+Focus and geometry are explicit frontend state; only the designated controlling view changes
+geometry. Observing never acquires input rights, displaces an owner or resizes the child.
+
+Fresh frontend attachment replays styled primary/alternate grids, scrollback, cursor/modes,
+hyperlinks and the owner's retained kitty image data/placements. Pending image decode completion
+must also reach a frontend that joined after the upload. Image storage and output queues stay
+bounded. Local selection/scrollback and all existing key/mouse/paste encoders remain native.
+Closing a frontend only detaches that view; it does not close the gateway's injector or abandon an
+accepted write. A disconnected renderer is stale/read-only until a fresh, identity-checked attach.
+
+### Modes, supervision and startup context
+
+`deck_core::config::GatewayMode` has `Off` (default), `WhileOpen`, and `Background`.
+`AppConfig.gateway_mode` is a settings CAS field. Enabling without an explicit lifetime selects
+Background. Off disables mobile access/autostart but still permits the native client's private
+local gateway; no network listener, relay, pairing or PWA is introduced in this step.
+
+Off/WhileOpen stop after the last GUI and accepted work have drained. Multiple GUI connections
+count independently. Losing a view is not a reason to interrupt a written command/destructive job.
+Unwritten confirmations belonging to a cleanly closed client may be cancelled, never auto-approved.
+An active direct-PTY program cannot be killed merely to complete a lifetime change: it remains a
+draining job until it exits or the user explicitly stops it. Persistent tmux/host processes survive
+gateway detachment.
+
+`deck_core::platform::gateway` owns `Startup`, `Registration`, `AutostartError` and register/start/
+inspect/remove operations. Linux uses a user systemd unit; Windows uses an interactive-user logon
+scheduled task, least privilege, no before-login execution, no battery/network execution cutoff,
+and restart-on-failure. Registration is idempotent and does not enable access during installation.
+Unavailability/failure is surfaced, not reported as successful background operation.
+
+The OS registration starts `omp-deck-gateway supervise`. The supervisor monitors the singleton
+owner and starts a replacement after an owner crash; it can supervise an already running,
+GUI-launched owner without replacing it or interrupting accepted work. The OS also restarts a
+crashed supervisor. Supervisors are not GUI clients and hold no session controller/input rights.
+They exit when Background is disabled and honor update maintenance barriers.
+
+Linux uses `KillMode=process`: stopping the supervisor must not kill host/omp descendants that
+share its cgroup. Windows registration removal never uses task-tree termination. Mode changes
+register/start/remove supervision through the gateway and report desired/effective state;
+failed registration cannot leave a falsely enabled mode or duplicate autostart entries.
+
+Startup context preserves absolute executable/root/profile paths and non-secret omp configuration
+environment in a private file. Shell-only credential values are not copied to a plaintext autostart
+file; use omp's normal credential store for unattended fresh-login operation. An initially launched
+owner still inherits the native launch environment. Background means a logged-in, awake user
+session, not before login, after logout or while the machine is asleep/offline.
+
+### Notifications, packaging and update
+
+The gateway runs the one canonical notification tracker/inbox while the GUI is closed. Native OS
+delivery/activation is an adapter, never another classifier. GUI visibility/focus is reported as
+client state; focused-tab inbox behavior and desktop-unfocused popup policy remain independent.
+Activation is fenced by the full target. With no GUI, an explicit notification activation may
+launch the native client with a private, generation-bound activation ticket. `PI_NOTIFICATIONS=off`
+remains in every OmpDeck-launched omp environment.
+
+Every tarball/AppImage/deb/rpm/Windows zip ships the gateway alongside GUI and host. Installers
+preserve the opt-in setting, repair an existing enabled registration for the new location, and do
+not opt a new installation into background operation. AppImage registration uses the stable
+AppImage path and `AppRun --gateway`, not its ephemeral mount directory.
+
+Updates and uninstall use a private maintenance barrier: reject new mutations, drain accepted work,
+flush settings, preserve persistent sessions, and prevent GUI/supervisor auto-start during binary
+replacement. Native clients flush/acknowledge before an update restart. Include the gateway in
+atomic/rename-aside replacement, rollback and stale-file cleanup lists. Resume supervision and
+clients only after a consistent installed bundle is available. Uninstall removes only OmpDeck's
+own registration and stops the gateway after draining; it never kills unrelated session processes.
+
+### Mobile companion step 2: as built
+
+Observed on Linux (isolated HOME/XDG/PI roots and `omp-deck-test-*` namespaces; real omp, no provider request).
+Windows runtime is **not** verified: `platform::gateway::task`, `launch_detached`/ConPTY, `install.ps1` and the CI edits
+only passed the `cargo xwin clippy` compile gate.
+
+- **Identity.** `GatewayId = gw-<24 hex sha256(host namespace)>`. Settings/sessions paths are compared in the handshake
+  (`ProfileMismatch`), never served silently. Concurrent `serve` calls yield one owner; losers exit 0 after signalling readiness.
+- **CLI** (`omp-deck-gateway`, all accept `--ns --settings --sessions-root --startup`): `serve [--foreground]`, `supervise`,
+  `status [--json]`, `request '<json Request>' [--timeout-secs N]` (stamps `key.client` with its connection's client id),
+  `watch`, `drain --purpose update|uninstall [--timeout-secs N]`, `resume`, `uninstall`, `--version`.
+  Exit codes: 0 ok, 3 not running, 4 drain timeout, 5 maintenance barrier, 6 direct program still running.
+- **Mode/supervision.** Config default Off; enabling from Settings picks Background. Background is *effective* only after
+  the supervisor's own hello. Off/WhileOpen owner exits ~10 s (`LINGER`) after the last GUI with no jobs or direct programs.
+  A mode change goes only through `Mutation::SetGatewayMode`; a settings edit touching `gateway_mode` is refused.
+  Registration failure leaves the mode unchanged and the card shows the reason (e.g. no systemd user manager).
+- **Protocol additions beyond step 1.** `Query::RunningDetail`, `Mutation::KillNames{names,wait}` → `Done::Killed`,
+  `ControllerInfo.live_cwd`, `UpdatePhase::NeedsManual{command}`, `GatewayError::Cancelled`; large payloads are boxed
+  (`Outcome::Done(Box<Done>)`, `Answer::Topic(Box<..>)`); wire JSON is unchanged.
+- **Bounds.** Control-link event queue: 1024 events and 8 MiB, then one `Resync`; view side items: 256. Replies are bounded
+  only by outstanding requests (not byte-capped; known limit).
+- **Maintenance barrier** is a file at `<app_root>/gateway/maintenance`: `drain` raises it, `resume` clears it and repairs
+  registrations for the new install location. Installers (`install.sh`, `install.ps1`, self-update) drain before replacing
+  binaries and resume after.
+- **Supervisor self-retirement.** deb/rpm removal cannot reach per-user registrations and ships no maintainer scripts. A
+  supervisor whose program has been missing for ≥ 30 s drains the owner (no barrier, so a reinstall works), removes its own
+  registration and exits 0; a replaced file exits 75 so the OS restarts it on the new binary. A removed package therefore
+  leaves a registration for at most ~30 s of an *already running* supervisor; a registration that never ran again is
+  removed the first time the OS starts it.
+- **AppImage.** Registration stores `$APPIMAGE --gateway …`; `AppRun --gateway` execs `usr/bin/omp-deck-gateway` (dispatch
+  checked; mount lifetime under a real AppImage run is not exercised here).
+- **GUI client.** `omp-deck` owns no controller/settings/notification/worker state: `gw.rs` (`Gw` facade, jobs as typed
+  requests), `activate.rs` (`--activate <ticket>`), frontend terminals via `deck_term::Frontend`. Tab close sends
+  `Mutation::Close` (view detach); kill is explicit. Drive login cancel is typed `GatewayError::Cancelled` in the protocol;
+  the GUI compares `GatewayError::Cancelled.to_string()` because `Gw` carries `String` errors.
+- **Known GUI gaps.** Changes "Refresh" re-reads the cached topic (no force refresh endpoint); one Drive lane (busy → refusal
+  toast); the post-failure move check reads the running snapshot, which can lag.
+- **Evidence.** `cargo test -p deck-service --test gateway_e2e` (real omp: singleton, Rename delivered, owner `kill -9` →
+  re-adoption, kill); manual user-systemd Background run (owner and supervisor SIGKILL, drain/resume/uninstall); Xvfb GUI
+  smoke: autostart, terminal render + typing through the frontend link, tab close/reopen on the same backend PID, restart of
+  GUI and gateway re-adopting the live session, two GUIs on one gateway, Mobile access card Off→Always on (systemd
+  unit active, supervisor connected)→While open (unit removed), GUI closed with Background (owner stays; `Query::Screen`
+  readable) and WhileOpen (owner exits, tmux session survives); `install.sh` fake bundle install/reinstall/upgrade-with-owner
+  (drained)/uninstall. Not exercised: desktop notification delivery and `--activate` in a GUI run (unit-tested only), host
+  backend through the gateway, draft-confirm origin routing and reconnect-without-replay (unit-tested).

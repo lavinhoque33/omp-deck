@@ -27,7 +27,7 @@ const GIT_INTERVAL: Duration = Duration::from_secs(5);
 pub const LAST_REPLY_CHARS: usize = 400;
 
 /// One session to follow.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FleetTarget {
     /// The session `.jsonl`.
     pub session: PathBuf,
@@ -38,7 +38,7 @@ pub struct FleetTarget {
 }
 
 /// What is known about one session.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FleetSession {
     pub session: PathBuf,
     pub model: Option<String>,
@@ -60,7 +60,7 @@ pub struct FleetSession {
 /// Target order. A target appears once its first read finished (a missing or unreadable file
 /// counts as read and shows empty stats); targets still waiting for their first read are absent.
 /// Sessions that did not change since the previous snapshot are the same `Arc`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FleetSnapshot {
     pub sessions: Vec<Arc<FleetSession>>,
 }

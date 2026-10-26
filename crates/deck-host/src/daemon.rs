@@ -92,7 +92,8 @@ pub fn serve(opts: &ServeOptions<'_>) -> Result<()> {
     let ready = if opts.foreground {
         None
     } else {
-        Some(daemonize()?)
+        // SAFETY: this daemon entrypoint has not started any threads on the detach path.
+        Some(unsafe { daemonize()? })
     };
     #[cfg(windows)]
     let _ = opts.foreground;
@@ -1281,10 +1282,14 @@ fn kill(conn: &mut Conn<'_>) -> Result<()> {
     result
 }
 
-/// Unix: fork; the parent waits until the daemon (child, new session, stdio on /dev/null)
-/// reports readiness and exits 0, or exits 1 if the daemon died first.
+/// Forks into a detached session and returns the child's readiness fd. The launcher parent
+/// waits for readiness and exits 0, or exits 1 if the daemon dies first.
+///
+/// # Safety
+///
+/// Call only at process entry while still single-threaded, before creating worker threads.
 #[cfg(unix)]
-fn daemonize() -> Result<std::os::fd::OwnedFd> {
+pub unsafe fn daemonize() -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::{FromRawFd, OwnedFd};
     let mut fds = [0; 2];
     // SAFETY: valid out array of two fds.
@@ -1330,8 +1335,9 @@ fn daemonize() -> Result<std::os::fd::OwnedFd> {
     }
 }
 
+/// Releases the detached launcher's readiness wait after the endpoint is accepting clients.
 #[cfg(unix)]
-fn signal_ready(fd: std::os::fd::OwnedFd) {
+pub fn signal_ready(fd: std::os::fd::OwnedFd) {
     let _ = std::fs::File::from(fd).write_all(b"1");
 }
 

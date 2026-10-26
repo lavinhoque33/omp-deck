@@ -221,6 +221,19 @@ impl Palette {
         }
         out
     }
+
+    /// This palette with the query colors of [`Self::host_colors`] replaced (the selection
+    /// color is not part of them and stays).
+    pub fn with_host_colors(&self, colors: [[u8; 3]; 19]) -> Palette {
+        let rgb = |[r, g, b]: [u8; 3]| Rgb { r, g, b };
+        Palette {
+            foreground: rgb(colors[16]),
+            background: rgb(colors[17]),
+            cursor: rgb(colors[18]),
+            selection_bg: self.selection_bg,
+            ansi: std::array::from_fn(|i| rgb(colors[i])),
+        }
+    }
 }
 
 /// Effective color at `index`: app override (OSC 4/10/11/12) else the palette.

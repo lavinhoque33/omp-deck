@@ -18,7 +18,7 @@ pub mod protocol;
 pub mod pty;
 pub mod snapshot;
 mod spawn;
-mod transport;
+pub mod transport;
 #[cfg(windows)]
 mod winproc;
 
@@ -29,6 +29,7 @@ pub use client::{
 pub use error::{Error, Result};
 pub use namespace::{Namespace, valid_namespace, valid_session_name};
 pub use protocol::{AttachParams, Grid, HostInfo, PROTOCOL, Palette, SessionSpec};
+pub use spawn::{Launcher, launch_detached};
 
 /// Version of this crate, reported in `Hello` and [`HostInfo::host_version`].
 pub const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");

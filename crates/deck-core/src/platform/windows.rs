@@ -178,6 +178,11 @@ pub fn user_tag() -> &'static str {
     &TAG
 }
 
+/// The raw SID of the current user (for the gateway's scheduled-task principal).
+pub fn user_sid_bytes() -> Option<Vec<u8>> {
+    current_sid()
+}
+
 fn current_sid() -> Option<Vec<u8>> {
     let mut token: HANDLE = ptr::null_mut();
     // SAFETY: the pseudo-handle of the current process is always valid; `token` is an out-pointer.

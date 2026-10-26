@@ -8,7 +8,7 @@ use std::hash::Hash;
 use std::time::SystemTime;
 
 /// What an entry reports.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     /// A turn finished.
     Finished,

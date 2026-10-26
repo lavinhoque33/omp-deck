@@ -17,7 +17,8 @@ use crate::sidebar::format_age;
 use crate::theme::{self, Palette};
 use crate::widgets::{icon_button, icon_text, paint_icon};
 use deck_service::controller::SessionTarget;
-use deck_service::notifications::inbox::{Entry, Kind};
+use deck_service::gateway::protocol::InboxEntry;
+use deck_service::notifications::inbox::Kind;
 
 const BELL_ID: &str = "notify-bell";
 /// Popover width.
@@ -41,9 +42,9 @@ pub enum PanelAction {
 }
 
 pub struct PanelInput<'a> {
-    pub entries: &'a [Entry<SessionTarget>],
+    pub entries: &'a [InboxEntry],
     /// Badge text; `None` while the inbox is empty.
-    pub badge: Option<&'static str>,
+    pub badge: Option<&'a str>,
     /// An entry needs the user (error / attention): the badge uses the warn colour.
     pub warn: bool,
     pub now: SystemTime,
@@ -182,13 +183,13 @@ fn popover(ui: &mut Ui, input: &PanelInput<'_>) -> Option<PanelAction> {
             }
             cache
                 .rows
-                .retain(|uid, _| input.entries.iter().any(|e| e.tab == *uid));
+                .retain(|uid, _| input.entries.iter().any(|e| e.target == *uid));
             let spacing = ui.spacing().item_spacing.y;
             let mut y = 0.0_f32;
             for entry in input.entries {
                 let known = cache
                     .rows
-                    .get(&entry.tab)
+                    .get(&entry.target)
                     .filter(|c| c.entry == *entry)
                     .map(|c| c.height);
                 let guess = known.unwrap_or(ESTIMATED_ROW_H);
@@ -199,7 +200,7 @@ fn popover(ui: &mut Ui, input: &PanelInput<'_>) -> Option<PanelAction> {
                     continue;
                 }
                 refresh_row(ui, &mut cache, entry, input.now, pal, text_w);
-                let Some(cached) = cache.rows.get(&entry.tab) else {
+                let Some(cached) = cache.rows.get(&entry.target) else {
                     continue;
                 };
                 y += cached.height + spacing;
@@ -253,7 +254,7 @@ struct LayoutKey {
 /// a whole when its tab has a newer event); `age_minutes` is the bucket the sub line shows.
 #[derive(Clone)]
 struct CachedRow {
-    entry: Entry<SessionTarget>,
+    entry: InboxEntry,
     age_minutes: u64,
     title: Arc<Galley>,
     sub: Arc<Galley>,
@@ -271,19 +272,18 @@ fn age_minutes(now: SystemTime, at: SystemTime) -> u64 {
     now.duration_since(at).map_or(0, |d| d.as_secs() / 60)
 }
 
-fn sub_galley(
-    ui: &Ui,
-    e: &Entry<SessionTarget>,
-    now: SystemTime,
-    pal: &Palette,
-    text_w: f32,
-) -> Arc<Galley> {
+/// When the gateway recorded the entry.
+fn entry_time(e: &InboxEntry) -> SystemTime {
+    SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(e.at_unix_ms)
+}
+
+fn sub_galley(ui: &Ui, e: &InboxEntry, now: SystemTime, pal: &Palette, text_w: f32) -> Arc<Galley> {
     let mut sub_text = String::new();
     if !e.project.is_empty() {
         sub_text.push_str(&e.project);
         sub_text.push_str(" · ");
     }
-    sub_text.push_str(&age_label(now, e.at));
+    sub_text.push_str(&age_label(now, entry_time(e)));
     galley(
         ui,
         RichText::new(sub_text).size(11.5).color(pal.weak),
@@ -301,13 +301,13 @@ fn row_height(title: &Galley, sub: &Galley, body: &Galley) -> f32 {
 fn refresh_row(
     ui: &Ui,
     cache: &mut RowCache,
-    e: &Entry<SessionTarget>,
+    e: &InboxEntry,
     now: SystemTime,
     pal: &Palette,
     text_w: f32,
 ) {
-    let minutes = age_minutes(now, e.at);
-    if let Some(c) = cache.rows.get_mut(&e.tab)
+    let minutes = age_minutes(now, entry_time(e));
+    if let Some(c) = cache.rows.get_mut(&e.target)
         && c.entry == *e
     {
         if c.age_minutes != minutes {
@@ -332,7 +332,7 @@ fn refresh_row(
     );
     let height = row_height(&title, &sub, &body);
     cache.rows.insert(
-        e.tab.clone(),
+        e.target.clone(),
         CachedRow {
             entry: e.clone(),
             age_minutes: minutes,
@@ -345,18 +345,22 @@ fn refresh_row(
 }
 
 /// One entry: kind icon, bold tab title, `project · age`, the body; a ✕ while hovered.
-fn row(ui: &mut Ui, e: &Entry<SessionTarget>, c: &CachedRow, pal: &Palette) -> Option<PanelAction> {
+fn row(ui: &mut Ui, e: &InboxEntry, c: &CachedRow, pal: &Palette) -> Option<PanelAction> {
     let width = ui.available_width();
     let (icon, tint) = kind_icon(&e.kind, pal);
     let (title, sub, body) = (c.title.clone(), c.sub.clone(), c.body.clone());
     let height = c.height;
     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
-    let resp = ui.interact(rect, Id::unique(("notify-row", &e.tab)), Sense::click());
+    let resp = ui.interact(rect, Id::unique(("notify-row", &e.target)), Sense::click());
     let x_rect = Rect::from_min_size(
         pos2(rect.right() - PAD - 18.0, rect.top() + PAD - 2.0),
         vec2(20.0, 20.0),
     );
-    let x = ui.interact(x_rect, Id::unique(("notify-row-x", &e.tab)), Sense::click());
+    let x = ui.interact(
+        x_rect,
+        Id::unique(("notify-row-x", &e.target)),
+        Sense::click(),
+    );
     let hovered = resp.hovered() || x.hovered();
     let hov = ui
         .ctx()
@@ -409,9 +413,9 @@ fn row(ui: &mut Ui, e: &Entry<SessionTarget>, c: &CachedRow, pal: &Palette) -> O
         );
     }
     if x.clicked() {
-        Some(PanelAction::Dismiss(e.tab.clone()))
+        Some(PanelAction::Dismiss(e.target.clone()))
     } else if resp.clicked() {
-        Some(PanelAction::Open(e.tab.clone()))
+        Some(PanelAction::Open(e.target.clone()))
     } else {
         None
     }

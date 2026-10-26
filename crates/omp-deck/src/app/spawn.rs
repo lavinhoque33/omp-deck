@@ -1,32 +1,26 @@
-//! Launching terminal tabs. A session tab first has its control directory prepared (and the
-//! session probed) on a worker; the terminal itself is then created on the UI thread (a host
-//! session connects on the terminal's own reader thread).
+//! Opening terminal tabs. The gateway launches (or attaches) the session and reports its target;
+//! this window then attaches its own view of it (a frontend terminal) and places the tab.
 //! Launches are processed one at a time in request order, so restored tabs keep their order.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime};
 
-use deck_core::ctl::{ctl_dir, ctl_env, prepare_ctl_dir, with_ctl};
-use deck_core::mux::{Launch, Mux};
+use deck_core::omp::UpdateKind;
+use deck_service::controller::SessionTarget;
+use deck_service::gateway::protocol::{Done, LaunchSpec, Mutation, SessionRole, Tool, ViewRole};
 use deck_term::{TermOptions, Terminal};
 
-use super::{App, AppEvent, CopyPending, Tab, TabRole, TermTab, term_theme};
-use crate::omp_worker;
+use super::{App, CopyPending, Tab, TabRole, TermTab};
 use crate::panes::Split;
-use crate::tabs::Anchor;
-use deck_service::controller::{SessionController, SessionKey};
-use deck_service::host_remote::HostRemote;
+use crate::tabs::{Anchor, TabLaunch};
 
 /// What to do with the tab once it exists.
 pub(super) enum Post {
     None,
-    /// `omp --fork`: the tab waits for the copy's session file.
+    /// `omp --fork`: the tab waits for the gateway to report the copy's session file.
     Copy {
-        src_id: String,
         label: String,
         dest: PathBuf,
-        started_at: SystemTime,
     },
     /// A restored tab; `active` = it was the focused one.
     Restore {
@@ -57,12 +51,78 @@ pub(super) struct SpawnReq {
     pub session_path: Option<PathBuf>,
     pub title: String,
     pub argv: Vec<String>,
-    pub role: TabRole,
+    /// An omp update or install run (a session of its own in the gateway) instead of `argv`.
+    pub tool: Option<Tool>,
+    /// `omp --fork` copy of the session with this id.
+    pub copy_of: Option<String>,
     pub post: Post,
     pub focus: Focus,
 }
 
-pub(super) enum Job {
+impl SpawnReq {
+    /// An omp session tab running `argv`.
+    pub fn session(
+        mux_name: Option<String>,
+        cwd: PathBuf,
+        session_path: Option<PathBuf>,
+        title: String,
+        post: Post,
+        focus: Focus,
+    ) -> SpawnReq {
+        let argv = crate::tabs::omp_argv(session_path.as_deref());
+        SpawnReq {
+            mux_name,
+            cwd,
+            session_path,
+            title,
+            argv,
+            tool: None,
+            copy_of: None,
+            post,
+            focus,
+        }
+    }
+
+    /// A tool tab (omp update / installer), outside the persisted tabs.
+    pub fn tool(tool: Tool, cwd: PathBuf) -> SpawnReq {
+        SpawnReq {
+            mux_name: None,
+            cwd,
+            session_path: None,
+            title: String::new(),
+            argv: Vec::new(),
+            tool: Some(tool),
+            copy_of: None,
+            post: Post::None,
+            focus: Focus::Claim,
+        }
+    }
+
+    fn role(&self) -> TabRole {
+        match &self.tool {
+            None => TabRole::Session,
+            Some(Tool::Update(kind)) => TabRole::Update(*kind),
+            Some(Tool::Install) => TabRole::InstallOmp,
+        }
+    }
+
+    fn mutation(&self) -> Mutation {
+        match &self.tool {
+            Some(tool) => Mutation::RunTool(tool.clone()),
+            None => Mutation::Launch(LaunchSpec {
+                mux_name: self.mux_name.clone(),
+                cwd: self.cwd.clone(),
+                session_path: self.session_path.clone(),
+                label: self.title.clone(),
+                argv: self.argv.clone(),
+                role: SessionRole::Session,
+                copy_of: self.copy_of.clone(),
+            }),
+        }
+    }
+}
+
+enum Job {
     Spawn {
         req: Box<SpawnReq>,
         /// The activation counter when the request was made (`Focus::Claim` only): the launch
@@ -74,7 +134,7 @@ pub(super) enum Job {
     RestoreDone,
 }
 
-/// Session file and tmux name of a launch.
+/// Session file and backend name of a launch.
 type Slot = (Option<PathBuf>, Option<String>);
 
 /// The launch queue and its one in-flight launch.
@@ -82,17 +142,15 @@ type Slot = (Option<PathBuf>, Option<String>);
 pub(super) struct Pump {
     queue: VecDeque<Job>,
     busy: bool,
-    /// Control key of the launch being prepared.
-    key: Option<String>,
-    /// The launch being prepared (it is in neither the queue nor the tab strip yet).
+    /// The launch the gateway is working on (it is in neither the queue nor the tab strip yet).
     inflight: Option<Slot>,
     /// Sessions whose tab was closed for a relaunch that has not been queued yet (a restart
-    /// waiting for its stop worker): they must not be opened again meanwhile.
+    /// waiting for the gateway): they must not be opened again meanwhile.
     reserved: Vec<Slot>,
 }
 
 impl Pump {
-    /// The next job, unless a launch is being prepared.
+    /// The next job, unless a launch is in flight.
     fn next(&mut self) -> Option<Job> {
         if self.busy {
             return None;
@@ -100,29 +158,14 @@ impl Pump {
         self.queue.pop_front()
     }
 
-    /// Mark a launch in flight and run `launch` (which hands it to a worker). If `launch`
-    /// fails nothing will ever report back, so the in-flight state is cleared again and the
-    /// next job may run.
-    fn start(
-        &mut self,
-        key: Option<String>,
-        slot: Slot,
-        launch: impl FnOnce() -> std::io::Result<()>,
-    ) -> std::io::Result<()> {
+    fn begin(&mut self, slot: Slot) {
         self.busy = true;
-        self.key = key;
         self.inflight = Some(slot);
-        let result = launch();
-        if result.is_err() {
-            self.finish();
-        }
-        result
     }
 
-    /// The in-flight launch is done.
+    /// The in-flight launch is done (opened, refused or failed).
     fn finish(&mut self) {
         self.busy = false;
-        self.key = None;
         self.inflight = None;
     }
 
@@ -150,19 +193,6 @@ impl Pump {
             })
     }
 
-    /// Control keys that must survive pruning: the in-flight launch, queued and reserved tmux
-    /// names (their sessions may not exist yet).
-    fn pending_keys(&self) -> impl Iterator<Item = String> + '_ {
-        self.key
-            .iter()
-            .cloned()
-            .chain(self.queue.iter().filter_map(|j| match j {
-                Job::Spawn { req, .. } => req.mux_name.clone(),
-                Job::RestoreDone => None,
-            }))
-            .chain(self.reserved.iter().filter_map(|(_, n)| n.clone()))
-    }
-
     /// A launch took focus by bumping the activation counter from `before` to `after`: queued
     /// claims that were still valid follow it; revoked ones stay revoked.
     fn rebase_claims(&mut self, before: u64, after: u64) {
@@ -187,75 +217,21 @@ impl Focus {
     }
 }
 
-/// The terminal for a resolved launch. A tmux client or direct child runs in a local PTY the GUI
-/// owns (Unix); a host session is connected lazily by [`HostRemote`], so nothing here blocks.
-fn open_terminal(
-    launch: Launch,
-    mux: Option<&Mux>,
-    opts: TermOptions,
-    ctx: &egui::Context,
-) -> Result<Terminal, String> {
-    match launch {
-        Launch::Host(spec) => {
-            let Some(Mux::Host(host)) = mux else {
-                return Err("the OmpDeck session host is not available".to_owned());
-            };
-            let remote = HostRemote::new(host.namespace().clone(), spec);
-            Ok(Terminal::connect(Box::new(remote), opts, ctx.clone()))
-        }
-        #[cfg(unix)]
-        Launch::Pty(spec) => {
-            let spec = deck_term::SpawnSpec {
-                program: spec.program,
-                args: spec.args,
-                cwd: spec.cwd,
-                env: spec.env,
-                tmux_client: matches!(mux, Some(Mux::Tmux(_))),
-            };
-            Terminal::spawn(spec, opts, ctx.clone()).map_err(|e| e.to_string())
-        }
-        #[cfg(not(unix))]
-        Launch::Pty(_) => Err("local terminals are not available on this platform".to_owned()),
-    }
-}
-
-/// Launch without any backend (nothing outlives the app): the command itself in a local PTY.
-#[cfg(unix)]
-fn direct(
-    cwd: &std::path::Path,
-    argv: &[String],
-    env: Vec<(String, String)>,
-) -> Result<Launch, String> {
-    let mut spec = deck_core::mux::direct_launch(cwd, argv);
-    spec.env.extend(env);
-    Ok(Launch::Pty(spec))
-}
-
-#[cfg(not(unix))]
-fn direct(
-    _cwd: &std::path::Path,
-    _argv: &[String],
-    _env: Vec<(String, String)>,
-) -> Result<Launch, String> {
-    Err("the OmpDeck session host (omp-deck-host.exe) was not found".to_owned())
-}
-
-/// A request whose control directory was prepared and whose launch command was resolved.
-pub(super) struct Prepared {
-    req: Box<SpawnReq>,
-    /// The request's own focus claim (see [`Job::Spawn`]).
-    claim: Option<u64>,
-    /// Control key; `None` = launch without control (not wanted, or the directory is unsafe).
-    key: Option<String>,
-    /// The launch creates the session (an attach ignores the argv).
-    created: bool,
-    /// Resolved on the worker: the working directory is stat'ed there, not on the UI thread.
-    launch: Result<Launch, String>,
-    /// The backend that runs the session (`None`: a direct launch).
-    mux: Option<Mux>,
-}
-
 impl App {
+    /// This window's own terminal view of the gateway session `target`.
+    pub(super) fn open_view(&self, target: &SessionTarget) -> Terminal {
+        let opts = TermOptions {
+            scrollback: 10_000,
+            theme: deck_service::gateway::terminal_theme(self.cfg.theme, self.cfg.style),
+            clipboard: self.clipboard.clone(),
+            // ConPTY does not implement the kitty keyboard protocol; the owner (not this side)
+            // answers `CSI ? u`, so this only selects the key encoder.
+            kitty_keyboard: !cfg!(windows),
+        };
+        let frontend = self.gw.frontend(target.clone(), ViewRole::Controlling);
+        Terminal::frontend(frontend, opts, self.ctx.clone())
+    }
+
     pub(super) fn spawn_tab_post(&mut self, req: SpawnReq) {
         // The claim belongs to this request: only the user's later tab switches revoke it.
         let claim = (req.focus == Focus::Claim).then_some(self.activation_seq);
@@ -263,7 +239,6 @@ impl App {
             req: Box::new(req),
             claim,
         });
-        self.sync_ctl_keep();
         self.pump_spawns();
     }
 
@@ -272,7 +247,7 @@ impl App {
         self.pump_spawns();
     }
 
-    /// A launch for this session file or tmux name is queued, being prepared, or reserved.
+    /// A launch for this session file or backend name is queued, in flight, or reserved.
     pub(super) fn spawn_queued_for(
         &self,
         path: Option<&std::path::Path>,
@@ -281,186 +256,85 @@ impl App {
         self.spawn.queued_for(path, name)
     }
 
-    /// Tell the tmux poller which control dirs must survive pruning: those of open tabs and of
-    /// queued launches (their tmux session may not exist yet).
-    pub(super) fn sync_ctl_keep(&self) {
-        let keep = self
-            .tabs
-            .iter()
-            .filter_map(Tab::term)
-            .filter_map(|t| t.ctl_key.clone())
-            .chain(self.spawn.pending_keys())
-            .collect();
-        self.running.set_ctl_keep(keep);
-    }
-
-    /// The backend a launch for `name` goes to: the one that holds a live session of that name
-    /// (so a session of the other backend is re-attached, never respawned elsewhere), else the
-    /// backend new sessions use.
-    pub(super) fn mux_for(&self, name: &str) -> Option<Mux> {
-        let kind = self.running.latest().and_then(|s| s.owner_of(name));
-        let owner: Option<&Mux> = kind.and_then(|k| self.backends.of_kind(k));
-        owner.or_else(|| self.backends.primary()).cloned()
-    }
-
     fn pump_spawns(&mut self) {
         while let Some(job) = self.spawn.next() {
-            let (mut req, claim) = match job {
+            let (req, claim) = match job {
                 Job::RestoreDone => {
                     self.finish_restore();
                     continue;
                 }
                 Job::Spawn { req, claim } => (req, claim),
             };
-            if req.mux_name.is_none() && !cfg!(unix) {
-                // Without a direct PTY every tab, update and installer tabs included, runs in a
-                // host session of its own.
-                req.mux_name = Some(format!("omp-tool-{}", super::unix_ms()));
-            }
-            let mux = req.mux_name.as_deref().and_then(|n| self.mux_for(n));
-            if mux.is_none() {
-                req.mux_name = None;
-            }
-            let wants_ctl = self.ctl_ext.is_some() && req.role == TabRole::Session;
-            let key = wants_ctl.then(|| {
-                req.mux_name.clone().unwrap_or_else(|| {
-                    self.direct_seq += 1;
-                    format!("direct-{}-{}", std::process::id(), self.direct_seq)
-                })
-            });
-            let ext = self.ctl_ext.clone();
-            let ns = self.ctl_ns.clone();
-            let slot = (req.session_path.clone(), req.mux_name.clone());
-            let title = req.title.clone();
-            let (ctx, tx) = (self.ctx.clone(), self.events_tx.clone());
-            let key_for_state = key.clone();
-            let started = self.spawn.start(key_for_state, slot, || {
-                omp_worker::try_spawn(&ctx, &tx, move || {
-                    let key = key.and_then(|key| match prepare_ctl_dir(&ctl_dir(&ns, &key)) {
-                        Ok(()) => Some(key),
-                        Err(e) => {
-                            log::warn!("live control unavailable for {key}: {e}");
-                            None
-                        }
-                    });
-                    let created = match (&mux, &req.mux_name) {
-                        (Some(m), Some(name)) => !m.has_session(name),
-                        _ => true,
-                    };
-                    // The environment is part of "control available": without it omp must not
-                    // load the extension, and the tab offers the restart-with-control path.
-                    let (key, env) = match key {
-                        Some(key) => match ctl_env(&ctl_dir(&ns, &key)) {
-                            Ok(vars) => {
-                                let env: Vec<(String, String)> = vars
-                                    .into_iter()
-                                    .map(|(k, v)| (k.to_owned(), v.to_string_lossy().into_owned()))
-                                    .collect();
-                                (Some(key), env)
-                            }
-                            Err(e) => {
-                                log::warn!("live control unavailable for {key}: {e}");
-                                (None, Vec::new())
-                            }
-                        },
-                        None => (None, Vec::new()),
-                    };
-                    let argv = match (&key, &ext) {
-                        (Some(_), Some(ext)) => with_ctl(&req.argv, ext),
-                        _ => req.argv.clone(),
-                    };
-                    let launch = match (&mux, &req.mux_name) {
-                        (Some(m), Some(name)) => Ok(m.launch_with_env(name, &req.cwd, &argv, &env)),
-                        _ => direct(&req.cwd, &argv, env),
-                    };
-                    AppEvent::SpawnPrepared(Prepared {
-                        req,
-                        claim,
-                        key,
-                        created,
-                        launch,
-                        mux,
-                    })
-                })
-            });
-            if let Err(e) = started {
-                // The launch never started: nothing will report back, so unwind and go on.
-                log::error!("cannot prepare launch of {title:?}: {e}");
-                self.toasts
-                    .error(&self.ctx, format!("Could not open “{title}”: {e}"));
-            }
-            self.sync_ctl_keep();
+            self.spawn
+                .begin((req.session_path.clone(), req.mux_name.clone()));
+            let op = req.mutation();
+            self.gw
+                .mutate(op, move |app, result| app.on_spawned(*req, claim, result));
         }
     }
 
-    pub(super) fn on_spawn_prepared(&mut self, p: Prepared) {
+    /// The gateway answered a launch: attach a view and place the tab, or say why not.
+    fn on_spawned(&mut self, req: SpawnReq, claim: Option<u64>, result: Result<Done, String>) {
         self.spawn.finish();
-        self.finish_spawn(p);
+        match result {
+            Ok(Done::Session(target)) => self.finish_spawn(req, claim, target),
+            Ok(other) => {
+                log::error!("launch answered with {other:?}");
+                self.toasts.error(
+                    &self.ctx,
+                    format!("Could not open “{}”: unexpected answer", req.title),
+                );
+            }
+            Err(e) => {
+                self.toasts
+                    .error(&self.ctx, format!("Could not open “{}”: {e}", req.title));
+            }
+        }
         self.pump_spawns();
     }
 
-    fn finish_spawn(&mut self, p: Prepared) {
-        let Prepared {
-            req,
-            claim,
-            key,
-            created,
-            launch,
-            mux,
-        } = p;
+    fn finish_spawn(&mut self, req: SpawnReq, claim: Option<u64>, target: SessionTarget) {
+        let role = req.role();
         let SpawnReq {
             mux_name,
             cwd,
             session_path,
             title,
-            argv: _,
-            role,
             post,
             focus,
-        } = *req;
-        let opts = TermOptions {
-            scrollback: 10_000,
-            theme: term_theme(self.cfg.theme, self.cfg.style),
-            clipboard: self.clipboard.clone(),
-            // ConPTY does not implement the kitty keyboard protocol; the host (not this side)
-            // answers `CSI ? u`, so this only selects the key encoder.
-            kitty_keyboard: !cfg!(windows),
-        };
-        let opened = launch.and_then(|l| open_terminal(l, mux.as_ref(), opts, &self.ctx));
-        let term = match opened {
-            Ok(term) => term,
-            Err(e) => {
-                log::error!("failed to open terminal: {e}");
-                self.toasts
-                    .error(&self.ctx, format!("Failed to start terminal: {e}"));
-                self.sync_ctl_keep();
-                return;
+            ..
+        } = req;
+        // The gateway returns the controller that already runs a session as is: a tab that shows
+        // it just takes focus.
+        let shown = self
+            .tabs
+            .iter()
+            .position(|t| t.term().is_some_and(|t| t.target().key == target.key));
+        if let Some(i) = shown {
+            if focus.grants(claim, self.activation_seq) {
+                self.activate(i);
             }
-        };
+            return;
+        }
+        let term = self.open_view(&target);
         self.next_tab_uid += 1;
         let uid = self.next_tab_uid;
-        let session_key = match (&mux, &mux_name) {
-            (Some(m), Some(name)) => SessionKey::backend(m, name),
-            _ => SessionKey::direct(),
-        };
-        self.tabs.push(Tab::Terminal(Box::new(TermTab {
-            ctl: SessionController::new(session_key, term, session_path),
-            mux_name,
-            mux,
-            cwd,
-            fallback_title: title,
-            bell: false,
-            role,
-            exit_handled: false,
-            copy: None,
+        let mut tab = TermTab::new(
+            term,
+            target.clone(),
             uid,
-            // Attaching to an existing session ignores the argv: only a launch that created the
-            // session can be expected to open the socket.
-            ctl_expect: key.is_some() && created,
-            ctl_key: key,
-            ctl_seen: false,
-            spawned: Instant::now(),
-        })));
+            TabLaunch {
+                mux_name,
+                cwd,
+                session_path,
+                title,
+                role,
+            },
+        );
+        if let Some(info) = self.gw.controller(&target) {
+            tab.set_info(&info);
+        }
+        self.tabs.push(Tab::Terminal(Box::new(tab)));
         let mut at = self.tabs.len() - 1;
         if let Post::Anchor(anchor) = &post {
             // The tab was appended; put it next to the neighbour it sat beside.
@@ -501,33 +375,17 @@ impl App {
             self.active += 1;
         }
         self.dirty = true;
-        self.running.poke();
-        self.sync_ctl_keep();
         match post {
-            Post::None => {}
+            Post::None | Post::Anchor(_) => {}
             Post::Restore { active, index } => {
                 self.restore_uids.insert(index, uid);
                 if active {
                     self.restore_focus = Some(uid);
                 }
             }
-            Post::Copy {
-                src_id,
-                label,
-                dest,
-                started_at,
-            } => {
-                self.next_copy_id += 1;
-                let copy = CopyPending {
-                    id: self.next_copy_id,
-                    src_id,
-                    started_at,
-                    started: Instant::now(),
-                    next_poll: Instant::now() + super::COPY_POLL,
-                    polling: false,
-                };
-                if let Some(t) = self.tabs.last_mut().and_then(Tab::term_mut) {
-                    t.copy = Some(copy);
+            Post::Copy { label, dest } => {
+                if let Some(t) = self.tabs[at].term_mut() {
+                    t.copy = Some(CopyPending { dest: dest.clone() });
                 }
                 self.toasts.info(
                     &self.ctx,
@@ -537,7 +395,37 @@ impl App {
                     ),
                 );
             }
-            Post::Anchor(_) => {}
+        }
+    }
+
+    /// The gateway found the new session file of a tab's copy, or gave up.
+    pub(super) fn on_copy_result(
+        &mut self,
+        target: &SessionTarget,
+        result: Result<PathBuf, String>,
+    ) {
+        let Some(tab) = self
+            .tabs
+            .iter_mut()
+            .filter_map(Tab::term_mut)
+            .find(|t| t.target().key == target.key && t.copy.is_some())
+        else {
+            return; // the tab is gone
+        };
+        let Some(copy) = tab.copy.take() else {
+            return;
+        };
+        match result {
+            Ok(_) => {
+                let dest = deck_core::sessions::abbreviate_home(&copy.dest);
+                self.dirty = true;
+                self.toasts.success(
+                    &self.ctx,
+                    format!("Copied to {dest} — the copy is a new session"),
+                );
+                self.refresh_sessions();
+            }
+            Err(e) => self.toasts.error(&self.ctx, format!("Copy failed: {e}")),
         }
     }
 
@@ -564,11 +452,20 @@ impl App {
         }
         self.activate(at);
     }
+
+    /// Opens an omp update run as a tab of its own (outside the persisted tabs).
+    pub(super) fn open_update_tab(&mut self, kind: UpdateKind) {
+        let cwd = self
+            .home
+            .clone()
+            .unwrap_or_else(deck_core::platform::home_or_root);
+        self.spawn_tab_post(SpawnReq::tool(Tool::Update(kind), cwd));
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Focus, Job, PathBuf, Post, Pump, SpawnReq, TabRole};
+    use super::{Focus, Job, PathBuf, Post, Pump, SpawnReq};
 
     #[test]
     fn a_queued_launch_focuses_only_while_the_active_tab_is_unchanged() {
@@ -585,16 +482,14 @@ mod tests {
 
     fn job(path: &str, claim: Option<u64>) -> Job {
         Job::Spawn {
-            req: Box::new(SpawnReq {
-                mux_name: None,
-                cwd: PathBuf::from("/"),
-                session_path: Some(PathBuf::from(path)),
-                title: String::new(),
-                argv: Vec::new(),
-                role: TabRole::Session,
-                post: Post::None,
-                focus: Focus::Claim,
-            }),
+            req: Box::new(SpawnReq::session(
+                None,
+                PathBuf::from("/"),
+                Some(PathBuf::from(path)),
+                String::new(),
+                Post::None,
+                Focus::Claim,
+            )),
             claim,
         }
     }
@@ -606,57 +501,25 @@ mod tests {
         }
     }
 
-    /// The pump loop as `App::pump_spawns` runs it, with `launch` standing in for the worker.
-    fn run(pump: &mut Pump, mut launch: impl FnMut(&str) -> std::io::Result<()>) -> Vec<String> {
-        let mut started = Vec::new();
-        while let Some(job) = pump.next() {
-            let Job::Spawn { req, .. } = job else {
-                continue;
-            };
-            let path = req.session_path.clone().unwrap_or_default();
-            let name = path.to_string_lossy().into_owned();
-            if pump
-                .start(None, (Some(path), None), || launch(&name))
-                .is_ok()
-            {
-                started.push(name);
-            }
-        }
-        started
-    }
-
     #[test]
-    fn a_failed_worker_start_does_not_stall_the_queue() {
+    fn one_launch_is_in_flight_at_a_time_in_request_order() {
         let mut pump = Pump::default();
         for p in ["/a", "/b", "/c"] {
             pump.queue.push_back(job(p, None));
         }
-        let started = run(&mut pump, |p| {
-            if p == "/a" {
-                Err(std::io::Error::other("no threads"))
-            } else {
-                Ok(())
-            }
-        });
-        // /a failed and was unwound; /b started and now holds the pump, /c waits behind it.
-        assert_eq!(started, ["/b"]);
-        assert!(pump.busy);
-        assert!(pump.queued_for(Some(std::path::Path::new("/b")), None));
-        assert!(!pump.queued_for(Some(std::path::Path::new("/a")), None));
-        assert_eq!(pump.queue.len(), 1);
+        let Some(Job::Spawn { req, .. }) = pump.next() else {
+            panic!("a job was queued");
+        };
+        pump.begin((req.session_path.clone(), None));
+        assert!(pump.next().is_none(), "the next waits for the answer");
+        assert!(pump.queued_for(Some(std::path::Path::new("/a")), None));
+        assert!(pump.queued_for(Some(std::path::Path::new("/c")), None));
         pump.finish();
-        assert_eq!(run(&mut pump, |_| Ok(())), ["/c"]);
-    }
-
-    #[test]
-    fn a_failed_start_leaves_no_in_flight_state() {
-        let mut pump = Pump::default();
-        let r = pump.start(Some("k".into()), (None, Some("n".into())), || {
-            Err(std::io::Error::other("no threads"))
-        });
-        assert!(r.is_err());
-        assert!(!pump.busy && pump.key.is_none() && pump.inflight.is_none());
-        assert!(pump.next().is_none());
+        assert!(!pump.queued_for(Some(std::path::Path::new("/a")), None));
+        let Some(Job::Spawn { req, .. }) = pump.next() else {
+            panic!("the second job follows");
+        };
+        assert_eq!(req.session_path, Some(PathBuf::from("/b")));
     }
 
     #[test]
@@ -684,7 +547,6 @@ mod tests {
         pump.reserve(slot.clone());
         assert!(pump.queued_for(Some(std::path::Path::new("/s")), None));
         assert!(pump.queued_for(None, Some("omp-s")));
-        assert_eq!(pump.pending_keys().collect::<Vec<_>>(), ["omp-s"]);
         pump.release(&slot);
         assert!(!pump.queued_for(Some(std::path::Path::new("/s")), None));
     }

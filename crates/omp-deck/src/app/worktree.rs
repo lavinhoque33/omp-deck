@@ -1,24 +1,27 @@
 //! App-side glue for git worktree sessions: the new-worktree and move dialogs, creating worktrees
-//! through omp, finishing (ask the agent, wait, remove once merged) and removing them, and the
-//! tab bookkeeping that follows a session moving into a worktree.
+//! through the gateway (which runs omp and git), finishing (ask the agent, wait, remove once
+//! merged) and removing them, and the tab bookkeeping that follows a session moving into a
+//! worktree. Git, omp and the removal itself run in the gateway; this module decides which tabs
+//! are affected and shows the dialogs.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use deck_core::config::RemovedWorktree;
-use deck_core::mux::Mux;
 use deck_core::sessions::SessionEntry;
-use deck_core::status;
-use deck_core::worktree::{self, Removed, RepoInfo, Worktree, WorktreeError, WorktreeStatus};
+use deck_core::worktree::{
+    self, MergeTarget, Removed, TabCwd, Worktree, WorktreeStatus, blockers, finish_prompt,
+};
+use deck_service::controller::{Command, CommandKind};
+use deck_service::gateway::protocol::{Answer, Done, Mutation, Query};
 
-use super::{App, AppEvent, PendingConfirm};
+use super::{App, PendingConfirm};
 use crate::confirm::Confirm;
 use crate::tabs::{Tab, TabRole};
 use crate::transfer;
-use crate::worktree_dialog::{CheckRes, Kind, Outcome, Plan, WorktreeDialog, brief};
-use crate::worktree_ui::{self, FINISH_TAB_TIMEOUT, Finishing, MergeTarget, Step, Verdict};
-use deck_service::controller::{Command, CommandKind};
+use crate::worktree_dialog::{Kind, Outcome, Plan, WorktreeDialog, brief};
+use crate::worktree_ui::{self, FINISH_TAB_TIMEOUT, Finishing, Step, Verdict};
 
 /// A move that was typed into a tab: the session reappears in the worktree omp creates.
 const MOVE_EXPIRES: Duration = Duration::from_secs(10 * 60);
@@ -32,77 +35,6 @@ pub(super) enum Purpose {
     Start,
     /// The agent's turn ended while finishing.
     Check,
-}
-
-/// What a worker reports about worktrees.
-pub(super) enum WtEvent {
-    Repo(Result<RepoInfo, WorktreeError>),
-    Checked(CheckRes),
-    Folder(Option<PathBuf>),
-    Created {
-        dest: PathBuf,
-        record_base: Option<String>,
-        result: Result<(), String>,
-    },
-    Inspected {
-        purpose: Purpose,
-        wt: Worktree,
-        result: Result<(String, WorktreeStatus), String>,
-    },
-    Removed {
-        wt: Worktree,
-        result: Result<Removed, String>,
-    },
-    /// Where the finish prompt tells the agent to merge (or why that is unknown).
-    Target {
-        path: PathBuf,
-        result: Result<MergeTarget, String>,
-    },
-    /// The tabs to stop for a removal were decided (or a tab could not be judged).
-    Classified {
-        wt: Worktree,
-        base: String,
-        result: Result<Vec<u64>, String>,
-    },
-    /// Removed-worktree entries whose primary checkout is gone.
-    Orphaned(Vec<PathBuf>),
-}
-
-/// A running session tab, snapshotted for the worker that classifies tabs.
-struct TabProbe {
-    uid: u64,
-    label: String,
-    stored: PathBuf,
-    session: Option<PathBuf>,
-    mux: Option<(Mux, String)>,
-}
-
-/// Each tab's live folder: the one omp wrote to its terminal breadcrumb, when the tab runs in a
-/// backend and the breadcrumb belongs to its current process (not a previous owner of the pty).
-/// Blocking.
-fn read_live(probes: &[TabProbe], agent_dir: &Path) -> Vec<worktree_ui::TabCwd> {
-    probes
-        .iter()
-        .map(|p| {
-            let live = p.mux.as_ref().and_then(|(mux, name)| {
-                let pane = mux.pane(name)?;
-                let crumb = status::read_breadcrumb(agent_dir, &pane.breadcrumb_key)?;
-                let written =
-                    std::fs::metadata(status::breadcrumb_path(agent_dir, &pane.breadcrumb_key))
-                        .and_then(|m| m.modified())
-                        .ok()?;
-                let fresh = written + Duration::from_secs(2) >= pane.started;
-                (fresh || p.session.as_deref() == Some(crumb.session.as_path()))
-                    .then_some(crumb.cwd)
-            });
-            worktree_ui::TabCwd {
-                uid: p.uid,
-                label: p.label.clone(),
-                stored: p.stored.clone(),
-                live,
-            }
-        })
-        .collect()
 }
 
 struct PendingMove {
@@ -149,12 +81,23 @@ fn unix_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The reply a query is expected to carry, or why not.
+fn unexpected<T>(
+    r: Result<Answer, String>,
+    pick: impl FnOnce(Answer) -> Option<T>,
+) -> Result<T, String> {
+    match r {
+        Ok(a) => pick(a).ok_or_else(|| "the gateway answered with something else".to_owned()),
+        Err(e) => Err(e),
+    }
+}
+
 impl App {
     // ------------------------------------------------------------ dialogs
 
     /// "New session in worktree…" for the project in `dir`.
     pub(super) fn open_new_worktree(&mut self, dir: PathBuf) {
-        if self.omp.is_none() || self.wt.dialog.is_some() {
+        if !self.omp_found() || self.wt.dialog.is_some() {
             return;
         }
         self.start_dialog(Kind::New { dir });
@@ -162,7 +105,7 @@ impl App {
 
     /// "Move to new worktree…" for the session open in a tab.
     pub(super) fn open_move_to_worktree(&mut self, entry: &SessionEntry) {
-        if self.omp.is_none() || self.wt.dialog.is_some() {
+        if !self.omp_found() || self.wt.dialog.is_some() {
             return;
         }
         let tab = self
@@ -178,7 +121,7 @@ impl App {
         };
         self.start_dialog(Kind::Move {
             uid: tab.uid,
-            target: tab.ctl.target().clone(),
+            target: tab.target().clone(),
             dir: tab.cwd.clone(),
             title: entry.label().to_owned(),
         });
@@ -188,24 +131,63 @@ impl App {
         let dialog = WorktreeDialog::new(kind, unix_secs());
         let dir = dialog.dir().to_path_buf();
         self.wt.dialog = Some(dialog);
-        let tx = self.events_tx.clone();
-        crate::omp_worker::spawn(&self.ctx, &tx, move || {
-            AppEvent::Worktree(WtEvent::Repo(worktree::repo_info(&dir)))
+        self.gw.query(Query::RepoInfo(dir), |app, r| {
+            let info = unexpected(r, |a| match a {
+                Answer::RepoInfo(i) => Some(i),
+                _ => None,
+            });
+            if let Some(d) = &mut app.wt.dialog {
+                d.on_repo(info);
+            }
         });
+    }
+
+    /// Starts one dialog check: the gateway judges the branch name, a native worker the folder.
+    fn run_check(&mut self, req: crate::worktree_dialog::CheckReq) {
+        let generation = req.generation;
+        let branch = req.branch().to_owned();
+        if branch.is_empty() {
+            if let Some(d) = &mut self.wt.dialog {
+                d.apply_branch(generation, Err("Enter a branch name".to_owned()));
+            }
+        } else {
+            let repo = req.dir().to_path_buf();
+            self.gw
+                .query(Query::CheckBranch { repo, name: branch }, move |app, r| {
+                    let verdict = unexpected(r, |a| match a {
+                        Answer::CheckBranch => Some(()),
+                        _ => None,
+                    })
+                    .map_err(|e| brief(&e));
+                    if let Some(d) = &mut app.wt.dialog {
+                        d.apply_branch(generation, verdict);
+                    }
+                });
+        }
+        self.gw.native(
+            move || req.locate(),
+            move |app, res| {
+                if let Some(d) = &mut app.wt.dialog {
+                    d.apply_location(generation, res);
+                }
+            },
+        );
     }
 
     pub(super) fn show_worktree_dialog(&mut self, ctx: &egui::Context) {
         let Some(dlg) = self.wt.dialog.as_mut() else {
             return;
         };
-        if let Some(req) = dlg.take_check(self.wt.base_setting.as_deref(), self.home.as_deref()) {
-            crate::omp_worker::spawn(ctx, &self.events_tx, move || {
-                AppEvent::Worktree(WtEvent::Checked(req.run()))
-            });
-        }
+        let req = dlg.take_check(self.wt.base_setting.as_deref(), self.home.as_deref());
         if let Some(due) = dlg.check_due_in() {
             ctx.request_repaint_after(due);
         }
+        if let Some(req) = req {
+            self.run_check(req);
+        }
+        let Some(dlg) = self.wt.dialog.as_mut() else {
+            return;
+        };
         match dlg.show(ctx, self.picker_available) {
             Outcome::Open => {}
             Outcome::Cancel => {
@@ -215,9 +197,17 @@ impl App {
             Outcome::Browse => {
                 dlg.browsing = true;
                 let start = dlg.start_dir(self.home.as_deref());
-                crate::omp_worker::spawn(ctx, &self.events_tx, move || {
-                    AppEvent::Worktree(WtEvent::Folder(transfer::pick_folder(&start)))
-                });
+                self.gw.native(
+                    move || transfer::pick_folder(&start),
+                    |app, path| {
+                        if let Some(d) = &mut app.wt.dialog {
+                            d.browsing = false;
+                            if let Some(p) = path {
+                                d.picked(&p);
+                            }
+                        }
+                    },
+                );
             }
             Outcome::Confirm(plan) => {
                 self.wt.dialog = None;
@@ -236,20 +226,21 @@ impl App {
                 record_base,
                 dest,
             } => {
-                let Some(omp) = self.omp.clone() else {
+                if !self.omp_found() {
                     return;
-                };
+                }
                 self.toasts
                     .info(&self.ctx, format!("Creating worktree “{branch}”…"));
-                crate::omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-                    let result = worktree::create(&omp, &repo, &branch, &base_ref, &dest)
-                        .map_err(|e| brief(&e));
-                    AppEvent::Worktree(WtEvent::Created {
+                let created = dest.clone();
+                self.gw.mutate(
+                    Mutation::WorktreeCreate {
+                        repo,
+                        branch,
+                        base_ref,
                         dest,
-                        record_base,
-                        result,
-                    })
-                });
+                    },
+                    move |app, r| app.on_worktree_created(created, record_base, r.map(drop)),
+                );
             }
             Plan::Move {
                 uid,
@@ -268,100 +259,88 @@ impl App {
                     return;
                 }
                 // Bound to the session the dialog was opened on: if it moved on to another
-                // conversation meanwhile, the controller refuses and nothing is typed.
-                if self
-                    .submit_command(&target, Command::WorktreeMove { branch })
-                    .is_some()
-                {
-                    self.wt.moves.push(PendingMove {
+                // conversation meanwhile, the controller refuses and nothing is typed. The move
+                // is only tracked once the gateway accepted the command.
+                self.submit_command(&target, Command::WorktreeMove { branch }, move |app, _| {
+                    app.wt.moves.push(PendingMove {
                         uid,
                         base,
                         since: Instant::now(),
                     });
-                }
+                });
             }
         }
     }
 
-    // ------------------------------------------------------------ worker results
-
-    pub(super) fn on_wt_event(&mut self, event: WtEvent) {
-        match event {
-            WtEvent::Repo(result) => {
-                if let Some(d) = &mut self.wt.dialog {
-                    d.on_repo(result);
+    fn on_worktree_created(
+        &mut self,
+        dest: PathBuf,
+        record_base: Option<String>,
+        result: Result<(), String>,
+    ) {
+        match result {
+            Ok(()) => {
+                if let Some(base) = record_base {
+                    self.cfg.worktree_bases.insert(dest.clone(), base);
                 }
-            }
-            WtEvent::Checked(res) => {
-                if let Some(d) = &mut self.wt.dialog {
-                    d.apply(res);
-                }
-            }
-            WtEvent::Folder(path) => {
-                if let Some(d) = &mut self.wt.dialog {
-                    d.browsing = false;
-                    if let Some(p) = path {
-                        d.picked(&p);
-                    }
-                }
-            }
-            WtEvent::Created {
-                dest,
-                record_base,
-                result,
-            } => match result {
-                Ok(()) => {
-                    if let Some(base) = record_base {
-                        self.cfg.worktree_bases.insert(dest.clone(), base);
-                        self.dirty = true;
-                    }
-                    // A worktree made at the path of a removed one is a live worktree again.
-                    self.cfg.removed_worktrees.remove(&dest);
-                    self.dirty = true;
-                    self.refresh_sessions();
-                    self.new_session(dest);
-                }
-                Err(e) => self
-                    .toasts
-                    .error(&self.ctx, format!("Could not create the worktree: {e}")),
-            },
-            WtEvent::Inspected {
-                purpose,
-                wt,
-                result,
-            } => self.on_inspected(purpose, wt, result),
-            WtEvent::Removed { wt, result } => self.on_removed(wt, result),
-            WtEvent::Target { path, result } => self.on_merge_target(&path, result),
-            WtEvent::Classified { wt, base, result } => self.on_classified(wt, base, result),
-            WtEvent::Orphaned(paths) => {
-                for p in paths {
-                    self.cfg.removed_worktrees.remove(&p);
-                }
+                // A worktree made at the path of a removed one is a live worktree again.
+                self.cfg.removed_worktrees.remove(&dest);
                 self.dirty = true;
+                self.refresh_sessions();
+                self.new_session(dest);
+            }
+            Err(e) => self.toasts.error(
+                &self.ctx,
+                format!("Could not create the worktree: {}", brief(&e)),
+            ),
+        }
+    }
+
+    // ------------------------------------------------------------ inspection
+
+    /// Reads a worktree's state through the gateway: its merge target (`base`, else the recorded
+    /// or inferred one) and whether it is clean and merged.
+    fn inspect(&mut self, purpose: Purpose, wt: Worktree, base: Option<String>) {
+        let recorded = base.or_else(|| self.cfg.worktree_bases.get(&wt.path).cloned());
+        match recorded {
+            Some(base) => self.inspect_status(purpose, wt, base),
+            None => {
+                let asked = wt.clone();
+                self.gw.query(Query::InferBase(asked), move |app, r| {
+                    let inferred = unexpected(r, |a| match a {
+                        Answer::InferBase(b) => Some(b),
+                        _ => None,
+                    });
+                    match inferred {
+                        Ok(Some(base)) => app.inspect_status(purpose, wt, base),
+                        Ok(None) => app.on_inspected(
+                            purpose,
+                            wt,
+                            Err(
+                                "OmpDeck does not know which branch it is meant to merge into"
+                                    .to_owned(),
+                            ),
+                        ),
+                        Err(e) => app.on_inspected(purpose, wt, Err(brief(&e))),
+                    }
+                });
             }
         }
     }
 
-    /// Reads a worktree's state on a worker: its merge target (`base`, else the recorded or
-    /// inferred one) and whether it is clean and merged.
-    fn inspect(&self, purpose: Purpose, wt: Worktree, base: Option<String>) {
-        let recorded = base.or_else(|| self.cfg.worktree_bases.get(&wt.path).cloned());
-        crate::omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            let result = (|| {
-                let base = match recorded {
-                    Some(b) => b,
-                    None => worktree::infer_base(&wt).ok_or_else(|| {
-                        "OmpDeck does not know which branch it is meant to merge into".to_owned()
-                    })?,
-                };
-                let st = worktree::status(&wt, &base).map_err(|e| brief(&e))?;
-                Ok((base, st))
-            })();
-            AppEvent::Worktree(WtEvent::Inspected {
-                purpose,
-                wt,
-                result,
+    fn inspect_status(&mut self, purpose: Purpose, wt: Worktree, base: String) {
+        let q = Query::WorktreeStatus {
+            worktree: wt.clone(),
+            base: base.clone(),
+        };
+        self.gw.query(q, move |app, r| {
+            let status = unexpected(r, |a| match a {
+                Answer::WorktreeStatus(s) => Some(s),
+                _ => None,
             })
+            .map(|s| (base, s))
+            .map_err(|e| brief(&e));
+            app.on_inspected(purpose, wt, status);
         });
     }
 
@@ -374,7 +353,7 @@ impl App {
         let label = worktree_ui::worktree_label(&wt);
         match (purpose, result) {
             (Purpose::Remove, Ok((base, st))) => {
-                let blockers = worktree_ui::blockers(&st, &base);
+                let blockers = blockers(&st, &base);
                 if !blockers.is_empty() {
                     self.toasts.error(
                         &self.ctx,
@@ -409,7 +388,7 @@ impl App {
                 let Some(f) = self.wt.finishing.get_mut(&wt.path) else {
                     return;
                 };
-                match f.on_checked(&worktree_ui::blockers(&st, &base)) {
+                match f.on_checked(&blockers(&st, &base)) {
                     Verdict::Remove => self.execute_remove(wt, base),
                     Verdict::Wait { announce } => {
                         if let Some(text) = announce {
@@ -479,10 +458,19 @@ impl App {
             wt.path.clone(),
             Finishing::new(wt, base, uid, session, Instant::now()),
         );
-        crate::omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            let result = worktree_ui::find_merge_target(&primary, &target_base);
-            AppEvent::Worktree(WtEvent::Target { path, result })
-        });
+        self.gw.query(
+            Query::MergeTarget {
+                primary,
+                base: target_base,
+            },
+            move |app, r| {
+                let found = unexpected(r, |a| match a {
+                    Answer::MergeTarget(t) => Some(t),
+                    _ => None,
+                });
+                app.on_merge_target(&path, found);
+            },
+        );
         self.ctx.request_repaint();
     }
 
@@ -511,7 +499,7 @@ impl App {
     }
 
     fn newest_session_in(&self, wt: &Worktree) -> Option<SessionEntry> {
-        let groups = self.watcher.latest()?;
+        let groups = self.groups()?;
         groups
             .iter()
             .filter(|g| g.worktree.as_ref().is_some_and(|w| w.path == wt.path))
@@ -589,11 +577,11 @@ impl App {
             .find(|t| t.uid == uid)
             .map(|t| {
                 (
-                    t.ctl.activity(),
-                    t.ctl.is_busy(),
+                    t.activity(),
+                    t.is_busy(),
                     // The tab was just found through its session file: its current target is the
                     // conversation the worktree belongs to.
-                    t.ctl.target().clone(),
+                    t.target().clone(),
                 )
             })
         else {
@@ -605,25 +593,21 @@ impl App {
                 let command = match f.target.clone() {
                     Some(target) if !busy && f.may_inject(Instant::now()) => {
                         Some(Command::WorktreeFinish {
-                            prompt: worktree_ui::finish_prompt(
-                                wt.branch.as_deref(),
-                                &f.base,
-                                &wt.path,
-                                &target,
-                            ),
+                            prompt: finish_prompt(wt.branch.as_deref(), &f.base, &wt.path, &target),
                         })
                     }
                     _ => None,
                 };
                 if let Some(command) = command {
-                    let accepted = self.submit_command(&session, command).is_some();
-                    if let Some(f) = self.wt.finishing.get_mut(path) {
-                        if accepted {
+                    // Until the gateway accepts the command it is only locally pending: the retry
+                    // pause keeps this frame loop from submitting it again meanwhile.
+                    f.injection_failed(Instant::now());
+                    let key = path.to_path_buf();
+                    self.submit_command(&session, command, move |app, _| {
+                        if let Some(f) = app.wt.finishing.get_mut(&key) {
                             f.mark_injected();
-                        } else {
-                            f.injection_failed(Instant::now());
                         }
-                    }
+                    });
                 }
             }
             Step::Recheck => {
@@ -712,39 +696,37 @@ impl App {
 
     // ------------------------------------------------------------ removal
 
+    /// The running session tabs as the removal classifier sees them: the folder each was launched
+    /// in and the one its omp runs in now (the gateway's controller record).
+    fn tab_cwds(&self) -> Vec<TabCwd> {
+        self.tabs
+            .iter()
+            .filter_map(Tab::term)
+            .filter(|t| t.role == TabRole::Session && !t.terminal().is_exited())
+            .map(|t| TabCwd {
+                uid: t.uid,
+                label: t.fallback_title.clone(),
+                stored: t.cwd.clone(),
+                live: t.info().and_then(|i| i.live_cwd.clone()),
+            })
+            .collect()
+    }
+
     /// Stops only the tabs inside the worktree, then removes it. Which tabs those are is decided
-    /// on a worker from each tab's live folder (see [`worktree_ui::classify`]); after they are
-    /// stopped the worker classifies the remaining tabs again and refuses to remove the folder
-    /// if one still runs in it. Git itself re-checks that the worktree is clean and merged.
+    /// off the UI thread from each tab's live folder (see [`worktree::classify`]); the gateway
+    /// stops them, checks again that no other session still runs in the folder, and removes it.
+    /// Git itself re-checks that the worktree is clean and merged.
     pub(super) fn execute_remove(&mut self, wt: Worktree, base: String) {
         self.wt.finishing.remove(&wt.path);
         if !self.wt.removing.insert(wt.path.clone()) {
             return;
         }
-        let probes = self.tab_probes(&[]);
-        let agent_dir = self.root.agent_dir();
-        crate::omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            let result = worktree_ui::classify(&wt, &read_live(&probes, &agent_dir));
-            AppEvent::Worktree(WtEvent::Classified { wt, base, result })
-        });
-    }
-
-    /// Snapshot of the running session tabs except `skip` (by uid).
-    fn tab_probes(&self, skip: &[u64]) -> Vec<TabProbe> {
-        self.tabs
-            .iter()
-            .filter_map(Tab::term)
-            .filter(|t| {
-                t.role == TabRole::Session && !t.terminal().is_exited() && !skip.contains(&t.uid)
-            })
-            .map(|t| TabProbe {
-                uid: t.uid,
-                label: t.fallback_title.clone(),
-                stored: t.cwd.clone(),
-                session: t.session_path_owned(),
-                mux: t.mux.clone().zip(t.mux_name.clone()),
-            })
-            .collect()
+        let tabs = self.tab_cwds();
+        let asked = wt.clone();
+        self.gw.native(
+            move || worktree::classify(&asked, &tabs),
+            move |app, result| app.on_classified(wt, base, result),
+        );
     }
 
     fn on_classified(&mut self, wt: Worktree, base: String, result: Result<Vec<u64>, String>) {
@@ -758,53 +740,34 @@ impl App {
                 return;
             }
         };
-        let mut names = Vec::new();
+        let targets: Vec<_> = self
+            .tabs
+            .iter()
+            .filter_map(Tab::term)
+            .filter(|t| stop.contains(&t.uid))
+            .map(|t| t.target().clone())
+            .collect();
         for i in (0..self.tabs.len()).rev() {
-            let hit = match self.tabs.get(i) {
-                Some(Tab::Terminal(t)) if stop.contains(&t.uid) => {
-                    Some(t.mux_name.clone().filter(|_| t.mux.is_some()))
-                }
-                _ => None,
-            };
-            let Some(name) = hit else {
-                continue;
-            };
-            match name {
-                Some(n) => names.push(n),
-                None => {
-                    if let Some(t) = self.tabs.get_mut(i).and_then(Tab::term_mut) {
-                        t.terminal_mut().kill();
-                    }
-                }
+            if matches!(self.tabs.get(i), Some(Tab::Terminal(t)) if stop.contains(&t.uid)) {
+                self.close_tab(i, false);
             }
-            self.close_tab(i, false);
         }
-        let remaining = self.tab_probes(&[]);
-        let backends = self.backends.clone();
-        let agent_dir = self.root.agent_dir();
-        crate::omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            let result = (|| {
-                names
-                    .iter()
-                    .try_for_each(|n| backends.stop(n))
-                    .map_err(|e| format!("could not stop a session running in it: {e}"))?;
-                if !worktree_ui::classify(&wt, &read_live(&remaining, &agent_dir))?.is_empty() {
-                    return Err("a session is still running in it".to_owned());
-                }
-                worktree::remove(&wt, &base, true).map_err(|e| e.to_string())
-            })();
-            // git can fail after it already deleted the folder: nothing is left to keep, so the
-            // removal counts, with the error as the note.
-            let result = match result {
-                Err(e) if !wt.path.exists() => Ok(Removed {
-                    branch_deleted: false,
-                    branch_note: Some(e),
-                }),
-                other => other,
-            };
-            AppEvent::Worktree(WtEvent::Removed { wt, result })
-        });
-        self.running.poke();
+        let asked = wt.clone();
+        self.gw.mutate(
+            Mutation::WorktreeRemove {
+                worktree: asked,
+                base,
+                delete_branch: true,
+                stop: targets,
+            },
+            move |app, r| {
+                let result = r.and_then(|d| match d {
+                    Done::Removed(r) => Ok(r),
+                    _ => Err("the gateway answered with something else".to_owned()),
+                });
+                app.on_removed(wt, result);
+            },
+        );
     }
 
     fn on_removed(&mut self, wt: Worktree, result: Result<Removed, String>) {
@@ -872,9 +835,15 @@ impl App {
             return;
         }
         let removed = self.cfg.removed_worktrees.clone();
-        crate::omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            AppEvent::Worktree(WtEvent::Orphaned(worktree_ui::orphaned_removed(&removed)))
-        });
+        self.gw.native(
+            move || worktree_ui::orphaned_removed(&removed),
+            |app, paths| {
+                for p in paths {
+                    app.cfg.removed_worktrees.remove(&p);
+                }
+                app.dirty = true;
+            },
+        );
     }
 
     fn expire_moves(&mut self) {
@@ -884,7 +853,7 @@ impl App {
     /// A tab whose session file changed (omp relocated it, `/new`, `/resume`, …) takes the folder
     /// of the new file; a pending move that landed in a worktree records its merge target.
     fn track_relocations(&mut self) {
-        let generation = self.watcher.generation();
+        let generation = self.gw.sessions_generation();
         let live: HashSet<u64> = self
             .tabs
             .iter()
@@ -912,7 +881,7 @@ impl App {
         if changed.is_empty() {
             return;
         }
-        let groups = self.watcher.latest();
+        let groups = self.groups();
         for (uid, path) in changed {
             let found = groups.as_deref().and_then(|gs| {
                 gs.iter()

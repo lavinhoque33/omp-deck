@@ -24,7 +24,7 @@ pub enum OmpError {
 
 /// One session to delete: the file and the session id it held when the user selected it. The id
 /// is re-checked under the session lease, so a file replaced since selection is never deleted.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeleteTarget {
     pub path: PathBuf,
     pub id: String,
@@ -59,7 +59,7 @@ pub struct Omp {
     env: Vec<(OsString, OsString)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UpdateKind {
     Omp,
     Plugins,
@@ -67,20 +67,20 @@ pub enum UpdateKind {
     Stable,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateStatus {
     pub current: String,
     /// `None` = up to date.
     pub latest: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MoveOutcome {
     pub new_path: PathBuf,
     pub kind: MoveKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MoveKind {
     Created,
     Replaced,
@@ -90,19 +90,19 @@ pub enum MoveKind {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SettingsCatalog {
     pub tabs: Vec<SettingsTab>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SettingsTab {
     pub id: String,
     pub label: String,
     pub settings: Vec<Setting>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Setting {
     pub key: String,
     pub kind: SettingKind,
@@ -114,7 +114,7 @@ pub struct Setting {
     pub secret: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SettingKind {
     Bool,
     Number,
@@ -239,7 +239,7 @@ pub fn fork_argv(src: &Path, dest_cwd: &Path) -> Vec<String> {
 }
 
 /// One entry of the `omp models --json` catalog.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     /// `provider/id`, what `/switch` takes.
     pub selector: String,

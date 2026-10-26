@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::namespace::Namespace;
 
-pub(crate) struct Endpoint {
+pub struct Endpoint {
     name: String,
     base: PathBuf,
     dir: PathBuf,
@@ -23,6 +23,9 @@ pub(crate) struct Endpoint {
 
 impl Endpoint {
     pub fn new(ns: &Namespace, name: &str) -> Result<Endpoint> {
+        if !crate::valid_session_name(name) {
+            return Err(Error::InvalidSessionName(name.to_owned()));
+        }
         let dir = ns.dir();
         let socket = dir.join(format!("{name}.sock"));
         // SAFETY: sockaddr_un is plain old data; all-zero is a valid value.
@@ -97,7 +100,7 @@ fn create_private_dir(path: &Path) -> Result<()> {
 }
 
 /// Creates (or verifies) the base and namespace directories.
-pub(crate) fn prepare(endpoint: &Endpoint) -> Result<()> {
+pub fn prepare(endpoint: &Endpoint) -> Result<()> {
     if let Some(parent) = endpoint.base.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -105,7 +108,7 @@ pub(crate) fn prepare(endpoint: &Endpoint) -> Result<()> {
     create_private_dir(&endpoint.dir)
 }
 
-pub(crate) fn connect(endpoint: &Endpoint) -> Result<Stream> {
+pub fn connect(endpoint: &Endpoint) -> Result<Stream> {
     if !existing_dirs_ok(&endpoint.base, &endpoint.dir)? {
         return Err(Error::NotRunning(endpoint.name.clone()));
     }
@@ -141,11 +144,10 @@ pub(crate) fn list_names(ns: &Namespace) -> Result<Vec<String>> {
 }
 
 /// The daemon's listening socket plus its instance lock.
-pub(crate) struct Listener {
+pub struct Listener {
     inner: UnixListener,
     _lock: File,
     socket: PathBuf,
-    lock_path: PathBuf,
 }
 
 impl Listener {
@@ -183,7 +185,6 @@ impl Listener {
             inner,
             _lock: lock,
             socket: endpoint.socket.clone(),
-            lock_path: endpoint.lock.clone(),
         })
     }
 
@@ -191,15 +192,17 @@ impl Listener {
         self.inner.accept().map(|(s, _)| Stream(s))
     }
 
-    /// Removes the endpoint so new clients see the session as gone.
+    /// Stops accepting new connections. The instance lock stays held until this listener drops.
     pub fn remove(&self) {
         let _ = fs::remove_file(&self.socket);
-        let _ = fs::remove_file(&self.lock_path);
+        // SAFETY: the listener owns this fd. Shutdown wakes blocked accept calls; accepted
+        // streams have their own sockets and remain available for the owner's drain.
+        unsafe { libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_RDWR) };
     }
 }
 
 /// A connected byte stream; clones share the connection.
-pub(crate) struct Stream(UnixStream);
+pub struct Stream(UnixStream);
 
 impl Stream {
     pub fn try_clone(&self) -> io::Result<Stream> {
@@ -235,5 +238,76 @@ impl Write for Stream {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier, mpsc};
+
+    use super::*;
+
+    fn test_namespace() -> Namespace {
+        let mut nonce = [0; 4];
+        getrandom::fill(&mut nonce).unwrap();
+        Namespace::new(&format!(
+            "omp-deck-test-{}-{:08x}",
+            std::process::id(),
+            u32::from_ne_bytes(nonce)
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn endpoint_rejects_names_that_escape_the_private_directory() {
+        let ns = test_namespace();
+        for name in ["", "../owner", "sub/owner", "/tmp/owner"] {
+            assert!(matches!(
+                Endpoint::new(&ns, name),
+                Err(Error::InvalidSessionName(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn removing_listener_preserves_instance_lock_and_accepted_streams() {
+        let ns = test_namespace();
+        let endpoint = Endpoint::new(&ns, "owner").unwrap();
+        let listener = Arc::new(Listener::bind(&endpoint).unwrap());
+        let mut client = connect(&endpoint).unwrap();
+        let mut accepted = listener.accept().unwrap();
+        accepted
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let waiter = Arc::clone(&listener);
+        let ready = Arc::clone(&barrier);
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            ready.wait();
+            tx.send(waiter.accept().is_err()).unwrap();
+        });
+        barrier.wait();
+        listener.remove();
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        thread.join().unwrap();
+        assert!(matches!(
+            Listener::bind(&endpoint),
+            Err(Error::AlreadyRunning(_))
+        ));
+
+        client.write_all(b"drain").unwrap();
+        let mut bytes = [0; 5];
+        accepted.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"drain");
+        drop(client);
+        drop(accepted);
+        drop(listener);
+
+        let replacement = Listener::bind(&endpoint).unwrap();
+        replacement.remove();
+        drop(replacement);
+        fs::remove_dir_all(ns.dir()).unwrap();
     }
 }

@@ -1,13 +1,13 @@
-//! OmpDeck self-update: the check tracker (independent of omp), the install phase, the title-bar
-//! pill + popover and the Settings card. Pure state and painting; the workers live in
-//! `app/app_update.rs`.
+//! OmpDeck self-update: the window's picture of the gateway's update state, the install phase,
+//! the title-bar pill + popover and the Settings card. Pure state and painting; the gateway
+//! checks, downloads and installs (`app/app_update.rs` sends the requests).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
-use deck_core::selfupdate::{self, InstallKind, Release};
+use deck_core::selfupdate::{self, Applied, InstallKind, Release};
+use deck_service::gateway::protocol::{AppUpdateView, UpdatePhase};
 use egui::{ProgressBar, RichText, Ui};
 
 use crate::icons::{
@@ -16,38 +16,8 @@ use crate::icons::{
 use crate::theme::{self, Palette};
 use crate::widgets::{Spin, card, icon_text, menu_item, setting_row, toggle};
 
-/// Background re-check cadence (plus one check at startup).
-pub const RECHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
-
 /// The running OmpDeck's version.
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
-
-/// Download folders left by a killed run are removed once this old.
-pub const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Best effort: removes `omp-deck-update-*` folders of `tmp` not modified for `max_age` (a
-/// running download keeps its folder fresh).
-pub fn sweep_stale_update_dirs(tmp: &std::path::Path, max_age: Duration) {
-    let Ok(entries) = std::fs::read_dir(tmp) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("omp-deck-update-") {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .ok()
-            .filter(|m| m.is_dir())
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= max_age);
-        if stale {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum CheckState {
@@ -70,11 +40,11 @@ pub enum Phase {
     },
     /// Downloaded and verified; unpacking / replacing / waiting for the package manager.
     Applying,
-    /// Could not install automatically: run this command (pkexec missing or declined).
+    Failed(String),
+    /// The gateway could not install automatically: the user runs `command` (the download is kept).
     NeedsManual {
         command: String,
     },
-    Failed(String),
     /// Installed; the app is closing and the new version starts.
     Restarting,
 }
@@ -89,54 +59,141 @@ impl Phase {
     }
 }
 
+/// A check this window asked for, finished.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Checked {
+    Available(Release),
+    UpToDate,
+    Error(String),
+}
+
+/// What taking the gateway's view produced for the window to act on.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum Adopted {
+    #[default]
+    Nothing,
+    /// The check this window asked for finished.
+    Checked(Checked),
+    /// The install this window started is in place: restart into it.
+    Applied(Applied),
+}
+
 #[derive(Debug, Default)]
 pub struct AppUpdateTracker {
     pub check: CheckState,
-    /// Last finished check: the pill stays while a re-check runs.
+    /// Last finished check: the pill stays while a re-check runs or fails.
     settled: CheckState,
-    last_started: Option<Instant>,
-    /// The running check was asked for by the user (report its outcome with a toast).
-    pub manual: bool,
+    /// This window asked for a check and waits for the gateway to finish one newer than this
+    /// `checked_unix_ms`.
+    awaiting: Option<Option<u64>>,
     pub phase: Phase,
-    /// How this copy was installed; `None` until detection finished.
+    /// This window runs the install (download, then apply): the gateway's download/apply phases
+    /// belong to it.
+    pub installing: bool,
+    /// How this copy was installed; `None` until the gateway reported.
     pub kind: Option<InstallKind>,
+    /// The gateway's last check time, for [`AppUpdateTracker::ask`].
+    last_checked: Option<u64>,
 }
 
 impl AppUpdateTracker {
     pub fn is_checking(&self) -> bool {
-        self.check == CheckState::Checking
+        self.check == CheckState::Checking || self.awaiting.is_some()
     }
 
-    /// A scheduled check is due: automatic checks are on, none runs, and none ran in the last 6 h.
-    pub fn due(&self, now: Instant, enabled: bool) -> bool {
-        enabled
-            && !self.is_checking()
-            && self
-                .last_started
-                .is_none_or(|t| now.saturating_duration_since(t) >= RECHECK_EVERY)
-    }
-
-    pub fn begin(&mut self, now: Instant, manual: bool) {
-        self.check = CheckState::Checking;
-        self.last_started = Some(now);
-        self.manual = manual;
+    /// This window asks for a check (the caller sends the request); the outcome is reported by
+    /// [`AppUpdateTracker::adopt`].
+    pub fn ask(&mut self) {
+        self.awaiting = Some(self.last_checked);
         // An earlier install failure no longer describes the state of things.
         if matches!(self.phase, Phase::Failed(_)) {
             self.phase = Phase::Idle;
         }
     }
 
-    /// Takes a finished check; a release that is not newer than `current` counts as up to date.
-    pub fn finish(&mut self, result: Result<Release, String>, current: &str) {
-        let state = match result {
-            Ok(r) if selfupdate::is_newer(&r.version, current) => CheckState::Available(r),
-            Ok(_) => CheckState::UpToDate,
-            Err(e) => CheckState::Error(e),
-        };
-        // A failed check says nothing about the release already known: keep offering it.
-        if !matches!(state, CheckState::Error(_)) {
-            self.settled = state.clone();
+    /// The gateway refused the check: nothing is awaited.
+    pub fn abandon_ask(&mut self) {
+        self.awaiting = None;
+    }
+
+    /// Takes the gateway's view.
+    pub fn adopt(&mut self, v: &AppUpdateView) -> Adopted {
+        self.kind = Some(v.install.clone());
+        match &v.phase {
+            UpdatePhase::Checking => {
+                self.check = CheckState::Checking;
+                Adopted::Nothing
+            }
+            UpdatePhase::Downloading { done, total } => {
+                if self.installing {
+                    self.phase = Phase::Downloading {
+                        done: *done,
+                        total: *total,
+                    };
+                }
+                Adopted::Nothing
+            }
+            UpdatePhase::Applied(applied) => {
+                self.settle(v);
+                if self.installing {
+                    self.installing = false;
+                    self.phase = Phase::Restarting;
+                    Adopted::Applied(applied.clone())
+                } else {
+                    Adopted::Nothing
+                }
+            }
+            UpdatePhase::NeedsManual { command } => {
+                if self.installing {
+                    self.installing = false;
+                    self.phase = Phase::NeedsManual {
+                        command: command.clone(),
+                    };
+                }
+                Adopted::Nothing
+            }
+            UpdatePhase::Failed(e) if self.installing => {
+                self.installing = false;
+                self.phase = Phase::Failed(e.clone());
+                Adopted::Nothing
+            }
+            UpdatePhase::Failed(e) => {
+                // A failed check says nothing about the release already known.
+                self.check = CheckState::Error(e.clone());
+                match self.awaiting.take() {
+                    Some(_) => Adopted::Checked(Checked::Error(e.clone())),
+                    None => Adopted::Nothing,
+                }
+            }
+            UpdatePhase::Idle => {
+                self.settle(v);
+                let done = self
+                    .awaiting
+                    .is_some_and(|since| v.checked_unix_ms != since);
+                if !done {
+                    return Adopted::Nothing;
+                }
+                self.awaiting = None;
+                Adopted::Checked(match &self.settled {
+                    CheckState::Available(r) => Checked::Available(r.clone()),
+                    _ => Checked::UpToDate,
+                })
+            }
         }
+    }
+
+    /// Stores the check outcome the view carries (a release that is not newer than this build
+    /// counts as up to date).
+    fn settle(&mut self, v: &AppUpdateView) {
+        self.last_checked = v.checked_unix_ms;
+        let state = match &v.latest {
+            Some(r) if selfupdate::is_newer(&r.version, CURRENT) => {
+                CheckState::Available(r.clone())
+            }
+            _ if v.checked_unix_ms.is_some() => CheckState::UpToDate,
+            _ => CheckState::Unknown,
+        };
+        self.settled = state.clone();
         self.check = state;
     }
 
@@ -232,9 +289,9 @@ pub enum UpdateAction {
     Install,
     Cancel,
     OpenPage(String),
-    CopyCommand(String),
     Skip(String),
     Check,
+    CopyCommand(String),
 }
 
 impl PillView<'_> {
@@ -247,7 +304,8 @@ impl PillView<'_> {
             Phase::Applying => "Installing…".to_owned(),
             Phase::Restarting => "Restarting…".to_owned(),
             Phase::Failed(_) => "Update failed".to_owned(),
-            Phase::Idle | Phase::NeedsManual { .. } => format!("OmpDeck {}", self.release.version),
+            Phase::NeedsManual { .. } => "Finish the update manually".to_owned(),
+            Phase::Idle => format!("OmpDeck {}", self.release.version),
         }
     }
 
@@ -334,24 +392,26 @@ pub fn popover(ui: &mut Ui, v: &PillView<'_>) -> Option<UpdateAction> {
                 ui.label(RichText::new("Restarting…").color(pal.weak));
             });
         }
-        Phase::NeedsManual { command } => {
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("OmpDeck could not install itself. Run this in a terminal:")
-                    .small()
-                    .color(pal.weak),
-            );
-            ui.add(
-                egui::Label::new(RichText::new(command).monospace().color(pal.text))
-                    .wrap()
-                    .selectable(true),
-            );
-            if menu_item(ui, ICON_COPY, "Copy command", None, true, false).clicked() {
-                action = Some(UpdateAction::CopyCommand(command.clone()));
+        Phase::Idle | Phase::Failed(_) | Phase::NeedsManual { .. } => {
+            if let Phase::NeedsManual { command } = v.phase {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("Run this to finish the update:")
+                            .small()
+                            .color(pal.weak),
+                    )
+                    .wrap(),
+                );
+                ui.add(
+                    egui::Label::new(RichText::new(command).monospace().small())
+                        .selectable(true)
+                        .wrap(),
+                );
+                if menu_item(ui, ICON_COPY, "Copy command", None, true, false).clicked() {
+                    action = Some(UpdateAction::CopyCommand(command.clone()));
+                }
             }
-            page_item(ui, v, &mut action);
-        }
-        Phase::Idle | Phase::Failed(_) => {
             if let Phase::Failed(e) = v.phase {
                 ui.add_space(4.0);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -514,6 +574,14 @@ pub fn settings_card(ui: &mut Ui, c: &SettingsCard<'_>) -> Vec<SettingsAction> {
         if let Phase::Failed(e) = c.phase {
             ui.colored_label(pal.danger, RichText::new(e).small());
         }
+        if let Phase::NeedsManual { command } = c.phase {
+            ui.label(RichText::new("Run this to finish the update:").small());
+            ui.add(
+                egui::Label::new(RichText::new(command).monospace().small())
+                    .selectable(true)
+                    .wrap(),
+            );
+        }
     });
     out
 }
@@ -530,79 +598,154 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_check_is_due_at_startup_then_every_six_hours_and_only_when_enabled() {
-        let t0 = Instant::now();
-        let mut t = AppUpdateTracker::default();
-        assert!(t.due(t0, true));
-        assert!(!t.due(t0, false), "automatic checks off");
-        t.begin(t0, false);
-        assert!(
-            !t.due(t0 + RECHECK_EVERY * 2, true),
-            "one is already running"
-        );
-        t.finish(Ok(release("0.0.1")), "0.0.1");
-        assert!(!t.due(t0 + RECHECK_EVERY - Duration::from_secs(1), true));
-        assert!(t.due(t0 + RECHECK_EVERY, true));
+    fn view(latest: Option<Release>, checked: Option<u64>, phase: UpdatePhase) -> AppUpdateView {
+        AppUpdateView {
+            install: InstallKind::Deb,
+            current: CURRENT.to_owned(),
+            latest,
+            asset: None,
+            checked_unix_ms: checked,
+            phase,
+        }
+    }
+
+    fn idle(latest: Option<Release>, checked: Option<u64>) -> AppUpdateView {
+        view(latest, checked, UpdatePhase::Idle)
+    }
+
+    fn newer() -> Release {
+        release("999.0.0")
     }
 
     #[test]
     fn only_a_newer_release_is_available() {
         let mut t = AppUpdateTracker::default();
-        t.finish(Ok(release("0.9.0")), "0.8.0");
-        assert_eq!(t.available().map(|r| r.version.as_str()), Some("0.9.0"));
-        t.finish(Ok(release("0.8.0")), "0.8.0");
+        t.adopt(&idle(Some(newer()), Some(1)));
+        assert_eq!(t.available().map(|r| r.version.as_str()), Some("999.0.0"));
+        t.adopt(&idle(Some(release(CURRENT)), Some(2)));
         assert!(t.available().is_none());
         assert_eq!(t.check, CheckState::UpToDate);
-        t.finish(Ok(release("0.7.0")), "0.8.0");
+        t.adopt(&idle(Some(release("0.0.1")), Some(3)));
         assert!(t.available().is_none(), "a downgrade is never offered");
-        t.finish(Ok(release("0.8.0-rc.1")), "0.8.0");
-        assert!(
-            t.available().is_none(),
-            "a release candidate is not newer than its release"
-        );
+        t.adopt(&idle(None, None));
+        assert_eq!(t.check, CheckState::Unknown);
     }
 
     #[test]
     fn skipping_hides_that_version_but_not_a_newer_one() {
         let mut t = AppUpdateTracker::default();
-        t.finish(Ok(release("0.9.0")), "0.8.0");
+        t.adopt(&idle(Some(newer()), Some(1)));
         assert!(t.offered(None).is_some());
-        assert!(t.offered(Some("0.9.0")).is_none());
-        assert!(t.offered(Some("0.8.5")).is_some());
-        t.finish(Ok(release("0.9.1")), "0.8.0");
-        assert!(t.offered(Some("0.9.0")).is_some());
-        // The skipped release is still known (Settings and manual checks can show it).
-        t.finish(Ok(release("0.9.0")), "0.8.0");
-        assert_eq!(t.available().map(|r| r.version.as_str()), Some("0.9.0"));
+        assert!(t.offered(Some("999.0.0")).is_none());
+        assert!(t.offered(Some("998.0.0")).is_some());
+        t.adopt(&idle(Some(release("999.0.1")), Some(2)));
+        assert!(t.offered(Some("999.0.0")).is_some());
     }
 
     #[test]
     fn a_known_release_survives_a_recheck_and_a_failed_check() {
         let mut t = AppUpdateTracker::default();
-        t.finish(Ok(release("0.9.0")), "0.8.0");
-        t.begin(Instant::now(), true);
+        t.adopt(&idle(Some(newer()), Some(1)));
+        t.ask();
         assert!(t.is_checking());
+        t.adopt(&view(Some(newer()), Some(1), UpdatePhase::Checking));
         assert!(t.available().is_some(), "the pill stays while re-checking");
-        t.finish(Err("offline".into()), "0.8.0");
-        assert_eq!(
-            t.available().map(|r| r.version.as_str()),
-            Some("0.9.0"),
-            "an offline re-check does not un-know the release"
+        let done = t.adopt(&view(
+            Some(newer()),
+            Some(1),
+            UpdatePhase::Failed("offline".into()),
+        ));
+        assert_eq!(done, Adopted::Checked(Checked::Error("offline".into())));
+        assert!(
+            t.available().is_some(),
+            "an offline re-check keeps the release"
         );
         assert_eq!(status_line(&t.check), "Check failed: offline");
-        t.finish(Ok(release("0.8.0")), "0.8.0");
+        t.adopt(&idle(None, Some(5)));
         assert!(t.available().is_none(), "a fresh answer replaces it");
     }
 
     #[test]
-    fn starting_a_check_clears_a_previous_install_failure() {
+    fn only_the_check_this_window_asked_for_is_reported() {
+        let mut t = AppUpdateTracker::default();
+        assert_eq!(t.adopt(&idle(Some(newer()), Some(1))), Adopted::Nothing);
+        t.ask();
+        assert_eq!(
+            t.adopt(&idle(Some(newer()), Some(1))),
+            Adopted::Nothing,
+            "the old result is not the answer"
+        );
+        assert_eq!(
+            t.adopt(&idle(None, Some(2))),
+            Adopted::Checked(Checked::UpToDate)
+        );
+        assert_eq!(t.adopt(&idle(None, Some(3))), Adopted::Nothing);
+    }
+
+    #[test]
+    fn asking_clears_a_previous_install_failure() {
         let mut t = AppUpdateTracker {
             phase: Phase::Failed("no asset".into()),
             ..AppUpdateTracker::default()
         };
-        t.begin(Instant::now(), true);
+        t.ask();
         assert_eq!(t.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn the_install_this_window_started_follows_the_gateway() {
+        let mut t = AppUpdateTracker {
+            installing: true,
+            ..AppUpdateTracker::default()
+        };
+        t.adopt(&view(
+            Some(newer()),
+            Some(1),
+            UpdatePhase::Downloading {
+                done: 1,
+                total: Some(4),
+            },
+        ));
+        assert_eq!(
+            t.phase,
+            Phase::Downloading {
+                done: 1,
+                total: Some(4)
+            }
+        );
+        let applied = Applied {
+            executable: PathBuf::from("/opt/omp-deck"),
+        };
+        let out = t.adopt(&view(
+            Some(newer()),
+            Some(1),
+            UpdatePhase::Applied(applied.clone()),
+        ));
+        assert_eq!(out, Adopted::Applied(applied));
+        assert_eq!(t.phase, Phase::Restarting);
+        assert!(!t.installing);
+    }
+
+    #[test]
+    fn another_clients_install_is_not_this_windows_to_restart() {
+        let mut t = AppUpdateTracker::default();
+        let applied = Applied {
+            executable: PathBuf::from("/opt/omp-deck"),
+        };
+        let out = t.adopt(&view(None, Some(1), UpdatePhase::Applied(applied)));
+        assert_eq!(out, Adopted::Nothing);
+        assert_eq!(t.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn a_failed_install_this_window_started_is_an_install_failure() {
+        let mut t = AppUpdateTracker {
+            installing: true,
+            ..AppUpdateTracker::default()
+        };
+        t.adopt(&view(None, Some(1), UpdatePhase::Failed("no asset".into())));
+        assert_eq!(t.phase, Phase::Failed("no asset".into()));
+        assert!(!t.installing);
     }
 
     #[test]
@@ -630,33 +773,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_update_dirs_are_swept_but_fresh_and_foreign_ones_stay() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mk = |name: &str, age_days: u64| {
-            let p = tmp.path().join(name);
-            std::fs::create_dir(&p).unwrap();
-            std::fs::write(p.join("x.part"), b"1").unwrap();
-            let when = std::time::SystemTime::now() - Duration::from_secs(age_days * 86_400);
-            let mut open = std::fs::OpenOptions::new();
-            open.read(true);
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::OpenOptionsExt;
-                // Directories open only with FILE_FLAG_BACKUP_SEMANTICS; setting times needs write.
-                open.write(true).custom_flags(0x0200_0000);
-            }
-            open.open(&p).unwrap().set_modified(when).unwrap();
-            p
-        };
-        let old = mk("omp-deck-update-OLD", 3);
-        let fresh = mk("omp-deck-update-NEW", 0);
-        let foreign = mk("other-old", 3);
-        sweep_stale_update_dirs(tmp.path(), STALE_AFTER);
-        assert!(!old.exists());
-        assert!(fresh.exists() && foreign.exists());
-    }
-
-    #[test]
     fn download_percent_is_clamped_and_needs_a_size() {
         assert_eq!(percent(50, Some(200)), Some(25));
         assert_eq!(percent(300, Some(200)), Some(100));
@@ -668,12 +784,6 @@ mod tests {
     fn busy_phases_block_a_second_install() {
         assert!(!Phase::Idle.is_busy());
         assert!(!Phase::Failed("x".into()).is_busy());
-        assert!(
-            !Phase::NeedsManual {
-                command: "x".into()
-            }
-            .is_busy()
-        );
         assert!(
             Phase::Downloading {
                 done: 0,

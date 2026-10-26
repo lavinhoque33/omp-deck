@@ -1,47 +1,31 @@
-//! App-side glue for the Changes panel: which repository it follows, the refresh rules, the git
-//! workers (list, diff, stage/unstage/discard/delete, copy patch) and the confirmations.
+//! App-side glue for the Changes panel: which repository it follows, the gateway topic that keeps
+//! its listing current, diffs, the git writes (stage/unstage/discard/delete) and the
+//! confirmations. The listing, the diffs and the writes run in the gateway; this module only asks
+//! and shows.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
-use deck_core::changes::{self, ChangedFile, Changes, ChangesError, FileDiff};
+use deck_core::changes::{ChangedFile, Changes, FileDiff};
+use deck_service::controller::{Command, RequestId};
+use deck_service::gateway::protocol::{Answer, Mutation, Query, Topic, TopicValue};
 use egui::{Frame, Margin};
 
-use super::{App, AppEvent, PendingConfirm};
+use super::{App, PendingConfirm};
 use crate::changes_view::{
     self, ChangesAction, DiffModel, DiffPane, FileKey, LoadState, ShownDiff, ViewState,
 };
 use crate::confirm::Confirm;
-use crate::omp_worker;
 use crate::review;
 use crate::tabs::{Tab, TabRole};
 use crate::theme::Palette;
-use deck_service::controller::{Command, RequestId};
 
-/// How often the open panel re-reads the repository.
-const REFRESH_EVERY: Duration = Duration::from_secs(3);
 /// Panel width until the user resizes it.
 const DEFAULT_WIDTH: f32 = 460.0;
 /// Paths listed in a confirmation before "and N more".
 const CONFIRM_PATHS: usize = 12;
-
-/// What a git worker reports.
-pub(super) enum ChangesEvent {
-    Listed {
-        generation: u64,
-        result: Result<Option<Changes>, String>,
-    },
-    Diff {
-        generation: u64,
-        key: FileKey,
-        result: Result<FileDiff, String>,
-    },
-    Wrote {
-        label: &'static str,
-        result: Result<(), String>,
-    },
-    Patch(Result<String, String>),
-}
+/// Shown while the gateway cannot be reached: the listing is the last one received.
+const OFFLINE: &str =
+    "The OmpDeck gateway is not reachable — this is the last list received; changes are paused.";
 
 /// A destructive write waiting for the user's answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,15 +78,15 @@ pub(super) struct ChangesUi {
     view: ViewState,
     /// Tab the listing belongs to.
     uid: Option<u64>,
-    /// Folder the last listing was requested for.
+    /// Folder the panel follows.
     cwd: Option<PathBuf>,
-    /// Latest listing request; older answers are dropped.
-    list_generation: u64,
-    list_busy: bool,
-    /// A refresh was asked for while one was running: run again when it lands.
-    list_again: bool,
-    last_started: Option<Instant>,
+    /// The folder whose gateway topic this window is subscribed to.
+    followed: Option<PathBuf>,
+    /// Revision of the cached listing last shown.
+    seen_rev: u64,
     diff_generation: u64,
+    /// The offline notice is the one shown in the panel.
+    offline_shown: bool,
     /// The review request in flight (cleared when its controller reports it settled).
     pending_reviews: PendingReviews,
 }
@@ -111,7 +95,7 @@ impl ChangesUi {
     /// Points the panel at `(uid, cwd)`. A different tab or folder drops the old listing, its
     /// root and selection at once and invalidates every request still in flight, so nothing of the
     /// old repository stays actionable and a late answer for it is ignored. Returns whether the
-    /// target changed (the caller then queues the new scan).
+    /// target changed (the caller then follows the new folder's topic).
     fn retarget(&mut self, uid: u64, cwd: PathBuf) -> bool {
         let tab_changed = self.uid != Some(uid);
         let moved = self.cwd.as_ref() != Some(&cwd);
@@ -122,9 +106,10 @@ impl ChangesUi {
         self.cwd = Some(cwd);
         self.view.clear_listing();
         self.view.notice = None;
+        self.offline_shown = false;
         self.view.busy = None;
         self.view.load = LoadState::Loading;
-        self.list_generation += 1;
+        self.seen_rev = 0;
         self.diff_generation += 1;
         true
     }
@@ -137,7 +122,7 @@ fn target_of(app: &App) -> Option<(u64, PathBuf)> {
         return None;
     };
     let live = (t.role == TabRole::Session)
-        .then(|| app.status.latest())
+        .then(|| app.gw.status_of(t.target()))
         .flatten()
         .map(|s| s.cwd.clone())
         .filter(|c| !c.as_os_str().is_empty());
@@ -194,8 +179,8 @@ impl App {
         } else {
             self.changes.open = true;
             self.close_dashboard();
-            // The next frame re-reads the repository at once.
-            self.changes.last_started = None;
+            // The next frame subscribes and reads the cache at once.
+            self.changes.seen_rev = 0;
         }
         self.focus_pending = true;
         self.ctx.request_repaint();
@@ -206,66 +191,91 @@ impl App {
         matches!(self.tabs.get(self.active), Some(Tab::Terminal(_)))
     }
 
-    /// Refresh rules: on open, on tab switch, when the folder changes, after writes, every 3 s.
-    pub(super) fn drive_changes(&mut self, ctx: &egui::Context) {
+    /// Stops following the folder's gateway topic (the gateway then stops watching it).
+    fn unfollow_changes(&mut self) {
+        if let Some(path) = self.changes.followed.take() {
+            self.gw.unsubscribe(&Topic::Changes(path));
+        }
+    }
+
+    /// Follows the gateway's listing of `cwd`; the gateway re-reads the repository on its own
+    /// schedule and right after every write.
+    fn follow_changes(&mut self, cwd: &Path) {
+        if self.changes.followed.as_deref() == Some(cwd) {
+            return;
+        }
+        self.unfollow_changes();
+        self.gw.subscribe(Topic::Changes(cwd.to_path_buf()));
+        self.changes.followed = Some(cwd.to_path_buf());
+        self.changes.seen_rev = 0;
+    }
+
+    /// Per frame while the panel is open: follow the active tab's folder and show the newest
+    /// listing the gateway published.
+    pub(super) fn drive_changes(&mut self, _ctx: &egui::Context) {
         if !self.changes.open {
+            self.unfollow_changes();
             return;
         }
         let Some((uid, cwd)) = target_of(self) else {
+            self.unfollow_changes();
             let ch = &mut self.changes;
             if ch.uid.take().is_some() {
                 ch.cwd = None;
                 ch.view.clear_listing();
-                ch.list_generation += 1;
+                ch.diff_generation += 1;
             }
             ch.view.load = LoadState::NoTab;
             return;
         };
-        if self.changes.retarget(uid, cwd) {
-            self.changes_refresh_now();
-            return;
-        }
+        self.changes.retarget(uid, cwd.clone());
+        self.follow_changes(&cwd);
+        self.take_listing(&cwd);
+        self.show_offline_notice();
+    }
+
+    /// The panel is read-only while the gateway is away: say so, and take the notice back when
+    /// it returns.
+    fn show_offline_notice(&mut self) {
+        let up = self.gw.is_up();
         let ch = &mut self.changes;
-        let due = ch.last_started.is_none_or(|t| t.elapsed() >= REFRESH_EVERY);
-        if due {
-            self.changes_refresh_now();
-        } else if let Some(t) = ch.last_started {
-            ctx.request_repaint_after(REFRESH_EVERY.saturating_sub(t.elapsed()));
+        if !up && ch.view.notice.is_none() {
+            ch.view.notice = Some(OFFLINE.to_owned());
+            ch.offline_shown = true;
+        } else if up && ch.offline_shown {
+            ch.offline_shown = false;
+            if ch.view.notice.as_deref() == Some(OFFLINE) {
+                ch.view.notice = None;
+            }
         }
     }
 
-    /// Reads the repository on a worker (one at a time; a request during a run repeats it).
-    pub(super) fn changes_refresh_now(&mut self) {
-        let Some(cwd) = self
-            .changes
-            .cwd
-            .clone()
-            .or_else(|| target_of(self).map(|t| t.1))
-        else {
+    /// Applies the cached listing of `cwd` when it is newer than the one shown.
+    fn take_listing(&mut self, cwd: &Path) {
+        let topic = Topic::Changes(cwd.to_path_buf());
+        let rev = self.gw.revision(&topic);
+        if rev == 0 || rev == self.changes.seen_rev {
+            return;
+        }
+        let Some(TopicValue::Changes(result)) = self.gw.topic(&topic) else {
             return;
         };
-        let ch = &mut self.changes;
-        if ch.cwd.is_none() {
-            ch.cwd = Some(cwd.clone());
+        self.changes.seen_rev = rev;
+        match result {
+            Ok(listing) => {
+                let ch = &mut self.changes;
+                if listing.as_ref().map(|c: &Changes| &c.root) != ch.view.root.as_ref() {
+                    ch.view.selected = None;
+                    ch.view.diff = DiffPane::Idle;
+                }
+                ch.view.apply_listing(listing);
+                self.changes_request_diff();
+            }
+            Err(e) => {
+                self.changes.view.clear_listing();
+                self.changes.view.load = LoadState::Failed(e);
+            }
         }
-        if ch.list_busy {
-            ch.list_again = true;
-            return;
-        }
-        ch.list_busy = true;
-        ch.list_again = false;
-        ch.last_started = Some(Instant::now());
-        ch.list_generation += 1;
-        let generation = ch.list_generation;
-        if ch.view.load != LoadState::Ready {
-            ch.view.load = LoadState::Loading;
-        }
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            AppEvent::Changes(ChangesEvent::Listed {
-                generation,
-                result: changes::list(&cwd).map_err(|e| e.to_string()),
-            })
-        });
     }
 
     fn changes_request_diff(&mut self) {
@@ -284,90 +294,55 @@ impl App {
             ch.view.diff = DiffPane::Loading;
         }
         let side = key.section.side();
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            AppEvent::Changes(ChangesEvent::Diff {
-                generation,
-                key,
-                result: changes::diff(&root, &file, side).map_err(|e| e.to_string()),
-            })
-        });
+        self.gw
+            .query(Query::Diff { root, file, side }, move |app, r| {
+                let result = match r {
+                    Ok(Answer::Diff(d)) => Ok(d),
+                    Ok(_) => Err("the gateway answered with something else".to_owned()),
+                    Err(e) => Err(e),
+                };
+                app.on_changes_diff(generation, key, result);
+            });
     }
 
-    pub(super) fn on_changes_event(&mut self, ev: ChangesEvent) {
-        match ev {
-            ChangesEvent::Listed { generation, result } => {
-                self.changes.list_busy = false;
-                if generation == self.changes.list_generation {
-                    match result {
-                        Ok(listing) => {
-                            let ch = &mut self.changes;
-                            if listing.as_ref().map(|c| &c.root) != ch.view.root.as_ref() {
-                                ch.view.selected = None;
-                                ch.view.diff = DiffPane::Idle;
-                            }
-                            ch.view.apply_listing(listing);
-                            self.changes_request_diff();
-                        }
-                        Err(e) => {
-                            self.changes.view.clear_listing();
-                            self.changes.view.load = LoadState::Failed(e);
-                        }
-                    }
-                }
-                if self.changes.list_again {
-                    self.changes_refresh_now();
-                }
-            }
-            ChangesEvent::Diff {
-                generation,
-                key,
-                result,
-            } => {
-                if generation != self.changes.diff_generation
-                    || self.changes.view.selected.as_ref() != Some(&key)
+    fn on_changes_diff(&mut self, generation: u64, key: FileKey, result: Result<FileDiff, String>) {
+        if generation != self.changes.diff_generation
+            || self.changes.view.selected.as_ref() != Some(&key)
+        {
+            return;
+        }
+        let view = &mut self.changes.view;
+        match result {
+            Err(e) => view.diff = DiffPane::Failed(e),
+            Ok(d) => {
+                if let DiffPane::Ready(shown) = &mut view.diff
+                    && shown.key == key
+                    && shown.model.source() == d.text
                 {
-                    return;
-                }
-                let view = &mut self.changes.view;
-                match result {
-                    Err(e) => view.diff = DiffPane::Failed(e),
-                    Ok(d) => {
-                        if let DiffPane::Ready(shown) = &mut view.diff
-                            && shown.key == key
-                            && shown.model.source() == d.text
-                        {
-                            (shown.binary, shown.truncated) = (d.binary, d.truncated);
-                            (shown.added, shown.removed) = (d.added, d.removed);
-                        } else {
-                            view.diff = DiffPane::Ready(Box::new(ShownDiff {
-                                key,
-                                model: DiffModel::parse(d.text),
-                                binary: d.binary,
-                                truncated: d.truncated,
-                                added: d.added,
-                                removed: d.removed,
-                            }));
-                        }
-                    }
+                    (shown.binary, shown.truncated) = (d.binary, d.truncated);
+                    (shown.added, shown.removed) = (d.added, d.removed);
+                } else {
+                    view.diff = DiffPane::Ready(Box::new(ShownDiff {
+                        key,
+                        model: DiffModel::parse(d.text),
+                        binary: d.binary,
+                        truncated: d.truncated,
+                        added: d.added,
+                        removed: d.removed,
+                    }));
                 }
             }
-            ChangesEvent::Wrote { label, result } => {
-                self.changes.view.busy = None;
-                match result {
-                    Ok(()) => self.changes.view.notice = None,
-                    Err(e) => {
-                        self.toasts.error(&self.ctx, format!("{label} failed: {e}"));
-                        self.changes.view.notice = Some(format!("{label} failed: {e}"));
-                    }
-                }
-                self.changes_refresh_now();
-            }
-            ChangesEvent::Patch(Ok(patch)) if patch.trim().is_empty() => {
+        }
+    }
+
+    fn on_changes_patch(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(patch) if patch.trim().is_empty() => {
                 self.toasts
                     .info(&self.ctx, "No staged or unstaged changes to copy");
             }
-            ChangesEvent::Patch(Ok(patch)) => self.copy_text(&patch, "diff"),
-            ChangesEvent::Patch(Err(e)) => {
+            Ok(patch) => self.copy_text(&patch, "diff"),
+            Err(e) => {
                 self.toasts
                     .error(&self.ctx, format!("Could not build the diff: {e}"));
             }
@@ -381,11 +356,12 @@ impl App {
             .collect()
     }
 
+    /// Sends a git write to the gateway. The listing follows from the gateway's own refresh.
     fn changes_write(
         &mut self,
         label: &'static str,
         files: Vec<ChangedFile>,
-        run: fn(&Path, &[&ChangedFile]) -> Result<(), ChangesError>,
+        op: fn(PathBuf, Vec<ChangedFile>) -> Mutation,
     ) {
         let Some(root) = self.changes.view.root.clone() else {
             return;
@@ -394,12 +370,20 @@ impl App {
             return;
         }
         self.changes.view.busy = Some(format!("{label}…"));
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            let refs: Vec<&ChangedFile> = files.iter().collect();
-            AppEvent::Changes(ChangesEvent::Wrote {
-                label,
-                result: run(&root, &refs).map_err(|e| e.to_string()),
-            })
+        self.gw.mutate(op(root.clone(), files), move |app, r| {
+            if app.changes.view.root.as_deref() != Some(root.as_path()) {
+                return;
+            }
+            app.changes.view.busy = None;
+            match r {
+                Ok(_) => app.changes.view.notice = None,
+                Err(e) => {
+                    app.toasts.error(&app.ctx, format!("{label} failed: {e}"));
+                    app.changes.view.notice = Some(format!("{label} failed: {e}"));
+                }
+            }
+            // The gateway re-lists after a write; read what it already has.
+            app.changes.seen_rev = 0;
         });
     }
 
@@ -428,9 +412,17 @@ impl App {
             return;
         }
         match w.kind {
-            WriteKind::Discard => self.changes_write("Discard", w.files, changes::discard),
+            WriteKind::Discard => {
+                self.changes_write("Discard", w.files, |root, files| Mutation::Discard {
+                    root,
+                    files,
+                });
+            }
             WriteKind::DeleteUntracked => {
-                self.changes_write("Delete", w.files, changes::delete_untracked);
+                self.changes_write("Delete", w.files, |root, files| Mutation::DeleteUntracked {
+                    root,
+                    files,
+                });
             }
         }
     }
@@ -446,11 +438,17 @@ impl App {
             }
             ChangesAction::Stage(ids) => {
                 let files = self.changes_files(&ids);
-                self.changes_write("Stage", files, changes::stage);
+                self.changes_write("Stage", files, |root, files| Mutation::Stage {
+                    root,
+                    files,
+                });
             }
             ChangesAction::Unstage(ids) => {
                 let files = self.changes_files(&ids);
-                self.changes_write("Unstage", files, changes::unstage);
+                self.changes_write("Unstage", files, |root, files| Mutation::Unstage {
+                    root,
+                    files,
+                });
             }
             ChangesAction::Discard(ids) => self.ask_changes_write(WriteKind::Discard, &ids),
             ChangesAction::DeleteUntracked(ids) => {
@@ -480,14 +478,20 @@ impl App {
             }
             ChangesAction::CopyDiff => {
                 if let Some(root) = self.changes.view.root.clone() {
-                    omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-                        AppEvent::Changes(ChangesEvent::Patch(
-                            changes::patch(&root).map_err(|e| e.to_string()),
-                        ))
+                    self.gw.query(Query::Patch { root }, |app, r| {
+                        let result = match r {
+                            Ok(Answer::Patch(p)) => Ok(p),
+                            Ok(_) => Err("the gateway answered with something else".to_owned()),
+                            Err(e) => Err(e),
+                        };
+                        app.on_changes_patch(result);
                     });
                 }
             }
-            ChangesAction::Refresh => self.changes_refresh_now(),
+            ChangesAction::Refresh => {
+                self.changes.seen_rev = 0;
+                self.changes_request_diff();
+            }
             ChangesAction::InsertReview => self.hand_review(false),
             ChangesAction::SendReview => self.hand_review(true),
             ChangesAction::Close => {
@@ -524,22 +528,28 @@ impl App {
             .iter()
             .filter_map(Tab::term)
             .find(|t| t.uid == uid)
-            .map(|t| t.ctl.target().clone())
+            .map(|t| t.target().clone())
         else {
             self.toasts
                 .error(&self.ctx, "The session tab was closed; nothing was sent");
             return;
         };
-        let Some(request) = self.submit_command(&target, Command::Review { text, send }) else {
-            return;
-        };
-        self.changes.pending_reviews.start(PendingReview {
-            uid,
-            root,
-            ids: comments.iter().map(|c| c.id).collect(),
-            send,
-            request,
-        });
+        let ids: Vec<u64> = comments.iter().map(|c| c.id).collect();
+        // The hand-off is only recorded once the gateway accepted the command: until then it is
+        // just a local request, and a refusal leaves the review exactly as it was.
+        self.submit_command(
+            &target,
+            Command::Review { text, send },
+            move |app, request| {
+                app.changes.pending_reviews.start(PendingReview {
+                    uid,
+                    root,
+                    ids,
+                    send,
+                    request,
+                });
+            },
+        );
     }
 
     /// A review request ended without reaching omp (refused, declined, cancelled): its comments
@@ -570,17 +580,16 @@ impl App {
     }
 
     /// Open a folder with the desktop's file manager off the UI thread.
-    fn open_dir(&self, dir: PathBuf) {
-        let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
-            if let Err(e) = deck_core::platform::open_path(dir.as_os_str()) {
-                let _ = tx.send(AppEvent::Toast(
-                    crate::toast::ToastKind::Error,
-                    format!("Could not open the folder: {e}"),
-                ));
-                ctx.request_repaint();
-            }
-        });
+    fn open_dir(&mut self, dir: PathBuf) {
+        self.gw.native(
+            move || deck_core::platform::open_path(dir.as_os_str()).map_err(|e| e.to_string()),
+            |app, r| {
+                if let Err(e) = r {
+                    app.toasts
+                        .error(&app.ctx, format!("Could not open the folder: {e}"));
+                }
+            },
+        );
     }
 
     pub(super) fn show_changes_panel(&mut self, ui: &mut egui::Ui) {
@@ -646,7 +655,8 @@ mod tests {
     fn a_cwd_move_drops_the_old_repository_and_invalidates_requests() {
         let mut ch = loaded("/repo-a");
         assert_eq!(ch.view.load, LoadState::Ready);
-        let (list, diff) = (ch.list_generation, ch.diff_generation);
+        ch.seen_rev = 7;
+        let diff = ch.diff_generation;
 
         assert!(
             ch.retarget(1, PathBuf::from("/repo-b")),
@@ -655,10 +665,7 @@ mod tests {
         assert_eq!(ch.view.load, LoadState::Loading);
         assert!(ch.view.root.is_none() && ch.view.files.is_empty());
         assert!(ch.view.selected.is_none());
-        assert!(
-            ch.list_generation > list,
-            "an in-flight listing is now stale"
-        );
+        assert_eq!(ch.seen_rev, 0, "the new folder's listing is read afresh");
         assert!(ch.diff_generation > diff);
     }
 
@@ -696,10 +703,10 @@ mod tests {
     #[test]
     fn the_same_target_changes_nothing() {
         let mut ch = loaded("/repo-a");
-        let list = ch.list_generation;
+        ch.seen_rev = 4;
         assert!(!ch.retarget(1, PathBuf::from("/repo-a")));
         assert_eq!(ch.view.load, LoadState::Ready);
-        assert_eq!(ch.list_generation, list);
+        assert_eq!(ch.seen_rev, 4);
         assert_eq!(ch.view.files.len(), 1);
     }
 }

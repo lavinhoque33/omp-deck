@@ -367,9 +367,16 @@ model tracking, input ownership, transactional settings and notification policy.
 wake callbacks rather than an eframe loop; host observers can follow output without taking control.
 
 The [mobile companion contract](docs/notes/mobile-companion.md) records command parity and remaining
-slices. Only the shared in-process service is implemented here: no gateway/autostart, relay or PWA
-is enabled. Generic terminal subscribers receive state/text; host observers additionally receive VT
-replay/live bytes. Raw tmux/direct VT mirroring is a later transport requirement.
+slices. Implemented: the shared service and the per-user **gateway** (`omp-deck-gateway`). The desktop is a
+private-local-IPC client of the gateway, which owns sessions, jobs, watchers, settings and notifications and
+is started on demand (singleton per user/namespace). Settings → General → *Mobile access* chooses the lifetime:
+Off (default; the gateway still serves the desktop and exits after the last window and accepted work),
+While OmpDeck is open, or Always on (user systemd unit on Linux, logon scheduled task on Windows;
+enabling picks Always on). Installers and self-update drain the gateway before replacing binaries and
+resume it afterwards; uninstall removes only OmpDeck's registration. deb/rpm removal has no maintainer
+script: a running supervisor notices its missing program after ~30 s, removes its own registration and exits.
+No relay, pairing or PWA is enabled yet, and Windows gateway behavior has only been compile-checked from Linux.
+Control with the window closed is verified with real omp on Linux (`cargo test -p deck-service --test gateway_e2e`).
 
 Packaging scripts live in `packaging/`: `build-tarball.sh`, `appimage/build-appimage.sh`, `install.sh`,
 `install.ps1`, `windows/fetch-conpty.ps1`. CI runs on Linux and Windows; releases are built by GitHub Actions

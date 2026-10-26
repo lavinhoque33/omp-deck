@@ -634,7 +634,7 @@ pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::palettes::{NEUTRAL_DARK, NEUTRAL_LIGHT};
+    use super::palettes::of as palette_of;
     use super::*;
 
     /// Menus hover with `widgets.hovered.weak_bg_fill` on top of `window_fill`; if they match,
@@ -669,14 +669,23 @@ mod tests {
     }
 
     #[test]
-    fn neutral_palettes_are_flat_and_match_the_contract() {
-        for pal in [&NEUTRAL_DARK, &NEUTRAL_LIGHT] {
+    fn converted_palettes_keep_the_core_values() {
+        let (dark, light) = (
+            palette_of(UiStyle::Neutral, true),
+            palette_of(UiStyle::Neutral, false),
+        );
+        for pal in [dark, light] {
             assert_eq!(pal.accent_a, pal.accent);
             assert_eq!(pal.accent_b, pal.accent);
         }
-        assert_eq!(NEUTRAL_DARK.bg, Color32::from_rgb(0x0b, 0x0b, 0x0d));
-        assert_eq!(NEUTRAL_DARK.accent, Color32::from_rgb(0x2d, 0xd4, 0xbf));
-        assert_eq!(NEUTRAL_LIGHT.accent, Color32::from_rgb(0x0d, 0x94, 0x88));
+        assert_eq!(dark.bg, Color32::from_rgb(0x0b, 0x0b, 0x0d));
+        assert_eq!(dark.accent, Color32::from_rgb(0x2d, 0xd4, 0xbf));
+        assert_eq!(light.accent, Color32::from_rgb(0x0d, 0x94, 0x88));
+        let neon = palette_of(UiStyle::Neon, true);
+        assert_eq!(
+            neon.hover_line,
+            Color32::from_rgba_premultiplied(74, 65, 153, 153)
+        );
     }
 
     #[test]
@@ -695,15 +704,9 @@ mod tests {
         let mut c = Style::default();
         let mut f = Style::default();
         let look = look::look_of(UiStyle::Neutral);
-        build(&mut c, &NEUTRAL_DARK, true, true, Density::Compact, &look);
-        build(
-            &mut f,
-            &NEUTRAL_DARK,
-            true,
-            true,
-            Density::Comfortable,
-            &look,
-        );
+        let pal = palette_of(UiStyle::Neutral, true);
+        build(&mut c, pal, true, true, Density::Compact, &look);
+        build(&mut f, pal, true, true, Density::Comfortable, &look);
         assert!(c.spacing.interact_size.y < f.spacing.interact_size.y);
         assert!(c.spacing.item_spacing.y < f.spacing.item_spacing.y);
     }

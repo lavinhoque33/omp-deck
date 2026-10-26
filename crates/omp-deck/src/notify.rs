@@ -1,115 +1,60 @@
-//! Desktop notifications: a notifier thread per platform that
-//! shows them (Linux: `org.freedesktop.Notifications` over one zbus connection, raising the window
-//! with xdg-activation on Wayland; Windows: WinRT toasts filed under a tag and group, so they can be withdrawn). The UI thread only sends requests and
-//! drains signals; it never touches D-Bus or WinRT.
+//! Raising the window when a notification was clicked: the one native effect of a notification.
+//! The gateway shows, replaces and withdraws the desktop notifications and reports a click with
+//! the desktop's activation token; this window only has to come to the front with it (Wayland:
+//! `xdg-activation` on winit's own display, which winit cannot do with an external token).
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use deck_service::controller::SessionTarget;
-
-#[cfg(target_os = "linux")]
-mod linux;
-#[cfg(any(windows, test))]
-mod toast_xml;
 #[cfg(target_os = "linux")]
 mod wayland;
+
+/// The Windows AppUserModelID of OmpDeck (the Start-menu shortcut and the gateway's toasts carry
+/// the same one).
 #[cfg(windows)]
-mod windows_toast;
+const AUMID: &str = "io.github.lavinhoque33.OmpDeck";
 
-/// The Windows AppUserModelID of OmpDeck (the Start-menu shortcut carries the same one).
-#[cfg(any(windows, test))]
-pub const AUMID: &str = "io.github.lavinhoque33.OmpDeck";
-
-/// One notification to show.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Request {
-    /// The tab it is about (`None` = the settings test); a newer request for the same tab replaces
-    /// the older notification.
-    pub tab: Option<SessionTarget>,
-    pub title: String,
-    pub body: String,
-}
-
-/// What the notifier thread reports back.
+/// What the raise thread reports back.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Signal {
-    /// The user clicked the notification. `token` is the compositor's xdg-activation token.
-    Clicked {
-        tab: Option<SessionTarget>,
-        token: Option<String>,
-    },
-    /// The notification went away without a click (dismissed, expired, replaced by the server).
-    Gone { tab: Option<SessionTarget> },
-    /// Notifications cannot be shown (no notification service, WinRT failure); sent once.
-    Unavailable(String),
     /// A requested raise could not be done by the platform path: use `Focus` + attention instead.
     #[cfg(target_os = "linux")]
     RaiseFailed,
 }
 
 enum Cmd {
-    Show(Request),
-    Close(Option<SessionTarget>),
-    /// Withdraw every tab's notification (the settings test stays).
-    CloseAll,
     /// winit's `wl_display` and the window's `wl_surface` (raw pointers as integers).
     #[cfg(target_os = "linux")]
-    Window {
-        display: usize,
-        surface: usize,
-    },
+    Window { display: usize, surface: usize },
     /// Raise the window with this activation token.
     #[cfg(target_os = "linux")]
     Raise(String),
 }
 
-/// Signal sink of the notifier thread: sends and wakes the UI.
-#[derive(Clone)]
-struct Out {
-    tx: Sender<Signal>,
-    ctx: egui::Context,
-}
-
-impl Out {
-    fn send(&self, s: Signal) {
-        if self.tx.send(s).is_ok() {
-            self.ctx.request_repaint();
-        }
-    }
-}
-
-pub struct Notifier {
+/// A thread that owns the platform's raise path, so the UI thread never waits for it.
+pub struct WindowRaiser {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     tx: Sender<Cmd>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     rx: Receiver<Signal>,
 }
 
-impl Notifier {
-    /// Starts the notifier thread (it connects in the background; this never blocks).
-    pub fn start(ctx: egui::Context) -> Notifier {
+impl WindowRaiser {
+    /// Starts the raise thread (it binds the Wayland protocol in the background).
+    pub fn start(ctx: egui::Context) -> WindowRaiser {
         let (tx, cmds) = mpsc::channel();
         let (sig_tx, rx) = mpsc::channel();
-        let out = Out { tx: sig_tx, ctx };
-        let spawned = std::thread::Builder::new()
-            .name("omp-deck-notify".into())
-            .spawn(move || run(cmds, out));
-        if let Err(e) = spawned {
-            log::warn!("starting the notification thread failed: {e}");
+        #[cfg(target_os = "linux")]
+        {
+            let spawned = std::thread::Builder::new()
+                .name("omp-deck-raise".into())
+                .spawn(move || run(cmds, sig_tx, ctx));
+            if let Err(e) = spawned {
+                log::warn!("starting the window raise thread failed: {e}");
+            }
         }
-        Notifier { tx, rx }
-    }
-
-    pub fn show(&self, req: Request) {
-        let _ = self.tx.send(Cmd::Show(req));
-    }
-
-    /// Withdraw the notification of `tab` (best effort).
-    pub fn close(&self, tab: Option<SessionTarget>) {
-        let _ = self.tx.send(Cmd::Close(tab));
-    }
-
-    /// Withdraw every tab's notification (best effort); the settings test notification stays.
-    pub fn close_all(&self) {
-        let _ = self.tx.send(Cmd::CloseAll);
+        #[cfg(not(target_os = "linux"))]
+        let _ = (cmds, sig_tx, ctx);
+        WindowRaiser { tx, rx }
     }
 
     /// Hand the Wayland window over so a click can raise it (no-op on other windowing systems).
@@ -136,59 +81,48 @@ impl Notifier {
         }
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn drain(&self) -> Vec<Signal> {
         self.rx.try_iter().collect()
     }
 }
 
 #[cfg(target_os = "linux")]
-fn run(cmds: Receiver<Cmd>, out: Out) {
-    linux::run(cmds, &out);
-}
-
-#[cfg(windows)]
-fn run(cmds: Receiver<Cmd>, out: Out) {
-    windows_toast::run(cmds, &out);
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-fn run(cmds: Receiver<Cmd>, out: Out) {
-    out.send(Signal::Unavailable(
-        "desktop notifications are not supported on this platform".into(),
-    ));
-    for _ in cmds.iter() {}
+fn run(cmds: Receiver<Cmd>, out: Sender<Signal>, ctx: egui::Context) {
+    let send = |s: Signal| {
+        if out.send(s).is_ok() {
+            ctx.request_repaint();
+        }
+    };
+    let mut raiser: Option<wayland::Raiser> = None;
+    while let Ok(cmd) = cmds.recv() {
+        match cmd {
+            Cmd::Window { display, surface } => match wayland::Raiser::new(display, surface) {
+                Ok(r) => raiser = Some(r),
+                Err(e) => log::info!("Wayland window raise unavailable: {e}"),
+            },
+            Cmd::Raise(token) => match raiser.as_ref().map(|r| r.activate(&token)) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    log::warn!("xdg-activation failed: {e}");
+                    send(Signal::RaiseFailed);
+                }
+                None => send(Signal::RaiseFailed),
+            },
+        }
+    }
 }
 
 /// Windows: tells the shell which AppUserModelID this process belongs to (taskbar grouping and
 /// toast identity). Call once at startup.
 #[cfg(windows)]
 pub fn init_process() {
-    windows_toast::set_process_aumid();
-}
+    use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 
-/// Whether a `.lnk` file carries the `System.AppUserModel.ID` property with `aumid`: the property
-/// store is serialized into the shortcut as UTF-16 text.
-#[cfg(any(windows, test))]
-pub fn lnk_has_aumid(lnk: &[u8], aumid: &str) -> bool {
-    let needle: Vec<u8> = aumid.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    !needle.is_empty() && lnk.windows(needle.len()).any(|w| w == needle.as_slice())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lnk_detection_finds_the_utf16_aumid() {
-        let mut lnk = b"L\0\0\0 junk ".to_vec();
-        lnk.extend(AUMID.encode_utf16().flat_map(u16::to_le_bytes));
-        lnk.extend_from_slice(&[0, 0, 7, 7]);
-        assert!(lnk_has_aumid(&lnk, AUMID));
-        assert!(!lnk_has_aumid(&lnk, "io.github.other.App"));
-        assert!(
-            !lnk_has_aumid(AUMID.as_bytes(), AUMID),
-            "ASCII text is not the stored form"
-        );
-        assert!(!lnk_has_aumid(b"", AUMID));
+    let wide: Vec<u16> = AUMID.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call.
+    let hr = unsafe { SetCurrentProcessExplicitAppUserModelID(wide.as_ptr()) };
+    if hr < 0 {
+        log::warn!("SetCurrentProcessExplicitAppUserModelID failed: {hr:#x}");
     }
 }

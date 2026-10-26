@@ -519,10 +519,11 @@ fn mode(path: &Path) -> u32 {
 }
 
 #[test]
-fn user_dir_update_replaces_gui_and_host_with_executable_files() {
+fn user_dir_update_replaces_gui_gateway_and_host_with_executable_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("omp-deck"), "old gui").expect("write");
     std::fs::write(dir.path().join("omp-deck-host"), "old host").expect("write");
+    std::fs::write(dir.path().join("omp-deck-gateway"), "old gateway").expect("write");
     std::fs::write(dir.path().join("keep.txt"), "mine").expect("write");
     let dl = tempfile::tempdir().expect("tempdir");
     let tarball = dl.path().join("omp-deck-0.9.0-x86_64-linux.tar.gz");
@@ -531,6 +532,10 @@ fn user_dir_update_replaces_gui_and_host_with_executable_files() {
         &[
             ("omp-deck-0.9.0-x86_64-linux/omp-deck", b"new gui"),
             ("omp-deck-0.9.0-x86_64-linux/omp-deck-host", b"new host"),
+            (
+                "omp-deck-0.9.0-x86_64-linux/omp-deck-gateway",
+                b"new gateway",
+            ),
             (
                 "omp-deck-0.9.0-x86_64-linux/omp-deck.desktop",
                 b"[Desktop Entry]",
@@ -555,6 +560,10 @@ fn user_dir_update_replaces_gui_and_host_with_executable_files() {
         b"new host"
     );
     assert_eq!(
+        std::fs::read(dir.path().join("omp-deck-gateway")).expect("gateway"),
+        b"new gateway"
+    );
+    assert_eq!(
         std::fs::read(dir.path().join("keep.txt")).expect("keep"),
         b"mine"
     );
@@ -562,17 +571,14 @@ fn user_dir_update_replaces_gui_and_host_with_executable_files() {
     {
         assert_eq!(mode(&dir.path().join("omp-deck")), 0o755);
         assert_eq!(mode(&dir.path().join("omp-deck-host")), 0o755);
+        assert_eq!(mode(&dir.path().join("omp-deck-gateway")), 0o755);
     }
     assert_eq!(
         names(dir.path()),
-        ["keep.txt", "omp-deck", "omp-deck-host"],
+        ["keep.txt", "omp-deck", "omp-deck-gateway", "omp-deck-host"],
         "no temp files left"
     );
-    assert_eq!(applied.restart.0, dir.path().join("omp-deck"));
-    assert_eq!(
-        applied.restart.1,
-        std::env::args_os().skip(1).collect::<Vec<_>>()
-    );
+    assert_eq!(applied.executable, dir.path().join("omp-deck"));
 }
 
 #[test]
@@ -623,7 +629,7 @@ fn appimage_update_replaces_the_file_in_place() {
     #[cfg(unix)]
     assert_eq!(mode(&image), 0o755);
     assert_eq!(names(dir.path()), ["OmpDeck.AppImage"]);
-    assert_eq!(applied.restart.0, image);
+    assert_eq!(applied.executable, image);
 }
 
 #[test]
@@ -666,6 +672,7 @@ fn full_zip(path: &Path) {
             ("omp-deck.exe", b"new gui"),
             // Compress-Archive on Windows PowerShell 5 stores backslash separators.
             ("stage\\omp-deck-host.exe", b"new host"),
+            ("omp-deck-gateway.exe", b"new gateway"),
             ("conpty.dll", b"new conpty"),
             ("OpenConsole.exe", b"new console"),
         ],
@@ -683,6 +690,7 @@ fn windows_update_renames_files_aside_then_writes_the_new_ones() {
     for (n, new) in [
         ("omp-deck.exe", "new gui"),
         ("omp-deck-host.exe", "new host"),
+        ("omp-deck-gateway.exe", "new gateway"),
         ("conpty.dll", "new conpty"),
         ("OpenConsole.exe", "new console"),
     ] {
@@ -705,6 +713,7 @@ fn windows_update_renames_files_aside_then_writes_the_new_ones() {
         [
             "OpenConsole.exe",
             "conpty.dll",
+            "omp-deck-gateway.exe",
             "omp-deck-host.exe",
             "omp-deck.exe"
         ],
@@ -719,7 +728,7 @@ fn windows_update_works_on_a_fresh_folder() {
     let zip = dl.path().join("w.zip");
     full_zip(&zip);
     apply_windows_zip(dir.path(), &zip, STAMP).expect("apply");
-    assert_eq!(names(dir.path()).len(), 4);
+    assert_eq!(names(dir.path()).len(), 5);
 }
 
 #[test]
@@ -727,7 +736,7 @@ fn windows_update_rolls_everything_back_when_a_later_file_fails() {
     let dir = tempfile::tempdir().expect("tempdir");
     windows_install(dir.path());
     // The aside name of the last file (omp-deck.exe) is taken by a directory: its rename fails
-    // after the first three files were already swapped.
+    // after the first four files were already swapped.
     std::fs::create_dir(dir.path().join(format!("omp-deck.exe.old-{STAMP}"))).expect("mkdir");
     let dl = tempfile::tempdir().expect("tempdir");
     let zip = dl.path().join("w.zip");
@@ -745,6 +754,7 @@ fn windows_update_rolls_everything_back_when_a_later_file_fails() {
         [
             "OpenConsole.exe",
             "conpty.dll",
+            "omp-deck-gateway.exe",
             "omp-deck-host.exe",
             "omp-deck.exe",
             "omp-deck.exe.old-20260102030405"
@@ -759,10 +769,17 @@ fn a_zip_missing_a_file_is_rejected_before_anything_is_touched() {
     windows_install(dir.path());
     let dl = tempfile::tempdir().expect("tempdir");
     let zip = dl.path().join("w.zip");
-    make_zip(&zip, &[("omp-deck.exe", b"x"), ("omp-deck-host.exe", b"x")]);
+    make_zip(
+        &zip,
+        &[
+            ("omp-deck.exe", b"x"),
+            ("omp-deck-host.exe", b"x"),
+            ("omp-deck-gateway.exe", b"x"),
+        ],
+    );
     let err = apply_windows_zip(dir.path(), &zip, STAMP).expect_err("incomplete");
     assert!(err.to_string().contains("conpty.dll"), "{err}");
-    assert_eq!(names(dir.path()).len(), 4);
+    assert_eq!(names(dir.path()).len(), 5);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("omp-deck.exe")).expect("gui"),
         "old omp-deck.exe"
@@ -784,6 +801,7 @@ fn only_aside_files_of_managed_names_are_leftovers() {
     assert!(is_leftover("omp-deck.exe.old-20260102030405"));
     assert!(is_leftover("conpty.dll.old-20260102030405"));
     assert!(is_leftover("omp-deck-host.old-20260102030405"));
+    assert!(is_leftover("omp-deck-gateway.exe.old-20260102030405"));
     assert!(!is_leftover("omp-deck.exe"));
     assert!(!is_leftover("omp-deck.exe.old-2026"));
     assert!(!is_leftover("omp-deck.exe.old-2026010203040x"));
@@ -909,14 +927,23 @@ fn install_kind_override_values_parse_strictly() {
 }
 
 #[test]
-fn overridden_package_kinds_restart_the_current_exe() {
-    let cur = Some(PathBuf::from("/sandbox/omp-deck"));
+fn overridden_package_kinds_name_the_gui_beside_the_running_executable() {
+    // The running executable may be the gateway: the GUI is its sibling, never itself.
+    let cur = Some(Path::new("/sandbox").join("omp-deck-gateway"));
+    let gui = Path::new("/sandbox").join(if cfg!(windows) {
+        "omp-deck.exe"
+    } else {
+        "omp-deck"
+    });
+    assert_eq!(package_executable_for(true, cur.clone()), gui);
     assert_eq!(
-        restart_exe(true, cur.clone()),
-        PathBuf::from("/sandbox/omp-deck")
+        package_executable_for(false, cur),
+        PathBuf::from(PACKAGE_BIN)
     );
-    assert_eq!(restart_exe(false, cur), PathBuf::from(PACKAGE_BIN));
-    assert_eq!(restart_exe(true, None), PathBuf::from(PACKAGE_BIN));
+    assert_eq!(
+        package_executable_for(true, None),
+        PathBuf::from(PACKAGE_BIN)
+    );
 }
 
 #[test]

@@ -130,8 +130,18 @@ function Remove-Leftovers([string]$dir) {
     }
 }
 
+# Runs the installed gateway's maintenance command. A non-zero exit means accepted work is still running (or
+# the gateway failed): the caller stops instead of replacing files under it.
+function Invoke-Gateway([string]$exe, [string[]]$arguments) {
+    & $exe @arguments
+    if ($LASTEXITCODE -ne 0) { throw "omp-deck-gateway $($arguments -join ' ') failed (exit $LASTEXITCODE). Finish or stop the listed jobs and retry." }
+}
+
 if ($Uninstall) {
     Step 'Uninstalling OmpDeck'
+    # The gateway drains accepted jobs and removes only OmpDeck's own logon task; sessions keep running.
+    $gatewayExe = Join-Path $InstallDir 'omp-deck-gateway.exe'
+    if (Test-Path -LiteralPath $gatewayExe) { Invoke-Gateway $gatewayExe @('uninstall') }
     # Stop running instances so their exes can go; host daemons keep omp sessions alive, so tell the user.
     $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
             try { $_.Path -and $_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) } catch { $false }
@@ -251,7 +261,15 @@ try {
         $payload = $sub.FullName
     }
 
+    foreach ($required in 'omp-deck.exe', 'omp-deck-host.exe', 'omp-deck-gateway.exe') {
+        if (-not (Test-Path -LiteralPath (Join-Path $payload $required))) { throw "Unexpected archive layout: $required not found" }
+    }
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    # Ask the running gateway to stop taking work and drain accepted jobs before any file is replaced.
+    $gatewayExe = Join-Path $InstallDir 'omp-deck-gateway.exe'
+    if (Test-Path -LiteralPath $gatewayExe) {
+        Invoke-Gateway $gatewayExe @('drain', '--purpose', 'update')
+    }
     $stamp = Get-Date -Format 'yyyyMMddHHmmss'
     foreach ($item in Get-ChildItem -LiteralPath $payload -File) {
         $dest = Join-Path $InstallDir $item.Name
@@ -261,6 +279,10 @@ try {
         Say "  $($item.Name)"
     }
     Remove-Leftovers $InstallDir
+    # The complete bundle is in place: clear the barrier (even when mobile access is Off) and repair an enabled
+    # background registration for this install location.
+    $resumeError = $null
+    try { Invoke-Gateway $gatewayExe @('resume') } catch { $resumeError = $_.Exception.Message }
 
     # --- Start Menu shortcut --------------------------------------------------------------------------------
     $exe = Join-Path $InstallDir 'omp-deck.exe'
@@ -282,6 +304,7 @@ try {
 
     Say ''
     Say "OmpDeck $Version installed to $InstallDir"
+    if ($resumeError) { throw "OmpDeck files were installed, but the background gateway could not be resumed: $resumeError Run '$gatewayExe resume' after fixing the problem." }
 
     # --- omp --------------------------------------------------------------------------------------------------
     $ompFound = [bool](Get-Command omp -ErrorAction SilentlyContinue) -or

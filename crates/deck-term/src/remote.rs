@@ -12,22 +12,20 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::time::Instant;
 
-use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::event::WindowSize;
 
-use crate::core::{Listener, Notice, SharedTerm};
+use crate::core::Notice;
+use crate::engine::{Engine, OutputEvent};
+use crate::frontend::FrontendState;
 use crate::out::{PtyOut, WriteProgress};
-use crate::scan::OutputScan;
 use crate::wake::Wake;
 
-/// What a session host sends.
+/// What a session host (or, for a frontend, the gateway) sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteEvent {
     /// Whole-screen replay (VT bytes) that a fresh terminal turns into the host's state; the
-    /// local terminal is reset before it is applied.
+    /// local terminal is reset before it is applied. A frontend accepts input from its first
+    /// snapshot on, and again after [`Self::Disconnected`] once a new one arrived.
     Snapshot(Vec<u8>),
     /// Child output.
     Output(Vec<u8>),
@@ -39,10 +37,16 @@ pub enum RemoteEvent {
         cell_width: u16,
         cell_height: u16,
     },
+    /// Frontend only: owner state (key rules, input hold, win32 modifiers, clipboard role).
+    State(FrontendState),
     /// The child exited (`None`: no exit code, e.g. killed by a signal).
     Exited(Option<i32>),
     /// Another client attached to the session; this connection is over.
     Displaced,
+    /// Frontend only: the link to the owner is lost. The view stays, stale and read-only,
+    /// until a fresh [`Self::Snapshot`] (a re-established, identity-checked attach). Not an
+    /// exit. Other remotes treat it as [`Self::Closed`].
+    Disconnected,
     /// The connection ended.
     Closed,
 }
@@ -131,10 +135,6 @@ pub(crate) enum RemoteCmd {
     Kill,
 }
 
-/// Longest run of bytes parsed under one `Term` lock (alacritty's event loop uses the same
-/// bound), so a large snapshot never stalls the UI thread for long.
-const MAX_LOCKED: usize = 0x1_0000;
-
 /// Writer thread: forwards commands until `Detach`/`Kill` (or every sender is gone).
 /// Handled bytes advance even on failure for bounded detach; only successful input calls
 /// advance the separate delivery acknowledgement. A failed input closes the connection.
@@ -188,31 +188,27 @@ pub(crate) fn run_reader(mut rx: Box<dyn RemoteRx>, events: SyncSender<RemoteEve
     }
 }
 
-/// Parses remote output into the shared `Term` and reports session state changes.
+/// Feeds remote output through the terminal's [`Engine`] and reports session state changes.
 pub(crate) struct Feeder {
-    pub(crate) term: SharedTerm,
-    /// Config of the fresh `Term` a snapshot starts from.
-    pub(crate) config: Config,
-    pub(crate) listener: Listener,
-    pub(crate) scan: OutputScan,
+    pub(crate) engine: Arc<Engine>,
     pub(crate) out: Arc<PtyOut>,
     pub(crate) notices: Sender<Notice>,
     pub(crate) wake: Wake,
+    /// A gateway frontend (state and connectivity events apply).
+    pub(crate) frontend: bool,
 }
 
 impl Feeder {
     /// Runs until the reader is gone or the connection closed.
-    pub(crate) fn run(mut self, events: Receiver<RemoteEvent>) {
-        let mut parser: Processor = Processor::new();
+    pub(crate) fn run(self, events: Receiver<RemoteEvent>) {
         loop {
-            let event = match parser.sync_timeout().sync_timeout() {
+            let event = match self.engine.sync_deadline() {
                 Some(deadline) => {
                     match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                         Ok(event) => event,
                         Err(RecvTimeoutError::Timeout) => {
                             // The app never ended its synchronized update: show what it drew.
-                            parser.stop_sync(&mut *self.term.lock());
-                            self.listener.send_event(Event::Wakeup);
+                            self.engine.flush_sync_due();
                             continue;
                         }
                         Err(RecvTimeoutError::Disconnected) => return,
@@ -225,11 +221,10 @@ impl Feeder {
             };
             match event {
                 RemoteEvent::Snapshot(bytes) => {
-                    parser = Processor::new();
-                    self.reset();
-                    self.feed(&mut parser, &bytes);
+                    self.engine.reset(&bytes);
+                    self.notify(Notice::Reset);
                 }
-                RemoteEvent::Output(bytes) => self.feed(&mut parser, &bytes),
+                RemoteEvent::Output(bytes) => self.engine.feed(&bytes),
                 RemoteEvent::Resize {
                     cols,
                     rows,
@@ -237,81 +232,54 @@ impl Feeder {
                     cell_height,
                 } => {
                     if cols == 0 || rows == 0 {
-                        self.out.displaced();
-                        return self.notify(Notice::Closed);
+                        return self.close();
                     }
-                    self.term
-                        .lock()
-                        .resize(TermSize::new(usize::from(cols), usize::from(rows)));
-                    self.notify(Notice::Resized(WindowSize {
+                    let size = WindowSize {
                         num_cols: cols,
                         num_lines: rows,
                         cell_width,
                         cell_height,
-                    }));
+                    };
+                    self.engine.resize(size);
+                    self.notify(Notice::Resized(size));
                 }
-                RemoteEvent::Exited(code) => self.notify(Notice::Exited(code)),
+                RemoteEvent::State(state) => {
+                    if self.frontend {
+                        self.notify(Notice::State(state));
+                    }
+                }
+                RemoteEvent::Exited(code) => {
+                    self.engine.finish(OutputEvent::Exited(code));
+                    self.notify(Notice::Exited(code));
+                }
                 RemoteEvent::Displaced => {
                     self.out.displaced();
+                    self.engine.finish(OutputEvent::Closed);
                     self.notify(Notice::Displaced);
                 }
-                RemoteEvent::Closed => {
-                    self.out.displaced();
-                    return self.notify(Notice::Closed);
+                RemoteEvent::Disconnected if self.frontend => {
+                    self.notify(Notice::Disconnected);
                 }
+                RemoteEvent::Disconnected | RemoteEvent::Closed => return self.close(),
             }
         }
+    }
+
+    fn close(&self) {
+        self.out.displaced();
+        self.engine.finish(OutputEvent::Closed);
+        self.notify(Notice::Closed);
     }
 
     fn notify(&self, notice: Notice) {
         let _ = self.notices.send(notice);
         self.wake.now();
     }
-
-    /// Fresh `Term` at the current size (keeping focus state), fresh scanners.
-    fn reset(&mut self) {
-        {
-            let mut term = self.term.lock();
-            let size = TermSize::new(term.columns(), term.screen_lines());
-            let focused = term.is_focused;
-            *term = Term::new(self.config.clone(), &size, self.listener.clone());
-            term.is_focused = focused;
-        }
-        self.scan.reset();
-        self.notify(Notice::Reset);
-    }
-
-    fn feed(&mut self, parser: &mut Processor, bytes: &[u8]) {
-        for chunk in bytes.chunks(MAX_LOCKED) {
-            parser.advance(&mut *self.term.lock(), chunk);
-            self.scan.feed(chunk);
-            // Redraw unless all of it went into a pending synchronized update.
-            if parser.sync_bytes_count() < chunk.len() {
-                self.listener.send_event(Event::Wakeup);
-            }
-        }
-    }
 }
 
-/// Starts the reader, feeder and writer threads of a remote terminal; returns the writer's
-/// command queue and handle. A thread that cannot start ends the connection (`Closed`).
-pub(crate) fn start(
-    remote: Box<dyn Remote>,
-    feeder: Feeder,
-    progress: Arc<WriteProgress>,
-) -> (Sender<RemoteCmd>, Option<std::thread::JoinHandle<()>>) {
-    let (rx, tx) = remote.split();
-    let (cmd_tx, cmd_rx) = mpsc::channel();
-    let writer = std::thread::Builder::new()
-        .name("deck-term-remote-tx".into())
-        .spawn(move || run_writer(tx, cmd_rx, progress));
-    let writer = match writer {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            log::warn!("remote terminal writer thread: {e}");
-            None
-        }
-    };
+/// Starts the reader and feeder threads of a remote terminal. A thread that cannot start ends
+/// the connection (`Closed`).
+pub(crate) fn start(rx: Box<dyn RemoteRx>, feeder: Feeder) {
     // Bound decoded-but-unparsed frames. Without backpressure here a slow observer renderer
     // could drain the host's bounded socket queue into unbounded frontend memory.
     let (ev_tx, ev_rx) = mpsc::sync_channel(4);
@@ -330,7 +298,24 @@ pub(crate) fn start(
         let _ = notices.send(Notice::Closed);
         wake.now();
     }
-    (cmd_tx, writer)
+}
+
+/// Starts the writer thread of a remote terminal; returns its command queue and handle.
+pub(crate) fn spawn_writer(
+    tx: Box<dyn RemoteTx>,
+    progress: Arc<WriteProgress>,
+) -> (Sender<RemoteCmd>, Option<std::thread::JoinHandle<()>>) {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let writer = std::thread::Builder::new()
+        .name("deck-term-remote-tx".into())
+        .spawn(move || run_writer(tx, cmd_rx, progress));
+    match writer {
+        Ok(handle) => (cmd_tx, Some(handle)),
+        Err(e) => {
+            log::warn!("remote terminal writer thread: {e}");
+            (cmd_tx, None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +323,7 @@ pub(crate) mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::term::TermMode;
 
     use super::*;

@@ -147,7 +147,7 @@ impl Credentials {
 }
 
 /// A finished upload.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BackupOutcome {
     pub file: BackupFile,
     /// Old backups deleted by retention.

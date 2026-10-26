@@ -200,7 +200,7 @@ fn load_or_create_secret(path: &Path) -> io::Result<[u8; 32]> {
     read().ok_or_else(|| io::Error::other("ctl.key is unreadable"))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LiveStatus {
     Running,
@@ -209,7 +209,7 @@ pub enum LiveStatus {
     Aborted,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LiveAgent {
     pub id: String,
     pub name: String,
@@ -222,7 +222,7 @@ pub struct LiveAgent {
     pub model: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LiveSnapshot {
     pub pid: u32,
     pub session_file: Option<PathBuf>,
@@ -238,7 +238,7 @@ pub struct LiveSnapshot {
 
 /// What the main session runs right now. Unlike the session file (written from the first message
 /// on) this is known for a fresh session too.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LiveModel {
     /// `provider/id`.
     pub selector: String,
@@ -249,7 +249,7 @@ pub struct LiveModel {
 }
 
 /// One row of the `/context` category meter.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContextCategory {
     /// omp's id: `systemPrompt`, `systemTools`, `systemContext`, `skills`, `messages`.
     pub id: String,
@@ -258,7 +258,7 @@ pub struct ContextCategory {
 }
 
 /// omp's `computeSessionContextBreakdown` (what `/context` shows) plus per-tool schema tokens.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContextBreakdown {
     /// Model display name.
     pub model: Option<String>,
@@ -279,7 +279,7 @@ pub struct ContextBreakdown {
     pub computed_at_ms: i64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CtlCommand {
     Kill {
         id: String,
@@ -306,7 +306,7 @@ pub enum CtlCommand {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CtlReply {
     pub ok: bool,
     pub error: Option<String>,

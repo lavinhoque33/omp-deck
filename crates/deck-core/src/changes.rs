@@ -46,7 +46,7 @@ const DIFF_FLAGS: [&str; 15] = [
 ];
 
 /// Kind of change on one side (index vs HEAD, or worktree vs index).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Change {
     Modified,
     Added,
@@ -56,7 +56,7 @@ pub enum Change {
     TypeChanged,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChangedFile {
     /// Display path, repo-relative with `/` separators, lossy UTF-8 (untracked directories end
     /// in `/`).
@@ -73,7 +73,7 @@ pub struct ChangedFile {
     pub is_dir: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Changes {
     /// Work-tree root.
     pub root: PathBuf,
@@ -105,14 +105,14 @@ impl From<git::GitError> for ChangesError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffSide {
     Staged,
     Unstaged,
     Untracked,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileDiff {
     /// Unified diff text (empty for binary files and for mode/EOL-only changes git prints no
     /// hunks for).

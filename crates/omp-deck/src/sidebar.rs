@@ -28,13 +28,13 @@ use egui::{
 
 use crate::folder_scope;
 use crate::panes::Side;
-use crate::running::RunningSnapshot;
 use crate::scope_bar::{self, ScopeAction, ScopeInput, ScopeState};
 use crate::tabs::{self, Tab};
 use crate::theme::{self, Palette};
 use crate::transfer::{self, TransferKind};
 use crate::widgets::{empty_state, icon_text, menu_item, paint_icon};
 use crate::worktree_ui::{self, Family, Finishing, Head};
+use deck_service::gateway::running::RunningSnapshot;
 use deck_service::status::TabStatus;
 
 /// "now", "5m", "3h", "2d", "4w", "2y".
@@ -83,14 +83,12 @@ pub fn matches_filter(query_lower: &str, group: &ProjectGroup, entry: &SessionEn
         || entry.id.to_lowercase().starts_with(query_lower)
 }
 
-/// POSIX single-quote `s` (always quoted; embedded `'` becomes `'\''`).
-pub fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
 /// `omp --resume '<path>'` for pasting into a shell.
 pub fn resume_command(path: &Path) -> String {
-    format!("omp --resume {}", shell_quote(&path.to_string_lossy()))
+    format!(
+        "omp --resume {}",
+        deck_core::worktree::shell_quote(&path.to_string_lossy())
+    )
 }
 
 /// `("~/dev", "proj")` for `"~/dev/proj"`; a display without a usable last segment is all name.
@@ -2233,9 +2231,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_quoting() {
-        assert_eq!(shell_quote("/a/b.jsonl"), "'/a/b.jsonl'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    fn resume_command_quotes_the_path() {
         assert_eq!(
             resume_command(Path::new("/h/my dir/s.jsonl")),
             "omp --resume '/h/my dir/s.jsonl'"

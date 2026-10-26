@@ -81,7 +81,7 @@ pub fn context_label(tokens: Option<u64>, window: Option<u64>) -> String {
 }
 
 /// What the omp TUI is doing, read from its terminal title `π <glyph> <label>`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Activity {
     /// No omp title seen (yet): nothing is claimed.
     Unknown,

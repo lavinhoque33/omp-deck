@@ -138,7 +138,7 @@ impl App {
     // ------------------------------------------------------------ switcher
 
     fn switcher_items(&self) -> Vec<Item> {
-        let running = self.running.latest();
+        let running = self.gw.running();
         let mut items = Vec::new();
         for tab in &self.tabs {
             match tab {
@@ -166,7 +166,7 @@ impl App {
                 }),
             }
         }
-        let Some(groups) = self.watcher.latest() else {
+        let Some(groups) = self.groups() else {
             return items;
         };
         let open: Vec<&std::path::Path> = self.tabs.iter().filter_map(Tab::session_path).collect();
@@ -210,7 +210,7 @@ impl App {
     fn active_worktree(&self) -> Option<deck_core::worktree::Worktree> {
         let term = self.tabs.get(self.active).and_then(Tab::term);
         let cwd = term.map(|t| t.cwd.clone()).or_else(|| self.scope.clone())?;
-        let from_group = self.watcher.latest().and_then(|gs| {
+        let from_group = self.groups().and_then(|gs| {
             gs.iter()
                 .find(|g| g.cwd == cwd)
                 .and_then(|g| g.worktree.clone())
@@ -236,8 +236,7 @@ impl App {
             .and_then(Tab::term)
             .map(|t| t.cwd.clone())
             .or_else(|| self.scope.clone())?;
-        self.watcher
-            .latest()
+        self.groups()
             .and_then(|gs| {
                 gs.iter()
                     .find(|g| g.cwd == cwd)
@@ -252,14 +251,14 @@ impl App {
         let term = self.tabs.get(self.active).and_then(Tab::term);
         let session_tab = term.filter(|t| t.role == TabRole::Session);
         let actx: Option<ActionCtx> = session_tab.map(|t| self.action_ctx(t));
-        let omp = self.omp.is_some();
+        let omp = self.omp_found();
         let entry = self.active_session().and_then(|p| self.find_entry(&p));
         let cwd: Option<PathBuf> = term.map(|t| t.cwd.clone()).or_else(|| self.scope.clone());
-        let groups = self.watcher.latest();
+        let groups = self.groups();
         let worktree = self.active_worktree();
         let drive = self.drive_menu();
         let live = term.is_some_and(|t| !t.terminal().is_exited());
-        let can_stop = !self.backends.is_empty();
+        let can_stop = self.backends_available();
         let cfg = &self.cfg;
 
         let mut items: Vec<Item> = Vec::new();

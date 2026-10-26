@@ -31,7 +31,7 @@ const MAX_DEPTH: usize = 16;
 // Inventory
 
 /// One top-level session file with everything the hub shows without parsing the transcript.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InventoryEntry {
     pub id: String,
     pub path: PathBuf,
@@ -232,7 +232,7 @@ fn transcripts(dir: &Path) -> Vec<PathBuf> {
 
 /// Usage numbers of one session. Main-file numbers come from the main jsonl only;
 /// `subagent_cost` sums the sibling directory's transcripts.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionStats {
     pub user_messages: u32,
     pub assistant_turns: u32,

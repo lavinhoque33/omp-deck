@@ -1,5 +1,6 @@
 //! Background poller: which sessions are alive in the available backends (tmux and/or the
-//! OmpDeck host) and which omp session files they hold.
+//! OmpDeck host) and which omp session files they hold. The gateway runs the one poller and
+//! publishes its snapshot to clients.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10,26 +11,31 @@ use std::time::Duration;
 use deck_core::mux::session_name_for;
 use deck_core::mux::{Mux, MuxKind};
 
-use deck_service::statusfmt::Activity;
+use serde::{Deserialize, Serialize};
+
+use crate::statusfmt::Activity;
 
 /// Outcome of [`RunningSnapshot::resolve`]; both variants are the name `attach_or_create` gets.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SessionTarget {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Resolved {
     Attach(String),
     Create(String),
 }
 
-impl SessionTarget {
+impl Resolved {
     pub fn into_name(self) -> String {
         match self {
-            SessionTarget::Attach(n) | SessionTarget::Create(n) => n,
+            Resolved::Attach(n) | Resolved::Create(n) => n,
         }
     }
 }
 
 /// One poll result.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningSnapshot {
+    /// Backends exist but their poller could not start: this snapshot carries no information
+    /// (resolve with [`RunningSnapshot::resolve_for`] and `blind`).
+    pub blind: bool,
     pub alive: HashSet<String>,
     pub files: HashMap<String, Vec<PathBuf>>,
     /// Backend of each live session (the first one listing it); empty when unknown.
@@ -38,6 +44,8 @@ pub struct RunningSnapshot {
     /// What omp reports in the terminal title of each live session (`Activity::Unknown` is not
     /// stored). Only state changes alter the snapshot, not spinner frames.
     activities: HashMap<String, Activity>,
+    /// Live sessions whose live-control endpoint exists (a background fork may use it).
+    pub ctl: HashSet<String>,
 }
 
 impl RunningSnapshot {
@@ -52,11 +60,13 @@ impl RunningSnapshot {
             }
         }
         RunningSnapshot {
+            blind: false,
             alive,
             files,
             owners: HashMap::new(),
             held,
             activities: HashMap::new(),
+            ctl: HashSet::new(),
         }
     }
 
@@ -85,6 +95,11 @@ impl RunningSnapshot {
         self.owners.get(name).copied()
     }
 
+    /// Live session `name` has a live-control endpoint.
+    pub fn has_ctl(&self, name: &str) -> bool {
+        self.ctl.contains(name)
+    }
+
     /// Running = a live session holds the file, or the canonical tmux name for this id is
     /// alive without a known file (a fresh omp that has not opened its jsonl yet). A canonical
     /// session that holds a *different* file (after `/new`, `/fork`, `/resume`) does not make this
@@ -100,25 +115,25 @@ impl RunningSnapshot {
     /// Which session a tab for `path` must use: the one that holds the file; else `preferred`
     /// when it is not alive (create it) or alive without a known file (attach: a fresh omp);
     /// else — `preferred` runs another file now — a new name derived from it (`<preferred>-<ms>`).
-    pub fn resolve(&self, preferred: &str, path: Option<&Path>, unix_ms: u128) -> SessionTarget {
+    pub fn resolve(&self, preferred: &str, path: Option<&Path>, unix_ms: u128) -> Resolved {
         if let Some(holder) = path.and_then(|p| self.holder(p)) {
-            return SessionTarget::Attach(holder.to_owned());
+            return Resolved::Attach(holder.to_owned());
         }
         if !self.is_alive(preferred) {
-            return SessionTarget::Create(preferred.to_owned());
+            return Resolved::Create(preferred.to_owned());
         }
         match path {
             Some(_) if !self.files_of(preferred).is_empty() => {
-                SessionTarget::Create(format!("{preferred}-{unix_ms}"))
+                Resolved::Create(format!("{preferred}-{unix_ms}"))
             }
-            _ => SessionTarget::Attach(preferred.to_owned()),
+            _ => Resolved::Attach(preferred.to_owned()),
         }
     }
 
     /// Name for a tab when no trustworthy snapshot exists (the poller could not start): never
     /// attach to a possibly foreign session, always create `<preferred>-<ms>`.
-    pub fn resolve_blind(preferred: &str, unix_ms: u128) -> SessionTarget {
-        SessionTarget::Create(format!("{preferred}-{unix_ms}"))
+    pub fn resolve_blind(preferred: &str, unix_ms: u128) -> Resolved {
+        Resolved::Create(format!("{preferred}-{unix_ms}"))
     }
 
     /// [`resolve`](Self::resolve), or [`resolve_blind`](Self::resolve_blind) when `blind`.
@@ -128,7 +143,7 @@ impl RunningSnapshot {
         preferred: &str,
         path: Option<&Path>,
         unix_ms: u128,
-    ) -> SessionTarget {
+    ) -> Resolved {
         if blind {
             Self::resolve_blind(preferred, unix_ms)
         } else {
@@ -211,7 +226,13 @@ impl RunningMonitor {
                         }
                         guard.poke = false;
                     }
-                    let snap = poll(&muxes, &sessions_root);
+                    let mut snap = poll(&muxes, &sessions_root);
+                    snap.ctl = snap
+                        .alive
+                        .iter()
+                        .filter(|n| ctl_endpoint_exists(&deck_core::ctl::ctl_dir(&ctl_ns, n)))
+                        .cloned()
+                        .collect();
                     // An empty answer may be a failed query: never prune on it, a running
                     // omp's socket would be lost.
                     if !snap.alive.is_empty() {
@@ -245,7 +266,10 @@ impl RunningMonitor {
         if failed {
             // Resolve waiting requests against an empty snapshot; `is_blind` makes them pick
             // unique names instead of trusting it.
-            lock(&shared).latest = Some(Arc::new(RunningSnapshot::default()));
+            lock(&shared).latest = Some(Arc::new(RunningSnapshot {
+                blind: true,
+                ..RunningSnapshot::default()
+            }));
         }
         RunningMonitor {
             shared,
@@ -292,6 +316,16 @@ struct Polled {
     files: HashMap<String, Vec<PathBuf>>,
     /// Session name → current terminal title.
     titles: HashMap<String, String>,
+}
+
+/// Whether a session's control endpoint is up: its `ctl.sock` (Unix) or its named pipe
+/// (Windows, where the pipe name is the endpoint itself).
+pub fn ctl_endpoint_exists(dir: &Path) -> bool {
+    if cfg!(windows) {
+        dir.exists()
+    } else {
+        dir.join("ctl.sock").exists()
+    }
 }
 
 /// Asks every backend (blocking) and merges the answers.
@@ -381,11 +415,11 @@ mod tests {
         );
         assert_eq!(
             s.resolve("omp-a", Some(Path::new("/s/a.jsonl")), 42),
-            SessionTarget::Create("omp-a-42".into())
+            Resolved::Create("omp-a-42".into())
         );
         assert_eq!(
             s.resolve("omp-b", Some(Path::new("/s/b.jsonl")), 42),
-            SessionTarget::Attach("omp-a".into()),
+            Resolved::Attach("omp-a".into()),
             "attach to whichever tmux session holds the file"
         );
     }
@@ -396,17 +430,17 @@ mod tests {
         // Not alive: create under the canonical name.
         assert_eq!(
             s.resolve("omp-a", Some(Path::new("/s/a.jsonl")), 1),
-            SessionTarget::Create("omp-a".into())
+            Resolved::Create("omp-a".into())
         );
         // Alive, file unknown (fresh omp): attach.
         assert_eq!(
             s.resolve("omp-fresh", Some(Path::new("/s/x.jsonl")), 1),
-            SessionTarget::Attach("omp-fresh".into())
+            Resolved::Attach("omp-fresh".into())
         );
         // No file to compare (new tab): the preferred name as is.
         assert_eq!(
             snap(&[("omp-n", &["/s/z.jsonl"])], &["omp-n"]).resolve("omp-n", None, 1),
-            SessionTarget::Attach("omp-n".into())
+            Resolved::Attach("omp-n".into())
         );
     }
 
@@ -484,8 +518,8 @@ mod tests {
         alive.insert("omp-a".to_owned());
         let snap = RunningSnapshot::new(alive, HashMap::new());
         let t = snap.resolve_for(true, "omp-a", Some(Path::new("/x.jsonl")), 42);
-        assert_eq!(t, SessionTarget::Create("omp-a-42".into()));
+        assert_eq!(t, Resolved::Create("omp-a-42".into()));
         let t = snap.resolve_for(false, "omp-a", None, 42);
-        assert_eq!(t, SessionTarget::Attach("omp-a".into()));
+        assert_eq!(t, Resolved::Attach("omp-a".into()));
     }
 }

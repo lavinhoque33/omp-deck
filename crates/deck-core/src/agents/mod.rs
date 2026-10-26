@@ -18,7 +18,7 @@ pub use scan::AgentsScanner;
 pub use transcript::{TranscriptReader, TranscriptUpdate, TranscriptWatcher};
 pub use watcher::AgentsWatcher;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AgentStatus {
     Running,
     Done,
@@ -27,7 +27,7 @@ pub enum AgentStatus {
     Interrupted,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AgentSummary {
     /// File stem, e.g. "CoreStatus" or "M2cCore.M2cSaveService".
     pub id: String,
@@ -64,21 +64,21 @@ pub struct AgentSummary {
     pub output_path: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AgentsTarget {
     pub session: PathBuf,
     /// The tab's omp process is running.
     pub owner_alive: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AgentsSnapshot {
     pub session: PathBuf,
     /// Parent before child, newest first among siblings.
     pub agents: Vec<AgentSummary>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TranscriptItem {
     User {
         text: String,

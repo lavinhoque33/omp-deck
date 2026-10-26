@@ -1356,6 +1356,7 @@ mod tests {
                 graphics: &Graphics::new(
                     ui.ctx().clone(),
                     crate::wake::Wake::Gui(ui.ctx().clone()),
+                    true,
                 ),
                 preedit: "",
                 banner: None,

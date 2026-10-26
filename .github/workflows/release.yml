@@ -48,7 +48,7 @@ jobs:
         env:
           OMP_DECK_GOOGLE_CLIENT_ID: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_ID }}
           OMP_DECK_GOOGLE_CLIENT_SECRET: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_SECRET }}
-        run: cargo build --release -p omp-deck -p deck-host --locked
+        run: cargo build --release -p omp-deck -p deck-host -p deck-service --locked
 
       - name: Validate desktop file
         run: desktop-file-validate packaging/omp-deck.desktop
@@ -138,7 +138,7 @@ jobs:
         env:
           OMP_DECK_GOOGLE_CLIENT_ID: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_ID }}
           OMP_DECK_GOOGLE_CLIENT_SECRET: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_SECRET }}
-        run: cargo build --release -p omp-deck -p deck-host --locked --target ${{ matrix.target }}
+        run: cargo build --release -p omp-deck -p deck-host -p deck-service --locked --target ${{ matrix.target }}
 
       - name: Fetch ConPTY
         run: ./packaging/windows/fetch-conpty.ps1 -OutDir conpty -Arch ${{ matrix.arch }} -NoticeFile conpty/THIRD-PARTY-ConPTY.txt
@@ -151,7 +151,7 @@ jobs:
           $stage = Join-Path 'dist' "$name-stage"
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stage
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          foreach ($f in @("$rel/omp-deck.exe", "$rel/omp-deck-host.exe", 'conpty/conpty.dll', 'conpty/OpenConsole.exe', 'LICENSE-MIT', 'LICENSE-APACHE', 'README.md')) {
+          foreach ($f in @("$rel/omp-deck.exe", "$rel/omp-deck-host.exe", "$rel/omp-deck-gateway.exe", 'conpty/conpty.dll', 'conpty/OpenConsole.exe', 'LICENSE-MIT', 'LICENSE-APACHE', 'README.md')) {
             if (-not (Test-Path $f)) { throw "missing $f" }
             Copy-Item $f $stage
           }
@@ -236,7 +236,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "$($shell.Name): install.ps1 $extra failed ($LASTEXITCODE)" }
           }
           function Assert-Installed($label) {
-            foreach ($f in 'omp-deck.exe', 'omp-deck-host.exe', 'conpty.dll', 'OpenConsole.exe') {
+            foreach ($f in 'omp-deck.exe', 'omp-deck-host.exe', 'omp-deck-gateway.exe', 'conpty.dll', 'OpenConsole.exe') {
               if (-not (Test-Path -LiteralPath (Join-Path $installDir $f))) { throw "$label`: $f missing in $installDir" }
             }
             if (-not (Test-Path -LiteralPath $shortcut)) { throw "$label`: Start Menu shortcut missing" }

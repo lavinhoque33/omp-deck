@@ -8,8 +8,9 @@
 //!
 //! Verification / sandbox use only: `OMP_DECK_UPDATE_KIND` overrides [`detect`] with `deb`, `rpm`,
 //! `appimage:<file>`, `dir:<dir>` (a user dir, or a Windows dir on Windows) or `dev`; any other
-//! value is `Unsupported`. With an overridden `deb`/`rpm`, [`apply`] restarts the current
-//! executable instead of `/usr/bin/omp-deck`, so a sandboxed run never launches a system binary.
+//! value is `Unsupported`. With an overridden `deb`/`rpm`, [`Applied::executable`] is the `omp-deck`
+//! next to the current executable instead of `/usr/bin/omp-deck`, so a sandboxed run never names a
+//! system binary.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -35,10 +36,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest `.sha256` file read.
 const MAX_SHA_FILE: u64 = 4096;
 /// Names of the installed files, in replacement order. The host goes first so a half-finished
-/// update never leaves a new GUI talking to an old daemon launcher.
-const UNIX_BINARIES: [&str; 2] = ["omp-deck-host", "omp-deck"];
-const WINDOWS_FILES: [&str; 4] = [
+/// update never leaves a new GUI talking to an old daemon launcher; the gateway sits between the
+/// host it launches and the GUI that connects to it.
+const UNIX_BINARIES: [&str; 3] = ["omp-deck-host", "omp-deck-gateway", "omp-deck"];
+const WINDOWS_FILES: [&str; 5] = [
     "omp-deck-host.exe",
+    "omp-deck-gateway.exe",
     "conpty.dll",
     "OpenConsole.exe",
     "omp-deck.exe",
@@ -47,7 +50,7 @@ const WINDOWS_FILES: [&str; 4] = [
 const PACKAGE_BIN: &str = "/usr/bin/omp-deck";
 
 /// How this OmpDeck was installed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum InstallKind {
     /// `install.sh` / tarball: a writable directory holding `omp-deck` and `omp-deck-host`.
     UserDir {
@@ -69,7 +72,7 @@ pub enum InstallKind {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Release {
     /// `"0.9.0"` (tag without the leading `v`).
     pub version: String,
@@ -79,10 +82,12 @@ pub struct Release {
     pub page_url: String,
 }
 
-/// What to exec once the process has exited.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The installed result, independent of which process applied it (GUI, gateway or supervisor).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Applied {
-    pub restart: (PathBuf, Vec<OsString>),
+    /// The installed primary GUI executable (the AppImage file for AppImage installs). Callers
+    /// decide what to restart and with which arguments; this never carries a process's argv.
+    pub executable: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -546,50 +551,49 @@ fn stream_to(
 // ---------------------------------------------------------------------------------------------
 // Apply
 
-/// Installs the downloaded asset. The caller removes the download directory afterwards. Returns
-/// what to exec after the process exits.
+/// Installs the downloaded asset. The caller removes the download directory afterwards.
 pub fn apply(kind: &InstallKind, downloaded: &Path) -> Result<Applied, UpdateError> {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    match kind {
+    let executable = match kind {
         InstallKind::UserDir { dir } => {
             apply_tarball(dir, downloaded)?;
-            Ok(Applied {
-                restart: (dir.join("omp-deck"), args),
-            })
+            dir.join("omp-deck")
         }
         InstallKind::AppImage { file } => {
             install_executable(downloaded, file)?;
-            Ok(Applied {
-                restart: (file.clone(), args),
-            })
+            file.clone()
         }
         InstallKind::WindowsDir { dir } => {
             apply_windows_zip(dir, downloaded, &timestamp(SystemTime::now()))?;
-            Ok(Applied {
-                restart: (dir.join("omp-deck.exe"), args),
-            })
+            dir.join("omp-deck.exe")
         }
         InstallKind::Deb | InstallKind::Rpm => {
             install_package(kind, downloaded)?;
-            Ok(Applied {
-                restart: (package_restart_exe(), args),
-            })
+            package_executable()
         }
-        InstallKind::Dev => Err(UpdateError::Unsupported(
-            "a development build is updated by rebuilding".into(),
-        )),
-        InstallKind::Unsupported { reason } => Err(UpdateError::Unsupported(reason.clone())),
-    }
+        InstallKind::Dev => {
+            return Err(UpdateError::Unsupported(
+                "a development build is updated by rebuilding".into(),
+            ));
+        }
+        InstallKind::Unsupported { reason } => {
+            return Err(UpdateError::Unsupported(reason.clone()));
+        }
+    };
+    Ok(Applied { executable })
 }
 
-/// `/usr/bin/omp-deck`, or the current executable when the install kind was overridden.
-fn package_restart_exe() -> PathBuf {
-    restart_exe(kind_override().is_some(), std::env::current_exe().ok())
+/// `/usr/bin/omp-deck`, or the GUI beside the current executable when the kind was overridden.
+fn package_executable() -> PathBuf {
+    package_executable_for(kind_override().is_some(), std::env::current_exe().ok())
 }
 
-fn restart_exe(overridden: bool, current: Option<PathBuf>) -> PathBuf {
-    match current {
-        Some(exe) if overridden => exe,
+fn package_executable_for(overridden: bool, current: Option<PathBuf>) -> PathBuf {
+    match current.as_deref().and_then(Path::parent) {
+        Some(dir) if overridden => dir.join(if cfg!(windows) {
+            "omp-deck.exe"
+        } else {
+            "omp-deck"
+        }),
         _ => PathBuf::from(PACKAGE_BIN),
     }
 }
@@ -632,7 +636,7 @@ fn install_executable(src: &Path, dest: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
-/// Unpacks `omp-deck` and `omp-deck-host` from the release tarball into temp files in `dir`
+/// Unpacks `omp-deck`, `omp-deck-gateway` and `omp-deck-host` from the release tarball into temp files in `dir`
 /// (0755), then renames them over the installed files, host first.
 fn apply_tarball(dir: &Path, tarball: &Path) -> Result<(), UpdateError> {
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(File::open(tarball)?));

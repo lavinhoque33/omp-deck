@@ -10,9 +10,10 @@ use crate::icons::{
     ICON_SEARCH, ICON_SEARCH_X, ICON_SETTINGS_2, ICON_SLIDERS_HORIZONTAL, ICON_SPARKLES, ICON_SUN,
     ICON_TERMINAL, ICON_TRIANGLE_ALERT, ICON_WRENCH,
 };
-use deck_core::config::{Density, Theme, UiStyle};
+use deck_core::config::{Density, GatewayMode, Theme, UiStyle};
 use deck_core::mux::BackendChoice;
 use deck_core::omp::{Setting, SettingsCatalog};
+use deck_service::gateway::protocol::{Effective, GatewayStatus, Supervision};
 use egui::{
     Align2, Color32, CursorIcon, FontId, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind,
     Ui, Vec2, pos2, vec2,
@@ -216,6 +217,7 @@ pub struct SettingsInput<'a> {
     pub sync: SyncPage<'a>,
     pub notify: NotifyInput<'a>,
     pub app_update: crate::app_update::SettingsCard<'a>,
+    pub mobile: MobileCard<'a>,
 }
 
 /// The session-backend card: the stored choice and which backends exist on this machine.
@@ -256,6 +258,8 @@ pub enum SettingsAction {
     /// The project sync page.
     Sync(SyncAction),
     Notify(NotifyAction),
+    /// The gateway lifetime mode (Settings → Mobile access).
+    GatewayMode(GatewayMode),
     AppUpdate(crate::app_update::SettingsAction),
 }
 
@@ -983,6 +987,156 @@ fn general_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Setti
                 }
             },
         );
+    });
+
+    mobile_card(ui, input, actions);
+}
+
+/// What the Mobile access card shows: the gateway's own record of its lifetime mode.
+pub struct MobileCard<'a> {
+    /// `None` until the gateway has reported.
+    pub status: Option<&'a GatewayStatus>,
+    pub link_up: bool,
+    /// A mode change is in flight.
+    pub pending: bool,
+    /// Why the last change failed.
+    pub error: Option<&'a str>,
+}
+
+fn requested_text(mode: GatewayMode) -> &'static str {
+    match mode {
+        GatewayMode::Off => "Off",
+        GatewayMode::WhileOpen => "While open",
+        GatewayMode::Background => "Always on",
+    }
+}
+
+/// `(headline, detail)`: the headline fits a row, the detail wraps under it.
+type StatusText = (String, Option<String>);
+
+fn effective_text(e: &Effective) -> StatusText {
+    match e {
+        Effective::OnDemand => ("Runs while needed".to_owned(), None),
+        Effective::Background => ("Running in the background".to_owned(), None),
+        Effective::Maintenance(p) => (
+            "Maintenance".to_owned(),
+            Some(format!("{p:?}: draining, refusing new work")),
+        ),
+        Effective::Stopping => (
+            "Stopping".to_owned(),
+            Some("No window and no work left.".to_owned()),
+        ),
+    }
+}
+
+/// Strips a `Failed("…")` Debug wrapper a message may have been given on the way.
+fn plain_message(e: &str) -> &str {
+    e.strip_prefix("Failed(\"")
+        .and_then(|r| r.strip_suffix("\")"))
+        .unwrap_or(e)
+}
+
+fn supervision_text(s: &Supervision) -> StatusText {
+    match s {
+        Supervision::None => ("Not requested".to_owned(), None),
+        Supervision::Active { registration } => ("Active".to_owned(), Some(registration.clone())),
+        Supervision::Registered { registration } => (
+            "Registered, waiting for the supervisor".to_owned(),
+            Some(registration.clone()),
+        ),
+        Supervision::Failed(e) => (
+            "Registration failed".to_owned(),
+            Some(plain_message(e).to_owned()),
+        ),
+    }
+}
+
+/// One status line: the label keeps its natural width, the headline sits right-aligned in what
+/// remains (truncated, full text on hover) and the detail wraps in the card under the row.
+fn status_row(ui: &mut Ui, pal: &Palette, title: &str, headline: &str, detail: Option<&str>) {
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(RichText::new(title).color(pal.text_strong)).extend());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(egui::Label::new(RichText::new(headline).color(pal.text)).truncate())
+                .on_hover_text(headline);
+        });
+    });
+    if let Some(d) = detail {
+        ui.add(egui::Label::new(RichText::new(d).small().color(pal.weak)).wrap())
+            .on_hover_text(d);
+    }
+    ui.add_space(4.0);
+}
+
+/// The always-on gateway that mobile clients will use. Off by default; turning it on keeps the
+/// gateway running in the background.
+fn mobile_card(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<SettingsAction>) {
+    let pal = Palette::of_ui(ui);
+    let m = &input.mobile;
+    card(ui, "Mobile access", |ui| {
+        let mode = m.status.map_or(GatewayMode::Off, |s| s.mode);
+        let editable = m.link_up && m.status.is_some() && !m.pending;
+        let note = if m.pending {
+            "Applying the change…"
+        } else if !m.link_up {
+            "The gateway is not reachable right now."
+        } else {
+            "Keep the OmpDeck gateway running so sessions stay reachable without this window."
+        };
+        setting_row(ui, "Allow mobile access", note, |ui| {
+            ui.add_enabled_ui(editable, |ui| {
+                let mut on = mode != GatewayMode::Off;
+                if toggle(ui, &mut on).changed() {
+                    actions.push(SettingsAction::GatewayMode(if on {
+                        GatewayMode::Background
+                    } else {
+                        GatewayMode::Off
+                    }));
+                }
+            });
+        });
+        if mode != GatewayMode::Off {
+            setting_row(
+                ui,
+                "Gateway lifetime",
+                "Always on survives logins and crashes; While open stops with the last window.",
+                |ui| {
+                    ui.add_enabled_ui(editable, |ui| {
+                        let mut idx = usize::from(mode == GatewayMode::Background);
+                        if segmented(
+                            ui,
+                            &mut idx,
+                            &[(ICON_TERMINAL, "While open"), (ICON_CPU, "Always on")],
+                        ) {
+                            actions.push(SettingsAction::GatewayMode(if idx == 1 {
+                                GatewayMode::Background
+                            } else {
+                                GatewayMode::WhileOpen
+                            }));
+                        }
+                    });
+                },
+            );
+        }
+        if let Some(s) = m.status {
+            let jobs = if s.jobs.is_empty() {
+                ("No running jobs".to_owned(), None)
+            } else {
+                (format!("{} running job(s)", s.jobs.len()), None)
+            };
+            let lines = [
+                ("Requested", (requested_text(mode).to_owned(), None)),
+                ("Effective", effective_text(&s.effective)),
+                ("Supervision", supervision_text(&s.supervision)),
+                ("Jobs", jobs),
+            ];
+            for (title, (headline, detail)) in lines {
+                status_row(ui, pal, title, &headline, detail.as_deref());
+            }
+        }
+        if let Some(e) = m.error {
+            ui.add(egui::Label::new(RichText::new(e).color(pal.warn)).wrap());
+        }
     });
 }
 

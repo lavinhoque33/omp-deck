@@ -1,10 +1,10 @@
-//! The "New session in worktree…" and "Move to new worktree…" dialogs: form state, the checks that
-//! run on a worker (branch name, destination folder) and the form itself.
+//! The "New session in worktree…" and "Move to new worktree…" dialogs: form state, the checks
+//! (the gateway checks the branch name, a native worker the destination folder) and the form itself.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use deck_core::worktree::{self, RepoInfo, WorktreeError};
+use deck_core::worktree::{self, RepoInfo};
 use deck_service::controller::SessionTarget;
 use egui::{Id, RichText, TextEdit, Ui, vec2};
 
@@ -65,34 +65,36 @@ pub struct CheckReq {
     loc: Loc,
 }
 
-/// Its answer.
-pub struct CheckRes {
-    pub generation: u64,
-    branch: Result<(), String>,
+/// The folder part of a check.
+pub struct LocationRes {
     location: Option<Result<PathBuf, String>>,
     /// The text of the computed default location.
     auto_text: Option<String>,
 }
 
-/// One line for a failure (git's own stderr says it best).
-pub fn brief(e: &WorktreeError) -> String {
-    match e {
-        WorktreeError::Git { stderr, .. } | WorktreeError::Omp { stderr } if !stderr.is_empty() => {
-            stderr.lines().next().unwrap_or(stderr).trim().to_owned()
-        }
-        WorktreeError::NotARepo => "This folder is not a git repository".to_owned(),
-        other => other.to_string(),
+/// One line for a failure the gateway reported (git's own stderr says it best: the command
+/// prefix of its text is dropped).
+pub fn brief(text: &str) -> String {
+    let line = text.lines().next().unwrap_or(text).trim();
+    match line.split_once(" failed: ") {
+        Some((_, rest)) if !rest.is_empty() => rest.to_owned(),
+        _ => line.to_owned(),
     }
 }
 
 impl CheckReq {
-    /// Blocking (git, filesystem): call from a worker.
-    pub fn run(self) -> CheckRes {
-        let branch = if self.branch.trim().is_empty() {
-            Err("Enter a branch name".to_owned())
-        } else {
-            worktree::check_branch_name(&self.dir, &self.branch).map_err(|e| brief(&e))
-        };
+    /// The repository whose branch names are checked.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The branch to check (empty = nothing typed yet).
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Blocking (filesystem): call from a native worker.
+    pub fn locate(self) -> LocationRes {
         let (location, auto_text) = match self.loc {
             Loc::None => (None, None),
             Loc::Auto { base_setting } => {
@@ -119,9 +121,7 @@ impl CheckReq {
                 None,
             ),
         };
-        CheckRes {
-            generation: self.generation,
-            branch,
+        LocationRes {
             location,
             auto_text,
         }
@@ -222,7 +222,7 @@ impl WorktreeDialog {
     }
 
     /// The repository facts arrived.
-    pub fn on_repo(&mut self, result: Result<RepoInfo, WorktreeError>) {
+    pub fn on_repo(&mut self, result: Result<RepoInfo, String>) {
         match result {
             Ok(info) => {
                 self.base_ref = info
@@ -284,15 +284,22 @@ impl WorktreeDialog {
             .then(|| DEBOUNCE.saturating_sub(self.edited_at.elapsed()))
     }
 
-    /// A worker's answer; ignored unless it answers the latest edit.
-    pub fn apply(&mut self, res: CheckRes) {
-        if res.generation != self.generation {
+    /// The gateway's verdict on the branch name; ignored unless it answers the latest edit.
+    pub fn apply_branch(&mut self, generation: u64, res: Result<(), String>) {
+        if generation != self.generation {
             return;
         }
-        self.branch_v = match res.branch {
+        self.branch_v = match res {
             Ok(()) => Check::Ok(()),
             Err(e) => Check::Bad(e),
         };
+    }
+
+    /// The destination folder's verdict; ignored unless it answers the latest edit.
+    pub fn apply_location(&mut self, generation: u64, res: LocationRes) {
+        if generation != self.generation {
+            return;
+        }
         if let Some(text) = res.auto_text
             && self.loc_auto
         {
@@ -616,16 +623,21 @@ mod tests {
         d.edited_at -= DEBOUNCE;
         let first = d.take_check(None, None).expect("check");
         d.edited(); // the user kept typing
-        let answer = |generation, location: &str| CheckRes {
-            generation,
-            branch: Ok(()),
-            location: Some(Ok(PathBuf::from(location))),
-            auto_text: Some(location.to_owned()),
+        let answer = |d: &mut WorktreeDialog, generation, location: &str| {
+            d.apply_branch(generation, Ok(()));
+            d.apply_location(
+                generation,
+                LocationRes {
+                    location: Some(Ok(PathBuf::from(location))),
+                    auto_text: Some(location.to_owned()),
+                },
+            );
         };
-        d.apply(answer(first.generation, "/wt/old"));
+        answer(&mut d, first.generation, "/wt/old");
         assert!(!d.confirmable());
         assert!(d.location.is_empty());
-        d.apply(answer(d.generation, "/wt/new"));
+        let current = d.generation;
+        answer(&mut d, current, "/wt/new");
         assert!(d.confirmable());
         assert_eq!(d.location, "/wt/new");
     }
@@ -642,12 +654,14 @@ mod tests {
             .take_check(None, Some(Path::new("/home/u")))
             .expect("check");
         assert!(matches!(&req.loc, Loc::Typed { text, .. } if text == "/typed/here"));
-        d.apply(CheckRes {
-            generation: req.generation,
-            branch: Ok(()),
-            location: Some(Ok(PathBuf::from("/typed/here"))),
-            auto_text: Some("/auto/ignored".into()),
-        });
+        d.apply_branch(req.generation, Ok(()));
+        d.apply_location(
+            req.generation,
+            LocationRes {
+                location: Some(Ok(PathBuf::from("/typed/here"))),
+                auto_text: Some("/auto/ignored".into()),
+            },
+        );
         assert_eq!(
             d.location, "/typed/here",
             "an auto text never overwrites the user's"
@@ -672,22 +686,26 @@ mod tests {
     fn a_bad_name_or_a_repository_without_commits_blocks_confirmation() {
         let mut d = new_dialog();
         d.on_repo(Ok(info(true)));
-        d.apply(CheckRes {
-            generation: d.generation,
-            branch: Err("branch 'x' already exists".into()),
-            location: Some(Ok(PathBuf::from("/wt/x"))),
-            auto_text: None,
-        });
+        d.apply_branch(d.generation, Err("branch 'x' already exists".into()));
+        d.apply_location(
+            d.generation,
+            LocationRes {
+                location: Some(Ok(PathBuf::from("/wt/x"))),
+                auto_text: None,
+            },
+        );
         assert!(d.plan().is_none());
 
         let mut empty = new_dialog();
         empty.on_repo(Ok(info(false)));
-        empty.apply(CheckRes {
-            generation: empty.generation,
-            branch: Ok(()),
-            location: Some(Ok(PathBuf::from("/wt/x"))),
-            auto_text: None,
-        });
+        empty.apply_branch(empty.generation, Ok(()));
+        empty.apply_location(
+            empty.generation,
+            LocationRes {
+                location: Some(Ok(PathBuf::from("/wt/x"))),
+                auto_text: None,
+            },
+        );
         assert!(empty.plan().is_none());
     }
 
@@ -697,6 +715,7 @@ mod tests {
             Kind::Move {
                 uid: 7,
                 target: SessionTarget {
+                    epoch: deck_service::controller::ServiceEpoch([0; 16]),
                     key: SessionKey::tmux("test", "s"),
                     generation: 1,
                 },
@@ -709,12 +728,14 @@ mod tests {
         d.edited_at -= DEBOUNCE;
         let req = d.take_check(None, None).expect("check");
         assert!(matches!(req.loc, Loc::None));
-        d.apply(CheckRes {
-            generation: req.generation,
-            branch: Ok(()),
-            location: None,
-            auto_text: None,
-        });
+        d.apply_branch(req.generation, Ok(()));
+        d.apply_location(
+            req.generation,
+            LocationRes {
+                location: None,
+                auto_text: None,
+            },
+        );
         let Some(Plan::Move {
             uid, branch, base, ..
         }) = d.plan()

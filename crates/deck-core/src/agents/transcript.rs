@@ -379,7 +379,7 @@ fn map_message(line: &[u8], out: &mut Vec<TranscriptItem>) {
 }
 
 /// What a [`TranscriptReader::refresh`] found.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TranscriptUpdate {
     /// The file was replaced or shrank: `items` replace everything read before.
     pub reset: bool,

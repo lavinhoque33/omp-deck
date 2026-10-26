@@ -59,7 +59,7 @@ fn raw(handle: &OwnedHandle) -> HANDLE {
 }
 
 /// Current user's SID as a string (`S-1-5-21-…`).
-fn user_sid() -> Result<String> {
+pub fn user_sid() -> Result<String> {
     let mut token = null_mut();
     // SAFETY: valid out pointer; the pseudo handle of the current process needs no closing.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -101,18 +101,21 @@ fn user_sid() -> Result<String> {
 }
 
 /// 16 hex chars of sha256(current user SID string).
-pub(crate) fn user_key() -> Result<String> {
+pub fn user_key() -> Result<String> {
     let digest = Sha256::digest(user_sid()?.as_bytes());
     Ok(digest[..8].iter().map(|b| format!("{b:02x}")).collect())
 }
 
-pub(crate) struct Endpoint {
+pub struct Endpoint {
     name: String,
     pipe: Vec<u16>,
 }
 
 impl Endpoint {
     pub fn new(ns: &Namespace, name: &str) -> Result<Endpoint> {
+        if !crate::valid_session_name(name) {
+            return Err(Error::InvalidSessionName(name.to_owned()));
+        }
         Ok(Endpoint {
             name: name.to_owned(),
             pipe: wide(&format!("{}{name}", ns.pipe_prefix())),
@@ -120,7 +123,7 @@ impl Endpoint {
     }
 }
 
-pub(crate) fn connect(endpoint: &Endpoint) -> Result<Stream> {
+pub fn connect(endpoint: &Endpoint) -> Result<Stream> {
     for _ in 0..4 {
         // SAFETY: NUL-terminated name; no security attributes; no template.
         let handle = unsafe {
@@ -228,7 +231,7 @@ impl Drop for SecurityDescriptor {
 
 /// The daemon's pipe server. Exactly one instance listens at a time: a client connected to a
 /// second listening instance would wait for an accept that is blocked on the first.
-pub(crate) struct Listener {
+pub struct Listener {
     pipe: Vec<u16>,
     sd: SecurityDescriptor,
     /// The listening instance; `None` once removed.
@@ -402,7 +405,7 @@ struct Pipe {
 }
 
 /// A connected pipe; clones share the connection (each with its own wait events).
-pub(crate) struct Stream {
+pub struct Stream {
     pipe: Arc<Pipe>,
     read_event: OwnedHandle,
     write_event: OwnedHandle,

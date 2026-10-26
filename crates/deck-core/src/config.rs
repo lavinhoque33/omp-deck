@@ -113,6 +113,48 @@ pub struct AppConfig {
     pub changes_panel_width: f32,
     /// Split-view layout of the global tab set (`panes` index into `open_tabs`).
     pub split: Option<SplitState>,
+    /// Lifetime of the per-user mobile-companion gateway (`Off` for configs that predate it).
+    pub gateway_mode: GatewayMode,
+}
+
+/// How long the per-user gateway owner lives. `Off` disables mobile access and autostart (the
+/// native client still uses a private local gateway); `WhileOpen` keeps it while a GUI or accepted
+/// work remains; `Background` additionally keeps it supervised across logins and crashes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GatewayMode {
+    #[default]
+    Off,
+    WhileOpen,
+    Background,
+}
+
+impl GatewayMode {
+    pub const ALL: [GatewayMode; 3] = [
+        GatewayMode::Off,
+        GatewayMode::WhileOpen,
+        GatewayMode::Background,
+    ];
+
+    /// The lifetime chosen when mobile access is switched on without an explicit choice.
+    pub const ENABLED_DEFAULT: GatewayMode = GatewayMode::Background;
+
+    /// Mobile access (and so the gateway lifetime beyond the GUI) is enabled.
+    pub fn enabled(self) -> bool {
+        self != GatewayMode::Off
+    }
+
+    /// An OS autostart/supervision registration is wanted.
+    pub fn supervised(self) -> bool {
+        self == GatewayMode::Background
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GatewayMode::Off => "Off",
+            GatewayMode::WhileOpen => "While OmpDeck is open",
+            GatewayMode::Background => "In the background",
+        }
+    }
 }
 
 /// Most palette commands remembered in [`AppConfig::palette_recent`].
@@ -188,6 +230,7 @@ impl Default for AppConfig {
             changes_panel_width: 0.0,
             removed_worktrees: BTreeMap::new(),
             split: None,
+            gateway_mode: GatewayMode::Off,
         }
     }
 }
@@ -540,6 +583,26 @@ mod tests {
         assert_eq!(cfg.sidebar_width, 250.0);
         assert!(!cfg.native_decorations);
         assert!(cfg.check_updates);
+    }
+
+    #[test]
+    fn gateway_mode_defaults_off_and_survives_a_roundtrip() {
+        assert_eq!(
+            parse_config(br#"{"font_size": 12.0}"#)
+                .unwrap()
+                .gateway_mode,
+            GatewayMode::Off
+        );
+        let cfg = AppConfig {
+            gateway_mode: GatewayMode::Background,
+            ..AppConfig::default()
+        };
+        let bytes = serde_json::to_vec(&cfg).unwrap();
+        assert_eq!(
+            parse_config(&bytes).unwrap().gateway_mode,
+            GatewayMode::Background
+        );
+        assert!(parse_config(br#"{"gateway_mode": "Nope"}"#).is_err());
     }
 
     #[test]

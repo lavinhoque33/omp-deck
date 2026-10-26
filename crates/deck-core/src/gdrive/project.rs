@@ -68,7 +68,7 @@ impl Parts {
 }
 
 /// The project's `.omp` directory as found on disk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OmpDir {
     Missing,
     /// The folder is `$HOME`: its `.omp` is omp's global directory, not a project one.
@@ -82,7 +82,7 @@ pub enum OmpDir {
 }
 
 /// The project's sharpshooter memory bank as found on disk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MemoryBank {
     /// The bank folder is absent, or none of its three files is a non-empty regular file.
     Missing,
@@ -91,7 +91,7 @@ pub enum MemoryBank {
 }
 
 /// One session of a project as the Sync page lists it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionSize {
     pub id: String,
     /// Title, else first-prompt snippet, else "(untitled)".
@@ -101,7 +101,7 @@ pub struct SessionSize {
     pub bytes: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectSizes {
     pub omp: OmpDir,
     /// The project's memory bank.
@@ -141,7 +141,7 @@ pub fn path_id(project: &Path) -> String {
     hex(&digest[..8])
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Stage {
     /// Reading the project (items = sessions).
     Scanning,
@@ -160,7 +160,7 @@ pub enum Stage {
 }
 
 /// Progress of the running stage, in bytes or items depending on [`Stage`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Progress {
     pub stage: Stage,
     pub done: u64,
@@ -186,7 +186,7 @@ pub struct ProjectSynced {
 }
 
 /// One Drive file, described by its appProperties (nothing is downloaded).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectBackup {
     pub file: BackupFile,
     pub host: String,
@@ -225,7 +225,7 @@ impl ProjectBackup {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProjectBackupOutcome {
     pub backup: ProjectBackup,
     pub synced: ProjectSynced,
@@ -237,7 +237,7 @@ pub struct ProjectBackupOutcome {
 }
 
 /// A session the restore would add.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionPlan {
     pub id: String,
     pub title: String,
@@ -251,7 +251,7 @@ pub struct SessionPlan {
     pub problem: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectRestorePlan {
     pub target: PathBuf,
     /// The target folder does not exist; applying creates it.
@@ -289,7 +289,7 @@ pub struct PreparedProjectRestore {
     stage: Staging,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProjectRestoreReport {
     pub omp_written: usize,
     pub omp_overwritten: usize,

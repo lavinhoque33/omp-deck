@@ -47,7 +47,7 @@ const POLL: Duration = Duration::from_millis(250);
 // ---- model -------------------------------------------------------------------------------------
 
 /// What an entry is; mirrors omp's entry types (session-tree.md §1 row-text table).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NodeKind {
     // `type == "message"`, by `message.role`
     User,
@@ -85,7 +85,7 @@ impl NodeKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TreeNode {
     pub id: String,
     pub parent: Option<String>,
@@ -105,7 +105,7 @@ pub struct TreeNode {
 }
 
 /// The tree of one session file.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionTree {
     /// File order; shared between successive snapshots of a watched file.
     pub nodes: Vec<Arc<TreeNode>>,

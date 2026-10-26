@@ -1,15 +1,14 @@
-//! App-side glue for the Usage view and the status-bar usage chip: the fetch workers, the
-//! schedule (see [`crate::usage_state`]), and the modal's open/close/refresh.
+//! App-side glue for the Usage view and the status-bar usage chip: the gateway owns the fetch
+//! schedule and the `omp usage` runs (see `Topic::Usage`); the window adopts its view, reads the
+//! activity statistics on demand and sends the manual refresh.
 
 use std::time::{Instant, SystemTime};
 
-use deck_core::usage::{
-    ACTIVITY_DAYS, DEFAULT_FETCH_TIMEOUT, activity, fetch_usage, stats_db_path,
-};
+use deck_core::usage::ACTIVITY_DAYS;
+use deck_service::gateway::protocol::{Answer, Mutation, Query, Topic};
 use egui::{Key, Modifiers};
 
-use super::{App, AppEvent};
-use crate::omp_worker;
+use super::App;
 use crate::usage_state::UsageEvent;
 use crate::usage_view::{self, UsageAction, ViewInput};
 
@@ -20,17 +19,19 @@ fn now_ms() -> i64 {
 }
 
 impl App {
-    /// Per frame: apply finished fetches, start due ones, keep the "resets in" labels fresh.
-    pub(super) fn drive_usage(&mut self, ctx: &egui::Context) {
+    /// Per frame: adopt the gateway's usage view, keep the "resets in" labels fresh.
+    pub(super) fn drive_usage(&mut self) {
+        let rev = self.gw.revision(&Topic::Usage);
+        if rev != self.usage_rev {
+            self.usage_rev = rev;
+            if let Some(view) = self.gw.usage() {
+                self.usage.adopt(&view, now_ms());
+            }
+        }
+        self.usage.omp_found(self.omp_found());
         let now = Instant::now();
         if self.usage.recompute_due(now) {
             self.usage.recompute(now, now_ms());
-        }
-        if self.usage.auto_due(now) {
-            self.start_usage_fetch(false);
-        }
-        if let Some(wait) = self.usage.next_due(now) {
-            ctx.request_repaint_after(wait);
         }
     }
 
@@ -49,11 +50,7 @@ impl App {
 
     pub(super) fn open_usage(&mut self) {
         self.usage_open = true;
-        let now = Instant::now();
-        if self.usage.open_due(now) {
-            self.start_usage_fetch(false);
-        }
-        if self.usage.activity_due(now) {
+        if self.usage.activity_due(Instant::now()) {
             self.start_activity_read();
         }
     }
@@ -63,31 +60,36 @@ impl App {
         self.focus_pending = true;
     }
 
-    /// `omp usage --json` on a worker; `invalidate` first drops omp's report cache.
-    fn start_usage_fetch(&mut self, invalidate: bool) {
-        let Some(omp) = self.omp.clone() else {
-            return;
-        };
-        self.usage.begin_fetch(Instant::now());
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            AppEvent::Usage(UsageEvent::Fetched(
-                fetch_usage(&omp, invalidate, DEFAULT_FETCH_TIMEOUT).map_err(|e| e.to_string()),
-            ))
-        });
+    /// The gateway re-fetches the quotas now (`omp usage --json` with omp's report cache dropped).
+    fn start_usage_fetch(&mut self) {
+        self.gw
+            .mutate(Mutation::UsageRefresh { force: true }, |app, r| {
+                if let Err(e) = r {
+                    app.toasts
+                        .error(&app.ctx, format!("Usage refresh failed: {e}"));
+                }
+            });
     }
 
-    /// `stats.db` (read-only) on a worker.
+    /// `stats.db` (read by the gateway, read-only).
     fn start_activity_read(&mut self) {
         self.usage.begin_activity();
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            AppEvent::Usage(UsageEvent::Activity(
-                activity(&stats_db_path(), ACTIVITY_DAYS).map_err(|e| e.to_string()),
-            ))
-        });
+        self.gw.query(
+            Query::UsageActivity {
+                days: ACTIVITY_DAYS,
+            },
+            |app, r| {
+                let r = r.and_then(|a| match a {
+                    Answer::UsageActivity(a) => Ok(a),
+                    other => Err(format!("unexpected answer: {other:?}")),
+                });
+                app.on_usage_event(UsageEvent::Activity(r));
+            },
+        );
     }
 
     pub(super) fn on_usage_event(&mut self, ev: UsageEvent) {
-        self.usage.apply(ev, Instant::now(), now_ms());
+        self.usage.apply(ev, Instant::now());
     }
 
     /// Per frame: draw the Usage view while it is open and run what it asks for.
@@ -104,7 +106,7 @@ impl App {
             activity_error: self.usage.activity_error(),
             activity_loading: self.usage.activity_loading(),
             fetching: self.usage.fetching(),
-            age_secs: self.usage.age_secs(now),
+            age_secs: self.usage.age_secs(now_ms()),
         };
         let actions = usage_view::show(ctx, &mut self.usage_ui, &input);
         // "Updated Xs ago" ticks while the view is open.
@@ -114,7 +116,7 @@ impl App {
                 UsageAction::Close => self.close_usage(),
                 UsageAction::Refresh => {
                     if self.usage.can_refresh() {
-                        self.start_usage_fetch(true);
+                        self.start_usage_fetch();
                         if self.usage.activity_due(now) {
                             self.start_activity_read();
                         }

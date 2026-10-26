@@ -59,7 +59,7 @@ pub(crate) struct ViewState {
     held_keys: Vec<egui::Key>,
     /// Modifiers the child last saw in win32-input-mode (each change is sent as modifier key
     /// records, see [`input::encode_win32_modifiers`]).
-    win32_mods: Mods,
+    pub(crate) win32_mods: Mods,
 }
 
 impl ViewState {
@@ -321,7 +321,7 @@ impl<'a> TerminalView<'a> {
             metrics.cell_w_px as u16,
             metrics.cell_h_px as u16,
         );
-        let (cols, rows) = if term.is_read_only() {
+        let (cols, rows) = if term.follows_remote_geometry() {
             let state = term.term.lock();
             (state.columns(), state.screen_lines())
         } else {
@@ -558,11 +558,8 @@ impl Terminal {
             self.key_rules(),
             self.view.win32_mods,
         );
-        self.write(&bytes);
         // Kitty CSI-u and win32 records encode Ctrl+C without a 0x03 byte; omp still sees it.
-        if key == Key::Char('c') && mods == Mods::CTRL {
-            self.note_ctrl_c();
-        }
+        self.write_input(&bytes, key == Key::Char('c') && mods == Mods::CTRL);
     }
 }
 
@@ -671,12 +668,12 @@ fn handle_keyboard(term: &mut Terminal, events: &[Event], modifiers: Modifiers, 
                         rules,
                     );
                     if !bytes.is_empty() {
-                        term.write(&bytes);
                         // Kitty CSI-u and win32 records encode Ctrl+C without a 0x03 byte;
                         // omp still sees it.
-                        if k == Key::Char('c') && mods == Mods::CTRL && *pressed {
-                            term.note_ctrl_c();
-                        }
+                        term.write_input(
+                            &bytes,
+                            k == Key::Char('c') && mods == Mods::CTRL && *pressed,
+                        );
                         after_input(term);
                     }
                 } else if let Some(t) = text {
@@ -701,7 +698,7 @@ fn handle_keyboard(term: &mut Terminal, events: &[Event], modifiers: Modifiers, 
                 }
                 let bytes =
                     input::encode_key(&KeyInput::press(Key::Char(c), Mods::CTRL), mode, rules);
-                term.write(&bytes);
+                term.write_input(&bytes, c == 'c');
                 after_input(term);
             }
             Event::Ime(ImeEvent::Preedit { text, .. }) => {

@@ -1,4 +1,6 @@
-//! The eframe application: wires sessions, session backends, tabs, persistence and the terminal widget.
+//! The eframe application: a window onto the OmpDeck gateway. Sessions, scans, settings and
+//! notifications live in the gateway; this window owns tabs, splits, focus, dialogs and the
+//! native effects (pickers, clipboard, window raise), and talks to the gateway asynchronously.
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufWriter;
@@ -11,22 +13,25 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::icons::{
     ICON_CLIPBOARD_LIST, ICON_COPY, ICON_EXTERNAL_LINK, ICON_TERMINAL, ICON_TRIANGLE_ALERT,
 };
-use deck_core::agents::{AgentsTarget, AgentsWatcher};
-use deck_core::config::{AppConfig, Density, FolderTabs, TabState, Theme, UiStyle, WindowGeometry};
-use deck_core::fleet::FleetWatcher;
-use deck_core::mux::{BackendChoice, MuxKind};
-use deck_core::mux::{new_session_name, session_name_for};
-use deck_core::omp::{
-    MoveKind, MoveOutcome, Omp, Setting, UpdateKind, UpdateStatus, fork_argv, install_argv,
-    update_argv,
+use deck_core::agents::AgentsTarget;
+use deck_core::config::{
+    AppConfig, Density, FolderTabs, GatewayMode, TabState, Theme, UiStyle, WindowGeometry,
 };
+use deck_core::mux::{BackendChoice, MuxKind, new_session_name, session_name_for};
+use deck_core::omp::{DeleteTarget, MoveKind, MoveOutcome, Setting, UpdateKind, fork_argv};
 use deck_core::platform;
-use deck_core::sessions::{
-    ProjectGroup, SessionEntry, SessionWatcher, SessionsRoot, abbreviate_home, find_fork,
-};
-use deck_core::status::{StatusTarget, StatusWatcher};
+use deck_core::sessions::{ProjectGroup, SessionEntry, abbreviate_home};
 use deck_core::worktree::Worktree;
-use deck_term::{Clipboard, TermTheme, TerminalView};
+use deck_service::controller::{RequestId, SessionTarget};
+use deck_service::gateway::client::{ClientEvent, GatewayOptions, Pending};
+use deck_service::gateway::protocol::{
+    Answer, Done, GatewayError, GatewayStatus, Mutation, Outcome, Query, Role, Tool, Topic,
+};
+use deck_service::gateway::running::RunningSnapshot;
+use deck_service::settings::{self, Edit, SettingsError};
+use deck_service::status::TabStatus;
+use deck_service::statusfmt::Activity;
+use deck_term::{Clipboard, TerminalView};
 use egui::{Frame, Key, Margin, Modifiers, RichText};
 use serde_json::Value;
 
@@ -38,19 +43,18 @@ use crate::clipboard_bridge;
 use crate::confirm::{self, Confirm};
 use crate::dashboard::DashState;
 use crate::folder_scope;
+use crate::gw::{Gw, LinkView};
 use crate::model_picker::{ModelsCache, PickerState};
 use crate::notify_view::NotifyInput;
 use crate::omp_settings::{config_dir_display, defaults_from_catalog};
-use crate::omp_worker::{self, MovedTab, OmpEvent};
 use crate::palette::PaletteState;
 use crate::panes::Split;
-use crate::running::{RunningMonitor, RunningSnapshot};
 use crate::settings_page::{self, SettingsAction, SettingsInput, SettingsState};
 use crate::sidebar::{self, MenuEnv, SidebarAction, SidebarCache, SidebarInput};
 use crate::statusbar;
 use crate::tabs::{
-    self, Anchor, ClosedTab, CopyPending, ReopenStack, Tab, TabAction, TabBarInput, TabRole,
-    TermTab,
+    self, Anchor, ClosedTab, CopyPending, MovedTab, ReopenStack, Tab, TabAction, TabBarInput,
+    TabRole, TermTab,
 };
 use crate::theme::{self, Palette};
 use crate::titlebar::{self, BarAction, BarInput, OmpBar};
@@ -58,14 +62,9 @@ use crate::toast::{ToastAction, ToastClick, ToastKind, Toasts};
 use crate::transfer::{self, FolderDialog, FolderOutcome, TransferKind};
 use crate::ui_fonts;
 use crate::update::UpdateTracker;
-use crate::usage_state::{Usage, UsageEvent};
+use crate::usage_state::Usage;
 use crate::usage_view;
 use crate::widgets::{empty_state, icon_text, menu_item};
-use deck_service::backend::Backends;
-use deck_service::controller::{RequestId, RequestKeys, SessionTarget};
-use deck_service::settings::{self, Edit, PendingEdit, SettingsError, SettingsService};
-use deck_service::status::TabStatus;
-use deck_service::statusfmt::Activity;
 
 mod agents;
 mod app_update;
@@ -86,12 +85,9 @@ mod worktree;
 
 use session_manager::MovePrep;
 use spawn::{Focus, Post, SpawnReq};
-use worktree::{WtEvent, WtUi};
+use worktree::WtUi;
 
-const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
-/// How often the settings file is re-read for commits of other processes.
-const SETTINGS_RELOAD: Duration = Duration::from_secs(1);
 const REFRESH_SPIN: Duration = Duration::from_millis(800);
 const MIN_FONT: f32 = 8.0;
 const MAX_FONT: f32 = 40.0;
@@ -100,24 +96,24 @@ const DEFAULT_FONT: f32 = 14.0;
 const TOAST_QUIT: u64 = 1;
 /// How often the sidebar's age chips are refreshed (they only change by minutes).
 const AGE_REFRESH: Duration = Duration::from_secs(15);
-/// How often a pending copy looks for its new session file, and for how long.
-const COPY_POLL: Duration = Duration::from_secs(1);
-const COPY_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long exit waits for the gateway to acknowledge the final settings.
+const EXIT_WAIT: Duration = Duration::from_secs(5);
+/// How long after an installer run the gateway may take to find the new omp.
+const INSTALL_WAIT: Duration = Duration::from_secs(5);
 
 pub struct AppInit {
     pub cli: Cli,
+    /// Native window geometry and appearance, read before the window opened; the committed
+    /// settings come from the gateway and are adopted as soon as they arrive.
     pub cfg: AppConfig,
-    /// Owner of the settings file (the config above is its snapshot at startup).
-    pub settings: SettingsService,
-    pub backends: Backends,
+    /// The gateway profile this window is a client of.
+    pub profile: deck_service::gateway::Profile,
     /// UI font bytes, read before the window opens.
     pub ui_fonts: ui_fonts::UiFonts,
     /// The command-line folder, already resolved (`None` = none given).
     pub folder: Option<Result<PathBuf, String>>,
     /// Process working directory at startup: base of relative typed scope paths.
     pub start_dir: PathBuf,
-    /// The installed control extension; `None` = live control unavailable (read-only agents).
-    pub ctl_ext: Option<PathBuf>,
 }
 
 enum ShotState {
@@ -131,40 +127,9 @@ struct ShotPlan {
     state: ShotState,
 }
 
-/// Results from worker threads, delivered through a channel and drained each frame.
+/// Results from native worker threads, delivered through a channel and drained each frame.
 enum AppEvent {
     Toast(ToastKind, String),
-    Omp(OmpEvent),
-    /// A poll for the copy's new session file finished (`None` = not there yet).
-    ForkFound {
-        copy_id: u64,
-        path: Option<PathBuf>,
-    },
-    /// The old session of a restart-with-control is gone (or refused to go): relaunch.
-    RestartReady {
-        /// Where the restarted tab goes in the strip.
-        anchor: Option<Anchor>,
-        tab: ClosedTab,
-        stopped: Result<(), String>,
-    },
-    /// A session tab's control directory is ready: spawn its terminal.
-    SpawnPrepared(spawn::Prepared),
-    /// A headless fork from the session tree finished: the new session file.
-    TreeForked(Result<PathBuf, String>),
-    /// A usage fetch / `stats.db` read finished.
-    Usage(UsageEvent),
-    /// The session manager's scan / statistics / bulk-operation workers reported.
-    Sessions(session_manager::SessionsEvent),
-    /// A Google Drive backup job finished.
-    Drive(drive::DriveEvent),
-    /// A project sync worker finished.
-    Sync(project_sync::SyncEvent),
-    /// A git worktree worker finished.
-    Worktree(WtEvent),
-    /// A Changes panel git worker finished.
-    Changes(changes::ChangesEvent),
-    /// An OmpDeck self-update worker reported.
-    AppUpdate(app_update::AppUpdateEvent),
 }
 
 /// A modal question awaiting the user's answer, with what to do on "yes".
@@ -215,7 +180,7 @@ enum PendingConfirm {
     /// Kill the live sessions (by backend name) checked in the session manager's Running view.
     KillRunning(Vec<String>),
     /// Restore a downloaded Google Drive backup over the local omp config.
-    RestoreBackup(Box<deck_core::gdrive::PreparedRestore>),
+    RestoreBackup(drive::PendingRestore),
     /// Remove a clean, merged worktree (and its branch) after stopping the tabs inside it.
     RemoveWorktree {
         wt: Worktree,
@@ -341,42 +306,40 @@ impl TabsProj {
 struct Applied {
     rows: Vec<deck_core::config::SyncRow>,
     look: (Theme, UiStyle, Density),
-    backend: BackendChoice,
-    backup_interval: deck_core::config::SyncInterval,
-    sync_interval: deck_core::config::SyncInterval,
 }
 
 pub struct App {
     ctx: egui::Context,
+    /// This window's working copy of the settings.
     cfg: AppConfig,
-    /// The single writer of the settings file; `cfg` is this window's working copy of it.
-    settings_service: SettingsService,
     /// The committed settings `cfg` was last reconciled with (the baseline of the next edit).
     cfg_base: Arc<AppConfig>,
-    /// Settings revision `cfg_base` reflects.
+    /// Settings revision `cfg_base` reflects (0 = the startup read, before the gateway's).
     cfg_rev: u64,
-    /// The edit in flight at the settings owner, with the config it carried.
-    saving: Option<(PendingEdit, AppConfig)>,
+    /// The edit in flight at the gateway, with the config it carried.
+    saving: Option<(
+        Pending<Result<settings::Snapshot, SettingsError>>,
+        AppConfig,
+    )>,
     /// The tab/split projection last agreed with the committed settings.
     tabs_synced: TabsProj,
-    /// When the settings file was last asked to be re-read (other processes' commits).
-    settings_reload_at: Instant,
-    backends: Backends,
-    /// Warning shown above the panels (no backend, or the chosen one is unavailable).
-    backend_banner: Option<String>,
-    root: SessionsRoot,
+    /// The gateway: link, caches and requests. Everything that is not native goes through it.
+    gw: Gw,
+    /// A gateway mode change in flight (Settings → Mobile access), and why the last one failed.
+    mode_change: Option<Pending<Result<GatewayStatus, GatewayError>>>,
+    mode_error: Option<String>,
+    root: deck_core::sessions::SessionsRoot,
     root_exists: bool,
-    watcher: SessionWatcher,
-    running: RunningMonitor,
     clipboard: Clipboard,
-    /// Request identities of this client for every controller.
-    request_keys: RequestKeys,
 
     tabs: Vec<Tab>,
     active: usize,
     closed: ReopenStack<ClosedTab>,
     labels: HashMap<PathBuf, String>,
+    /// Revision of the sessions topic `labels` was built from.
     labels_gen: Option<u64>,
+    /// Revision of the controllers topic the tabs last took their records from.
+    controllers_rev: u64,
     filter: String,
     /// Per-folder mode: the sidebar lists only sessions inside this folder.
     scope: Option<PathBuf>,
@@ -408,15 +371,15 @@ pub struct App {
     events_rx: Receiver<AppEvent>,
     confirm: Option<(Confirm, PendingConfirm)>,
     settings: SettingsState,
-    /// `None` = omp not found: every omp-CLI feature is hidden.
-    omp: Option<Omp>,
     update: UpdateTracker,
-    /// The running check was requested by the user (report its outcome with a toast).
-    check_manual: bool,
+    /// Revision of the omp update topic last adopted.
+    omp_update_rev: u64,
+    /// omp was found and its catalogs were requested.
+    omp_ready: bool,
+    /// An installer run finished: waiting for the gateway to report the new omp.
+    install_wait: Option<Instant>,
     /// Session files with a move in flight.
     moving: HashSet<PathBuf>,
-    /// Id source for pending copies (see `CopyPending`).
-    next_copy_id: u64,
     sidebar_cache: SidebarCache,
     folder_dialog: Option<FolderDialog>,
     /// Git worktree sessions (dialogs, finishing, relocation).
@@ -425,14 +388,16 @@ pub struct App {
     /// kdialog or zenity exists, so the folder dialog can offer "Browse…".
     picker_available: bool,
 
-    // Wave 3: status bar, model picker, session actions.
-    status: StatusWatcher,
-    /// Tab the status watcher currently follows.
+    /// The status the gateway follows for the active session tab.
+    status: bar::StatusView,
     status_uid: Option<u64>,
-    /// Last target handed to the status watcher (compared per frame to avoid rebuilding it).
-    status_target: Option<StatusTarget>,
+    /// What the gateway was last told the bar shows about the model.
+    model_sent: Option<(
+        SessionTarget,
+        deck_service::gateway::protocol::ModelFactsView,
+    )>,
     bar_view: statusbar::BarView,
-    /// omp's default model/thinking from its settings (read once at startup, refreshed with the catalog).
+    /// omp's default model/thinking from its settings (refreshed with the catalog).
     omp_defaults: statusbar::Defaults,
     picker: PickerState,
     models: ModelsCache,
@@ -440,8 +405,6 @@ pub struct App {
     /// The session (and generation) the open dialog was opened on.
     dialog_target: Option<SessionTarget>,
     next_tab_uid: u64,
-    /// Tabs (uid) whose close waits for their injector to reach a job boundary and its last byte to settle.
-    closing: Vec<u64>,
     /// Opens (sidebar, reopen) requested before the first snapshot of the backends: attaching a
     /// canonical name blindly could land in a session that now runs another file. Processed on arrival.
     deferred_opens: Vec<ClosedTab>,
@@ -451,43 +414,34 @@ pub struct App {
     frame_count: u32,
     frame_mark: Instant,
     repaint_causes: HashMap<String, u32>,
-    // Wave 4: agents dashboard.
-    agents: AgentsWatcher,
-    /// Last target handed to the agents watcher.
+    /// What the agents dashboard follows (reported to the gateway when it changes).
     agents_target: Option<AgentsTarget>,
     agents_view: AgentsView,
     dash: DashState,
     dash_index: agents::DashIndex,
-    fleet: FleetWatcher,
     popup: Option<PopupState>,
-    // Wave 6: session tree.
     tree: Option<tree::TreeUi>,
-    // Wave 9: Usage view.
+    tree_busy: Option<tree::TreeBusy>,
     usage: Usage,
+    /// Revision of the usage topic last adopted.
+    usage_rev: u64,
     usage_open: bool,
     usage_ui: usage_view::ViewState,
     sessions: session_manager::SessionHub,
-    tree_busy: Option<tree::TreeBusy>,
-    // Wave 5: live subagent control.
-    /// The installed control extension every omp launch loads.
-    ctl_ext: Option<PathBuf>,
-    /// The control client of the active session tab.
-    ctl: Option<ctl::CtlLink>,
+    /// Live subagent control of the active session tab.
+    live: ctl::LiveFollow,
     /// Commands sent and not answered yet, by request id.
     ctl_reqs: HashMap<u64, Req>,
+    ctl_seq: u64,
     /// The last chat error per agent id (shown under the composer).
     ctl_errors: HashMap<String, String>,
-    /// Launches waiting for their control directory (processed one at a time, in order).
+    /// Launches waiting for the gateway (processed one at a time, in order).
     spawn: spawn::Pump,
     /// Bumped whenever the active tab changes by the user's hand; a queued launch may take focus
     /// only while this still equals its own claim.
     activation_seq: u64,
-    /// Namespace of this instance's control dirs: the first backend's, or `direct`.
-    ctl_ns: String,
     /// The restored tab that was active (focused once all restored tabs exist).
     restore_focus: Option<u64>,
-    /// Counter for the control keys of tabs without a backend.
-    direct_seq: u64,
 
     dirty: bool,
     last_save: Instant,
@@ -500,13 +454,13 @@ pub struct App {
     drive: drive::DriveUi,
     /// Project sync (per-folder `.omp` + sessions backups).
     sync: project_sync::SyncUi,
-    /// Changes panel (Wave 14).
+    /// Changes panel.
     changes: changes::ChangesUi,
-    /// OmpDeck self-update (Wave 14).
+    /// OmpDeck self-update.
     app_update: app_update::AppUpdateUi,
-    /// Desktop notifications (Wave 14).
+    /// Window raise and what this window last told the gateway about itself.
     notify: notifications::NotifyUi,
-    /// The command palette / quick switcher while open (Wave 14).
+    /// The command palette / quick switcher while open.
     palette: Option<PaletteState>,
 }
 
@@ -519,27 +473,6 @@ fn unix_ms() -> u128 {
         .map_or(0, |d| d.as_millis())
 }
 
-fn term_theme(t: Theme, style: UiStyle) -> TermTheme {
-    match (style, t) {
-        (UiStyle::Neutral, Theme::Dark) => TermTheme::NeutralDark,
-        (UiStyle::Neutral, Theme::Light) => TermTheme::NeutralLight,
-        (UiStyle::Neon, Theme::Dark) => TermTheme::Dark,
-        (UiStyle::Neon, Theme::Light) => TermTheme::Light,
-        // Gallery styles are dark-only; the terminal follows the style's canvas colours.
-        (style, _) => {
-            let p = theme::palette(style, true);
-            let rgb = |c: egui::Color32| [c.r(), c.g(), c.b()];
-            let sel = theme::mix(p.bg, p.accent, 0.35);
-            TermTheme::Custom(deck_term::TermColors {
-                foreground: rgb(p.text),
-                background: rgb(p.bg),
-                cursor: rgb(p.text_strong),
-                selection_bg: rgb(sel),
-            })
-        }
-    }
-}
-
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, init: AppInit) -> App {
         let ctx = cc.egui_ctx.clone();
@@ -549,15 +482,11 @@ impl App {
         let AppInit {
             cli,
             mut cfg,
-            settings,
-            backends,
+            profile,
             ui_fonts,
             folder,
             start_dir,
-            ctl_ext,
         } = init;
-        let ctl_ns = backends.ctl_namespace();
-        let backend_banner = backends.banner();
         ui_fonts::install(&ctx, ui_fonts);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
@@ -567,21 +496,13 @@ impl App {
         cfg.font_size = cfg.font_size.clamp(MIN_FONT, MAX_FONT);
         theme::apply(&ctx, cfg.style, cfg.density, cfg.dark());
 
-        let root = match &cli.sessions_root {
-            Some(p) => SessionsRoot::at(p.clone()),
-            None => SessionsRoot::resolve(),
-        };
-        let repaint = {
-            let ctx = ctx.clone();
-            move || ctx.request_repaint()
-        };
-        let watcher = SessionWatcher::spawn(root.clone(), POLL_INTERVAL, repaint.clone());
-        let running = RunningMonitor::spawn(
-            backends.all().to_vec(),
-            ctl_ns.clone(),
-            root.path.clone(),
-            POLL_INTERVAL,
-            repaint,
+        let root = deck_core::sessions::SessionsRoot::at(profile.sessions_root.clone());
+        let gw = Gw::start(
+            &ctx,
+            GatewayOptions::new(profile, Role::Gui, {
+                let ctx = ctx.clone();
+                Arc::new(move || ctx.request_repaint())
+            }),
         );
 
         let mut startup_error = None;
@@ -598,8 +519,9 @@ impl App {
         if let Some(dir) = &launch_folder {
             cfg.push_recent_folder(dir.clone());
         }
-        // Tabs are only restored with a backend (without one nothing outlives the app). A folder
-        // launch restores that folder's own tabs, a plain launch the global ones.
+        // A folder launch restores that folder's own tabs, a plain launch the global ones. Whether
+        // the gateway has a backend (without one nothing outlives the app) is known once it
+        // answered: restore drops the tabs then.
         let (restore_tabs, restore_active) = match &launch_folder {
             Some(dir) => cfg
                 .folder_tabs
@@ -607,8 +529,7 @@ impl App {
                 .map_or((Vec::new(), None), |f| (f.open_tabs.clone(), f.active_tab)),
             None => (cfg.open_tabs.clone(), cfg.active_tab),
         };
-        let pending_restore = (!backends.is_empty() && !restore_tabs.is_empty())
-            .then_some((restore_tabs, restore_active));
+        let pending_restore = (!restore_tabs.is_empty()).then_some((restore_tabs, restore_active));
         let restore_split = pending_restore.as_ref().and_then(|_| match &launch_folder {
             Some(dir) => cfg.folder_tabs.get(dir).and_then(|f| f.split.clone()),
             None => cfg.split.clone(),
@@ -619,48 +540,26 @@ impl App {
             state: ShotState::Waiting,
         });
         let (events_tx, events_rx) = mpsc::channel();
-        let omp = Omp::detect();
-        if let Some(o) = omp.clone() {
-            omp_worker::spawn(&ctx, &events_tx, move || {
-                AppEvent::Omp(OmpEvent::Version(o.version().map_err(|e| e.to_string())))
-            });
-        }
-        let status = StatusWatcher::spawn(root.agent_dir(), {
-            let ctx = ctx.clone();
-            move || ctx.request_repaint()
-        });
-        let mut models = ModelsCache::default();
-        if let Some(o) = omp.clone() {
-            models.begin();
-            omp_worker::spawn(&ctx, &events_tx, move || {
-                AppEvent::Omp(OmpEvent::Models(o.models().map_err(|e| e.to_string())))
-            });
-        }
 
-        let usage = Usage::new(omp.is_some(), Instant::now());
-        let drive = drive::DriveUi::new(root.agent_dir());
         let mut app = App {
             ctx,
-            root_exists: root.exists(),
-            cfg_base: settings.snapshot().config,
-            cfg_rev: settings.snapshot().revision,
+            cfg_base: Arc::new(cfg.clone()),
+            cfg_rev: 0,
             saving: None,
             tabs_synced: TabsProj::of(&cfg, launch_folder.as_ref()),
-            settings_reload_at: Instant::now(),
-            settings_service: settings,
+            gw,
+            mode_change: None,
+            mode_error: None,
             cfg,
-            backends,
-            backend_banner,
+            root_exists: true,
             root,
-            watcher,
-            running,
             clipboard: Clipboard::new(),
-            request_keys: RequestKeys::new("desktop"),
             tabs: Vec::new(),
             active: 0,
             closed: ReopenStack::new(20),
             labels: HashMap::new(),
             labels_gen: None,
+            controllers_rev: 0,
             filter: String::new(),
             scope,
             launch_folder,
@@ -677,60 +576,50 @@ impl App {
             scroll_to_active: false,
             refresh_until: None,
             toasts: Toasts::default(),
-            ctl_ext,
-            ctl: None,
-            ctl_reqs: HashMap::new(),
-            ctl_errors: HashMap::new(),
-            spawn: spawn::Pump::default(),
-            activation_seq: 0,
-            ctl_ns,
-            restore_focus: None,
-            direct_seq: 0,
             events_tx,
             events_rx,
             confirm: None,
             settings: SettingsState::default(),
-            omp,
             update: UpdateTracker::default(),
-            check_manual: false,
+            omp_update_rev: 0,
+            omp_ready: false,
+            install_wait: None,
             moving: HashSet::new(),
-            next_copy_id: 0,
             sidebar_cache: SidebarCache::default(),
             folder_dialog: None,
             wt: WtUi::new(),
             home: dirs::home_dir(),
             picker_available: transfer::picker_available(),
-            status,
+            status: bar::StatusView::default(),
             status_uid: None,
-            status_target: None,
+            model_sent: None,
             bar_view: statusbar::BarView::default(),
             omp_defaults: statusbar::Defaults::default(),
             picker: PickerState::default(),
-            models,
+            models: ModelsCache::default(),
             dialog: None,
             dialog_target: None,
             next_tab_uid: 0,
-            closing: Vec::new(),
             deferred_opens: Vec::new(),
-            agents: AgentsWatcher::spawn({
-                let ctx = cc.egui_ctx.clone();
-                move || ctx.request_repaint()
-            }),
             agents_target: None,
             agents_view: AgentsView::default(),
             dash: DashState::default(),
             dash_index: agents::DashIndex::default(),
-            fleet: FleetWatcher::spawn({
-                let ctx = cc.egui_ctx.clone();
-                move || ctx.request_repaint()
-            }),
             popup: None,
             tree: None,
-            usage,
+            tree_busy: None,
+            usage: Usage::new(false),
+            usage_rev: 0,
             usage_open: false,
             usage_ui: usage_view::ViewState::default(),
             sessions: session_manager::SessionHub::default(),
-            tree_busy: None,
+            live: ctl::LiveFollow::default(),
+            ctl_reqs: HashMap::new(),
+            ctl_seq: 0,
+            ctl_errors: HashMap::new(),
+            spawn: spawn::Pump::default(),
+            activation_seq: 0,
+            restore_focus: None,
             fonts_finalized: false,
             frame_count: 0,
             frame_mark: Instant::now(),
@@ -743,7 +632,7 @@ impl App {
                 .unwrap_or_else(Instant::now),
             started: Instant::now(),
             shot,
-            drive,
+            drive: drive::DriveUi::new(),
             sync: project_sync::SyncUi::new(),
             changes: changes::ChangesUi::default(),
             app_update: app_update::AppUpdateUi::new(),
@@ -753,18 +642,175 @@ impl App {
         if let Some(e) = startup_error {
             app.toasts.error(&app.ctx, format!("Folder ignored: {e}"));
         }
-        app.settings_service.on_change({
-            let ctx = app.ctx.clone();
-            move || ctx.request_repaint()
-        });
-        // The default model/thinking for fresh sessions come from omp's settings.
-        if app.omp.is_some() {
-            app.load_catalog();
-        }
         app
     }
 
-    // ---------------------------------------------------------------- tab management
+    // ---------------------------------------------------------------- gateway
+
+    /// Per tick: completed requests, the events only this window can interpret, and the tabs'
+    /// view of the gateway's session records.
+    fn pump_gateway(&mut self) {
+        let pumped = self.gw.pump();
+        for job in pumped.jobs {
+            job(self);
+        }
+        for event in pumped.events {
+            self.on_client_event(event);
+        }
+        self.sync_controllers();
+    }
+
+    /// A lookup of an accepted request returned after a reconnect (see `Gw::settle_lookup`).
+    pub(crate) fn gw_lookup(
+        &mut self,
+        key: &deck_service::controller::RequestKey,
+        r: Result<Outcome, GatewayError>,
+    ) {
+        if let Some(job) = self.gw.settle_lookup(key, r) {
+            job(self);
+        }
+    }
+
+    fn on_client_event(&mut self, event: ClientEvent) {
+        match event {
+            // The gateway keeps no view state across a lost connection: report it all again.
+            ClientEvent::Link(_) | ClientEvent::Resync => {
+                self.notify.forget_report();
+                self.model_sent = None;
+            }
+            ClientEvent::Controller { target, event } => self.on_controller_event(&target, event),
+            ClientEvent::Bell(target) => self.on_bell(&target),
+            ClientEvent::Activate { target, token } => self.on_activate(&target, token.as_deref()),
+            ClientEvent::ModelUnconfirmed { switch, .. } => self.on_model_unconfirmed(&switch),
+            ClientEvent::CopyResult { target, result } => self.on_copy_result(&target, result),
+            // Consumed by `Gw` (outcomes, progress) or read from the caches (topic changes).
+            ClientEvent::Changed { .. }
+            | ClientEvent::Outcome { .. }
+            | ClientEvent::Progress { .. } => {}
+        }
+    }
+
+    /// Every terminal tab takes the gateway's record of its session. A new generation (omp
+    /// moved to another file, a restart) ended the tab's view: it attaches a new one.
+    fn sync_controllers(&mut self) {
+        let revision = self.gw.revision(&Topic::Controllers);
+        if revision == self.controllers_rev {
+            return;
+        }
+        self.controllers_rev = revision;
+        let Some(infos) = self.gw.controllers() else {
+            return;
+        };
+        let mut reattach = Vec::new();
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            let Some(t) = tab.term_mut() else {
+                continue;
+            };
+            let Some(info) = infos.iter().find(|c| c.target.key == t.target().key) else {
+                continue;
+            };
+            t.set_info(info);
+            if t.needs_reattach() {
+                reattach.push((i, info.target.clone()));
+            }
+        }
+        for (i, target) in reattach {
+            let term = self.open_view(&target);
+            if let Some(t) = self.tabs[i].term_mut() {
+                t.reattach(target, term);
+            }
+            self.dirty = true;
+        }
+        if !infos.is_empty() {
+            self.dirty = true;
+        }
+    }
+
+    pub(super) fn groups(&self) -> Option<Arc<Vec<ProjectGroup>>> {
+        self.gw.groups()
+    }
+
+    /// The latest snapshot of the running sessions (empty before the first one).
+    pub(super) fn running_snapshot(&self) -> Arc<RunningSnapshot> {
+        self.gw.running().unwrap_or_default()
+    }
+
+    pub(super) fn running_blind(&self) -> bool {
+        self.gw.running_blind()
+    }
+
+    /// The gateway found omp (false until it has said).
+    pub(super) fn omp_found(&self) -> bool {
+        self.gw.gateway().is_some_and(|g| g.omp_found)
+    }
+
+    /// The gateway has a session backend: sessions outlive tabs and the app.
+    pub(super) fn backends_available(&self) -> bool {
+        self.gw.gateway().is_some_and(|g| !g.backends.is_empty())
+    }
+
+    /// Per frame: once omp is found, ask for its model catalog and settings; after an installer
+    /// run, report whether the gateway found the new omp.
+    fn tick_omp(&mut self) {
+        let found = self.omp_found();
+        if found && !self.omp_ready {
+            self.omp_ready = true;
+            self.reload_models();
+            self.load_catalog();
+        } else if !found && self.gw.gateway().is_some() {
+            self.omp_ready = false;
+        }
+        if let Some(since) = self.install_wait {
+            if found {
+                self.install_wait = None;
+                self.toasts.success(&self.ctx, "omp installed");
+            } else if since.elapsed() >= INSTALL_WAIT {
+                self.install_wait = None;
+                self.toasts.error(
+                    &self.ctx,
+                    format!(
+                        "The installer finished, but omp is not in {}",
+                        crate::update::OMP_LOOKUP
+                    ),
+                );
+            } else {
+                self.ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
+    }
+
+    /// Per frame: adopt the gateway's omp version and update state.
+    fn tick_omp_update(&mut self) {
+        let revision = self.gw.revision(&Topic::OmpUpdate);
+        if revision == self.omp_update_rev {
+            return;
+        }
+        self.omp_update_rev = revision;
+        let Some(view) = self.gw.omp_update() else {
+            return;
+        };
+        if let Some(done) = self.update.adopt(&view) {
+            self.on_update_checked(done);
+        }
+    }
+
+    fn set_gateway_mode(&mut self, mode: GatewayMode) {
+        if self.mode_change.is_some() {
+            return;
+        }
+        self.mode_error = None;
+        self.mode_change = Some(self.gw.set_gateway_mode(mode));
+    }
+
+    fn poll_gateway_mode(&mut self) {
+        let Some(result) = self.mode_change.as_ref().and_then(Pending::try_take) else {
+            return;
+        };
+        self.mode_change = None;
+        if let Err(e) = result {
+            self.mode_error = Some(e.to_string());
+        }
+    }
 
     /// Per strip position: the terminal tab's uid (`None` for other tab kinds).
     fn tab_uids(&self) -> Vec<Option<u64>> {
@@ -804,7 +850,95 @@ impl App {
         }
     }
 
-    /// Queue a session tab. `mux_name` is ignored in degraded mode.
+    fn open_session(&mut self, entry: &SessionEntry) {
+        // A removed worktree's folder is gone: omp relocates its session to the launch folder, so
+        // that is the primary checkout, not whatever the missing folder resolves to.
+        let cwd = self
+            .cfg
+            .removed_worktrees
+            .get(&entry.cwd)
+            .map_or_else(|| entry.cwd.clone(), |r| r.primary.clone());
+        self.open_resolved(ClosedTab {
+            mux_name: Some(session_name_for(&entry.id)),
+            cwd,
+            session_path: Some(entry.path.clone()),
+            title: entry.label().to_owned(),
+        });
+    }
+
+    /// Focus the tab already showing `req.session_path`, else launch the session that holds that
+    /// file (or a unique name when the preferred one now runs another file). Before the first
+    /// snapshot of the gateway's backends exists the request waits in `deferred_opens`.
+    fn open_resolved(&mut self, req: ClosedTab) {
+        self.open_resolved_focus(req, Focus::Claim);
+    }
+
+    /// [`open_resolved`](Self::open_resolved) with the focus rule of the new tab (an existing tab
+    /// is always activated; a deferred open claims focus when it finally runs).
+    fn open_resolved_focus(&mut self, req: ClosedTab, focus: Focus) {
+        let Some(snap) = self.gw.running() else {
+            self.deferred_opens.push(req);
+            self.ctx.request_repaint();
+            return;
+        };
+        let path = req.session_path.as_deref();
+        let holds = |name: &str| path.is_some_and(|p| snap.files_of(name).iter().any(|f| f == p));
+        let existing = path.and_then(|p| {
+            self.tabs
+                .iter()
+                .position(|t| t.session_path() == Some(p) || t.mux_name().is_some_and(holds))
+        });
+        if let Some(i) = existing {
+            if let Some(t) = self.tabs[i].term_mut()
+                && t.session_path().is_none()
+                && let Some(p) = &req.session_path
+            {
+                // The tab runs this session but did not know its file yet: tell the gateway too.
+                t.hint_session_path(Some(p.clone()));
+                let target = t.target().clone();
+                self.gw.mutate(
+                    Mutation::SetSessionPath {
+                        target,
+                        path: Some(p.clone()),
+                    },
+                    |_, result| {
+                        if let Err(e) = result {
+                            log::debug!("setting the session file failed: {e}");
+                        }
+                    },
+                );
+            }
+            self.activate(i);
+            return;
+        }
+        if self.spawn_queued_for(req.session_path.as_deref(), None) {
+            return; // already on its way
+        }
+        let name = req
+            .mux_name
+            .filter(|_| self.backends_available())
+            .map(|preferred| {
+                snap.resolve_for(
+                    self.running_blind(),
+                    &preferred,
+                    req.session_path.as_deref(),
+                    unix_ms(),
+                )
+                .into_name()
+            });
+        self.spawn_tab_focus(name, req.cwd, req.session_path, req.title, focus);
+    }
+
+    fn open_deferred(&mut self) {
+        if self.pending_restore.is_some() || self.gw.running().is_none() {
+            return;
+        }
+        for req in std::mem::take(&mut self.deferred_opens) {
+            self.open_resolved(req);
+        }
+    }
+
+    /// Queue a session tab. `mux_name` is `None` without a backend.
     fn spawn_tab(
         &mut self,
         mux_name: Option<String>,
@@ -823,125 +957,17 @@ impl App {
         title: String,
         focus: Focus,
     ) {
-        let argv = self.with_omp_program(tabs::omp_argv(session_path.as_deref()));
-        self.spawn_tab_post(SpawnReq {
+        self.spawn_tab_post(SpawnReq::session(
             mux_name,
             cwd,
             session_path,
             title,
-            argv,
-            role: TabRole::Session,
-            post: Post::None,
+            Post::None,
             focus,
-        });
+        ));
     }
 
-    /// Queue a terminal tab running `argv` (in a backend session when `mux_name` is given and a backend exists).
-    /// Session tabs first get their control directory prepared on a worker (see `spawn.rs`).
-    fn spawn_tab_with(
-        &mut self,
-        mux_name: Option<String>,
-        cwd: PathBuf,
-        session_path: Option<PathBuf>,
-        title: String,
-        argv: Vec<String>,
-        role: TabRole,
-    ) {
-        self.spawn_tab_post(SpawnReq {
-            mux_name,
-            cwd,
-            session_path,
-            title,
-            argv,
-            role,
-            post: Post::None,
-            focus: Focus::Claim,
-        });
-    }
-
-    fn open_session(&mut self, entry: &SessionEntry) {
-        // A removed worktree's folder is gone: omp relocates its session to the launch folder, so
-        // that is the primary checkout, not whatever the missing folder resolves to.
-        let cwd = self
-            .cfg
-            .removed_worktrees
-            .get(&entry.cwd)
-            .map_or_else(|| entry.cwd.clone(), |r| r.primary.clone());
-        self.open_resolved(ClosedTab {
-            mux_name: Some(session_name_for(&entry.id)),
-            cwd,
-            session_path: Some(entry.path.clone()),
-            title: entry.label().to_owned(),
-        });
-    }
-
-    /// Focus the tab already showing `req.session_path`, else spawn one on the session that
-    /// holds that file (or a unique name when the preferred one now runs another file). Before the
-    /// first backend snapshot exists the request waits in `deferred_opens`; if the poller could not
-    /// start, the snapshot is empty and names are made unique instead.
-    fn open_resolved(&mut self, req: ClosedTab) {
-        self.open_resolved_focus(req, Focus::Claim);
-    }
-
-    /// [`open_resolved`](Self::open_resolved) with the focus rule of the new tab (an existing tab
-    /// is always activated; a deferred open claims focus when it finally runs).
-    fn open_resolved_focus(&mut self, req: ClosedTab, focus: Focus) {
-        let Some(snap) = self.running.latest() else {
-            self.deferred_opens.push(req);
-            self.ctx.request_repaint();
-            return;
-        };
-        let path = req.session_path.as_deref();
-        let holds = |name: &str| path.is_some_and(|p| snap.files_of(name).iter().any(|f| f == p));
-        let existing = path.and_then(|p| {
-            self.tabs
-                .iter()
-                .position(|t| t.session_path() == Some(p) || t.mux_name().is_some_and(holds))
-        });
-        if let Some(i) = existing {
-            if let Some(t) = self.tabs[i].term_mut()
-                && t.session_path().is_none()
-            {
-                t.ctl.set_session_path(req.session_path.clone());
-            }
-            self.activate(i);
-            return;
-        }
-        if self.spawn_queued_for(req.session_path.as_deref(), None) {
-            return; // already on its way
-        }
-        let name = req
-            .mux_name
-            .filter(|_| !self.backends.is_empty())
-            .map(|preferred| {
-                snap.resolve_for(
-                    self.running.is_blind(),
-                    &preferred,
-                    req.session_path.as_deref(),
-                    unix_ms(),
-                )
-                .into_name()
-            });
-        self.spawn_tab_focus(name, req.cwd, req.session_path, req.title, focus);
-    }
-
-    fn open_deferred(&mut self) {
-        if self.pending_restore.is_some() || self.running.latest().is_none() {
-            return;
-        }
-        for req in std::mem::take(&mut self.deferred_opens) {
-            self.open_resolved(req);
-        }
-    }
-
-    /// Open an `omp update …` tab: runs outside the session backends (not persisted) in $HOME.
-    fn open_update_tab(&mut self, kind: UpdateKind) {
-        let cwd = self.home.clone().unwrap_or_else(platform::home_or_root);
-        let argv = self.with_omp_program(update_argv(kind));
-        self.spawn_tab_with(None, cwd, None, String::new(), argv, TabRole::Update(kind));
-    }
-
-    /// Run omp's official installer in a direct tab; one at a time (re-focus a running one).
+    /// Run omp's official installer in a tool tab; one at a time (re-focus a running one).
     fn open_install_tab(&mut self) {
         let running = self.tabs.iter().position(|t| {
             matches!(t, Tab::Terminal(t) if t.role == TabRole::InstallOmp && !t.terminal().is_exited())
@@ -951,11 +977,10 @@ impl App {
             return;
         }
         let cwd = self.home.clone().unwrap_or_else(platform::home_or_root);
-        let argv = install_argv();
-        self.spawn_tab_with(None, cwd, None, String::new(), argv, TabRole::InstallOmp);
+        self.spawn_tab_post(SpawnReq::tool(Tool::Install, cwd));
     }
 
-    /// The installer finished: pick up the new omp without a restart.
+    /// The installer finished: the gateway looks for the new omp itself; report what it finds.
     fn finish_omp_install(&mut self, code: Option<i32>) {
         if code != Some(0) {
             let code = code.map_or("signal".to_owned(), |c| c.to_string());
@@ -965,38 +990,20 @@ impl App {
             );
             return;
         }
-        let Some(omp) = Omp::detect() else {
-            self.toasts.error(
-                &self.ctx,
-                format!(
-                    "The installer finished, but omp is not in {}",
-                    crate::update::OMP_LOOKUP
-                ),
-            );
-            return;
-        };
-        self.omp = Some(omp);
-        self.usage.omp_found();
-        self.spawn_omp(|omp| OmpEvent::Version(omp.version().map_err(|e| e.to_string())));
-        self.reload_models();
-        self.toasts.success(&self.ctx, "omp installed");
-    }
-
-    /// Use the detected omp binary as argv[0] (it may live outside PATH, e.g. `~/.local/bin`).
-    fn with_omp_program(&self, mut argv: Vec<String>) -> Vec<String> {
-        if let (Some(omp), Some(first)) = (&self.omp, argv.first_mut()) {
-            *first = omp.program().to_string_lossy().into_owned();
-        }
-        argv
+        self.install_wait = Some(Instant::now());
     }
 
     fn new_session(&mut self, cwd: PathBuf) {
-        let name = self
-            .backends
-            .primary()
-            .is_some()
-            .then(|| new_session_name(SystemTime::now()));
+        let name = self.new_mux_name();
         self.spawn_tab(name, cwd, None, String::new());
+    }
+
+    /// A fresh backend session name, when the gateway has a backend for new sessions.
+    fn new_mux_name(&self) -> Option<String> {
+        self.gw
+            .gateway()
+            .is_some_and(|g| g.primary_backend.is_some())
+            .then(|| new_session_name(SystemTime::now()))
     }
 
     /// Focus the settings page, creating its tab if needed (at most one).
@@ -1039,6 +1046,21 @@ impl App {
             Tab::Terminal(t) => (t.session_path_owned(), t.mux_name.clone()),
             _ => (None, None),
         };
+        if let Tab::Terminal(t) = &tab {
+            // Detach this window's view; the gateway keeps backend sessions (and accepted work)
+            // running, and ends a direct program only because nothing else can reach it.
+            self.gw.mutate(
+                Mutation::Close {
+                    target: t.target().clone(),
+                    kill_direct: t.mux_name.is_none(),
+                },
+                |_, result| {
+                    if let Err(e) = result {
+                        log::debug!("closing the view failed: {e}");
+                    }
+                },
+            );
+        }
         drop(tab);
         self.active = tabs::active_after_close(self.active, i, len_before);
         if let Some(uid) = pane_uid {
@@ -1069,7 +1091,6 @@ impl App {
         }
         self.focus_pending = true;
         self.scroll_to_active = true;
-        self.sync_ctl_keep();
         self.dirty = true;
     }
 
@@ -1080,38 +1101,47 @@ impl App {
         self.open_resolved(closed);
     }
 
-    /// Kill a session (in whichever backend holds it) on a worker thread; the outcome arrives
-    /// as a toast.
-    fn kill_session(&self, name: String, label: String) {
-        if self.backends.is_empty() {
-            return;
-        }
-        let backends = self.backends.clone();
-        let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
-            let event = match backends.kill(&name) {
-                Ok(()) => AppEvent::Toast(ToastKind::Success, format!("Stopped “{label}”")),
-                Err(e) => {
-                    AppEvent::Toast(ToastKind::Error, format!("Could not stop “{label}”: {e}"))
+    /// Kill the backend session `name` (the sidebar's "Stop session"); the outcome arrives as a
+    /// toast.
+    fn kill_session(&mut self, name: String, label: String) {
+        self.gw.mutate(
+            Mutation::KillNames {
+                names: vec![name],
+                wait: false,
+            },
+            move |app, result| match result {
+                Ok(Done::Killed(failed)) if !failed.is_empty() => {
+                    let why: Vec<&str> = failed.iter().map(|(_, e)| e.as_str()).collect();
+                    app.toasts.error(
+                        &app.ctx,
+                        format!("Could not stop “{label}”: {}", why.join("; ")),
+                    );
                 }
-            };
-            let _ = tx.send(event);
-            ctx.request_repaint();
-        });
-        self.running.poke();
+                Ok(_) => app.toasts.success(&app.ctx, format!("Stopped “{label}”")),
+                Err(e) => app
+                    .toasts
+                    .error(&app.ctx, format!("Could not stop “{label}”: {e}")),
+            },
+        );
+        self.refresh_sessions();
     }
 
+    /// Kill the process of tab `i` — only that tab's session.
     fn kill_tab(&mut self, i: usize) {
-        let Some(Tab::Terminal(tab)) = self.tabs.get_mut(i) else {
+        let Some(Tab::Terminal(tab)) = self.tabs.get(i) else {
             return;
         };
-        match tab.mux_name.clone() {
-            Some(name) if tab.mux.is_some() => {
-                let label = tab.title(&self.labels).to_owned();
-                self.kill_session(name, label);
-            }
-            _ => tab.terminal_mut().kill(),
-        }
+        let target = tab.target().clone();
+        let label = tab.title(&self.labels).to_owned();
+        let announce = tab.mux_name.is_some();
+        self.gw
+            .mutate(Mutation::Kill(target), move |app, result| match result {
+                Ok(_) if announce => app.toasts.success(&app.ctx, format!("Stopped “{label}”")),
+                Ok(_) => {}
+                Err(e) => app
+                    .toasts
+                    .error(&app.ctx, format!("Could not stop “{label}”: {e}")),
+            });
     }
 
     fn apply_tab_action(&mut self, action: TabAction) {
@@ -1128,6 +1158,10 @@ impl App {
         let Some((states, active)) = self.pending_restore.take() else {
             return;
         };
+        if !self.backends_available() {
+            return; // without a backend nothing outlives the app: the stored tabs stay as they are
+        }
+        let blind = self.running_blind();
         for (i, st) in states.iter().enumerate() {
             if self
                 .tabs
@@ -1141,59 +1175,32 @@ impl App {
                 continue;
             }
             let name = snap
-                .resolve_for(
-                    self.running.is_blind(),
-                    &st.session_name,
-                    path.as_deref(),
-                    unix_ms(),
-                )
+                .resolve_for(blind, &st.session_name, path.as_deref(), unix_ms())
                 .into_name();
-            let argv = self.with_omp_program(tabs::omp_argv(path.as_deref()));
-            self.spawn_tab_post(SpawnReq {
-                mux_name: Some(name),
-                cwd: st.cwd.clone(),
-                session_path: path,
-                title: st.title.clone(),
-                argv,
-                role: TabRole::Session,
-                post: Post::Restore {
+            self.spawn_tab_post(SpawnReq::session(
+                Some(name),
+                st.cwd.clone(),
+                path,
+                st.title.clone(),
+                Post::Restore {
                     active: Some(i) == active,
                     index: i,
                 },
-                focus: Focus::Always,
-            });
+                Focus::Always,
+            ));
         }
         self.queue_restore_done();
     }
 
-    /// A fresh `omp` tab learns its session file once omp has created it; a tab whose omp moved to
-    /// another file (`/new`, `/fork`, `/resume`, also while the tab was hidden) follows when the
-    /// monitor sees exactly one file open for its session. A pending copy waits for
-    /// `find_fork` instead: omp may hold the source file open too.
-    fn sync_session_paths(&mut self, snap: &RunningSnapshot) {
-        for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
-            if tab.copy.is_some() {
-                continue;
-            }
-            let Some(name) = &tab.mux_name else {
-                continue;
-            };
-            if let Some(path) = tabs::followed_path(tab.session_path(), snap.files_of(name)) {
-                tab.ctl.set_session_path(Some(path.clone()));
-                self.dirty = true;
-            }
-        }
-    }
-
     fn refresh_sessions_cache(&mut self) {
-        let generation = self.watcher.generation();
-        if self.labels_gen == Some(generation) {
+        let revision = self.gw.revision(&Topic::Sessions);
+        if self.labels_gen == Some(revision) {
             return;
         }
-        self.labels_gen = Some(generation);
-        self.root_exists = self.watcher.root_exists();
+        self.labels_gen = Some(revision);
+        self.root_exists = self.gw.sessions_root_exists();
         self.labels.clear();
-        if let Some(groups) = self.watcher.latest() {
+        if let Some(groups) = self.gw.groups() {
             for g in groups.iter() {
                 for e in &g.sessions {
                     self.labels.insert(e.path.clone(), e.label().to_owned());
@@ -1215,7 +1222,7 @@ impl App {
     /// Re-applies theme × style × density to egui and every open terminal.
     fn restyle(&mut self) {
         theme::apply(&self.ctx, self.cfg.style, self.cfg.density, self.cfg.dark());
-        let tt = term_theme(self.cfg.theme, self.cfg.style);
+        let tt = deck_service::gateway::terminal_theme(self.cfg.theme, self.cfg.style);
         for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
             tab.terminal_mut().set_theme(tt);
         }
@@ -1236,16 +1243,13 @@ impl App {
         }
     }
 
-    /// Where new sessions go. Running sessions stay where they are: every backend is still
-    /// polled, listed and stoppable.
+    /// Where new sessions go (the gateway reads the choice from the settings). Running sessions
+    /// stay where they are.
     fn set_session_backend(&mut self, choice: BackendChoice) {
-        if self.cfg.session_backend == choice {
-            return;
+        if self.cfg.session_backend != choice {
+            self.cfg.session_backend = choice;
+            self.dirty = true;
         }
-        self.cfg.session_backend = choice;
-        self.backends.set_choice(choice);
-        self.backend_banner = self.backends.banner();
-        self.dirty = true;
     }
 
     fn set_density(&mut self, density: Density) {
@@ -1285,7 +1289,7 @@ impl App {
         self.dirty = true;
     }
 
-    /// Ask the desktop's folder dialog for the scope (worker thread; the UI never waits).
+    /// Ask the desktop's folder dialog for the scope (native worker; the UI never waits).
     fn browse_scope(&mut self) {
         if self.picking_scope {
             return;
@@ -1299,31 +1303,26 @@ impl App {
             .or_else(|| self.home.clone())
             .unwrap_or_else(deck_core::platform::home_or_root);
         let (home, base) = (self.home.clone(), start.clone());
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            let picked = transfer::pick_folder(&start);
-            AppEvent::Omp(OmpEvent::ScopeChosen {
-                generation,
-                typed: false,
-                result: picked
-                    .map(|p| folder_scope::resolve(&p.to_string_lossy(), home.as_deref(), &base)),
-            })
-        });
+        self.gw.native(
+            move || {
+                transfer::pick_folder(&start)
+                    .map(|p| folder_scope::resolve(&p.to_string_lossy(), home.as_deref(), &base))
+            },
+            move |app, result| app.on_scope_chosen(generation, false, result),
+        );
     }
 
-    /// Check a typed scope path (existence, symlinks) on a worker. Relative paths are relative to
-    /// the folder OmpDeck was started in.
+    /// Check a typed scope path (existence, symlinks) on a native worker. Relative paths are
+    /// relative to the folder OmpDeck was started in.
     fn resolve_scope(&mut self, text: String) {
         self.scope_gen += 1;
         let generation = self.scope_gen;
         let home = self.home.clone();
         let base = self.start_dir.clone();
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            AppEvent::Omp(OmpEvent::ScopeChosen {
-                generation,
-                typed: true,
-                result: Some(folder_scope::resolve(&text, home.as_deref(), &base)),
-            })
-        });
+        self.gw.native(
+            move || Some(folder_scope::resolve(&text, home.as_deref(), &base)),
+            move |app, result| app.on_scope_chosen(generation, true, result),
+        );
     }
 
     fn on_scope_chosen(
@@ -1354,8 +1353,11 @@ impl App {
     }
 
     fn refresh_sessions(&mut self) {
-        self.watcher.refresh_now();
-        self.running.poke();
+        self.gw.mutate(Mutation::RefreshSessions, |_, result| {
+            if let Err(e) = result {
+                log::debug!("the session refresh was refused: {e}");
+            }
+        });
         self.refresh_until = Some(Instant::now() + REFRESH_SPIN);
     }
 
@@ -1401,10 +1403,10 @@ impl App {
         });
     }
 
-    /// session currently running `entry`: the holder of its file, a live tab on it, else the
+    /// Session currently running `entry`: the holder of its file, a live tab on it, else the
     /// canonical name.
     fn running_session_name(&self, entry: &SessionEntry) -> Option<String> {
-        let snap = self.running.latest();
+        let snap = self.gw.running();
         let holder = snap
             .as_ref()
             .and_then(|s| s.holder(&entry.path).map(str::to_owned));
@@ -1511,27 +1513,8 @@ impl App {
 
     fn drain_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.events_rx.try_recv() {
-            match event {
-                AppEvent::Toast(kind, text) => self.toasts.notify(ctx, kind, text),
-                AppEvent::Omp(ev) => self.on_omp_event(ev),
-                AppEvent::ForkFound { copy_id, path } => self.on_fork_found(copy_id, path),
-                AppEvent::RestartReady {
-                    anchor,
-                    tab,
-                    stopped,
-                } => {
-                    self.on_restart_ready(anchor, tab, stopped);
-                }
-                AppEvent::SpawnPrepared(p) => self.on_spawn_prepared(p),
-                AppEvent::TreeForked(r) => self.on_tree_forked(r),
-                AppEvent::Usage(u) => self.on_usage_event(u),
-                AppEvent::Sessions(ev) => self.on_sessions_event(ev),
-                AppEvent::Drive(ev) => self.on_drive_event(ev),
-                AppEvent::Sync(ev) => self.on_sync_event(ev),
-                AppEvent::Worktree(ev) => self.on_wt_event(ev),
-                AppEvent::Changes(ev) => self.on_changes_event(ev),
-                AppEvent::AppUpdate(ev) => self.on_app_update_event(ev),
-            }
+            let AppEvent::Toast(kind, text) = event;
+            self.toasts.notify(ctx, kind, text);
         }
     }
 
@@ -1539,7 +1522,9 @@ impl App {
 
     fn show_bar(&mut self, ui: &mut egui::Ui, maximized: bool) {
         let active = self.tabs.get(self.active);
-        let groups = self.watcher.latest();
+        let groups = self.groups();
+        let inbox = self.gw.inbox();
+        let omp_found = self.omp_found();
         let live_tabs: Vec<&Path> = self
             .tabs
             .iter()
@@ -1562,8 +1547,8 @@ impl App {
                 },
                 menu: MenuEnv {
                     groups: groups.as_deref().map_or(&[][..], Vec::as_slice),
-                    omp_available: self.omp.is_some(),
-                    can_stop: !self.backends.is_empty(),
+                    omp_available: omp_found,
+                    can_stop: self.backends_available(),
                     busy: &self.moving,
                     drive: self.drive_menu(),
                     live_tabs: &live_tabs,
@@ -1588,7 +1573,7 @@ impl App {
                 cwd: active.and_then(Tab::term).map(|t| t.cwd.as_path()),
                 session: active.and_then(Tab::session_path),
             },
-            omp: self.omp.as_ref().map(|_| OmpBar {
+            omp: omp_found.then(|| OmpBar {
                 version: self.update.version.as_deref(),
                 state: &self.update.state,
                 available: self.update.available(),
@@ -1596,9 +1581,9 @@ impl App {
             }),
             app_update: self.app_update_bar(),
             notifications: crate::notify_panel::PanelInput {
-                entries: self.notify.center.inbox().entries(),
-                badge: self.notify.center.inbox().badge(),
-                warn: self.notify.center.inbox().warns(),
+                entries: inbox.as_deref().map_or(&[][..], |v| v.entries.as_slice()),
+                badge: inbox.as_deref().and_then(|v| v.badge.as_deref()),
+                warn: inbox.as_deref().is_some_and(|v| v.warns),
                 now: std::time::SystemTime::now(),
             },
         };
@@ -1631,9 +1616,27 @@ impl App {
     }
 
     fn show_banners(&mut self, ui: &mut egui::Ui) {
-        if let Some(text) = &self.backend_banner {
-            let pal = Palette::of_ui(ui);
-            egui::Panel::top("backend-banner")
+        let pal = Palette::of_ui(ui);
+        let link = match self.gw.link_view() {
+            LinkView::Up => None,
+            LinkView::Connecting => Some("Connecting to the OmpDeck gateway…".to_owned()),
+            LinkView::Offline(why) => Some(format!(
+                "The OmpDeck gateway is not reachable ({why}). Showing the last known state, read-only; reconnecting…"
+            )),
+            LinkView::Refused(why) => Some(format!(
+                "The running OmpDeck gateway refused this window: {why}"
+            )),
+            LinkView::Maintenance => Some(
+                "OmpDeck is being updated or removed: the gateway is draining and everything is read-only."
+                    .to_owned(),
+            ),
+        };
+        let backend = self.gw.gateway().and_then(|g| g.backend_banner.clone());
+        for (id, text) in [("link-banner", link), ("backend-banner", backend)] {
+            let Some(text) = text else {
+                continue;
+            };
+            egui::Panel::top(id)
                 .show_separator_line(false)
                 .frame(
                     Frame::NONE
@@ -1657,7 +1660,7 @@ impl App {
         if refreshing {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
-        let groups = self.watcher.latest();
+        let groups = self.groups();
         let groups_ref: Option<&[ProjectGroup]> = groups.as_deref().map(Vec::as_slice);
         let active_path = self.tabs.get(self.active).and_then(Tab::session_path);
         // A session open in a live tab counts as running even before tmux's fd mapping shows it.
@@ -1674,7 +1677,7 @@ impl App {
             .filter_map(|t| Some((t.session_path()?, t.status(false))))
             .filter(|(_, s)| matches!(s, TabStatus::Busy | TabStatus::Attention))
             .collect();
-        let generation = self.watcher.generation();
+        let generation = self.gw.sessions_generation();
         let input = SidebarInput {
             groups: groups_ref,
             running: snap,
@@ -1688,8 +1691,8 @@ impl App {
                 .map(|t| t.cwd.as_path()),
             now: SystemTime::now(),
             refreshing,
-            can_stop: !self.backends.is_empty(),
-            omp_available: self.omp.is_some(),
+            can_stop: self.backends_available(),
+            omp_available: self.omp_found(),
             busy: &self.moving,
             generation,
             open_paths: &open_paths,
@@ -1786,7 +1789,8 @@ impl App {
         match self.tabs.get(self.active) {
             None => {
                 self.terminal_focused = false;
-                let omp_missing = self.omp.is_none();
+                // Nothing is claimed missing before the gateway has said what it found.
+                let omp_missing = self.gw.gateway().is_some_and(|g| !g.omp_found);
                 let install = theme::skin::central(ui, pal, false, |ui| {
                         theme::skin::paint_canvas(ui.painter(), ui.max_rect(), pal);
                         ui.add_space((ui.available_height() / 2.0 - 90.0).max(20.0));
@@ -1817,7 +1821,13 @@ impl App {
             }
             Some(Tab::Settings) => {
                 self.terminal_focused = false;
-                let account = self.drive.card(self.cfg.drive_backup_interval);
+                let gateway = self.gw.gateway();
+                let backends = gateway
+                    .as_deref()
+                    .map_or(&[][..], |g| g.backends.as_slice());
+                let account = self
+                    .drive
+                    .card(self.gw.drive().as_deref(), self.cfg.drive_backup_interval);
                 let rows = self.sync_rows();
                 let input = SettingsInput {
                     font_size: self.cfg.font_size,
@@ -1827,21 +1837,26 @@ impl App {
                     style: self.cfg.style,
                     density: self.cfg.density,
                     native_decorations: self.cfg.native_decorations,
-                    omp_found: self.omp.is_some(),
+                    omp_found: self.omp_found(),
                     omp_version: self.update.version.as_deref(),
                     check_updates: self.cfg.check_updates,
                     update: &self.update.state,
                     backend: settings_page::BackendCard {
                         choice: self.cfg.session_backend,
-                        tmux: self.backends.has(MuxKind::Tmux),
-                        host: self.backends.has(MuxKind::Host),
+                        tmux: backends.contains(&MuxKind::Tmux),
+                        host: backends.contains(&MuxKind::Host),
                     },
                     drive: account.clone(),
                     sync: self.sync_page(&account, &rows),
                     app_update: self.app_update.card(self.cfg.check_app_updates),
                     notify: NotifyInput {
                         cfg: &self.cfg.notify,
-                        unavailable: self.notify.unavailable.as_deref(),
+                    },
+                    mobile: settings_page::MobileCard {
+                        status: gateway.as_deref(),
+                        link_up: self.gw.is_up(),
+                        pending: self.mode_change.is_some(),
+                        error: self.mode_error.as_deref(),
                     },
                 };
                 let actions = theme::skin::central(ui, pal, false, |ui| {
@@ -1875,6 +1890,7 @@ impl App {
                         SettingsAction::Sync(a) => self.apply_sync_action(a),
                         SettingsAction::Notify(a) => self.apply_notify_action(a),
                         SettingsAction::AppUpdate(a) => self.apply_app_update_setting(a),
+                        SettingsAction::GatewayMode(mode) => self.set_gateway_mode(mode),
                     }
                 }
             }
@@ -2017,7 +2033,7 @@ impl App {
     fn snapshot_config(&self) -> AppConfig {
         let mut cfg = self.cfg.clone();
         // Before restore ran (or without a backend) the stored tab list is left untouched.
-        if !self.backends.is_empty() && self.pending_restore.is_none() {
+        if self.backends_available() && self.pending_restore.is_none() {
             // The settings page is never persisted; `active_tab` indexes the persisted list.
             let mut active_tab = None;
             let mut open_tabs = Vec::new();
@@ -2086,39 +2102,35 @@ impl App {
     }
 
     /// Submits what this window changed since the last reconciliation as field edits against
-    /// its baseline. Never blocks: the owner persists on its own thread.
+    /// its baseline. Never blocks: the gateway persists on its own thread.
     fn submit_settings(&mut self) {
+        if self.gw.config().is_none() {
+            return; // nothing committed to compare against yet
+        }
         let edited = self.pending_config();
         let edit = Edit::between(self.cfg_base.clone(), &edited);
         if edit.changes.is_empty() {
             return;
         }
-        self.saving = Some((self.settings_service.submit(edit), edited));
+        self.saving = Some((self.gw.settings().submit(edit), edited));
     }
 
     /// Per tick: the outcome of the edit in flight, and commits other windows made.
     fn poll_settings(&mut self) {
-        // Commits of other processes only reach the snapshot through a reload; the owner re-reads
-        // off the UI thread, so asking is cheap. The result shows up as a revision change.
-        let since = self.settings_reload_at.elapsed();
-        if since >= SETTINGS_RELOAD {
-            self.settings_service.reload();
-            self.settings_reload_at = Instant::now();
-            self.ctx.request_repaint_after(SETTINGS_RELOAD);
-        } else {
-            self.ctx.request_repaint_after(SETTINGS_RELOAD - since);
-        }
         if let Some((pending, _)) = &self.saving
-            && let Some(result) = pending.try_result()
+            && let Some(result) = pending.try_take()
             && let Some((_, sent)) = self.saving.take()
         {
             self.on_settings_result(result, sent);
         }
-        let snap = self.settings_service.snapshot();
-        if snap.revision != self.cfg_rev && self.saving.is_none() {
-            // Another window or process committed: take over the fields this window did not touch.
+        if self.saving.is_none()
+            && let Some((revision, config)) = self.gw.config()
+            && revision != self.cfg_rev
+        {
+            // The first commit the gateway reported, or another window's: take over the fields
+            // this window did not touch.
             let old = self.cfg_base.clone();
-            self.adopt_settings(&old, snap.config, snap.revision);
+            self.adopt_settings(&old, config, revision);
         }
     }
 
@@ -2182,16 +2194,13 @@ impl App {
     fn applied_settings(&self) -> Applied {
         Applied {
             look: (self.cfg.theme, self.cfg.style, self.cfg.density),
-            backend: self.cfg.session_backend,
-            backup_interval: self.cfg.drive_backup_interval,
             rows: self.cfg.project_sync.clone(),
-            sync_interval: self.cfg.project_sync_interval,
         }
     }
 
     /// Carries out the runtime side effects of settings that changed from `before` through
-    /// adoption, as their settings-page handlers would: restyle, and the backend choice for new
-    /// sessions (running sessions keep their backend).
+    /// adoption, as their settings-page handlers would: restyle, and the project-sync rows.
+    /// Everything else (backend choice, schedules) is applied by the gateway from the commit.
     fn reconcile_settings(&mut self, before: Applied) {
         // A committed font size is trusted no further than the one typed in the settings page.
         if !self.cfg.font_size.is_finite() {
@@ -2202,20 +2211,8 @@ impl App {
         if before.look != now.look {
             self.restyle();
         }
-        if before.backend != now.backend {
-            self.backends.set_choice(now.backend);
-            self.backend_banner = self.backends.banner();
-        }
-        if before.backup_interval != now.backup_interval {
-            self.drive
-                .reschedule(before.backup_interval, now.backup_interval);
-        }
         if before.rows != now.rows {
             self.reconcile_sync_rows(&before.rows);
-        }
-        if before.sync_interval != now.sync_interval {
-            self.sync
-                .reschedule(before.sync_interval, now.sync_interval);
         }
     }
 
@@ -2299,41 +2296,33 @@ impl App {
 // -------------------------------------------------------------------- omp CLI features
 
 impl App {
-    /// Run `job` with the detected omp on a worker thread; its event comes back via the channel.
-    fn spawn_omp(&self, job: impl FnOnce(Omp) -> OmpEvent + Send + 'static) {
-        let Some(omp) = self.omp.clone() else {
-            return;
-        };
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || AppEvent::Omp(job(omp)));
-    }
-
-    fn start_update_check(&mut self) {
-        if self.omp.is_none() || self.update.is_checking() {
-            return;
-        }
-        self.update.begin(Instant::now());
-        self.spawn_omp(|omp| {
-            OmpEvent::UpdateChecked(omp.check_update().map_err(|e| e.to_string()))
-        });
-    }
-
+    /// "Check for omp updates now".
     fn check_updates_manually(&mut self) {
         if self.update.is_checking() {
             return;
         }
-        self.check_manual = true;
-        self.start_update_check();
+        self.start_update_check(None);
     }
 
-    /// Startup check and the 6 h schedule (only while automatic checks are enabled).
-    fn tick_updates(&mut self, ctx: &egui::Context) {
-        if self.omp.is_none() || !self.cfg.check_updates {
+    /// Asks the gateway to check omp for an update; `announce` = the update this check follows.
+    fn start_update_check(&mut self, announce: Option<UpdateKind>) {
+        if !self.omp_found() {
             return;
         }
-        if self.update.due(Instant::now()) {
-            self.start_update_check();
-        }
-        ctx.request_repaint_after(Duration::from_secs(60));
+        self.update.begin(announce);
+        self.send_update_check();
+    }
+
+    fn send_update_check(&mut self) {
+        self.gw.mutate(Mutation::OmpUpdateCheck, |app, result| {
+            if let Err(e) = result {
+                app.update.abandon();
+                app.toasts.error(
+                    &app.ctx,
+                    format!("Update check failed: {}", crate::summary::strip_context(&e)),
+                );
+            }
+        });
     }
 
     fn confirm_channel_switch(&mut self, kind: UpdateKind) {
@@ -2397,89 +2386,17 @@ impl App {
     /// Start the next owed post-update check once no other check is in flight; the announcement
     /// belongs to that new check, never to an older one that was still running.
     fn pump_update_queue(&mut self) {
-        if self.omp.is_some() && self.update.start_queued(Instant::now()) {
-            self.check_manual = false;
-            self.spawn_omp(|omp| {
-                OmpEvent::UpdateChecked(omp.check_update().map_err(|e| e.to_string()))
-            });
+        if self.omp_found() && self.update.next_queued().is_some() {
+            self.send_update_check();
         }
     }
 
-    fn on_omp_event(&mut self, ev: OmpEvent) {
-        match ev {
-            OmpEvent::Version(Ok(v)) => {
-                if self.update.version.is_none() {
-                    self.update.version = Some(v);
-                }
-            }
-            OmpEvent::Version(Err(e)) => log::warn!("omp --version failed: {e}"),
-            OmpEvent::UpdateChecked(result) => self.on_update_checked(result),
-            OmpEvent::Models(result) => {
-                self.models.finish(result);
-                self.ctx.request_repaint();
-            }
-            OmpEvent::Catalog(result) => {
-                if let Ok(catalog) = &result {
-                    self.omp_defaults = defaults_from_catalog(catalog);
-                    self.wt.base_setting = crate::omp_settings::worktree_base_from_catalog(catalog);
-                }
-                let env = std::env::var("PI_CODING_AGENT_DIR").ok();
-                let dir = config_dir_display(env.as_deref(), self.home.as_deref());
-                self.settings.catalog_loaded(result, dir);
-            }
-            OmpEvent::SettingDone { key, outcome } => {
-                let reset = matches!(outcome, Ok(None));
-                let err = outcome.as_ref().err().cloned();
-                let label = self.settings.write_done(&key, outcome);
-                match err {
-                    None if reset => self
-                        .toasts
-                        .success(&self.ctx, format!("Reset “{label}” to its default")),
-                    None => self.toasts.success(&self.ctx, format!("Saved “{label}”")),
-                    Some(e) => self.toasts.error(
-                        &self.ctx,
-                        format!("{label}: {}", crate::summary::strip_context(&e)),
-                    ),
-                }
-            }
-            OmpEvent::MoveDone {
-                src,
-                dest,
-                title,
-                tab,
-                result,
-            } => self.on_move_done(src, dest, title, tab, result),
-            OmpEvent::DeleteDone {
-                path,
-                title,
-                result,
-            } => self.on_delete_done(&path, &title, result),
-            OmpEvent::FolderPicked(path) => {
-                if let Some(dlg) = &mut self.folder_dialog {
-                    dlg.browsing = false;
-                    if let Some(p) = path {
-                        dlg.set_text(p.to_string_lossy().into_owned(), self.home.as_deref());
-                    }
-                }
-                self.dispatch_folder_check();
-            }
-            OmpEvent::ScopeChosen {
-                generation,
-                typed,
-                result,
-            } => self.on_scope_chosen(generation, typed, result),
-            OmpEvent::FolderChecked { generation, result } => {
-                if let Some(dlg) = &mut self.folder_dialog {
-                    dlg.apply_check(generation, result);
-                }
-            }
-        }
-    }
-
-    fn on_update_checked(&mut self, result: Result<UpdateStatus, String>) {
-        let manual = std::mem::take(&mut self.check_manual);
-        let announce = self.update.announce.take();
-        self.update.finish(result.clone());
+    fn on_update_checked(&mut self, done: crate::update::Finished) {
+        let crate::update::Finished {
+            result,
+            announce,
+            manual,
+        } = done;
         match (result, announce) {
             (Ok(_), Some(UpdateKind::Plugins)) => {
                 self.toasts.success(&self.ctx, "omp plugins updated");
@@ -2511,34 +2428,71 @@ impl App {
         }
     }
 
-    fn load_catalog(&self) {
-        self.spawn_omp(|omp| OmpEvent::Catalog(omp.load_settings().map_err(|e| e.to_string())));
-    }
-
-    fn write_setting(&self, setting: Setting, value: Value) {
-        self.spawn_omp(move |omp| OmpEvent::SettingDone {
-            key: setting.key.clone(),
-            outcome: omp
-                .set_setting(&setting, &value)
-                .map(Some)
-                .map_err(|e| e.to_string()),
+    /// Asks the gateway for omp's settings catalog (and the defaults the status bar shows).
+    fn load_catalog(&mut self) {
+        if !self.omp_found() {
+            return;
+        }
+        self.gw.query(Query::OmpSettings, |app, result| {
+            let catalog = result.and_then(|a| match a {
+                Answer::OmpSettings(c) => Ok(c),
+                other => Err(format!("unexpected answer {other:?}")),
+            });
+            if let Ok(catalog) = &catalog {
+                app.omp_defaults = defaults_from_catalog(catalog);
+                app.wt.base_setting = crate::omp_settings::worktree_base_from_catalog(catalog);
+            }
+            let env = std::env::var("PI_CODING_AGENT_DIR").ok();
+            let dir = config_dir_display(env.as_deref(), app.home.as_deref());
+            app.settings.catalog_loaded(catalog, dir);
         });
     }
 
-    fn reset_setting(&self, key: String) {
-        self.spawn_omp(move |omp| OmpEvent::SettingDone {
-            outcome: omp
-                .reset_setting(&key)
-                .map(|()| None)
-                .map_err(|e| e.to_string()),
-            key,
-        });
+    fn write_setting(&mut self, setting: Setting, value: Value) {
+        let key = setting.key.clone();
+        // A secret's value is never echoed back.
+        let saved = if setting.secret {
+            Value::Null
+        } else {
+            value.clone()
+        };
+        self.gw.mutate(
+            Mutation::OmpSet {
+                key: key.clone(),
+                value,
+            },
+            move |app, result| app.on_setting_done(&key, result.map(|_| Some(saved))),
+        );
+    }
+
+    fn reset_setting(&mut self, key: String) {
+        self.gw.mutate(
+            Mutation::OmpReset { key: key.clone() },
+            move |app, result| app.on_setting_done(&key, result.map(|_| None)),
+        );
+    }
+
+    /// `outcome`: `Ok(Some(v))` = saved value (`Null` for secrets), `Ok(None)` = reset done.
+    fn on_setting_done(&mut self, key: &str, outcome: Result<Option<Value>, String>) {
+        let reset = matches!(outcome, Ok(None));
+        let err = outcome.as_ref().err().cloned();
+        let label = self.settings.write_done(key, outcome);
+        match err {
+            None if reset => self
+                .toasts
+                .success(&self.ctx, format!("Reset “{label}” to its default")),
+            None => self.toasts.success(&self.ctx, format!("Saved “{label}”")),
+            Some(e) => self.toasts.error(
+                &self.ctx,
+                format!("{label}: {}", crate::summary::strip_context(&e)),
+            ),
+        }
     }
 
     // ------------------------------------------------------------ copy / move
 
     fn start_transfer(&mut self, kind: TransferKind, entry: SessionEntry, dest: Option<PathBuf>) {
-        if self.omp.is_none() || self.moving.contains(&entry.path) {
+        if !self.omp_found() || self.moving.contains(&entry.path) {
             return;
         }
         match dest {
@@ -2554,114 +2508,24 @@ impl App {
         }
     }
 
-    /// Copy = a new tab running `omp --fork <src> --cwd <dest>`. The tab starts "copy pending":
-    /// success is only announced once the new session file is found (see `drive_copies`).
+    /// Copy = a new tab running `omp --fork <src> --cwd <dest>` in the gateway. The tab starts
+    /// "copy pending": success is only announced once the gateway found the new session file
+    /// (`ClientEvent::CopyResult`).
     fn copy_session(&mut self, entry: &SessionEntry, dest: &Path) {
-        let argv = self.with_omp_program(fork_argv(&entry.path, dest));
-        let name = self
-            .backends
-            .primary()
-            .is_some()
-            .then(|| new_session_name(SystemTime::now()));
-        let started_at = SystemTime::now();
-        self.spawn_tab_post(SpawnReq {
-            mux_name: name,
-            cwd: dest.to_path_buf(),
-            session_path: None,
-            title: entry.label().to_owned(),
-            argv,
-            role: TabRole::Session,
-            post: Post::Copy {
-                src_id: entry.id.clone(),
+        let mut req = SpawnReq::session(
+            self.new_mux_name(),
+            dest.to_path_buf(),
+            None,
+            entry.label().to_owned(),
+            Post::Copy {
                 label: entry.label().to_owned(),
                 dest: dest.to_path_buf(),
-                started_at,
             },
-            focus: Focus::Claim,
-        });
-    }
-
-    /// Per frame: poll for the new file of every pending copy (on a worker, about once a second)
-    /// and fail copies whose process exited first or that took too long.
-    fn drive_copies(&mut self, ctx: &egui::Context) {
-        let now = Instant::now();
-        let mut errors = Vec::new();
-        let mut polls = Vec::new();
-        let mut pending = false;
-        for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
-            if tab.copy.is_none() {
-                continue;
-            }
-            let exited = tab.terminal().is_exited();
-            let exit_code = tab.terminal().exit_code();
-            let Some(copy) = &mut tab.copy else {
-                continue;
-            };
-            if exited {
-                errors.push(match exit_code {
-                    Some(code) => format!(
-                        "Copy failed: omp exited (code {code}) before the copy was created — see the tab for its output"
-                    ),
-                    None => "Copy failed: omp ended before the copy was created — see the tab for its output".to_owned(),
-                });
-                tab.copy = None;
-            } else if now.duration_since(copy.started) >= COPY_TIMEOUT {
-                errors.push(
-                    "Copy failed: no new session appeared within 2 minutes — see the tab for omp's output".to_owned(),
-                );
-                tab.copy = None;
-            } else {
-                pending = true;
-                if !copy.polling && now >= copy.next_poll {
-                    copy.polling = true;
-                    copy.next_poll = now + COPY_POLL;
-                    polls.push((copy.id, copy.src_id.clone(), copy.started_at));
-                }
-            }
-        }
-        for msg in errors {
-            self.toasts.error(&self.ctx, msg);
-        }
-        for (copy_id, src_id, started_at) in polls {
-            let root = self.root.clone();
-            // omp stamps the file slightly before we noted the start time.
-            let since = started_at
-                .checked_sub(Duration::from_secs(2))
-                .unwrap_or(started_at);
-            omp_worker::spawn(&self.ctx, &self.events_tx, move || AppEvent::ForkFound {
-                copy_id,
-                path: find_fork(&root, &src_id, since),
-            });
-        }
-        if pending {
-            ctx.request_repaint_after(COPY_POLL / 2);
-        }
-    }
-
-    fn on_fork_found(&mut self, copy_id: u64, path: Option<PathBuf>) {
-        let Some(tab) = self
-            .tabs
-            .iter_mut()
-            .filter_map(Tab::term_mut)
-            .find(|t| t.copy.as_ref().is_some_and(|c| c.id == copy_id))
-        else {
-            return; // the copy already failed or its tab is gone
-        };
-        let Some(path) = path else {
-            if let Some(copy) = &mut tab.copy {
-                copy.polling = false;
-            }
-            return;
-        };
-        tab.copy = None;
-        tab.ctl.set_session_path(Some(path));
-        let dest = abbreviate_home(&tab.cwd);
-        self.dirty = true;
-        self.toasts.success(
-            &self.ctx,
-            format!("Copied to {dest} — the copy is a new session"),
+            Focus::Claim,
         );
-        self.refresh_sessions();
+        req.argv = fork_argv(&entry.path, dest);
+        req.copy_of = Some(entry.id.clone());
+        self.spawn_tab_post(req);
     }
 
     fn request_move(&mut self, entry: SessionEntry, dest: PathBuf) {
@@ -2691,12 +2555,11 @@ impl App {
         ));
     }
 
-    /// Stop the session if it runs (kill every session involved + close its tabs), then
-    /// `omp session pack/unpack` on a worker, retrying while omp still sees the dying process.
-    /// A tab that was open comes back afterwards: on the new path after success, on the original
-    /// path (re-attached if its session survived) after a failure.
+    /// Stop the session if it runs (kill every session involved + close its tabs), then the
+    /// gateway moves the files. A tab that was open comes back afterwards: on the new path after
+    /// success, on the original path (re-attached if its session survived) after a failure.
     fn execute_move(&mut self, entry: SessionEntry, dest: PathBuf) {
-        if self.omp.is_none() || !self.moving.insert(entry.path.clone()) {
+        if !self.omp_found() || !self.moving.insert(entry.path.clone()) {
             return;
         }
         let prep = self.prepare_move(entry);
@@ -2705,19 +2568,20 @@ impl App {
             &self.ctx,
             format!("Moving “{title}” to {}…", abbreviate_home(&dest)),
         );
-        let backends = self.backends.clone();
         let src = prep.entry.path.clone();
-        self.spawn_omp(move |omp| {
-            let (result, tab) = prep.run(&omp, &backends, &dest);
-            OmpEvent::MoveDone {
-                src,
-                dest,
-                title,
-                tab,
-                result,
-            }
+        let op = Mutation::Move {
+            file: src.clone(),
+            dest_cwd: dest.clone(),
+            stop: prep.kill_names.clone(),
+        };
+        self.gw.mutate(op, move |app, result| {
+            let result = result.and_then(|d| match d {
+                Done::Moved(outcome) => Ok(outcome),
+                other => Err(format!("unexpected answer {other:?}")),
+            });
+            let tab = app.finish_move(prep, &result, &dest);
+            app.on_move_done(src, dest, title, tab, result);
         });
-        self.running.poke();
     }
 
     /// Capture the tab state of a session about to be moved and close its tabs. The monitor
@@ -2774,7 +2638,7 @@ impl App {
     }
 
     fn request_delete(&mut self, entry: SessionEntry) {
-        if self.omp.is_none() || self.moving.contains(&entry.path) {
+        if !self.omp_found() || self.moving.contains(&entry.path) {
             return;
         }
         let label = entry.label().to_owned();
@@ -2815,38 +2679,36 @@ impl App {
         ));
     }
 
-    /// Stop whatever runs the session, then let omp delete it on a worker.
+    /// Stop whatever runs the session, then let the gateway delete it.
     fn execute_delete(&mut self, entry: SessionEntry) {
-        if self.omp.is_none() || !self.moving.insert(entry.path.clone()) {
+        if !self.omp_found() || !self.moving.insert(entry.path.clone()) {
             return;
         }
-        let kill_names = self.session_kill_names(&entry, true);
+        let stop = self.session_kill_names(&entry, true);
         let path = entry.path.clone();
-        let id = entry.id.clone();
         let title = entry.label().to_owned();
-        let backends = self.backends.clone();
-        self.spawn_omp(move |omp| {
-            let mut result = Err("omp did not answer".to_owned());
-            let target = deck_core::omp::DeleteTarget {
-                path: path.clone(),
-                id,
-            };
-            deck_service::lifecycle::stop_then_delete(
-                &omp,
-                &backends,
-                &kill_names,
-                std::slice::from_ref(&target),
-                |_, r| result = r,
-            );
-            OmpEvent::DeleteDone {
-                path,
-                title,
-                result,
-            }
-        });
-        self.running.poke();
+        let target = DeleteTarget {
+            path: path.clone(),
+            id: entry.id.clone(),
+        };
         self.toasts
             .info(&self.ctx, format!("Deleting “{}”…", entry.label()));
+        self.gw.mutate(
+            Mutation::Delete {
+                targets: vec![target],
+                stop,
+            },
+            move |app, result| {
+                let result = result.and_then(|d| match d {
+                    Done::Deleted(failed) => match failed.into_iter().find(|(p, _)| *p == path) {
+                        Some((_, Some(why))) => Err(why),
+                        _ => Ok(()),
+                    },
+                    other => Err(format!("unexpected answer {other:?}")),
+                });
+                app.on_delete_done(&path, &title, result);
+            },
+        );
     }
 
     /// Kill list for stopping `entry`: the backend session that holds it, plus the ones its
@@ -2948,21 +2810,18 @@ impl App {
             return;
         };
         self.retarget_pane_claim(src, t.session_path_owned(), t.mux_name.clone());
-        let argv = self.with_omp_program(tabs::omp_argv(t.session_path()));
-        self.spawn_tab_post(SpawnReq {
-            mux_name: t.mux_name,
-            cwd: t.cwd,
-            session_path: t.session_path,
-            title: t.title,
-            argv,
-            role: TabRole::Session,
-            post: Post::Anchor(anchor),
-            focus: if refocus == Some(self.activation_seq) {
+        self.spawn_tab_post(SpawnReq::session(
+            t.mux_name,
+            t.cwd,
+            t.session_path,
+            t.title,
+            Post::Anchor(anchor),
+            if refocus == Some(self.activation_seq) {
                 Focus::Claim
             } else {
                 Focus::Never
             },
-        });
+        ));
     }
 
     fn show_folder_dialog(&mut self, ctx: &egui::Context) {
@@ -2984,16 +2843,25 @@ impl App {
             FolderOutcome::Browse => {
                 dlg.browsing = true;
                 let start = dlg.start_dir(self.home.as_deref());
-                omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-                    AppEvent::Omp(OmpEvent::FolderPicked(transfer::pick_folder(&start)))
-                });
+                self.gw.native(
+                    move || transfer::pick_folder(&start),
+                    |app, path| {
+                        if let Some(dlg) = &mut app.folder_dialog {
+                            dlg.browsing = false;
+                            if let Some(p) = path {
+                                dlg.set_text(p.to_string_lossy().into_owned(), app.home.as_deref());
+                            }
+                        }
+                        app.dispatch_folder_check();
+                    },
+                );
             }
         }
         self.dispatch_folder_check();
     }
 
     /// Run the dialog's pending filesystem check (is it a directory? is it the source project?)
-    /// on a worker; the verdict comes back as `FolderChecked`.
+    /// on a native worker; the verdict comes back through `apply_check`.
     fn dispatch_folder_check(&mut self) {
         let Some(request) = self
             .folder_dialog
@@ -3002,10 +2870,14 @@ impl App {
         else {
             return;
         };
-        omp_worker::spawn(&self.ctx, &self.events_tx, move || {
-            let (generation, result) = request.run();
-            AppEvent::Omp(OmpEvent::FolderChecked { generation, result })
-        });
+        self.gw.native(
+            move || request.run(),
+            |app, (generation, result)| {
+                if let Some(dlg) = &mut app.folder_dialog {
+                    dlg.apply_check(generation, result);
+                }
+            },
+        );
     }
 }
 
@@ -3071,10 +2943,13 @@ impl eframe::App for App {
     }
 
     /// Runs every tick, also while the window is minimized or on another desktop (when eframe
-    /// skips `ui`): terminal polling and the notification rules must not depend on painting.
+    /// skips `ui`): gateway results, terminal polling and what the gateway is told about this
+    /// window must not depend on painting.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.pump_gateway();
         self.poll_tabs();
         self.poll_settings();
+        self.poll_gateway_mode();
         self.drive_notifications(ctx, frame);
     }
 
@@ -3088,14 +2963,17 @@ impl eframe::App for App {
         self.handle_shortcuts(&ctx);
         self.drain_events(&ctx);
 
-        let latest = self.running.latest();
-        if let Some(snap) = &latest {
-            self.restore_tabs(snap);
-            self.sync_session_paths(snap);
+        if self.gw.gateway().is_some()
+            && let Some(snap) = self.gw.running()
+        {
+            self.restore_tabs(&snap);
             self.open_deferred();
         }
-        let snap = latest.unwrap_or_default();
+        let snap = self.running_snapshot();
         self.refresh_sessions_cache();
+        self.tick_omp();
+        self.tick_omp_update();
+        self.drive_tick(&ctx);
 
         // Panes follow the tab list; then only the tabs on screen repaint promptly on output
         // (the others coalesce). Polling for title/bell/exit happens in `logic`.
@@ -3138,10 +3016,9 @@ impl eframe::App for App {
         theme::skin::paint_backdrop(ui.painter(), ui.max_rect(), Palette::of_ui(ui));
         self.show_bar(ui, maximized);
         self.show_banners(ui);
-        self.drive_status(&ctx);
-        self.drive_usage(&ctx);
-        self.drive_tick(&ctx);
-        self.sync_tick(&ctx);
+        self.drive_status();
+        self.drive_ctl();
+        self.drive_usage();
         self.drive_agents();
         self.drive_dashboard();
         self.drive_changes(&ctx);
@@ -3163,8 +3040,6 @@ impl eframe::App for App {
         self.drive_worktrees(&ctx);
         self.check_update_tabs();
         self.pump_update_queue();
-        self.drive_copies(&ctx);
-        self.tick_updates(&ctx);
         self.tick_app_update(&ctx);
         // Age chips tick over without any other event.
         ctx.request_repaint_after(AGE_REFRESH);
@@ -3182,12 +3057,18 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Whatever is still in flight settles first; then the final state goes through the same
-        // compare-and-set path and the owner is flushed so it is on disk before exit.
-        // A conflict drops this window's conflicting fields and leaves the rest dirty: those go
-        // out again, so a lost race on one field never loses the others. Every conflicting round
-        // gives up at least one of the fields still to send, so the fields in flight plus the
-        // fields still dirty, plus one final round, bound the loop. A failed write ends it.
+        // Closing the window detaches its views only: the gateway keeps the sessions (and any
+        // accepted work) running. What is left is this window's last settings. Whatever is still
+        // in flight settles first; then the final state goes through the same compare-and-set
+        // path and the gateway is flushed so it is on disk before exit. A conflict drops this
+        // window's conflicting fields and leaves the rest dirty: those go out again, so a lost
+        // race on one field never loses the others. Every conflicting round gives up at least one
+        // of the fields still to send, so the fields in flight plus the fields still dirty, plus
+        // one final round, bound the loop. A failed write, or a gateway that does not answer in
+        // time, ends it.
+        if !self.gw.is_up() || self.gw.config().is_none() {
+            return;
+        }
         let in_flight = self.saving.as_ref().map_or(0, |(_, sent)| {
             settings::Setting::diff(&self.cfg_base, sent).len()
         });
@@ -3199,14 +3080,18 @@ impl eframe::App for App {
             let Some((pending, sent)) = self.saving.take() else {
                 break;
             };
-            let result = pending.wait();
+            let Some(result) = pending.wait(EXIT_WAIT) else {
+                break;
+            };
             let failed = matches!(result, Err(SettingsError::Io(_) | SettingsError::Gone));
             self.on_settings_result(result, sent);
             if failed {
                 break;
             }
         }
-        self.settings_service.flush();
+        if self.gw.flush().wait(EXIT_WAIT).is_none() {
+            log::warn!("the gateway did not acknowledge the final settings in time");
+        }
     }
 }
 

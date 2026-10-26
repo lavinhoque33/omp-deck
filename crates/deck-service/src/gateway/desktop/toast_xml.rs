@@ -7,7 +7,7 @@ pub const GROUP: &str = "omp-deck";
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use deck_service::controller::SessionTarget;
+use crate::controller::SessionTarget;
 
 /// The toast tag of a session's notification (a newer toast with the same tag replaces the older
 /// one); the settings test notification (`None`) is `"test"`. The key is hashed: tags are limited
@@ -59,7 +59,8 @@ mod tests {
     #[test]
     fn tags_are_per_tab_with_a_fixed_test_tag() {
         let key = |n: &str| SessionTarget {
-            key: deck_service::controller::SessionKey::tmux("t", n),
+            epoch: crate::controller::ServiceEpoch::current(),
+            key: crate::controller::SessionKey::tmux("t", n),
             generation: 1,
         };
         assert_eq!(tag(Some(&key("7"))), tag(Some(&key("7"))));

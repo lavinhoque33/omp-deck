@@ -1,13 +1,13 @@
 //! Byte-level scanners for child output that alacritty_terminal parses but ignores: xterm
 //! modifyOtherKeys requests (`CSI > 4 ; n m`), win32-input-mode (`CSI ? 9001 h/l`) and kitty
-//! graphics commands (APC strings). Both output paths (the local PTY reader and the remote
-//! feeder) run every chunk through one [`OutputScan`] before or after the `Term` sees it; the
-//! bytes themselves pass unchanged.
+//! graphics commands (APC strings). Every output path (the local PTY loop, the remote and
+//! frontend feeders) runs each chunk through one [`OutputScan`] inside the terminal's engine,
+//! right after the `Term` saw it; the bytes themselves pass unchanged.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use crate::graphics::{ApcScanner, Graphics};
+use crate::graphics::{ApcScanner, Command, Graphics, ImageReplay};
 
 const ESC: u8 = 0x1b;
 
@@ -28,16 +28,23 @@ pub(crate) struct OutputScan {
     apc: ApcScanner,
     modes: Arc<KeyModes>,
     graphics: Arc<Graphics>,
+    /// An owner's retained images, replayed to renderers attaching later.
+    replay: Option<ImageReplay>,
 }
 
 impl OutputScan {
-    pub(crate) fn new(modes: Arc<KeyModes>, graphics: Arc<Graphics>) -> OutputScan {
+    pub(crate) fn new(
+        modes: Arc<KeyModes>,
+        graphics: Arc<Graphics>,
+        replay: Option<ImageReplay>,
+    ) -> OutputScan {
         OutputScan {
             mok: MokScanner::default(),
             win32: Win32ModeScanner::default(),
             apc: ApcScanner::default(),
             modes,
             graphics,
+            replay,
         }
     }
 
@@ -50,7 +57,29 @@ impl OutputScan {
             self.modes.win32_input.store(on, Ordering::Relaxed);
         }
         let graphics = &self.graphics;
-        self.apc.feed(bytes, |cmd| graphics.apply(cmd));
+        let replay = &mut self.replay;
+        self.apc.feed(bytes, |cmd| match cmd {
+            Command::Transmit(up) => {
+                let up = Arc::new(up);
+                if let Some(replay) = replay.as_mut() {
+                    replay.transmit(up.clone());
+                }
+                graphics.transmit(up);
+            }
+            cmd => {
+                if let Some(replay) = replay.as_mut() {
+                    replay.apply(&cmd);
+                }
+                graphics.apply(cmd);
+            }
+        });
+    }
+
+    /// Appends the APC replay of the retained images (nothing unless this is an owner).
+    pub(crate) fn image_replay(&self, out: &mut Vec<u8>) {
+        if let Some(replay) = &self.replay {
+            replay.encode(self.apc.pending(), out);
+        }
     }
 
     /// Forgets partial sequences and every mode (a remote snapshot replays them). Stored images
@@ -61,6 +90,110 @@ impl OutputScan {
         self.apc = ApcScanner::default();
         self.modes.modify_other_keys.store(0, Ordering::Relaxed);
         self.modes.win32_input.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Whether a byte stream is between sequences, as vte's parser sees it: not inside an escape,
+/// control or string sequence and not inside a UTF-8 character. A renderer joining the stream
+/// at such a boundary parses the following bytes exactly like the owner did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GroundTracker {
+    #[default]
+    Ground,
+    /// Continuation bytes still expected.
+    Utf8(u8),
+    Esc,
+    /// `ESC` + intermediates.
+    EscIntermediate,
+    Csi,
+    /// OSC: ends with BEL or ST.
+    Osc,
+    /// DCS, SOS, PM, APC: end with ST.
+    String,
+}
+
+impl GroundTracker {
+    pub(crate) fn is_ground(self) -> bool {
+        self == GroundTracker::Ground
+    }
+
+    /// Advances over `bytes`; returns the offset after the last byte that left the stream
+    /// between sequences, if any did.
+    pub(crate) fn feed_last_ground(&mut self, bytes: &[u8]) -> Option<usize> {
+        let mut last = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            self.step(b);
+            if self.is_ground() {
+                last = Some(i + 1);
+            }
+        }
+        last
+    }
+
+    /// Advances up to the first ground boundary in `bytes`; returns its offset (bytes before
+    /// it), or `None` with all of `bytes` consumed.
+    pub(crate) fn feed_to_ground(&mut self, bytes: &[u8]) -> Option<usize> {
+        for (i, &b) in bytes.iter().enumerate() {
+            self.step(b);
+            if self.is_ground() {
+                return Some(i + 1);
+            }
+        }
+        None
+    }
+
+    fn step(&mut self, b: u8) {
+        use GroundTracker::*;
+        // Transitions from any state (C0 CAN/SUB abort, ESC starts over).
+        match b {
+            0x18 | 0x1a => {
+                *self = Ground;
+                return;
+            }
+            ESC => {
+                *self = Esc;
+                return;
+            }
+            _ => {}
+        }
+        *self = match *self {
+            Ground => match b {
+                0xc2..=0xdf => Utf8(1),
+                0xe0..=0xef => Utf8(2),
+                0xf0..=0xf4 => Utf8(3),
+                _ => Ground,
+            },
+            Utf8(n) => match b {
+                0x80..=0xbf if n > 1 => Utf8(n - 1),
+                0x80..=0xbf => Ground,
+                // An invalid sequence ends; the byte starts afresh.
+                _ => {
+                    *self = Ground;
+                    return self.step(b);
+                }
+            },
+            Esc => match b {
+                0x20..=0x2f => EscIntermediate,
+                b'[' => Csi,
+                b']' => Osc,
+                b'P' | b'X' | b'^' | b'_' => String,
+                0x30..=0x7e => Ground,
+                _ => Esc,
+            },
+            EscIntermediate => match b {
+                0x30..=0x7e => Ground,
+                _ => EscIntermediate,
+            },
+            Csi => match b {
+                0x40..=0x7e => Ground,
+                _ => Csi,
+            },
+            Osc => match b {
+                0x07 => Ground,
+                _ => Osc,
+            },
+            String => String,
+        };
     }
 }
 

@@ -1,7 +1,9 @@
-//! Usage data owned by the app: what `omp usage --json` and omp's `stats.db` last said, when to
-//! ask again, and the pre-formatted view model the chip, the hover cards and the Usage view paint.
+//! Usage data the window shows: what the gateway's `omp usage --json` fetches and omp's
+//! `stats.db` last said, and the pre-formatted view model the chip, the hover cards and the Usage
+//! view paint.
 //!
-//! Fetching itself runs on worker threads (see `app/usage.rs`); this module is pure state.
+//! The gateway owns the fetch schedule (see `app/usage.rs` for the window's side); this module is
+//! pure state.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,28 +13,20 @@ use deck_core::usage::{
     UsageSnapshot, format_remaining, limit_fraction, provider_cards, provider_display_name,
     tightest,
 };
+use deck_service::gateway::protocol::UsageView;
 
 use crate::usage_fmt::{left_pct, left_text, money, requests, requests_short, short_date};
 use deck_service::statusfmt::fmt_tokens;
 
-/// First fetch after startup.
-pub const FIRST_FETCH_DELAY: Duration = Duration::from_secs(3);
-/// Background refresh period (omp caches reports for about as long).
-pub const REFRESH_EVERY: Duration = Duration::from_secs(300);
-/// Opening the view refreshes data older than this.
-pub const OPEN_STALE: Duration = Duration::from_secs(60);
 /// Opening the view reads `stats.db` again when the last read is at least this old.
 pub const ACTIVITY_EVERY: Duration = Duration::from_secs(600);
 /// "resets in" labels are recomputed this often.
 pub const RECOMPUTE_EVERY: Duration = Duration::from_secs(30);
-/// An open view never retries a failed fetch faster than this on its own.
-const RETRY_GAP: Duration = Duration::from_secs(10);
 /// Rows of one provider card before "N more in Details".
 pub const CARD_ROWS: usize = 4;
 
-/// Results of the workers.
+/// Results of the window's own reads.
 pub enum UsageEvent {
-    Fetched(Result<UsageSnapshot, String>),
     Activity(Result<Activity, String>),
 }
 
@@ -524,12 +518,11 @@ impl ActivityView {
 /// The app's usage state.
 pub struct Usage {
     omp_found: bool,
-    started: Instant,
     snapshot: Option<UsageSnapshot>,
     summary: Option<Arc<Summary>>,
     summary_at: Option<Instant>,
-    fetched: Option<Instant>,
-    last_attempt: Option<Instant>,
+    /// When the gateway last fetched successfully (unix ms).
+    fetched_ms: Option<i64>,
     fetching: bool,
     error: Option<String>,
     activity: Option<Arc<ActivityView>>,
@@ -548,15 +541,13 @@ pub enum Load {
 }
 
 impl Usage {
-    pub fn new(omp_found: bool, now: Instant) -> Usage {
+    pub fn new(omp_found: bool) -> Usage {
         Usage {
             omp_found,
-            started: now,
             snapshot: None,
             summary: None,
             summary_at: None,
-            fetched: None,
-            last_attempt: None,
+            fetched_ms: None,
             fetching: false,
             error: None,
             activity: None,
@@ -567,8 +558,8 @@ impl Usage {
     }
 
     /// omp was installed while OmpDeck runs: quotas can be fetched from now on.
-    pub fn omp_found(&mut self) {
-        self.omp_found = true;
+    pub fn omp_found(&mut self, found: bool) {
+        self.omp_found = found;
     }
 
     pub fn summary(&self) -> Option<&Arc<Summary>> {
@@ -607,48 +598,10 @@ impl Usage {
         }
     }
 
-    /// Seconds since the last successful fetch.
-    pub fn age_secs(&self, now: Instant) -> Option<u64> {
-        self.fetched
-            .map(|t| now.saturating_duration_since(t).as_secs())
-    }
-
-    /// Whether a background refresh is due now (startup delay, then every five minutes).
-    pub fn auto_due(&self, now: Instant) -> bool {
-        if self.fetching || !self.omp_found {
-            return false;
-        }
-        match self.last_attempt {
-            None => now.saturating_duration_since(self.started) >= FIRST_FETCH_DELAY,
-            Some(t) => now.saturating_duration_since(t) >= REFRESH_EVERY,
-        }
-    }
-
-    /// When the next background refresh falls due (for repaint scheduling).
-    pub fn next_due(&self, now: Instant) -> Option<Duration> {
-        if self.fetching || !self.omp_found {
-            return None;
-        }
-        let at = match self.last_attempt {
-            None => self.started + FIRST_FETCH_DELAY,
-            Some(t) => t + REFRESH_EVERY,
-        };
-        Some(at.saturating_duration_since(now))
-    }
-
-    /// Whether opening the view should fetch: data older than a minute (or none), not retried
-    /// within seconds of the last attempt.
-    pub fn open_due(&self, now: Instant) -> bool {
-        if self.fetching || !self.omp_found {
-            return false;
-        }
-        let stale = self
-            .fetched
-            .is_none_or(|t| now.saturating_duration_since(t) > OPEN_STALE);
-        let calm = self
-            .last_attempt
-            .is_none_or(|t| now.saturating_duration_since(t) >= RETRY_GAP);
-        stale && calm
+    /// Seconds since the gateway's last successful fetch.
+    pub fn age_secs(&self, now_ms: i64) -> Option<u64> {
+        self.fetched_ms
+            .map(|t| u64::try_from(now_ms.saturating_sub(t) / 1000).unwrap_or(0))
     }
 
     /// Whether opening the view should read `stats.db` again.
@@ -662,15 +615,6 @@ impl Usage {
     /// A manual refresh: refused only while a fetch is already running.
     pub fn can_refresh(&self) -> bool {
         self.omp_found && !self.fetching
-    }
-
-    pub fn begin_fetch(&mut self, now: Instant) {
-        self.fetching = true;
-        self.last_attempt = Some(now);
-    }
-
-    pub fn begin_activity(&mut self) {
-        self.activity_busy = true;
     }
 
     /// Whether the "resets in" labels should be recomputed.
@@ -688,32 +632,35 @@ impl Usage {
         }
     }
 
-    pub fn apply(&mut self, ev: UsageEvent, now: Instant, now_ms: i64) {
-        match ev {
-            UsageEvent::Fetched(Ok(snap)) => {
-                self.fetching = false;
-                self.error = None;
-                self.fetched = Some(now);
-                self.snapshot = Some(snap);
-                self.recompute(now, now_ms);
+    /// Takes the gateway's usage view (it owns the schedule and the fetches).
+    pub fn adopt(&mut self, view: &UsageView, now_ms: i64) {
+        self.fetching = view.fetching;
+        self.error.clone_from(&view.error);
+        self.fetched_ms = view.fetched_unix_ms.and_then(|ms| i64::try_from(ms).ok());
+        if let Some(snap) = &view.snapshot
+            && self.snapshot.as_ref() != Some(snap)
+        {
+            self.snapshot = Some(snap.clone());
+            self.recompute(Instant::now(), now_ms);
+        }
+    }
+
+    pub fn begin_activity(&mut self) {
+        self.activity_busy = true;
+    }
+
+    pub fn apply(&mut self, ev: UsageEvent, now: Instant) {
+        let UsageEvent::Activity(r) = ev;
+        self.activity_busy = false;
+        self.activity_at = Some(now);
+        match r {
+            Ok(a) => {
+                self.activity_error = None;
+                let today = deck_core::usage::today_local();
+                let heatmap = Heatmap::build(&a, today, 53);
+                self.activity = Some(Arc::new(ActivityView::build(&a, heatmap)));
             }
-            UsageEvent::Fetched(Err(e)) => {
-                self.fetching = false;
-                self.error = Some(e);
-            }
-            UsageEvent::Activity(r) => {
-                self.activity_busy = false;
-                self.activity_at = Some(now);
-                match r {
-                    Ok(a) => {
-                        self.activity_error = None;
-                        let today = deck_core::usage::today_local();
-                        let heatmap = Heatmap::build(&a, today, 53);
-                        self.activity = Some(Arc::new(ActivityView::build(&a, heatmap)));
-                    }
-                    Err(e) => self.activity_error = Some(e),
-                }
-            }
+            Err(e) => self.activity_error = Some(e),
         }
     }
 }
@@ -878,59 +825,27 @@ mod tests {
     }
 
     #[test]
-    fn schedule_waits_three_seconds_then_five_minutes() {
-        let t0 = Instant::now();
-        let mut u = Usage::new(true, t0);
-        assert!(!u.auto_due(t0 + Duration::from_secs(2)));
-        assert!(u.auto_due(t0 + Duration::from_secs(3)));
-        u.begin_fetch(t0 + Duration::from_secs(3));
-        assert!(!u.auto_due(t0 + Duration::from_secs(400)), "one at a time");
-        u.apply(
-            UsageEvent::Fetched(Err("boom".to_owned())),
-            t0 + Duration::from_secs(4),
-            0,
-        );
-        assert_eq!(u.load(), Load::Failed);
-        assert!(!u.auto_due(t0 + Duration::from_secs(200)));
-        assert!(u.auto_due(t0 + Duration::from_secs(303)));
-    }
-
-    #[test]
-    fn opening_refreshes_only_stale_data() {
-        let t0 = Instant::now();
-        let mut u = Usage::new(true, t0);
-        assert!(u.open_due(t0 + Duration::from_secs(1)));
-        u.begin_fetch(t0);
-        u.apply(
-            UsageEvent::Fetched(Ok(snap(ONE))),
-            t0 + Duration::from_secs(1),
-            0,
-        );
+    fn an_adopted_view_replaces_the_data_and_keeps_the_old_one_on_error() {
+        let mut u = Usage::new(true);
+        let view = |snapshot, error: Option<&str>| UsageView {
+            snapshot,
+            fetched_unix_ms: Some(1_000),
+            error: error.map(str::to_owned),
+            fetching: false,
+        };
+        u.adopt(&view(Some(snap(ONE)), None), 0);
         assert_eq!(u.load(), Load::Ready);
-        assert!(!u.open_due(t0 + Duration::from_secs(50)));
-        assert!(u.open_due(t0 + Duration::from_secs(70)));
-        assert!(u.activity_due(t0));
-    }
-
-    #[test]
-    fn without_omp_nothing_is_fetched() {
-        let t0 = Instant::now();
-        let u = Usage::new(false, t0);
-        assert_eq!(u.load(), Load::OmpMissing);
-        assert!(!u.auto_due(t0 + Duration::from_secs(999)));
-        assert!(!u.open_due(t0 + Duration::from_secs(999)));
-        assert!(!u.can_refresh());
-    }
-
-    #[test]
-    fn a_failed_refresh_keeps_the_old_data() {
-        let t0 = Instant::now();
-        let mut u = Usage::new(true, t0);
-        u.apply(UsageEvent::Fetched(Ok(snap(ONE))), t0, 0);
-        u.apply(UsageEvent::Fetched(Err("offline".to_owned())), t0, 0);
+        u.adopt(&view(Some(snap(ONE)), Some("offline")), 0);
         assert_eq!(u.load(), Load::Ready);
         assert_eq!(u.error(), Some("offline"));
-        assert!(u.summary().is_some());
+        assert_eq!(u.age_secs(4_000), Some(3));
+    }
+
+    #[test]
+    fn without_omp_nothing_can_be_refreshed() {
+        let u = Usage::new(false);
+        assert_eq!(u.load(), Load::OmpMissing);
+        assert!(!u.can_refresh());
     }
 
     #[test]

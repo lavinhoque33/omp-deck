@@ -29,13 +29,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 use deck_core::config::{
-    AppConfig, Density, FolderTabs, NotifyConfig, RemovedWorktree, SplitState, SyncInterval,
-    SyncRow, TabState, Theme, UiStyle, WindowGeometry, config_dir, parse_config,
+    AppConfig, Density, FolderTabs, GatewayMode, NotifyConfig, RemovedWorktree, SplitState,
+    SyncInterval, SyncRow, TabState, Theme, UiStyle, WindowGeometry, config_dir, parse_config,
 };
 use deck_core::mux::BackendChoice;
+use serde::{Deserialize, Serialize};
 
 /// Who a field belongs to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scope {
     /// This machine and its windows.
     Device,
@@ -46,7 +47,7 @@ pub enum Scope {
 /// This window's tabs, the active one and the split layout: one value for the compare-and-swap,
 /// because an index or split pane only means something together with the tab list it was
 /// chosen in (two windows editing the parts separately must conflict, not mix).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TabLayout {
     pub open_tabs: Vec<TabState>,
     pub active_tab: Option<usize>,
@@ -92,7 +93,7 @@ fn put_folder(cfg: &mut AppConfig, key: &Path, value: Option<&FolderTabs>) {
 macro_rules! settings {
     ($($variant:ident($field:ident: $ty:ty) = $scope:ident,)*) => {
         /// A new value for one setting.
-        #[derive(Clone, Debug, PartialEq)]
+        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
         pub enum Setting {
             $($variant($ty),)*
             TabLayout(TabLayout),
@@ -105,7 +106,7 @@ macro_rules! settings {
         }
 
         /// One setting: the unit of the compare-and-swap.
-        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
         pub enum Field {
             $($variant,)*
             TabLayout,
@@ -292,10 +293,11 @@ settings! {
     SkippedAppVersion(skipped_app_version: Option<String>) = Shared,
     PaletteRecent(palette_recent: Vec<String>) = Device,
     ChangesPanelWidth(changes_panel_width: f32) = Device,
+    GatewayMode(gateway_mode: GatewayMode) = Device,
 }
 
 /// The committed settings as one client read them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub config: Arc<AppConfig>,
     /// Grows whenever this process saw the committed settings change.
@@ -303,7 +305,7 @@ pub struct Snapshot {
 }
 
 /// Field changes made from `base` (the snapshot config the client edited).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Edit {
     pub base: Arc<AppConfig>,
     pub changes: Vec<Setting>,
@@ -317,7 +319,7 @@ impl Edit {
     }
 }
 
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum SettingsError {
     /// Someone else changed these fields since the edit's baseline; nothing was applied.
     /// `current` holds the committed settings to rebase onto.

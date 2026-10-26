@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::SystemTime;
 
+pub mod gateway;
+
 #[cfg(unix)]
 #[path = "unix.rs"]
 mod imp;
@@ -38,7 +40,7 @@ pub fn process_memory(pid: u32) -> Option<TreeMemory> {
 }
 
 /// Memory of one process tree (root + every descendant).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TreeMemory {
     /// Linux: summed proportional set size (shared pages split between their users, so a tree is
     /// not charged for pages it only shares), `VmRSS` where `smaps_rollup` is unreadable.

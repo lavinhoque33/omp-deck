@@ -392,7 +392,7 @@ pub struct PreparedRestore {
     files: BTreeMap<String, Restored>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RestoreReport {
     /// Where the previous versions were copied.
     pub safety_dir: PathBuf,

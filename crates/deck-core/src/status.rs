@@ -29,7 +29,7 @@ use crate::platform::{self, FileId};
 /// `/fork`, `/resume`, `/move`), so it names the pane's current file. The key is omp's terminal
 /// id: the tty minus `/dev/` with `/`→`-` (`pts-6`), or `apple-<TERM_SESSION_ID>` where there is
 /// no tty (the OmpDeck host on Windows).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Breadcrumb {
     pub cwd: PathBuf,
     pub session: PathBuf,
@@ -128,7 +128,7 @@ const ROLE_PEEK: usize = 1024;
 /// Cap of [`SessionStats::last_assistant_text`].
 const MAX_ASSISTANT_TEXT: usize = 256 * 1024;
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionStats {
     pub title: Option<String>,
     /// Last `model_change` / assistant `provider/id`, whichever came later in the file.
@@ -574,7 +574,7 @@ const TAIL_WINDOW: u64 = 256 * 1024;
 const MAX_ERROR_CHARS: usize = 200;
 
 /// How the session's most recent assistant message ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TurnOutcome {
     /// Any `stopReason` other than `error` / `aborted`.
     Completed,
@@ -586,7 +586,7 @@ pub enum TurnOutcome {
 }
 
 /// [`TurnOutcome`] plus when the deciding assistant message was written.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LastTurn {
     pub outcome: TurnOutcome,
     /// When the deciding assistant reply finished: `message.completedAt`, else the entry's own
@@ -733,7 +733,7 @@ fn run_capture(
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 const GH_TIMEOUT: Duration = Duration::from_secs(20);
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GitInfo {
     /// Branch name, or "detached".
     pub branch: String,
@@ -748,7 +748,7 @@ pub struct GitInfo {
     pub worktree_of: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PrInfo {
     pub number: u64,
     pub url: String,
@@ -868,7 +868,7 @@ pub struct StatusTarget {
     pub cwd: PathBuf,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionStatus {
     /// Current file (breadcrumb wins; follows /new, /fork, /move).
     pub session: Option<PathBuf>,

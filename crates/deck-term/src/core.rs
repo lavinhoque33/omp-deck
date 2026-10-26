@@ -1,8 +1,10 @@
 //! Terminal state: alacritty `Term` + the event listener, fed either by a local PTY child
-//! (Unix: alacritty tty + EventLoop) or by a remote session host ([`crate::Remote`]). No egui
-//! types except `egui::Context` (used only to wake the UI).
+//! (Unix: alacritty tty + our PTY loop) or by a remote session host ([`crate::Remote`]) or, for
+//! a gateway frontend, by the gateway ([`crate::Frontend`]). Every output path runs through the
+//! terminal's [`Engine`]. No egui types except `egui::Context` (used only to wake the UI).
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -18,14 +20,24 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{ClipboardType, Config, Osc52, Term, TermMode};
 
 use crate::clipboard::Clipboard;
-use crate::graphics::Graphics;
-use crate::input::KeyRules;
+use crate::engine::{Engine, OutputEvent, OutputNotify, OutputSubscription};
+use crate::frontend::{
+    self, ClipboardPolicy, Frontend, FrontendState, FrontendView, InputMeta, ReplyRejected,
+};
+use crate::graphics::{Graphics, ImageReplay};
+use crate::input::{KeyRules, Mods};
 use crate::out::{PtyOut, Sink, WriteProgress, register_detaching};
 use crate::remote::{self, Feeder, Remote};
 use crate::scan::{KeyModes, OutputScan};
 use crate::theme::{self, Palette, TermTheme};
 use crate::wake::{Wake, WakeCallback};
 use crate::widget::ViewState;
+
+/// Formats the reply to an OSC 52 read from the clipboard text.
+type ClipboardFormat = Arc<dyn Fn(&str) -> String + Sync + Send + 'static>;
+
+/// OSC 52 reads kept outstanding for the designated frontend (the oldest is dropped beyond).
+const MAX_OUTSTANDING_LOADS: usize = 8;
 
 /// What to run in a local PTY (Unix).
 #[cfg(unix)]
@@ -177,6 +189,25 @@ pub(crate) enum Notice {
     Reset,
     /// Authoritative geometry received by an output observer.
     Resized(WindowSize),
+    /// Frontend: new owner state.
+    State(FrontendState),
+    /// Frontend: the link to the owner is lost until the next snapshot.
+    Disconnected,
+}
+
+/// OSC 52 traffic of an owner whose clipboard is a designated frontend's
+/// ([`ClipboardPolicy::Frontend`]). Reads are recorded by the output thread while it parses,
+/// before the output is published, so a frontend's reply can never outrun its record.
+#[derive(Default)]
+pub(crate) struct RoutedClipboard {
+    routed: AtomicBool,
+    loads: Mutex<VecDeque<ClipboardFormat>>,
+}
+
+impl RoutedClipboard {
+    fn loads(&self) -> MutexGuard<'_, VecDeque<ClipboardFormat>> {
+        self.loads.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Called from the output thread (and from `Term` methods on the UI thread while the Term is
@@ -191,6 +222,7 @@ pub(crate) struct Listener {
     gate: Arc<RepaintGate>,
     /// Local terminal: this side answers terminal queries.
     answers: bool,
+    clipboard: Arc<RoutedClipboard>,
 }
 
 impl EventListener for Listener {
@@ -205,6 +237,15 @@ impl EventListener for Listener {
                 self.gate.request(&self.wake);
             }
             Event::ColorRequest(..) | Event::TextAreaSizeRequest(_) if !self.answers => {}
+            // The designated frontend's own Term stores; its reply is checked against this.
+            Event::ClipboardStore(..) if self.clipboard.routed.load(Ordering::Acquire) => {}
+            Event::ClipboardLoad(_, fmt) if self.clipboard.routed.load(Ordering::Acquire) => {
+                let mut loads = self.clipboard.loads();
+                if loads.len() == MAX_OUTSTANDING_LOADS {
+                    loads.pop_front();
+                }
+                loads.push_back(fmt);
+            }
             e @ (Event::ColorRequest(..)
             | Event::TextAreaSizeRequest(_)
             | Event::ClipboardLoad(..)) => {
@@ -221,10 +262,9 @@ impl EventListener for Listener {
 
 pub(crate) type SharedTerm = Arc<FairMutex<Term<Listener>>>;
 
-/// Shared construction of both terminal kinds.
+/// Shared construction of every terminal kind.
 struct Parts {
     term: SharedTerm,
-    config: Config,
     listener: Listener,
     out: Arc<PtyOut>,
     progress: Arc<WriteProgress>,
@@ -233,12 +273,23 @@ struct Parts {
     gate: Arc<RepaintGate>,
     graphics: Arc<Graphics>,
     key_modes: Arc<KeyModes>,
+    engine: Arc<Engine>,
     window_size: WindowSize,
+    wake: Wake,
+    /// The owner of its output (publishes to subscribers).
+    serve: bool,
 }
 
 impl Parts {
-    /// Initial size 80x24 until the first `TerminalView::show`.
-    fn new(opts: &TermOptions, ctx: &egui::Context, answers: bool, wake: Wake) -> Parts {
+    /// Initial size 80x24 until the first `TerminalView::show`. `serve`: an owner (retains
+    /// snapshot side state and images for output subscribers).
+    fn new(
+        opts: &TermOptions,
+        ctx: &egui::Context,
+        answers: bool,
+        wake: Wake,
+        serve: bool,
+    ) -> Parts {
         let (cols, rows) = (80u16, 24u16);
         let window_size = WindowSize {
             num_lines: rows,
@@ -256,6 +307,7 @@ impl Parts {
             wake: wake.clone(),
             gate: gate.clone(),
             answers,
+            clipboard: Arc::new(RoutedClipboard::default()),
         };
         let config = Config {
             kitty_keyboard: opts.kitty_keyboard,
@@ -263,28 +315,53 @@ impl Parts {
             scrolling_history: opts.scrollback,
             ..Config::default()
         };
-        let term = Term::new(
+        let term = Arc::new(FairMutex::new(Term::new(
             config.clone(),
             &TermSize::new(usize::from(cols), usize::from(rows)),
             listener.clone(),
+        )));
+        // A headless owner never paints: its renderers decode the replayed uploads.
+        let decode = !(serve && matches!(wake, Wake::Headless(_)));
+        let graphics = Arc::new(Graphics::new(ctx.clone(), wake.clone(), decode));
+        let key_modes = Arc::new(KeyModes::default());
+        let scan = OutputScan::new(
+            key_modes.clone(),
+            graphics.clone(),
+            serve.then(ImageReplay::default),
+        );
+        let engine = Engine::new(
+            term.clone(),
+            config,
+            listener.clone(),
+            scan,
+            serve,
+            window_size,
         );
         Parts {
-            term: Arc::new(FairMutex::new(term)),
-            config,
+            term,
             listener,
             out,
             progress,
             tx,
             rx,
             gate,
-            graphics: Arc::new(Graphics::new(ctx.clone(), wake)),
-            key_modes: Arc::new(KeyModes::default()),
+            graphics,
+            key_modes,
+            engine,
             window_size,
+            wake,
+            serve,
         }
     }
 
-    fn scan(&self) -> OutputScan {
-        OutputScan::new(self.key_modes.clone(), self.graphics.clone())
+    fn feeder(&self, frontend: bool) -> Feeder {
+        Feeder {
+            engine: self.engine.clone(),
+            out: self.out.clone(),
+            notices: self.tx.clone(),
+            wake: self.wake.clone(),
+            frontend,
+        }
     }
 
     fn into_terminal(
@@ -301,6 +378,7 @@ impl Parts {
             window_size: self.window_size,
             size_sent: !remote,
             clipboard: opts.clipboard,
+            routed_clipboard: self.listener.clipboard.clone(),
             palette: Palette::for_theme(opts.theme),
             tmux_client,
             key_modes: self.key_modes,
@@ -311,19 +389,23 @@ impl Parts {
             displaced: false,
             shut_down: false,
             read_only: false,
+            frontend: None,
             writer,
             last_ctrl_c: Cell::new(None),
             input_hold: Cell::new(None),
             gate: self.gate,
             graphics: self.graphics,
+            engine: self.engine,
+            serving: self.serve,
+            wake: self.wake,
             view: ViewState::default(),
         }
     }
 }
 
-/// One child with its terminal state: a local PTY child ([`Terminal::spawn`], Unix) or a
-/// session on a remote host ([`Terminal::connect`]). Both behave alike towards the widget and
-/// the app.
+/// One child with its terminal state: a local PTY child ([`Terminal::spawn`], Unix), a
+/// session on a remote host ([`Terminal::connect`]) or a gateway-owned session
+/// ([`Terminal::frontend`]). All behave alike towards the widget and the app.
 pub struct Terminal {
     pub(crate) term: SharedTerm,
     /// Every byte (and resize) to the child goes through here.
@@ -334,6 +416,8 @@ pub struct Terminal {
     /// host's size is unknown here).
     size_sent: bool,
     clipboard: Clipboard,
+    /// OSC 52 routing to a designated frontend (see [`Terminal::set_clipboard_policy`]).
+    routed_clipboard: Arc<RoutedClipboard>,
     palette: Palette,
     tmux_client: bool,
     /// Keyboard modes requested by the child that `TermMode` lacks (set by the output thread).
@@ -346,7 +430,9 @@ pub struct Terminal {
     displaced: bool,
     shut_down: bool,
     read_only: bool,
-    /// Remote writer thread (joined via [`crate::wait_detached`] after drop).
+    /// Gateway frontend state (`None` for owners and observers).
+    frontend: Option<FrontendView>,
+    /// Remote or frontend writer thread (joined via [`crate::wait_detached`] after drop).
     writer: Option<JoinHandle<()>>,
     /// When the last byte 0x03 was sent to the PTY (see [`Terminal::last_ctrl_c`]).
     last_ctrl_c: Cell<Option<Instant>>,
@@ -355,13 +441,18 @@ pub struct Terminal {
     gate: Arc<RepaintGate>,
     /// Kitty graphics images (fed by the output thread, painted by the widget).
     pub(crate) graphics: Arc<Graphics>,
+    /// Output parsing and publication.
+    engine: Arc<Engine>,
+    /// This terminal owns its output (output subscribers, state publication).
+    serving: bool,
+    wake: Wake,
     /// Per-terminal widget state (selection drag, blink timer, render buffers).
     pub(crate) view: ViewState,
 }
 
 impl Terminal {
-    /// Spawns the PTY child (alacritty tty + EventLoop thread). Initial size 80x24 until the
-    /// first `TerminalView::show`.
+    /// Spawns the PTY child (alacritty tty + our PTY loop thread). Initial size 80x24 until
+    /// the first `TerminalView::show`.
     #[cfg(unix)]
     pub fn spawn(
         spec: SpawnSpec,
@@ -389,10 +480,9 @@ impl Terminal {
         ctx: egui::Context,
         wake: Wake,
     ) -> std::io::Result<Terminal> {
-        use alacritty_terminal::event_loop::EventLoop;
         use alacritty_terminal::tty::{self, Options, Shell};
 
-        let parts = Parts::new(&opts, &ctx, true, wake);
+        let parts = Parts::new(&opts, &ctx, true, wake, true);
         let tty_opts = Options {
             shell: Some(Shell::new(spec.program, spec.args)),
             working_directory: Some(spec.cwd),
@@ -400,28 +490,27 @@ impl Terminal {
             env: spec.env.into_iter().collect(),
         };
         let pty = tty::new(&tty_opts, parts.window_size, 0)?;
-        let pty = crate::pty::TrackedPty::new(pty, parts.scan(), parts.progress.clone())?;
-        let event_loop = EventLoop::new(
-            parts.term.clone(),
-            parts.listener.clone(),
+        let (pty_loop, sender) = crate::pty::PtyLoop::new(
             pty,
-            tty_opts.drain_on_exit,
-            false,
+            parts.engine.clone(),
+            parts.listener.clone(),
+            parts.progress.clone(),
         )?;
-        // Set before the loop starts parsing, so no PtyWrite can be dropped.
-        parts.out.set_sink(Sink::Local(event_loop.channel()));
+        // Set before the loop starts parsing, so no reply can be dropped.
+        parts.out.set_sink(Sink::Local(sender));
         // Detached: the thread owns the Pty and drops it (SIGHUP + wait) after Msg::Shutdown.
-        drop(event_loop.spawn());
+        pty_loop.spawn()?;
         Ok(parts.into_terminal(opts, spec.tmux_client, false, None))
     }
 
     /// Attaches to a session on a remote host. The host's `Term` answers every terminal query;
     /// this side only renders, except that OSC 52 clipboard reads are answered here (the
-    /// clipboard lives here). A [`crate::RemoteEvent::Snapshot`] resets the local `Term` and
-    /// replays; the palette of `opts.theme` is sent at once (and again on
-    /// [`Self::set_theme`]), the grid size on the first `TerminalView::show`. `Displaced`
-    /// shows `[attached elsewhere]` and stops input. Dropping the terminal detaches (queued
-    /// input is sent first), [`Self::kill`] kills the session.
+    /// clipboard lives here, see [`Self::set_clipboard_policy`]). A
+    /// [`crate::RemoteEvent::Snapshot`] resets the local `Term` and replays; the palette of
+    /// `opts.theme` is sent at once (and again on [`Self::set_theme`]), the grid size on the
+    /// first `TerminalView::show`. `Displaced` shows `[attached elsewhere]` and stops input.
+    /// Dropping the terminal detaches (queued input is sent first), [`Self::kill`] kills the
+    /// session.
     pub fn connect(remote: Box<dyn Remote>, opts: TermOptions, ctx: egui::Context) -> Terminal {
         Self::connect_with_wake(remote, opts, ctx.clone(), Wake::Gui(ctx), false)
     }
@@ -479,18 +568,12 @@ impl Terminal {
         wake: Wake,
         read_only: bool,
     ) -> Terminal {
-        let parts = Parts::new(&opts, &ctx, false, wake.clone());
-        let feeder = Feeder {
-            term: parts.term.clone(),
-            config: parts.config.clone(),
-            listener: parts.listener.clone(),
-            scan: parts.scan(),
-            out: parts.out.clone(),
-            notices: parts.tx.clone(),
-            wake,
-        };
-        let (cmds, writer) = remote::start(remote, feeder, parts.progress.clone());
+        let parts = Parts::new(&opts, &ctx, false, wake, !read_only);
+        let (rx, tx) = remote.split();
+        let (cmds, writer) = remote::spawn_writer(tx, parts.progress.clone());
+        // Before the feeder runs, so no clipboard reply can be dropped.
         parts.out.set_sink(Sink::Remote(cmds));
+        remote::start(rx, parts.feeder(false));
         if !read_only {
             parts
                 .out
@@ -498,6 +581,36 @@ impl Terminal {
         }
         let mut terminal = parts.into_terminal(opts, false, true, writer);
         terminal.read_only = read_only;
+        terminal
+    }
+
+    /// A native renderer of a session terminal owned elsewhere (the gateway's
+    /// [`Self::subscribe_output`] on the other end). Its own `Term` parses the owner's
+    /// snapshot and output for display, local selection/scrollback and the key, mouse, paste
+    /// encoders; it never answers terminal queries (the owner does). Input goes out with its
+    /// [`InputMeta`] and is dropped (never queued) until the first snapshot, while the owner
+    /// holds input ([`FrontendState::input_held`]) and while the link is
+    /// [`crate::RemoteEvent::Disconnected`]. Geometry follows the owner's
+    /// [`crate::RemoteEvent::Resize`]; widget layout only requests a size. Focus and palette
+    /// are sent explicitly. OSC 52 stores/reads are served only while this frontend is the
+    /// designated clipboard owner. A lost link leaves a stale view, never an exit; dropping
+    /// the terminal only detaches this view.
+    pub fn frontend(
+        frontend: Box<dyn Frontend>,
+        opts: TermOptions,
+        ctx: egui::Context,
+    ) -> Terminal {
+        let parts = Parts::new(&opts, &ctx, false, Wake::Gui(ctx.clone()), false);
+        let (rx, tx) = frontend.split();
+        let (cmds, writer) = frontend::spawn_writer(tx, parts.progress.clone());
+        parts.out.set_sink(Sink::Frontend(cmds));
+        remote::start(rx, parts.feeder(true));
+        let mut terminal = parts.into_terminal(opts, false, true, writer);
+        // Focus, palette and requested size go out with the first snapshot.
+        terminal.frontend = Some(FrontendView {
+            resync: true,
+            ..FrontendView::default()
+        });
         terminal
     }
 
@@ -516,32 +629,96 @@ impl Terminal {
                         self.banner = Some("[attached elsewhere]".to_owned());
                     }
                 }
-                Notice::Closed => {
-                    if self.exit_code.is_none()
-                        && !self.displaced
-                        && !(self.read_only && self.shut_down)
-                    {
-                        self.exit_code = Some(-1);
-                        self.banner = Some("[connection to the session host lost]".to_owned());
+                Notice::Closed => self.on_closed(),
+                Notice::Disconnected => match &mut self.frontend {
+                    Some(view) => {
+                        view.live = false;
+                        view.resync = true;
+                        if self.exit_code.is_none() && !self.displaced && !view.closed {
+                            self.banner = Some("[gateway disconnected]".to_owned());
+                        }
                     }
-                }
-                Notice::Reset => {
-                    if self.title.take().is_some() {
-                        out.title_changed = Some(String::new());
-                    }
-                }
+                    None => self.on_closed(),
+                },
+                Notice::Reset => self.on_frontend_snapshot(),
                 Notice::Resized(size) => {
                     self.window_size = size;
                     self.size_sent = true;
                 }
+                Notice::State(state) => {
+                    if let Some(view) = &mut self.frontend {
+                        view.state = state;
+                        self.tmux_client = state.tmux_client;
+                        self.view.win32_mods = Mods::from_bits(state.win32_modifiers);
+                    }
+                }
             }
         }
         self.out.flush_due();
+        self.publish_state();
         if !self.exit_reported && self.exit_code.is_some() {
             self.exit_reported = true;
             out.exited = self.exit_code;
         }
         out
+    }
+
+    /// The connection ended. A frontend keeps its stale view and never reports an exit (the
+    /// session may live on in the gateway); the other kinds end here.
+    fn on_closed(&mut self) {
+        if let Some(view) = &mut self.frontend {
+            view.live = false;
+            view.closed = true;
+            if self.exit_code.is_none() && !self.displaced {
+                self.banner = Some("[gateway connection closed]".to_owned());
+            }
+            return;
+        }
+        if self.exit_code.is_none() && !self.displaced && !(self.read_only && self.shut_down) {
+            self.exit_code = Some(-1);
+            self.banner = Some("[connection to the session host lost]".to_owned());
+        }
+    }
+
+    /// A frontend's view is current again: input passes, and after a reconnect the view's
+    /// focus, palette and requested size reach the owner again.
+    fn on_frontend_snapshot(&mut self) {
+        let Some(view) = &mut self.frontend else {
+            return;
+        };
+        if view.closed {
+            return;
+        }
+        view.live = true;
+        if self.exit_code.is_none() && !self.displaced {
+            self.banner = None;
+        }
+        if std::mem::take(&mut view.resync) {
+            view.focus_sent = Some(self.view.focused);
+            self.out.frontend_focus(self.view.focused);
+            self.out.palette(self.palette.host_colors());
+            if let Some((cols, rows, cell_width, cell_height)) = view.requested {
+                self.out.resize(WindowSize {
+                    num_lines: rows,
+                    num_cols: cols,
+                    cell_width,
+                    cell_height,
+                });
+            }
+        }
+    }
+
+    /// This terminal acts on OSC 52: a designated, live frontend; a terminal that keeps its
+    /// clipboard local. Never an observer, nor an owner that routes to a frontend (its
+    /// listener records those reads).
+    fn serves_clipboard(&self) -> bool {
+        if self.read_only || self.shut_down {
+            return false;
+        }
+        match &self.frontend {
+            Some(view) => view.live && view.state.clipboard_owner,
+            None => !self.routed_clipboard.routed.load(Ordering::Acquire),
+        }
     }
 
     fn on_event(&mut self, event: Event, out: &mut TerminalEvents) {
@@ -555,20 +732,25 @@ impl Terminal {
                 out.title_changed = Some(String::new());
             }
             Event::Bell => out.bell = true,
-            Event::ClipboardStore(..) | Event::ClipboardLoad(..) if self.read_only => {}
+            Event::ClipboardStore(..) | Event::ClipboardLoad(..) if !self.serves_clipboard() => {}
             Event::ClipboardStore(ty, text) => match ty {
                 ClipboardType::Clipboard => self.clipboard.set_text(&text),
                 ClipboardType::Selection => self.clipboard.set_primary(&text),
             },
             Event::ClipboardLoad(ty, fmt) => {
-                // Answered from the clipboard worker once the read completes.
-                if !self.shut_down {
-                    let out = self.out.clone();
-                    self.clipboard
-                        .load(ty == ClipboardType::Selection, move |text| {
-                            out.reply(fmt(text.as_deref().unwrap_or("")).into_bytes());
-                        });
-                }
+                // Answered from the clipboard worker once the read completes; a frontend's
+                // answer goes to its owner, which checks it against the read it recorded.
+                let out = self.out.clone();
+                let frontend = self.frontend.is_some();
+                self.clipboard
+                    .load(ty == ClipboardType::Selection, move |text| {
+                        let reply = fmt(text.as_deref().unwrap_or("")).into_bytes();
+                        if frontend {
+                            out.clipboard_reply(reply);
+                        } else {
+                            out.reply(reply);
+                        }
+                    });
             }
             Event::ColorRequest(index, fmt) => {
                 let rgb = {
@@ -625,21 +807,110 @@ impl Terminal {
         }
     }
 
-    /// Switches the palette; a remote host gets the new query colors.
+    /// Switches the palette; a remote host (or a frontend's owner) gets the new query colors.
     pub fn set_theme(&mut self, theme: TermTheme) {
         let palette = Palette::for_theme(theme);
         if palette != self.palette {
-            if !self.shut_down && !self.read_only {
+            let link_up = self.frontend.as_ref().is_none_or(|v| v.live);
+            if !self.shut_down && !self.read_only && link_up {
                 self.out.palette(palette.host_colors());
             }
             self.palette = palette;
         }
     }
 
+    /// Owner: the query colors (OSC 4/10/11/12 answers) of the controlling frontend, in the
+    /// layout of [`Palette::host_colors`]. A remote owner passes them on to its host.
+    pub fn set_palette(&mut self, colors: [[u8; 3]; 19]) {
+        if self.frontend.is_some() || self.read_only {
+            return;
+        }
+        let palette = self.palette.with_host_colors(colors);
+        if palette != self.palette {
+            if !self.shut_down {
+                self.out.palette(colors);
+            }
+            self.palette = palette;
+        }
+    }
+
+    /// Owner: where OSC 52 clipboard stores and reads go. [`ClipboardPolicy::Frontend`] (set
+    /// before the first [`Self::poll`]) leaves both to the subscriber marked
+    /// [`OutputSubscription::set_clipboard_owner`]; reads wait for its
+    /// [`Self::write_frontend_reply`]. Switching back to `Local` forgets outstanding reads.
+    pub fn set_clipboard_policy(&mut self, policy: ClipboardPolicy) {
+        let routed = matches!(policy, ClipboardPolicy::Frontend);
+        self.routed_clipboard
+            .routed
+            .store(routed, Ordering::Release);
+        if !routed {
+            self.routed_clipboard.loads().clear();
+        }
+    }
+
+    /// Owner: subscribes to this terminal's output. The subscription starts with the current
+    /// size, a snapshot (grids, scrollback, modes, hyperlinks, retained kitty images) and the
+    /// owner state, then every later output byte exactly once, in order (see
+    /// [`OutputEvent`]). The initial events are queued at once, or — while a synchronized
+    /// update is buffered, or inside an unfinished sequence over 4 MiB — when it ends. A
+    /// subscriber more than 4 MiB of queued events behind gets [`OutputEvent::Overflow`].
+    /// `notify` runs whenever an event was queued. Observers and frontends
+    /// own no output: their subscription ends at once with [`OutputEvent::Closed`].
+    pub fn subscribe_output(&self, notify: OutputNotify) -> OutputSubscription {
+        self.publish_state();
+        self.engine.subscribe(notify)
+    }
+
+    /// Owner: the metadata of a frontend's input, applied right before its bytes are written
+    /// with [`Self::write`]: a semantic Ctrl+C (kitty/win32 encodings carry no 0x03) moves the
+    /// [`Self::last_ctrl_c`] guard; win32 modifier state is what the child now believes held.
+    pub fn record_input_meta(&mut self, meta: InputMeta) {
+        if meta.ctrl_c {
+            self.note_ctrl_c();
+        }
+        if let Some(bits) = meta.win32_modifiers {
+            self.view.win32_mods = Mods::from_bits(bits);
+        }
+        self.publish_state();
+    }
+
+    /// Owner: a designated frontend's reply to an OSC 52 read. Accepted only if it is exactly
+    /// the reply to an outstanding read (which it consumes); it then goes to the child like any
+    /// query reply (lone-ESC quiet time applies, the input hold does not).
+    pub fn write_frontend_reply(&self, bytes: &[u8]) -> Result<(), ReplyRejected> {
+        if self.shut_down || self.read_only || self.out.is_closed() {
+            return Err(ReplyRejected::Closed);
+        }
+        let text = frontend::osc52_reply_text(bytes).ok_or(ReplyRejected::NotOutstanding)?;
+        let mut loads = self.routed_clipboard.loads();
+        let pos = loads
+            .iter()
+            .position(|fmt| fmt(&text).as_bytes() == bytes)
+            .ok_or(ReplyRejected::NotOutstanding)?;
+        loads.remove(pos);
+        drop(loads);
+        self.out.reply(bytes.to_vec());
+        Ok(())
+    }
+
+    /// Owner: publishes the state frontends follow (deduplicated by the engine).
+    fn publish_state(&self) {
+        if !self.serving {
+            return;
+        }
+        self.engine.set_state(FrontendState {
+            tmux_client: self.tmux_client,
+            input_held: self.input_hold.get().is_some_and(|u| Instant::now() < u),
+            win32_modifiers: self.view.win32_mods.bits(),
+            clipboard_owner: false,
+        });
+    }
+
     /// Records keyboard focus. On a change it updates the Term and, when the child enabled
     /// focus reporting (DECSET 1004), writes `ESC[I` / `ESC[O`. [`crate::TerminalView`] uses
     /// the same state, so calling `set_focused(false)` on a tab being hidden and showing it
-    /// again later yields exactly one out/in pair.
+    /// again later yields exactly one out/in pair. A frontend sends its focus to the owner
+    /// instead (once live; again after a reconnect), which reports it in the child's modes.
     ///
     /// Like every terminal-generated byte (query replies too), a report due less than 100 ms
     /// after a [`Self::write`] that ended with ESC is queued until that quiet time passed (sent
@@ -656,7 +927,12 @@ impl Terminal {
             term.is_focused = focused;
             *term.mode()
         };
-        if !self.read_only
+        if let Some(view) = &mut self.frontend {
+            if view.live && !self.shut_down && view.focus_sent != Some(focused) {
+                view.focus_sent = Some(focused);
+                self.out.frontend_focus(focused);
+            }
+        } else if !self.read_only
             && let Some(bytes) = crate::input::encode_focus(focused, mode)
         {
             self.out.focus_report(bytes.to_vec());
@@ -666,7 +942,8 @@ impl Terminal {
 
     /// Ends the child at once. Local: Msg::Shutdown → the PTY thread drops the Pty, which
     /// SIGHUPs the child. Remote: the host kills the session. Input not yet written is
-    /// discarded (unlike drop, see [`Terminal`]'s `Drop`).
+    /// discarded (unlike drop, see [`Terminal`]'s `Drop`). A frontend asks its owner to kill
+    /// the session; the exit arrives from the owner like any other.
     pub fn kill(&mut self) {
         if self.read_only {
             self.shut_down = true;
@@ -674,8 +951,15 @@ impl Terminal {
             self.banner = Some("[observer detached]".to_owned());
             return;
         }
+        if self.frontend.is_some() {
+            if !self.shut_down {
+                self.out.kill();
+            }
+            return;
+        }
         if !self.shut_down {
             self.shut_down = true;
+            self.engine.finish(OutputEvent::Exited(None));
             self.out.kill();
             if let Some(writer) = self.writer.take() {
                 register_detaching(writer);
@@ -686,25 +970,57 @@ impl Terminal {
 
     /// Raw input to the child (keys, paste, injected text): sent at once, in order, never held
     /// by [`Self::hold_input_until`] or by the lone-ESC quiet time (the caller's
-    /// responsibility).
+    /// responsibility). A frontend drops it while its link is not live.
     pub fn write(&self, bytes: &[u8]) {
+        self.write_input(bytes, false);
+    }
+
+    /// [`Self::write`] of input that may encode a Ctrl+C without a 0x03 byte (kitty CSI-u,
+    /// win32 records): `ctrl_c` marks it, so the quiet-time guard (here, or at a frontend's
+    /// owner) still moves. A frontend's input carries the win32 modifier state it leaves.
+    pub(crate) fn write_input(&self, bytes: &[u8], ctrl_c: bool) {
         if bytes.is_empty() || self.shut_down || self.read_only {
             return;
         }
-        if bytes.contains(&0x03) {
+        if self.frontend.as_ref().is_some_and(|v| !v.live) {
+            return;
+        }
+        let ctrl_c = ctrl_c || bytes.contains(&0x03);
+        if ctrl_c {
             self.note_ctrl_c();
         }
-        self.out.write(bytes);
+        let meta = InputMeta {
+            ctrl_c,
+            win32_modifiers: (self.key_rules() == KeyRules::Win32)
+                .then(|| self.view.win32_mods.bits()),
+        };
+        self.out.write(bytes, meta);
     }
 
     /// Whether this connection still owns its write path. Observer and displaced/lost
-    /// connections must be refused by command controllers, never reported as delivered.
+    /// connections must be refused by command controllers, never reported as delivered; a
+    /// frontend accepts input only while its view is current.
     pub fn accepts_input(&self) -> bool {
-        !self.read_only && !self.shut_down && !self.out.is_closed()
+        !self.read_only
+            && !self.shut_down
+            && !self.out.is_closed()
+            && self.frontend.as_ref().is_none_or(|v| v.live && !v.closed)
     }
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Frontend whose link is down (before the first snapshot, after
+    /// [`crate::RemoteEvent::Disconnected`] or `Closed`): the view is stale and takes no input.
+    pub fn is_stale(&self) -> bool {
+        self.frontend.as_ref().is_some_and(|v| !v.live)
+    }
+
+    /// Size and focus follow another party's authority (observer, frontend): the widget only
+    /// requests them.
+    pub(crate) fn follows_remote_geometry(&self) -> bool {
+        self.read_only || self.frontend.is_some()
     }
 
     /// A checkpoint for asynchronous command delivery, without waiting on the I/O thread.
@@ -714,15 +1030,27 @@ impl Terminal {
 
     /// While `Instant::now() < until`, all user keyboard/paste/IME input to this terminal is
     /// dropped (mouse reports, wheel, selection and focus reports are unaffected; [`Self::write`]
-    /// is never held). Each call replaces the previous deadline.
+    /// is never held). Each call replaces the previous deadline. An owner publishes the hold
+    /// to its frontends (and its end, through a wake-up at the deadline).
     pub fn hold_input_until(&self, until: Instant) {
         self.input_hold.set(Some(until));
+        self.publish_state();
+        if self.serving {
+            self.wake
+                .after(until.saturating_duration_since(Instant::now()));
+        }
     }
 
-    /// User keystrokes/pastes must not pass while an injected sequence owns input.
+    /// User keystrokes/pastes must not pass while an injected sequence owns input (here or,
+    /// for a frontend, at its owner) or while a frontend's view is stale.
     /// Raw [`Self::write`] and [`Self::send_key`] deliberately bypass this gate for the injector.
     pub fn input_held(&self) -> bool {
-        self.read_only || self.input_hold.get().is_some_and(|u| Instant::now() < u)
+        self.read_only
+            || self.input_hold.get().is_some_and(|u| Instant::now() < u)
+            || self
+                .frontend
+                .as_ref()
+                .is_some_and(|v| !v.live || v.state.input_held)
     }
 
     /// Instant the last Ctrl+C was written to the child: any 0x03 byte (key input or
@@ -795,7 +1123,7 @@ impl Terminal {
 
     pub(crate) fn mode(&self) -> TermMode {
         let mode = *self.term.lock().mode();
-        if self.read_only {
+        if self.read_only || self.is_stale() {
             mode.difference(TermMode::MOUSE_MODE | TermMode::ALTERNATE_SCROLL)
         } else {
             mode
@@ -803,8 +1131,10 @@ impl Terminal {
     }
 
     /// Resizes the Term and tells the child (local SIGWINCH, remote host) when the grid or the
-    /// cell pixel size changed. Grids are clamped to at least 2×1 cells. Read-only observers
-    /// ignore this call and follow their controller's geometry.
+    /// cell pixel size changed; an owner's subscribers get the new size in output order. Grids
+    /// are clamped to at least 2×1 cells. Read-only observers ignore this call and follow
+    /// their controller's geometry; a frontend only requests the size from its owner and
+    /// follows the geometry the owner announces.
     pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
         if self.read_only {
             return;
@@ -817,6 +1147,16 @@ impl Terminal {
             cell_width,
             cell_height,
         };
+        if let Some(view) = &mut self.frontend {
+            let requested = Some((cols, rows, cell_width, cell_height));
+            if view.requested != requested {
+                view.requested = requested;
+                if view.live && !self.shut_down {
+                    self.out.resize(ws);
+                }
+            }
+            return;
+        }
         let old = self.window_size;
         let same = (old.num_lines, old.num_cols, old.cell_width, old.cell_height)
             == (ws.num_lines, ws.num_cols, ws.cell_width, ws.cell_height);
@@ -825,11 +1165,7 @@ impl Terminal {
         }
         self.window_size = ws;
         self.size_sent = true;
-        if (old.num_lines, old.num_cols) != (rows, cols) {
-            self.term
-                .lock()
-                .resize(TermSize::new(usize::from(cols), usize::from(rows)));
-        }
+        self.engine.resize(ws);
         if !self.shut_down {
             self.out.resize(ws);
         }
@@ -843,8 +1179,10 @@ impl Drop for Terminal {
     /// remote: the host is told to detach). When bytes are in flight a short-lived thread
     /// waits for them to be written (bounded by 2 s) plus 50 ms after the last write for the
     /// child to read them, then ends the connection. That thread and a remote writer are
-    /// registered for [`crate::wait_detached`].
+    /// registered for [`crate::wait_detached`]. Output subscribers get
+    /// [`OutputEvent::Closed`]; a frontend only detaches its view.
     fn drop(&mut self) {
+        self.engine.finish(OutputEvent::Closed);
         if let Some(writer) = self.writer.take() {
             register_detaching(writer);
         }

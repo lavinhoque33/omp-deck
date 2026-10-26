@@ -45,7 +45,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build host and app
-        run: cargo build -p deck-host -p omp-deck
+        run: cargo build -p deck-host -p deck-service -p omp-deck
 
       # conpty.dll + OpenConsole.exe next to omp-deck-host.exe so the host (and the tests that spawn it)
       # sideload the pinned ConPTY instead of the inbox one.
@@ -58,7 +58,7 @@ jobs:
       - name: Host tests (release build)
         if: ${{ !cancelled() }}
         run: |
-          cargo build --release -p deck-host
+          cargo build --release -p deck-host -p deck-service
           ./packaging/windows/fetch-conpty.ps1 -OutDir target/release -Arch x64
           cargo test --release -p deck-host --no-fail-fast
 

@@ -1,6 +1,6 @@
-//! App-side glue for the agents dashboard: the active tab's subagent watcher (status-bar chip and
-//! live overlay), the fleet watcher behind the dashboard cards, the dashboard view and the
-//! subagent popup.
+//! App-side glue for the agents dashboard: the gateway's subagent snapshot of the active tab
+//! (status-bar chip and live overlay), the fleet snapshot behind the dashboard cards, the
+//! dashboard view and the subagent popup (which follows a transcript topic).
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -11,15 +11,16 @@ use std::time::{Duration, SystemTime};
 use deck_core::agents::AgentsTarget;
 use deck_core::fleet::{FleetSession, FleetSnapshot, FleetTarget};
 use deck_core::mux::session_name_for;
+use deck_service::gateway::protocol::{Topic, TopicValue};
+use deck_service::gateway::running::RunningSnapshot;
 use egui::{Key, Modifiers};
 
-use super::{App, AppEvent};
+use super::App;
 use crate::agent_ctl::{CtlView, Link, Restart};
 use crate::agent_model::{self, AgentsView};
 use crate::agent_popup::{self, PopupAction, PopupInput, PopupState, PopupTab};
 use crate::dashboard::{self, DashAction, DashInput, DashState};
 use crate::dashboard_model::{Card, CardKey, CardSrc, Extra, Status};
-use crate::running::RunningSnapshot;
 use crate::tabs::{ClosedTab, Tab, TabRole};
 use crate::theme::{self, Palette};
 use crate::toast::ToastKind;
@@ -171,11 +172,11 @@ impl App {
             _ => None,
         };
         if want != self.agents_target {
-            self.agents.set_target(want.clone());
+            self.gw.set_agents_target(want.clone());
             self.agents_target = want;
         }
         // A snapshot of another session (right after a tab or session switch) is not ours.
-        let snap = self.agents.latest().filter(|s| {
+        let snap = self.gw.agents().filter(|s| {
             self.agents_target
                 .as_ref()
                 .is_some_and(|t| t.session == s.session)
@@ -190,7 +191,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|t| t.session == p.session);
             if !active && !self.dash.open {
-                self.popup = None;
+                self.close_popup_topic();
             }
         }
     }
@@ -201,14 +202,14 @@ impl App {
         if !self.dash.open {
             if self.dash.sig.is_some() {
                 self.dash.close();
-                self.fleet.set_targets(Vec::new());
+                self.gw.set_fleet_targets(Vec::new());
             }
             return;
         }
         self.refresh_dash_index();
         let now = SystemTime::now();
-        let running = self.running.latest();
-        let fleet = self.fleet.latest();
+        let running = self.gw.running();
+        let fleet = self.gw.fleet();
         let live = self.live_snapshot();
         let live_ctx = live
             .as_deref()
@@ -236,7 +237,7 @@ impl App {
                 })
                 .collect();
             drop(srcs);
-            self.fleet.set_targets(targets);
+            self.gw.set_fleet_targets(targets);
             self.dash.set_cards(cards, fleet, sig);
         }
         let root = self.ctl_root().map(Path::to_path_buf);
@@ -283,14 +284,14 @@ impl App {
 
     /// Session file → scan facts, rebuilt when the sidebar's scan changed.
     fn refresh_dash_index(&mut self) {
-        let generation = self.watcher.generation();
+        let generation = self.gw.sessions_generation();
         if self.dash_index.generation == Some(generation) {
             return;
         }
         self.dash_index.generation = Some(generation);
         self.dash_index.entries.clear();
         self.dash_index.by_name.clear();
-        if let Some(groups) = self.watcher.latest() {
+        if let Some(groups) = self.groups() {
             for g in groups.iter() {
                 for e in &g.sessions {
                     self.dash_index
@@ -328,7 +329,6 @@ impl App {
         for t in self.tabs.iter_mut().filter_map(Tab::term_mut) {
             t.terminal_mut().set_focused(false);
         }
-        self.running.poke();
         self.ctx.request_repaint();
     }
 
@@ -337,15 +337,15 @@ impl App {
             return;
         }
         self.dash.close();
-        self.fleet.set_targets(Vec::new());
+        self.gw.set_fleet_targets(Vec::new());
         // A popup that only the dashboard can feed goes with it.
-        if let Some(p) = &self.popup
-            && !self
+        if self.popup.as_ref().is_some_and(|p| {
+            !self
                 .agents_target
                 .as_ref()
                 .is_some_and(|t| t.session == p.session)
-        {
-            self.popup = None;
+        }) {
+            self.close_popup_topic();
         }
         // The active terminal is on screen again: it has been seen.
         if let Some(t) = self.tabs.get_mut(self.active).and_then(Tab::term_mut) {
@@ -374,8 +374,15 @@ impl App {
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
     }
 
+    /// Drops the popup and stops following its transcript.
+    fn close_popup_topic(&mut self) {
+        if let Some(p) = self.popup.take() {
+            self.gw.unsubscribe(&Topic::Transcript(p.transcript_path));
+        }
+    }
+
     pub(super) fn close_agent_popup(&mut self) {
-        self.popup = None;
+        self.close_popup_topic();
         self.focus_pending = true;
     }
 
@@ -393,8 +400,11 @@ impl App {
             let Some(agent) = view.agents().iter().find(|a| a.id == id) else {
                 return;
             };
-            PopupState::new(&self.ctx, session.to_path_buf(), agent, tab)
+            PopupState::new(session.to_path_buf(), agent, tab)
         };
+        self.close_popup_topic();
+        self.gw
+            .subscribe(Topic::Transcript(state.transcript_path.clone()));
         self.popup = Some(state);
         self.ctx.request_repaint();
     }
@@ -491,7 +501,7 @@ impl App {
             .iter()
             .find(|c| c.session.as_deref() == Some(session.as_path()))
             .map(|c| c.key.clone());
-        self.popup = None;
+        self.close_popup_topic();
         if let Some(key) = key {
             self.open_dash_card(&key);
         }
@@ -506,6 +516,14 @@ impl App {
         let Some(st) = self.popup.as_mut() else {
             return;
         };
+        // The gateway's transcript, when it moved.
+        let topic = Topic::Transcript(st.transcript_path.clone());
+        let rev = self.gw.revision(&topic);
+        if rev != st.fed
+            && let Some(TopicValue::Transcript { revision, items }) = self.gw.topic(&topic)
+        {
+            st.feed(rev, revision, items);
+        }
         let session = st.session.clone();
         let tab = st.tab;
         let source = popup_source(
@@ -517,12 +535,12 @@ impl App {
         );
         let Some((view, active)) = source else {
             // Neither the active tab nor the dashboard has this session any more.
-            self.popup = None;
+            self.close_popup_topic();
             return;
         };
         let Some(index) = view.agents().iter().position(|a| a.id == st.agent_id) else {
             // The agent vanished (session switched or its files were removed).
-            self.popup = None;
+            self.close_popup_topic();
             return;
         };
         let order = agent_model::visible(view.agents(), true, &HashSet::new());
@@ -576,20 +594,22 @@ impl App {
     }
 
     /// Open a file with the desktop's default handler off the UI thread.
-    fn open_path(&self, path: PathBuf) {
-        let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
-            let outcome = if !path.is_absolute() || !path.is_file() {
-                Err(format!("File not found: {}", path.display()))
-            } else {
-                deck_core::platform::open_path(path.as_os_str())
-                    .map_err(|e| format!("Could not open the file: {e}"))
-            };
-            if let Err(msg) = outcome {
-                let _ = tx.send(AppEvent::Toast(ToastKind::Error, msg));
-                ctx.request_repaint();
-            }
-        });
+    fn open_path(&mut self, path: PathBuf) {
+        self.gw.native(
+            move || {
+                if !path.is_absolute() || !path.is_file() {
+                    Err(format!("File not found: {}", path.display()))
+                } else {
+                    deck_core::platform::open_path(path.as_os_str())
+                        .map_err(|e| format!("Could not open the file: {e}"))
+                }
+            },
+            |app, outcome: Result<(), String>| {
+                if let Err(msg) = outcome {
+                    app.toasts.notify(&app.ctx, ToastKind::Error, msg);
+                }
+            },
+        );
     }
 }
 

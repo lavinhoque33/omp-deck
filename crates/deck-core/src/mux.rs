@@ -35,14 +35,14 @@ pub enum BackendChoice {
     Host,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MuxKind {
     Tmux,
     Host,
 }
 
 /// One live mux session as the Running view shows it ([`Mux::running`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningSession {
     /// Mux session name (what [`Mux::kill`] takes).
     pub name: String,
@@ -218,6 +218,25 @@ fn checked_override(value: Option<&str>, default: &str, var: &str) -> String {
     }
 }
 
+/// The host namespace in effect: `OMP_DECK_HOST_NS` when it is a test name, else [`HOST_NAMESPACE`].
+pub fn host_namespace() -> String {
+    checked_override(
+        std::env::var(HOST_NS_ENV).ok().as_deref(),
+        HOST_NAMESPACE,
+        HOST_NS_ENV,
+    )
+}
+
+/// The tmux socket in effect: `OMP_DECK_TMUX_SOCKET` when it is a test name, else
+/// [`tmux::APP_SOCKET`].
+pub fn tmux_socket() -> String {
+    checked_override(
+        std::env::var(TMUX_SOCKET_ENV).ok().as_deref(),
+        tmux::APP_SOCKET,
+        TMUX_SOCKET_ENV,
+    )
+}
+
 impl Mux {
     /// The backend for `choice`. Windows always uses the host. Elsewhere `Auto` is tmux when
     /// installed, else the host when its daemon exists; `Tmux` / `Host` demand that backend.
@@ -229,11 +248,8 @@ impl Mux {
         } else {
             choice
         };
-        let from_env = |var: &str, default: &str| {
-            checked_override(std::env::var(var).ok().as_deref(), default, var)
-        };
-        let tmux = || Tmux::detect_on(&from_env(TMUX_SOCKET_ENV, tmux::APP_SOCKET)).map(Mux::Tmux);
-        let host = || HostMux::detect(&from_env(HOST_NS_ENV, HOST_NAMESPACE)).map(Mux::Host);
+        let tmux = || Tmux::detect_on(&tmux_socket()).map(Mux::Tmux);
+        let host = || HostMux::detect(&host_namespace()).map(Mux::Host);
         match choice {
             BackendChoice::Tmux => tmux(),
             BackendChoice::Host => host(),

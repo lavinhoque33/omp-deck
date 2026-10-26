@@ -137,7 +137,7 @@ mod tests {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionEntry {
     pub id: String,
     pub path: PathBuf,
@@ -157,7 +157,7 @@ impl SessionEntry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectGroup {
     pub cwd: PathBuf,
     pub display: String,

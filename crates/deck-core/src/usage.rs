@@ -82,7 +82,7 @@ where
         .collect())
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSnapshot {
     #[serde(default, rename = "generatedAt", deserialize_with = "tolerant")]
@@ -95,7 +95,7 @@ pub struct UsageSnapshot {
     pub disabled_credentials: Vec<UnavailableAccount>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageReport {
     #[serde(default, deserialize_with = "tolerant")]
@@ -112,7 +112,7 @@ pub struct UsageReport {
     pub metadata: UsageMetadata,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageMetadata {
     #[serde(default, deserialize_with = "tolerant")]
@@ -132,7 +132,7 @@ pub struct UsageMetadata {
     pub daybreak: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageLimit {
     #[serde(default, deserialize_with = "tolerant")]
@@ -151,7 +151,7 @@ pub struct UsageLimit {
     pub notes: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageScope {
     #[serde(default, deserialize_with = "tolerant")]
@@ -169,7 +169,7 @@ pub struct UsageScope {
     pub shared_group: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageWindow {
     #[serde(default, deserialize_with = "tolerant")]
@@ -184,7 +184,7 @@ pub struct UsageWindow {
     pub reset_label: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageAmount {
     #[serde(default, deserialize_with = "tolerant")]
@@ -224,7 +224,7 @@ impl Default for UsageAmount {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LimitStatus {
     Ok,
@@ -235,7 +235,7 @@ pub enum LimitStatus {
     Unknown,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResetCredits {
     #[serde(default, deserialize_with = "tolerant")]
@@ -255,7 +255,7 @@ pub struct ResetCredits {
     pub credits: Vec<ResetCredit>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResetCredit {
     #[serde(default, deserialize_with = "tolerant")]
@@ -276,7 +276,7 @@ pub struct ResetCredit {
 }
 
 /// A credential that produced no usage report (`accountsWithoutUsage`, `disabledCredentials`).
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
 pub struct UnavailableAccount {
     #[serde(default, deserialize_with = "tolerant")]
     pub provider: String,
@@ -422,7 +422,7 @@ pub fn fetch_usage(
 
 // ---- provider cards -----------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CardWindow {
     /// omp's limit label (plus the tier when the label does not name it).
     pub label: String,
@@ -445,7 +445,7 @@ impl CardWindow {
 }
 
 /// Banked "reset" credits of a provider (Codex, Claude).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ResetSummary {
     pub banked: i64,
     pub redeemable: i64,
@@ -476,7 +476,7 @@ impl ResetSummary {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderCard {
     /// omp's provider id (`anthropic`, `openai-codex`).
     pub provider: String,
@@ -1037,7 +1037,9 @@ pub fn stats_db_path() -> PathBuf {
 }
 
 /// A calendar date (local time), ordered chronologically.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Date {
     pub year: i32,
     pub month: u32,
@@ -1125,21 +1127,21 @@ fn now_ms() -> i64 {
 }
 
 /// Totals of one local day.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DayTotals {
     pub cost: f64,
     pub requests: u64,
     pub tokens: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DayActivity {
     pub day: Date,
     pub totals: DayTotals,
 }
 
 /// One model's usage over the last 30 days.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelActivity {
     pub provider: String,
     pub model: String,
@@ -1148,7 +1150,7 @@ pub struct ModelActivity {
     pub tokens: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Activity {
     /// Per local day (ascending) over the requested window; days without messages are absent.
     pub days: Vec<DayActivity>,
@@ -1314,7 +1316,39 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-#[derive(Clone, Debug, PartialEq)]
+/// Wire form of [`Heatmap::month_labels`]: the abbreviations are `'static`, so reading maps each
+/// back onto [`MONTHS`] and rejects anything else.
+mod month_labels {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        labels: &[Option<&'static str>],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        labels.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<Option<&'static str>>, D::Error> {
+        Vec::<Option<String>>::deserialize(d)?
+            .into_iter()
+            .map(|label| {
+                label
+                    .map(|l| {
+                        super::MONTHS
+                            .iter()
+                            .copied()
+                            .find(|m| *m == l)
+                            .ok_or_else(|| serde::de::Error::custom(format!("not a month: {l}")))
+                    })
+                    .transpose()
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Last30 {
     pub cost: f64,
     pub requests: u64,
@@ -1323,7 +1357,7 @@ pub struct Last30 {
     pub daily: Vec<f64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Heatmap {
     pub weeks: usize,
     /// `cells[row][week]`, row 0 = Monday … 6 = Sunday; `None` after today, else level 0–4.
@@ -1331,6 +1365,7 @@ pub struct Heatmap {
     /// Same shape as `cells`: the day's totals (zero for quiet days).
     pub totals: Vec<Vec<DayTotals>>,
     /// Per week: the month's abbreviation where it differs from the previous week's.
+    #[serde(with = "month_labels")]
     pub month_labels: Vec<Option<&'static str>>,
     /// The Monday of the first week.
     pub start: Date,

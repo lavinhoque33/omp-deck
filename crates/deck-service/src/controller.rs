@@ -36,7 +36,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use deck_core::mux::{Mux, MuxKind};
-use deck_term::{ScreenText, Terminal, TerminalEvents};
+use deck_term::{InputMeta, ScreenText, Terminal, TerminalEvents};
+use serde::{Deserialize, Serialize};
 
 use crate::inject::{End, Env, HOLD_TAIL, Injector, Job, JobId, Requires, Write};
 use crate::model_switch::{FRESH_TIMEOUT, Pending, SWITCH_TIMEOUT, plan_switch};
@@ -60,7 +61,7 @@ const HISTORY: usize = 256;
 const SWITCH_RECHECK: Duration = Duration::from_millis(200);
 
 /// Generations are unique in the process, so a new controller for a restarted session never
-/// reuses a target an old client still holds.
+/// reuses a target an old client still holds; [`ServiceEpoch`] separates processes.
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_DIRECT: AtomicU64 = AtomicU64::new(1);
 
@@ -68,8 +69,64 @@ fn next_generation() -> u64 {
     NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Random identity of this service process instance. Every [`SessionTarget`] carries it, so a
+/// target (or request) from another instance — a restarted gateway reusing small generation
+/// numbers — never validates here. The same value is announced by the gateway handshake.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ServiceEpoch(pub [u8; 16]);
+
+static EPOCH: std::sync::LazyLock<ServiceEpoch> = std::sync::LazyLock::new(|| {
+    let mut bytes = [0u8; 16];
+    if let Err(e) = getrandom::fill(&mut bytes) {
+        // No OS randomness: still distinct per process and start time.
+        log::error!("no random source for the service epoch: {e}");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        bytes[..8].copy_from_slice(&(now as u64).to_le_bytes());
+        bytes[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+    }
+    ServiceEpoch(bytes)
+});
+
+impl ServiceEpoch {
+    /// This process's epoch: drawn once from the OS random source.
+    pub fn current() -> ServiceEpoch {
+        *EPOCH
+    }
+
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    pub fn from_hex(s: &str) -> Option<ServiceEpoch> {
+        if s.len() != 32 || !s.is_ascii() {
+            return None;
+        }
+        let mut out = [0u8; 16];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+        }
+        Some(ServiceEpoch(out))
+    }
+}
+
+impl fmt::Debug for ServiceEpoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ServiceEpoch({})", self.to_hex())
+    }
+}
+
+impl fmt::Display for ServiceEpoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
 /// Stable identity of a live session, independent of tabs and view indices. Cheap to clone.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SessionKey(Arc<str>);
 
 impl SessionKey {
@@ -116,15 +173,17 @@ impl fmt::Display for SessionKey {
     }
 }
 
-/// What a submission is aimed at: the session and the generation the client saw.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// What a submission is aimed at: the service instance, the session and the generation the
+/// client saw.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionTarget {
+    pub epoch: ServiceEpoch,
     pub key: SessionKey,
     pub generation: u64,
 }
 
 /// Client-chosen identity of a request: `seq` must grow with every new request of `client`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RequestKey {
     pub client: String,
     pub seq: u64,
@@ -156,7 +215,7 @@ impl RequestKeys {
 }
 
 /// Controller-assigned identity of an accepted request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RequestId(pub u64);
 
 impl From<JobId> for RequestId {
@@ -166,7 +225,7 @@ impl From<JobId> for RequestId {
 }
 
 /// Everything that runs through omp's composer or hotkeys.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Command {
     /// A session action with an injected route (see [`session_actions::job`]); fork, copy-last
     /// and export run elsewhere and are [`Rejected::NotInjected`].
@@ -187,7 +246,7 @@ pub enum Command {
 }
 
 /// Which kind of command a request carried (for clients mapping outcomes back to their state).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandKind {
     Action,
     ModelSwitch,
@@ -223,7 +282,7 @@ pub struct Submission {
 }
 
 /// An accepted submission.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submitted {
     pub id: RequestId,
     /// The key was accepted before; nothing new was queued.
@@ -231,7 +290,7 @@ pub struct Submitted {
 }
 
 /// Why a submission was not accepted (nothing was queued).
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum Rejected {
     #[error("the session changed since this was requested")]
     Stale { current: SessionTarget },
@@ -262,7 +321,7 @@ pub enum Rejected {
 }
 
 /// Why a job was dropped before its first byte.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Refusal {
     /// omp was not in the state the command needs.
     Precondition(Requires),
@@ -273,7 +332,7 @@ pub enum Refusal {
 }
 
 /// Why the controller dropped an accepted request itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Cancel {
     /// omp exited.
     Exited,
@@ -286,7 +345,7 @@ pub enum Cancel {
 }
 
 /// How far a request got toward the terminal.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Delivery {
     /// Accepted; no byte written yet.
     Queued,
@@ -328,7 +387,7 @@ impl Delivery {
 }
 
 /// What is known about the command's effect inside omp.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Runtime {
     /// The command has no observable confirmation.
     Untracked,
@@ -344,7 +403,7 @@ pub enum Runtime {
     Abandoned,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestRecord {
     pub id: RequestId,
     pub key: RequestKey,
@@ -353,6 +412,7 @@ pub struct RequestRecord {
     pub label: String,
     pub delivery: Delivery,
     pub runtime: Runtime,
+    #[serde(skip)]
     fingerprint: u64,
 }
 
@@ -363,7 +423,7 @@ impl RequestRecord {
 }
 
 /// Something a client reacts to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControllerEvent {
     /// omp's composer holds `draft`; ask, then call [`SessionController::answer`] with `id`.
     Confirm {
@@ -528,6 +588,7 @@ impl SessionController {
         SessionController {
             terminal,
             target: SessionTarget {
+                epoch: ServiceEpoch::current(),
                 key,
                 generation: next_generation(),
             },
@@ -561,10 +622,17 @@ impl SessionController {
     }
 
     /// User input from a client (already encoded for the terminal's modes): written at once,
-    /// or refused — never queued or replayed. Refused for another session or generation, an
-    /// exited, read-only or detached terminal, and while the controller holds input around an
-    /// injected command ([`Rejected::InputHeld`]).
-    pub fn write_input(&mut self, target: &SessionTarget, bytes: &[u8]) -> Result<(), Rejected> {
+    /// or refused — never queued or replayed. Refused for another instance, session or
+    /// generation, an exited, read-only or detached terminal, and while the controller holds
+    /// input around an injected command ([`Rejected::InputHeld`]). `meta` (semantic Ctrl+C, win32
+    /// modifier state) is recorded only for accepted input, so a refused Ctrl+C never moves the
+    /// injector's quiet-time guard.
+    pub fn write_input(
+        &mut self,
+        target: &SessionTarget,
+        bytes: &[u8],
+        meta: InputMeta,
+    ) -> Result<(), Rejected> {
         if *target != self.target {
             return Err(Rejected::Stale {
                 current: self.target.clone(),
@@ -582,6 +650,7 @@ impl SessionController {
         if self.terminal.input_held() {
             return Err(Rejected::InputHeld);
         }
+        self.terminal.record_input_meta(meta);
         self.terminal.write(bytes);
         Ok(())
     }
@@ -730,6 +799,11 @@ impl SessionController {
 
     pub fn request_by_key(&self, key: &RequestKey) -> Option<&RequestRecord> {
         self.history.iter().find(|r| r.key == *key)
+    }
+
+    /// Every remembered request, oldest first (pending ones are never dropped).
+    pub fn requests(&self) -> impl Iterator<Item = &RequestRecord> {
+        self.history.iter()
     }
 
     /// The single entry point for injected commands.
@@ -1106,10 +1180,14 @@ impl SessionController {
         out
     }
 
-    /// The answer to [`ControllerEvent::Confirm`] `id`: `true` clears the draft and goes on,
-    /// `false` drops the request. An answer for anything but the outstanding confirmation (an
-    /// old one, another session's) is ignored; returns whether it applied.
-    pub fn answer(&mut self, id: RequestId, clear: bool) -> bool {
+    /// The answer to [`ControllerEvent::Confirm`] `id` for `target`: `true` clears the draft and
+    /// goes on, `false` drops the request. An answer for anything but the outstanding
+    /// confirmation of this exact target (an old one, another instance's, another
+    /// conversation's) is ignored; returns whether it applied.
+    pub fn answer(&mut self, target: &SessionTarget, id: RequestId, clear: bool) -> bool {
+        if *target != self.target {
+            return false;
+        }
         let Some(job) = self.awaiting.filter(|j| RequestId::from(*j) == id) else {
             return false;
         };
@@ -1541,7 +1619,7 @@ mod tests {
             ev.iter()
                 .any(|e| matches!(e, ControllerEvent::Confirm { id, .. } if *id == context))
         });
-        assert!(ctl.answer(context, false));
+        assert!(ctl.answer(&ctl.target().clone(), context, false));
         assert_eq!(
             ctl.request(context).map(|r| r.delivery.clone()),
             Some(Delivery::Declined)
@@ -1634,13 +1712,26 @@ mod tests {
             let omp = fake.omp();
             (omp.draft.clone(), omp.input.clone())
         };
-        assert_eq!(ctl.write_input(&target, b"x"), Err(Rejected::InputHeld));
+        let meta = InputMeta::default();
+        assert_eq!(
+            ctl.write_input(&target, b"x", meta),
+            Err(Rejected::InputHeld)
+        );
         let stale = SessionTarget {
             generation: target.generation + 1,
             ..target.clone()
         };
         assert!(matches!(
-            ctl.write_input(&stale, b"x"),
+            ctl.write_input(&stale, b"x", meta),
+            Err(Rejected::Stale { .. })
+        ));
+        // A target of another service instance with the same key and generation is stale too.
+        let other_instance = SessionTarget {
+            epoch: ServiceEpoch([0xa5; 16]),
+            ..target.clone()
+        };
+        assert!(matches!(
+            ctl.write_input(&other_instance, b"x", meta),
             Err(Rejected::Stale { .. })
         ));
         std::thread::sleep(Duration::from_millis(50));
@@ -1657,7 +1748,7 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match ctl.write_input(&target, b"x") {
+            match ctl.write_input(&target, b"x", meta) {
                 Ok(()) => break,
                 Err(Rejected::InputHeld) => {
                     assert!(Instant::now() < deadline, "the hold never ended");
@@ -1734,8 +1825,13 @@ mod tests {
             label: "Context".to_owned(),
             draft: "half typed".to_owned(),
         }));
+        let old = ctl.target().clone();
         assert!(ctl.set_session_path(Some(PathBuf::from("/s/b.jsonl"))));
-        assert!(!ctl.answer(id, true), "the old conversation's answer");
+        assert!(!ctl.answer(&old, id, true), "the old conversation's answer");
+        assert!(
+            !ctl.answer(&ctl.target().clone(), id, true),
+            "nor under the new target"
+        );
         let events = ctl.drive(Instant::now()).events;
         assert!(events.iter().any(|e| matches!(
             e,

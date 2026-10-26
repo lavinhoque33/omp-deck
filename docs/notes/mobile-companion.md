@@ -181,7 +181,8 @@ events. Preserve focused-tab inbox behavior and desktop-unfocused popup policy.
 1. **Shared service and command contract.** Map every existing command, extract
    safe execution/state ownership, solve terminal single-writer/fan-out, preserve
    desktop behavior and define protocol capabilities/errors and config ownership.
-2. **Gateway and OS integration.** Headless lifecycle/jobs/watchers, private IPC,
+2. **Gateway and OS integration** (implemented on Linux; Windows compile-checked only; contract and evidence in
+   `contracts.md` "Mobile companion step 2: as built"). Headless lifecycle/jobs/watchers, private IPC,
    singleton startup, both lifetime modes, installer/uninstaller and update paths
    on Linux and Windows. Prove control with the GUI closed before networking.
 3. **Encrypted connectivity.** Relay, pairing, device identity/revocation,

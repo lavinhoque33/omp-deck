@@ -3,7 +3,7 @@
 use crate::statusfmt::Activity;
 
 /// What a session's leading indicator shows, in precedence order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TabStatus {
     /// The process ended (`clean` = exit code 0).
     Exited { clean: bool },

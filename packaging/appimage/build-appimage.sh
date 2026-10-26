@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds dist/omp-deck-<version>-x86_64.AppImage from target/release/{omp-deck,omp-deck-host}.
+# Builds dist/omp-deck-<version>-x86_64.AppImage from the GUI, host and gateway binaries.
 # Needs appimagetool on PATH (or APPIMAGETOOL=/path/to/appimagetool). In CI it is downloaded first.
 # The AppImage bundles only OmpDeck itself: omp and (optionally) tmux come from the host.
 set -eu
@@ -11,8 +11,10 @@ version=${1:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)}
 tool=${APPIMAGETOOL:-appimagetool}
 bin=target/release/omp-deck
 host=target/release/omp-deck-host
-[ -x "$bin" ] || { echo "build-appimage: $bin missing; run cargo build --release -p omp-deck -p deck-host" >&2; exit 1; }
-[ -x "$host" ] || { echo "build-appimage: $host missing; run cargo build --release -p omp-deck -p deck-host" >&2; exit 1; }
+gateway=target/release/omp-deck-gateway
+for executable in "$bin" "$host" "$gateway"; do
+    [ -x "$executable" ] || { echo "build-appimage: $executable missing; run cargo build --release --workspace" >&2; exit 1; }
+done
 
 appdir=dist/OmpDeck.AppDir
 rm -rf "$appdir"
@@ -22,6 +24,8 @@ install -m 0755 "$bin" "$appdir/usr/bin/omp-deck"
 strip "$appdir/usr/bin/omp-deck" 2>/dev/null || true
 install -m 0755 "$host" "$appdir/usr/bin/omp-deck-host"
 strip "$appdir/usr/bin/omp-deck-host" 2>/dev/null || true
+install -m 0755 "$gateway" "$appdir/usr/bin/omp-deck-gateway"
+strip "$appdir/usr/bin/omp-deck-gateway" 2>/dev/null || true
 install -m 0755 packaging/appimage/AppRun "$appdir/AppRun"
 install -m 0644 packaging/omp-deck.desktop "$appdir/omp-deck.desktop"
 install -m 0644 packaging/omp-deck.desktop "$appdir/usr/share/applications/omp-deck.desktop"

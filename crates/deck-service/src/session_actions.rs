@@ -8,7 +8,7 @@ use deck_term::input::{Key, Mods};
 
 use crate::inject::{Job, Requires, sanitize_line};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     Handoff,
     Compact,
@@ -25,7 +25,7 @@ pub enum Kind {
     Export,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CompactMode {
     Default,
     Soft,
@@ -34,7 +34,7 @@ pub enum CompactMode {
 }
 
 /// A fully specified action ready to run.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     Handoff(Option<String>),
     Compact(CompactMode),

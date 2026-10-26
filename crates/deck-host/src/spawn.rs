@@ -1,5 +1,6 @@
 //! Client side of daemon startup: the private spec file and the detached daemon process.
 
+use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -37,25 +38,37 @@ pub(crate) fn write_spec(ns: &Namespace, name: &str, contents: &[u8]) -> Result<
     Ok(path)
 }
 
-/// Handle of the launched daemon process (Unix: the launcher that exits once the forked
-/// daemon serves).
-#[cfg(unix)]
-pub(crate) type Launcher = std::process::Child;
-
-/// Starts `exe serve --ns <ns> --name <name> --spec <spec>` detached from the caller.
-/// Unix: the daemon forks into its own session itself (the launched process exits once the
-/// daemon serves).
-#[cfg(unix)]
+/// Starts the session-host entrypoint; the child reports readiness after detaching on Unix.
 pub(crate) fn spawn_daemon(exe: &Path, ns: &str, name: &str, spec: &Path) -> io::Result<Launcher> {
+    launch_detached(
+        exe,
+        [
+            OsStr::new("serve"),
+            OsStr::new("--ns"),
+            OsStr::new(ns),
+            OsStr::new("--name"),
+            OsStr::new(name),
+            OsStr::new("--spec"),
+            spec.as_os_str(),
+        ],
+    )
+}
+
+/// Handle of the launcher, which exits after its daemon reports readiness.
+#[cfg(unix)]
+pub type Launcher = std::process::Child;
+
+/// Starts an entrypoint with null stdio. On Unix the entrypoint must call
+/// [`crate::daemon::daemonize`] before starting threads to complete detachment.
+#[cfg(unix)]
+pub fn launch_detached<I, S>(exe: &Path, args: I) -> io::Result<Launcher>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     use std::process::{Command, Stdio};
     Command::new(exe)
-        .arg("serve")
-        .arg("--ns")
-        .arg(ns)
-        .arg("--name")
-        .arg(name)
-        .arg("--spec")
-        .arg(spec)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -64,12 +77,12 @@ pub(crate) fn spawn_daemon(exe: &Path, ns: &str, name: &str, spec: &Path) -> io:
 
 /// The daemon process itself (Windows).
 #[cfg(windows)]
-pub(crate) struct Launcher(std::os::windows::io::OwnedHandle);
+pub struct Launcher(std::os::windows::io::OwnedHandle);
 
 #[cfg(windows)]
 impl Launcher {
     /// Exit status if the daemon has exited.
-    pub(crate) fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
         use std::os::windows::io::AsRawHandle;
         use std::os::windows::process::ExitStatusExt;
         use windows_sys::Win32::Foundation::{STILL_ACTIVE, WAIT_OBJECT_0};
@@ -88,8 +101,8 @@ impl Launcher {
     }
 }
 
-/// Starts `exe serve --ns <ns> --name <name> --spec <spec>` detached (own process group, no
-/// console, out of the caller's job when allowed).
+/// Starts an entrypoint detached (own process group, no console, out of the caller's job
+/// when allowed). Only null stdio handles are inherited.
 ///
 /// Not `std::process::Command`: it creates the child with `bInheritHandles = TRUE`, which
 /// hands the daemon every inheritable handle of the caller (e.g. the stdout pipe of a CLI run
@@ -97,7 +110,11 @@ impl Launcher {
 /// whole life. Here only a `NUL` handle for stdio is inherited, via
 /// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
 #[cfg(windows)]
-pub(crate) fn spawn_daemon(exe: &Path, ns: &str, name: &str, spec: &Path) -> io::Result<Launcher> {
+pub fn launch_detached<I, S>(exe: &Path, args: I) -> io::Result<Launcher>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, OwnedHandle};
     use std::ptr::{null, null_mut};
@@ -120,17 +137,9 @@ pub(crate) fn spawn_daemon(exe: &Path, ns: &str, name: &str, spec: &Path) -> io:
 
     let mut line = String::new();
     quote_arg(&exe.to_string_lossy(), false, &mut line);
-    for arg in [
-        "serve",
-        "--ns",
-        ns,
-        "--name",
-        name,
-        "--spec",
-        &spec.to_string_lossy(),
-    ] {
+    for arg in args {
         line.push(' ');
-        quote_arg(arg, false, &mut line);
+        quote_arg(&arg.as_ref().to_string_lossy(), false, &mut line);
     }
     let mut line: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
     let app: Vec<u16> = exe

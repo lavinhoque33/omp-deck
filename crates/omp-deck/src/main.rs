@@ -1,6 +1,7 @@
 //! OmpDeck: desktop wrapper for the omp coding-agent TUI.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod activate;
 mod agent_ctl;
 mod agent_hub;
 mod agent_model;
@@ -18,6 +19,7 @@ mod dashboard;
 mod dashboard_model;
 mod drive_view;
 mod folder_scope;
+mod gw;
 mod icons;
 mod model_order;
 mod model_picker;
@@ -26,12 +28,10 @@ mod notify_panel;
 mod notify_view;
 mod omp_rows;
 mod omp_settings;
-mod omp_worker;
 mod paint_cache;
 mod palette;
 mod panes;
 mod review;
-mod running;
 mod running_model;
 mod running_view;
 mod scope_bar;
@@ -64,25 +64,8 @@ use deck_core::config::{AppConfig, config_dir};
 
 use crate::app::{App, AppInit};
 use crate::cli::Parsed;
-use deck_service::backend::Backends;
 
 const MIN_SIZE: [f32; 2] = [640.0, 400.0];
-
-/// Writes the control extension into `$XDG_DATA_HOME/omp-deck/` (a small file write before the
-/// window opens). Failure only costs live control: the hub stays read-only.
-fn install_ctl_extension() -> Option<std::path::PathBuf> {
-    let Some(data) = dirs::data_dir() else {
-        log::warn!("no data directory: live subagent control is unavailable");
-        return None;
-    };
-    match deck_core::ctl::install_extension(&data.join("omp-deck")) {
-        Ok(path) => Some(path),
-        Err(e) => {
-            log::warn!("installing the control extension failed: {e}; live control is unavailable");
-            None
-        }
-    }
-}
 
 /// The 256px window icon embedded at build time.
 fn window_icon() -> egui::IconData {
@@ -177,27 +160,19 @@ fn run() -> anyhow::Result<()> {
         }
     };
 
-    // The one writer of the settings file; the app edits a projection of its snapshot.
-    let settings = deck_service::settings::SettingsService::open_default();
-    let cfg = (*settings.snapshot().config).clone();
-    let backends = Backends::detect(cfg.session_backend);
-    backends.prepare();
-    if backends.is_empty() {
-        log::warn!("no session backend (tmux / omp-deck-host): running omp directly");
+    // The profile this window is a client of. `--sessions-root` selects another sessions store;
+    // the gateway serving that profile owns the scans and backends for it.
+    let mut profile = deck_service::gateway::Profile::default_for_user();
+    if let Some(root) = &cli.sessions_root {
+        profile.sessions_root.clone_from(root);
     }
-    // Control endpoints of sessions that no longer exist. Before any tab launches, so a fresh
-    // launch can't be pruned; the alive sessions of every backend are the keys still in use.
-    // An empty answer may be a failed query: never prune on it (same rule as the poller).
-    if !backends.is_empty() {
-        let alive: std::collections::HashSet<String> = backends
-            .all()
-            .iter()
-            .flat_map(|m| m.alive_sessions())
-            .collect();
-        if !alive.is_empty() {
-            deck_core::ctl::prune_ctl_dirs(&backends.ctl_namespace(), &alive);
-        }
+    if let Some(ticket) = &cli.activate {
+        return activate::run(ticket, profile);
     }
+
+    // Native window geometry and appearance are read once, read-only, before the window exists.
+    // Every later setting goes through the gateway's settings service (the single writer).
+    let cfg = AppConfig::load();
     log::debug!("config dir: {}", config_dir().display());
 
     // One option set per renderer; `viewport` is rebuilt because the builder is consumed.
@@ -222,12 +197,10 @@ fn run() -> anyhow::Result<()> {
     let init = AppInit {
         cli,
         cfg,
-        settings,
-        backends,
+        profile,
         ui_fonts: ui_fonts::UiFonts::load(),
         folder,
         start_dir,
-        ctl_ext: install_ctl_extension(),
     };
     let init = std::sync::Arc::new(std::sync::Mutex::new(Some(init)));
     let result = run_window(options, init);

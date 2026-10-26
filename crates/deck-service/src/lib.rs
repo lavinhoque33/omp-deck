@@ -9,6 +9,7 @@
 //! - [`host_remote`]: host sessions as terminal remotes, and read-only host observers.
 //! - [`notifications`]: the canonical notification pipeline.
 //! - [`settings`]: the single, cross-process-safe writer of the settings file.
+//! - [`gateway`]: the per-user headless owner of all of the above, its private IPC and client.
 //! - [`status`], [`statusfmt`]: session status and its text formatting.
 //!
 //! No GUI toolkit here: the desktop app is one client, headless drivers are others.
@@ -16,6 +17,7 @@
 pub mod backend;
 pub mod composer;
 pub mod controller;
+pub mod gateway;
 pub mod host_remote;
 pub mod inject;
 pub mod lifecycle;

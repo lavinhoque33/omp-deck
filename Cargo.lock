@@ -714,9 +714,19 @@ dependencies = [
  "deck-host",
  "deck-term",
  "dirs",
+ "env_logger",
+ "futures-lite",
+ "getrandom 0.4.3",
+ "libc",
  "log",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
+ "windows",
+ "windows-sys 0.61.2",
+ "zbus",
 ]
 
 [[package]]
@@ -725,6 +735,7 @@ version = "0.14.3"
 dependencies = [
  "alacritty_terminal",
  "arboard",
+ "deck-host",
  "eframe",
  "egui",
  "egui_system_font_provider",
@@ -733,6 +744,7 @@ dependencies = [
  "miniz_oxide 0.8.9",
  "png",
  "polling",
+ "serde",
  "tempfile",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",

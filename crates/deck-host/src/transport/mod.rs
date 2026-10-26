@@ -7,6 +7,10 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub(crate) use unix::{Endpoint, Listener, Stream, connect, list_names, prepare};
+pub(crate) use unix::list_names;
+#[cfg(unix)]
+pub use unix::{Endpoint, Listener, Stream, connect, prepare};
 #[cfg(windows)]
-pub(crate) use windows::{Endpoint, Listener, Stream, connect, list_names, user_key};
+pub(crate) use windows::list_names;
+#[cfg(windows)]
+pub use windows::{Endpoint, Listener, Stream, connect, user_key, user_sid};

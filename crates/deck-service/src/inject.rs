@@ -73,7 +73,7 @@ const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// What omp must be doing for a job to run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Requires {
     Any,
     /// `Activity::Idle` exactly (not attention, not unknown, not busy): `/compact` would abort a

@@ -1,42 +1,36 @@
-//! App-side glue of the session manager hub: inventory scan and statistics workers, the bulk
-//! delete / copy / move / stop operations with their confirmations, and the hub's open / close.
+//! App-side glue of the session manager hub: the gateway's inventory topic and statistics
+//! queries, the bulk delete / copy / move / stop operations with their confirmations, and the
+//! hub's open / close.
 //!
 //! Rendering is [`crate::sessions_view`], the data rules are [`crate::sessions_model`]; this
-//! module owns the threads and the cleanup shared with the sidebar's single-session actions.
+//! module sends the requests (the gateway runs omp and the backends) and owns the cleanup shared
+//! with the sidebar's single-session actions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf, absolute};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use deck_core::inventory::{self, InventoryEntry, SessionStats, StatsCache};
-use deck_core::mux::{Mux, session_name_for};
-use deck_core::omp::{DeleteTarget, MoveKind, MoveOutcome, Omp};
+use deck_core::inventory::{InventoryEntry, SessionStats};
+use deck_core::mux::session_name_for;
+use deck_core::omp::{DeleteTarget, MoveKind, MoveOutcome};
 use deck_core::platform::TreeMemory;
 use deck_core::sessions::{SessionEntry, abbreviate_home};
+use deck_service::gateway::protocol::{Answer, Done as Reply, Mutation, Query, Topic, TopicValue};
+use deck_service::statusfmt::Activity;
 use egui::{Key, Modifiers};
 
-use super::{App, AppEvent, PendingConfirm};
+use super::{App, PendingConfirm};
 use crate::app::human_size;
 use crate::confirm::Confirm;
-use crate::omp_worker::MovedTab;
 use crate::running_model::{HubMode, RunModel, RunPoll};
 use crate::sessions_model::{Live, Model, plural};
 use crate::sessions_view::{self, OpProgress, SessionsAction, ViewInput, ViewState};
-use crate::tabs::{Anchor, ClosedTab, Tab};
+use crate::tabs::{Anchor, ClosedTab, MovedTab, Tab};
 use crate::transfer::{FolderDialog, Subject, TransferKind};
 use crate::worktree_ui;
-use deck_service::backend::Backends;
-use deck_service::lifecycle;
-use deck_service::statusfmt::Activity;
 
-/// Statistics worker threads (each one parses whole transcripts: I/O and JSON bound).
-const STATS_THREADS: usize = 4;
-/// Results are forwarded to the UI in batches of this many, or at least this often.
-const STATS_BATCH: usize = 8;
-const STATS_FLUSH: Duration = Duration::from_millis(150);
+/// Statistics are requested in batches of this many sessions (newest first).
+const STATS_BATCH: usize = 32;
 /// How often the Running view re-reads the live sessions.
 const RUN_POLL: Duration = Duration::from_secs(2);
 /// How often the Sessions view refreshes its RAM column (only while something runs).
@@ -52,18 +46,16 @@ pub(crate) struct MovePrep {
 }
 
 impl MovePrep {
-    /// Kill what runs the session, move it (retrying while omp still sees the dying process)
-    /// and work out the tab to bring back: on the new path after success, on the original one
-    /// (re-attached if its session survived) after a failure. Blocking: run on a worker.
-    pub(super) fn run(
+    /// The tab to bring back once the gateway answered the move: on the new path after success,
+    /// on the original one (re-attached if its session survived, per `is_alive`) after a
+    /// failure. `persistent` = a backend keeps sessions alive across tabs.
+    pub(super) fn finish(
         self,
-        omp: &Omp,
-        backends: &Backends,
+        result: &Result<MoveOutcome, String>,
         dest: &Path,
-    ) -> (Result<MoveOutcome, String>, Option<Box<MovedTab>>) {
-        let result =
-            lifecycle::stop_then_move(omp, backends, &self.kill_names, &self.entry.path, dest);
-        let persistent = !backends.is_empty();
+        persistent: bool,
+        is_alive: &dyn Fn(&str) -> bool,
+    ) -> Option<Box<MovedTab>> {
         let MovePrep {
             entry,
             kill_names,
@@ -71,8 +63,8 @@ impl MovePrep {
             anchor,
             refocus,
         } = self;
-        let tab = tab.map(|mut tab| {
-            match &result {
+        tab.map(|mut tab| {
+            match result {
                 Ok(outcome) => {
                     let new_id = match &outcome.kind {
                         MoveKind::Forked { new_id } => new_id,
@@ -85,7 +77,7 @@ impl MovePrep {
                 Err(_) => {
                     // Re-attach a session that survived; else resume the original file under
                     // its canonical name.
-                    let alive = lifecycle::surviving_session(backends, &kill_names);
+                    let alive = kill_names.iter().find(|n| is_alive(n)).cloned();
                     tab.mux_name =
                         alive.or_else(|| persistent.then(|| session_name_for(&entry.id)));
                 }
@@ -95,8 +87,7 @@ impl MovePrep {
                 anchor,
                 refocus,
             })
-        });
-        (result, tab)
+        })
     }
 }
 
@@ -152,17 +143,18 @@ struct Op {
     first_error: Option<String>,
 }
 
+#[derive(Default)]
 pub(super) struct SessionHub {
     pub(super) open: bool,
     model: Model,
     view: ViewState,
-    /// Parsed statistics; lives for the process so a reopen is instant for unchanged files.
-    cache: Arc<Mutex<StatsCache>>,
-    /// Id of the latest scan; older answers (scan or statistics) are dropped.
+    /// Id of the latest inventory read; older statistics answers are dropped.
     generation: u64,
-    scanning: bool,
+    /// The gateway's inventory revision last taken into the model.
+    inventory_rev: u64,
+    /// Entries whose statistics were asked for, by what the entry looked like then.
+    asked: HashMap<PathBuf, (SystemTime, u64)>,
     loaded: bool,
-    stats_cancel: Option<Arc<AtomicBool>>,
     op: Option<Op>,
     next_op: u64,
     labels_gen: Option<u64>,
@@ -171,57 +163,7 @@ pub(super) struct SessionHub {
     run_poll: RunPolling,
 }
 
-impl Default for SessionHub {
-    fn default() -> Self {
-        SessionHub {
-            open: false,
-            model: Model::default(),
-            view: ViewState::default(),
-            cache: Arc::new(Mutex::new(StatsCache::new())),
-            generation: 0,
-            scanning: false,
-            loaded: false,
-            stats_cancel: None,
-            op: None,
-            next_op: 0,
-            labels_gen: None,
-            mode: HubMode::default(),
-            run: RunModel::default(),
-            run_poll: RunPolling::default(),
-        }
-    }
-}
-
-/// What a worker reports to the hub.
-pub(super) enum SessionsEvent {
-    Scanned {
-        generation: u64,
-        entries: Vec<InventoryEntry>,
-    },
-    Stats {
-        generation: u64,
-        batch: Vec<(PathBuf, Result<SessionStats, String>)>,
-    },
-    /// One session of a bulk operation finished.
-    Step {
-        op: u64,
-        path: PathBuf,
-        outcome: Result<Done, String>,
-        /// A moved session's tab to bring back.
-        tab: Option<Box<MovedTab>>,
-    },
-    OpFinished {
-        op: u64,
-    },
-    /// The running-sessions worker's answer.
-    Running(Box<RunPoll>),
-    /// A kill from the Running view finished; `failed` = (session name, why).
-    Killed {
-        total: usize,
-        failed: Vec<(String, String)>,
-    },
-}
-
+/// What one session of a bulk operation ended with.
 pub(super) enum Done {
     Deleted,
     Copied,
@@ -245,7 +187,7 @@ impl App {
         }
     }
 
-    /// Open the hub (scoped to `scope` when given) and scan the store.
+    /// Open the hub (scoped to `scope` when given) and follow the gateway's inventory.
     pub(super) fn open_sessions(&mut self, scope: Option<PathBuf>) {
         let hub = &mut self.sessions;
         hub.open = true;
@@ -259,152 +201,94 @@ impl App {
         hub.mode = HubMode::Sessions;
         hub.run.reset();
         hub.run_poll.last = None;
-        self.start_scan();
+        // The entries are read from the cache; every one's statistics are asked for again.
+        hub.inventory_rev = 0;
+        hub.asked.clear();
+        hub.generation += 1;
+        self.gw.subscribe(Topic::Inventory);
     }
 
     pub(super) fn close_sessions(&mut self) {
         let hub = &mut self.sessions;
         hub.open = false;
         hub.generation += 1;
-        hub.scanning = false;
-        if let Some(c) = hub.stats_cancel.take() {
-            c.store(true, Ordering::Relaxed);
-        }
+        self.gw.unsubscribe(&Topic::Inventory);
         self.focus_pending = true;
     }
 
-    /// A worker walks the store; its answer starts the statistics worker.
+    /// Reads the inventory again from the gateway (a refresh, or an operation just finished).
     fn start_scan(&mut self) {
         if !self.sessions.open {
             return;
         }
+        self.sessions.inventory_rev = 0;
+    }
+
+    /// Takes a newer inventory from the gateway's cache into the model and asks for the
+    /// statistics of what is new or changed.
+    fn take_inventory(&mut self) {
+        let rev = self.gw.revision(&Topic::Inventory);
+        if rev == 0 || rev == self.sessions.inventory_rev {
+            return;
+        }
+        let Some(TopicValue::Inventory(entries)) = self.gw.topic(&Topic::Inventory) else {
+            return;
+        };
+        self.sessions.inventory_rev = rev;
         self.sessions.generation += 1;
-        self.sessions.scanning = true;
-        if let Some(c) = self.sessions.stats_cancel.take() {
-            c.store(true, Ordering::Relaxed);
-        }
-        let generation = self.sessions.generation;
-        let root = self.root.clone();
-        let ok = self.spawn_worker("deck-inventory", move |tx, ctx| {
-            let entries = inventory::scan(&root);
-            send(
-                tx,
-                ctx,
-                SessionsEvent::Scanned {
-                    generation,
-                    entries,
-                },
-            );
-        });
-        if !ok {
-            self.sessions.scanning = false;
-            self.sessions.loaded = true;
-        }
+        self.sessions.loaded = true;
+        self.start_stats(&entries);
+        self.sessions.model.set_entries(entries);
+        self.resolve_running();
+        self.refresh_ram();
     }
 
-    /// Run `job` on a named thread with the event channel; false if the thread did not start.
-    fn spawn_worker(
-        &self,
-        name: &str,
-        job: impl FnOnce(&Sender<AppEvent>, &egui::Context) + Send + 'static,
-    ) -> bool {
-        let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
-        match std::thread::Builder::new()
-            .name(name.to_owned())
-            .spawn(move || job(&tx, &ctx))
-        {
-            Ok(_) => true,
-            Err(e) => {
-                log::warn!("cannot start {name}: {e}");
-                false
-            }
-        }
-    }
-
-    pub(super) fn on_sessions_event(&mut self, ev: SessionsEvent) {
-        match ev {
-            SessionsEvent::Scanned {
-                generation,
-                entries,
-            } => {
-                if !self.sessions.open || generation != self.sessions.generation {
+    /// Asks the gateway for the statistics of the entries (newest first) it has not parsed for
+    /// this version of the file yet, in batches whose answers stream in.
+    fn start_stats(&mut self, entries: &[InventoryEntry]) {
+        let hub = &mut self.sessions;
+        hub.asked
+            .retain(|p, _| entries.iter().any(|e| &e.path == p));
+        let due: Vec<PathBuf> = entries
+            .iter()
+            .filter(|e| {
+                let fingerprint = (e.modified, e.total_bytes());
+                hub.asked.insert(e.path.clone(), fingerprint) != Some(fingerprint)
+            })
+            .map(|e| e.path.clone())
+            .collect();
+        let generation = hub.generation;
+        for batch in due.chunks(STATS_BATCH) {
+            self.gw.query(Query::Stats(batch.to_vec()), move |app, r| {
+                if generation != app.sessions.generation {
                     return;
                 }
-                self.sessions.scanning = false;
-                self.sessions.loaded = true;
-                self.start_stats(generation, entries.clone());
-                self.sessions.model.set_entries(entries);
-                self.resolve_running();
-                self.refresh_ram();
-            }
-            SessionsEvent::Stats { generation, batch } => {
-                if generation != self.sessions.generation {
-                    return;
-                }
-                for (path, result) in batch {
-                    self.sessions.model.set_stats(&path, result);
-                }
-            }
-            SessionsEvent::Step {
-                op,
-                path,
-                outcome,
-                tab,
-            } => self.on_step(op, &path, outcome, tab),
-            SessionsEvent::OpFinished { op } => self.on_op_finished(op),
-            SessionsEvent::Running(poll) => {
-                self.sessions.run_poll.in_flight = false;
-                self.sessions.run.set_poll(*poll);
-                self.resolve_running();
-                self.refresh_ram();
-            }
-            SessionsEvent::Killed { total, failed } => self.on_killed(total, &failed),
-        }
-    }
-
-    /// Parse the transcripts of `entries` (newest first) on a worker, streaming batches.
-    fn start_stats(&mut self, generation: u64, entries: Vec<InventoryEntry>) {
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.sessions.stats_cancel = Some(Arc::clone(&cancel));
-        let cache = Arc::clone(&self.sessions.cache);
-        self.spawn_worker("deck-session-stats", move |tx, ctx| {
-            let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
-            cache.prune(&entries);
-            let mut batch = Vec::with_capacity(STATS_BATCH);
-            let mut last = Instant::now();
-            cache.compute_many(&entries, STATS_THREADS, &cancel, |entry, result| {
-                batch.push((
-                    entry.path.clone(),
-                    result.cloned().map_err(|e| e.to_string()),
-                ));
-                if batch.len() >= STATS_BATCH || last.elapsed() >= STATS_FLUSH {
-                    let b = std::mem::take(&mut batch);
-                    send(
-                        tx,
-                        ctx,
-                        SessionsEvent::Stats {
-                            generation,
-                            batch: b,
-                        },
-                    );
-                    last = Instant::now();
+                let batch = match r {
+                    Ok(Answer::Stats(b)) => b,
+                    Ok(_) => return,
+                    Err(e) => {
+                        log::warn!("session statistics: {e}");
+                        return;
+                    }
+                };
+                for (path, stats) in batch {
+                    let result: Result<SessionStats, String> =
+                        stats.ok_or_else(|| "its statistics could not be read".to_owned());
+                    app.sessions.model.set_stats(&path, result);
                 }
             });
-            if !batch.is_empty() {
-                send(tx, ctx, SessionsEvent::Stats { generation, batch });
-            }
-        });
+        }
     }
 
     /// Per frame while open: tell the model which sessions run / have tabs and what the
     /// worktree projects are called.
     fn sync_hub_inputs(&mut self) {
-        let generation = self.watcher.generation();
+        self.take_inventory();
+        let generation = self.gw.sessions_generation();
         if self.sessions.labels_gen != Some(generation) {
             self.sessions.labels_gen = Some(generation);
             let labels: HashMap<PathBuf, String> = self
-                .watcher
-                .latest()
+                .groups()
                 .map(|groups| {
                     groups
                         .iter()
@@ -419,13 +303,11 @@ impl App {
             self.sessions.model.set_labels(labels);
             self.resolve_running();
         }
-        let snap = self.running.latest();
+        let snap = self.running_snapshot();
         let mut live: HashMap<PathBuf, Live> = HashMap::new();
-        if let Some(snap) = &snap {
-            for r in self.sessions.model.rows() {
-                if snap.is_running(&r.entry.id, &r.entry.path) {
-                    live.entry(r.entry.path.clone()).or_default().running = true;
-                }
+        for r in self.sessions.model.rows() {
+            if snap.is_running(&r.entry.id, &r.entry.path) {
+                live.entry(r.entry.path.clone()).or_default().running = true;
             }
         }
         for t in self.tabs.iter().filter_map(Tab::term) {
@@ -465,10 +347,10 @@ impl App {
             || self.dialog.is_some()
             || self.wt.dialog.is_some()
             || self.palette.is_some();
-        let (omp, can_stop) = (self.omp.is_some(), !self.backends.is_empty());
+        let (omp, can_stop) = (self.omp_found(), self.backends_available());
         let hub = &mut self.sessions;
         let input = ViewInput {
-            scanning: hub.scanning,
+            scanning: !hub.loaded,
             loaded: hub.loaded,
             mode: hub.mode,
             op: hub.op.as_ref().map(|o| &o.progress),
@@ -490,14 +372,16 @@ impl App {
     /// Poll the live sessions: every 2 s in the Running view; in the Sessions view once on open
     /// and every 5 s while something runs (the RAM column). Never while the hub is closed.
     fn drive_run_poll(&mut self, ctx: &egui::Context) {
+        let can_stop = self.backends_available();
+        let up = self.gw.is_up();
         let hub = &mut self.sessions;
-        if self.backends.is_empty() {
+        if !can_stop {
             if !hub.run.loaded() {
                 hub.run.set_poll(RunPoll::default());
             }
             return;
         }
-        if hub.run_poll.in_flight {
+        if hub.run_poll.in_flight || !up {
             return;
         }
         let every = match hub.mode {
@@ -521,27 +405,22 @@ impl App {
         }
         hub.run_poll.in_flight = true;
         hub.run_poll.last = Some(Instant::now());
-        let (backends, root) = (self.backends.clone(), self.root.path.clone());
-        let ok = self.spawn_worker("deck-running", move |tx, ctx| {
-            let mut poll = RunPoll::default();
-            let mut seen: HashSet<String> = HashSet::new();
-            for mux in backends.all() {
-                // A name listed by several backends belongs to the first.
-                poll.sessions.extend(
-                    mux.running(&root)
-                        .into_iter()
-                        .filter(|s| seen.insert(s.name.clone())),
-                );
-                if matches!(mux, Mux::Tmux(_)) {
-                    poll.tmux = true;
-                    poll.tmux_server = mux.server_memory();
+        self.gw.query(Query::RunningDetail, |app, r| {
+            app.sessions.run_poll.in_flight = false;
+            match r {
+                Ok(Answer::RunningDetail(d)) => {
+                    app.sessions.run.set_poll(RunPoll {
+                        sessions: d.sessions,
+                        tmux_server: d.tmux_server,
+                        tmux: d.tmux,
+                    });
+                    app.resolve_running();
+                    app.refresh_ram();
                 }
+                Ok(_) => {}
+                Err(e) => log::warn!("running sessions: {e}"),
             }
-            send(tx, ctx, SessionsEvent::Running(Box::new(poll)));
         });
-        if !ok {
-            self.sessions.run_poll.in_flight = false;
-        }
     }
 
     /// Titles and project labels of the running rows, from the inventory.
@@ -611,7 +490,6 @@ impl App {
         }
         // The list refreshes at once.
         self.sessions.run_poll.last = None;
-        self.running.poke();
         self.ctx.request_repaint();
     }
 
@@ -648,20 +526,18 @@ impl App {
             return;
         }
         self.sessions.run.set_killing(names.iter().cloned());
-        let backends = self.backends.clone();
         let total = names.len();
-        let ok = self.spawn_worker("deck-kill-running", move |tx, ctx| {
-            let failed: Vec<(String, String)> = names
-                .into_iter()
-                .filter_map(|n| backends.stop(&n).err().map(|e| (n, e)))
-                .collect();
-            send(tx, ctx, SessionsEvent::Killed { total, failed });
-        });
-        if !ok {
-            self.sessions.run.clear_killing();
-            self.toasts
-                .error(&self.ctx, "Could not start the kill (no thread)");
-        }
+        let asked = names.clone();
+        self.gw
+            .mutate(Mutation::KillNames { names, wait: true }, move |app, r| {
+                let failed = match r {
+                    Ok(Reply::Killed(failed)) => failed,
+                    Ok(_) => Vec::new(),
+                    // Nothing is known to have been killed: every name counts as failed.
+                    Err(e) => asked.into_iter().map(|n| (n, e.clone())).collect(),
+                };
+                app.on_killed(total, &failed);
+            });
     }
 
     fn apply_sessions_action(&mut self, action: SessionsAction) {
@@ -785,24 +661,6 @@ impl App {
         id
     }
 
-    /// Start `job` as the worker of the running op; if no thread can be created the op is
-    /// abandoned with an error toast.
-    fn run_op(
-        &mut self,
-        entries: &[InventoryEntry],
-        job: impl FnOnce(&Sender<AppEvent>, &egui::Context) + Send + 'static,
-    ) {
-        if !self.spawn_worker("deck-session-op", job) {
-            for e in entries {
-                self.moving.remove(&e.path);
-            }
-            self.sessions.op = None;
-            self.toasts
-                .error(&self.ctx, "Could not start the operation (no thread)");
-        }
-        self.running.poke();
-    }
-
     fn on_step(
         &mut self,
         op: u64,
@@ -817,6 +675,7 @@ impl App {
             return;
         };
         o.progress.done += 1;
+        let finished = o.progress.done >= o.progress.total;
         match outcome {
             Ok(done) => {
                 o.ok += 1;
@@ -843,6 +702,9 @@ impl App {
                     .model
                     .set_error(path, failure_line(&e).to_owned());
             }
+        }
+        if finished {
+            self.on_op_finished(op);
         }
     }
 
@@ -906,7 +768,7 @@ impl App {
     // ------------------------------------------------------------- delete
 
     fn request_delete_sessions(&mut self, paths: &[PathBuf]) {
-        if self.omp.is_none() || self.sessions.op.is_some() {
+        if !self.omp_found() || self.sessions.op.is_some() {
             return;
         }
         let model = &self.sessions.model;
@@ -960,10 +822,7 @@ impl App {
     }
 
     pub(super) fn execute_delete_sessions(&mut self, targets: Vec<DeleteTarget>) {
-        let Some(omp) = self.omp.clone() else {
-            return;
-        };
-        if self.sessions.op.is_some() {
+        if !self.omp_found() || self.sessions.op.is_some() {
             return;
         }
         let paths: Vec<PathBuf> = targets.iter().map(|t| t.path.clone()).collect();
@@ -985,22 +844,30 @@ impl App {
             }
         }
         let op = self.begin_op(OpKind::Delete, &entries, None);
-        let backends = self.backends.clone();
-        self.run_op(&entries, move |tx, ctx| {
-            lifecycle::stop_then_delete(&omp, &backends, &kill_names, &files, |path, result| {
-                send(
-                    tx,
-                    ctx,
-                    SessionsEvent::Step {
-                        op,
-                        path: path.to_path_buf(),
-                        outcome: result.map(|()| Done::Deleted),
-                        tab: None,
-                    },
-                );
-            });
-            send(tx, ctx, SessionsEvent::OpFinished { op });
-        });
+        let asked: Vec<PathBuf> = files.iter().map(|t| t.path.clone()).collect();
+        self.gw.mutate(
+            Mutation::Delete {
+                targets: files,
+                stop: kill_names,
+            },
+            move |app, r| match r {
+                Ok(Reply::Deleted(results)) => {
+                    for (path, failure) in results {
+                        let outcome = failure.map_or(Ok(Done::Deleted), Err);
+                        app.on_step(op, &path, outcome, None);
+                    }
+                }
+                Ok(_) => app.fail_all(op, &asked, "the gateway answered with something else"),
+                Err(e) => app.fail_all(op, &asked, &e),
+            },
+        );
+    }
+
+    /// Every path of `paths` ended with the same failure.
+    fn fail_all(&mut self, op: u64, paths: &[PathBuf], why: &str) {
+        for p in paths {
+            self.on_step(op, p, Err(why.to_owned()), None);
+        }
     }
 
     // --------------------------------------------------------------- copy
@@ -1024,10 +891,7 @@ impl App {
     }
 
     fn execute_copy_sessions(&mut self, paths: Vec<PathBuf>, dest: PathBuf) {
-        let Some(omp) = self.omp.clone() else {
-            return;
-        };
-        if self.sessions.op.is_some() {
+        if !self.omp_found() || self.sessions.op.is_some() {
             return;
         }
         let claimed = self.claim_rows(&paths);
@@ -1044,35 +908,39 @@ impl App {
         if let Some(o) = self.sessions.op.as_mut() {
             o.skipped = claimed_n - entries.len();
         }
-        let files: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
-        self.run_op(&entries, move |tx, ctx| {
-            let Ok(dest) = absolute(&dest) else {
-                return;
-            };
-            for src in files {
-                let outcome = omp
-                    .copy_session(&src, &dest)
-                    .map(|_| Done::Copied)
-                    .map_err(|e| e.to_string());
-                send(
-                    tx,
-                    ctx,
-                    SessionsEvent::Step {
-                        op,
-                        path: src,
-                        outcome,
-                        tab: None,
-                    },
-                );
+        let files: VecDeque<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+        match absolute(&dest) {
+            Ok(dest) => self.copy_next(op, files, dest),
+            Err(e) => {
+                let files: Vec<PathBuf> = files.into();
+                self.fail_all(op, &files, &e.to_string());
             }
-            send(tx, ctx, SessionsEvent::OpFinished { op });
-        });
+        }
+    }
+
+    /// Copies the next session of the queue; each is its own request, one after the other.
+    fn copy_next(&mut self, op: u64, mut files: VecDeque<PathBuf>, dest: PathBuf) {
+        let Some(src) = files.pop_front() else {
+            return;
+        };
+        let done_path = src.clone();
+        self.gw.mutate(
+            Mutation::Copy {
+                file: src,
+                dest_cwd: dest.clone(),
+            },
+            move |app, r| {
+                let outcome = r.map(|_| Done::Copied);
+                app.on_step(op, &done_path, outcome, None);
+                app.copy_next(op, files, dest);
+            },
+        );
     }
 
     // --------------------------------------------------------------- move
 
     fn request_move_sessions(&mut self, paths: Vec<PathBuf>, dest: PathBuf) {
-        if self.omp.is_none() || self.sessions.op.is_some() {
+        if !self.omp_found() || self.sessions.op.is_some() {
             return;
         }
         let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
@@ -1116,10 +984,7 @@ impl App {
     }
 
     pub(super) fn execute_move_sessions(&mut self, paths: Vec<PathBuf>, dest: PathBuf) {
-        let Some(omp) = self.omp.clone() else {
-            return;
-        };
-        if self.sessions.op.is_some() {
+        if !self.omp_found() || self.sessions.op.is_some() {
             return;
         }
         let claimed = self.claim_rows(&paths);
@@ -1129,28 +994,56 @@ impl App {
         }
         let op = self.begin_op(OpKind::Move, &entries, Some(dest.clone()));
         // Tabs close now and come back one by one as their session finishes.
-        let preps: Vec<MovePrep> = entries
+        let preps: VecDeque<MovePrep> = entries
             .iter()
             .map(|e| self.prepare_move(session_entry(e)))
             .collect();
-        let backends = self.backends.clone();
-        self.run_op(&entries, move |tx, ctx| {
-            for prep in preps {
-                let path = prep.entry.path.clone();
-                let (result, tab) = prep.run(&omp, &backends, &dest);
-                send(
-                    tx,
-                    ctx,
-                    SessionsEvent::Step {
-                        op,
-                        path,
-                        outcome: result.map(|o| Done::Moved(o.kind)),
-                        tab,
-                    },
-                );
+        match absolute(&dest) {
+            Ok(dest) => self.move_next(op, preps, dest),
+            Err(e) => {
+                for prep in preps {
+                    let path = prep.entry.path.clone();
+                    let err = Err(e.to_string());
+                    let tab = self.finish_move(prep, &err, &dest);
+                    self.on_step(op, &path, err.map(|o| Done::Moved(o.kind)), tab);
+                }
             }
-            send(tx, ctx, SessionsEvent::OpFinished { op });
+        }
+    }
+
+    /// Moves the next session of the queue; each is its own request, one after the other.
+    fn move_next(&mut self, op: u64, mut preps: VecDeque<MovePrep>, dest: PathBuf) {
+        let Some(prep) = preps.pop_front() else {
+            return;
+        };
+        let request = Mutation::Move {
+            file: prep.entry.path.clone(),
+            dest_cwd: dest.clone(),
+            stop: prep.kill_names.clone(),
+        };
+        self.gw.mutate(request, move |app, r| {
+            let result = r.and_then(|d| match d {
+                Reply::Moved(o) => Ok(o),
+                _ => Err("the gateway answered with something else".to_owned()),
+            });
+            let path = prep.entry.path.clone();
+            let tab = app.finish_move(prep, &result, &dest);
+            app.on_step(op, &path, result.map(|o| Done::Moved(o.kind)), tab);
+            app.move_next(op, preps, dest);
         });
+    }
+
+    /// The tab of a finished move, ready to come back (see [`MovePrep::finish`]).
+    pub(super) fn finish_move(
+        &self,
+        prep: MovePrep,
+        result: &Result<MoveOutcome, String>,
+        dest: &Path,
+    ) -> Option<Box<MovedTab>> {
+        let snap = self.running_snapshot();
+        prep.finish(result, dest, self.backends_available(), &|n| {
+            snap.is_alive(n)
+        })
     }
 
     // --------------------------------------------------------------- stop
@@ -1209,37 +1102,25 @@ impl App {
             return;
         }
         let op = self.begin_op(OpKind::Stop, &entries, None);
-        let backends = self.backends.clone();
-        self.run_op(&entries, move |tx, ctx| {
-            for (path, names) in jobs {
-                let outcome = if names.is_empty() {
-                    Err("it is not running anymore".to_owned())
-                } else {
-                    names
-                        .iter()
-                        .map(|n| backends.kill(n))
-                        .find_map(Result::err)
-                        .map_or(Ok(Done::Stopped), Err)
-                };
-                send(
-                    tx,
-                    ctx,
-                    SessionsEvent::Step {
-                        op,
-                        path,
-                        outcome,
-                        tab: None,
-                    },
-                );
+        for (path, names) in jobs {
+            if names.is_empty() {
+                self.on_step(op, &path, Err("it is not running anymore".to_owned()), None);
+                continue;
             }
-            send(tx, ctx, SessionsEvent::OpFinished { op });
-        });
+            self.gw
+                .mutate(Mutation::KillNames { names, wait: false }, move |app, r| {
+                    let outcome = match r {
+                        Ok(Reply::Killed(failed)) => failed
+                            .into_iter()
+                            .next()
+                            .map_or(Ok(Done::Stopped), |(_, why)| Err(why)),
+                        Ok(_) => Err("the gateway answered with something else".to_owned()),
+                        Err(e) => Err(e),
+                    };
+                    app.on_step(op, &path, outcome, None);
+                });
+        }
     }
-}
-
-fn send(tx: &Sender<AppEvent>, ctx: &egui::Context, ev: SessionsEvent) {
-    let _ = tx.send(AppEvent::Sessions(ev));
-    ctx.request_repaint();
 }
 
 /// The message of a failure without omp's source excerpts and stack frames: the first

@@ -27,7 +27,7 @@ const MAX_ATTEMPTS: u32 = 5;
 pub(super) const PROJECT_KIND: &str = "project";
 
 /// One backup in the app folder.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub struct BackupFile {
     pub id: String,
     pub name: String,
