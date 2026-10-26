@@ -52,11 +52,20 @@ impl BackupFile {
     }
 }
 
-/// Drive sends `size` as a decimal string.
+/// Drive sends `size` as a decimal string; our own serialization (gateway replies) writes a
+/// number.
 fn size_string<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<u64, D::Error> {
-    Ok(Option::<String>::deserialize(d)?
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0))
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Size {
+        Number(u64),
+        Text(String),
+    }
+    Ok(match Option::<Size>::deserialize(d)? {
+        Some(Size::Number(n)) => n,
+        Some(Size::Text(s)) => s.parse().unwrap_or(0),
+        None => 0,
+    })
 }
 
 /// Newest first by creation time, then name (names carry a UTC timestamp).

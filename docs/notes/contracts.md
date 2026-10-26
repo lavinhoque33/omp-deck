@@ -2603,6 +2603,10 @@ only passed the `cargo xwin clippy` compile gate.
   sibling → the `omp-deck` app (itself or sibling) with `--gateway`; startup contexts, systemd units and Windows tasks
   then record that program. The next self-update (0.15.x updater) installs the missing executable. Verified on Windows:
   a dir with only `omp-deck.exe` + host served, registered `omp-deck.exe --gateway supervise`, uninstalled cleanly.
+- **`BackupFile.size` on the wire (0.15.2).** Drive reports `size` as a decimal string; serde serializes the `u64` as a
+  number. Before the gateway nothing re-decoded our own output, so `size_string` accepted strings only and every gateway
+  reply carrying a `BackupFile` (Drive list/backup, project list/backup) failed with "undecodable gateway reply". It now
+  accepts both; a gateway JSON round trip is unit-tested.
 - **GUI client.** `omp-deck` owns no controller/settings/notification/worker state: `gw.rs` (`Gw` facade, jobs as typed
   requests), `activate.rs` (`--activate <ticket>`), frontend terminals via `deck_term::Frontend`. Tab close sends
   `Mutation::Close` (view detach); kill is explicit. Drive login cancel is typed `GatewayError::Cancelled` in the protocol;

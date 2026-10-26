@@ -319,6 +319,18 @@ fn retention_deletes_all_but_the_newest() {
     assert!(to_delete(&files[..5], KEEP_BACKUPS).is_empty());
 }
 
+/// The gateway sends a [`BackupFile`] to its clients as JSON: what it serializes must decode,
+/// besides Drive's own string-sized metadata.
+#[test]
+fn backup_file_survives_a_json_round_trip() {
+    let mut f = file("a", "2026-10-01T10:00:00.000Z");
+    f.size = 12_345;
+    let back: BackupFile = serde_json::from_slice(&serde_json::to_vec(&f).unwrap()).unwrap();
+    assert_eq!(back, f);
+    let drive: BackupFile = serde_json::from_value(meta_json(&f)).unwrap();
+    assert_eq!(drive, f);
+}
+
 #[test]
 fn credentials_prefer_runtime_values_and_need_a_client_id() {
     let c = Credentials::pick(Some("rt".into()), Some("baked"), None, Some("s")).unwrap();
