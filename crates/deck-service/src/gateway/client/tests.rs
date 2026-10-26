@@ -59,9 +59,13 @@ fn hello(s: &mut Stream) -> Hello {
 }
 
 fn welcome(s: &mut Stream, epoch: ServiceEpoch, profile: &Profile) {
+    welcome_as(s, epoch, profile, GATEWAY_VERSION);
+}
+
+fn welcome_as(s: &mut Stream, epoch: ServiceEpoch, profile: &Profile, version: &str) {
     let w = Welcome {
         protocol: PROTOCOL,
-        version: GATEWAY_VERSION.into(),
+        version: version.into(),
         epoch,
         pid: 1,
         profile: profile.clone(),
@@ -204,6 +208,65 @@ fn a_dead_owner_fails_pending_requests_and_the_next_owner_gets_the_interests_bac
         .collect();
     assert!(matches!(links.last(), Some(Link::Up(w)) if w.epoch == ServiceEpoch([2; 16])));
     assert!(links.iter().any(|l| matches!(l, Link::Down { .. })));
+}
+
+/// An autostarting GUI asks an owner of an older build to exit once it is drained (never
+/// while it has work), and only once: an owner that comes back still older is kept.
+#[test]
+fn an_older_owner_is_asked_to_exit_once_drained_and_only_once() {
+    let (_dir, profile) = test_profile("outdated");
+    let listener = Arc::new(Listener::bind(&endpoint(&profile)).expect("bind"));
+    let mut o = options(&profile, Role::Gui);
+    o.autostart = true;
+    // Never launched: the mock owner stays reachable.
+    o.gateway_exe = Some(PathBuf::from("/nonexistent/omp-deck-gateway"));
+    let client = GatewayClient::start(o);
+    let is_maintenance = |r: &Request| matches!(r, Request::Maintenance(_));
+
+    // Busy: polled, not told to exit.
+    let mut s = accept(&listener);
+    hello(&mut s);
+    welcome_as(&mut s, ServiceEpoch([1; 16]), &profile, "0.0.1");
+    let mut asm = Assembly::default();
+    let env = request(&mut s, &mut asm).expect("request");
+    assert!(matches!(env.body, Request::Maintenance(MaintenanceOp::Poll)), "{:?}", env.body);
+    let busy = DrainState::Draining {
+        jobs: 1,
+        controllers_busy: 0,
+        direct_programs: 0,
+    };
+    reply(&mut s, env.id, &Ok(Answer::Maintenance(busy)));
+    wait_until("link up", || matches!(client.link(), Link::Up(_)));
+    let _sentinel = client.query(Query::OmpVersion);
+    let env = until(&mut s, &mut asm, |r| {
+        is_maintenance(r) || matches!(r, Request::Query(Query::OmpVersion))
+    });
+    assert!(!is_maintenance(&env.body), "{:?}", env.body);
+    s.shutdown();
+    drop(s);
+
+    // Drained: told to exit.
+    let mut s = accept(&listener);
+    hello(&mut s);
+    welcome_as(&mut s, ServiceEpoch([2; 16]), &profile, "0.0.1");
+    let mut asm = Assembly::default();
+    let env = request(&mut s, &mut asm).expect("request");
+    assert!(matches!(env.body, Request::Maintenance(MaintenanceOp::Poll)), "{:?}", env.body);
+    reply(&mut s, env.id, &Ok(Answer::Maintenance(DrainState::Drained)));
+    let env = until(&mut s, &mut asm, is_maintenance);
+    assert!(matches!(env.body, Request::Maintenance(MaintenanceOp::Exit)), "{:?}", env.body);
+    reply(&mut s, env.id, &Ok(Answer::Done));
+    s.shutdown();
+    drop(s);
+
+    // The owner that comes back is still older (another installation's): kept.
+    let mut s = accept(&listener);
+    hello(&mut s);
+    welcome_as(&mut s, ServiceEpoch([3; 16]), &profile, "0.0.1");
+    let mut asm = Assembly::default();
+    let env = request(&mut s, &mut asm).expect("request");
+    assert!(!is_maintenance(&env.body), "{:?}", env.body);
+    drop(client);
 }
 
 fn inbox(badge: usize) -> Reply {

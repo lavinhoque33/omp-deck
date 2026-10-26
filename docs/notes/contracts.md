@@ -2607,6 +2607,15 @@ only passed the `cargo xwin clippy` compile gate.
   number. Before the gateway nothing re-decoded our own output, so `size_string` accepted strings only and every gateway
   reply carrying a `BackupFile` (Drive list/backup, project list/backup) failed with "undecodable gateway reply". It now
   accepts both; a gateway JSON round trip is unit-tested.
+- **Outdated owner replacement (0.15.3).** An update replaces the executables under a running owner, and nothing restarted
+  it: the in-app updater runs inside the owner, deb/rpm have no maintainer scripts, and `PROTOCOL` is unchanged across
+  patch releases. So a 0.15.2 GUI kept talking to a 0.15.1 owner. Now an autostarting GUI client whose `GATEWAY_VERSION`
+  `selfupdate::is_newer` than `Welcome.version` sends `MaintenanceOp::Poll` (no barrier) first on the link: `Drained` →
+  `MaintenanceOp::Exit` (barrier in memory only, no marker file, so the client's autostart or the supervisor launches the
+  new owner); `Draining` → asked again every 15 s while that epoch's link lasts. Once per client: an owner that comes back
+  still older (another installation) is kept. Only newer clients replace, so an older GUI never downgrades the owner and
+  two installs never fight. A gateway with no desktop GUI stays old until one connects. Verified: an isolated real 0.15.2
+  owner was replaced by the dev 0.15.3 build within ~140 ms (one `Down` blip), no marker left.
 - **GUI client.** `omp-deck` owns no controller/settings/notification/worker state: `gw.rs` (`Gw` facade, jobs as typed
   requests), `activate.rs` (`--activate <ticket>`), frontend terminals via `deck_term::Frontend`. Tab close sends
   `Mutation::Close` (view detach); kill is explicit. Drive login cancel is typed `GatewayError::Cancelled` in the protocol;

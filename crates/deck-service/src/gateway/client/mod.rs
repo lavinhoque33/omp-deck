@@ -7,6 +7,9 @@
 //! - **Connect**: the owner endpoint of the profile's [`super::GatewayId`]. When no owner runs
 //!   and `autostart` is set, the owner is launched detached (inheriting this process's
 //!   environment) unless the maintenance barrier is up, then connected with a bounded retry.
+//! - **Replace**: an autostarting GUI that finds an owner of an older build (an update replaced
+//!   the executables under it) asks it to exit once it is drained, then launches its own. Once
+//!   per client: an owner that comes back still older is kept.
 //! - **Reconnect** forever with backoff. A lost link resolves every outstanding request with
 //!   [`GatewayError::Disconnected`]; the next link re-sends the client state, interest
 //!   subscriptions and dashboard targets and refetches every cached topic.
@@ -65,6 +68,8 @@ const RETRY_MAX: Duration = Duration::from_secs(5);
 const REFUSED_RETRY: Duration = Duration::from_secs(30);
 /// Poll interval while the maintenance barrier keeps the owner down.
 const MAINTENANCE_POLL: Duration = Duration::from_secs(2);
+/// Poll interval while an outdated owner has work left before it can be replaced.
+const REPLACE_RETRY: Duration = Duration::from_secs(15);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -258,6 +263,7 @@ impl GatewayClient {
                 agents: None,
                 fetches: HashMap::new(),
                 closing: false,
+                replaced: false,
             }),
             cv: Condvar::new(),
         });
@@ -632,6 +638,8 @@ struct Inner {
     agents: Option<Option<AgentsTarget>>,
     fetches: HashMap<Topic, FetchState>,
     closing: bool,
+    /// This client asked an outdated owner to exit (at most once per client).
+    replaced: bool,
 }
 
 pub(crate) struct Shared {
@@ -957,6 +965,50 @@ impl Shared {
         self.cv.notify_all();
     }
 
+    /// Asks the outdated owner of `epoch` whether it is drained ([`MaintenanceOp::Poll`] raises
+    /// no barrier). Drained, it is asked to exit; else asked again after [`REPLACE_RETRY`] while
+    /// the link still serves it.
+    fn poll_outdated(self: &Arc<Self>, epoch: ServiceEpoch) {
+        self.request(
+            Request::Maintenance(MaintenanceOp::Poll),
+            Box::new(move |sh, r| match r {
+                Ok(Answer::Maintenance(DrainState::Drained)) => sh.retire_outdated(epoch),
+                Ok(Answer::Maintenance(DrainState::Draining { .. })) => {
+                    let sh = sh.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("gateway-replace".into())
+                        .spawn(move || {
+                            if !sh.sleep(REPLACE_RETRY) && serves(&lock(&sh.inner), epoch) {
+                                sh.poll_outdated(epoch);
+                            }
+                        });
+                    if let Err(e) = spawned {
+                        log::warn!("replacing the outdated gateway: {e}");
+                    }
+                }
+                Ok(_) => log::warn!("replacing the outdated gateway: {}", unexpected()),
+                // The next link decides again.
+                Err(GatewayError::Disconnected) => {}
+                Err(e) => log::warn!("replacing the outdated gateway: {e}"),
+            }),
+        );
+    }
+
+    /// [`MaintenanceOp::Exit`] to the drained outdated owner of `epoch`. It raises its barrier in
+    /// memory only (no marker file, so nothing blocks a launch), exits once idle, and the
+    /// reconnect launches this client's owner.
+    fn retire_outdated(self: &Arc<Self>, epoch: ServiceEpoch) {
+        {
+            let mut inner = lock(&self.inner);
+            if inner.replaced || !serves(&inner, epoch) {
+                return;
+            }
+            inner.replaced = true;
+        }
+        log::info!("asking the outdated gateway to exit");
+        self.notice(Request::Maintenance(MaintenanceOp::Exit));
+    }
+
     /// The client thread: connect, serve, reconnect until closed.
     fn run(self: Arc<Self>) {
         let mut delay = RETRY_MIN;
@@ -1125,6 +1177,11 @@ impl Shared {
             return e.to_string();
         }
         let welcome = Arc::new(welcome);
+        let epoch = welcome.epoch;
+        let older = (self.role == Role::Gui
+            && self.autostart
+            && deck_core::selfupdate::is_newer(GATEWAY_VERSION, &welcome.version))
+        .then(|| welcome.version.clone());
         let restore = {
             let mut inner = lock(&self.inner);
             if inner.closing {
@@ -1139,6 +1196,7 @@ impl Shared {
             inner.link = Link::Up(welcome.clone());
             Shared::push_locked(&mut inner, ClientEvent::Link(Link::Up(welcome)));
             (
+                older.filter(|_| !inner.replaced),
                 inner.client_state.clone(),
                 inner.interests.clone(),
                 inner.fleet.clone(),
@@ -1146,7 +1204,13 @@ impl Shared {
             )
         };
         self.wake();
-        let (client_state, interests, fleet, agents) = restore;
+        let (replace, client_state, interests, fleet, agents) = restore;
+        if let Some(theirs) = replace {
+            log::info!(
+                "the running gateway is {theirs}, this client {GATEWAY_VERSION}: replacing it once it is drained"
+            );
+            self.poll_outdated(epoch);
+        }
         if let Some(s) = client_state {
             self.notice(Request::ClientState(s));
         }
@@ -1218,6 +1282,14 @@ impl Shared {
             }
         }
     }
+}
+
+/// The link is up to the owner of `epoch`.
+fn serves(inner: &Inner, epoch: ServiceEpoch) -> bool {
+    inner
+        .conn
+        .as_ref()
+        .is_some_and(|c| c.welcome.epoch == epoch)
 }
 
 fn request_label(r: &Request) -> &'static str {
