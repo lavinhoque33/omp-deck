@@ -203,16 +203,35 @@ pub fn live_duration(a: &AgentSummary, now: SystemTime) -> Option<Duration> {
     a.duration
 }
 
-/// `$0.0091 · 12.3s · 4 req · 9 tools · 15K tok`.
-pub fn metrics_line(a: &AgentSummary, now: SystemTime) -> String {
-    let mut parts = vec![fmt_agent_cost(a.cost)];
+/// What one metric badge counts. Each kind has its own colour, so the card reads as separate
+/// facts instead of one grey run of text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetricKind {
+    Cost,
+    Time,
+    Requests,
+    Tools,
+    Tokens,
+}
+
+/// One formatted metric of a card: `$0.0091`, `12.3s`, `4 req`, `9 tools`, `15K tok`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Metric {
+    pub kind: MetricKind,
+    pub text: String,
+}
+
+/// The card's metric badges in display order (the last ones are dropped first when narrow).
+pub fn metrics(a: &AgentSummary, now: SystemTime) -> Vec<Metric> {
+    let m = |kind, text: String| Metric { kind, text };
+    let mut out = vec![m(MetricKind::Cost, fmt_agent_cost(a.cost))];
     if let Some(d) = live_duration(a, now) {
-        parts.push(fmt_duration(d));
+        out.push(m(MetricKind::Time, fmt_duration(d)));
     }
-    parts.push(format!("{} req", a.requests));
-    parts.push(format!("{} tools", a.tool_calls));
-    parts.push(tokens_text(a.tokens));
-    parts.join(" · ")
+    out.push(m(MetricKind::Requests, format!("{} req", a.requests)));
+    out.push(m(MetricKind::Tools, format!("{} tools", a.tool_calls)));
+    out.push(m(MetricKind::Tokens, tokens_text(a.tokens)));
+    out
 }
 
 /// Age of the last activity (falling back to creation); `"now"` when unknown.
@@ -228,7 +247,7 @@ pub fn agent_age(a: &AgentSummary, now: SystemTime) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct CardView {
     pub short_model: String,
-    pub metrics: String,
+    pub metrics: Vec<Metric>,
     pub age: String,
     pub gist: String,
     /// Direct children in the snapshot.
@@ -374,7 +393,7 @@ impl AgentsView {
                     card.age = agent_age(a, now);
                 }
                 if !rebuilt && a.status == AgentStatus::Running {
-                    card.metrics = metrics_line(a, now);
+                    card.metrics = metrics(a, now);
                 }
             }
         }
@@ -409,7 +428,7 @@ impl AgentsView {
             .iter()
             .map(|a| CardView {
                 short_model: a.model.as_deref().map(short_model).unwrap_or_default(),
-                metrics: metrics_line(a, now),
+                metrics: metrics(a, now),
                 age: String::new(),
                 gist: one_line(&a.task_gist, GIST_CHARS),
                 children: children.get(a.id.as_str()).copied().unwrap_or(0),
@@ -590,9 +609,25 @@ mod tests {
         assert_eq!(one_line("a\n\n  b   c", 20), "a b c");
         assert_eq!(one_line("alpha beta gamma", 8), "alpha be…");
         let a = agent("X", None, AgentStatus::Done, 1);
+        let texts = |a: &AgentSummary, now| -> Vec<String> {
+            metrics(a, now).into_iter().map(|m| m.text).collect()
+        };
         assert_eq!(
-            metrics_line(&a, SystemTime::UNIX_EPOCH),
-            "$0.0091 · 1 req · 2 tools · 1.5K tok"
+            texts(&a, SystemTime::UNIX_EPOCH),
+            ["$0.0091", "1 req", "2 tools", "1.5K tok"]
+        );
+        let kinds: Vec<MetricKind> = metrics(&a, SystemTime::UNIX_EPOCH)
+            .iter()
+            .map(|m| m.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                MetricKind::Cost,
+                MetricKind::Requests,
+                MetricKind::Tools,
+                MetricKind::Tokens
+            ]
         );
     }
 
@@ -602,7 +637,7 @@ mod tests {
         a.duration = Some(Duration::from_secs(1));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(165);
         assert_eq!(live_duration(&a, now), Some(Duration::from_secs(65)));
-        assert!(metrics_line(&a, now).contains("1m 05s"));
+        assert!(metrics(&a, now).iter().any(|m| m.text == "1m 05s"));
         a.status = AgentStatus::Done;
         assert_eq!(live_duration(&a, now), Some(Duration::from_secs(1)));
     }
@@ -623,7 +658,7 @@ mod tests {
             v.update(Some(&running), None, t(161)),
             "running view ticks per second"
         );
-        assert!(v.cards[0].metrics.contains("1m 01s"));
+        assert!(v.cards[0].metrics.iter().any(|m| m.text == "1m 01s"));
         let done = mk(AgentStatus::Done);
         let mut idle = AgentsView::default();
         assert!(idle.update(Some(&done), None, t(160)));

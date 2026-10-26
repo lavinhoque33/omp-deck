@@ -336,3 +336,17 @@ fn tree_memory_counts_a_spawned_child_tree() {
     assert_eq!(shell.processes, 1);
     assert!(own.bytes > shell.bytes, "{own:?} vs {shell:?}");
 }
+
+#[cfg(windows)]
+#[test]
+fn verbatim_prefix_is_dropped_only_for_drive_and_unc_paths() {
+    let plain = |s: &str| strip_verbatim(PathBuf::from(s));
+    assert_eq!(plain(r"\\?\C:\x\y"), PathBuf::from(r"C:\x\y"));
+    assert_eq!(
+        plain(r"\\?\UNC\srv\share\x"),
+        PathBuf::from(r"\\srv\share\x")
+    );
+    assert_eq!(plain(r"C:\x"), PathBuf::from(r"C:\x"));
+    assert_eq!(plain(r"\\srv\share"), PathBuf::from(r"\\srv\share"));
+    assert_eq!(plain(r"\\?\Volume{1}\x"), PathBuf::from(r"\\?\Volume{1}\x"));
+}

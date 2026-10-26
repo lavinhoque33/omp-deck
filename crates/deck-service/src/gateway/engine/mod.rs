@@ -1223,11 +1223,11 @@ impl Engine {
             ),
             Topic::Controllers => TopicValue::Controllers(self.controller_infos()),
             Topic::Notifications => TopicValue::Notifications(self.inbox_view()),
-            Topic::Status => TopicValue::Status(
+            Topic::Status => TopicValue::Status(Box::new(
                 self.status_target
                     .clone()
                     .zip(self.status.latest().map(|s| (*s).clone())),
-            ),
+            )),
             Topic::Usage => TopicValue::Usage(self.sched.usage_view()),
             Topic::AppUpdate => TopicValue::AppUpdate(self.sched.app_view()),
             Topic::Drive => TopicValue::Drive(self.drive_view()),

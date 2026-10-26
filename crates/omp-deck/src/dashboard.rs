@@ -24,14 +24,16 @@ use egui::{
 use crate::agent_ctl::{CtlView, Link, Restart};
 use crate::agent_hub::{self, RowAction, RowsInput, RowsState};
 use crate::agent_model::AgentsView;
+use crate::badge::{Badge, Hue};
 use crate::dashboard_model::{
     Card, CardKey, FILTERS, GAP, Grid, Item, PAD, Query, REPLY_LINE_H, REPLY_LINES, ROW_AGENTS,
     ROW_CTX, ROW_FILES, ROW_HEAD, ROW_MODEL, ROW_PROJECT, SECTION_GAP, Status, StatusFilter,
     card_height, columns, layout, visible,
 };
 use crate::icons::{
-    ICON_BRAIN, ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_FOLDER, ICON_FOLDER_GIT_2,
-    ICON_GIT_BRANCH, ICON_LIST, ICON_LIST_TREE, ICON_NETWORK, ICON_SEARCH, ICON_X, Icon,
+    ICON_BRAIN, ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CPU, ICON_FOLDER,
+    ICON_FOLDER_GIT_2, ICON_GIT_BRANCH, ICON_LIST, ICON_LIST_TREE, ICON_NETWORK, ICON_SEARCH,
+    ICON_X, Icon,
 };
 use crate::statusbar::level_color;
 use crate::tabs::paint_status;
@@ -856,53 +858,31 @@ fn paint_card(
 
     if let Some(m) = &card.metrics {
         y += SECTION_GAP;
-        // Model, thinking … cost.
+        // Model, thinking … failed, cost: each a badge of its own hue.
         let cy = y + ROW_MODEL / 2.0;
         let mut x = left;
         if !m.model.is_empty() {
-            let g = line(&p, &m.model, 11.5, pal.text, (right - left) * 0.5);
-            let w = g.size().x + 14.0;
-            let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(w, 20.0));
-            skin::paint_chip(
-                &p,
-                r,
-                theme::ui_rad(10),
-                pal,
-                pal.raised.gamma_multiply(0.9),
-            );
-            p.galley(pos2(x + 7.0, cy - g.size().y / 2.0), g, pal.text);
-            x += w + 6.0;
+            let name = if m.model.chars().count() > 32 {
+                let mut s: String = m.model.chars().take(31).collect();
+                s.push('…');
+                s
+            } else {
+                m.model.clone()
+            };
+            let b = Badge::single(&p, Some(ICON_CPU), &name, Hue::Violet.color(pal), 11.5);
+            b.paint_at(&p, x, cy);
+            x += b.width() + 5.0;
         }
         if let Some(t) = &m.thinking {
-            let g = p.layout_no_wrap(t.clone(), theme::label_font(11.0), pal.weak);
-            paint_icon(
-                &p,
-                pos2(x + 7.0, cy),
-                Align2::CENTER_CENTER,
-                ICON_BRAIN,
-                13.0,
-                pal.weak,
-            );
-            p.galley(pos2(x + 17.0, cy - g.size().y / 2.0), g, pal.weak);
+            let b = Badge::single(&p, Some(ICON_BRAIN), t, Hue::Rose.color(pal), 11.5);
+            b.paint_at(&p, x, cy);
         }
-        let cost = p.layout_no_wrap(m.cost.clone(), theme::font(12.0), pal.text);
-        let cost_w = cost.size().x;
-        p.galley(
-            pos2(right - cost_w, cy - cost.size().y / 2.0),
-            cost,
-            pal.text,
-        );
+        let cost = Badge::single(&p, None, &m.cost, Hue::Green.color(pal), 11.5);
+        let cost_left = right - cost.width();
+        cost.paint_at(&p, cost_left, cy);
         if m.failed {
-            let g = p.layout_no_wrap(
-                "last turn failed".to_owned(),
-                theme::label_font(11.0),
-                pal.danger,
-            );
-            p.galley(
-                pos2(right - cost_w - 10.0 - g.size().x, cy - g.size().y / 2.0),
-                g,
-                pal.danger,
-            );
+            let fail = Badge::single(&p, None, "last turn failed", pal.danger, 11.5);
+            fail.paint_at(&p, cost_left - 5.0 - fail.width(), cy);
         }
         y += ROW_MODEL;
 
@@ -943,16 +923,23 @@ fn paint_card(
                 p.galley(pos2(bar.right() + 8.0, cy - g.size().y / 2.0), g, pal.weak);
             }
         }
-        let toks = p.layout_no_wrap(
-            format!("↑{}  ↓{}", m.input, m.output),
-            theme::label_font(11.5),
-            pal.weak,
+        let out = Badge::new(
+            &p,
+            None,
+            &[("↓", pal.weak), (&m.output, Hue::Teal.color(pal))],
+            Hue::Teal.color(pal),
+            11.0,
         );
-        p.galley(
-            pos2(right - toks.size().x, cy - toks.size().y / 2.0),
-            toks,
-            pal.weak,
+        let inp = Badge::new(
+            &p,
+            None,
+            &[("↑", pal.weak), (&m.input, Hue::Blue.color(pal))],
+            Hue::Blue.color(pal),
+            11.0,
         );
+        let out_left = right - out.width();
+        out.paint_at(&p, out_left, cy);
+        inp.paint_at(&p, out_left - 5.0 - inp.width(), cy);
         y += ROW_CTX;
     }
 

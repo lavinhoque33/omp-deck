@@ -27,7 +27,7 @@ use crate::frontend::{
 use crate::graphics::{Graphics, ImageReplay};
 use crate::input::{KeyRules, Mods};
 use crate::out::{PtyOut, Sink, WriteProgress, register_detaching};
-use crate::remote::{self, Feeder, Remote};
+use crate::remote::{self, Feeder, Remote, ScrollKeep};
 use crate::scan::{KeyModes, OutputScan};
 use crate::theme::{self, Palette, TermTheme};
 use crate::wake::{Wake, WakeCallback};
@@ -278,6 +278,7 @@ struct Parts {
     wake: Wake,
     /// The owner of its output (publishes to subscribers).
     serve: bool,
+    scroll_keep: Arc<ScrollKeep>,
 }
 
 impl Parts {
@@ -329,6 +330,7 @@ impl Parts {
             graphics.clone(),
             serve.then(ImageReplay::default),
         );
+        let scroll_keep = Arc::<ScrollKeep>::default();
         let engine = Engine::new(
             term.clone(),
             config,
@@ -336,6 +338,7 @@ impl Parts {
             scan,
             serve,
             window_size,
+            scroll_keep.clone(),
         );
         Parts {
             term,
@@ -351,6 +354,7 @@ impl Parts {
             window_size,
             wake,
             serve,
+            scroll_keep,
         }
     }
 
@@ -382,6 +386,7 @@ impl Parts {
             palette: Palette::for_theme(opts.theme),
             tmux_client,
             key_modes: self.key_modes,
+            scroll_keep: self.scroll_keep,
             title: None,
             exit_code: None,
             exit_reported: false,
@@ -422,6 +427,8 @@ pub struct Terminal {
     tmux_client: bool,
     /// Keyboard modes requested by the child that `TermMode` lacks (set by the output thread).
     key_modes: Arc<KeyModes>,
+    /// Holds a scrolled-back view across the redraw an app answers a resize with.
+    pub(crate) scroll_keep: Arc<ScrollKeep>,
     title: Option<String>,
     exit_code: Option<i32>,
     exit_reported: bool,

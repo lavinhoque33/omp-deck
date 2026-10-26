@@ -25,6 +25,7 @@ use deck_host::snapshot::{self, SideScanner};
 
 use crate::core::{Listener, SharedTerm};
 use crate::frontend::FrontendState;
+use crate::remote::ScrollKeep;
 use crate::scan::{GroundTracker, OutputScan};
 
 /// Called after an event was queued for a subscription. It runs on the output thread (possibly
@@ -98,6 +99,8 @@ pub(crate) struct Engine {
     /// Config of the fresh `Term` a remote snapshot starts from.
     config: Config,
     listener: Listener,
+    /// Holds a scrolled-back view across the redraw an app answers a resize with.
+    keep: Arc<ScrollKeep>,
     inner: Mutex<Inner>,
 }
 
@@ -160,6 +163,7 @@ impl Engine {
         scan: OutputScan,
         serve: bool,
         size: WindowSize,
+        keep: Arc<ScrollKeep>,
     ) -> Arc<Engine> {
         let serve = serve.then(|| Serve {
             side: SideScanner::new(size.num_lines),
@@ -176,6 +180,7 @@ impl Engine {
             term,
             config,
             listener,
+            keep,
             inner: Mutex::new(Inner {
                 parser: Processor::new(),
                 scan,
@@ -223,7 +228,11 @@ impl Engine {
 
     /// Parses into the `Term`, scans, and (owner) tracks side state and publishes.
     fn parse(&self, inner: &mut Inner, bytes: &[u8], publish: bool) {
-        inner.parser.advance(&mut *self.term.lock(), bytes);
+        {
+            let mut term = self.term.lock();
+            inner.parser.advance(&mut *term, bytes);
+            self.keep.pin(&mut *term);
+        }
         inner.scan.feed(bytes);
         if let Some(s) = &mut inner.serve {
             s.side.advance(bytes);
@@ -265,7 +274,11 @@ impl Engine {
             .sync_timeout()
             .is_some_and(|at| at <= Instant::now())
         {
-            inner.parser.stop_sync(&mut *self.term.lock());
+            {
+                let mut term = self.term.lock();
+                inner.parser.stop_sync(&mut *term);
+                self.keep.pin(&mut *term);
+            }
             self.listener.send_event(Event::Wakeup);
             self.join_if_ready(&mut inner);
         }
@@ -310,6 +323,7 @@ impl Engine {
             let mut term = self.term.lock();
             let changed = term.columns() != cols || term.screen_lines() != rows;
             if changed {
+                self.keep.arm(term.grid().display_offset());
                 term.resize(TermSize::new(cols, rows));
             }
             changed

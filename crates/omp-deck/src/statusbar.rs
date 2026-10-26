@@ -22,9 +22,12 @@ use egui::{
 };
 
 use crate::agent_model::Counts;
+use crate::badge::{Badge, Hue};
+use crate::cost_tip::{self, CostTip};
 use crate::ctx_tip::{self, CtxTip};
-use crate::usage_state::Summary;
+use crate::usage_state::{Chip, PillKind, QuotaPill, Summary};
 use crate::usage_view;
+use deck_core::usage::LimitStatus;
 
 use crate::model_picker::{self, ModelsCache, PickerAction, PickerInput, PickerState};
 use crate::theme::{self, Palette};
@@ -109,7 +112,7 @@ pub struct BarView {
     pub tokens_tip: String,
     pub show_tokens: bool,
     pub cost: String,
-    pub cost_tip: String,
+    pub cost_tip: CostTip,
     pub show_cost: bool,
     pub last_turn_failed: bool,
     pub has_reply: bool,
@@ -298,10 +301,7 @@ impl BarView {
         self.show_cost = st.cost > 0.0;
         self.last_turn_failed = st.last_turn_failed;
         self.has_reply = st.last_assistant_text.is_some();
-        self.cost_tip = format!(
-            "Session cost ${:.4}\nSum of every assistant reply and side-model call in this session file",
-            st.cost
-        );
+        self.cost_tip = CostTip::build(st.cost, &st.cost_detail);
     }
 
     /// Selector + level the dropdown highlights.
@@ -706,20 +706,15 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
             chip(ui, "cost", Sense::hover(), |ui| {
                 ui.label(RichText::new(&v.cost).size(14.4).color(pal.ok));
             })
-            .on_hover_text(&v.cost_tip);
+            .on_hover_ui(|ui| cost_tip::show(ui, &v.cost_tip));
         }
         Seg::Usage => {
             if let Some(u) = &v.usage
                 && let Some(c) = &u.chip
             {
                 divider(ui);
-                let color = match c.status {
-                    deck_core::usage::LimitStatus::Ok => pal.text,
-                    s => usage_view::status_color(pal, s),
-                };
                 let r = chip(ui, "usage", Sense::click(), |ui| {
-                    ui.label(icon_text(ICON_GAUGE, 15.6, pal.weak));
-                    ui.add(text(&c.text, 14.4, color));
+                    usage_chip_content(ui, pal, v, u, c);
                 });
                 let r = r
                     .on_hover_cursor(CursorIcon::PointingHand)
@@ -730,6 +725,59 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
             }
         }
     }
+}
+
+/// The usage chip's content: the selected model's provider quota as one pill per window (5 h,
+/// weekly), each in its own colour; a provider without a measurable window falls back to the
+/// tightest quota overall, named so it is not mistaken for the selected provider's.
+fn usage_chip_content(ui: &mut Ui, pal: &Palette, v: &BarView, u: &Summary, c: &Chip) {
+    ui.label(icon_text(ICON_GAUGE, 15.6, pal.weak));
+    let quota = v
+        .model_selector
+        .as_deref()
+        .and_then(|s| s.split_once('/'))
+        .and_then(|(provider, _)| u.quota_of(provider));
+    if let Some(q) = quota {
+        for p in &q.pills {
+            quota_pill(ui, pal, p);
+        }
+        return;
+    }
+    let tint = match c.status {
+        LimitStatus::Ok => Hue::Teal.color(pal),
+        s => usage_view::status_color(pal, s),
+    };
+    let who = c.tight.split(" · ").next().unwrap_or_default();
+    let parts: &[(&str, Color32)] = if who.is_empty() {
+        &[(&c.text, tint)]
+    } else {
+        &[(who, pal.weak), (&c.text, tint)]
+    };
+    Badge::new(ui.painter(), None, parts, tint, 13.0).show(ui);
+}
+
+/// `5h 63% left`: the window tag in the window's hue, the figure strong; a warning or exhausted
+/// window turns the whole pill amber or red.
+fn quota_pill(ui: &mut Ui, pal: &Palette, p: &QuotaPill) {
+    let hue = match p.kind {
+        PillKind::FiveHour => Hue::Blue,
+        PillKind::Weekly => Hue::Violet,
+        PillKind::Other => Hue::Teal,
+    }
+    .color(pal);
+    let (tint, figure) = match p.status {
+        LimitStatus::Warning => (pal.warn, pal.warn),
+        LimitStatus::Exhausted => (pal.danger, pal.danger),
+        _ => (hue, pal.text_strong),
+    };
+    Badge::new(
+        ui.painter(),
+        None,
+        &[(&p.tag, tint), (&p.text, figure)],
+        tint,
+        13.0,
+    )
+    .show(ui);
 }
 
 fn text(s: &str, size: f32, color: Color32) -> egui::Label {
@@ -1424,6 +1472,7 @@ mod tests {
             thinking: vec!["low".into(), "high".into()],
             cost_input: Some(5.0),
             cost_output: Some(25.0),
+            ..Default::default()
         }]));
         c
     }

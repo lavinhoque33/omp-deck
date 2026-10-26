@@ -18,7 +18,9 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Align2, Color32, CursorIcon, FontFamily, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 
 use crate::agent_ctl::{self, CtlView};
-use crate::agent_model::{self, AgentsView, CardView, status_label};
+use crate::agent_model::{self, AgentsView, CardView, MetricKind, status_label};
+use crate::badge::{Badge, Hue};
+use crate::icons::ICON_CPU;
 use crate::theme::{self, Palette};
 use crate::widgets::{Spin, paint_icon};
 
@@ -385,27 +387,20 @@ fn card(
     let id_g = p.layout_no_wrap(a.id.clone(), crate::theme::font(13.5), pal.text_strong);
     let id_w = id_g.size().x;
     // Model chip on the right (dropped when it would crowd the id).
-    let model_g = (!c.short_model.is_empty())
-        .then(|| p.layout_no_wrap(c.short_model.clone(), crate::theme::font(11.0), pal.weak));
+    let model_badge = (!c.short_model.is_empty()).then(|| {
+        Badge::single(
+            &p,
+            Some(ICON_CPU),
+            &c.short_model,
+            Hue::Violet.color(pal),
+            11.0,
+        )
+    });
     let mut limit = right;
-    if let Some(g) = &model_g
-        && x + id_w + 24.0 + g.size().x + 14.0 < right
+    if let Some(b) = &model_badge
+        && x + id_w + 24.0 + b.width() < right
     {
-        let r = Rect::from_min_size(
-            pos2(right - g.size().x - 14.0, mid - 9.0),
-            vec2(g.size().x + 14.0, 18.0),
-        );
-        p.rect_filled(
-            r,
-            9,
-            pal.raised
-                .gamma_multiply(if theme::flat() { 1.0 } else { 0.8 }),
-        );
-        p.galley(
-            pos2(r.left() + 7.0, mid - g.size().y / 2.0),
-            g.clone(),
-            pal.weak,
-        );
+        let r = b.paint_at(&p, right - b.width(), mid);
         limit = r.left() - 6.0;
     }
     let id_galley = if x + id_w > limit {
@@ -587,13 +582,23 @@ fn card(
         }
         rx = r.left() - 10.0;
     }
-    let mut job =
-        LayoutJob::simple_singleline(c.metrics.clone(), crate::theme::font(11.5), pal.weak);
-    job.wrap.max_width = (rx - left).max(30.0);
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    let g = p.layout_job(job);
-    p.galley(pos2(left, my - g.size().y / 2.0), g, pal.weak);
+    // One badge per metric, each in its own hue; the ones that do not fit are dropped.
+    let mut bx = left;
+    for m in &c.metrics {
+        let hue = match m.kind {
+            MetricKind::Cost => Hue::Green,
+            MetricKind::Time => Hue::Amber,
+            MetricKind::Requests => Hue::Blue,
+            MetricKind::Tools => Hue::Orange,
+            MetricKind::Tokens => Hue::Teal,
+        };
+        let b = Badge::single(&p, None, &m.text, hue.color(pal), 11.0);
+        if bx + b.width() > rx - 4.0 {
+            break;
+        }
+        b.paint_at(&p, bx, my);
+        bx += b.width() + 5.0;
+    }
 
     if act.is_some() {
         resp.context_menu(|ui| {

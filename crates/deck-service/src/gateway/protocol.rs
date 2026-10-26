@@ -429,8 +429,9 @@ pub enum TopicValue {
     Running(RunningSnapshot),
     Controllers(Vec<ControllerInfo>),
     Notifications(InboxView),
-    /// The status of the focused client's active session.
-    Status(Option<(SessionTarget, SessionStatus)>),
+    /// The status of the focused client's active session (boxed: it carries the full
+    /// [`SessionStats`] with the per-source cost detail).
+    Status(Box<Option<(SessionTarget, SessionStatus)>>),
     Usage(UsageView),
     AppUpdate(AppUpdateView),
     Drive(DriveView),

@@ -428,6 +428,9 @@ pub struct CardWindow {
     pub label: String,
     /// `5h`, `7d`, `mo`… only when another window of the card has the same label.
     pub window_tag: Option<String>,
+    /// Length of the window (`durationMs`, else parsed from an id like `5h`/`7d`); `None` when
+    /// omp reports neither.
+    pub window_ms: Option<i64>,
     /// Used fraction, mean across accounts; `None` when no limit reports one.
     pub fraction: Option<f64>,
     pub status: LimitStatus,
@@ -626,6 +629,23 @@ fn window_tag(w: &UsageWindow) -> String {
     }
 }
 
+/// Length of a limit window: omp's `durationMs`, else read from an id such as `5h`, `7d`, `1w`.
+fn window_length_ms(w: &UsageWindow) -> Option<i64> {
+    if let Some(ms) = w.duration_ms.filter(|d| *d > 0) {
+        return Some(ms);
+    }
+    let id = w.id.trim().to_lowercase();
+    let (num, unit) = id.split_at(id.find(|c: char| !c.is_ascii_digit())?);
+    let n: i64 = num.parse().ok().filter(|n| *n > 0)?;
+    let unit_ms = match unit {
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 604_800_000,
+        _ => return None,
+    };
+    Some(n * unit_ms)
+}
+
 /// `12.3 usd used` / `5 credits left` for windows without a fraction (omp's `C0e`, simplified).
 fn used_text(limits: &[&UsageLimit]) -> Option<String> {
     let first = limits.first()?;
@@ -766,6 +786,9 @@ fn build_card(
             let statuses: Vec<LimitStatus> = g.limits.iter().map(|l| effective_status(l)).collect();
             CardWindow {
                 window_tag: fullest.and_then(|l| l.window.as_ref()).map(window_tag),
+                window_ms: fullest
+                    .and_then(|l| l.window.as_ref())
+                    .and_then(window_length_ms),
                 fraction,
                 status: combine_status(&statuses),
                 resets_in_ms,
@@ -1219,7 +1242,7 @@ fn is_wal_mode(db: &Path) -> bool {
 /// - WAL database whose sidecars are missing: `immutable=1` (no locking, no `-wal`/`-shm` creation;
 ///   there is nothing beyond the main file to see);
 /// - rollback-journal database: `mode=ro` (a hot journal is never rolled back or deleted).
-fn open_stats_readonly(db: &Path) -> rusqlite::Result<Connection> {
+pub(crate) fn open_stats_readonly(db: &Path) -> rusqlite::Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -1716,6 +1739,25 @@ mod tests {
             Some(3_600_000),
             "reset of the fullest account"
         );
+    }
+
+    #[test]
+    fn window_length_comes_from_duration_else_from_the_id() {
+        let w = |id: &str, ms: Option<i64>| UsageWindow {
+            id: id.into(),
+            duration_ms: ms,
+            ..UsageWindow::default()
+        };
+        assert_eq!(
+            window_length_ms(&w("x", Some(18_000_000))),
+            Some(18_000_000)
+        );
+        assert_eq!(window_length_ms(&w("5h", None)), Some(5 * 3_600_000));
+        assert_eq!(window_length_ms(&w("7D", None)), Some(7 * MS_DAY));
+        assert_eq!(window_length_ms(&w("1w", Some(0))), Some(7 * MS_DAY));
+        for id in ["", "h", "5", "0h", "5x", "primary"] {
+            assert_eq!(window_length_ms(&w(id, None)), None, "{id:?}");
+        }
     }
 
     #[test]

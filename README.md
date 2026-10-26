@@ -28,8 +28,14 @@ host), so closing a tab or the whole app leaves omp running.
   model picker and actions (handoff, compact, fork, rename, plan, retry, stop, export). Hovering the
   context meter shows omp's `/context` breakdown (system prompt, tools, skills, messages, free space,
   auto-compact buffer, per-tool schema sizes) for tabs running with live control.
+  The model picker shows IQ, output tokens/sec, context size and token rates where available.
+  Hover a model for output limits, cache-read pricing, input modalities, reasoning support and
+  speed measurement details. Locally measured speed takes precedence over catalog estimates (`~`).
+  Hover the session cost for recorded input/output/cache costs and token counts, split between
+  assistant replies and side-model calls; older records without itemized costs are marked partial.
 - **Usage**: omp's `/usage` as a native view (Ctrl+Shift+U or the status-bar usage chip): remaining quota
   per provider and window with reset times, a year of activity as a heatmap, and top models by cost.
+  The chip itself shows the selected model's provider: its 5-hour and weekly quota as two colored pills.
 - **Session manager** (Ctrl+Shift+S, the ⋯ menu, the sidebar button or a project's "Manage sessions…"): every
   omp session on the machine, including empty ones the sidebar hides, in a sortable table with its disk size
   (session file plus attachments and subagent transcripts, i.e. what deleting it frees), prompts and turns, tokens,
@@ -45,7 +51,10 @@ host), so closing a tab or the whole app leaves omp running.
 - **Split view**: show two to four tabs side by side, stacked or in a grid (tab or sidebar menu "Open in split
   right / down", or the command palette); each pane is a full terminal, Ctrl+Alt+Arrow moves between panes, and
   the status bar follows the focused pane. The layout is restored on the next start.
-- **Session tree**: browse the session tree, fork or navigate from a node.
+- **Session tree**: browse the session tree, fork or navigate from a node. Each entry shows its
+  recorded cumulative cost **before** that entry, across all branches (compaction does not reset it).
+  Missing or unreadable earlier usage is marked with `≥`; hover for a higher-precision subtotal
+  and scope details. Unrecorded live subagent spend is not included.
 - **omp updates and settings**: update check badge, update actions, and a searchable editor for every `omp config` key.
 - **Google Drive backup**: sign in with Google and back up your omp config (settings, models,
   custom agents, skills, …) and prompt history to a private Drive app folder, automatically when it

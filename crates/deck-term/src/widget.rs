@@ -468,6 +468,7 @@ impl<'a> TerminalView<'a> {
 
 fn after_input(term: &mut Terminal) {
     term.view.blink_epoch = Some(Instant::now());
+    term.scroll_keep.cancel();
     let mut t = term.term.lock();
     if t.grid().display_offset() != 0 {
         t.scroll_display(Scroll::Bottom);
@@ -897,8 +898,10 @@ fn handle_pointer(
                         let mut t = term.term.lock();
                         // Drag past the edges scrolls the local scrollback.
                         if pos.y < rect.top() {
+                            term.scroll_keep.cancel();
                             t.scroll_display(Scroll::Delta(1));
                         } else if pos.y > rect.bottom() {
+                            term.scroll_keep.cancel();
                             t.scroll_display(Scroll::Delta(-1));
                         }
                         let point = viewport_to_point(
@@ -971,6 +974,7 @@ fn handle_pointer(
                     term.write(&input::encode_alt_scroll(steps * per, mode));
                 } else {
                     let per = if notch { 3 } else { 1 };
+                    term.scroll_keep.cancel();
                     term.term.lock().scroll_display(Scroll::Delta(steps * per));
                 }
             }

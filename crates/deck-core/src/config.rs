@@ -57,7 +57,9 @@ pub fn parse_config(bytes: &[u8]) -> Result<AppConfig, serde_json::Error> {
             map.insert("style_rev".into(), STYLE_REV.into());
         }
     }
-    serde_json::from_value(value)
+    let mut cfg: AppConfig = serde_json::from_value(value)?;
+    cfg.plain_folder_paths();
+    Ok(cfg)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -545,6 +547,44 @@ impl AppConfig {
         self.recent_folders.insert(0, dir);
         self.recent_folders.truncate(MAX_RECENT_FOLDERS);
     }
+
+    /// Older versions stored folders picked or typed on Windows in the verbatim form
+    /// (`\\?\C:\x`, from `canonicalize`): it matches no session cwd and displays malformed. The
+    /// same goes for the cwd of a tab started in such a folder. Rewrites them to the plain form;
+    /// where both forms exist the plain entry wins.
+    fn plain_folder_paths(&mut self) {
+        use crate::platform::strip_verbatim;
+        self.folder_scope = self.folder_scope.take().map(strip_verbatim);
+        let mut recent: Vec<PathBuf> = Vec::with_capacity(self.recent_folders.len());
+        for dir in std::mem::take(&mut self.recent_folders) {
+            let dir = strip_verbatim(dir);
+            if !recent.contains(&dir) {
+                recent.push(dir);
+            }
+        }
+        self.recent_folders = recent;
+        let mut tabs = BTreeMap::new();
+        let mut converted = Vec::new();
+        for (dir, folder) in std::mem::take(&mut self.folder_tabs) {
+            let plain = strip_verbatim(dir.clone());
+            if plain == dir {
+                tabs.insert(dir, folder);
+            } else {
+                converted.push((plain, folder));
+            }
+        }
+        for (dir, folder) in converted {
+            tabs.entry(dir).or_insert(folder);
+        }
+        fn plain_tab(tab: &mut TabState) {
+            tab.cwd = strip_verbatim(std::mem::take(&mut tab.cwd));
+        }
+        self.open_tabs.iter_mut().for_each(plain_tab);
+        for folder in tabs.values_mut() {
+            folder.open_tabs.iter_mut().for_each(plain_tab);
+        }
+        self.folder_tabs = tabs;
+    }
 }
 
 #[cfg(test)]
@@ -722,6 +762,29 @@ mod tests {
         assert_eq!(cfg.favorite_models, vec!["b/y"]);
         assert!(cfg.toggle_favorite("a/x"));
         assert_eq!(cfg.favorite_models, vec!["b/y", "a/x"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_folder_paths_from_old_versions_are_stored_plain() {
+        let json = r#"{
+            "open_tabs": [{"session_name": "a", "cwd": "\\\\?\\E:\\p\\x", "session_path": null, "title": ""}],
+            "folder_scope": "\\\\?\\E:\\p",
+            "recent_folders": ["\\\\?\\E:\\p\\x", "E:\\p\\x", "\\\\?\\UNC\\srv\\share\\y"],
+            "folder_tabs": {
+                "\\\\?\\E:\\p": {"open_tabs": [{"session_name": "b", "cwd": "\\\\?\\E:\\p", "session_path": null, "title": ""}], "active_tab": 3},
+                "E:\\p": {"open_tabs": [], "active_tab": 1}
+            }
+        }"#;
+        let cfg = parse_config(json.as_bytes()).expect("parse");
+        assert_eq!(cfg.open_tabs[0].cwd, PathBuf::from(r"E:\p\x"));
+        assert_eq!(cfg.folder_scope, Some(PathBuf::from(r"E:\p")));
+        assert_eq!(
+            cfg.recent_folders,
+            [PathBuf::from(r"E:\p\x"), PathBuf::from(r"\\srv\share\y")]
+        );
+        assert_eq!(cfg.folder_tabs.len(), 1);
+        assert_eq!(cfg.folder_tabs[Path::new(r"E:\p")].active_tab, Some(1));
     }
 
     #[test]

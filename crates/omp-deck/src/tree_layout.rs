@@ -501,6 +501,7 @@ mod tests {
                     has_text: *has_text,
                     stop_reason: None,
                     active_leaf: None,
+                    cost_before: Default::default(),
                 })
             })
             .collect();

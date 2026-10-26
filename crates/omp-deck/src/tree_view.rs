@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use crate::icons::Icon;
 use crate::icons::{
-    ICON_ALIGN_LEFT, ICON_ARROW_RIGHT, ICON_BOOKMARK, ICON_COPY, ICON_CORNER_DOWN_RIGHT,
-    ICON_CROSSHAIR, ICON_FOLD_VERTICAL, ICON_GIT_FORK, ICON_KEY_ROUND, ICON_LIST_TREE,
-    ICON_SCROLL_TEXT, ICON_SPARKLES, ICON_USER, ICON_WRENCH, ICON_X,
+    ICON_ALIGN_LEFT, ICON_ARROW_RIGHT, ICON_BOOKMARK, ICON_COINS, ICON_COPY,
+    ICON_CORNER_DOWN_RIGHT, ICON_CROSSHAIR, ICON_FOLD_VERTICAL, ICON_GIT_FORK, ICON_KEY_ROUND,
+    ICON_LIST_TREE, ICON_SCROLL_TEXT, ICON_SPARKLES, ICON_USER, ICON_WRENCH, ICON_X,
 };
-use deck_core::tree::{NodeKind, SessionTree};
+use deck_core::tree::{NodeKind, RecordedCost, SessionTree};
 use egui::Galley;
 use egui::epaint::CubicBezierShape;
 use egui::text::{LayoutJob, TextFormat};
@@ -21,6 +21,7 @@ use egui::{
     Pos2, Rect, RichText, Sense, Sides, Stroke, StrokeKind, TextEdit, Ui, pos2, vec2,
 };
 
+use crate::badge::{Badge, Hue};
 use crate::theme::{self, Palette};
 use crate::tree_layout::{self, Filter, Layout, Row, RowClass};
 use crate::widgets::{empty_state, menu_item, paint_icon};
@@ -1215,6 +1216,34 @@ fn row_tip(ui: &mut Ui, tree: &SessionTree, row: &Row, now: i64) {
     if let Some(l) = tree.labels.get(&n.id) {
         ui.label(RichText::new(format!("label: {l}")).color(pal.warn));
     }
+    ui.horizontal(|ui| {
+        let hue = if n.cost_before.incomplete {
+            Hue::Amber
+        } else {
+            Hue::Green
+        }
+        .color(pal);
+        let amount = format!(
+            "{}${:.6}",
+            if n.cost_before.incomplete { "≥" } else { "" },
+            n.cost_before.total
+        );
+        Badge::new(
+            ui.painter(),
+            Some(ICON_COINS),
+            &[("cost before entry", pal.weak), (&amount, hue)],
+            hue,
+            11.5,
+        )
+        .show(ui);
+    });
+    ui.weak("Journal order across all branches; excludes this entry and unrecorded live subagent spend.");
+    if n.cost_before.incomplete {
+        ui.colored_label(
+            pal.warn,
+            "Some earlier usage could not be read or priced; this is the known subtotal.",
+        );
+    }
     if let Some(ts) = row.ts {
         ui.weak(format!(
             "{} · {} ago",
@@ -1490,7 +1519,26 @@ fn paint_content(
         };
         p.layout_job(text_job(shown, font, color, pal, &spans, max_w))
     });
-    p.galley(pos2(text_left, cy - g.size().y / 2.0), g, color);
+    p.galley(pos2(text_left, cy - 8.0 - g.size().y / 2.0), g, color);
+
+    // Recorded cost before this entry: its own badge (amber with `≥` when incomplete).
+    let hue = tone(
+        if node.cost_before.incomplete {
+            Hue::Amber
+        } else {
+            Hue::Green
+        }
+        .color(pal),
+    );
+    let amount = cost_amount(node.cost_before);
+    Badge::new(
+        p,
+        Some(ICON_COINS),
+        &[("before", tone(pal.weak)), (&amount, hue)],
+        hue,
+        10.5,
+    )
+    .paint_at(p, text_left, cy + 10.0);
 
     // Age, or the hover actions in its place.
     if cx.show_actions {
@@ -1507,6 +1555,15 @@ fn paint_content(
         );
     }
     None
+}
+
+/// `$1.23`, or `≥$1.23` when some earlier usage could not be priced.
+fn cost_amount(cost: RecordedCost) -> String {
+    format!(
+        "{}{}",
+        if cost.incomplete { "≥" } else { "" },
+        deck_service::statusfmt::fmt_cost(cost.total),
+    )
 }
 
 fn clip(s: &str, max: usize) -> String {

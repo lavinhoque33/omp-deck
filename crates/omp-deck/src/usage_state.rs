@@ -5,13 +5,14 @@
 //! The gateway owns the fetch schedule (see `app/usage.rs` for the window's side); this module is
 //! pure state.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use deck_core::usage::{
-    Activity, Heatmap, LimitStatus, ProviderCard, UnavailableAccount, UsageLimit, UsageReport,
-    UsageSnapshot, format_remaining, limit_fraction, provider_cards, provider_display_name,
-    tightest,
+    Activity, CardWindow, Heatmap, LimitStatus, ProviderCard, UnavailableAccount, UsageLimit,
+    UsageReport, UsageSnapshot, format_remaining, limit_fraction, provider_cards,
+    provider_display_name, tightest,
 };
 use deck_service::gateway::protocol::UsageView;
 
@@ -38,6 +39,99 @@ pub struct Chip {
     pub status: LimitStatus,
     /// `Anthropic · Claude 7 Day` for the hover header; empty without a tightest window.
     pub tight: String,
+}
+
+/// Which window a chip pill stands for; the chip gives each its own colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PillKind {
+    FiveHour,
+    Weekly,
+    /// A provider without a 5 h / weekly window: its shortest measured windows instead.
+    Other,
+}
+
+/// One quota window as the chip paints it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuotaPill {
+    pub kind: PillKind,
+    /// `5h`, `wk`, or the window's own length (`1d`, `mo`) for [`PillKind::Other`].
+    pub tag: String,
+    /// `63% left`.
+    pub text: String,
+    pub status: LimitStatus,
+}
+
+/// The windows of one provider the chip shows: its 5-hour and its weekly quota (the fullest of
+/// each when a provider has several, such as per-model weekly limits).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderQuota {
+    /// omp's provider id (`anthropic`), as in a model selector's `provider/model`.
+    pub provider: String,
+    pub pills: Vec<QuotaPill>,
+}
+
+const HOUR_MS: i64 = 3_600_000;
+/// Window lengths counted as "5 hours" and "a week" (omp reports `durationMs` or ids like `5h`).
+const FIVE_HOUR_MS: std::ops::RangeInclusive<i64> = 9 * HOUR_MS / 2..=11 * HOUR_MS / 2;
+const WEEK_MS: std::ops::RangeInclusive<i64> = 6 * 24 * HOUR_MS..=8 * 24 * HOUR_MS;
+
+impl ProviderQuota {
+    fn build(c: &ProviderCard) -> ProviderQuota {
+        let measured: Vec<&CardWindow> =
+            c.windows.iter().filter(|w| w.fraction.is_some()).collect();
+        let fullest = |span: std::ops::RangeInclusive<i64>| {
+            measured
+                .iter()
+                .copied()
+                .filter(|w| w.window_ms.is_some_and(|m| span.contains(&m)))
+                .max_by(|a, b| {
+                    a.fraction
+                        .partial_cmp(&b.fraction)
+                        .unwrap_or(Ordering::Equal)
+                })
+        };
+        let mut pills: Vec<QuotaPill> = [
+            (fullest(FIVE_HOUR_MS), PillKind::FiveHour, "5h"),
+            (fullest(WEEK_MS), PillKind::Weekly, "wk"),
+        ]
+        .into_iter()
+        .filter_map(|(w, kind, tag)| w.map(|w| QuotaPill::of(w, kind, tag.to_owned())))
+        .collect();
+        if pills.is_empty() {
+            let mut rest = measured;
+            rest.sort_by_key(|w| w.window_ms.unwrap_or(i64::MAX));
+            pills = rest
+                .into_iter()
+                .take(2)
+                .map(|w| QuotaPill::of(w, PillKind::Other, other_tag(w)))
+                .collect();
+        }
+        ProviderQuota {
+            provider: c.provider.clone(),
+            pills,
+        }
+    }
+}
+
+impl QuotaPill {
+    fn of(w: &CardWindow, kind: PillKind, tag: String) -> QuotaPill {
+        QuotaPill {
+            kind,
+            tag,
+            text: w.fraction.map(left_text).unwrap_or_default(),
+            status: w.status,
+        }
+    }
+}
+
+/// `6h`, `1d`, `mo` from the window length, else omp's tag, else the limit's label.
+fn other_tag(w: &CardWindow) -> String {
+    match w.window_ms {
+        Some(ms) if ms < 24 * HOUR_MS => format!("{}h", (ms / HOUR_MS).max(1)),
+        Some(ms) if ms < 28 * 24 * HOUR_MS => format!("{}d", ms / (24 * HOUR_MS)),
+        Some(_) => "mo".to_owned(),
+        None => w.window_tag.clone().unwrap_or_else(|| w.label.clone()),
+    }
 }
 
 /// One row of a Details table.
@@ -177,6 +271,8 @@ pub fn chip_visible(snap: &UsageSnapshot) -> bool {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Summary {
     pub cards: Vec<CardView>,
+    /// Per provider, the quota windows the status-bar chip shows.
+    pub quotas: Vec<ProviderQuota>,
     pub chip: Option<Chip>,
     pub details: Vec<DetailBlock>,
     /// `Untouched: A · B` footnote for providers with nothing used; empty when none.
@@ -271,6 +367,7 @@ impl Summary {
             .collect();
         Summary {
             details: detail_blocks(&snap.reports, now_ms),
+            quotas: provider_cards.iter().map(ProviderQuota::build).collect(),
             cards: provider_cards
                 .iter()
                 .map(|c| CardView::build(c, snap))
@@ -280,6 +377,14 @@ impl Summary {
             orphans,
             warning: no_data_warning(snap),
         }
+    }
+
+    /// The 5 h / weekly pills of `provider` (omp's provider id); `None` when it reports no
+    /// measurable window, so the chip falls back to the tightest quota overall.
+    pub fn quota_of(&self, provider: &str) -> Option<&ProviderQuota> {
+        self.quotas
+            .iter()
+            .find(|q| q.provider == provider && !q.pills.is_empty())
     }
 }
 
@@ -692,6 +797,61 @@ mod tests {
         assert_eq!(chip.text, "19% left");
         assert_eq!(chip.tight, "Anthropic · Claude 7 Day");
         assert_eq!(chip.status, LimitStatus::Ok);
+    }
+
+    fn pills(q: &ProviderQuota) -> Vec<(PillKind, &str, &str)> {
+        q.pills
+            .iter()
+            .map(|p| (p.kind, p.tag.as_str(), p.text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn provider_quota_is_its_five_hour_then_weekly_window() {
+        let s = Summary::build(&snap(ONE), 0);
+        let q = s.quota_of("anthropic").expect("anthropic quota");
+        assert_eq!(
+            pills(q),
+            [
+                (PillKind::FiveHour, "5h", "63% left"),
+                (PillKind::Weekly, "wk", "19% left"),
+            ],
+            "the usd-only extra window has no fraction and is not a pill"
+        );
+        assert!(
+            s.quota_of("openai-codex").is_none(),
+            "an account without usage has no windows"
+        );
+        assert!(s.quota_of("nobody").is_none());
+    }
+
+    #[test]
+    fn several_weekly_limits_show_the_fullest_and_other_providers_their_shortest_windows() {
+        let s = Summary::build(
+            &snap(
+                r#"{"generatedAt":1,"reports":[
+                {"provider":"anthropic","limits":[
+                  {"id":"a","label":"Claude 7 Day","window":{"id":"7d","durationMs":604800000},"amount":{"usedFraction":0.2,"unit":"percent"}},
+                  {"id":"b","label":"Claude 7 Day (Opus)","window":{"id":"7d","durationMs":604800000},"amount":{"usedFraction":0.7,"unit":"percent"}}]},
+                {"provider":"google-gemini-cli","limits":[
+                  {"id":"c","label":"Monthly","window":{"id":"m","durationMs":2592000000},"amount":{"usedFraction":0.1,"unit":"percent"}},
+                  {"id":"d","label":"Daily","window":{"id":"d","durationMs":86400000},"amount":{"usedFraction":0.5,"unit":"percent"}},
+                  {"id":"e","label":"Unmeasured","window":{"id":"x"},"amount":{"used":3,"unit":"requests"}}]}]}"#,
+            ),
+            0,
+        );
+        assert_eq!(
+            pills(s.quota_of("anthropic").expect("anthropic")),
+            [(PillKind::Weekly, "wk", "30% left")],
+            "no 5 h window: only the weekly pill, from the fullest weekly limit"
+        );
+        assert_eq!(
+            pills(s.quota_of("google-gemini-cli").expect("gemini")),
+            [
+                (PillKind::Other, "1d", "50% left"),
+                (PillKind::Other, "mo", "90% left"),
+            ]
+        );
     }
 
     #[test]
