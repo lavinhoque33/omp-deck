@@ -2595,6 +2595,14 @@ only passed the `cargo xwin clippy` compile gate.
   removed the first time the OS starts it.
 - **AppImage.** Registration stores `$APPIMAGE --gateway …`; `AppRun --gateway` execs `usr/bin/omp-deck-gateway` (dispatch
   checked; mount lifetime under a real AppImage run is not exercised here).
+- **Install without `omp-deck-gateway` (0.15.1).** Self-updaters of 0.14.6 and older replace only the files they know
+  (`omp-deck`, `omp-deck-host`; Windows also ConPTY), so an install.sh/tarball/Windows-dir install they move to 0.15.x has
+  no gateway executable and the 0.15.0 GUI showed nothing. The gateway CLI lives in `deck_service::gateway::cli`; the
+  `omp-deck-gateway` bin and `omp-deck --gateway <command>` (dispatched first in `main`, before logging or any thread)
+  both run it. `gateway_program()` resolves `$OMP_DECK_GATEWAY_EXE` → AppImage `--gateway` → the gateway itself → its
+  sibling → the `omp-deck` app (itself or sibling) with `--gateway`; startup contexts, systemd units and Windows tasks
+  then record that program. The next self-update (0.15.x updater) installs the missing executable. Verified on Windows:
+  a dir with only `omp-deck.exe` + host served, registered `omp-deck.exe --gateway supervise`, uninstalled cleanly.
 - **GUI client.** `omp-deck` owns no controller/settings/notification/worker state: `gw.rs` (`Gw` facade, jobs as typed
   requests), `activate.rs` (`--activate <ticket>`), frontend terminals via `deck_term::Frontend`. Tab close sends
   `Mutation::Close` (view detach); kill is explicit. Drive login cancel is typed `GatewayError::Cancelled` in the protocol;

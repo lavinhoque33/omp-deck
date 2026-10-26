@@ -17,6 +17,7 @@
 //! sessions.
 
 pub mod activation;
+pub mod cli;
 pub mod client;
 pub mod desktop;
 mod engine;
@@ -36,6 +37,11 @@ use sha2::{Digest, Sha256};
 
 /// Name of the gateway executable (without the Windows `.exe`).
 pub const GATEWAY_BIN: &str = "omp-deck-gateway";
+/// Name of the app executable (without the Windows `.exe`).
+pub const APP_BIN: &str = "omp-deck";
+/// First argument that makes the app (or the AppImage's `AppRun`) run the gateway command line
+/// ([`cli::main`]) instead of the window.
+pub const GATEWAY_FLAG: &str = "--gateway";
 /// Environment override of the gateway executable (tests, sandboxes).
 pub const GATEWAY_EXE_ENV: &str = "OMP_DECK_GATEWAY_EXE";
 /// Version of this gateway build (handshakes compare it).
@@ -216,7 +222,8 @@ fn appimage() -> Option<PathBuf> {
 }
 
 /// How to run the gateway from this process: `$OMP_DECK_GATEWAY_EXE`; inside an AppImage
-/// `$APPIMAGE --gateway`; else this executable when it is the gateway, else its sibling.
+/// `$APPIMAGE --gateway`; else this executable when it is the gateway, else its sibling, else
+/// the `omp-deck` app (this executable or its sibling) with `--gateway`.
 pub fn gateway_program() -> Option<Program> {
     if let Some(p) = std::env::var_os(GATEWAY_EXE_ENV).filter(|v| !v.is_empty()) {
         return Some(Program {
@@ -227,19 +234,38 @@ pub fn gateway_program() -> Option<Program> {
     if let Some(image) = appimage() {
         return Some(Program {
             program: image,
-            args: vec!["--gateway".into()],
+            args: vec![GATEWAY_FLAG.into()],
         });
     }
-    let me = std::env::current_exe().ok()?;
+    bundle_gateway(std::env::current_exe().ok()?)
+}
+
+/// The gateway of the install `me` belongs to: `me` when it is the gateway, else its sibling
+/// gateway, else the `omp-deck` app (`me` or its sibling) with `--gateway`. An install updated by
+/// an OmpDeck that predates the gateway has no gateway executable (that updater replaced only
+/// the files it knew), so the app runs the same gateway itself.
+fn bundle_gateway(me: PathBuf) -> Option<Program> {
     let stem = me.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let program = if stem == GATEWAY_BIN {
+    if stem == GATEWAY_BIN {
+        return Some(Program {
+            program: me,
+            args: Vec::new(),
+        });
+    }
+    if let Some(program) = sibling(&me, GATEWAY_BIN) {
+        return Some(Program {
+            program,
+            args: Vec::new(),
+        });
+    }
+    let app = if stem == APP_BIN {
         me
     } else {
-        sibling(&me, GATEWAY_BIN)?
+        sibling(&me, APP_BIN)?
     };
     Some(Program {
-        program,
-        args: Vec::new(),
+        program: app,
+        args: vec![GATEWAY_FLAG.into()],
     })
 }
 
@@ -254,7 +280,7 @@ pub fn gui_program() -> Option<Program> {
     }
     let me = std::env::current_exe().ok()?;
     Some(Program {
-        program: sibling(&me, "omp-deck")?,
+        program: sibling(&me, APP_BIN)?,
         args: Vec::new(),
     })
 }
@@ -494,6 +520,38 @@ pub(crate) fn serve_args(profile: &Profile) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_install_without_the_gateway_executable_runs_the_gateway_through_the_app() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = |name: &str| {
+            dir.path()
+                .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+        };
+        for name in [APP_BIN, "omp-deck-host"] {
+            std::fs::write(exe(name), b"").expect("write");
+        }
+        let via_app = Some(Program {
+            program: exe(APP_BIN),
+            args: vec![GATEWAY_FLAG.into()],
+        });
+        // A self-update by an OmpDeck older than the gateway left only these two.
+        assert_eq!(bundle_gateway(exe(APP_BIN)), via_app);
+        assert_eq!(bundle_gateway(exe("omp-deck-host")), via_app);
+
+        // A complete install runs its gateway executable, from the app and from itself.
+        std::fs::write(exe(GATEWAY_BIN), b"").expect("write");
+        let direct = Some(Program {
+            program: exe(GATEWAY_BIN),
+            args: Vec::new(),
+        });
+        assert_eq!(bundle_gateway(exe(APP_BIN)), direct);
+        assert_eq!(bundle_gateway(exe(GATEWAY_BIN)), direct);
+
+        // Neither executable: nothing to run.
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(bundle_gateway(empty.path().join("omp-deck-host")), None);
+    }
 
     #[test]
     fn identity_is_bounded_and_depends_only_on_the_host_namespace() {

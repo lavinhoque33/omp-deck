@@ -139,6 +139,13 @@ fn report_fatal(err: &anyhow::Error) {
 }
 
 fn main() -> anyhow::Result<()> {
+    // `omp-deck --gateway <command>`: the gateway command line, used when no `omp-deck-gateway`
+    // sits next to this executable. First, before logging and any thread: the gateway sets up
+    // its own log and its `serve` forks.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some(deck_service::gateway::GATEWAY_FLAG) {
+        std::process::exit(deck_service::gateway::cli::main(args));
+    }
     init_logging();
     #[cfg(windows)]
     notify::init_process();
