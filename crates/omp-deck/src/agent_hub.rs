@@ -20,7 +20,7 @@ use egui::{Align2, Color32, CursorIcon, FontFamily, FontId, Rect, Sense, Stroke,
 use crate::agent_ctl::{self, CtlView};
 use crate::agent_model::{self, AgentsView, CardView, MetricKind, status_label};
 use crate::badge::{Badge, Hue};
-use crate::icons::ICON_CPU;
+use crate::icons::{ICON_BRAIN, ICON_CPU};
 use crate::theme::{self, Palette};
 use crate::widgets::{Spin, paint_icon};
 
@@ -387,7 +387,8 @@ fn card(
     let mut x = left + 24.0;
     let id_g = p.layout_no_wrap(a.id.clone(), crate::theme::font(13.5), pal.text_strong);
     let id_w = id_g.size().x;
-    // Model chip on the right (dropped when it would crowd the id).
+    // Model and thinking chips on the right (thinking dropped first, then the model, when they
+    // would crowd the id).
     let model_badge = (!c.short_model.is_empty()).then(|| {
         Badge::single(
             &p,
@@ -397,11 +398,27 @@ fn card(
             11.0,
         )
     });
+    let thinking_badge = (!c.thinking.is_empty()).then(|| {
+        Badge::single(
+            &p,
+            Some(ICON_BRAIN),
+            &c.thinking,
+            Hue::Rose.color(pal),
+            11.0,
+        )
+    });
+    // Model then thinking, as on the session card; thinking is dropped first when space is short.
     let mut limit = right;
     if let Some(b) = &model_badge
         && x + id_w + 24.0 + b.width() < right
     {
-        let r = b.paint_at(&p, right - b.width(), mid);
+        if let Some(t) = &thinking_badge
+            && x + id_w + 24.0 + b.width() + 6.0 + t.width() < right
+        {
+            let r = t.paint_at(&p, right - t.width(), mid);
+            limit = r.left() - 6.0;
+        }
+        let r = b.paint_at(&p, limit - b.width(), mid);
         limit = r.left() - 6.0;
     }
     let id_galley = if x + id_w > limit {

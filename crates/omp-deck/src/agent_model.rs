@@ -9,7 +9,7 @@ use deck_core::agents::{AgentStatus, AgentSummary, AgentsSnapshot};
 use deck_core::ctl::{LiveAgent, LiveSnapshot, LiveStatus};
 
 use crate::sidebar::format_age;
-use deck_service::statusfmt::fmt_tokens;
+use deck_service::statusfmt::{fmt_tokens, thinking_short};
 
 /// Age strings only change by minutes; they are refreshed at this granularity.
 const AGE_BUCKET_SECS: u64 = 15;
@@ -165,6 +165,19 @@ pub fn short_model(model: &str) -> String {
     id.split(':').next().unwrap_or(id).to_owned()
 }
 
+/// The agent's thinking level: its latest `thinking_level_change`, else the `:level` suffix of
+/// its model selector.
+pub fn agent_thinking(a: &AgentSummary) -> Option<&str> {
+    a.thinking.as_deref().or_else(|| {
+        a.model
+            .as_deref()
+            .and_then(|m| m.rsplit('/').next())
+            .and_then(|id| id.split_once(':'))
+            .map(|(_, level)| level)
+            .filter(|l| !l.is_empty())
+    })
+}
+
 /// Whitespace collapsed to single spaces, cut to `max` chars with an ellipsis.
 pub fn one_line(text: &str, max: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max + 4));
@@ -247,6 +260,8 @@ pub fn agent_age(a: &AgentSummary, now: SystemTime) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct CardView {
     pub short_model: String,
+    /// omp's short thinking level (`med`, `xhigh`); empty when unknown or `off`.
+    pub thinking: String,
     pub metrics: Vec<Metric>,
     pub age: String,
     pub gist: String,
@@ -428,6 +443,10 @@ impl AgentsView {
             .iter()
             .map(|a| CardView {
                 short_model: a.model.as_deref().map(short_model).unwrap_or_default(),
+                thinking: agent_thinking(a)
+                    .filter(|t| *t != "off")
+                    .map(|t| thinking_short(t).to_owned())
+                    .unwrap_or_default(),
                 metrics: metrics(a, now),
                 age: String::new(),
                 gist: one_line(&a.task_gist, GIST_CHARS),

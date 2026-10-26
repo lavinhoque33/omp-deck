@@ -33,7 +33,7 @@ use crate::sync_view::{self, SyncAction, SyncPage};
 use crate::theme::{self, Palette};
 use crate::update::{UpdateState, status_line};
 use crate::widgets::{
-    card, empty_state, icon_button, icon_text, paint_icon, segmented, setting_row, toggle,
+    card, empty_state, icon_button, icon_text, paint_icon, segmented, setting_row, stepper, toggle,
 };
 
 /// One page of the settings area: an OmpDeck subpage, project sync, or omp's catalog tab `i`.
@@ -852,7 +852,7 @@ fn appearance_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Se
     let pal = Palette::of_ui(ui);
     card(ui, "Appearance", |ui| {
         // The whole app zooms; the terminal row below compensates, so its size stays absolute.
-        let mut percent = (input.ui_scale * 100.0).round() as i32;
+        let percent = (input.ui_scale * 100.0).round() as i32;
         let effective = theme::body_size(input.style) * input.ui_scale;
         let effective = if (effective - effective.round()).abs() < 0.05 {
             format!("{effective:.0} pt")
@@ -866,7 +866,6 @@ fn appearance_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Se
                 "{effective} at {percent} % — menus, tabs, sidebar and dialogs; the terminal has its own size"
             ),
             |ui| {
-                ui.spacing_mut().slider_width = 120.0;
                 if ui
                     .add(
                         egui::Button::new(icon_text(crate::icons::ICON_ROTATE_CCW, 16.0, pal.text))
@@ -877,14 +876,16 @@ fn appearance_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Se
                 {
                     actions.push(SettingsAction::UiScale(1.0));
                 }
-                let slider = egui::Slider::new(
-                    &mut percent,
-                    (MIN_UI_SCALE * 100.0).round() as i32..=(MAX_UI_SCALE * 100.0).round() as i32,
-                )
-                .step_by(5.0)
-                .show_value(false);
-                if ui.add(slider).changed() {
-                    actions.push(SettingsAction::UiScale(percent as f32 / 100.0));
+                ui.add_space(6.0);
+                if let Some(p) = stepper(
+                    ui,
+                    "ui-scale",
+                    percent as f32,
+                    (MIN_UI_SCALE * 100.0, MAX_UI_SCALE * 100.0),
+                    5.0,
+                    "%",
+                ) {
+                    actions.push(SettingsAction::UiScale(p / 100.0));
                 }
             },
         );
@@ -894,7 +895,6 @@ fn appearance_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Se
             "Terminal font size",
             "Ctrl+Shift+= / - / 0 also work",
             |ui| {
-                ui.spacing_mut().slider_width = 120.0;
                 if ui
                     .add(
                         egui::Button::new(icon_text(crate::icons::ICON_ROTATE_CCW, 16.0, pal.text))
@@ -905,14 +905,15 @@ fn appearance_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Se
                 {
                     actions.push(SettingsAction::FontSize(input.font_default));
                 }
-                let mut size = input.font_size;
-                ui.label(
-                    theme::strong(format!("{:.0} pt", input.font_size)).color(pal.text_strong),
-                );
-                let slider = egui::Slider::new(&mut size, input.font_range.0..=input.font_range.1)
-                    .step_by(1.0)
-                    .show_value(false);
-                if ui.add(slider).changed() {
+                ui.add_space(6.0);
+                if let Some(size) = stepper(
+                    ui,
+                    "term-font",
+                    input.font_size,
+                    input.font_range,
+                    1.0,
+                    "pt",
+                ) {
                     actions.push(SettingsAction::FontSize(size));
                 }
             },

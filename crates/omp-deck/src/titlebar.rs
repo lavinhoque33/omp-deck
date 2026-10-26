@@ -31,7 +31,7 @@ const CORNER: f32 = 10.0;
 const CONTROL_INSET: f32 = 12.0;
 /// Width of the minimize / maximize / close cluster measured from the right window edge (three
 /// 40 px buttons, two 2 px gaps, [`CONTROL_INSET`]). The north resize edge stops short of it: the
-/// buttons are 30 px tall in the 32 px strip, so they reach into the top `EDGE` pixels.
+/// buttons are 30 px tall, centred in the [`STRIP_H`] strip, so they reach into the top `EDGE` pixels.
 const CONTROL_W: f32 = CONTROL_INSET + 3.0 * 40.0 + 2.0 * 2.0;
 
 pub struct BarInput<'a> {
@@ -91,7 +91,8 @@ pub enum BarAction {
 }
 
 /// Height of the title row (app name, active title, window buttons; client-side decorations only).
-pub const STRIP_H: f32 = 32.0;
+/// Everything in it is centred, so the extra height is equal padding above and below.
+pub const STRIP_H: f32 = 40.0;
 /// Width reserved at each end of the title row for the icon/name and the window buttons.
 const STRIP_SIDE_W: f32 = 160.0;
 

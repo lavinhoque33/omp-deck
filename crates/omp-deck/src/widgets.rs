@@ -750,3 +750,166 @@ fn paint_draft(
     let pos = egui::pos2(left + icon_w, body.center().y - galley.size().y / 2.0);
     p.galley(pos, galley, text);
 }
+
+/// How long a [`stepper`] value must stay unchanged before it is reported, so a burst of clicks
+/// (and the relayout an app-wide zoom causes) applies once instead of once per click.
+pub const STEPPER_SETTLE: f64 = 0.4;
+
+#[derive(Clone, Default)]
+struct StepperState {
+    /// Value shown but not reported yet, and when it last changed.
+    pending: Option<(f32, f64)>,
+    /// Field text while the user types.
+    text: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum StepperPart {
+    Minus,
+    Field,
+    Unit,
+    Plus,
+}
+
+/// `−` [value] unit `+` for a whole-number setting in `lo..=hi`. The buttons move to the
+/// previous / next multiple of `step`; the field takes any whole number (Enter or focus loss
+/// applies, Escape reverts; out-of-range values are clamped). Returns the new value once it has
+/// settled for [`STEPPER_SETTLE`] (typed values at once), never per click.
+pub fn stepper(
+    ui: &mut Ui,
+    id_salt: &str,
+    value: f32,
+    (lo, hi): (f32, f32),
+    step: f32,
+    unit: &str,
+) -> Option<f32> {
+    let pal = Palette::of_ui(ui);
+    let id = ui.scope_id().with(("stepper", id_salt));
+    let now = ui.input(|i| i.time);
+    let mut st: StepperState = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+    let shown = st.pending.map_or(value, |(v, _)| v);
+    // (value, apply at once)
+    let mut set: Option<(f32, bool)> = None;
+    let mut parts = [
+        StepperPart::Minus,
+        StepperPart::Field,
+        StepperPart::Unit,
+        StepperPart::Plus,
+    ];
+    // Setting rows lay their control out right to left: add in reverse visual order.
+    if ui.layout().prefer_right_to_left() {
+        parts.reverse();
+    }
+    ui.spacing_mut().item_spacing.x = 4.0;
+    for part in parts {
+        match part {
+            StepperPart::Minus | StepperPart::Plus => {
+                let up = matches!(part, StepperPart::Plus);
+                let (icon, tip, enabled) = if up {
+                    (crate::icons::ICON_PLUS, "Larger", shown < hi - 1e-3)
+                } else {
+                    (crate::icons::ICON_MINUS, "Smaller", shown > lo + 1e-3)
+                };
+                let resp = ui
+                    .add_enabled(
+                        enabled,
+                        Button::new(icon_text(icon, 15.0, pal.text)).min_size(vec2(28.0, 28.0)),
+                    )
+                    .on_hover_text(tip);
+                if resp.clicked() {
+                    set = Some((step_value(shown, step, up).clamp(lo, hi), false));
+                }
+            }
+            StepperPart::Field => {
+                let mut text = st.text.clone().unwrap_or_else(|| format!("{shown:.0}"));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut text)
+                        .desired_width(40.0)
+                        .align(Align2::CENTER_CENTER)
+                        .font(theme::font(13.5)),
+                );
+                if resp.lost_focus() {
+                    if !ui.input(|i| i.key_pressed(egui::Key::Escape))
+                        && let Some(v) = parse_whole(&text)
+                    {
+                        set = Some((v.clamp(lo, hi), true));
+                    }
+                    st.text = None;
+                } else if resp.has_focus() {
+                    st.text = Some(text);
+                }
+            }
+            StepperPart::Unit => {
+                // Fixed width, so steppers with different units line up in a column.
+                ui.add_sized(
+                    vec2(18.0, 28.0),
+                    egui::Label::new(RichText::new(unit).color(pal.weak)).selectable(false),
+                );
+            }
+        }
+    }
+    if let Some((v, at_once)) = set {
+        let at = if at_once { now - STEPPER_SETTLE } else { now };
+        st.pending = Some((v, at));
+    }
+    let mut out = None;
+    if let Some((v, at)) = st.pending {
+        let left = STEPPER_SETTLE - (now - at);
+        if left <= 0.0 {
+            st.pending = None;
+            out = ((v - value).abs() > 1e-3).then_some(v);
+        } else {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(left));
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(id, st));
+    out
+}
+
+/// The next (`up`) or previous multiple of `step` from `v`; a value already on the grid moves a
+/// whole step.
+fn step_value(v: f32, step: f32, up: bool) -> f32 {
+    let k = v / step;
+    if up {
+        ((k + 1e-3).floor() + 1.0) * step
+    } else {
+        ((k - 1e-3).ceil() - 1.0) * step
+    }
+}
+
+/// A typed number with an optional unit (`130`, `130 %`, `14pt`), rounded to a whole number.
+fn parse_whole(text: &str) -> Option<f32> {
+    text.trim()
+        .trim_end_matches(|c: char| c.is_alphabetic() || c == '%' || c.is_whitespace())
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .map(f32::round)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_whole, step_value};
+
+    #[test]
+    fn stepper_buttons_snap_to_the_step_grid() {
+        assert_eq!(step_value(130.0, 5.0, true), 135.0);
+        assert_eq!(step_value(130.0, 5.0, false), 125.0);
+        // Off-grid values (typed 133 %) go to the neighbouring multiple, not 138 / 128.
+        assert_eq!(step_value(133.0, 5.0, true), 135.0);
+        assert_eq!(step_value(133.0, 5.0, false), 130.0);
+        assert_eq!(step_value(14.0, 1.0, true), 15.0);
+        assert_eq!(step_value(14.0, 1.0, false), 13.0);
+    }
+
+    #[test]
+    fn typed_values_accept_units_and_reject_garbage() {
+        assert_eq!(parse_whole(" 130 % "), Some(130.0));
+        assert_eq!(parse_whole("14pt"), Some(14.0));
+        assert_eq!(parse_whole("12.6"), Some(13.0));
+        assert_eq!(parse_whole(""), None);
+        assert_eq!(parse_whole("abc"), None);
+        assert_eq!(parse_whole("inf"), None);
+    }
+}

@@ -408,7 +408,7 @@ fn header_rows(
             .show(ui)
             .on_hover_text(m);
         }
-        if let Some(t) = &a.thinking {
+        if let Some(t) = crate::agent_model::agent_thinking(a) {
             crate::badge::Badge::single(
                 ui.painter(),
                 Some(crate::icons::ICON_BRAIN),

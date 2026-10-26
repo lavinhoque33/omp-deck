@@ -2749,5 +2749,13 @@ styles through the palette; per-style character kept where it fits.
 - **App font size**: `AppConfig.ui_scale` (0.8–1.6, default 1.0, clamped at load and by the settings owner; row
   `UiScale`, Shared) → `ctx.set_zoom_factor`. Terminals get `font_size / zoom` so their on-screen size depends only on
   "Terminal font size". Window geometry is persisted in native logical points (zoom-independent).
-  Settings → Appearance "App font size" (pt at %, 5 % slider, reset); palette Larger/Smaller/Reset (10 % steps).
+  Settings → Appearance "App font size" + "Terminal font size" use `widgets::stepper` (− / whole-number field / unit
+  / +, no slider): buttons step to the previous/next multiple of 5 % / 1 pt, the field takes any whole number
+  (Enter or focus loss; Escape reverts; clamped); a value is reported only after `STEPPER_SETTLE` (0.4 s) without
+  further change (typed values at once), so a click burst zooms once. Palette Larger/Smaller/Reset (10 % steps).
 - **Sidebar**: session rows are one step below their project header (flat 12 vs 13 px, Neon 13 vs 14 px).
+- **Title strip** (`titlebar::STRIP_H`) is 40 px (was 32); all its content is centred, so the extra is equal top and
+  bottom padding.
+- **Subagent rows** (agents hub / dashboard accordion) show the thinking level (Rose brain badge, omp's short names)
+  right of the model chip: `agent_model::agent_thinking` = latest `thinking_level_change`, else the model selector's
+  `:level` suffix; `off` is hidden; dropped before the model chip when the row is narrow.
