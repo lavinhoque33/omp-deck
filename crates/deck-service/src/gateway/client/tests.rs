@@ -158,6 +158,7 @@ fn a_dead_owner_fails_pending_requests_and_the_next_owner_gets_the_interests_bac
     listener.remove();
     drop(listener);
     s.shutdown();
+    drop(s);
 
     let r = q.wait(TIMEOUT);
     assert!(matches!(r, Some(Err(GatewayError::Disconnected))), "{r:?}");

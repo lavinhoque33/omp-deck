@@ -293,64 +293,72 @@ impl Listener {
         owned(handle, "CreateNamedPipeW")
     }
 
-    /// Waits for a client on the listening instance, then puts up the next one.
+    /// Waits for a client on the listening instance, then puts up the next one. A client that
+    /// connects and leaves before it was accepted is skipped; after [`Listener::remove`] this
+    /// returns an error (like the Unix listener), so accept loops end.
     pub fn accept(&self) -> io::Result<Stream> {
-        let current = self
-            .listening
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let pipe = match current {
-            Some(p) => p,
-            None if self.removed.load(Ordering::Acquire) => {
-                // Removed: nothing will ever connect again; park this thread.
-                loop {
-                    std::thread::park();
-                }
-            }
-            None => {
-                let p = Arc::new(self.instance(false).map_err(io::Error::other)?);
-                *self
-                    .listening
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&p));
-                p
-            }
-        };
-        let connected = wait_connect(&pipe);
-        if let Err(e) = &connected {
-            // This instance is finished either way (its client left, or the wait failed):
-            // reset it so the handle closes cleanly; a fresh instance replaces it below.
-            log::info!("pipe client left before it was accepted: {e}");
-            // SAFETY: valid pipe handle; no I/O pending on it any more.
-            unsafe { DisconnectNamedPipe(raw(&pipe)) };
-        }
-        // The next instance is created while this one still exists, so the pipe name never
-        // disappears (clients would read that as "not running"); in the gap they see
-        // ERROR_PIPE_BUSY and wait. After `remove` no new instance is created.
-        {
-            let mut listening = self
+        loop {
+            let current = self
                 .listening
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if self.removed.load(Ordering::Acquire) {
-                *listening = None;
-            } else {
-                match self.instance(false) {
-                    Ok(next) => *listening = Some(Arc::new(next)),
-                    Err(e) => {
-                        *listening = None;
-                        log::warn!("creating the next pipe instance: {e}");
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let pipe = match current {
+                Some(p) => p,
+                None if self.removed.load(Ordering::Acquire) => return Err(removed_error()),
+                None => {
+                    let p = Arc::new(self.instance(false).map_err(io::Error::other)?);
+                    *self
+                        .listening
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&p));
+                    p
+                }
+            };
+            let connected = wait_connect(&pipe, &self.removed);
+            if let Err(e) = &connected {
+                // This instance is finished either way (its client left, the wait was
+                // cancelled by `remove`, or it failed): reset it so the handle closes cleanly;
+                // a fresh instance replaces it below.
+                log::info!("pipe client left before it was accepted: {e}");
+                // SAFETY: valid pipe handle; no I/O pending on it any more.
+                unsafe { DisconnectNamedPipe(raw(&pipe)) };
+            }
+            // The next instance is created while this one still exists, so the pipe name never
+            // disappears (clients would read that as "not running"); in the gap they see
+            // ERROR_PIPE_BUSY and wait. After `remove` no new instance is created.
+            {
+                let mut listening = self
+                    .listening
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if self.removed.load(Ordering::Acquire) {
+                    *listening = None;
+                } else {
+                    match self.instance(false) {
+                        Ok(next) => *listening = Some(Arc::new(next)),
+                        Err(e) => {
+                            *listening = None;
+                            log::warn!("creating the next pipe instance: {e}");
+                        }
                     }
                 }
             }
+            match connected {
+                Ok(()) if self.removed.load(Ordering::Acquire) => return Err(removed_error()),
+                Ok(()) => return Stream::new(pipe, true).map_err(io::Error::other),
+                Err(_) if self.removed.load(Ordering::Acquire) => return Err(removed_error()),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {}
+                Err(e) => return Err(e),
+            }
         }
-        connected?;
-        Stream::new(pipe, true).map_err(io::Error::other)
     }
 
-    /// Stops listening: the endpoint disappears once every connected instance is closed.
+    /// Stops listening: pending and later [`Listener::accept`] calls fail, and the endpoint
+    /// disappears once every connected instance is closed.
     pub fn remove(&self) {
+        // The flag is set before the pending connect is cancelled: `wait_connect` re-checks it
+        // after issuing its connect, so a connect issued after the cancel is cancelled there.
         self.removed.store(true, Ordering::Release);
         let listening = self
             .listening
@@ -365,8 +373,13 @@ impl Listener {
     }
 }
 
-/// Overlapped ConnectNamedPipe on a fresh instance, waited for.
-fn wait_connect(pipe: &OwnedHandle) -> io::Result<()> {
+fn removed_error() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "the listener was removed")
+}
+
+/// Overlapped ConnectNamedPipe on a fresh instance, waited for. Gives up (cancelled) once
+/// `removed` is set.
+fn wait_connect(pipe: &OwnedHandle, removed: &AtomicBool) -> io::Result<()> {
     let event = new_event()?;
     // SAFETY: OVERLAPPED is plain old data.
     let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
@@ -379,6 +392,12 @@ fn wait_connect(pipe: &OwnedHandle) -> io::Result<()> {
     match unsafe { GetLastError() } {
         ERROR_PIPE_CONNECTED => Ok(()),
         ERROR_IO_PENDING => {
+            // `remove` cancels the instance it took; if it ran before this connect was
+            // issued it found nothing pending, but it had already set `removed`.
+            if removed.load(Ordering::Acquire) {
+                // SAFETY: valid handle; cancels the connect issued above.
+                unsafe { CancelIoEx(raw(pipe), &ov) };
+            }
             let mut n = 0;
             // SAFETY: the pending operation's handle and OVERLAPPED; waits until it settles.
             if unsafe { GetOverlappedResult(raw(pipe), &ov, &mut n, 1) } == 0 {
@@ -570,5 +589,50 @@ impl Write for Stream {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use super::*;
+
+    /// Runs `accept` on its own thread; the result arrives on the channel (`true` = it failed),
+    /// so a hang fails the test instead of the whole run.
+    fn accept_fails(listener: &Arc<Listener>) -> mpsc::Receiver<bool> {
+        let (tx, rx) = mpsc::channel();
+        let listener = Arc::clone(listener);
+        std::thread::spawn(move || {
+            let _ = tx.send(listener.accept().is_err());
+        });
+        rx
+    }
+
+    #[test]
+    fn removing_the_listener_ends_pending_and_later_accepts() {
+        let mut nonce = [0; 4];
+        getrandom::fill(&mut nonce).unwrap();
+        let ns = Namespace::new(&format!(
+            "omp-deck-test-{}-{:08x}",
+            std::process::id(),
+            u32::from_ne_bytes(nonce)
+        ))
+        .unwrap();
+        let endpoint = Endpoint::new(&ns, "owner").unwrap();
+        let listener = Arc::new(Listener::bind(&endpoint).unwrap());
+
+        let pending = accept_fails(&listener);
+        std::thread::sleep(Duration::from_millis(200));
+        listener.remove();
+        assert!(
+            pending.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "a pending accept fails once the listener is removed"
+        );
+        let later = accept_fails(&listener);
+        assert!(
+            later.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "an accept after remove fails instead of waiting"
+        );
     }
 }

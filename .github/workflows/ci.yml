@@ -52,7 +52,10 @@ jobs:
       - name: Fetch ConPTY
         run: ./packaging/windows/fetch-conpty.ps1 -OutDir target/debug -Arch x64
 
-      - run: cargo test --workspace --no-fail-fast
+      # A hung test must fail the step with the test names (libtest warns after 60 s), not eat the job.
+      - name: Run cargo test --workspace --no-fail-fast
+        timeout-minutes: 25
+        run: cargo test --workspace --no-fail-fast
 
       # Release builds use the GUI subsystem and optimizations; run the host's process/ConPTY tests against them too.
       - name: Host tests (release build)
