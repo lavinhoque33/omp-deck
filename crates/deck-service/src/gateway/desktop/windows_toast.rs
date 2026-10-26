@@ -160,6 +160,7 @@ mod tests {
             tab: tab.clone(),
             title: "OmpDeck <test> & \"quotes\"".to_owned(),
             body: "withdrawal test".to_owned(),
+            sound: None,
         };
         let in_history = || -> bool {
             let history = ToastNotificationManager::History()

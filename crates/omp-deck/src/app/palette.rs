@@ -1010,6 +1010,15 @@ impl App {
             ICON_BELL,
             need(n.desktop, "Desktop pop-ups are off"),
         );
+        if cfg!(target_os = "linux") {
+            add(
+                "notify.sound",
+                &format!("Desktop pop-ups: {} sound", cap(on_off(n.sound))),
+                None,
+                ICON_BELL,
+                need(n.desktop, "Desktop pop-ups are off"),
+            );
+        }
         add(
             "notify.while_viewing",
             &format!(
@@ -1300,6 +1309,7 @@ impl App {
             "notify.unfocused" => self.apply_notify_action(NotifyAction::OnlyWhenUnfocused(
                 !self.cfg.notify.only_when_unfocused,
             )),
+            "notify.sound" => self.apply_notify_action(NotifyAction::Sound(!self.cfg.notify.sound)),
             "notify.while_viewing" => {
                 self.apply_notify_action(NotifyAction::WhileViewing(!self.cfg.notify.while_viewing))
             }

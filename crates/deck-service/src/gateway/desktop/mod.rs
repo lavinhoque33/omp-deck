@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::controller::SessionTarget;
+pub use crate::notifications::Sound;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -29,6 +30,8 @@ pub struct Request {
     pub tab: Option<SessionTarget>,
     pub title: String,
     pub body: String,
+    /// The sound to ask the desktop for; `None` = silent. Linux only: Windows toasts stay silent.
+    pub sound: Option<Sound>,
 }
 
 /// What the notifier thread reports back.

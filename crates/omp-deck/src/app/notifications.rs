@@ -151,6 +151,7 @@ impl App {
             NotifyAction::Exited(v) => cfg.exited = v,
             NotifyAction::OnlyWhenUnfocused(v) => cfg.only_when_unfocused = v,
             NotifyAction::WhileViewing(v) => cfg.while_viewing = v,
+            NotifyAction::Sound(v) => cfg.sound = v,
             NotifyAction::Test => {
                 self.send_test_notification();
                 return;

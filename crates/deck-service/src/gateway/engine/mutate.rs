@@ -1015,6 +1015,7 @@ impl Engine {
                     tab: None,
                     title: "OmpDeck".to_owned(),
                     body: "Desktop notifications are working.".to_owned(),
+                    sound: self.cfg.notify.sound.then_some(desktop::Sound::Test),
                 });
                 self.finish_journal(&key, Outcome::Done(Box::new(Done::Unit)));
             }

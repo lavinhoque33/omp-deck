@@ -67,7 +67,9 @@ host), so closing a tab or the whole app leaves omp running.
   brings OmpDeck forward on that tab. Desktop pop-ups by default only while the OmpDeck window is not focused.
   It also works while the window is minimized or on another desktop. omp's own notifications (bell,
   `notify-send`) are turned off inside OmpDeck, so you get one, not two. The gear in the bell's popover opens
-  Settings → OmpDeck → Notifications.
+  Settings → OmpDeck → Notifications. On Linux the desktop notification also asks the notification server for a
+  sound from your sound theme (a finished turn, attention, an error and a session end each have their own);
+  switch it off with "Play a sound".
 - **Changes panel** (Ctrl+Shift+G, or click the git chip in the status bar): the active tab's git changes,
   grouped into conflicted, staged, changed and untracked files, with a diff view, stage / unstage, discard,
   delete untracked files (both confirmed first) and copy the whole diff. Click a diff line (Shift+click for a

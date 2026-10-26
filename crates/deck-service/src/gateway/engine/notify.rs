@@ -101,10 +101,12 @@ impl Engine {
                     target,
                     title,
                     body,
+                    sound,
                 } => self.notify.notifier.show(desktop::Request {
                     tab: Some(target),
                     title,
                     body,
+                    sound,
                 }),
                 Effect::Withdraw(t) => self.notify.notifier.close(Some(t)),
                 Effect::WithdrawAll => self.notify.notifier.close_all(),

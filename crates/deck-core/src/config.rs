@@ -177,6 +177,8 @@ pub struct NotifyConfig {
     pub only_when_unfocused: bool,
     /// The in-app inbox (title-bar bell) also records events for the tab being looked at.
     pub while_viewing: bool,
+    /// Desktop pop-ups ask the notification server for a sound (Linux; Windows toasts stay silent).
+    pub sound: bool,
 }
 
 impl Default for NotifyConfig {
@@ -188,6 +190,7 @@ impl Default for NotifyConfig {
             exited: true,
             only_when_unfocused: true,
             while_viewing: true,
+            sound: true,
         }
     }
 }

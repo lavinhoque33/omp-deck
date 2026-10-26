@@ -15,6 +15,7 @@ pub enum NotifyAction {
     Exited(bool),
     OnlyWhenUnfocused(bool),
     WhileViewing(bool),
+    Sound(bool),
     /// Show a notification now.
     Test,
 }
@@ -100,6 +101,17 @@ pub fn card_ui(ui: &mut Ui, input: &NotifyInput<'_>) -> Vec<NotifyAction> {
                 cfg.only_when_unfocused,
                 NotifyAction::OnlyWhenUnfocused,
             );
+            // Windows toasts are silent by design; only the freedesktop server takes a sound name.
+            if cfg!(target_os = "linux") {
+                ui.add_space(4.0);
+                row(
+                    ui,
+                    "Play a sound",
+                    "Asks the notification server for a sound from your sound theme: complete for a finished turn, a warning for attention or an error, a message sound when the session ends",
+                    cfg.sound,
+                    NotifyAction::Sound,
+                );
+            }
         });
         ui.add_space(4.0);
         let sub = "Clicking the notification brings the tab to the front";

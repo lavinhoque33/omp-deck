@@ -2574,3 +2574,17 @@ only passed the `cargo xwin clippy` compile gate.
   readable) and WhileOpen (owner exits, tmux session survives); `install.sh` fake bundle install/reinstall/upgrade-with-owner
   (drained)/uninstall. Not exercised: desktop notification delivery and `--activate` in a GUI run (unit-tested only), host
   backend through the gateway, draft-confirm origin routing and reconnect-without-replay (unit-tested).
+
+## Desktop notification sounds (Linux)
+
+Cause of "pop-ups but no sound" (verified against Plasma 6.7 with `gdbus` + `pactl subscribe`): the notifier sent only
+`desktop-entry`; Plasma plays a sound for a freedesktop notification only when it carries `sound-name`/`sound-file`, and
+it plays none for a notification that *replaces* a still-listed one (updated in place). Fix: `NotifyConfig.sound`
+(default `true`, Settings → Notifications "Play a sound", palette "Desktop pop-ups: … sound", Linux only; Windows toasts
+stay `<audio silent>`). `notifications::Sound { Finished, Attention, Error, Ended, Test }` is chosen from the inbox
+`Kind` when the effect is produced (`Effect::Show.sound`, `desktop::Request.sound`, `None` when off) and mapped to the
+sound-theme names `complete`, `dialog-warning`, `dialog-error`, `message-new-instant`. `desktop/linux.rs`: `hints()`
+adds `sound-name` (or `suppress-sound: true` when off); a sounded notification first withdraws the session's previous
+pop-up (`close` forgets the id before asking, so the resulting `NotificationClosed` is ignored) so the new one is not a
+silent replacement. Smoke: the real `Notifier` showing Finished, Finished again, Attention, Error, Ended opened an audio
+sink-input each; the silent variants none.

@@ -13,7 +13,7 @@ use zbus::message::Type;
 use zbus::zvariant::Value;
 use zbus::{Connection, MatchRule, Message, MessageStream};
 
-use super::{Cmd, Out, Request, Signal};
+use super::{Cmd, Out, Request, Signal, Sound};
 
 const SERVICE: &str = "org.freedesktop.Notifications";
 const PATH: &str = "/org/freedesktop/Notifications";
@@ -114,10 +114,28 @@ fn unavailable(out: &Out, why: &str) {
     out.send(Signal::Unavailable(why.to_owned()));
 }
 
-async fn notify(conn: &Connection, state: &State, req: &Request) -> Result<(), String> {
-    let replaces = lock(state).by_tab.get(&req.tab).copied().unwrap_or(0);
-    let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
+/// Hints of a notification. Without a `sound-name` the server shows the pop-up silently (Plasma
+/// plays nothing for a freedesktop notification that does not ask), so a wanted sound is named
+/// from the freedesktop sound theme; a silenced one says so, for servers with their own default.
+fn hints(sound: Option<Sound>) -> HashMap<&'static str, Value<'static>> {
+    let mut hints: HashMap<&'static str, Value<'static>> = HashMap::new();
     hints.insert("desktop-entry", Value::from(DESKTOP_ENTRY));
+    match sound {
+        Some(s) => hints.insert("sound-name", Value::from(s.theme_name())),
+        None => hints.insert("suppress-sound", Value::from(true)),
+    };
+    hints
+}
+
+async fn notify(conn: &Connection, state: &State, req: &Request) -> Result<(), String> {
+    // A server plays the sound of a new notification only: one that replaces a still-listed one
+    // updates it in silence (Plasma). So a sounded notification withdraws the session's previous
+    // one first; `close` forgets the old id before asking, so its `NotificationClosed` is ignored.
+    if req.sound.is_some() {
+        close(conn, state, req.tab.clone()).await;
+    }
+    let replaces = lock(state).by_tab.get(&req.tab).copied().unwrap_or(0);
+    let hints = hints(req.sound);
     let body = (
         APP_NAME,
         replaces,
@@ -260,6 +278,7 @@ mod tests {
             tab,
             title: String::new(),
             body: body.to_owned(),
+            sound: None,
         })
     }
 
@@ -281,5 +300,16 @@ mod tests {
             })
             .collect();
         assert_eq!(bodies, ["test", "close", "new", "other"]);
+    }
+
+    #[test]
+    fn a_wanted_sound_is_named_and_a_silenced_one_suppressed() {
+        let loud = hints(Some(Sound::Finished));
+        assert_eq!(loud.get("sound-name"), Some(&Value::from("complete")));
+        assert!(!loud.contains_key("suppress-sound"));
+        let quiet = hints(None);
+        assert_eq!(quiet.get("suppress-sound"), Some(&Value::from(true)));
+        assert!(!quiet.contains_key("sound-name"));
+        assert_eq!(quiet.get("desktop-entry"), Some(&Value::from("omp-deck")));
     }
 }

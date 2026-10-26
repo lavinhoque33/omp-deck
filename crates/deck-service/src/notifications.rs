@@ -53,6 +53,39 @@ pub struct Observation<'a> {
     pub visible: bool,
 }
 
+/// Which sound a desktop pop-up asks for: a name of the freedesktop sound theme, so the user's
+/// theme and volume decide how it plays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sound {
+    Finished,
+    Attention,
+    Error,
+    Ended,
+    /// The settings' sample notification.
+    Test,
+}
+
+impl Sound {
+    pub fn of(kind: &Kind) -> Sound {
+        match kind {
+            Kind::Finished => Sound::Finished,
+            Kind::Attention => Sound::Attention,
+            Kind::Error(_) => Sound::Error,
+            Kind::Exited { .. } => Sound::Ended,
+        }
+    }
+
+    /// The freedesktop sound-theme name (`sound-name` hint).
+    pub fn theme_name(self) -> &'static str {
+        match self {
+            Sound::Finished => "complete",
+            Sound::Attention => "dialog-warning",
+            Sound::Error => "dialog-error",
+            Sound::Ended | Sound::Test => "message-new-instant",
+        }
+    }
+}
+
 /// What the client does with its platform channels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -61,6 +94,8 @@ pub enum Effect {
         target: SessionTarget,
         title: String,
         body: String,
+        /// `None`: silent (the user turned sounds off).
+        sound: Option<Sound>,
     },
     /// Withdraw the session's pop-up (best effort).
     Withdraw(SessionTarget),
@@ -292,6 +327,7 @@ impl NotificationCenter {
             out.effects.push(Effect::Bell(key.clone()));
         }
         let (title, body) = tracker::describe(&kind, &known.title, &known.project);
+        let sound = cfg.sound.then(|| Sound::of(&kind));
         let entry = Entry::new(
             key.clone(),
             kind,
@@ -310,6 +346,7 @@ impl NotificationCenter {
                 target: key,
                 title,
                 body,
+                sound,
             });
         }
     }
@@ -545,6 +582,45 @@ mod tests {
         );
         assert!(t.effects.contains(&Effect::Withdraw(key.clone())));
         assert!(c.inbox().entries().is_empty());
+    }
+
+    #[test]
+    fn a_popup_asks_for_its_events_sound_unless_sounds_are_off() {
+        let shown_sound = |cfg: &NotifyConfig| -> Option<Sound> {
+            let key = target(SessionKey::tmux("omp-deck", "snd"), 1);
+            let mut c = center();
+            let t0 = Instant::now();
+            c.tick(t0, &[obs(&key, TabStatus::Busy, None, false)], false, cfg);
+            let effects = settle(
+                &mut c,
+                t0 + Duration::from_secs(10),
+                &[obs(&key, TabStatus::Idle, None, false)],
+                false,
+                cfg,
+            );
+            effects
+                .into_iter()
+                .find_map(|e| match e {
+                    Effect::Show { sound, .. } => Some(sound),
+                    _ => None,
+                })
+                .expect("a pop-up")
+        };
+        assert_eq!(shown_sound(&NotifyConfig::default()), Some(Sound::Finished));
+        let quiet = NotifyConfig {
+            sound: false,
+            ..NotifyConfig::default()
+        };
+        assert_eq!(shown_sound(&quiet), None);
+    }
+
+    #[test]
+    fn each_kind_has_its_own_theme_sound() {
+        let name = |k: Kind| Sound::of(&k).theme_name();
+        assert_eq!(name(Kind::Finished), "complete");
+        assert_eq!(name(Kind::Attention), "dialog-warning");
+        assert_eq!(name(Kind::Error(None)), "dialog-error");
+        assert_eq!(name(Kind::Exited { code: Some(0) }), "message-new-instant");
     }
 
     #[test]
