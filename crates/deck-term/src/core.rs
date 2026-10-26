@@ -21,7 +21,7 @@ use crate::clipboard::Clipboard;
 use crate::graphics::Graphics;
 use crate::input::KeyRules;
 use crate::out::{PtyOut, Sink, WriteProgress, register_detaching};
-use crate::remote::{self, Feeder, Remote};
+use crate::remote::{self, Feeder, Remote, ScrollKeep};
 use crate::scan::{KeyModes, OutputScan};
 use crate::theme::{self, Palette, TermTheme};
 use crate::wake::{Wake, WakeCallback};
@@ -234,6 +234,7 @@ struct Parts {
     graphics: Arc<Graphics>,
     key_modes: Arc<KeyModes>,
     window_size: WindowSize,
+    scroll_keep: Arc<ScrollKeep>,
 }
 
 impl Parts {
@@ -280,6 +281,7 @@ impl Parts {
             graphics: Arc::new(Graphics::new(ctx.clone(), wake)),
             key_modes: Arc::new(KeyModes::default()),
             window_size,
+            scroll_keep: Arc::default(),
         }
     }
 
@@ -304,6 +306,7 @@ impl Parts {
             palette: Palette::for_theme(opts.theme),
             tmux_client,
             key_modes: self.key_modes,
+            scroll_keep: self.scroll_keep,
             title: None,
             exit_code: None,
             exit_reported: false,
@@ -338,6 +341,8 @@ pub struct Terminal {
     tmux_client: bool,
     /// Keyboard modes requested by the child that `TermMode` lacks (set by the output thread).
     key_modes: Arc<KeyModes>,
+    /// Holds a scrolled-back view across the redraw an app answers a resize with.
+    pub(crate) scroll_keep: Arc<ScrollKeep>,
     title: Option<String>,
     exit_code: Option<i32>,
     exit_reported: bool,
@@ -486,6 +491,7 @@ impl Terminal {
             listener: parts.listener.clone(),
             scan: parts.scan(),
             out: parts.out.clone(),
+            keep: parts.scroll_keep.clone(),
             notices: parts.tx.clone(),
             wake,
         };
@@ -826,9 +832,9 @@ impl Terminal {
         self.window_size = ws;
         self.size_sent = true;
         if (old.num_lines, old.num_cols) != (rows, cols) {
-            self.term
-                .lock()
-                .resize(TermSize::new(usize::from(cols), usize::from(rows)));
+            let mut term = self.term.lock();
+            self.scroll_keep.arm(term.grid().display_offset());
+            term.resize(TermSize::new(usize::from(cols), usize::from(rows)));
         }
         if !self.shut_down {
             self.out.resize(ws);

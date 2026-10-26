@@ -38,14 +38,17 @@ pub fn normalize(text: &str, home: Option<&Path>, base: &Path) -> PathBuf {
 }
 
 /// Normalizes `text` and requires an existing directory; returns its canonical path (symlinks
-/// resolved, as omp records session cwds). Blocking.
+/// resolved, as omp records session cwds; on Windows without the `\\?\` verbatim prefix, which
+/// omp's cwds never carry). Blocking.
 pub fn resolve(text: &str, home: Option<&Path>, base: &Path) -> Result<PathBuf, String> {
     if text.trim().is_empty() {
         return Err("Enter a folder path".to_owned());
     }
     let path = normalize(text, home, base);
     match std::fs::metadata(&path) {
-        Ok(m) if m.is_dir() => Ok(std::fs::canonicalize(&path).unwrap_or(path)),
+        Ok(m) if m.is_dir() => Ok(deck_core::platform::strip_verbatim(
+            std::fs::canonicalize(&path).unwrap_or(path),
+        )),
         Ok(_) => Err(format!("Not a folder: {}", path.display())),
         Err(_) => Err(format!("Folder not found: {}", path.display())),
     }
@@ -124,6 +127,21 @@ mod tests {
                 .starts_with("Folder not found")
         );
         assert!(resolve("   ", None, base).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_returns_the_drive_form_omp_records_not_the_verbatim_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = resolve(dir.path().to_str().expect("utf8"), None, dir.path()).expect("resolve");
+        let text = scope.to_str().expect("utf8");
+        assert!(!text.starts_with(r"\\?\"), "{text}");
+        assert!(matches!(
+            scope.components().next(),
+            Some(Component::Prefix(p)) if matches!(p.kind(), std::path::Prefix::Disk(_))
+        ));
+        // A session cwd under it, as omp records it (no verbatim prefix).
+        assert!(contains(&scope, &scope.join("sub")));
     }
 
     #[test]

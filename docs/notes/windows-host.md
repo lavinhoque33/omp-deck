@@ -45,6 +45,13 @@ points); `OsStr::as_encoded_bytes()` is the portable byte view.
 - Job objects: windows-sys 0.61.2 (already in Cargo.lock) with `Win32_System_JobObjects` +
   `Win32_System_Threading`; `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; create the child `CREATE_SUSPENDED`, assign,
   then resume (no grandchild escapes the job).
+- Resize (observed with omp 18.12.6 in a ConPTY at 140→90→140 columns): ConPTY sends `CSI 8;rows;cols t` and
+  repaints its viewport from `CSI H`; omp, which draws into the main screen, then clears screen and
+  scrollback (`CSI 2 J`, `CSI 3 J`) and prints its whole transcript again. The local `Term` drops to the
+  bottom of the view on the clear, so any resize (changes panel, sidebar drag, window resize) used to throw
+  a scrolled-back view to the end. `deck-term` `ScrollKeep` re-pins the distance from the bottom for 1.5 s
+  after a resize that started scrolled back (cancelled by wheel, selection autoscroll, typing).
+  `[INFERENCE]` why Linux/tmux never showed it: tmux repaints only the visible pane to its client.
 
 ## alacritty_terminal state for snapshots (public in 0.26)
 Grid cells (`c`, `fg`, `bg`, `flags`, `zerowidth()`, `underline_color()`, `hyperlink()`), history via

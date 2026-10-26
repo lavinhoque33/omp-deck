@@ -172,7 +172,7 @@ fn canonical(p: &Path) -> PathBuf {
     let mut cur = p;
     loop {
         if let Ok(c) = std::fs::canonicalize(cur) {
-            let mut out = strip_verbatim(c);
+            let mut out = deck_core::platform::strip_verbatim(c);
             out.extend(tail.iter().rev());
             return out;
         }
@@ -184,23 +184,6 @@ fn canonical(p: &Path) -> PathBuf {
             _ => return p.to_path_buf(),
         }
     }
-}
-
-#[cfg(windows)]
-fn strip_verbatim(p: PathBuf) -> PathBuf {
-    let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(rest.to_owned())
-    } else {
-        p
-    }
-}
-
-#[cfg(not(windows))]
-fn strip_verbatim(p: PathBuf) -> PathBuf {
-    p
 }
 
 /// The path's components as comparable keys (case-folded on Windows, whose file systems are

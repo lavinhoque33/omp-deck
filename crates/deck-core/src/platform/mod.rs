@@ -111,6 +111,29 @@ pub fn home_or_root() -> PathBuf {
     dirs::home_dir().unwrap_or_else(root_dir)
 }
 
+/// Windows: `\\?\C:\x` → `C:\x` and `\\?\UNC\server\share\x` → `\\server\share\x`, the forms
+/// omp records as session cwds (`process.cwd()` never carries the verbatim prefix).
+/// `fs::canonicalize` returns the verbatim form; a path kept in it never equals a session cwd
+/// and shows up malformed. Other verbatim kinds (`\\?\Volume{…}`) and every other platform's
+/// paths are returned unchanged.
+pub fn strip_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(s) = path.to_str() {
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\")
+            && rest
+                .as_bytes()
+                .get(..2)
+                .is_some_and(|d| d[0].is_ascii_alphabetic() && d[1] == b':')
+        {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 /// Keeps a console child from flashing a window when the GUI is a Windows-subsystem process.
 /// No-op elsewhere. [`KillableCommand`] applies it itself.
 pub fn no_window(cmd: &mut Command) -> &mut Command {

@@ -8,12 +8,12 @@
 //! blocks on the connection).
 
 use std::io;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
@@ -135,6 +135,52 @@ pub(crate) enum RemoteCmd {
 /// bound), so a large snapshot never stalls the UI thread for long.
 const MAX_LOCKED: usize = 0x1_0000;
 
+/// How long after a grid resize the scroll position is held (see [`ScrollKeep`]).
+const KEEP_FOR: Duration = Duration::from_millis(1500);
+
+/// Keeps a scrolled-back view where it was across a resize.
+///
+/// Apps that draw into the main screen (omp's TUI) answer a width change by clearing the screen
+/// and the scrollback (`CSI 2 J`, `CSI 3 J`) and printing everything again. Clearing resets the
+/// `Term`'s view to the bottom, and the reprint leaves it there. For a short window after a
+/// resize that started scrolled back, the feeder puts the view back at the same distance from
+/// the bottom after every chunk it parses. The distance is in lines, so rewrapped text can
+/// shift the view slightly; it does not jump to the end.
+#[derive(Default)]
+pub(crate) struct ScrollKeep(Mutex<Option<(usize, Instant)>>);
+
+impl ScrollKeep {
+    /// A resize is about to change the grid while the view is `offset` lines above the bottom.
+    /// A view already at the bottom arms nothing (and leaves a running window alone: the
+    /// clearing redraw of the previous resize may have put it there).
+    pub(crate) fn arm(&self, offset: usize) {
+        if offset > 0 {
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some((offset, Instant::now() + KEEP_FOR));
+        }
+    }
+
+    /// The user moved the view or typed: stop holding it.
+    pub(crate) fn cancel(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Puts the view back at the held distance (clamped to the scrollback now present).
+    fn pin<T: EventListener>(&self, term: &mut Term<T>) {
+        let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some((offset, until)) = *slot else { return };
+        if Instant::now() >= until {
+            *slot = None;
+            return;
+        }
+        let want = offset.min(term.grid().history_size());
+        let now = term.grid().display_offset();
+        if want != now {
+            term.scroll_display(Scroll::Delta(want as i32 - now as i32));
+        }
+    }
+}
+
 /// Writer thread: forwards commands until `Detach`/`Kill` (or every sender is gone).
 /// Handled bytes advance even on failure for bounded detach; only successful input calls
 /// advance the separate delivery acknowledgement. A failed input closes the connection.
@@ -198,6 +244,8 @@ pub(crate) struct Feeder {
     pub(crate) out: Arc<PtyOut>,
     pub(crate) notices: Sender<Notice>,
     pub(crate) wake: Wake,
+    /// Holds a scrolled-back view across a resize's redraw.
+    pub(crate) keep: Arc<ScrollKeep>,
 }
 
 impl Feeder {
@@ -211,7 +259,11 @@ impl Feeder {
                         Ok(event) => event,
                         Err(RecvTimeoutError::Timeout) => {
                             // The app never ended its synchronized update: show what it drew.
-                            parser.stop_sync(&mut *self.term.lock());
+                            {
+                                let mut term = self.term.lock();
+                                parser.stop_sync(&mut *term);
+                                self.keep.pin(&mut *term);
+                            }
                             self.listener.send_event(Event::Wakeup);
                             continue;
                         }
@@ -283,7 +335,11 @@ impl Feeder {
 
     fn feed(&mut self, parser: &mut Processor, bytes: &[u8]) {
         for chunk in bytes.chunks(MAX_LOCKED) {
-            parser.advance(&mut *self.term.lock(), chunk);
+            {
+                let mut term = self.term.lock();
+                parser.advance(&mut *term, chunk);
+                self.keep.pin(&mut *term);
+            }
             self.scan.feed(chunk);
             // Redraw unless all of it went into a pending synchronized update.
             if parser.sync_bytes_count() < chunk.len() {
@@ -799,5 +855,67 @@ pub(crate) mod tests {
         assert_eq!(t.banner.as_deref(), Some("[observer detached]"));
         drop(t);
         wait_detached(TIMEOUT);
+    }
+
+    /// What omp answers a width change with: wipe screen and scrollback, print everything again.
+    /// Ends with a title change, which `until(.. title ..)` sees only after the lines are parsed.
+    fn redraw(t: &mut Terminal, host: &Sender<RemoteEvent>, done: &str) {
+        output(host, b"\x1b[2J\x1b[3J\x1b[H");
+        for half in 0..2 {
+            let mut lines = Vec::new();
+            for i in 0..50 {
+                lines.extend_from_slice(format!("line {}\r\n", half * 50 + i).as_bytes());
+            }
+            output(host, &lines);
+        }
+        output(host, format!("\x1b]0;{done}\x07").as_bytes());
+        until(t, done, |t| t.title() == Some(done));
+    }
+
+    fn scroll_back(t: &Terminal, lines: i32) {
+        t.term
+            .lock()
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+    }
+
+    fn display_offset(t: &Terminal) -> usize {
+        t.term.lock().grid().display_offset()
+    }
+
+    #[test]
+    fn a_scrolled_back_view_survives_the_redraw_a_resize_triggers() {
+        let (mut t, host, _log) = connect();
+        t.resize(40, 10, 8, 16);
+        redraw(&mut t, &host, "first");
+        scroll_back(&t, 7);
+        assert_eq!(display_offset(&t), 7);
+
+        // The redraw clears the scrollback (view to the bottom) and rebuilds it in chunks.
+        t.resize(30, 10, 8, 16);
+        redraw(&mut t, &host, "second");
+        assert!(t.term.lock().grid().history_size() >= 90);
+        assert_eq!(display_offset(&t), 7);
+    }
+
+    #[test]
+    fn a_view_at_the_bottom_stays_there_through_a_resize_redraw() {
+        let (mut t, host, _log) = connect();
+        t.resize(40, 10, 8, 16);
+        redraw(&mut t, &host, "first");
+        t.resize(30, 10, 8, 16);
+        redraw(&mut t, &host, "second");
+        assert_eq!(display_offset(&t), 0);
+    }
+
+    #[test]
+    fn scrolling_by_hand_ends_the_hold() {
+        let (mut t, host, _log) = connect();
+        t.resize(40, 10, 8, 16);
+        redraw(&mut t, &host, "first");
+        scroll_back(&t, 7);
+        t.resize(30, 10, 8, 16);
+        t.scroll_keep.cancel();
+        redraw(&mut t, &host, "second");
+        assert_eq!(display_offset(&t), 0);
     }
 }
