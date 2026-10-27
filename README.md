@@ -97,6 +97,7 @@ host), so closing a tab or the whole app leaves omp running.
   Teal Signal, Slate Ink, Mono Wire, Graphite Islands, Aurora, Obsidian Glass, Ember, Indigo Night, Phosphor,
   Neo-Brutal, Rosé Noir, Spotlight and Two-Tone Frame; the flat Neutral look and "Midnight neon" also come in
   light. The terminal colors follow the style, and a Comfortable density option is available (Settings → OmpDeck).
+  "Separated panels" (on by default) shows the sidebar and main area as separate rounded, bordered panels, like VS Code.
   Integrated title bar (or native decorations), persisted window geometry and open tabs.
 
 OmpDeck never writes to the omp session store directly; changes go through omp's own CLI.

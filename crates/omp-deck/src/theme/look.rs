@@ -287,6 +287,11 @@ pub struct Look {
     pub glass_fields: bool,
     /// Gap between the sidebar and the main area, and the margin around them (Islands).
     pub island_gap: u8,
+    /// Corner radius of the Islands panels.
+    pub island_r: u8,
+    /// Islands made by the "Separated panels" setting from a line-divided style (see
+    /// [`separated`]): VS Code-like panels on the bar tone, no drop shadow.
+    pub separated: bool,
     /// The sidebar casts a soft shadow onto the canvas (Layered Depth).
     pub cast: bool,
     /// An accent line under the tab row (Teal Signal).
@@ -360,6 +365,8 @@ const BASE: Look = Look {
     outlined_chips: false,
     glass_fields: false,
     island_gap: 6,
+    island_r: 12,
+    separated: false,
     cast: false,
     tab_rule: false,
 };
@@ -854,5 +861,23 @@ pub(super) const fn look_of(style: UiStyle) -> Look {
             },
             ..BASE
         },
+    }
+}
+
+/// `look` with the sidebar and main area as separate panels (the "Separated panels" setting):
+/// line-divided styles become VS Code-like Islands (4 px gaps, 8 px corners, bordered, on the
+/// bar tone); Islands and Frame styles keep their own structure.
+pub(super) const fn separated(look: Look) -> Look {
+    match look.region {
+        Region::Lines | Region::Fade => Look {
+            region: Region::Islands,
+            island_gap: 4,
+            island_r: 8,
+            separated: true,
+            // The sidebar no longer touches the canvas it would cast onto.
+            cast: false,
+            ..look
+        },
+        Region::Islands | Region::Frame => look,
     }
 }

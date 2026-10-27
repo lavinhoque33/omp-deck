@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use deck_core::changes::{ChangedFile, Changes, FileDiff};
 use deck_service::controller::{Command, RequestId};
 use deck_service::gateway::protocol::{Answer, Mutation, Query, Topic, TopicValue};
-use egui::{Frame, Margin};
+use egui::Margin;
 
 use super::{App, PendingConfirm};
 use crate::changes_view::{
@@ -17,7 +17,7 @@ use crate::changes_view::{
 use crate::confirm::Confirm;
 use crate::review;
 use crate::tabs::{Tab, TabRole};
-use crate::theme::Palette;
+use crate::theme::{self, Palette};
 
 /// Panel width until the user resizes it.
 const DEFAULT_WIDTH: f32 = 460.0;
@@ -603,11 +603,11 @@ impl App {
             .resizable(true)
             .default_size(width)
             .size_range(320.0..=900.0)
-            .frame(
-                Frame::NONE
-                    .fill(pal.panel)
-                    .inner_margin(Margin::symmetric(12, 12)),
-            )
+            .show_separator_line(theme::skin::right_panel_separator_line())
+            .frame(theme::skin::right_panel_frame(
+                pal,
+                Margin::symmetric(12, 12),
+            ))
             .show(ui, |ui| changes_view::show(ui, &mut self.changes.view));
         // A comment editor owns the keyboard: the terminal must not take it back while the user
         // types (every other place that asks for terminal focus runs before this, or on a click).

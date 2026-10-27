@@ -81,6 +81,9 @@ pub struct AppConfig {
     /// Scale of the whole app (egui zoom: 1.0 = 100 %). The terminal compensates so its own
     /// font size stays absolute.
     pub ui_scale: f32,
+    /// Sidebar and main area as separate rounded, bordered panels on the window backdrop
+    /// (VS Code-like) in the styles that otherwise divide them with a line.
+    pub separated_panels: bool,
     /// false → OmpDeck draws its own title bar; true → the window manager's frame.
     pub native_decorations: bool,
     /// Run `omp update --check` at startup and every 6 h.
@@ -239,6 +242,7 @@ impl Default for AppConfig {
             density: Density::default(),
             ui_font: UiFont::default(),
             ui_scale: 1.0,
+            separated_panels: true,
             native_decorations: false,
             check_updates: true,
             favorite_models: Vec::new(),

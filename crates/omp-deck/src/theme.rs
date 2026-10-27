@@ -11,7 +11,7 @@ mod palettes;
 pub mod skin;
 
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use deck_core::config::{Density, UiFont, UiStyle};
 use egui::epaint::Mesh;
@@ -34,9 +34,13 @@ static STYLE: AtomicU8 = AtomicU8::new(0);
 static COMPACT: AtomicU8 = AtomicU8::new(1);
 /// Index into [`UiFont::ALL`] of the chosen UI font.
 static UI_FONT: AtomicU8 = AtomicU8::new(0);
+/// The "Separated panels" setting (`AppConfig::separated_panels`, default on).
+static SEPARATED: AtomicBool = AtomicBool::new(true);
 
-/// The structure of every style, in [`UiStyle::ALL`] order.
+/// The structure of every style, in [`UiStyle::ALL`] order: as designed, and with separated panels.
 static LOOKS: LazyLock<[Look; 18]> = LazyLock::new(|| UiStyle::ALL.map(look::look_of));
+static LOOKS_SEPARATED: LazyLock<[Look; 18]> =
+    LazyLock::new(|| UiStyle::ALL.map(|s| look::separated(look::look_of(s))));
 
 /// The active style.
 pub fn style() -> UiStyle {
@@ -48,12 +52,28 @@ pub fn style() -> UiStyle {
 
 /// Structure of the active style.
 pub fn look() -> &'static Look {
-    &LOOKS[usize::from(STYLE.load(Ordering::Relaxed)).min(LOOKS.len() - 1)]
+    let looks = if SEPARATED.load(Ordering::Relaxed) {
+        &LOOKS_SEPARATED
+    } else {
+        &LOOKS
+    };
+    &looks[usize::from(STYLE.load(Ordering::Relaxed)).min(looks.len() - 1)]
 }
 
-/// Structure of `style` (for previews of styles that are not active).
+/// Structure of `style` under the current "Separated panels" setting (previews of styles that
+/// are not active).
 pub fn look_of(style: UiStyle) -> Look {
-    look::look_of(style)
+    let look = look::look_of(style);
+    if SEPARATED.load(Ordering::Relaxed) {
+        look::separated(look)
+    } else {
+        look
+    }
+}
+
+/// Sets the "Separated panels" setting; takes effect with the next [`apply`].
+pub fn set_separated(on: bool) {
+    SEPARATED.store(on, Ordering::Relaxed);
 }
 
 /// Whether a flat-family look is active: every style but Neon (flat, hairlines, JetBrains Mono).
@@ -181,7 +201,7 @@ pub fn apply(ctx: &Context, style: UiStyle, density: Density, ui_font: UiFont, d
     let font_idx = UiFont::ALL.iter().position(|f| *f == ui_font).unwrap_or(0);
     UI_FONT.store(font_idx as u8, Ordering::Relaxed);
     let flat = style != UiStyle::Neon;
-    let look = look::look_of(style);
+    let look = look_of(style);
     let family = family_for(&look, flat, ui_font);
     let (pd, pl) = (palettes::of(style, true), palettes::of(style, false));
     ctx.style_mut_of(Theme::Dark, |s| {

@@ -274,8 +274,14 @@ pub fn top_highlight(painter: &Painter, rect: Rect, radius: f32, a: u8) {
 // ------------------------------------------------------------------ window regions
 
 /// Backdrop of the whole window (what shows in the Islands gaps and around the Frame canvas).
+/// Separated panels sit on the bar tone, so the gaps read as part of the title and status bars.
 pub fn paint_backdrop(painter: &Painter, screen: Rect, pal: &Palette) {
-    painter.rect_filled(screen, 0, pal.window);
+    let fill = if look().separated {
+        pal.bar
+    } else {
+        pal.window
+    };
+    painter.rect_filled(screen, 0, fill);
 }
 
 /// Gap between the Islands panels and the window edge.
@@ -283,26 +289,58 @@ fn gap() -> i8 {
     look().island_gap as i8
 }
 
-/// Frame of the sidebar panel; `inner` is the inner margin of the flat look.
-pub fn sidebar_frame(pal: &Palette, inner: Margin) -> Frame {
-    match look().region {
-        Region::Islands => Frame::NONE
-            .fill(pal.panel)
-            .stroke(Stroke::new(1.0, pal.separator))
-            .corner_radius(12)
-            .shadow(Shadow {
+/// An Islands side panel: rounded, bordered, with the designed drop shadow (none when separated).
+fn island_panel(pal: &Palette, outer: Margin, inner: Margin) -> Frame {
+    let lk = look();
+    Frame::NONE
+        .fill(pal.panel)
+        .stroke(Stroke::new(1.0, pal.separator))
+        .corner_radius(lk.island_r)
+        .shadow(if lk.separated {
+            Shadow::NONE
+        } else {
+            Shadow {
                 offset: [0, 10],
                 blur: 30,
                 spread: 0,
                 color: black(140),
-            })
-            .outer_margin(Margin {
+            }
+        })
+        .outer_margin(outer)
+        .inner_margin(inner)
+}
+
+/// Frame of the sidebar panel; `inner` is the inner margin of the flat look.
+pub fn sidebar_frame(pal: &Palette, inner: Margin) -> Frame {
+    match look().region {
+        Region::Islands => island_panel(
+            pal,
+            Margin {
                 left: gap(),
                 right: gap() / 2,
                 top: 2,
                 bottom: 2,
-            })
-            .inner_margin(inner),
+            },
+            inner,
+        ),
+        _ => Frame::NONE.fill(pal.panel).inner_margin(inner),
+    }
+}
+
+/// Frame of a right-hand side panel (Changes): an Islands panel beside the canvas (whose own
+/// margin is the gap), else flat.
+pub fn right_panel_frame(pal: &Palette, inner: Margin) -> Frame {
+    match look().region {
+        Region::Islands => island_panel(
+            pal,
+            Margin {
+                left: 0,
+                right: gap(),
+                top: 2,
+                bottom: 2,
+            },
+            inner,
+        ),
         _ => Frame::NONE.fill(pal.panel).inner_margin(inner),
     }
 }
@@ -312,13 +350,19 @@ pub fn panel_separator_line() -> bool {
     look().region == Region::Lines
 }
 
+/// Whether egui should draw its separator line next to a right-hand side panel (Islands panels
+/// carry their own border).
+pub fn right_panel_separator_line() -> bool {
+    look().region != Region::Islands
+}
+
 /// Frame of the central panel: the canvas, rounded and bordered where the region asks for it.
 pub fn central_frame(pal: &Palette) -> Frame {
     match look().region {
         Region::Islands => Frame::NONE
             .fill(pal.bg)
             .stroke(Stroke::new(1.0, pal.separator))
-            .corner_radius(12)
+            .corner_radius(look().island_r)
             .outer_margin(Margin {
                 left: gap() / 2,
                 right: gap(),
@@ -335,17 +379,18 @@ pub fn central_frame(pal: &Palette) -> Frame {
     }
 }
 
-/// Shows the central panel around `add`: the canvas fill and region frame (gallery styles only;
-/// Neutral and Neon keep their unfilled panel), no scroll-edge fade over the canvas, and the
-/// region's decoration painted above the content. `terminal` keeps the canvas clear of rounded
-/// corners around a terminal.
+/// Shows the central panel around `add`: the canvas fill and region frame (gallery styles, and
+/// Neutral and Neon with separated panels; otherwise those two keep their unfilled panel), no
+/// scroll-edge fade over the canvas, and the region's decoration painted above the content.
+/// `terminal` keeps the canvas clear of rounded corners around a terminal.
 pub fn central<R>(
     ui: &mut egui::Ui,
     pal: &Palette,
     terminal: bool,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
-    let frame = if super::is_gallery() {
+    let framed = super::is_gallery() || look().separated;
+    let frame = if framed {
         let mut f = central_frame(pal);
         if terminal {
             f = f.inner_margin(terminal_margin());
@@ -360,7 +405,7 @@ pub fn central<R>(
             ui.spacing_mut().scroll.fade.strength = 0.0;
             add(ui)
         });
-    if super::is_gallery() {
+    if framed {
         paint_central_decor(ui.painter(), out.response.rect, pal);
         paint_sidebar_cast(ui.painter(), out.response.rect);
     }
@@ -370,7 +415,7 @@ pub fn central<R>(
 /// Margin around the terminal inside the central panel so it keeps clear of rounded corners.
 pub fn terminal_margin() -> Margin {
     match look().region {
-        Region::Islands => Margin::same(6),
+        Region::Islands => Margin::same((look().island_r / 2) as i8),
         Region::Frame => Margin {
             left: 4,
             top: 4,
@@ -433,10 +478,10 @@ pub fn paint_central_decor(painter: &Painter, rect: Rect, pal: &Palette) {
             });
             painter.add(Shape::mesh(mesh));
         }
-        Region::Islands => {
+        Region::Islands if !look().separated => {
             painter.rect_stroke(
                 rect.shrink(1.0),
-                11,
+                look().island_r - 1,
                 Stroke::new(1.0, white(14)),
                 StrokeKind::Inside,
             );

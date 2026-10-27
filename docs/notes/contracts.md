@@ -2941,3 +2941,20 @@ deleted).
     worktree rows → Finish worktree (Cancel finishing while finishing) + Remove worktree…; parked rows → Continue in
     worktree + Continue in main checkout (Switch main checkout back to <base> when checked out there). Same code
     path as the menu items; the age column yields to the buttons while hovered.
+
+## Terminal file drops and separated panels (0.18.1+)
+
+- **File drops** (`deck_term::input::encode_dropped_paths`, `TerminalView`): `RawInput::dropped_files` paste into the
+  view under the pointer (the focused one when no pointer position is known) as space-separated paths, Unix
+  backslash-escaped over omp's unescape set (whitespace, quotes, backslash, backtick and `()[]{}&;<>|?*!$`), Windows `"`-wrapped when needed;
+  through the terminal's bracketed paste, blocked while input is held. `hovered_files` draw an accent outline.
+  Wayland: `omp-deck` `file_drop.rs` binds `wl_data_device` (v≤3) on winit's display (separate queue + thread), accepts
+  `text/uri-list` over the main surface, reads the list off-thread, and injects `PointerMoved` (surface px / zoom),
+  `PointerGone` and `dropped_files` in `App::raw_input_hook`. X11/Windows come from winit.
+- **Separated panels** (user, 2026-10-27; VS Code reference): `AppConfig.separated_panels` (default true,
+  `Setting::SeparatedPanels`, Shared). `theme::set_separated` before `theme::apply`; `look()`/`look_of()` return
+  `look::separated(look)`: Lines/Fade regions → `Region::Islands` with `island_gap` 4, `island_r` 8, `separated`
+  (no drop shadow, no inner highlight, no Layered Depth cast, backdrop `pal.bar`); Islands/Frame styles unchanged.
+  Neutral/Neon get the framed central panel too. Changes panel uses `skin::right_panel_frame` (Islands panel in every
+  Islands look). Tab row stays full width (user choice). Settings → Appearance toggle + palette
+  `layout.separated_panels`.

@@ -279,6 +279,7 @@ settings! {
     Density(density: Density) = Shared,
     UiFont(ui_font: UiFont) = Shared,
     UiScale(ui_scale: f32) = Shared,
+    SeparatedPanels(separated_panels: bool) = Shared,
     NativeDecorations(native_decorations: bool) = Device,
     CheckUpdates(check_updates: bool) = Shared,
     FavoriteModels(favorite_models: Vec<String>) = Shared,

@@ -893,6 +893,17 @@ impl App {
             ICON_CHEVRONS_UP_DOWN,
             need(cfg.density != Density::Comfortable, "Already active"),
         );
+        add(
+            "layout.separated_panels",
+            if cfg.separated_panels {
+                "Layout: Join sidebar and main area"
+            } else {
+                "Layout: Separate sidebar and main area into panels"
+            },
+            None,
+            ICON_COLUMNS_2,
+            None,
+        );
         for font in UiFont::ALL {
             add(
                 &format!("ui_font.{}", font.key()),
@@ -1333,6 +1344,7 @@ impl App {
             }
             "density.compact" => self.set_density(Density::Compact),
             "density.comfortable" => self.set_density(Density::Comfortable),
+            "layout.separated_panels" => self.set_separated_panels(!self.cfg.separated_panels),
             "window.native_titlebar" => self.set_native_decorations(!self.cfg.native_decorations),
             "omp.check" => self.check_updates_manually(),
             "omp.update" => self.open_update_tab(UpdateKind::Omp),

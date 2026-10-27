@@ -527,7 +527,7 @@ pub fn show(
             );
         });
     let r = panel.response.rect;
-    if theme::is_gallery() {
+    if theme::is_gallery() || theme::look().separated {
         theme::skin::paint_edge(ui.painter(), r, theme::skin::Edge::Top, pal);
     } else {
         ui.painter().hline(

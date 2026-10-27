@@ -213,6 +213,7 @@ pub struct SettingsInput<'a> {
     pub theme: Theme,
     pub style: UiStyle,
     pub density: Density,
+    pub separated_panels: bool,
     pub ui_font: UiFont,
     pub native_decorations: bool,
     pub omp_found: bool,
@@ -243,6 +244,7 @@ pub enum SettingsAction {
     Theme(Theme),
     Style(UiStyle),
     Density(Density),
+    SeparatedPanels(bool),
     UiFont(UiFont),
     NativeDecorations(bool),
     SetCheckUpdates(bool),
@@ -967,6 +969,19 @@ fn appearance_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Se
                     } else {
                         Density::Comfortable
                     }));
+                }
+            },
+        );
+        ui.add_space(4.0);
+        setting_row(
+            ui,
+            "Separated panels",
+            "Sidebar and main area as separate rounded, bordered panels. Graphite Islands and \
+             Two-Tone Frame keep their own layout.",
+            |ui| {
+                let mut on = input.separated_panels;
+                if toggle(ui, &mut on).changed() {
+                    actions.push(SettingsAction::SeparatedPanels(on));
                 }
             },
         );

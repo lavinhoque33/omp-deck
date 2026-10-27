@@ -316,7 +316,7 @@ impl TabsProj {
 #[derive(Clone, PartialEq)]
 struct Applied {
     rows: Vec<deck_core::config::SyncRow>,
-    look: (Theme, UiStyle, Density, UiFont),
+    look: (Theme, UiStyle, Density, UiFont, bool),
     ui_scale: f32,
 }
 
@@ -516,6 +516,7 @@ impl App {
         cfg.font_size = cfg.font_size.clamp(MIN_FONT, MAX_FONT);
         cfg.ui_scale = clamp_ui_scale(cfg.ui_scale);
         ctx.set_zoom_factor(cfg.ui_scale);
+        theme::set_separated(cfg.separated_panels);
         theme::apply(&ctx, cfg.style, cfg.density, cfg.ui_font, cfg.dark());
 
         let root = deck_core::sessions::SessionsRoot::at(profile.sessions_root.clone());
@@ -1301,6 +1302,7 @@ impl App {
 
     /// Re-applies theme × style × density × UI font to egui and every open terminal.
     fn restyle(&mut self) {
+        theme::set_separated(self.cfg.separated_panels);
         theme::apply(
             &self.ctx,
             self.cfg.style,
@@ -1341,6 +1343,13 @@ impl App {
     fn set_density(&mut self, density: Density) {
         if self.cfg.density != density {
             self.cfg.density = density;
+            self.restyle();
+        }
+    }
+
+    fn set_separated_panels(&mut self, on: bool) {
+        if self.cfg.separated_panels != on {
+            self.cfg.separated_panels = on;
             self.restyle();
         }
     }
@@ -1970,6 +1979,7 @@ impl App {
                     theme: self.cfg.theme,
                     style: self.cfg.style,
                     density: self.cfg.density,
+                    separated_panels: self.cfg.separated_panels,
                     ui_font: self.cfg.ui_font,
                     native_decorations: self.cfg.native_decorations,
                     omp_found: self.omp_found(),
@@ -2005,6 +2015,7 @@ impl App {
                         SettingsAction::Theme(t) => self.set_theme(t),
                         SettingsAction::Style(v) => self.set_style(v),
                         SettingsAction::Density(v) => self.set_density(v),
+                        SettingsAction::SeparatedPanels(v) => self.set_separated_panels(v),
                         SettingsAction::UiFont(v) => self.set_ui_font(v),
                         SettingsAction::SessionBackend(v) => self.set_session_backend(v),
                         SettingsAction::NativeDecorations(v) => self.set_native_decorations(v),
@@ -2355,6 +2366,7 @@ impl App {
                 self.cfg.style,
                 self.cfg.density,
                 self.cfg.ui_font,
+                self.cfg.separated_panels,
             ),
             ui_scale: self.cfg.ui_scale,
             rows: self.cfg.project_sync.clone(),

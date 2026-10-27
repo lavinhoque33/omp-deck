@@ -304,7 +304,7 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
             let rect = ui.max_rect();
             let p = ui.painter();
             theme::paint_bar(p, rect, pal);
-            if theme::is_gallery() {
+            if theme::is_gallery() || theme::look().separated {
                 theme::skin::paint_edge(p, rect, theme::skin::Edge::Bottom, pal);
             } else {
                 p.hline(
