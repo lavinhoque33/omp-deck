@@ -36,7 +36,9 @@ use deck_core::selfupdate::{Applied, InstallKind, Release};
 use deck_core::sessions::ProjectGroup;
 use deck_core::status::SessionStatus;
 use deck_core::usage::{Activity as UsageActivity, UsageSnapshot};
-use deck_core::worktree::{MergeTarget, Removed, RepoInfo, Worktree, WorktreeStatus};
+use deck_core::worktree::{
+    BranchState, MergeTarget, Removal, Removed, RepoInfo, Worktree, WorktreeStatus,
+};
 use deck_term::InputMeta;
 use serde::{Deserialize, Serialize};
 
@@ -345,6 +347,12 @@ pub enum Query {
     },
     /// Which controlled sessions run inside `worktree` (target and label).
     WorktreeSessions(Worktree),
+    /// Whether a (parked) branch still exists, where it is checked out and whether it is merged.
+    BranchState {
+        primary: PathBuf,
+        branch: String,
+        base: String,
+    },
     DriveList,
     DriveProjects,
     DriveProjectState,
@@ -386,6 +394,7 @@ pub enum Answer {
     InferBase(Option<String>),
     MergeTarget(MergeTarget),
     WorktreeSessions(Vec<(SessionTarget, String)>),
+    BranchState(BranchState),
     DriveList(Vec<BackupFile>),
     DriveProjects(Vec<ProjectBackup>),
     DriveProjectState(ProjectSyncState),
@@ -739,12 +748,34 @@ pub enum Mutation {
         base_ref: String,
         dest: PathBuf,
     },
-    /// Stops the listed sessions running in it first; refused while another one runs there.
+    /// Stops the listed sessions running in it first, then moves every session file of the
+    /// worktree (a fresh scan of the store, stubs included) into the worktree's primary
+    /// repository with omp's `/move`, then removes it: merged (`Removal::Merged`) or parked with
+    /// its branch kept (`Removal::Park`, clean + pushed). `moved`: running sessions the client
+    /// already moved out with [`Command::MoveTo`](crate::controller::Command::MoveTo); they keep
+    /// running. Refused while another session runs in the worktree.
     WorktreeRemove {
         worktree: Worktree,
         base: String,
-        delete_branch: bool,
+        how: Removal,
         stop: Vec<SessionTarget>,
+        moved: Vec<SessionTarget>,
+    },
+    /// Moves closed sessions into `dest` with omp's own `/move` (headless).
+    RelocateSessions {
+        files: Vec<PathBuf>,
+        dest: PathBuf,
+    },
+    /// A worktree at `dest` on the existing `branch` (a parked one).
+    WorktreeAddExisting {
+        repo: PathBuf,
+        branch: String,
+        dest: PathBuf,
+    },
+    /// `git switch <branch>` in `dir` (refused when the checkout is dirty).
+    SwitchBranch {
+        dir: PathBuf,
+        branch: String,
     },
     OmpSet {
         key: String,
@@ -835,6 +866,9 @@ impl Mutation {
             Mutation::DeleteUntracked { .. } => "git-delete-untracked",
             Mutation::WorktreeCreate { .. } => "worktree-create",
             Mutation::WorktreeRemove { .. } => "worktree-remove",
+            Mutation::RelocateSessions { .. } => "relocate-sessions",
+            Mutation::WorktreeAddExisting { .. } => "worktree-add-existing",
+            Mutation::SwitchBranch { .. } => "git-switch",
             Mutation::OmpSet { .. } => "omp-set",
             Mutation::OmpReset { .. } => "omp-reset",
             Mutation::RunTool(_) => "run-tool",
@@ -986,7 +1020,14 @@ pub enum Done {
     /// Per file: `None` = deleted, else the error text.
     Deleted(Vec<(PathBuf, Option<String>)>),
     Setting(serde_json::Value),
-    Removed(Removed),
+    /// [`Mutation::WorktreeRemove`]: the git result and the ids of the sessions it moved into the
+    /// primary repository.
+    Removed {
+        removed: Removed,
+        sessions: Vec<String>,
+    },
+    /// [`Mutation::RelocateSessions`]: per file, its new path or why it was not moved.
+    Relocated(Vec<(PathBuf, Result<PathBuf, String>)>),
     Settings(Snapshot),
     Gateway(GatewayStatus),
     DriveLogin {

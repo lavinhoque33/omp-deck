@@ -109,6 +109,8 @@ pub struct AppConfig {
     /// Worktrees OmpDeck removed, keyed by their former path (so their sessions can be grouped
     /// under the primary repo).
     pub removed_worktrees: BTreeMap<PathBuf, RemovedWorktree>,
+    /// Worktrees parked before their PR was merged (branch kept; never deleted by OmpDeck).
+    pub parked_branches: Vec<ParkedBranch>,
     /// Desktop notification settings.
     pub notify: NotifyConfig,
     /// Look for new OmpDeck releases at startup and every 6 h.
@@ -210,6 +212,19 @@ pub struct RemovedWorktree {
     pub branch: Option<String>,
 }
 
+/// A worktree parked before its PR was merged: the folder is gone, the local branch is kept
+/// (OmpDeck never deletes it). Key = `primary` + `branch`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ParkedBranch {
+    pub primary: PathBuf,
+    pub branch: String,
+    /// The base the worktree was created from / finished into.
+    pub base: String,
+    /// Ids of every session of the worktree when it was parked.
+    pub sessions: Vec<String>,
+    pub parked_ms: u64,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
@@ -242,6 +257,7 @@ impl Default for AppConfig {
             palette_recent: Vec::new(),
             changes_panel_width: 0.0,
             removed_worktrees: BTreeMap::new(),
+            parked_branches: Vec::new(),
             split: None,
             gateway_mode: GatewayMode::Off,
         }
@@ -804,8 +820,16 @@ mod tests {
         fs::write(&path, r#"{"font_size": 12.0}"#).unwrap();
         let old = AppConfig::load_from(&path);
         assert!(old.worktree_bases.is_empty() && old.removed_worktrees.is_empty());
+        assert!(old.parked_branches.is_empty());
         let mut cfg = AppConfig::default();
         cfg.worktree_bases.insert("/wt/a".into(), "main".into());
+        cfg.parked_branches.push(ParkedBranch {
+            primary: "/repo".into(),
+            branch: "wt/x".into(),
+            base: "main".into(),
+            sessions: vec!["s1".into(), "s2".into()],
+            parked_ms: 1_700_000_000_000,
+        });
         cfg.removed_worktrees.insert(
             "/wt/b".into(),
             RemovedWorktree {

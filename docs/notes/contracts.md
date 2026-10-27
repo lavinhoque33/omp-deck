@@ -2825,3 +2825,119 @@ earlier "always alongside, never replace" rule for that case only; the default s
   replaced by the backup" + "Copies are saved to OmpDeck's restore-safety folder first; running ones are stopped
   and their tabs closed." On Confirm, `stop` = `session_kill_names(entry, true)` for each overwritten local copy.
   The result summary reports added / replaced / kept counts.
+
+## Worktree sessions belong to their parent folder
+
+User request (2026-10-26): a "New session in worktree…" session should live in the parent (primary repo) folder
+while the work happens in the worktree; after the work is merged no worktree folder or dangling session/group
+may remain. Facts (omp 18.13.1, sandbox-verified; `docs/notes/worktrees.md` "Relocation"): omp binds the tool cwd
+to the session header `cwd`, so the session must run with cwd = worktree while working (no omp mode stores it as
+folder A while tools run in B; `--session-dir` only moves the file, header cwd stays the worktree). omp's own
+`/move <abs dir>` (live TUI, or `{"type":"prompt","message":"/move <dir>"}` over `--mode rpc --resume <path>`)
+moves the jsonl + artifacts into `<dir>`'s bucket, rewrites header `cwd`, chdirs the process; no model call, no
+message appended. `omp --resume <path>` never relocates a removed-worktree session by itself (only id-prefix
+resumes of omp-named worktrees do), so OmpDeck relocates explicitly. Replaces the Wave 13 "worktree groups nest
+under their primary repo" presentation and its "(removed)" groups.
+
+- **deck-core** `Omp::relocate_session(&self, file: &Path, dest: &Path) -> Result<PathBuf, OmpError>`: headless
+  `omp --mode rpc --resume <abs file>` with process cwd `dest` (stdin piped, terminal env removed like the other
+  headless runs, `--no-extensions`), sends `/move <abs dest>` as a prompt, waits for the success response, returns
+  the session's new path (`get_state`'s session file, else `<dest bucket>/<same file name>` verified to exist).
+  `dest` must be an existing absolute directory without control characters. Header cwd already `dest` → `Ok(file)`
+  without running omp. Live-writer refusal retried ≤ ~3 s; 60 s timeout, process tree killed. Blocking.
+- **deck-service**
+  - `controller::Command::MoveTo { dest: PathBuf }` (`CommandKind::MoveTo`) → `Job::slash("Move to folder",
+    "/move <dest>", Requires::Idle)`; rejected while busy, and when `dest` is relative or has control characters.
+  - `Mutation::WorktreeRemove` gains `moved: Vec<SessionTarget>` (running sessions the client moved out with
+    `MoveTo`; never stopped, skipped by the "another session still runs in this worktree" check, which otherwise
+    uses each managed session's live cwd, else its launch cwd). The job kills `stop`, re-checks clean + merged
+    (refused → nothing moved), relocates every session whose header cwd is inside the worktree
+    (`deck_core::sessions::sessions_under`, fresh scan, stubs included) into `worktree.primary`; the first
+    failure fails the job ("could not move a session of this worktree into <primary>: <why>; the worktree was
+    kept"; sessions already moved stay in the primary), then `git worktree remove`.
+  - `Mutation::RelocateSessions { files: Vec<PathBuf>, dest: PathBuf }` → `Done::Relocated(Vec<(PathBuf,
+    Result<PathBuf, String>)>)` (old path → new path or error), one job, sequential.
+- **omp-deck**
+  - **Sidebar**: a worktree's sessions are ordinary rows of the primary repo's group (newest-first among the
+    repo's own), each with a branch chip (git-branch icon + branch / folder name; "Finishing…" state); no nested
+    worktree groups. A repo with only worktree sessions still gets its (synthetic) group. Worktree actions (Finish
+    worktree, Cancel finishing, Remove worktree…, Open worktree folder, Copy worktree path) are in the session
+    row / tab / "Open tabs" context menus of sessions in that worktree; the row hover shows Branch + Worktree path.
+    Per-folder scope, filter (matches branch), active-tab expansion and "Move to new worktree…" gating keep working.
+  - **Finish / Remove**: once removal is allowed (clean + merged, unchanged checks), every live omp tab whose live
+    cwd is in the worktree gets `Command::MoveTo { dest: primary }` when idle; OmpDeck waits (≤ 30 s) until its
+    live cwd / session file left the worktree (`track_relocations` then updates `tab.cwd`); those tabs keep running
+    in the parent, are excluded from `stop` and sent as `moved`. Tabs that did not move (e.g. busy for 30 s) are
+    stopped as before. Remove confirmation and toasts say the sessions move into the parent folder.
+  - **Leftovers**: sessions whose header cwd is a removed worktree (`cfg.removed_worktrees`) and that are not
+    running are relocated into the recorded primary with `RelocateSessions` once per run; the record is dropped when
+    no session of it remains. Opening such a session first relocates it, then opens the new path in the primary.
+
+### "Merged" covers squash and rebase merges (2026-10-26)
+
+User: some repos squash-merge, some merge-commit; Finish/Remove must treat both equally.
+- `deck_core::worktree::status(wt, base)`: `merged` = the worktree's work is contained in `base` **or** in base's
+  upstream (`<base>@{upstream}`, e.g. `origin/main`, refreshed first by a best-effort `git fetch --quiet <remote>
+  <branch>`: `GIT_TERMINAL_PROMPT=0`, ssh `BatchMode=yes`, ≤ 20 s, failure ignored). Contained = `HEAD` is an
+  ancestor (regular merge / fast-forward), else `git merge-tree --write-tree <target> HEAD` exits 0 with a tree
+  equal to `<target>^{tree}` (merging again changes nothing: squash / rebase / cherry-pick merges; later commits on
+  the target are fine). Conflicts, errors or git < 2.38 (no `--write-tree`) → not contained (safe side). `ahead` =
+  commits not in the target as before. `remove`'s final re-check before `git worktree remove` uses the same rule;
+  branch deletion stays the CAS `update-ref -d <ref> <verified tip>` (works for squash-merged branches).
+
+### Park a worktree before its PR is merged (2026-10-26)
+
+User decisions: "Remove worktree…" on a worktree that is clean and **pushed** but not merged **parks** it: sessions
+move into the parent, the folder is removed, the local branch is kept and OmpDeck **never deletes a parked
+branch** (the user deletes local branches by hand). Both "Continue in worktree" and "Continue in main checkout"
+exist. Unpushed or dirty work is still refused. Merged worktrees keep the Finish/Remove behavior (merged branch
+deleted).
+
+- **deck-core** (`worktree.rs`, `config.rs`)
+  - `WorktreeStatus` gains `pushed: bool` (HEAD is an ancestor of the branch's upstream `<branch>@{upstream}`,
+    else of `<remote>/<branch>` for the only/`origin` remote, after the same best-effort fetch as the merged rule;
+    no upstream → false) and `upstream: Option<String>` (e.g. `origin/wt/x`).
+  - `pub enum Removal { Merged { delete_branch: bool }, Park }`; `remove(wt, base, how: Removal)`: `Merged` as
+    today; `Park` requires clean + `pushed` (new `Unsafe::NotPushed`; detached → `Unsafe::Detached`) and never
+    touches the branch. `park_blockers(st) -> Vec<String>` beside `blockers`.
+  - `add_existing(omp, repo, branch, dest) -> Result<(), WorktreeError>`: `omp worktree add -q -C <repo> <dest>
+    <branch>` with the same clean-checkout overlay as `create` (branch must exist; git refuses when it is
+    checked out elsewhere — surface its message).
+  - `switch_branch(dir, branch) -> Result<(), WorktreeError>`: refuses a dirty checkout (`Unsafe::Dirty`, nothing
+    run), then `git -C <dir> switch --no-guess -q <branch>` (never `--force`/`--discard-changes`).
+  - `branch_state(primary, branch, base) -> BranchState { exists: bool, checked_out: Option<PathBuf>, merged: bool }`
+    (`checked_out` from `git worktree list --porcelain`; `merged` = the squash-aware rule for the branch tip vs base /
+    base upstream; `false` when it does not exist).
+  - `config::ParkedBranch { primary: PathBuf, branch: String, base: String, sessions: Vec<String> /* ids */,
+    parked_ms: u64 }`; `AppConfig.parked_branches: Vec<ParkedBranch>` (serde default, key = primary + branch).
+- **deck-service**
+  - `settings::Field::ParkedBranches(parked_branches) = Device`.
+  - `Mutation::WorktreeRemove { worktree, base, how: Removal, stop, moved }` (replaces `delete_branch`); the job's
+    pre-relocation check uses `blockers` for `Merged` and `park_blockers` for `Park`.
+  - `Mutation::WorktreeAddExisting { repo, branch, dest }` → `Done::Path(dest)`; `Mutation::SwitchBranch { dir,
+    branch }` → `Done::Unit`; `Query::BranchState { primary, branch, base }` → `Answer::BranchState(BranchState)`.
+  - `Done::Removed { removed: Removed, sessions: Vec<String> }`: ids of the sessions the job relocated
+    (`sessions_under` now returns `(path, id)`); the park record = these ∪ the moved tabs' session ids. `moved`
+    targets are matched by session key only (the `/move` path fix starts a new controller generation); tabs are
+    matched to sessions by session file name (omp's `/move` keeps it) and get `SetSessionPath` once they moved.
+- **omp-deck**
+  - **Remove worktree…**: merged → as today. Not merged but clean + pushed → "Park" confirm (branch, upstream,
+    "the PR is not merged yet; the local branch is kept and never deleted by OmpDeck; sessions move into <parent>")
+    → same relocation flow with `Removal::Park`; on success a `ParkedBranch` with the ids of every session of the
+    worktree (scan before removal) is recorded. Otherwise refused with the reasons (push first / commit first).
+  - Rows of parked sessions (id in a record): chip `parked · <branch>` (own hue); hover Branch / Base / "Parked —
+    local branch kept"; when checked out in the primary: "checked out in the main checkout".
+  - Row/tab menu on parked sessions: **Continue in worktree** (disabled with a reason while the branch is checked
+    out somewhere): default location for the branch → `WorktreeAddExisting` → open tabs of the record's sessions get
+    `MoveTo { dest: worktree }`, closed ones `RelocateSessions`, then the clicked session is opened/focused; records
+    `worktree_bases[worktree] = base`, drops the park record. **Continue in main checkout**: `Query::BranchState`,
+    confirm that lists the other running sessions in the main checkout ("they will see branch <b>"), `SwitchBranch
+    (primary, branch)` (dirty → refused with the reason), then opens/focuses the session. **Switch main checkout
+    back to <base>** when the branch is checked out in the primary (same confirm/refusal).
+  - Record pruning (startup + every 10 min, worker): drop when the branch no longer exists, or when it is merged and
+    not checked out anywhere. Never deletes a branch.
+  - **Row hover buttons** (user, 2026-10-26): every worktree/park action of a row is also an icon button shown on
+    hover of the eligible row (header-button style: size, outline pop, tooltip = menu label, disabled + reason):
+    worktree rows → Finish worktree (Cancel finishing while finishing) + Remove worktree…; parked rows → Continue in
+    worktree + Continue in main checkout (Switch main checkout back to <base> when checked out there). Same code
+    path as the menu items; the age column yields to the buttons while hovered.

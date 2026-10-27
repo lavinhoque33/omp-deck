@@ -1012,6 +1012,8 @@ mod tests {
         let tabs = [crate::tabs::Tab::Settings, crate::tabs::Tab::Settings];
         let labels = HashMap::new();
         let busy = HashSet::new();
+        let finishing = HashMap::new();
+        let parkable = HashSet::new();
         let state = UpdateState::default();
         let input = BarInput {
             tabs: TabBarInput {
@@ -1026,6 +1028,12 @@ mod tests {
                     busy: &busy,
                     drive: crate::sidebar::DriveMenu::Hidden,
                     live_tabs: &[],
+                    finishing: &finishing,
+                    parked: crate::worktree_ui::ParkView {
+                        records: &[],
+                        states: &[],
+                        parkable: &parkable,
+                    },
                 },
                 modal_open: false,
                 shown: &[],

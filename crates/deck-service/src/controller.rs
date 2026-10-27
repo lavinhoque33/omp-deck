@@ -54,6 +54,8 @@ pub const REVIEW_SEND_LABEL: &str = "Send review";
 pub const WORKTREE_MOVE_LABEL: &str = "Move to worktree";
 /// Job label of the injected worktree finish prompt.
 pub const WORKTREE_FINISH_LABEL: &str = "Finish worktree";
+/// Job label of the `/move <dir>` relocation (a finished worktree's session into its repository).
+pub const MOVE_TO_LABEL: &str = "Move to folder";
 
 /// Settled requests remembered per session (pending ones are never dropped).
 const HISTORY: usize = 256;
@@ -243,6 +245,8 @@ pub enum Command {
     WorktreeMove { branch: String },
     /// The worktree finish prompt.
     WorktreeFinish { prompt: String },
+    /// `/move <dest>`: omp moves the session (file, artifacts, process cwd) into `dest`.
+    MoveTo { dest: std::path::PathBuf },
 }
 
 /// Which kind of command a request carried (for clients mapping outcomes back to their state).
@@ -253,6 +257,7 @@ pub enum CommandKind {
     Review { send: bool },
     WorktreeMove,
     WorktreeFinish,
+    MoveTo,
 }
 
 impl Command {
@@ -263,6 +268,7 @@ impl Command {
             Command::Review { send, .. } => CommandKind::Review { send: *send },
             Command::WorktreeMove { .. } => CommandKind::WorktreeMove,
             Command::WorktreeFinish { .. } => CommandKind::WorktreeFinish,
+            Command::MoveTo { .. } => CommandKind::MoveTo,
         }
     }
 
@@ -318,6 +324,10 @@ pub enum Rejected {
     Expired,
     #[error("omp is receiving a command; type again in a moment")]
     InputHeld,
+    #[error(
+        "that folder cannot be typed into omp (it must be absolute, without control characters)"
+    )]
+    BadPath,
 }
 
 /// Why a job was dropped before its first byte.
@@ -928,6 +938,19 @@ impl SessionController {
                 }
                 Ok((
                     Job::slash(WORKTREE_FINISH_LABEL, prompt, Requires::Idle),
+                    None,
+                ))
+            }
+            Command::MoveTo { dest } => {
+                if self.is_busy() {
+                    return Err(Rejected::Busy);
+                }
+                let text = dest
+                    .to_str()
+                    .filter(|t| dest.is_absolute() && !t.chars().any(char::is_control))
+                    .ok_or(Rejected::BadPath)?;
+                Ok((
+                    Job::slash(MOVE_TO_LABEL, &format!("/move {text}"), Requires::Idle),
                     None,
                 ))
             }

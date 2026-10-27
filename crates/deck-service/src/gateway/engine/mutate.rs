@@ -228,19 +228,28 @@ impl Engine {
             {
                 refused("change the gateway mode with SetGatewayMode")
             }
-            Mutation::WorktreeRemove { worktree, stop, .. } => {
+            Mutation::WorktreeRemove {
+                worktree,
+                stop,
+                moved,
+                ..
+            } => {
                 for t in stop {
                     if let Err(e) = self.check_target(t) {
                         return Some(e);
                     }
                 }
+                // `moved` sessions are only exempted here, never acted on: their `/move` started
+                // a new generation, so they are matched by session, not by exact target.
                 self.sess
                     .managed
                     .iter()
                     .find(|m| {
+                        let target = m.ctl.target();
                         !m.exited()
-                            && m.cwd.starts_with(&worktree.path)
-                            && !stop.iter().any(|t| *t == *m.ctl.target())
+                            && m.current_cwd().starts_with(&worktree.path)
+                            && !stop.iter().any(|t| t == target)
+                            && !moved.iter().any(|t| t.key == target.key)
                     })
                     .map(|_| {
                         GatewayError::Refused(
@@ -674,8 +683,9 @@ impl Engine {
             Mutation::WorktreeRemove {
                 worktree,
                 base,
-                delete_branch,
+                how,
                 stop,
+                moved: _,
             } => {
                 // Backend sessions are killed by the job; direct programs end here.
                 let mut names = Vec::new();
@@ -695,9 +705,40 @@ impl Engine {
                     false,
                     false,
                     Post::Refresh,
-                    move |ctx, _, _| {
-                        jobs::worktree_remove(ctx, &worktree, &base, delete_branch, &names)
-                    },
+                    move |ctx, _, _| jobs::worktree_remove(ctx, &worktree, &base, how, &names),
+                );
+            }
+            Mutation::WorktreeAddExisting { repo, branch, dest } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "worktree-add-existing",
+                    false,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::worktree_add_existing(ctx, &repo, &branch, &dest),
+                );
+            }
+            Mutation::SwitchBranch { dir, branch } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "git-switch",
+                    false,
+                    false,
+                    Post::None,
+                    move |_, _, _| jobs::switch_branch(&dir, &branch),
+                );
+            }
+            Mutation::RelocateSessions { files, dest } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "relocate-sessions",
+                    false,
+                    false,
+                    Post::Refresh,
+                    move |ctx, _, _| jobs::relocate_sessions(ctx, &files, &dest),
                 );
             }
             Mutation::OmpSet {

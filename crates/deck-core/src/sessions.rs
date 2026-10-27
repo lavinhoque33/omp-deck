@@ -121,6 +121,49 @@ mod tests {
     }
 
     #[test]
+    fn sessions_under_finds_worktree_stub_and_subdir_sessions_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = SessionsRoot::at(tmp.path().join("sessions"));
+        let wt = tmp.path().join("wt");
+        fs::create_dir_all(wt.join("sub")).unwrap();
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        let write = |bucket: &str, name: &str, cwd: &Path, body: &str| {
+            let dir = root.path.join(bucket);
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(name);
+            let header = format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{name}\",\"cwd\":{}}}\n{body}",
+                serde_json::to_string(&cwd.to_string_lossy()).unwrap()
+            );
+            fs::write(&path, header).unwrap();
+            path
+        };
+        let real = write(
+            "a",
+            "real.jsonl",
+            &wt,
+            "{\"type\":\"title\",\"title\":\"t\"}\n",
+        );
+        let stub = write("a", "stub.jsonl", &wt, "");
+        let sub = write("b", "sub.jsonl", &wt.join("sub"), "");
+        write("c", "other.jsonl", &other, "");
+        // A sibling of `wt` sharing its name prefix is not inside it.
+        write("c", "wt2.jsonl", &tmp.path().join("wt2"), "");
+        // A subagent transcript lives in the session's artifact directory.
+        write("a/real", "sub-agent.jsonl", &wt, "");
+        let mut want: Vec<(PathBuf, String)> = [real, stub, sub]
+            .into_iter()
+            .map(|p| {
+                let id = p.file_name().unwrap().to_string_lossy().into_owned();
+                (p, id)
+            })
+            .collect();
+        want.sort();
+        assert_eq!(sessions_under(&root, &wt), want);
+    }
+
+    #[test]
     fn absolutize_normalizes_lexically() {
         #[cfg(unix)]
         {
@@ -210,6 +253,7 @@ pub fn find_copy(
 }
 
 struct ForkHeader {
+    id: Option<String>,
     parent: Option<String>,
     cwd: Option<String>,
 }
@@ -268,6 +312,7 @@ fn header_fork(path: &Path) -> io::Result<Option<ForkHeader>> {
         };
         if line.kind.as_deref() == Some("session") {
             return Ok(Some(ForkHeader {
+                id: line.id,
                 parent: line.parent_session,
                 cwd: line.cwd,
             }));
@@ -275,6 +320,58 @@ fn header_fork(path: &Path) -> io::Result<Option<ForkHeader>> {
     }
     Ok(None)
 }
+
+/// Every top-level session `.jsonl` under `root` (real files; sibling artifact directories such
+/// as subagent transcripts are never entered; prompt-less stubs included) whose header `cwd` is
+/// `dir` or lies inside it, textually or after resolving symlinks, as `(path, header session
+/// id)`. Only the first [`HEADER_LIMIT`] bytes of each file are read; unreadable files are
+/// skipped.
+pub fn sessions_under(root: &SessionsRoot, dir: &Path) -> Vec<(PathBuf, String)> {
+    let real_dir = fs::canonicalize(dir).ok();
+    let inside = |cwd: &Path| {
+        cwd.starts_with(dir)
+            || real_dir.as_deref().is_some_and(|rd| {
+                fs::canonicalize(cwd).is_ok_and(|real_cwd| real_cwd.starts_with(rd))
+            })
+    };
+    let mut out = Vec::new();
+    let Ok(projects) = fs::read_dir(&root.path) else {
+        return out;
+    };
+    for project in projects.flatten() {
+        if !project.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(project.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            // `DirEntry` metadata does not follow symlinks.
+            if path.extension().is_none_or(|e| e != "jsonl")
+                || !file.metadata().is_ok_and(|m| m.is_file())
+            {
+                continue;
+            }
+            match header_fork(&path) {
+                Ok(Some(ForkHeader {
+                    cwd: Some(cwd), id, ..
+                })) if inside(Path::new(&cwd)) => {
+                    let id = id.unwrap_or_else(|| {
+                        path.file_stem()
+                            .map_or_else(String::new, |s| s.to_string_lossy().into_owned())
+                    });
+                    out.push((path, id));
+                }
+                Ok(_) => {}
+                Err(e) => log::debug!("sessions_under: skip {}: {e}", path.display()),
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// One-shot scan; see [`Scanner`] for the incremental variant.
 pub fn scan(root: &SessionsRoot) -> Vec<ProjectGroup> {
     Scanner::new(root.clone()).scan()
@@ -530,7 +627,11 @@ fn prompt_text(content: RawContent) -> Option<String> {
 
 /// `cwd` of the session header (bounded read).
 pub(crate) fn header_cwd(path: &Path) -> Option<PathBuf> {
-    parse_file(path).ok().flatten().map(|p| p.cwd)
+    header_fork(path)
+        .ok()
+        .flatten()
+        .and_then(|h| h.cwd)
+        .map(PathBuf::from)
 }
 
 pub(crate) fn parse_file(path: &Path) -> io::Result<Option<Parsed>> {

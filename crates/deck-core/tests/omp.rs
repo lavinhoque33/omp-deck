@@ -506,6 +506,156 @@ cat >/dev/null"#,
 
 #[cfg(unix)]
 #[test]
+fn relocate_session_sends_move_from_dest_and_returns_the_new_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = tmp.path().join("wt");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&wt).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let src = write_session(&tmp.path().join("agent-old"), &wt);
+    // What omp leaves behind after `/move`: the same file name in the repo's bucket.
+    let moved = write_session(&tmp.path().join("agent"), &repo);
+    let script = |name: &str, body: &str| {
+        let p = tmp.path().join(name);
+        install_exec(&p, &format!("#!/bin/sh\n{body}\n"));
+        Omp::at(p).with_env("PI_CODING_AGENT_DIR", tmp.path().join("agent"))
+    };
+
+    let ok = script(
+        "ok.sh",
+        &format!(
+            r#"echo "$@" > "{0}/argv"
+pwd > "{0}/pwd"
+read a; read b
+echo "$a" > "{0}/request1.json"
+echo "$b" > "{0}/request2.json"
+echo '{{"type":"ready"}}'
+echo '{{"id":"1","type":"response","command":"prompt","success":true,"data":{{"agentInvoked":false}}}}'
+echo '{{"id":"2","type":"response","command":"get_state","success":true,"data":{{"sessionFile":"{1}"}}}}'
+cat >/dev/null"#,
+            tmp.path().display(),
+            moved.display()
+        ),
+    );
+    assert_eq!(ok.relocate_session(&src, &repo).unwrap(), moved);
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("argv")).unwrap().trim(),
+        format!("--mode rpc --resume {} --no-extensions", src.display())
+    );
+    assert_eq!(
+        Path::new(fs::read_to_string(tmp.path().join("pwd")).unwrap().trim()),
+        fs::canonicalize(&repo).unwrap()
+    );
+    let req: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(tmp.path().join("request1.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        (req["type"].as_str(), req["message"].as_str()),
+        (
+            Some("prompt"),
+            Some(format!("/move {}", repo.display()).as_str())
+        )
+    );
+
+    // get_state names a stale (missing) file: the file is found in the destination's bucket.
+    let stale = script(
+        "stale.sh",
+        r#"read a; read b
+echo '{"id":"1","type":"response","command":"prompt","success":true,"data":{}}'
+echo '{"id":"2","type":"response","command":"get_state","success":true,"data":{"sessionFile":"/gone/old.jsonl"}}'
+cat >/dev/null"#,
+    );
+    assert_eq!(stale.relocate_session(&src, &repo).unwrap(), moved);
+
+    // omp's refusal text is the error.
+    let refused = script(
+        "refused.sh",
+        r#"read a
+echo '{"id":"1","type":"response","command":"prompt","success":false,"error":"Error: Cannot move while streaming"}'
+cat >/dev/null"#,
+    );
+    assert_eq!(
+        refused
+            .relocate_session(&src, &repo)
+            .unwrap_err()
+            .to_string(),
+        "Cannot move while streaming"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn relocate_session_retries_a_live_writer_and_skips_omp_when_already_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = tmp.path().join("wt");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&wt).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let src = write_session(&tmp.path().join("agent-old"), &wt);
+    let moved = write_session(&tmp.path().join("agent"), &repo);
+    let runs = tmp.path().join("runs");
+    let flaky = tmp.path().join("flaky.sh");
+    install_exec(
+        &flaky,
+        &format!(
+            r#"#!/bin/sh
+echo x >> "{0}"
+if [ "$(wc -l < "{0}")" -lt 3 ]; then
+  echo 'Error: session is open in another live omp process (pid 1)' >&2
+  exit 1
+fi
+read a; read b
+echo '{{"id":"1","type":"response","command":"prompt","success":true,"data":{{}}}}'
+echo '{{"id":"2","type":"response","command":"get_state","success":true,"data":{{"sessionFile":"{1}"}}}}'
+cat >/dev/null
+"#,
+            runs.display(),
+            moved.display()
+        ),
+    );
+    let omp = Omp::at(flaky);
+    assert_eq!(omp.relocate_session(&src, &repo).unwrap(), moved);
+    assert_eq!(fs::read_to_string(&runs).unwrap().lines().count(), 3);
+
+    // A held lease that never frees up surfaces omp's text after ~3 s.
+    let stuck = tmp.path().join("stuck.sh");
+    install_exec(
+        &stuck,
+        "#!/bin/sh\necho 'Error: session is open in another live omp process' >&2\nexit 1\n",
+    );
+    let e = Omp::at(stuck).relocate_session(&src, &repo).unwrap_err();
+    assert!(e.to_string().contains("another live omp process"), "{e}");
+
+    // Header cwd already the destination: omp is not run at all.
+    let never = tmp.path().join("never.sh");
+    install_exec(
+        &never,
+        &format!("#!/bin/sh\ntouch \"{}/ran\"\n", tmp.path().display()),
+    );
+    assert_eq!(
+        Omp::at(never).relocate_session(&moved, &repo).unwrap(),
+        moved
+    );
+    assert!(!tmp.path().join("ran").exists());
+}
+
+#[test]
+fn relocate_session_rejects_bad_destinations_and_files_without_running_omp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = tmp.path().join("wt");
+    fs::create_dir_all(&wt).unwrap();
+    let src = write_session(&tmp.path().join("agent"), &wt);
+    let omp = Omp::at(tmp.path().join("no-such-omp"));
+    let err = |file: &Path, dest: &Path| omp.relocate_session(file, dest).unwrap_err().to_string();
+    assert!(err(&src, Path::new("rel/dir")).contains("absolute"));
+    assert!(err(&src, &tmp.path().join("missing")).contains("not a directory"));
+    assert!(err(&src, &PathBuf::from(format!("{}\nx", tmp.path().display()))).contains("control"));
+    assert!(err(&wt.join("x.txt"), tmp.path()).contains("Not a session file"));
+    assert!(err(&wt, tmp.path()).contains("Not a session file"));
+}
+
+#[cfg(unix)]
+#[test]
 fn unpack_session_runs_detached_from_the_terminal_and_reports_the_mode() {
     use deck_core::omp::MoveKind;
     let tmp = tempfile::tempdir().unwrap();

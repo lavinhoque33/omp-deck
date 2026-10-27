@@ -540,6 +540,15 @@ fn delete_result(v: &Value) -> Result<(), DeleteError> {
     }
 }
 
+/// `a` and `b` name the same directory (textually, else after resolving links).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
 fn failed(message: impl Into<String>) -> OmpError {
     OmpError::Failed {
         code: None,
@@ -1142,6 +1151,115 @@ impl Omp {
             Some(entry_id),
             std::time::Duration::from_secs(30),
         )
+    }
+
+    /// Moves a closed session (jsonl + sibling artifacts) into `dest`'s bucket with omp's own
+    /// `/move`, headless: `omp --mode rpc --resume <file> --no-extensions` with process cwd
+    /// `dest`, one `{"type":"prompt","message":"/move <dest>"}` (no model call, nothing appended
+    /// to the session), then `get_state` for the new session file (else the same file name under
+    /// `dest`'s bucket, verified by its header cwd). `dest` must be an existing absolute
+    /// directory without control characters; `file` a `.jsonl` regular file. A header cwd that
+    /// already is `dest` returns `file` without running omp. A live omp holding the session is
+    /// retried for ~3 s before its message is returned. 60 s timeout, process tree killed.
+    /// Blocking: run on a worker.
+    pub fn relocate_session(&self, file: &Path, dest: &Path) -> Result<PathBuf, OmpError> {
+        use std::time::{Duration, Instant};
+
+        let file = std::path::absolute(file)?;
+        if !dest.is_absolute() {
+            return Err(failed(format!(
+                "Destination is not an absolute path: {}",
+                dest.display()
+            )));
+        }
+        if dest.to_string_lossy().chars().any(char::is_control) {
+            return Err(failed("Destination contains control characters"));
+        }
+        if !dest.is_dir() {
+            return Err(failed(format!(
+                "Destination is not a directory: {}",
+                dest.display()
+            )));
+        }
+        if file.extension().is_none_or(|e| e != "jsonl") || !file.is_file() {
+            return Err(failed(format!("Not a session file: {}", file.display())));
+        }
+        if crate::sessions::header_cwd(&file).is_some_and(|c| same_dir(&c, dest)) {
+            return Ok(file);
+        }
+        let message = format!("/move {}", dest.display());
+        let args = vec![
+            OsString::from("--resume"),
+            file.clone().into_os_string(),
+            OsString::from("--no-extensions"),
+        ];
+        let requests = [
+            serde_json::json!({"id": "1", "type": "prompt", "message": message}),
+            serde_json::json!({"id": "2", "type": "get_state"}),
+        ];
+        let name = file.file_name().map(PathBuf::from).unwrap_or_default();
+        let give_up = Instant::now() + Duration::from_secs(3);
+        loop {
+            let mut moved = false;
+            let mut state: Option<Option<PathBuf>> = None;
+            let verified = |p: &Path| {
+                p.is_file() && crate::sessions::header_cwd(p).is_some_and(|c| same_dir(&c, dest))
+            };
+            let result = self.rpc_exchange(
+                &args,
+                dest.to_path_buf(),
+                &requests,
+                Duration::from_secs(60),
+                |id, v| {
+                    match id {
+                        Some("1") => moved = true,
+                        Some("2") => {
+                            state = Some(
+                                v.pointer("/data/sessionFile")
+                                    .and_then(Value::as_str)
+                                    .map(PathBuf::from)
+                                    .filter(|p| verified(p)),
+                            );
+                        }
+                        _ => return None,
+                    }
+                    // `get_state` may answer before the move finished: only an answer that
+                    // verifies counts; otherwise the bucket scan below decides.
+                    match (&state, moved) {
+                        (Some(Some(p)), true) => Some(Ok(Some(p.clone()))),
+                        (Some(None), true) => Some(Ok(None)),
+                        _ => None,
+                    }
+                },
+            );
+            match result {
+                Ok(Some(new)) => return Ok(new),
+                Ok(None) => {
+                    return self.find_in_bucket(&name, dest).ok_or_else(|| {
+                        failed("omp moved the session but its new file was not found")
+                    });
+                }
+                Err(e)
+                    if Instant::now() < give_up
+                        && e.to_string().contains("another live omp process") =>
+                {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// `<bucket>/<name>` under the sessions root whose header cwd is `dest`.
+    fn find_in_bucket(&self, name: &Path, dest: &Path) -> Option<PathBuf> {
+        let root = self.sessions_root();
+        std::fs::read_dir(&root.path)
+            .ok()?
+            .flatten()
+            .map(|b| b.path().join(name))
+            .find(|p| {
+                p.is_file() && crate::sessions::header_cwd(p).is_some_and(|c| same_dir(&c, dest))
+            })
     }
 
     /// Copies a whole session into `dest_cwd` without a terminal: a headless

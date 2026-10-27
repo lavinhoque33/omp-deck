@@ -182,10 +182,20 @@ enum PendingConfirm {
     KillRunning(Vec<String>),
     /// Restore a downloaded Google Drive backup over the local omp config.
     RestoreBackup(drive::PendingRestore),
-    /// Remove a clean, merged worktree (and its branch) after stopping the tabs inside it.
+    /// Remove a clean worktree after moving the tabs inside it into the primary checkout:
+    /// merged ones with their branch, pushed ones parked (the branch stays).
     RemoveWorktree {
         wt: Worktree,
         base: String,
+        how: deck_core::worktree::Removal,
+    },
+    /// Check `target` out in the main checkout `primary` (a parked branch, or its base again);
+    /// `open` then opens the clicked session.
+    SwitchMain {
+        entry: SessionEntry,
+        primary: PathBuf,
+        target: String,
+        open: bool,
     },
     /// Drop the project-backup row of a worktree that no longer exists.
     DropSyncRow {
@@ -884,17 +894,31 @@ impl App {
     }
 
     fn open_session(&mut self, entry: &SessionEntry) {
-        // A removed worktree's folder is gone: omp relocates its session to the launch folder, so
-        // that is the primary checkout, not whatever the missing folder resolves to.
-        let cwd = self
+        // A removed worktree's folder is gone: its session is moved into the primary checkout
+        // first (unless a tab already shows it), then opened there.
+        let primary = self
             .cfg
             .removed_worktrees
             .get(&entry.cwd)
-            .map_or_else(|| entry.cwd.clone(), |r| r.primary.clone());
+            .map(|r| r.primary.clone());
+        if let Some(primary) = primary
+            && !self
+                .tabs
+                .iter()
+                .any(|t| t.session_path() == Some(entry.path.as_path()))
+        {
+            self.open_relocated(entry, primary);
+            return;
+        }
+        self.open_entry_at(entry, entry.path.clone(), entry.cwd.clone());
+    }
+
+    /// Opens `entry` (a tab is focused or launched) on the session file `path` in `cwd`.
+    fn open_entry_at(&mut self, entry: &SessionEntry, path: PathBuf, cwd: PathBuf) {
         self.open_resolved(ClosedTab {
             mux_name: Some(session_name_for(&entry.id)),
             cwd,
-            session_path: Some(entry.path.clone()),
+            session_path: Some(path),
             title: entry.label().to_owned(),
         });
     }
@@ -1642,6 +1666,12 @@ impl App {
                     busy: &self.moving,
                     drive: self.drive_menu(),
                     live_tabs: &live_tabs,
+                    finishing: &self.wt.finishing,
+                    parked: crate::worktree_ui::ParkView {
+                        records: &self.cfg.parked_branches,
+                        states: &self.wt.park_states,
+                        parkable: &self.wt.parkable,
+                    },
                 },
             },
             csd: !self.cfg.native_decorations,
@@ -1797,6 +1827,11 @@ impl App {
             drive: self.drive_menu(),
             finishing: &self.wt.finishing,
             removed: &self.cfg.removed_worktrees,
+            parked: crate::worktree_ui::ParkView {
+                records: &self.cfg.parked_branches,
+                states: &self.wt.park_states,
+                parkable: &self.wt.parkable,
+            },
         };
         let margin = if theme::compact() {
             Margin::symmetric(8, 8)
@@ -1869,6 +1904,9 @@ impl App {
             SidebarAction::FinishWorktree(wt) => self.request_finish(wt),
             SidebarAction::CancelFinish(path) => self.cancel_finish(&path),
             SidebarAction::RemoveWorktree(wt) => self.request_remove(wt),
+            SidebarAction::ContinueInWorktree(entry) => self.continue_in_worktree(entry),
+            SidebarAction::ContinueInMain(entry) => self.continue_in_main(entry),
+            SidebarAction::SwitchMainBack(entry) => self.switch_main_back(entry),
         }
     }
 
@@ -2101,7 +2139,13 @@ impl App {
             }
             PendingConfirm::StopSessions(paths) => self.execute_stop_sessions(paths),
             PendingConfirm::KillRunning(names) => self.execute_kill_running(names),
-            PendingConfirm::RemoveWorktree { wt, base } => self.execute_remove(wt, base),
+            PendingConfirm::RemoveWorktree { wt, base, how } => self.execute_remove(wt, base, how),
+            PendingConfirm::SwitchMain {
+                entry,
+                primary,
+                target,
+                open,
+            } => self.execute_switch_main(entry, primary, target, open),
             PendingConfirm::DropSyncRow { path } => self.drop_sync_row(&path),
             PendingConfirm::Changes(w) => self.execute_changes_write(w),
             PendingConfirm::ClearDraft { .. } | PendingConfirm::RestoreBackup(_) => {}

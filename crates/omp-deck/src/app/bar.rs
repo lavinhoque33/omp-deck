@@ -220,6 +220,8 @@ impl App {
         delivery: &Delivery,
     ) {
         let finish = kind == CommandKind::WorktreeFinish;
+        // Both retry by themselves; only the final failure is announced.
+        let quiet = finish || kind == CommandKind::MoveTo;
         match (kind, delivery) {
             (CommandKind::Review { send }, Delivery::Delivered) => {
                 self.review_delivered(uid, send, id);
@@ -232,16 +234,16 @@ impl App {
             Delivery::Refused(Refusal::NoBracketedPaste) => Some(format!(
                 "{label} refused: omp has not enabled bracketed paste"
             )),
-            Delivery::Refused(Refusal::Precondition(Requires::Idle)) if !finish => Some(format!(
+            Delivery::Refused(Refusal::Precondition(Requires::Idle)) if !quiet => Some(format!(
                 "{label} needs omp to be idle — try again when it finishes"
             )),
-            Delivery::Refused(Refusal::DialogOpen) if !finish => {
+            Delivery::Refused(Refusal::DialogOpen) if !quiet => {
                 Some("Close omp's open dialog first".to_owned())
             }
-            Delivery::Aborted if !finish => Some(format!(
+            Delivery::Aborted if !quiet => Some(format!(
                 "{label} cancelled: omp started working — check the composer"
             )),
-            Delivery::Stalled if !finish => Some(format!(
+            Delivery::Stalled if !quiet => Some(format!(
                 "{label} cancelled: omp did not show it in time — check the composer"
             )),
             // Never a success claim and never retried: it may still be written.
@@ -258,7 +260,7 @@ impl App {
             Delivery::Refused(Refusal::Precondition(_) | Refusal::DialogOpen)
                 | Delivery::Aborted
                 | Delivery::Stalled
-        ) || (kind == CommandKind::WorktreeMove
+        ) || (matches!(kind, CommandKind::WorktreeMove | CommandKind::MoveTo)
             && matches!(delivery, Delivery::Cancelled(_)));
         if lost {
             self.injection_lost(uid, kind);

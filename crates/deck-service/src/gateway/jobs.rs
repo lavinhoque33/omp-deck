@@ -14,8 +14,8 @@ use deck_core::ctl::{CtlClient, CtlCommand, CtlReply};
 use deck_core::gdrive::{self, LoginFlow, PreparedProjectRestore, PreparedRestore, Service};
 use deck_core::inventory::{InventoryEntry, SessionStats, StatsCache};
 use deck_core::omp::{Omp, SECRET_PLACEHOLDER, SettingsCatalog};
-use deck_core::sessions::{SessionsRoot, find_copy, find_fork};
-use deck_core::worktree::{self, Removed, Worktree};
+use deck_core::sessions::{SessionsRoot, find_copy, find_fork, sessions_under};
+use deck_core::worktree::{self, Removal, Removed, Worktree};
 
 use super::protocol::{
     Answer, Done, GatewayError, Progress, Query, RestorePlanView, RunningDetail,
@@ -185,6 +185,13 @@ pub fn query(ctx: &JobCtx, q: &Query) -> Option<Result<Answer, GatewayError>> {
         Query::MergeTarget { primary, base } => worktree::find_merge_target(primary, base)
             .map(Answer::MergeTarget)
             .map_err(GatewayError::Failed),
+        Query::BranchState {
+            primary,
+            branch,
+            base,
+        } => worktree::branch_state(primary, branch, base)
+            .map(Answer::BranchState)
+            .map_err(failed),
         Query::DriveList => ctx
             .drive()
             .and_then(|s| s.list().map_err(failed))
@@ -322,24 +329,90 @@ pub fn worktree_create(
         .map_err(failed)
 }
 
-/// Stops `stop` (backend names), then removes the worktree. A removal whose git step failed
-/// after the folder was deleted still counts as removed (the branch note says why).
+pub fn worktree_add_existing(
+    ctx: &JobCtx,
+    repo: &Path,
+    branch: &str,
+    dest: &Path,
+) -> Result<Done, GatewayError> {
+    worktree::add_existing(ctx.omp()?, repo, branch, dest)
+        .map(|()| Done::Path(dest.to_path_buf()))
+        .map_err(failed)
+}
+
+pub fn switch_branch(dir: &Path, branch: &str) -> Result<Done, GatewayError> {
+    worktree::switch_branch(dir, branch)
+        .map(|()| Done::Unit)
+        .map_err(failed)
+}
+
+/// Stops `stop` (backend names), moves every session of the worktree (header cwd inside it,
+/// stubs included) into its primary repository with omp's `/move`, then removes the worktree
+/// (`how`: merged, or parked with its branch kept). Nothing is moved while removal would be
+/// refused, and the first failed move keeps the worktree. A removal whose git step failed after
+/// the folder was deleted still counts as removed (the branch note says why).
 pub fn worktree_remove(
     ctx: &JobCtx,
     wt: &Worktree,
     base: &str,
-    delete_branch: bool,
+    how: Removal,
     stop: &[String],
 ) -> Result<Done, GatewayError> {
     lifecycle::kill_all(&ctx.backends, stop, "worktree removal");
-    match worktree::remove(wt, base, delete_branch) {
-        Ok(r) => Ok(Done::Removed(r)),
-        Err(e) if !wt.path.exists() => Ok(Done::Removed(Removed {
-            branch_deleted: false,
-            branch_note: Some(e.to_string()),
-        })),
+    if wt.path.is_dir() {
+        let st = worktree::status(wt, base).map_err(failed)?;
+        let why = match how {
+            Removal::Merged { .. } => worktree::blockers(&st, base),
+            Removal::Park => worktree::park_blockers(&st),
+        };
+        if !why.is_empty() {
+            return Err(GatewayError::Refused(format!(
+                "the worktree cannot be removed: {}",
+                why.join("; ")
+            )));
+        }
+    }
+    let found = sessions_under(&ctx.root, &wt.path);
+    if !found.is_empty() {
+        let omp = ctx.omp()?;
+        for (file, _) in &found {
+            omp.relocate_session(file, &wt.primary).map_err(|e| {
+                GatewayError::Failed(format!(
+                    "could not move a session of this worktree into {}: {e}; the worktree was kept",
+                    wt.primary.display()
+                ))
+            })?;
+        }
+    }
+    let sessions = found.into_iter().map(|(_, id)| id).collect();
+    match worktree::remove(wt, base, how) {
+        Ok(removed) => Ok(Done::Removed { removed, sessions }),
+        Err(e) if !wt.path.exists() => Ok(Done::Removed {
+            removed: Removed {
+                branch_deleted: false,
+                branch_note: Some(e.to_string()),
+            },
+            sessions,
+        }),
         Err(e) => Err(failed(e)),
     }
+}
+
+/// Moves each closed session in `files` into `dest` with omp's `/move`, one after the other.
+pub fn relocate_sessions(
+    ctx: &JobCtx,
+    files: &[PathBuf],
+    dest: &Path,
+) -> Result<Done, GatewayError> {
+    let omp = ctx.omp()?;
+    let results = files
+        .iter()
+        .map(|f| {
+            let r = omp.relocate_session(f, dest).map_err(|e| e.to_string());
+            (f.clone(), r)
+        })
+        .collect();
+    Ok(Done::Relocated(results))
 }
 
 pub fn omp_set(ctx: &JobCtx, key: &str, value: &serde_json::Value) -> Result<Done, GatewayError> {

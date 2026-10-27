@@ -18,6 +18,8 @@ const MAX_WALK: usize = 64;
 const GIT_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const GIT_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 const OMP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Bound of the best-effort upstream fetch in [`status`].
+const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Longest slug in bytes (slugs are ASCII).
 const SLUG_MAX: usize = 60;
 /// `-2`, `-3`, … suffixes tried by [`default_location`] before giving up on uniqueness.
@@ -46,6 +48,9 @@ pub enum WorktreeError {
     Omp { stderr: String },
     #[error("worktree cannot be removed safely: {}", describe(.0))]
     Unsafe(Vec<Unsafe>),
+    /// [`switch_branch`] refused: the checkout has local changes.
+    #[error("{} has uncommitted or untracked changes", .0.display())]
+    DirtyCheckout(PathBuf),
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("timed out")]
@@ -61,6 +66,8 @@ pub enum Unsafe {
     NotMerged { ahead: u32 },
     /// Detached HEAD whose commit is not in the base (it would become unreachable).
     Detached,
+    /// Park only: HEAD is not in the branch's upstream (unpushed commits or no upstream).
+    NotPushed,
     /// The worktree directory no longer exists.
     Missing,
 }
@@ -73,6 +80,7 @@ fn describe(reasons: &[Unsafe]) -> String {
             Unsafe::NotMerged { ahead } => format!("{ahead} commit(s) not merged into the base"),
             Unsafe::Detached => "detached HEAD with commits not in the base".to_owned(),
             Unsafe::Missing => "the worktree folder is missing".to_owned(),
+            Unsafe::NotPushed => "commits not pushed to the branch's upstream".to_owned(),
         })
         .collect();
     parts.join("; ")
@@ -451,6 +459,37 @@ pub fn create(
     dest: &Path,
 ) -> Result<(), WorktreeError> {
     check_base(base_ref)?;
+    run_omp_add(
+        omp,
+        repo,
+        &[OsStr::new("-b"), OsStr::new(branch)],
+        dest,
+        base_ref,
+    )
+}
+
+/// `omp worktree add -q -C <repo> <dest> <branch>`: checks the existing local `branch` out at
+/// `dest` (no `-b`), with the same clean-checkout overlay as [`create`]. Git refuses a branch
+/// that is checked out elsewhere; its message is surfaced in [`WorktreeError::Omp`].
+pub fn add_existing(
+    omp: &Omp,
+    repo: &Path,
+    branch: &str,
+    dest: &Path,
+) -> Result<(), WorktreeError> {
+    check_base(branch)?;
+    run_omp_add(omp, repo, &[], dest, branch)
+}
+
+/// Shared tail of [`create`] / [`add_existing`]: `omp worktree add -q -C <repo> <flags…> <dest>
+/// <target>` with the overlay in `PI_CONFIG_FILES`.
+fn run_omp_add(
+    omp: &Omp,
+    repo: &Path,
+    flags: &[&OsStr],
+    dest: &Path,
+    target: &str,
+) -> Result<(), WorktreeError> {
     if !dest.is_absolute() {
         return Err(WorktreeError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -469,17 +508,16 @@ pub fn create(
     files.push(overlay);
     let joined = std::env::join_paths(files)
         .map_err(|e| WorktreeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-    let args: [&OsStr; 9] = [
+    let mut args: Vec<&OsStr> = vec![
         OsStr::new("worktree"),
         OsStr::new("add"),
         OsStr::new("-q"),
         OsStr::new("-C"),
         repo.as_os_str(),
-        OsStr::new("-b"),
-        OsStr::new(branch),
-        dest.as_os_str(),
-        OsStr::new(base_ref),
     ];
+    args.extend_from_slice(flags);
+    args.push(dest.as_os_str());
+    args.push(OsStr::new(target));
     let mut cmd = omp.command(&args);
     cmd.env("PI_CONFIG_FILES", joined);
     let (code, stdout, stderr) = run_bounded(cmd, OMP_TIMEOUT).map_err(usage_err)?;
@@ -505,10 +543,17 @@ pub struct WorktreeStatus {
     pub branch: Option<String>,
     /// Staged, unstaged or untracked changes; ignored files excluded.
     pub dirty: bool,
-    /// HEAD is an ancestor of the base.
+    /// HEAD is contained in the base or in its upstream: an ancestor, or merging it again
+    /// changes nothing (squash / rebase merges). The upstream is fetched first, best effort.
     pub merged: bool,
     /// Commits of HEAD not in the base.
     pub ahead: u32,
+    /// HEAD is an ancestor of the branch's upstream (`<branch>@{upstream}`, else
+    /// `<remote>/<branch>` of the only / `origin` remote), judged after the same best-effort
+    /// fetch as `merged`. No upstream or detached → `false`.
+    pub pushed: bool,
+    /// That upstream, e.g. `origin/wt/x`.
+    pub upstream: Option<String>,
 }
 
 fn check_base(base: &str) -> Result<(), WorktreeError> {
@@ -519,6 +564,150 @@ fn check_base(base: &str) -> Result<(), WorktreeError> {
         });
     }
     Ok(())
+}
+
+/// The upstream of `base` as `<remote>/<branch>`, when `base` is a branch that has one.
+fn upstream_of(dir: &Path, base: &str) -> Option<String> {
+    let spec = format!("{base}@{{upstream}}");
+    let up = git_ok(
+        dir,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", &spec],
+        true,
+        GIT_READ_TIMEOUT,
+    )
+    .ok()?;
+    (!up.is_empty()).then_some(up)
+}
+
+/// Best-effort fetch of the remote-tracking refs `upstreams` (`<remote>/<branch>`), one `git
+/// fetch --quiet <remote> <branches…>` per remote: never prompts (no terminal prompt, no
+/// askpass helper; stored credential helpers still work), ssh in batch mode, each bounded by
+/// [`FETCH_TIMEOUT`]; every failure is only logged.
+fn fetch_upstreams(dir: &Path, upstreams: &[&str]) {
+    let Ok(remotes) = git_ok(dir, &["remote"], true, GIT_READ_TIMEOUT) else {
+        return;
+    };
+    let mut plan: Vec<(&str, Vec<&str>)> = Vec::new();
+    for upstream in upstreams {
+        // Remote names may contain '/': the longest one that prefixes the upstream wins. A
+        // local upstream (remote '.') matches none and needs no fetch.
+        let Some((remote, branch)) = remotes
+            .lines()
+            .filter_map(|r| Some((r, upstream.strip_prefix(r)?.strip_prefix('/')?)))
+            .max_by_key(|(r, _)| r.len())
+        else {
+            continue;
+        };
+        match plan.iter_mut().find(|(r, _)| *r == remote) {
+            Some((_, branches)) => {
+                if !branches.contains(&branch) {
+                    branches.push(branch);
+                }
+            }
+            None => plan.push((remote, vec![branch])),
+        }
+    }
+    for (remote, branches) in plan {
+        let mut args = vec!["fetch", "--quiet", remote];
+        args.extend(&branches);
+        let mut cmd = git::command(dir, &args, false);
+        cmd.env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .env("GCM_INTERACTIVE", "never");
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+            cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        }
+        match git::run_bytes(cmd, FETCH_TIMEOUT, 64 * 1024) {
+            Ok(out) if out.code == Some(0) => {}
+            Ok(out) => log::debug!("worktree: fetch {remote}: {}", out.stderr.trim()),
+            Err(e) => log::debug!("worktree: fetch {remote}: {e:?}"),
+        }
+    }
+}
+
+/// `base`, then its upstream when it resolves.
+fn merge_targets(dir: &Path, base: &str) -> Vec<String> {
+    let mut targets = vec![base.to_owned()];
+    targets.extend(upstream_of(dir, base));
+    targets
+}
+
+/// Is the work up to `commit` contained in `target`? Either `commit` is an ancestor (regular
+/// merge, fast-forward), or merging it into `target` changes nothing: `git merge-tree
+/// --write-tree <target> <commit>` exits 0 with a tree equal to `<target>^{tree}` (squash,
+/// rebase and cherry-pick merges; later commits on `target` are fine). Errors, conflicts and git
+/// without `--write-tree` (< 2.38) count as not contained.
+fn contained(dir: &Path, commit: &str, target: &str) -> bool {
+    let ancestor = git_raw(
+        dir,
+        &["merge-base", "--is-ancestor", commit, target],
+        true,
+        GIT_READ_TIMEOUT,
+    );
+    match ancestor {
+        Ok(o) if o.code == Some(0) => return true,
+        Ok(o) if o.code == Some(1) => {}
+        _ => return false,
+    }
+    let Ok(merged) = git_raw(
+        dir,
+        &["merge-tree", "--write-tree", target, commit],
+        true,
+        GIT_READ_TIMEOUT,
+    ) else {
+        return false;
+    };
+    if !merged.ok() {
+        return false;
+    }
+    let Some(tree) = merged.stdout.lines().next().map(str::trim) else {
+        return false;
+    };
+    let spec = format!("{target}^{{tree}}");
+    git_ok(
+        dir,
+        &["rev-parse", "--verify", "-q", &spec],
+        true,
+        GIT_READ_TIMEOUT,
+    )
+    .is_ok_and(|t| !tree.is_empty() && t == tree)
+}
+
+/// Is `ancestor` an ancestor of (or equal to) `of`? Errors count as no.
+fn is_ancestor(dir: &Path, ancestor: &str, of: &str) -> bool {
+    git_raw(
+        dir,
+        &["merge-base", "--is-ancestor", ancestor, of],
+        true,
+        GIT_READ_TIMEOUT,
+    )
+    .is_ok_and(|o| o.code == Some(0))
+}
+
+/// The remote-tracking ref `branch` is pushed to: its configured upstream, else
+/// `<remote>/<branch>` for the only remote (or `origin`) when that ref exists.
+fn push_target(dir: &Path, branch: &str) -> Option<String> {
+    if let Some(up) = upstream_of(dir, branch) {
+        return Some(up);
+    }
+    let remotes = git_ok(dir, &["remote"], true, GIT_READ_TIMEOUT).ok()?;
+    let names: Vec<&str> = remotes.lines().collect();
+    let remote = match names.as_slice() {
+        [only] => *only,
+        _ if names.contains(&"origin") => "origin",
+        _ => return None,
+    };
+    let candidate = format!("{remote}/{branch}");
+    let spec = format!("refs/remotes/{candidate}^{{commit}}");
+    git_ok(
+        dir,
+        &["rev-parse", "--verify", "-q", &spec],
+        true,
+        GIT_READ_TIMEOUT,
+    )
+    .ok()
+    .map(|_| candidate)
 }
 
 pub fn status(wt: &Worktree, base: &str) -> Result<WorktreeStatus, WorktreeError> {
@@ -547,17 +736,18 @@ pub fn status(wt: &Worktree, base: &str) -> Result<WorktreeStatus, WorktreeError
         command: "git rev-parse".into(),
         stderr: format!("base '{base}' does not exist"),
     })?;
-    let anc = git_raw(
-        dir,
-        &["merge-base", "--is-ancestor", "HEAD", base],
-        true,
-        GIT_READ_TIMEOUT,
-    )?;
-    let merged = match anc.code {
-        Some(0) => true,
-        Some(1) => false,
-        _ => return Err(failed(&["merge-base"], &anc)),
-    };
+    let base_upstream = upstream_of(dir, base);
+    let branch = branch_of(dir);
+    let upstream = branch.as_deref().and_then(|b| push_target(dir, b));
+    // One bounded fetch per remote covers the base's upstream and the branch's own upstream, so
+    // neither `merged` nor `pushed` is judged on a stale ref.
+    let mut fetches: Vec<&str> = Vec::new();
+    fetches.extend(base_upstream.as_deref());
+    fetches.extend(upstream.as_deref());
+    fetch_upstreams(dir, &fetches);
+    let merged = merge_targets(dir, base)
+        .iter()
+        .any(|target| contained(dir, "HEAD", target));
     let not_in_base = format!("^{base}");
     let count = git_ok(
         dir,
@@ -565,11 +755,16 @@ pub fn status(wt: &Worktree, base: &str) -> Result<WorktreeStatus, WorktreeError
         true,
         GIT_READ_TIMEOUT,
     )?;
+    let pushed = upstream
+        .as_deref()
+        .is_some_and(|up| is_ancestor(dir, "HEAD", up));
     Ok(WorktreeStatus {
-        branch: branch_of(dir),
+        branch,
         dirty: !porcelain.is_empty(),
         merged,
         ahead: count.parse().unwrap_or(0),
+        pushed,
+        upstream,
     })
 }
 
@@ -617,17 +812,31 @@ fn delete_branch_at(primary: &Path, branch: &str, tip: &str) -> Result<(), Workt
     Ok(())
 }
 
-/// Removes a worktree that is clean and fully merged into `base`. Re-checks [`status`] first and
-/// returns [`WorktreeError::Unsafe`] without touching anything otherwise. Never forces
-/// (`--force`, `-D`).
+/// How [`remove`] treats the worktree's branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Removal {
+    /// The work is merged into the base; the branch is deleted when `delete_branch`.
+    Merged { delete_branch: bool },
+    /// Not merged yet but clean and pushed: only the folder goes, the branch is never touched.
+    Park,
+}
+
+/// Removes a worktree. Re-checks [`status`] first and returns [`WorktreeError::Unsafe`] without
+/// touching anything otherwise. Never forces (`--force`, `-D`).
 ///
-/// With `delete_branch` the branch ref is then deleted with `git update-ref -d refs/heads/<b>
-/// <tip>`, where `<tip>` is the commit verified (just before the removal) to be an ancestor of
-/// `base`; the old-value check makes this `branch -d` relative to `base` (git's own `-d` compares
-/// with the primary's HEAD/upstream instead) and atomic: a branch that moved meanwhile is kept
-/// and explained in [`Removed::branch_note`]. A failed branch deletion is not an error: the
-/// folder is already gone and callers must still prune.
-pub fn remove(wt: &Worktree, base: &str, delete_branch: bool) -> Result<Removed, WorktreeError> {
+/// [`Removal::Merged`]: the worktree must be clean and fully merged into `base` (or its
+/// upstream; squash and rebase merges count, see [`status`]). With `delete_branch` the branch
+/// ref is then deleted with `git update-ref -d refs/heads/<b> <tip>`, where `<tip>` is the
+/// commit verified (just before the removal) to be contained in `base` or its upstream; the
+/// old-value check makes this `branch -d` relative to `base` (git's own `-d` compares with the
+/// primary's HEAD/upstream instead) and atomic: a branch that moved meanwhile is kept and
+/// explained in [`Removed::branch_note`]. A failed branch deletion is not an error: the folder
+/// is already gone and callers must still prune.
+///
+/// [`Removal::Park`]: the worktree must be clean, on a branch, and `pushed` (HEAD is in its
+/// upstream; [`Unsafe::NotPushed`] otherwise, [`Unsafe::Detached`] when detached). The branch is
+/// never deleted.
+pub fn remove(wt: &Worktree, base: &str, how: Removal) -> Result<Removed, WorktreeError> {
     if !wt.path.is_dir() {
         return Err(WorktreeError::Unsafe(vec![Unsafe::Missing]));
     }
@@ -636,12 +845,23 @@ pub fn remove(wt: &Worktree, base: &str, delete_branch: bool) -> Result<Removed,
     if st.dirty {
         reasons.push(Unsafe::Dirty);
     }
-    if st.branch.is_none() {
-        if !st.merged {
-            reasons.push(Unsafe::Detached);
+    match how {
+        Removal::Merged { .. } => {
+            if st.branch.is_none() {
+                if !st.merged {
+                    reasons.push(Unsafe::Detached);
+                }
+            } else if !st.merged {
+                reasons.push(Unsafe::NotMerged { ahead: st.ahead });
+            }
         }
-    } else if !st.merged {
-        reasons.push(Unsafe::NotMerged { ahead: st.ahead });
+        Removal::Park => {
+            if st.branch.is_none() {
+                reasons.push(Unsafe::Detached);
+            } else if !st.pushed {
+                reasons.push(Unsafe::NotPushed);
+            }
+        }
     }
     if !reasons.is_empty() {
         return Err(WorktreeError::Unsafe(reasons));
@@ -653,16 +873,27 @@ pub fn remove(wt: &Worktree, base: &str, delete_branch: bool) -> Result<Removed,
         true,
         GIT_READ_TIMEOUT,
     )?;
-    let anc = git_raw(
-        &wt.path,
-        &["merge-base", "--is-ancestor", &tip, base],
-        true,
-        GIT_READ_TIMEOUT,
-    )?;
-    if anc.code != Some(0) {
-        return Err(WorktreeError::Unsafe(vec![Unsafe::NotMerged {
-            ahead: st.ahead.max(1),
-        }]));
+    match how {
+        Removal::Merged { .. } => {
+            // Same rule as `status` (squash / rebase merges count); no second fetch.
+            let merged = merge_targets(&wt.path, base)
+                .iter()
+                .any(|target| contained(&wt.path, &tip, target));
+            if !merged {
+                return Err(WorktreeError::Unsafe(vec![Unsafe::NotMerged {
+                    ahead: st.ahead.max(1),
+                }]));
+            }
+        }
+        Removal::Park => {
+            let pushed = st
+                .upstream
+                .as_deref()
+                .is_some_and(|up| is_ancestor(&wt.path, &tip, up));
+            if !pushed {
+                return Err(WorktreeError::Unsafe(vec![Unsafe::NotPushed]));
+            }
+        }
     }
     let path = wt.path.to_string_lossy();
     git_ok(
@@ -675,13 +906,102 @@ pub fn remove(wt: &Worktree, base: &str, delete_branch: bool) -> Result<Removed,
         branch_deleted: false,
         branch_note: None,
     };
-    if delete_branch && let Some(branch) = &st.branch {
+    if let Removal::Merged {
+        delete_branch: true,
+    } = how
+        && let Some(branch) = &st.branch
+    {
         match delete_branch_at(&wt.primary, branch, &tip) {
             Ok(()) => done.branch_deleted = true,
             Err(e) => done.branch_note = Some(format!("branch '{branch}' was kept: {e}")),
         }
     }
     Ok(done)
+}
+
+/// Switches the checkout at `dir` to the existing local `branch` (`git switch --no-guess -q`).
+/// A dirty checkout is refused with [`WorktreeError::DirtyCheckout`] before anything runs; nothing is forced.
+pub fn switch_branch(dir: &Path, branch: &str) -> Result<(), WorktreeError> {
+    check_base(branch)?;
+    let porcelain = git_ok(
+        dir,
+        &["status", "--porcelain", "-unormal"],
+        true,
+        GIT_READ_TIMEOUT,
+    )?;
+    if !porcelain.is_empty() {
+        return Err(WorktreeError::DirtyCheckout(dir.to_path_buf()));
+    }
+    git_ok(
+        dir,
+        &["switch", "--no-guess", "-q", branch],
+        false,
+        GIT_WRITE_TIMEOUT,
+    )?;
+    Ok(())
+}
+
+/// Where a (parked) local branch stands.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BranchState {
+    /// `refs/heads/<branch>` exists.
+    pub exists: bool,
+    /// Working tree the branch is checked out in (any worktree of the repository).
+    pub checked_out: Option<PathBuf>,
+    /// The branch tip is contained in `base` or its upstream (same rule as [`status`], without
+    /// the fetch); `false` when the branch does not exist.
+    pub merged: bool,
+}
+
+/// State of local `branch` in the repository of `primary` relative to `base`.
+pub fn branch_state(
+    primary: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<BranchState, WorktreeError> {
+    check_base(base)?;
+    check_base(branch)?;
+    let full = format!("refs/heads/{branch}");
+    let exists = git_raw(
+        primary,
+        &["show-ref", "--verify", "--quiet", &full],
+        true,
+        GIT_READ_TIMEOUT,
+    )?
+    .ok();
+    if !exists {
+        return Ok(BranchState {
+            exists: false,
+            checked_out: None,
+            merged: false,
+        });
+    }
+    let list = git_ok(
+        primary,
+        &["worktree", "list", "--porcelain"],
+        true,
+        GIT_READ_TIMEOUT,
+    )?;
+    let mut checked_out = None;
+    let mut current: Option<&str> = None;
+    for line in list.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            current = Some(p);
+        } else if line.strip_prefix("branch ") == Some(full.as_str())
+            && let Some(p) = current
+        {
+            checked_out = Some(native(p));
+            break;
+        }
+    }
+    let merged = merge_targets(primary, base)
+        .iter()
+        .any(|target| contained(primary, &full, target));
+    Ok(BranchState {
+        exists,
+        checked_out,
+        merged,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -910,6 +1230,23 @@ pub fn blockers(st: &WorktreeStatus, base: &str) -> Vec<String> {
                 if st.ahead == 1 { " is" } else { "s are" }
             ),
             None => format!("its detached HEAD has commits that are not in {base}"),
+        });
+    }
+    out
+}
+
+/// Why `status` does not allow parking the worktree (empty = safe: clean and pushed).
+pub fn park_blockers(st: &WorktreeStatus) -> Vec<String> {
+    let mut out = Vec::new();
+    if st.dirty {
+        out.push("it has uncommitted or untracked changes".to_owned());
+    }
+    if st.branch.is_none() {
+        out.push("it is on a detached HEAD, so there is no branch to keep".to_owned());
+    } else if !st.pushed {
+        out.push(match &st.upstream {
+            Some(up) => format!("it has commits that are not pushed to {up}"),
+            None => "its branch has not been pushed (no upstream)".to_owned(),
         });
     }
     out
@@ -1209,6 +1546,8 @@ mod tests {
             dirty,
             merged,
             ahead,
+            pushed: false,
+            upstream: None,
         }
     }
 
@@ -1231,5 +1570,42 @@ mod tests {
             ..status(false, false, 3)
         };
         assert!(blockers(&detached, "main")[0].contains("detached"));
+    }
+
+    #[test]
+    fn park_blockers_name_dirty_unpushed_and_detached() {
+        let pushed = WorktreeStatus {
+            pushed: true,
+            upstream: Some("origin/b".into()),
+            ..status(false, false, 4)
+        };
+        assert!(
+            park_blockers(&pushed).is_empty(),
+            "unmerged but pushed parks"
+        );
+        let unpushed = WorktreeStatus {
+            pushed: false,
+            ..pushed.clone()
+        };
+        assert_eq!(
+            park_blockers(&WorktreeStatus {
+                dirty: true,
+                ..unpushed
+            }),
+            [
+                "it has uncommitted or untracked changes",
+                "it has commits that are not pushed to origin/b"
+            ]
+        );
+        let none = status(false, false, 1);
+        assert_eq!(
+            park_blockers(&none),
+            ["its branch has not been pushed (no upstream)"]
+        );
+        let detached = WorktreeStatus {
+            branch: None,
+            ..pushed
+        };
+        assert!(park_blockers(&detached)[0].contains("detached"));
     }
 }

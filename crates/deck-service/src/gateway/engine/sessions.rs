@@ -121,6 +121,11 @@ impl Managed {
         self.ctl.terminal().is_exited()
     }
 
+    /// The folder omp runs in now (its breadcrumb), else the one it was launched in.
+    pub(super) fn current_cwd(&self) -> &Path {
+        self.live_cwd.as_deref().unwrap_or(&self.cwd)
+    }
+
     pub(super) fn display_label(&self) -> String {
         if !self.label.is_empty() {
             return self.label.clone();
@@ -333,7 +338,7 @@ impl Engine {
         self.sess
             .managed
             .iter()
-            .filter(|m| !m.exited() && m.cwd.starts_with(path))
+            .filter(|m| !m.exited() && m.current_cwd().starts_with(path))
             .map(|m| (m.ctl.target().clone(), m.display_label()))
             .collect()
     }

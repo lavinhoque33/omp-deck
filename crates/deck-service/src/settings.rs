@@ -29,9 +29,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 use deck_core::config::{
-    AppConfig, Density, FolderTabs, GatewayMode, NotifyConfig, RemovedWorktree, SplitState,
-    SyncInterval, SyncRow, TabState, Theme, UiFont, UiStyle, WindowGeometry, clamp_ui_scale,
-    config_dir, parse_config,
+    AppConfig, Density, FolderTabs, GatewayMode, NotifyConfig, ParkedBranch, RemovedWorktree,
+    SplitState, SyncInterval, SyncRow, TabState, Theme, UiFont, UiStyle, WindowGeometry,
+    clamp_ui_scale, config_dir, parse_config,
 };
 use deck_core::mux::BackendChoice;
 use serde::{Deserialize, Serialize};
@@ -291,6 +291,7 @@ settings! {
     SessionBackend(session_backend: BackendChoice) = Device,
     WorktreeBases(worktree_bases: BTreeMap<PathBuf, String>) = Device,
     RemovedWorktrees(removed_worktrees: BTreeMap<PathBuf, RemovedWorktree>) = Device,
+    ParkedBranches(parked_branches: Vec<ParkedBranch>) = Device,
     Notify(notify: NotifyConfig) = Shared,
     CheckAppUpdates(check_app_updates: bool) = Shared,
     SkippedAppVersion(skipped_app_version: Option<String>) = Shared,

@@ -343,17 +343,29 @@ in a worktree starts from scratch.
 **Move to new worktree…** on a running session types omp's `/wt <branch>` once omp is idle: the session,
 with its uncommitted changes, moves into a new worktree and the tab follows it.
 
-Worktree sessions are listed under their repository with the branch name (also those created by omp's own
-`/wt` and PR checkouts), and the status bar's git chip shows which repository a worktree belongs to.
+Worktree sessions belong to their repository: they are listed among the repository's own sessions with a
+branch badge (also those created by omp's own `/wt` and PR checkouts), and the status bar's git chip shows
+which repository a worktree belongs to. omp itself works inside the worktree folder while the session runs.
 
-**Finish worktree** (on a worktree in the sidebar) asks that worktree's omp session to commit its work and
-merge the branch into the branch it started from. The agent follows the project's own rules (`AGENTS.md`
-and the like): if they don't allow committing or merging on its own, it asks you in the chat first. Once
-the branch is merged and nothing uncommitted is left, OmpDeck stops only that worktree's tabs, removes the
-worktree and deletes the merged branch. **Remove worktree…** does the same on demand. Both refuse when
-work would be lost (uncommitted changes, commits not in the base branch); OmpDeck never force-removes a
-worktree or force-deletes a branch. Sessions of removed worktrees stay in the sidebar under their
-repository, marked "(removed)", and resume in the repository's folder.
+**Finish worktree** (in the menu of any session of that worktree, or its hover button) asks that worktree's omp
+session to commit its work and merge the branch into the branch it started from. The agent follows the
+project's own rules (`AGENTS.md` and the like): if they don't allow committing or merging on its own, it asks
+you in the chat first. Once the branch is merged and nothing uncommitted is left, OmpDeck moves the worktree's
+sessions into the repository's folder with omp's `/move` (open tabs keep running there), removes the worktree
+and deletes the merged branch, so nothing is left behind. **Remove worktree…** does the same on demand.
+"Merged" covers regular merges, fast-forwards, squash merges and rebase merges alike: the branch counts as
+merged when merging it again would change nothing, in the base branch or in its upstream (OmpDeck fetches it
+first, so a PR merged on GitHub counts without pulling). Both refuse when work would be lost (uncommitted
+changes, commits not in the base branch); OmpDeck never force-removes a worktree or force-deletes a branch.
+Sessions left over from a worktree removed earlier are moved into the repository's folder automatically.
+
+**Parking a worktree whose PR is still open**: Remove worktree… on a clean worktree whose commits are all
+pushed but not merged yet parks it: its sessions move into the repository's folder and the worktree folder is
+removed, but the local branch is kept (OmpDeck never deletes a parked branch; delete it yourself when you no
+longer need it). Parked sessions carry a "parked" badge and offer **Continue in worktree** (a new worktree on
+that branch, the sessions move back into it) and **Continue in main checkout** (switches the main checkout to
+the branch after showing which other running sessions there will see it; refused while the main checkout has
+uncommitted changes), plus **Switch main checkout back to …**. Unpushed work is never parked.
 
 ## Uninstall
 

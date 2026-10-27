@@ -8,16 +8,17 @@ use std::time::{Duration, SystemTime};
 
 use crate::icons::Icon;
 use crate::icons::{
-    ICON_ARCHIVE_RESTORE, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CHEVRONS_DOWN_UP,
-    ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_STOP, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_COLUMNS_2,
-    ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS, ICON_FOLDER,
-    ICON_FOLDER_GIT_2, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_GIT_BRANCH,
-    ICON_GIT_BRANCH_PLUS, ICON_GIT_MERGE, ICON_HARD_DRIVE, ICON_HISTORY, ICON_KEY_ROUND,
-    ICON_LIST_TREE, ICON_MESSAGES_SQUARE, ICON_PLAY, ICON_PLUS, ICON_POWER, ICON_REFRESH_CW,
-    ICON_ROTATE_CCW, ICON_ROWS_2, ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL, ICON_TRASH_2, ICON_X,
+    ICON_ARCHIVE_RESTORE, ICON_ARROW_LEFT_RIGHT, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT,
+    ICON_CHEVRONS_DOWN_UP, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_STOP, ICON_CLOUD, ICON_CLOUD_UPLOAD,
+    ICON_COLUMNS_2, ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS,
+    ICON_FOLDER, ICON_FOLDER_GIT_2, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X,
+    ICON_GIT_BRANCH, ICON_GIT_BRANCH_PLUS, ICON_GIT_MERGE, ICON_HARD_DRIVE, ICON_HISTORY,
+    ICON_KEY_ROUND, ICON_LIST_TREE, ICON_MESSAGES_SQUARE, ICON_PLAY, ICON_PLUS, ICON_POWER,
+    ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_ROWS_2, ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL,
+    ICON_TRASH_2, ICON_X,
 };
-use deck_core::config::RemovedWorktree;
-use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot};
+use deck_core::config::{ParkedBranch, RemovedWorktree};
+use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot, abbreviate_home};
 use deck_core::worktree::Worktree;
 use egui::collapsing_header::CollapsingState;
 use egui::text::{LayoutJob, TextFormat};
@@ -27,14 +28,13 @@ use egui::{
 };
 
 use crate::badge::{self, Hue};
-use crate::folder_scope;
 use crate::panes::Side;
 use crate::scope_bar::{self, ScopeAction, ScopeInput, ScopeState};
 use crate::tabs::{self, Tab};
 use crate::theme::{self, Palette};
 use crate::transfer::{self, TransferKind};
 use crate::widgets::{empty_state, icon_text, menu_item, paint_icon};
-use crate::worktree_ui::{self, Family, Finishing, Head};
+use crate::worktree_ui::{self, Family, Finishing, ParkView, Row, RowWorktree};
 use crate::{card, tips};
 mod running;
 use deck_service::gateway::running::RunningSnapshot;
@@ -102,7 +102,7 @@ fn split_display(display: &str) -> (&str, &str) {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum SidebarAction {
     Open(SessionEntry),
     /// Show the session's tree (reads the file; no tab needed).
@@ -154,8 +154,16 @@ pub enum SidebarAction {
     FinishWorktree(Worktree),
     /// Stop waiting for the worktree (by folder) to finish.
     CancelFinish(PathBuf),
-    /// Ask before removing the worktree (clean and merged only).
+    /// Remove the worktree: ask first; merged ones are deleted with their branch, clean and
+    /// pushed ones are parked (the branch stays), anything else is refused.
     RemoveWorktree(Worktree),
+    /// A parked session: create a worktree on its branch and move the branch's sessions into it.
+    ContinueInWorktree(SessionEntry),
+    /// A parked session: check its branch out in the main checkout and open the session there.
+    ContinueInMain(SessionEntry),
+    /// A parked session whose branch is checked out in the main checkout: switch that back to the
+    /// parked branch's base.
+    SwitchMainBack(SessionEntry),
     /// Open the tab at this strip index in a new pane beside the focused one.
     SplitTab {
         index: usize,
@@ -238,6 +246,8 @@ pub struct SidebarInput<'a> {
     pub finishing: &'a HashMap<PathBuf, Finishing>,
     /// Worktrees OmpDeck removed: their sessions nest under the primary, marked as removed.
     pub removed: &'a BTreeMap<PathBuf, RemovedWorktree>,
+    /// Parked branches: their sessions carry a chip and the continue actions.
+    pub parked: ParkView<'a>,
 }
 
 /// Which project groups are open. A group is open while filtering, else by its user override,
@@ -607,9 +617,12 @@ pub fn show(
     let active_group = active_cache.get(stamp, groups, input.active_path, input.active_cwd);
     expansion.on_activation(
         active_group.map(|g| g.cwd.as_path()),
-        active_group
-            .and_then(|g| g.worktree.as_ref())
-            .map(|w| w.primary.as_path()),
+        active_group.and_then(|g| {
+            g.worktree
+                .as_ref()
+                .map(|w| w.primary.as_path())
+                .or_else(|| input.removed.get(&g.cwd).map(|r| r.primary.as_path()))
+        }),
     );
     let visible = filter_cache.sync(stamp, &query, groups);
     let families = layout_cache.sync(stamp, input.scope, groups, input.removed);
@@ -635,19 +648,7 @@ pub fn show(
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             for family in families {
-                let group = family.group(groups);
-                let gi = match family.head {
-                    Head::Group(i) => Some(i),
-                    Head::Synthetic(_) => None,
-                };
-                any_shown |= show_group(
-                    ui,
-                    &pass,
-                    (group, gi),
-                    &family.children,
-                    (expansion, ages),
-                    &mut out,
-                );
+                any_shown |= show_group(ui, &pass, family, (expansion, ages), &mut out);
             }
             if !any_shown {
                 if filtering {
@@ -674,67 +675,63 @@ struct Pass<'a> {
     input: &'a SidebarInput<'a>,
     groups: &'a [ProjectGroup],
     families: &'a [Family],
-    /// Filtered row indices per group (only with a query).
+    /// Filtered row indices per group (only with a query), ascending.
     visible: &'a [Vec<u32>],
     filtering: bool,
     age_key: ((u64, usize), u64),
 }
 
 impl Pass<'_> {
-    /// The rows of group `gi` to show: the filtered indices (`None` = all) and their number.
-    fn rows(&self, gi: Option<usize>) -> (Option<&[u32]>, usize) {
-        let Some(gi) = gi else { return (None, 0) };
-        let idx = self
-            .filtering
-            .then(|| self.visible.get(gi).map_or(&[][..], Vec::as_slice));
-        (
-            idx,
-            idx.map_or(self.groups[gi].sessions.len(), <[u32]>::len),
-        )
+    /// Whether a row passes the filter (always without a query).
+    fn is_shown(&self, r: &Row) -> bool {
+        !self.filtering
+            || self
+                .visible
+                .get(r.group)
+                .is_some_and(|v| v.binary_search(&(r.session as u32)).is_ok())
     }
 }
 
-/// One project group with its worktree groups nested below; false when nothing of it shows.
+/// One project: its header and its rows (its own sessions and those of its worktrees, newest
+/// first); false when nothing of it shows.
 fn show_group(
     ui: &mut Ui,
     pass: &Pass<'_>,
-    (group, gi): (&ProjectGroup, Option<usize>),
-    children: &[usize],
+    family: &Family,
     (expansion, ages): (&mut Expansion, &mut AgeCache),
     out: &mut SidebarOutput,
 ) -> bool {
     let input = pass.input;
-    let (idx, own_rows) = pass.rows(gi);
-    let child_rows: usize = children.iter().map(|&c| pass.rows(Some(c)).1).sum();
-    let bare_parent = gi.is_none() && !pass.filtering && !children.is_empty();
-    if own_rows + child_rows == 0 && !bare_parent {
+    let group = family.group(pass.groups);
+    let shown = if pass.filtering {
+        family.rows.iter().filter(|r| pass.is_shown(r)).count()
+    } else {
+        family.rows.len()
+    };
+    if shown == 0 {
         return false;
     }
-    let removed = (group.worktree.is_none() && gi.is_some())
+    // A worktree group listed by itself (its repository is outside the scope) that was removed:
+    // new sessions go to the repository, not into the vanished folder.
+    let removed = group
+        .worktree
+        .is_none()
         .then(|| input.removed.get(&group.cwd))
         .flatten();
-    let look = match (&group.worktree, gi) {
-        (Some(w), _) => Look::Worktree {
-            finishing: input.finishing.contains_key(&w.path),
-        },
-        (None, None) => Look::Synthetic,
-        (None, Some(_)) if removed.is_some() => Look::Removed,
-        (None, Some(_)) => Look::Project,
-    };
     let open = expansion.is_open(&group.cwd, pass.filtering);
 
     let pid = ui.make_persistent_id(("project", &group.cwd));
     let mut state = CollapsingState::load_with_default_open(ui.ctx(), pid, true);
     state.set_open(open);
     let open_t = state.openness(ui.ctx());
+    let wt_allowed = input.omp_available && group.worktree.is_none() && removed.is_none();
     let hdr = group_header(
         ui,
         &HeaderSpec {
             group,
-            look,
-            removed,
-            shown: own_rows + child_rows,
-            wt_button: input.omp_available && group.worktree.is_none() && look != Look::Removed,
+            shown,
+            total: family.rows.len(),
+            wt_button: wt_allowed,
         },
         open_t,
         out,
@@ -747,27 +744,22 @@ fn show_group(
             out.interacted = true;
             ui.close();
         }
-        match (&group.worktree, look) {
-            (Some(w), Look::Worktree { finishing }) => worktree_items(ui, input, w, finishing, out),
-            _ if input.omp_available
-                && look != Look::Removed
-                && menu_item(
-                    ui,
-                    ICON_GIT_BRANCH_PLUS,
-                    "New session in worktree…",
-                    None,
-                    true,
-                    false,
-                )
-                .on_hover_text("Create a git worktree on a new branch and start a session in it")
-                .clicked() =>
-            {
-                out.actions
-                    .push(SidebarAction::NewWorktree(group.cwd.clone()));
-                out.interacted = true;
-                ui.close();
-            }
-            _ => {}
+        if wt_allowed
+            && menu_item(
+                ui,
+                ICON_GIT_BRANCH_PLUS,
+                "New session in worktree…",
+                None,
+                true,
+                false,
+            )
+            .on_hover_text("Create a git worktree on a new branch and start a session in it")
+            .clicked()
+        {
+            out.actions
+                .push(SidebarAction::NewWorktree(group.cwd.clone()));
+            out.interacted = true;
+            ui.close();
         }
         let focused = input.scope == Some(group.cwd.as_path());
         if menu_item(ui, ICON_FOCUS, "Focus this folder", None, !focused, false)
@@ -815,11 +807,7 @@ fn show_group(
         expansion.set_all(
             pass.families
                 .iter()
-                .flat_map(|f| {
-                    std::iter::once(f.group(pass.groups))
-                        .chain(f.children.iter().map(|&c| &pass.groups[c]))
-                })
-                .map(|g| g.cwd.as_path()),
+                .map(|f| f.group(pass.groups).cwd.as_path()),
             !collapse,
         );
         state.set_open(pass.filtering || !collapse);
@@ -832,40 +820,22 @@ fn show_group(
     state.store(ui.ctx());
     state.show_body_unindented(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
-        if let Some(gi) = gi {
-            for k in 0..own_rows {
-                let entry = match idx {
-                    Some(ix) => ix
-                        .get(k)
-                        .and_then(|&i| pass.groups[gi].sessions.get(i as usize)),
-                    None => pass.groups[gi].sessions.get(k),
-                };
-                let Some(entry) = entry else {
-                    continue;
-                };
-                let selected = input.active_path == Some(entry.path.as_path());
-                let running = input.running.is_running(&entry.id, &entry.path)
-                    || input.open_paths.contains(&entry.path.as_path());
-                let age = ages.get(pass.age_key, input.now, entry);
-                session_row(ui, entry, age, running, selected, input, out);
-            }
-        }
-        if !children.is_empty() {
-            let indent = ui.spacing().indent;
-            ui.spacing_mut().indent = 10.0;
-            ui.indent(("worktrees", &group.cwd), |ui| {
-                for &c in children {
-                    show_group(
-                        ui,
-                        pass,
-                        (&pass.groups[c], Some(c)),
-                        &[],
-                        (&mut *expansion, &mut *ages),
-                        out,
-                    );
-                }
-            });
-            ui.spacing_mut().indent = indent;
+        for r in family.rows.iter().filter(|r| pass.is_shown(r)) {
+            let row_group = &pass.groups[r.group];
+            let Some(entry) = row_group.sessions.get(r.session) else {
+                continue;
+            };
+            let row = RowCtx {
+                selected: input.active_path == Some(entry.path.as_path()),
+                running: input.running.is_running(&entry.id, &entry.path)
+                    || input.open_paths.contains(&entry.path.as_path()),
+                chip: RowWorktree::of(row_group, &entry.id, input.removed, &input.parked).map(|wt| RowChip {
+                    finishing: matches!(wt, RowWorktree::Live(w) if input.finishing.contains_key(&w.path)),
+                    wt,
+                }),
+            };
+            let age = ages.get(pass.age_key, input.now, entry);
+            session_row(ui, entry, age, &row, input, out);
         }
         ui.add_space(2.0);
     });
@@ -873,47 +843,227 @@ fn show_group(
     true
 }
 
-/// "Finish worktree" / "Cancel finishing" and "Remove worktree…" in a worktree header's menu.
-fn worktree_items(
-    ui: &mut Ui,
-    input: &SidebarInput<'_>,
-    w: &Worktree,
-    finishing: bool,
-    out: &mut SidebarOutput,
-) {
-    if finishing {
-        if menu_item(ui, ICON_X, "Cancel finishing", None, true, false)
-            .on_hover_text("Stop waiting for the agent; the worktree stays")
-            .clicked()
-        {
-            out.actions.push(SidebarAction::CancelFinish(w.path.clone()));
-            ui.close();
+/// A worktree action's hover button as the row needs it every frame: the icon and whether it is
+/// enabled, from the row's chip alone (no allocation, no lookups). The full [`RowAct`] (labels,
+/// action) is built only when hovered, clicked or in a menu.
+#[derive(Clone, Copy)]
+struct Slot {
+    icon: Icon,
+    enabled: bool,
+}
+
+/// The hover-button slots of a row, in the order of [`live_acts`] / [`parked_acts`]
+/// (index 0 is the rightmost button).
+fn slots(chip: &RowChip<'_>, omp: bool) -> [Option<Slot>; 2] {
+    match chip.wt {
+        RowWorktree::Live(_) => [
+            Some(if chip.finishing {
+                Slot {
+                    icon: ICON_X,
+                    enabled: true,
+                }
+            } else {
+                Slot {
+                    icon: ICON_GIT_MERGE,
+                    enabled: omp,
+                }
+            }),
+            Some(Slot {
+                icon: ICON_TRASH_2,
+                enabled: true,
+            }),
+        ],
+        RowWorktree::Parked(r, at) => [
+            Some(Slot {
+                icon: ICON_GIT_BRANCH_PLUS,
+                enabled: omp && at.is_none(),
+            }),
+            Some(if at == Some(r.primary.as_path()) {
+                Slot {
+                    icon: ICON_ARROW_LEFT_RIGHT,
+                    enabled: true,
+                }
+            } else {
+                Slot {
+                    icon: ICON_FOLDER_GIT_2,
+                    enabled: at.is_none(),
+                }
+            }),
+        ],
+        RowWorktree::Removed(..) => [None, None],
+    }
+}
+
+/// One worktree action of a session row. The row's context menu and its hover buttons are both
+/// built from these, so they always offer the same actions under the same gating.
+struct RowAct {
+    icon: Icon,
+    label: String,
+    /// The menu item's hover text while enabled.
+    tip: &'static str,
+    enabled: bool,
+    /// Why it is disabled.
+    why: Option<String>,
+    danger: bool,
+    action: SidebarAction,
+}
+
+impl RowAct {
+    /// Tooltip of the hover button: the label, plus the reason while disabled.
+    fn button_tip(&self) -> String {
+        match (&self.why, self.enabled) {
+            (Some(why), false) => format!("{} — {why}", self.label),
+            _ => self.label.clone(),
         }
-    } else if menu_item(
-        ui,
-        ICON_GIT_MERGE,
-        "Finish worktree",
-        None,
-        input.omp_available,
-        false,
-    )
-    .on_hover_text(
-        "Ask the session's agent to commit and merge the branch; the worktree is removed once it is merged and clean",
-    )
-    .clicked()
-    {
-        out.actions.push(SidebarAction::FinishWorktree(w.clone()));
+    }
+}
+
+/// "Finish worktree" / "Cancel finishing" and "Remove worktree…" for a session that runs in
+/// worktree `w`.
+fn live_acts(env: &MenuEnv<'_>, w: &Worktree) -> Vec<RowAct> {
+    let mut acts = Vec::new();
+    if env.finishing.contains_key(&w.path) {
+        acts.push(RowAct {
+            icon: ICON_X,
+            label: "Cancel finishing".to_owned(),
+            tip: "Stop waiting for the agent; the worktree stays",
+            enabled: true,
+            why: None,
+            danger: false,
+            action: SidebarAction::CancelFinish(w.path.clone()),
+        });
+    } else {
+        acts.push(RowAct {
+            icon: ICON_GIT_MERGE,
+            label: "Finish worktree".to_owned(),
+            tip: "Ask the session's agent to commit and merge the branch; the worktree is removed once it is merged and clean, and its sessions move into the project folder",
+            enabled: env.omp_available,
+            why: (!env.omp_available).then(|| "omp was not found".to_owned()),
+            danger: false,
+            action: SidebarAction::FinishWorktree(w.clone()),
+        });
+    }
+    let parkable = env.parked.is_parkable(w);
+    acts.push(RowAct {
+        icon: ICON_TRASH_2,
+        label: if parkable {
+            "Remove / park worktree…"
+        } else {
+            "Remove worktree…"
+        }
+        .to_owned(),
+        tip: "Remove the folder; its sessions move into the project folder. A merged branch is deleted with it; a clean, pushed branch that is not merged yet is parked: the branch is kept and can be continued later",
+        enabled: true,
+        why: None,
+        danger: true,
+        action: SidebarAction::RemoveWorktree(w.clone()),
+    });
+    acts
+}
+
+/// "Continue in worktree" and "Continue in main checkout" (or "Switch main checkout back to
+/// <base>") for a session of the parked branch `r`; `checked_out` is where the branch is checked out.
+fn parked_acts(
+    env: &MenuEnv<'_>,
+    entry: &SessionEntry,
+    r: &ParkedBranch,
+    checked_out: Option<&Path>,
+) -> Vec<RowAct> {
+    let in_primary = checked_out == Some(r.primary.as_path());
+    let where_text = |p: &Path| {
+        if p == r.primary {
+            "the main checkout".to_owned()
+        } else {
+            abbreviate_home(p)
+        }
+    };
+    let busy_why = checked_out.map(|p| format!("The branch is checked out in {}", where_text(p)));
+    let mut acts = vec![RowAct {
+        icon: ICON_GIT_BRANCH_PLUS,
+        label: "Continue in worktree".to_owned(),
+        tip: "Create a worktree on the parked branch and move its sessions into it",
+        enabled: env.omp_available && checked_out.is_none(),
+        why: busy_why
+            .clone()
+            .or_else(|| (!env.omp_available).then(|| "omp was not found".to_owned())),
+        danger: false,
+        action: SidebarAction::ContinueInWorktree(entry.clone()),
+    }];
+    if in_primary {
+        acts.push(RowAct {
+            icon: ICON_ARROW_LEFT_RIGHT,
+            label: format!("Switch main checkout back to {}", r.base),
+            tip: "Check the base branch out in the main checkout again; the parked branch stays",
+            enabled: true,
+            why: None,
+            danger: false,
+            action: SidebarAction::SwitchMainBack(entry.clone()),
+        });
+    } else {
+        acts.push(RowAct {
+            icon: ICON_FOLDER_GIT_2,
+            label: "Continue in main checkout".to_owned(),
+            tip: "Check the parked branch out in the main checkout and open this session there",
+            enabled: checked_out.is_none(),
+            why: busy_why,
+            danger: false,
+            action: SidebarAction::ContinueInMain(entry.clone()),
+        });
+    }
+    acts
+}
+
+/// The worktree actions of the row of `entry`: its live worktree's, or its parked branch's.
+fn row_acts(env: &MenuEnv<'_>, entry: &SessionEntry) -> Vec<RowAct> {
+    if let Some(w) = env.worktree_of(&entry.cwd) {
+        return live_acts(env, w);
+    }
+    match env.parked.record_of(&entry.id) {
+        Some(r) => parked_acts(env, entry, r, env.parked.checked_out(r)),
+        None => Vec::new(),
+    }
+}
+
+fn act_item(ui: &mut Ui, a: &RowAct, out: &mut SidebarOutput) {
+    let item = menu_item(ui, a.icon, &a.label, None, a.enabled, a.danger);
+    let item = if a.enabled {
+        item.on_hover_text(a.tip)
+    } else {
+        item.on_disabled_hover_text(a.why.as_deref().unwrap_or(a.tip))
+    };
+    if item.clicked() {
+        out.actions.push(a.action.clone());
         out.interacted = true;
         ui.close();
     }
-    if menu_item(ui, ICON_TRASH_2, "Remove worktree…", None, true, true)
-        .on_hover_text("Remove the folder and its branch when everything is committed and merged")
-        .clicked()
+}
+
+/// The worktree actions, "Open worktree folder" and "Copy worktree path" in the menu of a
+/// session that runs in worktree `w`.
+fn worktree_items(ui: &mut Ui, env: &MenuEnv<'_>, w: &Worktree, out: &mut SidebarOutput) {
+    for a in live_acts(env, w) {
+        act_item(ui, &a, out);
+    }
+    if menu_item(
+        ui,
+        ICON_FOLDER_OPEN,
+        "Open worktree folder",
+        None,
+        true,
+        false,
+    )
+    .clicked()
     {
-        out.actions.push(SidebarAction::RemoveWorktree(w.clone()));
+        out.actions.push(SidebarAction::OpenFolder(w.path.clone()));
         ui.close();
     }
-    ui.separator();
+    if menu_item(ui, ICON_COPY, "Copy worktree path", None, true, false).clicked() {
+        out.actions.push(SidebarAction::CopyText {
+            text: w.path.to_string_lossy().into_owned(),
+            what: "worktree path",
+        });
+        ui.close();
+    }
 }
 
 /// Nothing under the scope yet: say so (the button above the list starts the first session).
@@ -978,55 +1128,27 @@ struct HeaderResult {
     toggle: bool,
 }
 
-/// How a project header presents itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Look {
-    Project,
-    /// The group of a worktree OmpDeck removed (nested under its primary, muted).
-    Removed,
-    /// A repository that has worktree sessions but none of its own.
-    Synthetic,
-    Worktree {
-        finishing: bool,
-    },
-}
-
 struct HeaderSpec<'a> {
     group: &'a ProjectGroup,
-    look: Look,
-    removed: Option<&'a RemovedWorktree>,
+    /// Rows shown below the header (filtered).
     shown: usize,
+    /// Rows of the project before filtering.
+    total: usize,
     /// Offer the hover button that starts a session in a new worktree.
     wt_button: bool,
 }
 
-/// The header's name and its faint hint: branch and folder for a worktree, else folder name and
-/// parent path.
+/// The header's name and its faint hint: folder name and parent path.
 fn header_text<'a>(spec: &'a HeaderSpec<'_>) -> (Cow<'a, str>, Cow<'a, str>) {
-    let group = spec.group;
-    if let Some(r) = spec.removed {
-        return (
-            Cow::Owned(worktree_ui::removed_label(&group.cwd, r)),
-            Cow::Owned(folder_scope::folder_name(&group.cwd)),
-        );
-    }
-    match (&group.worktree, spec.look) {
-        (Some(w), Look::Worktree { .. }) => (
-            Cow::Owned(worktree_ui::worktree_label(w)),
-            Cow::Owned(folder_scope::folder_name(&group.cwd)),
-        ),
-        _ => {
-            let (parent, name) = split_display(&group.display);
-            (Cow::Borrowed(name), Cow::Borrowed(parent))
-        }
-    }
+    let (parent, name) = split_display(&spec.group.display);
+    (Cow::Borrowed(name), Cow::Borrowed(parent))
 }
 
-fn header_icon(look: Look, open_t: f32) -> Icon {
-    match look {
-        Look::Worktree { .. } | Look::Removed => ICON_FOLDER_GIT_2,
-        _ if open_t > 0.5 => ICON_FOLDER_OPEN,
-        _ => ICON_FOLDER,
+fn header_icon(open_t: f32) -> Icon {
+    if open_t > 0.5 {
+        ICON_FOLDER_OPEN
+    } else {
+        ICON_FOLDER
     }
 }
 
@@ -1035,14 +1157,12 @@ struct HeaderGeom {
     rect: Rect,
     plus: Rect,
     wt: Option<Rect>,
-    badge: Option<Rect>,
 }
 
 impl HeaderGeom {
-    /// Width at the right of the name taken by buttons and the badge.
+    /// Width at the right of the name taken by buttons.
     fn reserved(&self, base: f32) -> f32 {
         base + if self.wt.is_some() { 28.0 } else { 0.0 }
-            + if self.badge.is_some() { 84.0 } else { 0.0 }
     }
 }
 
@@ -1070,19 +1190,8 @@ fn group_header(
     let wt_btn = spec
         .wt_button
         .then(|| ui.interact(wt_rect, resp.id.with("new-wt"), Sense::click()));
-    let badge_rect = matches!(spec.look, Look::Worktree { finishing: true }).then(|| {
-        Rect::from_center_size(
-            pos2(plus_rect.left() - 44.0, rect.center().y),
-            vec2(76.0, 18.0),
-        )
-    });
-    let badge_btn = badge_rect.map(|r| ui.interact(r, resp.id.with("finishing"), Sense::click()));
     let over = |r: &Option<egui::Response>| r.as_ref().is_some_and(egui::Response::hovered);
-    let hov_raw = resp.hovered()
-        || plus.hovered()
-        || over(&wt_btn)
-        || over(&badge_btn)
-        || resp.context_menu_opened();
+    let hov_raw = resp.hovered() || plus.hovered() || over(&wt_btn) || resp.context_menu_opened();
     let ctx = ui.ctx().clone();
     let hover = HeaderHover {
         hov: ctx.animate_bool_with_time(resp.id.with("hov"), hov_raw, 0.1),
@@ -1093,7 +1202,6 @@ fn group_header(
         rect,
         plus: plus_rect,
         wt: wt_btn.as_ref().map(|_| wt_rect),
-        badge: badge_rect,
     };
 
     let (name, hint) = header_text(spec);
@@ -1111,10 +1219,6 @@ fn group_header(
     for (btn, tip) in [
         (&Some(plus.clone()), "New omp session in this project"),
         (&wt_btn, "New session in a new git worktree"),
-        (
-            &badge_btn,
-            "Waiting for the agent to finish — click to stop waiting",
-        ),
     ] {
         if let Some(b) = btn {
             if b.hovered() {
@@ -1138,35 +1242,22 @@ fn group_header(
         out.interacted = true;
         return none;
     }
-    if badge_btn.as_ref().is_some_and(egui::Response::clicked) {
-        if let Some(w) = &group.worktree {
-            out.actions
-                .push(SidebarAction::CancelFinish(w.path.clone()));
-        }
-        out.interacted = true;
-        return none;
-    }
-    let toggle = resp.clicked() && !over(&wt_btn) && !over(&badge_btn) && !plus.hovered();
+    let toggle = resp.clicked() && !over(&wt_btn) && !plus.hovered();
     HeaderResult { resp, toggle }
 }
 
-/// Hover card of a project header: folder, worktree branch and primary checkout, session count.
+/// Hover card of a project header: folder and session count.
 fn group_hover(resp: &egui::Response, spec: &HeaderSpec<'_>, name: &str, open_t: f32) {
     const KEY_W: f32 = 100.0;
     let group = spec.group;
-    let mut head = card::Header::new(header_icon(spec.look, open_t), name);
-    if spec.look == Look::Removed {
-        head = head.subtitle("Worktree removed by OmpDeck");
-    } else if matches!(spec.look, Look::Worktree { finishing: true }) {
-        head = head.subtitle("Finishing: waiting for the agent to merge");
-    }
+    let head = card::Header::new(header_icon(open_t), name);
     card::hover(
         resp,
         340.0,
         false,
         &head,
         |ui| {
-            let n = group.sessions.len();
+            let n = spec.total;
             let text = if n == 1 {
                 "1 session".to_owned()
             } else {
@@ -1176,13 +1267,6 @@ fn group_hover(resp: &egui::Response, spec: &HeaderSpec<'_>, name: &str, open_t:
         },
         |ui| {
             card::kv(ui, KEY_W, "Folder", |ui| tips::path(ui, &group.cwd));
-            if let Some(w) = &group.worktree {
-                card::kv(ui, KEY_W, "Branch", |ui| {
-                    let branch = w.branch.as_deref().unwrap_or("detached HEAD");
-                    badge::show(ui, Some(ICON_GIT_BRANCH), branch, Hue::Blue, tips::VALUE);
-                });
-                card::kv(ui, KEY_W, "Worktree of", |ui| tips::path(ui, &w.primary));
-            }
             card::footer_hints(
                 ui,
                 &[("click", "fold / unfold"), ("right-click", "actions")],
@@ -1194,7 +1278,6 @@ fn group_hover(resp: &egui::Response, spec: &HeaderSpec<'_>, name: &str, open_t:
 /// Name (medium) and hint (faint) on one line, cut at `max_width`.
 fn header_job(
     pal: &Palette,
-    muted: bool,
     (name, hint): (&str, &str),
     (name_px, hint_px): (f32, f32),
     max_width: f32,
@@ -1205,7 +1288,7 @@ fn header_job(
         0.0,
         TextFormat {
             font_id: crate::theme::font(name_px),
-            color: if muted { pal.weak } else { pal.text_strong },
+            color: pal.text_strong,
             ..Default::default()
         },
     );
@@ -1226,7 +1309,7 @@ fn header_job(
     job
 }
 
-/// The hover button for a worktree session and the "finishing" badge.
+/// The hover button that starts a session in a new worktree.
 fn paint_header_extras(p: &egui::Painter, pal: &Palette, geom: &HeaderGeom, hover: &HeaderHover) {
     if let Some(r) = geom.wt
         && hover.hov > 0.01
@@ -1249,16 +1332,6 @@ fn paint_header_extras(p: &egui::Painter, pal: &Palette, geom: &HeaderGeom, hove
             theme::mix(pal.weak, pal.text_strong, hover.wt).gamma_multiply(hover.hov),
         );
     }
-    if let Some(r) = geom.badge {
-        p.rect_filled(r, 9, pal.accent.gamma_multiply(0.16 + 0.1 * hover.hov));
-        p.text(
-            r.center(),
-            Align2::CENTER_CENTER,
-            "Finishing…",
-            crate::theme::font(11.0),
-            pal.accent,
-        );
-    }
 }
 
 /// Neon header: folder glyph, name + parent path, count chip that crossfades into the "+".
@@ -1277,13 +1350,12 @@ fn paint_header_neon(
         p,
         pos2(rect.left() + 34.0, rect.center().y),
         Align2::CENTER_CENTER,
-        header_icon(spec.look, open_t),
+        header_icon(open_t),
         18.0,
         pal.accent,
     );
     let job = header_job(
         pal,
-        spec.look == Look::Removed,
         text,
         (14.0, 11.5),
         rect.width() - 46.0 - geom.reserved(40.0),
@@ -1340,13 +1412,12 @@ fn paint_header_neutral(
         p,
         pos2(rect.left() + 31.0, y),
         Align2::CENTER_CENTER,
-        header_icon(spec.look, open_t),
+        header_icon(open_t),
         15.0,
         theme::mix(pal.glyph, pal.text_strong, open_t * 0.5),
     );
     let job = header_job(
         pal,
-        spec.look == Look::Removed,
         text,
         (13.0, 11.0),
         rect.width() - 44.0 - geom.reserved(40.0),
@@ -1630,16 +1701,99 @@ fn open_tab_row(
     theme::context_menu(&resp, 230.0, |ui| tab_menu(ui, i, tab, &env, out));
 }
 
+/// The branch chip of a session that runs in a worktree of the project.
+struct RowChip<'a> {
+    wt: RowWorktree<'a>,
+    /// The worktree is being finished: the chip says so instead of naming the branch.
+    finishing: bool,
+}
+
+impl RowChip<'_> {
+    /// Longest branch name shown in the chip (characters); a parked chip is longer ("parked ·")
+    /// and shorter in its name to leave the title room.
+    fn max_chars(&self) -> usize {
+        match self.wt {
+            RowWorktree::Parked(..) => 8,
+            _ => 14,
+        }
+    }
+
+    /// The chip, its branch name cut further while it is wider than `max_w` (the title keeps room).
+    fn badge(&self, p: &egui::Painter, pal: &Palette, size: f32, max_w: f32) -> badge::Badge {
+        let mut chars = self.max_chars();
+        loop {
+            let b = self.badge_with(p, pal, size, chars);
+            if b.width() <= max_w || chars <= 3 {
+                return b;
+            }
+            chars -= 1;
+        }
+    }
+
+    fn badge_with(
+        &self,
+        p: &egui::Painter,
+        pal: &Palette,
+        size: f32,
+        chars: usize,
+    ) -> badge::Badge {
+        let label = self.wt.chip_label();
+        let label: std::borrow::Cow<'_, str> = match label.char_indices().nth(chars) {
+            Some((at, _)) => {
+                let keep = label.char_indices().nth(chars - 1).map_or(at, |(i, _)| i);
+                std::borrow::Cow::Owned(format!("{}…", &label[..keep]))
+            }
+            None => label,
+        };
+        match (self.wt, self.finishing) {
+            (_, true) => badge::Badge::single(
+                p,
+                Some(ICON_GIT_MERGE),
+                "Finishing…",
+                Hue::Amber.color(pal),
+                size,
+            ),
+            (RowWorktree::Live(_), false) => {
+                badge::Badge::single(p, Some(ICON_GIT_BRANCH), &label, Hue::Teal.color(pal), size)
+            }
+            (RowWorktree::Parked(..), false) => badge::Badge::single(
+                p,
+                Some(ICON_GIT_BRANCH),
+                &format!("parked · {label}"),
+                Hue::Violet.color(pal),
+                size,
+            ),
+            (RowWorktree::Removed(..), false) => {
+                let dim = Hue::Teal.color(pal).gamma_multiply(0.55);
+                badge::Badge::new(
+                    p,
+                    Some(ICON_GIT_BRANCH),
+                    &[(&label, dim), ("removed", pal.weak)],
+                    dim,
+                    size,
+                )
+            }
+        }
+    }
+}
+
+/// What one session row shows besides its entry.
+struct RowCtx<'a> {
+    running: bool,
+    selected: bool,
+    chip: Option<RowChip<'a>>,
+}
+
 fn session_row(
     ui: &mut Ui,
     entry: &SessionEntry,
     age_text: &str,
-    running: bool,
-    selected: bool,
+    row: &RowCtx<'_>,
     input: &SidebarInput<'_>,
     out: &mut SidebarOutput,
 ) {
     let pal = Palette::of_ui(ui);
+    let (running, selected) = (row.running, row.selected);
     // A delete/move/copy of this session is in flight on a worker.
     let busy = input.busy.contains(&entry.path);
     // The live omp state of a tab showing this session (replaces the LED).
@@ -1649,27 +1803,76 @@ fn session_row(
         .copied()
         .filter(|_| !busy);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h()), Sense::click());
+    let env = input.menu_env();
+    // The worktree actions: a hover button each (the same actions as the context menu's).
+    let slots: Vec<Slot> = row
+        .chip
+        .as_ref()
+        .map(|c| {
+            slots(c, input.omp_available)
+                .into_iter()
+                .flatten()
+                .collect()
+        })
+        .unwrap_or_default();
+    let pill_rect = rect.shrink2(vec2(2.0, 0.0));
+    let btn_rects: Vec<Rect> = (0..slots.len())
+        .map(|k| {
+            Rect::from_center_size(
+                pos2(pill_rect.right() - 14.0 - 28.0 * k as f32, rect.center().y),
+                vec2(24.0, 24.0),
+            )
+        })
+        .collect();
+    let btns: Vec<egui::Response> = btn_rects
+        .iter()
+        .enumerate()
+        .map(|(k, r)| ui.interact(*r, resp.id.with(("act", k)), Sense::click()))
+        .collect();
+    // Width at the right of the row the buttons take: the title and chip never move for them.
+    let acts_w = if slots.is_empty() {
+        0.0
+    } else {
+        14.0 + 28.0 * slots.len() as f32
+    };
+    let over_btn = btns.iter().any(egui::Response::hovered);
+    // The buttons show (and the age hides) while the row is hovered or its menu is open.
+    let show_btns = !slots.is_empty() && (resp.hovered() || over_btn || resp.context_menu_opened());
+    // What the chip may take: the title keeps at least ~90 px beside the age / the buttons.
+    let chip_budget = pill_rect.width() - 32.0 - 90.0 - acts_w.max(46.0);
     let ctx = ui.ctx().clone();
     let hov = ctx.animate_bool_with_time(
         resp.id.with("hov"),
-        resp.hovered() || resp.context_menu_opened(),
+        resp.hovered() || over_btn || resp.context_menu_opened(),
         0.12,
     );
     let sel = ctx.animate_bool_with_time(resp.id.with("sel"), selected, 0.18);
+    let btn_hov: Vec<f32> = btns
+        .iter()
+        .map(|b| ctx.animate_bool_with_time(b.id.with("hov"), b.hovered(), 0.1))
+        .collect();
     if ui.is_rect_visible(rect) {
         let pill = rect.shrink2(vec2(2.0, 0.0));
         let p = ui.painter();
         if theme::flat() {
+            let badge = row
+                .chip
+                .as_ref()
+                .map(|c| c.badge(p, pal, 10.5, chip_budget));
             paint_row_neutral(
                 p,
                 pal,
                 pill,
-                entry.label(),
-                age_text,
+                (entry.label(), age_text),
                 (running, busy || live.is_some()),
                 (hov, sel),
+                (badge.as_ref(), acts_w, show_btns),
             );
         } else {
+            let badge = row
+                .chip
+                .as_ref()
+                .map(|c| c.badge(p, pal, 11.0, chip_budget));
             paint_row_bg(p, pal, pill, (hov, sel));
             // Status dot.
             let dot = pos2(pill.left() + 19.0, pill.center().y);
@@ -1689,8 +1892,10 @@ fn session_row(
                 ),
                 vec2(age.size().x + 12.0, 18.0),
             );
-            p.rect_filled(chip, 9, pal.bg.gamma_multiply(0.55 + 0.45 * sel));
-            p.galley(chip.center() - age.size() / 2.0, age, pal.weak);
+            if !show_btns {
+                p.rect_filled(chip, 9, pal.bg.gamma_multiply(0.55 + 0.45 * sel));
+                p.galley(chip.center() - age.size() / 2.0, age, pal.weak);
+            }
             // Title.
             let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.5));
             let mut job = LayoutJob::simple_singleline(
@@ -1699,7 +1904,12 @@ fn session_row(
                 crate::theme::font(13.0),
                 color,
             );
-            job.wrap.max_width = (chip.left() - pill.left() - 32.0 - 8.0).max(10.0);
+            let mut text_right = chip.left().min(pill.right() - acts_w);
+            if let Some(b) = &badge {
+                text_right -= 6.0 + b.width();
+                b.paint_at(p, text_right, pill.center().y);
+            }
+            job.wrap.max_width = (text_right - pill.left() - 32.0 - 8.0).max(10.0);
             job.wrap.max_rows = 1;
             job.wrap.break_anywhere = true;
             let galley = p.layout_job(job);
@@ -1708,6 +1918,9 @@ fn session_row(
                 galley,
                 color,
             );
+        }
+        if show_btns {
+            paint_row_acts(p, pal, &slots, &btn_rects, &btn_hov, hov);
         }
     }
     let dot = pos2(
@@ -1723,11 +1936,30 @@ fn session_row(
         tabs::paint_status(ui, dot, STATUS_SIZE, status);
     }
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    if resp.clicked() {
+    for (k, btn) in btns.iter().enumerate() {
+        if btn.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        let _ = btn.clone().on_hover_ui(|ui| {
+            if let Some(act) = row_acts(&env, entry).get(k) {
+                ui.label(act.button_tip());
+            }
+        });
+    }
+    let clicked = btns
+        .iter()
+        .enumerate()
+        .find(|(k, b)| b.clicked() && slots[*k].enabled)
+        .map(|(k, _)| k);
+    if let Some(k) = clicked {
+        if let Some(act) = row_acts(&env, entry).into_iter().nth(k) {
+            out.actions.push(act.action);
+            out.interacted = true;
+        }
+    } else if resp.clicked() && !over_btn {
         out.actions.push(SidebarAction::Open(entry.clone()));
         out.interacted = true;
     }
-    let env = input.menu_env();
     theme::context_menu(&resp, 230.0, |ui| {
         session_menu(ui, entry, running, true, &env, out)
     });
@@ -1736,6 +1968,18 @@ fn session_row(
     let mut head = card::Header::new(ICON_MESSAGES_SQUARE, entry.label()).tone(tone);
     if let Some(hint) = live.and_then(TabStatus::hint) {
         head = head.subtitle(hint);
+    } else if let Some(chip) = &row.chip {
+        if chip.finishing {
+            head = head.subtitle("Finishing: waiting for the agent to merge");
+        } else if matches!(chip.wt, RowWorktree::Removed(..)) {
+            head = head.subtitle("Its worktree was removed by OmpDeck");
+        } else if matches!(chip.wt, RowWorktree::Parked(..)) {
+            head = head.subtitle("Parked — local branch kept");
+        }
+    }
+    // The row's card would cover the buttons' tooltips.
+    if over_btn {
+        return;
     }
     card::hover(
         &resp,
@@ -1755,6 +1999,54 @@ fn session_row(
             card::kv(ui, KEY_W, "Id", |ui| tips::id_badge(ui, &entry.id));
             card::kv(ui, KEY_W, "Folder", |ui| tips::path(ui, &entry.cwd));
             card::kv(ui, KEY_W, "File", |ui| tips::path(ui, &entry.path));
+            if let Some(chip) = &row.chip {
+                card::kv(ui, KEY_W, "Branch", |ui| match chip.wt {
+                    RowWorktree::Live(w) => {
+                        let branch = w.branch.as_deref().unwrap_or("detached HEAD");
+                        badge::show(ui, Some(ICON_GIT_BRANCH), branch, Hue::Teal, tips::VALUE);
+                    }
+                    RowWorktree::Removed(_, r) => {
+                        let branch = r.branch.as_deref().unwrap_or("detached HEAD");
+                        badge::show(ui, Some(ICON_GIT_BRANCH), branch, Hue::Rose, tips::VALUE);
+                    }
+                    RowWorktree::Parked(r, _) => {
+                        badge::show(
+                            ui,
+                            Some(ICON_GIT_BRANCH),
+                            &r.branch,
+                            Hue::Violet,
+                            tips::VALUE,
+                        );
+                    }
+                });
+                if let RowWorktree::Parked(r, checked_out) = chip.wt {
+                    card::kv(ui, KEY_W, "Base", |ui| {
+                        badge::show(ui, Some(ICON_GIT_BRANCH), &r.base, Hue::Blue, tips::VALUE);
+                    });
+                    card::kv(ui, KEY_W, "State", |ui| {
+                        badge::show(
+                            ui,
+                            None,
+                            "Parked — local branch kept",
+                            Hue::Violet,
+                            tips::VALUE,
+                        );
+                    });
+                    if let Some(at) = checked_out {
+                        card::kv(ui, KEY_W, "Checkout", |ui| {
+                            let text = if at == r.primary {
+                                "checked out in the main checkout".to_owned()
+                            } else {
+                                format!("checked out in {}", abbreviate_home(at))
+                            };
+                            badge::show(ui, None, &text, Hue::Amber, tips::VALUE);
+                        });
+                    }
+                }
+                if let Some(path) = chip.wt.path() {
+                    card::kv(ui, KEY_W, "Worktree", |ui| tips::path(ui, path));
+                }
+            }
             card::kv(ui, KEY_W, "Updated", |ui| {
                 let ago = if age_text == "now" {
                     "just now".to_owned()
@@ -1768,15 +2060,16 @@ fn session_row(
     );
 }
 
-/// Neutral session row: status dot at the left, age at the right (background: [`paint_row_bg`]).
+/// Neutral session row: status dot at the left, age at the right, the worktree chip left of the
+/// age (background: [`paint_row_bg`]).
 fn paint_row_neutral(
     p: &egui::Painter,
     pal: &Palette,
     pill: Rect,
-    label: &str,
-    age_text: &str,
+    (label, age_text): (&str, &str),
     (running, placed): (bool, bool),
     (hov, sel): (f32, f32),
+    (chip, acts_w, show_btns): (Option<&badge::Badge>, f32, bool),
 ) {
     paint_row_bg(p, pal, pill, (hov, sel));
     let y = pill.center().y;
@@ -1790,10 +2083,16 @@ fn paint_row_neutral(
     }
     let age = p.layout_no_wrap(age_text.to_owned(), crate::theme::font(11.0), pal.weak);
     let age_x = pill.right() - 10.0 - age.size().x;
+    // With hover buttons the age gives way to them (it fades out while the row is hovered).
+    let mut text_right = age_x.min(pill.right() - acts_w);
+    if let Some(b) = chip {
+        text_right -= 6.0 + b.width();
+        b.paint_at(p, text_right, y);
+    }
     let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.6));
     // One step below the project header's 13 px name.
     let mut job = LayoutJob::simple_singleline(label.to_owned(), crate::theme::font(12.0), color);
-    job.wrap.max_width = (age_x - pill.left() - 28.0 - 8.0).max(10.0);
+    job.wrap.max_width = (text_right - pill.left() - 28.0 - 8.0).max(10.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     let galley = p.layout_job(job);
@@ -1802,7 +2101,49 @@ fn paint_row_neutral(
         galley,
         color,
     );
-    p.galley(pos2(age_x, y - age.size().y / 2.0), age, pal.weak);
+    if !show_btns {
+        p.galley(pos2(age_x, y - age.size().y / 2.0), age, pal.weak);
+    }
+}
+
+/// The hover buttons of a session row, drawn like the project header's: a raised rounded square
+/// with the action's icon, lifting on hover; disabled actions are dimmed.
+fn paint_row_acts(
+    p: &egui::Painter,
+    pal: &Palette,
+    slots: &[Slot],
+    rects: &[Rect],
+    btn_hov: &[f32],
+    hov: f32,
+) {
+    if hov <= 0.01 {
+        return;
+    }
+    for ((act, r), over) in slots.iter().zip(rects).zip(btn_hov) {
+        let over = if act.enabled { *over } else { 0.0 };
+        if theme::flat() {
+            p.rect_filled(*r, 6, pal.raised.gamma_multiply(hov * over));
+        } else {
+            p.rect_filled(
+                *r,
+                8,
+                theme::mix(pal.raised, pal.accent, over * 0.5).gamma_multiply(hov),
+            );
+        }
+        let tint = if act.enabled {
+            theme::mix(pal.weak, pal.text_strong, over)
+        } else {
+            pal.weak.gamma_multiply(0.45)
+        };
+        paint_icon(
+            p,
+            r.center(),
+            Align2::CENTER_CENTER,
+            act.icon,
+            if theme::flat() { 15.0 } else { 17.0 },
+            tint.gamma_multiply(hov),
+        );
+    }
 }
 
 /// List row hover and selection. Hover lifts the row (raised fill + a bright outline, also on the
@@ -1895,6 +2236,9 @@ pub struct MenuEnv<'a> {
     pub drive: DriveMenu,
     /// Session files open in a live tab (a move to a worktree types into that tab).
     pub live_tabs: &'a [&'a Path],
+    /// Worktrees (by folder) that were sent the finish prompt and are being waited for.
+    pub finishing: &'a HashMap<PathBuf, Finishing>,
+    pub parked: ParkView<'a>,
 }
 
 impl MenuEnv<'_> {
@@ -1903,6 +2247,14 @@ impl MenuEnv<'_> {
             .iter()
             .flat_map(|g| &g.sessions)
             .find(|e| e.path == path)
+    }
+
+    /// The linked worktree a session whose header folder is `cwd` runs in.
+    fn worktree_of(&self, cwd: &Path) -> Option<&Worktree> {
+        self.groups
+            .iter()
+            .find(|g| g.cwd == cwd)
+            .and_then(|g| g.worktree.as_ref())
     }
 }
 
@@ -1915,6 +2267,8 @@ impl SidebarInput<'_> {
             busy: self.busy,
             drive: self.drive,
             live_tabs: self.open_paths,
+            finishing: self.finishing,
+            parked: self.parked,
         }
     }
 }
@@ -2045,13 +2399,23 @@ fn session_menu(
             |ui| drive_items(ui, env.drive, &entry.cwd, false, out),
         );
     }
+    let worktree = env.worktree_of(&entry.cwd);
+    if let Some(w) = worktree {
+        ui.separator();
+        worktree_items(ui, env, w, out);
+    }
+    if worktree.is_none()
+        && let Some(r) = env.parked.record_of(&entry.id)
+    {
+        ui.separator();
+        for a in parked_acts(env, entry, r, env.parked.checked_out(r)) {
+            act_item(ui, &a, out);
+        }
+    }
     if env.omp_available {
         ui.separator();
         let live = env.live_tabs.contains(&entry.path.as_path());
-        let linked = env
-            .groups
-            .iter()
-            .any(|g| g.cwd == entry.cwd && g.worktree.is_some());
+        let linked = worktree.is_some();
         let mut item = menu_item(
             ui,
             ICON_GIT_BRANCH_PLUS,
@@ -2207,6 +2571,59 @@ fn transfer_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_button_slots_mirror_the_menu_actions() {
+        let busy = HashSet::new();
+        let finishing = HashMap::new();
+        let parkable = HashSet::new();
+        let (records, states) = ([], []);
+        let env = MenuEnv {
+            groups: &[],
+            omp_available: true,
+            can_stop: true,
+            busy: &busy,
+            drive: DriveMenu::Hidden,
+            live_tabs: &[],
+            finishing: &finishing,
+            parked: ParkView {
+                records: &records,
+                states: &states,
+                parkable: &parkable,
+            },
+        };
+        let rec = ParkedBranch {
+            primary: PathBuf::from("/p/repo"),
+            branch: "feat".into(),
+            base: "main".into(),
+            sessions: vec!["s".into()],
+            parked_ms: 0,
+        };
+        let entry = SessionEntry {
+            id: "s".into(),
+            path: PathBuf::from("/s/s.jsonl"),
+            cwd: PathBuf::from("/p/repo"),
+            title: None,
+            first_prompt: None,
+            modified: SystemTime::UNIX_EPOCH,
+        };
+        for at in [
+            None,
+            Some(Path::new("/p/repo")),
+            Some(Path::new("/wt/elsewhere")),
+        ] {
+            let chip = RowChip {
+                wt: RowWorktree::Parked(&rec, at),
+                finishing: false,
+            };
+            let acts = parked_acts(&env, &entry, &rec, at);
+            let sl = slots(&chip, true);
+            assert_eq!(acts.len(), sl.iter().flatten().count());
+            for (a, s) in acts.iter().zip(sl.iter().flatten()) {
+                assert_eq!((a.enabled, a.icon.codepoint), (s.enabled, s.icon.codepoint));
+            }
+        }
+    }
 
     fn at(secs: u64) -> (SystemTime, SystemTime) {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000_000);
