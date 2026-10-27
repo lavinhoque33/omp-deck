@@ -386,8 +386,10 @@ While OmpDeck is open, or Always on (user systemd unit on Linux, logon scheduled
 enabling picks Always on). Installers and self-update drain the gateway before replacing binaries and
 resume it afterwards; uninstall removes only OmpDeck's registration. deb/rpm removal has no maintainer
 script: a running supervisor notices its missing program after ~30 s, removes its own registration and exits.
-No relay, pairing or PWA is enabled yet, and Windows gateway behavior has only been compile-checked from Linux.
-Control with the window closed is verified with real omp on Linux (`cargo test -p deck-service --test gateway_e2e`).
+No relay, pairing or PWA is enabled yet. On Linux the gateway is verified end to end with real omp (`cargo test -p
+deck-service --test gateway_e2e`, systemd Background run, Xvfb GUI smoke). On Windows, CI runs the workspace tests,
+real-omp live control, the ConPTY host smoke and a GUI typing/screenshot check through the gateway; the Always on
+registration, `install.ps1` drain/resume and gateway toasts are not covered by CI.
 
 Packaging scripts live in `packaging/`: `build-tarball.sh`, `appimage/build-appimage.sh`, `install.sh`,
 `install.ps1`, `windows/fetch-conpty.ps1`. CI runs on Linux and Windows; releases are built by GitHub Actions

@@ -181,7 +181,7 @@ events. Preserve focused-tab inbox behavior and desktop-unfocused popup policy.
 1. **Shared service and command contract.** Map every existing command, extract
    safe execution/state ownership, solve terminal single-writer/fan-out, preserve
    desktop behavior and define protocol capabilities/errors and config ownership.
-2. **Gateway and OS integration** (implemented on Linux; Windows compile-checked only; contract and evidence in
+2. **Gateway and OS integration** (implemented and released in 0.15.0; Linux and Windows runtime evidence in
    `contracts.md` "Mobile companion step 2: as built"). Headless lifecycle/jobs/watchers, private IPC,
    singleton startup, both lifetime modes, installer/uninstaller and update paths
    on Linux and Windows. Prove control with the GUI closed before networking.
@@ -267,3 +267,13 @@ tests, formatting and Linux/Windows-target clippy passed. Native Linux runtime w
 exercised; Windows runtime still requires Windows CI. Turn-finished classification
 and desktop-popup policy have test coverage; an actual OS popup was not exercised
 in this isolated native smoke. Gateway/PWA/mobile-device runtime remains unimplemented.
+
+## Step 2 status
+
+Implemented (0.15.0, follow-ups through 0.16.1): the per-user gateway, the desktop as its client, both lifetime
+modes with systemd-user / Windows logon-task supervision, install/update/uninstall drain, and replacement of an
+outdated owner. Step 1's "Windows runtime still requires Windows CI" is now answered for the transport, host,
+real-omp live control and the GUI-through-gateway path (CI), plus the gateway CLI/e2e and task trigger measured
+on Windows 11 (see `contracts.md`). Not shown by CI: `install.ps1` drain/resume, enabling Always on from the
+Mobile access card on Windows, and gateway-originated toast delivery. Relay, pairing and the PWA (slices 3-4) remain
+unimplemented.

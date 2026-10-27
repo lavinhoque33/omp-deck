@@ -2567,8 +2567,13 @@ own registration and stops the gateway after draining; it never kills unrelated 
 ### Mobile companion step 2: as built
 
 Observed on Linux (isolated HOME/XDG/PI roots and `omp-deck-test-*` namespaces; real omp, no provider request).
-Windows runtime is **not** verified: `platform::gateway::task`, `launch_detached`/ConPTY, `install.ps1` and the CI edits
-only passed the `cargo xwin clippy` compile gate.
+Windows: the first CI run hung in `cargo test` on the pipe `Listener` (accept parked forever after `remove`; fixed in
+`e33ea0a`, with a bounded test). Since then `windows-latest` runs the workspace tests, host release tests, the WinRT
+toast withdraw, real-omp live control over the named pipe, the ConPTY host smoke and a GUI screenshot step that starts
+`omp-deck-gateway.exe` and types into a restored omp tab through the frontend link. `gateway_e2e` skips in that job
+(omp is installed after `cargo test`); commit `14ae775` made it runnable on Windows (host backend) and measured the
+task's repeating-trigger need on Windows 11. Not covered by CI: `install.ps1` drain/resume, enabling Always on from Settings on Windows, and
+toast delivery from the gateway.
 
 - **Identity.** `GatewayId = gw-<24 hex sha256(host namespace)>`. Settings/sessions paths are compared in the handshake
   (`ProfileMismatch`), never served silently. Concurrent `serve` calls yield one owner; losers exit 0 after signalling readiness.
