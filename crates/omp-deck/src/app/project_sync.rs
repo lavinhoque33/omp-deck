@@ -5,16 +5,16 @@
 //! automatic passes on its own schedule. This window sends the user's requests (one project job
 //! at a time, as before), shows the gateway's progress and results, and keeps the dialogs.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use deck_core::config::SyncRow;
 use deck_core::gdrive::{
-    MemoryBank, OmpDir, Parts, ProjectBackup, ProjectBackupOutcome, ProjectRestorePlan,
-    ProjectRestoreReport, ProjectSizes, ProjectSyncState, hostname, path_id,
+    ConflictChoice, MemoryBank, OmpDir, Parts, ProjectBackup, ProjectBackupOutcome,
+    ProjectRestorePlan, ProjectRestoreReport, ProjectSizes, ProjectSyncState, hostname, path_id,
 };
-use deck_core::sessions::abbreviate_home;
+use deck_core::sessions::{SessionEntry, abbreviate_home};
 use deck_service::controller::RequestKey;
 use deck_service::gateway::protocol::{Answer, Done, Mutation, Progress, Query, Topic};
 
@@ -23,14 +23,26 @@ use crate::confirm::{self, Confirm};
 use crate::drive_view::DriveCard;
 use crate::sidebar::{DriveMenu, format_age};
 use crate::sync_view::{
-    self, BackupAnswer, BackupDialog, Cells, CloudProject, LastView, ListState, ManagerAction,
-    ManagerDialog, ManagerStep, MemoryCell, OmpCell, PathAnswer, PathPrompt, PathPurpose, PlanView,
-    ProgView, ReportView, RestoreAction, RestoreDialog, RowView, SessionItem, SessionsAnswer,
-    SessionsCell, SessionsDialog, SessionsTarget, Step, SyncAction, SyncPage, TargetStatus,
-    VersionRow,
+    self, BackupAnswer, BackupDialog, Cells, CloudProject, ConflictRow, LastView, ListState,
+    ManagerAction, ManagerDialog, ManagerStep, MemoryCell, OmpCell, PathAnswer, PathPrompt,
+    PathPurpose, PlanView, ProgView, ReportView, RestoreAction, RestoreDialog, RowView,
+    SessionItem, SessionsAnswer, SessionsCell, SessionsDialog, SessionsTarget, Step, SyncAction,
+    SyncPage, TargetStatus, VersionRow,
 };
 use crate::transfer;
 use crate::tree_layout::clock;
+
+/// A stand-in `SessionEntry` for a local copy at `path`, enough to look up and stop its process.
+fn local_entry(id: &str, path: &Path) -> SessionEntry {
+    SessionEntry {
+        id: id.to_owned(),
+        path: path.to_path_buf(),
+        cwd: PathBuf::new(),
+        title: None,
+        first_prompt: None,
+        modified: SystemTime::UNIX_EPOCH,
+    }
+}
 
 /// The confirmation lists at most this many overwritten paths.
 const PLAN_LIST: usize = 8;
@@ -1171,7 +1183,42 @@ impl App {
         );
     }
 
+    /// One row per backed-up session whose id already exists locally (default: keep current).
+    fn conflict_rows(&self, plan: &ProjectRestorePlan) -> Vec<ConflictRow> {
+        plan.sessions
+            .iter()
+            .filter(|s| !s.local.is_empty())
+            .map(|s| {
+                let newest = s.local.iter().max_by_key(|c| c.modified_unix);
+                ConflictRow {
+                    id: s.id.clone(),
+                    title: if s.title.is_empty() {
+                        s.id.clone()
+                    } else {
+                        clip(&s.title, 80)
+                    },
+                    backup_unix: s.modified_unix,
+                    local_unix: newest.map_or(0, |c| c.modified_unix),
+                    local_dir: newest
+                        .and_then(|c| c.cwd.as_deref())
+                        .filter(|dir| *dir != plan.target.as_path())
+                        .map(abbreviate_home),
+                    running: s.local.iter().any(|c| {
+                        self.running_session_name(&local_entry(&s.id, &c.path))
+                            .is_some()
+                    }),
+                    paths: s.local.iter().map(|c| c.path.clone()).collect(),
+                    choice: ConflictChoice::KeepLocal,
+                }
+            })
+            .collect()
+    }
+
     fn on_prepared(&mut self, result: Result<(u64, ProjectRestorePlan), String>) {
+        let conflicts = result
+            .as_ref()
+            .map(|(_, plan)| self.conflict_rows(plan))
+            .unwrap_or_default();
         let Some(r) = &mut self.sync.restore else {
             // The dialog was closed while it was downloading: the gateway still holds the result.
             if let Ok((handle, _)) = result {
@@ -1188,12 +1235,7 @@ impl App {
                 }
             }
             Ok((handle, plan)) => {
-                let sessions = (!plan.sessions.is_empty()).then(|| {
-                    (
-                        plan.sessions.len(),
-                        plan.sessions.iter().filter(|s| s.new_id).count(),
-                    )
-                });
+                let sessions = (!plan.sessions.is_empty()).then_some(plan.sessions.len());
                 r.dlg.step = Step::Confirm(PlanView {
                     target: abbreviate_home(&plan.target),
                     create_target: plan.create_target,
@@ -1217,6 +1259,7 @@ impl App {
                         .filter_map(|s| Some(format!("{}: {}", s.title, s.problem.as_ref()?)))
                         .collect(),
                     sessions,
+                    conflicts,
                     safety: "OmpDeck's restore-safety folder".to_owned(),
                 });
                 r.session_total = plan.sessions.len();
@@ -1229,16 +1272,41 @@ impl App {
         let Some(handle) = self.sync.restore.as_ref().and_then(|r| r.prepared) else {
             return;
         };
+        let mut choices = BTreeMap::new();
+        let mut overwritten: Vec<(String, PathBuf)> = Vec::new();
+        if let Some(Step::Confirm(plan)) = self.sync.restore.as_ref().map(|r| &r.dlg.step) {
+            for row in &plan.conflicts {
+                choices.insert(row.id.clone(), row.choice);
+                if row.choice == ConflictChoice::Overwrite {
+                    overwritten.extend(row.paths.iter().map(|p| (row.id.clone(), p.clone())));
+                }
+            }
+        }
         if !self.begin_job(Kind::Restoring) {
             self.toasts.info(&self.ctx, LANE_BUSY);
             return;
+        }
+        // Running sessions on overwritten copies are stopped (their tabs closed) before the apply.
+        let mut stop: Vec<String> = Vec::new();
+        for (id, path) in overwritten {
+            let entry = local_entry(&id, &path);
+            for name in self.session_kill_names(&entry, true) {
+                if !stop.contains(&name) {
+                    stop.push(name);
+                }
+            }
         }
         if let Some(r) = &mut self.sync.restore {
             r.prepared = None;
             r.dlg.cancelling = false;
             r.dlg.step = Step::Applying;
         }
-        self.send_job(Mutation::ProjectApplyRestore(handle), |app, r| {
+        let job = Mutation::ProjectApplyRestore {
+            handle,
+            conflicts: choices,
+            stop,
+        };
+        self.send_job(job, |app, r| {
             app.sync.job = None;
             let report = r.and_then(|d| match d {
                 Done::ProjectRestored(report) => Ok(report),
@@ -1267,14 +1335,37 @@ impl App {
                     report.memory_overwritten,
                 ));
                 let added = report.sessions_added.len();
-                if report.cancelled && total > 0 {
-                    parts.push(format!("{added} of {total} sessions added"));
+                let mut sessions = if report.cancelled && total > 0 {
+                    Some(format!("{added} of {total} sessions added"))
                 } else if added > 0 || !report.sessions_failed.is_empty() {
-                    parts.push(format!(
+                    Some(format!(
                         "{added} session{} added",
                         if added == 1 { "" } else { "s" }
+                    ))
+                } else {
+                    None
+                };
+                let mut extra = Vec::new();
+                if report.sessions_replaced > 0 {
+                    extra.push(format!(
+                        "{} of them replacing the local copy",
+                        report.sessions_replaced
                     ));
                 }
+                if !report.sessions_kept.is_empty() {
+                    extra.push(format!(
+                        "{} existing kept unchanged",
+                        report.sessions_kept.len()
+                    ));
+                }
+                if !extra.is_empty() {
+                    let extra = extra.join(", ");
+                    sessions = Some(match sessions {
+                        Some(s) => format!("{s}, {extra}"),
+                        None => extra,
+                    });
+                }
+                parts.extend(sessions);
                 let mut summary = match (parts.is_empty(), report.cancelled) {
                     (true, true) => "Restore cancelled before anything was restored.".to_owned(),
                     (true, false) => "Nothing was restored.".to_owned(),

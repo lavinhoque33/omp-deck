@@ -4,26 +4,29 @@
 //! Nothing here trusts the archive: member paths are checked against a fixed shape, every member
 //! must be a regular file listed in the manifest with matching size and sha256, nothing may be
 //! missing or extra. `.omp` files are only ever added or overwritten (after a safety copy);
-//! sessions are written by `omp session unpack`, never by us.
+//! sessions are written by `omp session unpack`, never by us, apart from the restored file's
+//! mtime (set to its backed-up time). A replaced local session is saved by `omp session pack`
+//! and removed by omp's delete extension, never by us.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 
 use super::snapshot::valid_id;
 use super::{
-    FORMAT, ItemManifest, KIND, MAX_MEMBER, Manifest, Meter, PreparedProjectRestore, Progress,
-    ProjectRestorePlan, ProjectRestoreReport, Pump, SessionPlan, Stage, invalid, job_io,
+    ConflictChoice, FORMAT, ItemManifest, KIND, LocalCopy, MAX_MEMBER, Manifest, Meter,
+    PreparedProjectRestore, Progress, ProjectRestorePlan, ProjectRestoreReport, Pump, SessionPlan,
+    Stage, invalid, job_io,
 };
 use crate::gdrive::archive::{ManifestFile, PROJECT_SAFETY_PREFIX, hex, prune_safety};
 use crate::gdrive::{Error, KEEP_SAFETY_COPIES, Result, compact_stamp, io_err, unix_now};
-use crate::omp::{MoveKind, Omp};
+use crate::omp::{DeleteError, DeleteTarget, MoveKind, MoveOutcome, Omp};
 use crate::platform;
 use crate::sharpshooter::{self, MEMORY_FILES};
 
@@ -298,34 +301,95 @@ fn check_headers(m: &Manifest, root: &Path) -> Result<()> {
 
 // ---------------------------------------------------------------- plan
 
-/// File names of every `*.jsonl` in a project directory of the sessions store.
-fn local_session_files(root: &crate::sessions::SessionsRoot) -> Vec<String> {
-    let mut names = Vec::new();
-    let Ok(projects) = fs::read_dir(&root.path) else {
-        return names;
-    };
-    for project in projects.flatten() {
-        if !project.path().is_dir() {
-            continue;
-        }
-        let Ok(files) = fs::read_dir(project.path()) else {
-            continue;
-        };
-        names.extend(
-            files
-                .flatten()
-                .filter_map(|f| f.file_name().into_string().ok())
-                .filter(|n| n.ends_with(".jsonl")),
-        );
-    }
-    names
+/// Every `*.jsonl` file of the sessions store's project directories, found with one directory
+/// walk and indexed by the session id its name ends with (`<timestamp>_<id>.jsonl`). A file
+/// only counts as a copy of an id once its header says so ([`LocalFiles::copies`]).
+struct LocalFiles {
+    by_id: BTreeMap<String, Vec<PathBuf>>,
 }
 
-/// Some local copy of session `id` exists (`<timestamp>_<id>.jsonl`): unpacking the same id
-/// would make omp replace or fork it.
-fn has_local_copy(files: &[String], id: &str) -> bool {
-    let suffix = format!("_{id}.jsonl");
-    files.iter().any(|n| n.ends_with(&suffix))
+impl LocalFiles {
+    fn scan(root: &crate::sessions::SessionsRoot) -> LocalFiles {
+        let mut by_id: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        let Ok(projects) = fs::read_dir(&root.path) else {
+            return LocalFiles { by_id };
+        };
+        for project in projects.flatten() {
+            if !project.path().is_dir() {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(project.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                if !file.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                let name = file.file_name();
+                let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".jsonl")) else {
+                    continue;
+                };
+                // The id is what follows the timestamp's `_`; try every `_` rather than assume.
+                for (at, _) in stem.match_indices('_') {
+                    by_id
+                        .entry(stem[at + 1..].to_owned())
+                        .or_default()
+                        .push(file.path());
+                }
+            }
+        }
+        LocalFiles { by_id }
+    }
+
+    /// The local copies of session `id`: named `*_<id>.jsonl`, header id `id` (a bounded
+    /// read), with their mtime, size and header cwd. Files that vanished or cannot be read
+    /// are not copies.
+    fn copies(&self, id: &str) -> Vec<LocalCopy> {
+        let mut copies: Vec<LocalCopy> = self
+            .by_id
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|path| matches!(header_id(path), Ok(Some(h)) if h == id))
+            .filter_map(|path| {
+                let md = fs::metadata(path).ok()?;
+                let modified_unix = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_secs()).ok())
+                    .unwrap_or(0);
+                let artifacts = path.with_extension("");
+                Some(LocalCopy {
+                    path: path.clone(),
+                    cwd: crate::sessions::header_cwd(path),
+                    modified_unix,
+                    bytes: md.len() + dir_bytes(&artifacts),
+                })
+            })
+            .collect();
+        copies.sort_by(|a, b| a.path.cmp(&b.path));
+        copies
+    }
+}
+
+/// Total size of the regular files below `dir`, links not followed; 0 when it is not a folder.
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_owned()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => total += e.metadata().map_or(0, |m| m.len()),
+                _ => {}
+            }
+        }
+    }
+    total
 }
 
 pub(super) fn plan(
@@ -394,7 +458,7 @@ pub(super) fn plan(
     if parts.sessions
         && let Some(sessions) = &m.sessions
     {
-        let local = local_session_files(root);
+        let local = LocalFiles::scan(root);
         let blob_size: BTreeMap<&str, u64> = sessions
             .blobs
             .iter()
@@ -424,7 +488,7 @@ pub(super) fn plan(
                     title: i.title.clone(),
                     modified_unix: i.modified_unix,
                     bytes: i.size + i.artifacts.iter().map(|a| a.size).sum::<u64>(),
-                    new_id: has_local_copy(&local, &i.id),
+                    local: local.copies(&i.id),
                     problem,
                 }
             })
@@ -437,6 +501,7 @@ pub(super) fn plan(
 
 pub(super) fn apply(
     p: &PreparedProjectRestore,
+    conflicts: &BTreeMap<String, ConflictChoice>,
     safety_root: &Path,
     omp: Option<&Omp>,
     cancel: &AtomicBool,
@@ -507,11 +572,11 @@ pub(super) fn apply(
             Err(e) => report.memory_error = Some(e.to_string()),
         }
     }
-    if let (Some(sessions), Some(omp)) = (sessions, omp) {
+    if let (Some(_), Some(omp)) = (sessions, omp) {
         restore_sessions(
             p,
-            &sessions.items,
-            &unpacked,
+            conflicts,
+            safety_root,
             omp,
             cancel,
             progress,
@@ -691,16 +756,7 @@ fn restore_memory(
         .map(|(f, _)| f)
         .collect();
     if !replaced.is_empty() {
-        let safety = match report.safety_dir.clone() {
-            Some(dir) => dir,
-            None => {
-                let dir = safety_dir(safety_root, unix_now());
-                platform::create_private_dir_all(&dir).map_err(io_err("cannot create", &dir))?;
-                prune_safety(safety_root, KEEP_SAFETY_COPIES, true);
-                report.safety_dir = Some(dir.clone());
-                dir
-            }
-        };
+        let safety = ensure_safety(safety_root, report)?;
         let copies = safety.join("memory");
         fs::create_dir_all(&copies).map_err(io_err("cannot create", &copies))?;
         for f in replaced {
@@ -863,15 +919,275 @@ fn install(src: &Path, dest: &Path, mode: u32) -> Result<()> {
     write().map_err(io_err("cannot write", dest))
 }
 
+/// How often a restore retries a pack/delete that failed only because a live omp writes the
+/// session, and how long it waits in between (~3 s in all).
+const LIVE_RETRIES: u32 = 10;
+const LIVE_WAIT: Duration = Duration::from_millis(300);
+
+/// What happened to one backed-up session.
+enum Step {
+    Added(PathBuf),
+    Replaced(PathBuf),
+    Kept,
+    Failed(String),
+}
+
+/// What restoring sessions needs besides the report: the env-configured omp and the staging
+/// directories.
+struct SessionJob<'a> {
+    p: &'a PreparedProjectRestore,
+    omp: Omp,
+    unpacked: &'a Path,
+    work: PathBuf,
+    omp_version: &'a str,
+    safety_root: &'a Path,
+}
+
+/// Sets `path`'s mtime to `unix` seconds (metadata only). `unix <= 0` leaves it; a failure is
+/// logged, never a session failure.
+fn set_mtime(path: &Path, unix: i64) {
+    let Ok(secs) = u64::try_from(unix) else {
+        return;
+    };
+    if secs == 0 {
+        return;
+    }
+    let when = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+    if let Err(e) = File::options()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(when))
+    {
+        log::warn!("cannot set the time of {}: {e}", path.display());
+    }
+}
+
+/// The restore's safety directory, created on first use (shared with the `.omp` and memory
+/// parts).
+fn ensure_safety(safety_root: &Path, report: &mut ProjectRestoreReport) -> Result<PathBuf> {
+    if let Some(dir) = &report.safety_dir {
+        return Ok(dir.clone());
+    }
+    let dir = safety_dir(safety_root, unix_now());
+    platform::create_private_dir_all(&dir).map_err(io_err("cannot create", &dir))?;
+    prune_safety(safety_root, KEEP_SAFETY_COPIES, true);
+    report.safety_dir = Some(dir.clone());
+    Ok(dir)
+}
+
+impl SessionJob<'_> {
+    /// Builds the pack for item `i` (under a fresh id when `fresh`), unpacks it into the
+    /// restore target and removes the tar.
+    fn unpack(&self, item: &ItemManifest, i: usize, fresh: bool) -> Result<MoveOutcome, String> {
+        let tar = self.work.join(format!("{i}.tar"));
+        let outcome = build_pack(
+            item,
+            fresh,
+            &self.p.manifest.project,
+            self.omp_version,
+            self.unpacked,
+            &self.work,
+            &tar,
+        )
+        .map_err(|e| format!("cannot prepare the session: {e}"))
+        .and_then(|()| {
+            self.omp
+                .unpack_session(&tar, &self.p.plan.target)
+                .map_err(|e| tidy_failure(&e.to_string()))
+        });
+        if let Err(e) = fs::remove_file(&tar)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            log::warn!("cannot remove {}: {e}", tar.display());
+        }
+        outcome
+    }
+
+    /// The session file omp created, which must be a new session; its mtime becomes the
+    /// backed-up one.
+    fn created(item: &ItemManifest, done: MoveOutcome) -> Result<PathBuf, String> {
+        if done.kind == MoveKind::Created {
+            set_mtime(&done.new_path, item.modified_unix);
+            Ok(done.new_path)
+        } else {
+            Err(format!(
+                "omp did not add the session as new ({:?}); it wrote {}",
+                done.kind,
+                done.new_path.display()
+            ))
+        }
+    }
+
+    /// `omp session pack`, retried while another omp process is writing the session.
+    fn pack(&self, src: &Path, tar: &Path) -> Result<(), String> {
+        let mut attempt = 1;
+        loop {
+            match self.omp.pack_session(src, tar) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    let text = e.to_string();
+                    if attempt < LIVE_RETRIES && text.contains("live omp process") {
+                        attempt += 1;
+                        std::thread::sleep(LIVE_WAIT);
+                    } else {
+                        return Err(tidy_failure(&text));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Replaces every local copy of the session by the backup (original id). Copies are saved
+    /// first; a failure after one was deleted puts the deleted ones back.
+    fn overwrite(
+        &self,
+        item: &ItemManifest,
+        i: usize,
+        copies: &[LocalCopy],
+        report: &mut ProjectRestoreReport,
+    ) -> Result<PathBuf, String> {
+        let safety = ensure_safety(self.safety_root, report)
+            .map_err(|e| format!("cannot save the local copy first: {e}"))?;
+        let saved_in = safety.join("sessions");
+        fs::create_dir_all(&saved_in)
+            .map_err(|e| format!("cannot save the local copy first: {e}"))?;
+        let mut tars = Vec::with_capacity(copies.len());
+        for (k, copy) in copies.iter().enumerate() {
+            let name = if k == 0 {
+                format!("{}.tar", item.id)
+            } else {
+                format!("{}-{k}.tar", item.id)
+            };
+            let tar = saved_in.join(name);
+            self.pack(&copy.path, &tar)
+                .map_err(|e| format!("cannot save the local copy first: {e}"))?;
+            tars.push(tar);
+        }
+        let targets: Vec<DeleteTarget> = copies
+            .iter()
+            .map(|c| DeleteTarget {
+                path: c.path.clone(),
+                id: item.id.clone(),
+            })
+            .collect();
+        let mut deleted = vec![false; copies.len()];
+        let mut failure: Option<String> = None;
+        self.omp.delete_sessions(&targets, |path, result| {
+            match result {
+                Ok(()) => {
+                    if let Some(k) = copies.iter().position(|c| c.path == path) {
+                        deleted[k] = true;
+                    }
+                }
+                Err(DeleteError::Live) => {
+                    failure.get_or_insert_with(|| "it is open in another omp process".to_owned());
+                }
+                Err(e) => {
+                    failure.get_or_insert_with(|| format!("cannot remove the local copy: {e}"));
+                }
+            };
+        });
+        // A target that never reported (it should not happen) is a failure, not a success.
+        let reason = match failure {
+            Some(why) => Some(why),
+            None if deleted.iter().all(|d| *d) => None,
+            None => Some("cannot remove the local copy".to_owned()),
+        };
+        let restored = match reason {
+            Some(why) => Err(why),
+            None => self
+                .unpack(item, i, false)
+                .and_then(|done| Self::created(item, done)),
+        };
+        match restored {
+            Ok(path) => Ok(path),
+            Err(why) if deleted.iter().any(|d| *d) => {
+                Err(self.put_back(why, copies, &tars, &deleted))
+            }
+            Err(why) => Err(why),
+        }
+    }
+
+    /// Unpacks every deleted local copy again from its safety tar (into its own folder when
+    /// that exists, else the restore target) with its previous mtime; returns the failure text,
+    /// naming the safety tar of every copy that could not be put back.
+    fn put_back(
+        &self,
+        why: String,
+        copies: &[LocalCopy],
+        tars: &[PathBuf],
+        deleted: &[bool],
+    ) -> String {
+        let mut stranded = Vec::new();
+        for (k, copy) in copies.iter().enumerate().filter(|(k, _)| deleted[*k]) {
+            let cwd = copy
+                .cwd
+                .as_deref()
+                .filter(|c| c.is_dir())
+                .unwrap_or(&self.p.plan.target);
+            match self.omp.unpack_session(&tars[k], cwd) {
+                Ok(done) => set_mtime(&done.new_path, copy.modified_unix),
+                Err(e) => {
+                    log::warn!("cannot put {} back: {e}", copy.path.display());
+                    stranded.push(tars[k].display().to_string());
+                }
+            }
+        }
+        match stranded.as_slice() {
+            [] => format!("{why}; the local copy was put back"),
+            [one] => format!("{why}; the local copy is saved at {one}"),
+            many => format!("{why}; the local copies are saved at {}", many.join(", ")),
+        }
+    }
+
+    fn restore_one(
+        &self,
+        item: &ItemManifest,
+        i: usize,
+        local: &LocalFiles,
+        conflicts: &BTreeMap<String, ConflictChoice>,
+        report: &mut ProjectRestoreReport,
+    ) -> Step {
+        let copies = local.copies(&item.id);
+        let choice = if copies.is_empty() {
+            None
+        } else {
+            Some(conflicts.get(&item.id).copied().unwrap_or_default())
+        };
+        if choice == Some(ConflictChoice::KeepLocal) {
+            return Step::Kept;
+        }
+        if let Some(why) = self.p.plan.sessions.get(i).and_then(|s| s.problem.clone()) {
+            return Step::Failed(why);
+        }
+        if choice == Some(ConflictChoice::Overwrite) {
+            return match self.overwrite(item, i, &copies, report) {
+                Ok(path) => Step::Replaced(path),
+                Err(why) => Step::Failed(why),
+            };
+        }
+        let fresh = choice == Some(ConflictChoice::KeepBoth);
+        match self
+            .unpack(item, i, fresh)
+            .and_then(|done| Self::created(item, done))
+        {
+            Ok(path) => Step::Added(path),
+            Err(why) => Step::Failed(why),
+        }
+    }
+}
+
 fn restore_sessions(
     p: &PreparedProjectRestore,
-    items: &[ItemManifest],
-    unpacked: &Path,
+    conflicts: &BTreeMap<String, ConflictChoice>,
+    safety_root: &Path,
     omp: &Omp,
     cancel: &AtomicBool,
     progress: &(dyn Fn(Progress) + Sync),
     report: &mut ProjectRestoreReport,
 ) -> Result<()> {
+    let items: &[ItemManifest] = p.manifest.sessions.as_ref().map_or(&[], |s| &s.items);
+    let unpacked = p.stage.dir.join("x");
     let omp_version = if p.manifest.omp_version.is_empty() {
         "unknown"
     } else {
@@ -891,7 +1207,15 @@ fn restore_sessions(
         .with_env("TMPDIR", &scratch)
         .with_env("TMP", &scratch)
         .with_env("TEMP", &scratch);
-    let local = local_session_files(&p.root);
+    let job = SessionJob {
+        p,
+        omp,
+        unpacked: &unpacked,
+        work,
+        omp_version,
+        safety_root,
+    };
+    let local = LocalFiles::scan(&p.root);
     let mut pump = Pump::new(
         cancel,
         progress,
@@ -908,46 +1232,14 @@ fn restore_sessions(
         } else {
             item.title.clone()
         };
-        if let Some(why) = p.plan.sessions.get(i).and_then(|s| s.problem.clone()) {
-            report.sessions_failed.push((label, why));
-            if pump.item().is_err() {
-                report.cancelled = true;
-                return Ok(());
+        match job.restore_one(item, i, &local, conflicts, report) {
+            Step::Added(path) => report.sessions_added.push(path),
+            Step::Replaced(path) => {
+                report.sessions_added.push(path);
+                report.sessions_replaced += 1;
             }
-            continue;
-        }
-        let new_id = has_local_copy(&local, &item.id);
-        let tar = work.join(format!("{i}.tar"));
-        let outcome = build_pack(
-            item,
-            new_id,
-            &p.manifest.project,
-            omp_version,
-            unpacked,
-            &work,
-            &tar,
-        )
-        .map_err(|e| format!("cannot prepare the session: {e}"))
-        .and_then(|()| {
-            omp.unpack_session(&tar, &p.plan.target)
-                .map_err(|e| tidy_failure(&e.to_string()))
-        });
-        if let Err(e) = fs::remove_file(&tar)
-            && e.kind() != io::ErrorKind::NotFound
-        {
-            log::warn!("cannot remove {}: {e}", tar.display());
-        }
-        match outcome {
-            Ok(done) if done.kind == MoveKind::Created => report.sessions_added.push(done.new_path),
-            Ok(done) => report.sessions_failed.push((
-                label,
-                format!(
-                    "omp did not add the session as new ({:?}); it wrote {}",
-                    done.kind,
-                    done.new_path.display()
-                ),
-            )),
-            Err(why) => report.sessions_failed.push((label, why)),
+            Step::Kept => report.sessions_kept.push(label),
+            Step::Failed(why) => report.sessions_failed.push((label, why)),
         }
         if pump.item().is_err() {
             report.cancelled = true;

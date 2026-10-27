@@ -3,6 +3,7 @@
 //! and the typed-path prompt.
 
 use deck_core::config::SyncInterval;
+use deck_core::gdrive::ConflictChoice;
 use egui::{Button, Context, Frame, Id, Margin, RichText, ScrollArea, Stroke, Ui, vec2};
 
 use crate::badge::{self, Hue};
@@ -1016,14 +1017,38 @@ pub struct PlanView {
     pub memory_skipped: Vec<String>,
     /// Sessions that cannot be restored ("<title>: <reason>").
     pub session_problems: Vec<String>,
-    /// `Some((sessions, with a new id))` when sessions are restored.
-    pub sessions: Option<(usize, usize)>,
+    /// How many sessions the backup holds (`None` = the backup has none).
+    pub sessions: Option<usize>,
+    /// Backed-up sessions whose id already exists in the sessions root, with the user's choice.
+    pub conflicts: Vec<ConflictRow>,
     pub safety: String,
+}
+
+/// One backed-up session that already exists locally.
+pub struct ConflictRow {
+    pub id: String,
+    pub title: String,
+    pub backup_unix: i64,
+    /// The newest local copy's mtime.
+    pub local_unix: i64,
+    /// The local copy's folder, `~`-abbreviated; `None` when it is the restore target.
+    pub local_dir: Option<String>,
+    pub running: bool,
+    /// Every local copy's file (to stop the sessions that run them).
+    pub paths: Vec<std::path::PathBuf>,
+    pub choice: ConflictChoice,
 }
 
 impl PlanView {
     pub fn danger(&self) -> bool {
-        self.omp_danger() || self.memory_danger()
+        self.omp_danger() || self.memory_danger() || self.sessions_overwritten() > 0
+    }
+
+    fn sessions_overwritten(&self) -> usize {
+        self.conflicts
+            .iter()
+            .filter(|c| c.choice == ConflictChoice::Overwrite)
+            .count()
     }
 
     fn omp_danger(&self) -> bool {
@@ -1181,48 +1206,84 @@ pub fn restore_dialog(
                 _ => None,
             },
         },
-        |ui| match &d.step {
-            Step::Pick => pick_body(ui, d, lane_busy, &mut act),
-            Step::Preparing => {
-                progress_or_wait(ui, progress, "Downloading and checking the backup…");
+        |ui| {
+            if let Step::Confirm(plan) = &mut d.step {
+                confirm_body(ui, plan);
+                return;
             }
-            Step::Confirm(plan) => confirm_body(ui, plan),
-            Step::Applying => {
-                progress_or_wait(
-                    ui,
-                    progress,
-                    if d.cancelling {
-                        "Stopping after the current item…"
-                    } else {
-                        "Restoring…"
-                    },
-                );
-            }
-            Step::Report(r) => {
-                ui.label(RichText::new(&r.summary).color(pal.text));
-                if !r.failures.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("These sessions could not be restored:").color(pal.danger),
+            match &d.step {
+                Step::Pick => pick_body(ui, d, lane_busy, &mut act),
+                Step::Preparing => {
+                    progress_or_wait(ui, progress, "Downloading and checking the backup…");
+                }
+                Step::Confirm(_) => {}
+                Step::Applying => {
+                    progress_or_wait(
+                        ui,
+                        progress,
+                        if d.cancelling {
+                            "Stopping after the current item…"
+                        } else {
+                            "Restoring…"
+                        },
                     );
-                    ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                        for (name, why) in &r.failures {
+                }
+                Step::Report(r) => {
+                    ui.label(RichText::new(&r.summary).color(pal.text));
+                    if !r.failures.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("These sessions could not be restored:")
+                                .color(pal.danger),
+                        );
+                        ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                            for (name, why) in &r.failures {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("• {name}: {why}"))
+                                            .small()
+                                            .color(pal.text),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                );
+                            }
+                        });
+                    }
+                    if !r.notes.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("These .omp files were not written:").color(pal.warn),
+                        );
+                        ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                            for n in &r.notes {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("• {n}")).small().color(pal.text),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                );
+                            }
+                        });
+                    }
+                    if let Some(e) = &r.memory_error {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(icon_text(ICON_TRIANGLE_ALERT, 16.0, pal.warn));
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(format!("• {name}: {why}"))
-                                        .small()
-                                        .color(pal.text),
+                                    RichText::new(format!("Memory was not restored: {e}"))
+                                        .color(pal.warn),
                                 )
                                 .wrap_mode(egui::TextWrapMode::Wrap),
                             );
-                        }
-                    });
-                }
-                if !r.notes.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("These .omp files were not written:").color(pal.warn));
-                    ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-                        for n in &r.notes {
+                        });
+                    }
+                    if !r.memory_notes.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("These memory files were not written:").color(pal.warn),
+                        );
+                        for n in &r.memory_notes {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(format!("• {n}")).small().color(pal.text),
@@ -1230,31 +1291,6 @@ pub fn restore_dialog(
                                 .wrap_mode(egui::TextWrapMode::Wrap),
                             );
                         }
-                    });
-                }
-                if let Some(e) = &r.memory_error {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label(icon_text(ICON_TRIANGLE_ALERT, 16.0, pal.warn));
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("Memory was not restored: {e}"))
-                                    .color(pal.warn),
-                            )
-                            .wrap_mode(egui::TextWrapMode::Wrap),
-                        );
-                    });
-                }
-                if !r.memory_notes.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("These memory files were not written:").color(pal.warn));
-                    for n in &r.memory_notes {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("• {n}")).small().color(pal.text),
-                            )
-                            .wrap_mode(egui::TextWrapMode::Wrap),
-                        );
                     }
                 }
             }
@@ -1483,7 +1519,7 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
     }
 }
 
-fn confirm_body(ui: &mut Ui, plan: &PlanView) {
+fn confirm_body(ui: &mut Ui, plan: &mut PlanView) {
     let pal = Palette::of_ui(ui);
     let wrap = |ui: &mut Ui, text: RichText| {
         ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Wrap));
@@ -1574,35 +1610,28 @@ fn confirm_body(ui: &mut Ui, plan: &PlanView) {
             );
         });
     }
-    if let Some((n, new_ids)) = plan.sessions {
-        ui.add_space(6.0);
-        deck_card::kv(ui, 84.0, "Sessions", |ui| {
-            badge::show(
-                ui,
-                None,
-                &format!("{n} session{} added", if n == 1 { "" } else { "s" }),
-                Hue::Teal,
-                11.0,
-            );
+    if let Some(n) = plan.sessions {
+        let fresh = n.saturating_sub(plan.conflicts.len());
+        if fresh > 0 || plan.conflicts.is_empty() {
             ui.add_space(6.0);
-            ui.label(
-                RichText::new("alongside the existing ones")
-                    .small()
-                    .color(pal.weak),
-            );
-        });
-        if new_ids > 0 {
-            deck_card::kv(ui, 84.0, "New ids", |ui| {
-                badge::show(ui, None, &new_ids.to_string(), Hue::Amber, 11.0);
+            deck_card::kv(ui, 84.0, "Sessions", |ui| {
+                badge::show(
+                    ui,
+                    None,
+                    &format!("{fresh} session{} added", if fresh == 1 { "" } else { "s" }),
+                    Hue::Teal,
+                    11.0,
+                );
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new("a session with that id already exists")
+                    RichText::new("alongside the existing ones")
                         .small()
                         .color(pal.weak),
                 );
             });
         }
     }
+    conflicts_section(ui, plan);
     warn_list(
         ui,
         ".omp files that will NOT be written:",
@@ -1618,6 +1647,164 @@ fn confirm_body(ui: &mut Ui, plan: &PlanView) {
         "Sessions that cannot be restored:",
         &plan.session_problems,
     );
+}
+
+const CONFLICT_CHOICES: [(ConflictChoice, &str, &str); 3] = [
+    (
+        ConflictChoice::KeepLocal,
+        "Keep current",
+        "Leave the local session as it is; nothing is written",
+    ),
+    (
+        ConflictChoice::Overwrite,
+        "Overwrite",
+        "Replace the local session with the backup",
+    ),
+    (
+        ConflictChoice::KeepBoth,
+        "Keep both",
+        "Restore the backup as a separate session with a new id",
+    ),
+];
+
+/// Three compact pills; returns the newly clicked choice.
+fn choice_pills(ui: &mut Ui, current: Option<ConflictChoice>) -> Option<ConflictChoice> {
+    let mut picked = None;
+    ui.spacing_mut().item_spacing.x = 4.0;
+    for (choice, label, tip) in CONFLICT_CHOICES {
+        let on = current == Some(choice);
+        if ui
+            .selectable_label(on, RichText::new(label).small())
+            .on_hover_text(tip)
+            .clicked()
+            && !on
+        {
+            picked = Some(choice);
+        }
+    }
+    picked
+}
+
+fn unix_time(secs: i64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(secs).unwrap_or(0))
+}
+
+/// "Sessions already here": an All selector and one row per session whose id exists locally.
+fn conflicts_section(ui: &mut Ui, plan: &mut PlanView) {
+    if plan.conflicts.is_empty() {
+        return;
+    }
+    let pal = Palette::of_ui(ui);
+    let now = std::time::SystemTime::now();
+    ui.add_space(8.0);
+    Frame::NONE
+        .fill(pal.panel)
+        .stroke(Stroke::new(1.0, pal.stroke))
+        .corner_radius(theme::rad(6, 10))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(theme::strong("Sessions already here").color(pal.text_strong));
+                badge::show(
+                    ui,
+                    None,
+                    &plan.conflicts.len().to_string(),
+                    Hue::Amber,
+                    10.5,
+                );
+            });
+            ui.label(
+                RichText::new("These backed-up sessions have the same id as a local one.")
+                    .small()
+                    .color(pal.weak),
+            );
+            ui.add_space(4.0);
+            let all = plan.conflicts[0].choice;
+            let uniform = plan.conflicts.iter().all(|c| c.choice == all);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("All:").small().color(pal.weak));
+                if let Some(c) = choice_pills(ui, uniform.then_some(all)) {
+                    for row in &mut plan.conflicts {
+                        row.choice = c;
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            ScrollArea::vertical()
+                .id_salt("restore-conflicts")
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    for row in &mut plan.conflicts {
+                        conflict_row(ui, pal, now, row);
+                    }
+                });
+        });
+    let n = plan
+        .conflicts
+        .iter()
+        .filter(|c| c.choice == ConflictChoice::Overwrite)
+        .count();
+    if n > 0 {
+        overwrite_warning(
+            ui,
+            &format!(
+                "{n} local session{} will be replaced by the backup",
+                if n == 1 { "" } else { "s" }
+            ),
+            &[],
+            0,
+            "Copies are saved to OmpDeck's restore-safety folder first; running ones are stopped and their tabs closed.",
+        );
+    }
+}
+
+fn conflict_row(ui: &mut Ui, pal: &Palette, now: std::time::SystemTime, row: &mut ConflictRow) {
+    Frame::NONE
+        .stroke(Stroke::new(1.0, pal.stroke))
+        .corner_radius(theme::rad(5, 8))
+        .inner_margin(Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Label::new(theme::strong(&row.title).color(pal.text_strong)).truncate(),
+                )
+                .on_hover_text(&row.id);
+                if row.running {
+                    badge::show(ui, None, "Running", Hue::Green, 10.5);
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                let newer_backup = row.backup_unix > row.local_unix;
+                let newer_local = row.local_unix > row.backup_unix;
+                for (label, unix, newer) in [
+                    ("Backup", row.backup_unix, newer_backup),
+                    ("Local", row.local_unix, newer_local),
+                ] {
+                    ui.label(RichText::new(label).small().color(pal.weak));
+                    ui.label(
+                        RichText::new(crate::sidebar::format_age(now, unix_time(unix)))
+                            .small()
+                            .color(pal.text),
+                    );
+                    if newer {
+                        badge::show(ui, None, "Newer", Hue::Teal, 10.0);
+                    }
+                    ui.add_space(6.0);
+                }
+                if let Some(dir) = &row.local_dir {
+                    ui.label(RichText::new("in").small().color(pal.weak));
+                    ui.label(RichText::new(dir).small().monospace().color(pal.text));
+                }
+            });
+            ui.horizontal(|ui| {
+                if let Some(c) = choice_pills(ui, Some(row.choice)) {
+                    row.choice = c;
+                }
+            });
+        });
+    ui.add_space(4.0);
 }
 
 /// The danger box of the confirm step: `title`, the first `names`, "… and N more" up to `total`, `note`.
@@ -2232,8 +2419,33 @@ mod tests {
             memory_skipped: Vec::new(),
             session_problems: Vec::new(),
             sessions: None,
+            conflicts: Vec::new(),
             safety: String::new(),
         }
+    }
+
+    pub(super) fn conflict_row(id: &str, choice: ConflictChoice) -> ConflictRow {
+        ConflictRow {
+            id: id.into(),
+            title: format!("session {id}"),
+            backup_unix: 2_000,
+            local_unix: 1_000,
+            local_dir: Some("~/other".into()),
+            running: true,
+            paths: vec![format!("/s/{id}.jsonl").into()],
+            choice,
+        }
+    }
+
+    #[test]
+    fn only_overwriting_a_session_makes_the_restore_dangerous() {
+        let mut p = plan(false, 0);
+        p.conflicts = vec![conflict_row("a", ConflictChoice::KeepLocal)];
+        assert!(!p.danger());
+        p.conflicts[0].choice = ConflictChoice::KeepBoth;
+        assert!(!p.danger());
+        p.conflicts[0].choice = ConflictChoice::Overwrite;
+        assert!(p.danger());
     }
 
     #[test]
@@ -2469,7 +2681,11 @@ mod render_tests {
                 memory_exists: true,
                 memory_overwritten: vec!["product.md".into()],
                 memory_skipped: vec!["style.md: symlink".into()],
-                sessions: Some((2, 1)),
+                sessions: Some(2),
+                conflicts: vec![
+                    super::tests::conflict_row("a", ConflictChoice::KeepLocal),
+                    super::tests::conflict_row("b", ConflictChoice::Overwrite),
+                ],
                 ..super::tests::plan_for_render()
             }),
             Step::Applying,

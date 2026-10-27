@@ -34,8 +34,13 @@ sources. The existing config backup (`docs/notes/google-drive-backup.md`) is a s
 - Side effects: `<agent>/custom-session-files/<hash>` (harmless); `<agent>/terminal-sessions/<terminal-id>`
   breadcrumb unless stdin is null and these are removed from the env: `TMUX`, `TMUX_PANE`, `ZELLIJ_PANE_ID`,
   `CMUX_SURFACE_ID`, `KITTY_WINDOW_ID`, `WEZTERM_PANE`, `TERM_SESSION_ID`, `WT_SESSION` (bundle:565593+).
-- ⇒ **Restore "alongside"**: keep the original id when no local `*_<id>.jsonl` exists (mode `created`);
-  otherwise rewrite to a fresh id first, so omp never takes the replace path.
+- ⇒ **Restore "alongside"** (the Keep both choice): keep the original id when no local `*_<id>.jsonl` exists (mode
+  `created`); otherwise rewrite to a fresh id first, so omp never takes the replace path. **Overwrite** deletes the
+  local copies through omp (headless delete after an `omp session pack` safety tar) and then unpacks with the
+  original id (`created`); relying on omp's replace path would fork whenever the local copy diverged.
+- Session age: omp's picker and OmpDeck's sidebar both use the `.jsonl` mtime (omp `session-listing.ts`
+  `modified: mtime`, newest-mtime-first listing), and unpack writes a fresh file (mtime = now) plus a `session-transfer`
+  entry; the backed-up `modified_unix` (jsonl mtime, s) is set back on the new file after unpack.
 
 ## Project `.omp` (bundle:620242-621022, 382469)
 

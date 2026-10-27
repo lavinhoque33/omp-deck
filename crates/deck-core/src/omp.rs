@@ -1628,31 +1628,62 @@ impl Omp {
     /// removed so omp writes no `terminal-sessions` breadcrumb; 120 s timeout, the process group
     /// is killed on timeout. Blocking: run on a worker.
     pub fn unpack_session(&self, tar: &Path, cwd: &Path) -> Result<MoveOutcome, OmpError> {
-        use crate::usage::{UsageError, run_bounded};
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
         let tar = std::path::absolute(tar)?;
         let cwd = std::path::absolute(cwd)?;
-        let cmd = self.command(&[
-            "session".as_ref(),
-            "unpack".as_ref(),
-            tar.as_os_str(),
-            "--cwd".as_ref(),
-            cwd.as_os_str(),
-        ]);
+        let (stdout, stderr) = self.run_detached(
+            &[
+                "session".as_ref(),
+                "unpack".as_ref(),
+                tar.as_os_str(),
+                "--cwd".as_ref(),
+                cwd.as_os_str(),
+            ],
+            "unpacking",
+        )?;
+        parse_unpack(&stdout, &stderr)
+    }
+
+    /// `omp session pack <src> <out_tar>`: saves one session (jsonl, artifacts, blobs) as an
+    /// archive without touching it, detached exactly like [`Omp::unpack_session`] (stdin null,
+    /// terminal env vars removed, 120 s timeout, process group killed on timeout). Fails with
+    /// omp's own text while a live omp process writes the session. Returns the absolute
+    /// archive path. Blocking: run on a worker.
+    pub fn pack_session(&self, src: &Path, out_tar: &Path) -> Result<PathBuf, OmpError> {
+        let src = std::path::absolute(src)?;
+        let out = std::path::absolute(out_tar)?;
+        self.run_detached(
+            &[
+                "session".as_ref(),
+                "pack".as_ref(),
+                src.as_os_str(),
+                out.as_os_str(),
+            ],
+            "packing",
+        )?;
+        Ok(out)
+    }
+
+    /// Runs `args` with the null-stdin / no-terminal-env command setup, bounded to 120 s;
+    /// returns (stdout, stderr) of a zero exit.
+    fn run_detached(
+        &self,
+        args: &[&std::ffi::OsStr],
+        what: &str,
+    ) -> Result<(String, String), OmpError> {
+        use crate::usage::{UsageError, run_bounded};
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        let cmd = self.command(args);
         let (code, stdout, stderr) = run_bounded(cmd, TIMEOUT).map_err(|e| match e {
             UsageError::Spawn(e) => OmpError::Spawn(e),
             _ => OmpError::Failed {
                 code: None,
-                message: format!(
-                    "omp did not finish unpacking within {} s",
-                    TIMEOUT.as_secs()
-                ),
+                message: format!("omp did not finish {what} within {} s", TIMEOUT.as_secs()),
             },
         })?;
         if code != Some(0) {
             return Err(failure(code, &stdout, &stderr));
         }
-        parse_unpack(&stdout, &stderr)
+        Ok((stdout, stderr))
     }
 }
 

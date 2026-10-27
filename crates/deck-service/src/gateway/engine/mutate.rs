@@ -78,7 +78,7 @@ fn uses_lane(op: &Mutation) -> bool {
             | Mutation::ProjectBackup { .. }
             | Mutation::ProjectDeleteBackup(_)
             | Mutation::ProjectPrepareRestore { .. }
-            | Mutation::ProjectApplyRestore(_)
+            | Mutation::ProjectApplyRestore { .. }
     )
 }
 
@@ -903,7 +903,11 @@ impl Engine {
                     },
                 );
             }
-            Mutation::ProjectApplyRestore(handle) => {
+            Mutation::ProjectApplyRestore {
+                handle,
+                conflicts,
+                stop,
+            } => {
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
@@ -912,7 +916,9 @@ impl Engine {
                     true,
                     Post::Refresh,
                     move |ctx, cancel, progress| {
-                        jobs::project_apply_restore(ctx, handle, cancel, progress)
+                        jobs::project_apply_restore(
+                            ctx, handle, &conflicts, &stop, cancel, progress,
+                        )
                     },
                 );
             }

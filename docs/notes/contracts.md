@@ -1180,8 +1180,8 @@ impl Service {
 - **Prepare restore**: stream-download to the cache dir, extract to staging with validation (regular files only,
   safe relative paths under the four prefixes, manifest present exactly once, every member listed with matching
   size + sha256, no extras, `format==1`, `kind=="project"`). Plan: `.omp` overwritten/added relative paths
-  (when `parts.omp`); sessions with `new_id = true` when any `*_<id>.jsonl` exists in a project dir of the
-  sessions root. `parts` not present in the backup → `InvalidBackup`. `.omp` into `$HOME` → error.
+  (when `parts.omp`); sessions with their local copies (`SessionPlan.local`, see "Project restore: session times
+  and id conflicts"). `parts` not present in the backup → `InvalidBackup`. `.omp` into `$HOME` → error.
 - **Apply**: create target if missing. `.omp`: safety copy of every overwritten file to
   `$XDG_DATA_HOME/omp-deck/restore-safety/project-<stamp>/` (newest 5 project copies kept), then atomic writes
   (exec bit kept); **never deletes** local files. Sessions: per item build a pack-format tar in staging
@@ -2775,3 +2775,53 @@ styles through the palette; per-style character kept where it fits.
 - **Close buttons**: every modal/window header ✕ is `card::close_button` (26 / 14) or `card::close_button_sized`
   (30 / 18 for Sessions, Usage, Session tree) — hover fill + outline. Dialog bodies must not widen past the dialog
   width (unwrapped labels in `horizontal` rows → `.truncate()`), else the header ✕ ends short of the corner.
+
+## Project restore: session times and id conflicts
+
+User request (2026-10-26): restored sessions keep their relative age, and a backed-up session whose id already
+exists locally is **overwritten or kept** by the user's choice instead of always becoming a duplicate. Overrides the
+earlier "always alongside, never replace" rule for that case only; the default stays non-destructive.
+
+- **Session time** (deck-core): after every unpack that reports `MoveKind::Created`, the new `.jsonl`'s mtime is set
+  to `UNIX_EPOCH + ItemManifest.modified_unix` s (the jsonl mtime at backup time, already in every backup) via
+  `File::set_modified` (metadata only, no bytes; `modified_unix <= 0` → left alone; failure → `log::warn`, not a
+  session failure). Both OmpDeck's sidebar and omp's own picker order/age sessions by file mtime
+  (`session-listing.ts` `modified: mtime`, newest-mtime-first). User-approved exception to "OmpDeck never writes
+  `~/.omp/**`". A rolled-back local copy (below) gets its own previous mtime back the same way.
+- `deck_core::gdrive` (re-exported like the other project types):
+  ```rust
+  #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+  pub enum ConflictChoice { #[default] KeepLocal, Overwrite, KeepBoth }
+  #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+  pub struct LocalCopy {
+      pub path: PathBuf,             // the local `<ts>_<id>.jsonl`
+      pub cwd: Option<PathBuf>,      // its header cwd (bounded header read)
+      pub modified_unix: i64,        // its mtime, s
+      pub bytes: u64,                // jsonl + `<stem>/` artifacts
+  }
+  ```
+  `SessionPlan.new_id` is **removed**; `SessionPlan.local: Vec<LocalCopy>` = every `*_<id>.jsonl` in a project dir of
+  the sessions root whose header id is the session id (empty = no conflict). `ProjectRestoreReport` gains
+  `sessions_replaced: usize` (of `sessions_added`, how many replaced local copies) and `sessions_kept: Vec<String>`
+  (title or id of conflicting sessions left as they were, nothing written).
+  `Service::apply_project_restore(prepared, conflicts: &BTreeMap<String, ConflictChoice>, omp, cancel, progress)`;
+  key = session id, a conflicting id missing from the map = `KeepLocal`.
+- **Apply per session** (local copies re-discovered at apply time; none left → plain unpack with the original id):
+  `KeepLocal` → nothing written, `sessions_kept`. `KeepBoth` → today's fresh-id copy. `Overwrite` → (1) every local
+  copy is saved with `Omp::pack_session(<copy>, <safety>/sessions/<id>[-k].tar)` (new; `omp session pack`, stdin null,
+  terminal env removed, bounded like `unpack_session`; retried ≤ ~3 s while omp reports a live writer), the safety
+  dir being the restore's `restore-safety/project-<stamp>/` (`report.safety_dir`); a failed pack → session failed,
+  nothing deleted; (2) `Omp::delete_sessions` (headless omp, lease-guarded) removes every copy; (3) the backup is
+  unpacked with the **original id**, must be `Created`. Any failure after a copy was deleted → each deleted copy is
+  unpacked back from its safety tar with `--cwd` = its header cwd when that folder exists, else the restore target,
+  and its mtime restored; the failure text says the local copy was put back (or names the safety tar if that failed).
+  A live omp holding a copy makes the delete fail (`Live`) → session failed, local copy untouched.
+- `deck-service`: `Mutation::ProjectApplyRestore { handle: u64, conflicts: BTreeMap<String, ConflictChoice>, stop:
+  Vec<String> }`; the job runs `lifecycle::kill_all(&ctx.backends, &stop, "restore")` and then the apply.
+- `omp-deck` confirm step: a **"Sessions already here"** section when any plan session has `local`: an "All:" choice
+  (Keep current / Overwrite / Keep both) and one row per conflict (title, backup age vs local age with a Newer
+  badge on the newer side, the local copy's folder `~`-abbreviated when it differs from the target, Running badge)
+  with its own three-way choice; default Keep current. Any Overwrite → danger box "N local session(s) will be
+  replaced by the backup" + "Copies are saved to OmpDeck's restore-safety folder first; running ones are stopped
+  and their tabs closed." On Confirm, `stop` = `session_kill_names(entry, true)` for each overwritten local copy.
+  The result summary reports added / replaced / kept counts.

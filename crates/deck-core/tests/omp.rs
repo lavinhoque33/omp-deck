@@ -578,6 +578,54 @@ fn unpack_session_runs_detached_from_the_terminal_and_reports_the_mode() {
 }
 
 #[cfg(unix)]
+#[test]
+fn pack_session_runs_detached_and_returns_the_archive_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seen = tmp.path().join("seen");
+    let script = tmp.path().join("omp.sh");
+    install_exec(
+        &script,
+        &format!(
+            "#!/bin/sh\n{{ echo \"$@\"; for v in TMUX TMUX_PANE WT_SESSION KEEP; do eval \"echo $v=\\${{$v-unset}}\"; done; \
+             if [ -t 0 ]; then echo tty-stdin; fi; }} > {}\n\
+             echo 'Packed session.' >&2\n",
+            seen.display()
+        ),
+    );
+    let omp = Omp::at(&script)
+        .with_env("TMUX", "terminal-value")
+        .with_env("WT_SESSION", "terminal-value")
+        .with_env("KEEP", "yes");
+    let (src, out) = (tmp.path().join("a.jsonl"), tmp.path().join("saved.tar"));
+    assert_eq!(omp.pack_session(&src, &out).unwrap(), out);
+    assert_eq!(
+        fs::read_to_string(&seen)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            format!("session pack {} {}", src.display(), out.display()),
+            "TMUX=unset".into(),
+            "TMUX_PANE=unset".into(),
+            "WT_SESSION=unset".into(),
+            "KEEP=yes".into(),
+        ]
+    );
+
+    // omp's own refusal text comes back as the error.
+    let busy = tmp.path().join("busy.sh");
+    install_exec(
+        &busy,
+        "#!/bin/sh\necho 'error: Cannot pack x: another live omp process writes this session. Exit it first.' >&2\nexit 1\n",
+    );
+    let err = Omp::at(&busy).pack_session(&src, &out).unwrap_err();
+    assert!(
+        err.to_string().contains("another live omp process"),
+        "{err}"
+    );
+}
+
+#[cfg(unix)]
 /// Creates executable `dest` with `content` without ever holding a write fd to the executed
 /// inode: a concurrent fork in a sibling test thread would otherwise leak it and exec would fail
 /// with ETXTBSY. The bytes go to a staging file; `install` (external process) makes the copy.

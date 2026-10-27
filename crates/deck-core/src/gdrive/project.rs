@@ -7,7 +7,9 @@
 //! * [`snapshot`]: what a project consists of, found with metadata only (sizes, fingerprint).
 //! * [`pack`]: builds the archive in the cache directory, streaming, manifest last.
 //! * [`restore`]: downloads, validates, plans and applies. Sessions are written only by
-//!   `omp session unpack`.
+//!   `omp session unpack`; the one thing written directly is a restored session file's mtime
+//!   (so it keeps its backed-up age). A replaced local session is removed by `omp` too (the
+//!   delete extension), after `omp session pack` saved it to the safety directory.
 
 mod pack;
 mod restore;
@@ -236,16 +238,47 @@ pub struct ProjectBackupOutcome {
     pub skipped: Vec<String>,
 }
 
+/// One local copy of a session id: a `<timestamp>_<id>.jsonl` in a project directory of the
+/// sessions store whose header id is that id.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalCopy {
+    /// The local `<ts>_<id>.jsonl`.
+    pub path: PathBuf,
+    /// Its header `cwd` (bounded header read).
+    pub cwd: Option<PathBuf>,
+    /// Its mtime, seconds since the Unix epoch.
+    pub modified_unix: i64,
+    /// The jsonl plus its `<stem>/` artifacts directory.
+    pub bytes: u64,
+}
+
+/// What to do with a backed-up session whose id already exists locally.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum ConflictChoice {
+    /// Leave the local session as it is; nothing is written.
+    #[default]
+    KeepLocal,
+    /// Replace the local copies by the backup (the copies are saved to the safety directory
+    /// first and put back when the replacement fails).
+    Overwrite,
+    /// Restore the backup under a fresh id next to the local session.
+    KeepBoth,
+}
+
 /// A session the restore would add.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionPlan {
     pub id: String,
     pub title: String,
+    /// The backed-up session file's mtime (what the restored file's mtime is set to).
     pub modified_unix: i64,
     /// Session file plus artifacts.
     pub bytes: u64,
-    /// The id already exists in the sessions store: the copy is added under a fresh id.
-    pub new_id: bool,
+    /// Local copies of this id found when the plan was made (empty = no conflict); the
+    /// [`ConflictChoice`] passed to `apply_project_restore` decides what happens to them.
+    pub local: Vec<LocalCopy>,
     /// Why this session cannot be restored (a member above omp's 2 GiB pack limit); applying
     /// reports it as failed without running omp.
     pub problem: Option<String>,
@@ -307,8 +340,12 @@ pub struct ProjectRestoreReport {
     /// Why the memory part was not (fully) restored: omp holds the bank's lock, or a write
     /// failed. The other parts are unaffected.
     pub memory_error: Option<String>,
-    /// The session files omp created.
+    /// The session files omp created (also the ones that replaced a local copy).
     pub sessions_added: Vec<PathBuf>,
+    /// Of `sessions_added`, how many replaced local copies ([`ConflictChoice::Overwrite`]).
+    pub sessions_replaced: usize,
+    /// Title or id of conflicting sessions left as they were ([`ConflictChoice::KeepLocal`]).
+    pub sessions_kept: Vec<String>,
     /// (title or id, reason)
     pub sessions_failed: Vec<(String, String)>,
     /// The job was cancelled after some of the work was done; the lists above hold what was.
@@ -962,18 +999,31 @@ impl Service {
     /// target's bank (under omp's consolidation lock, same safety directory under `memory/`; a
     /// held lock is [`ProjectRestoreReport::memory_error`] and the other parts go on), then every
     /// session through `omp session unpack` against the sessions store the restore was prepared
-    /// for. `omp` may
-    /// be `None` only when no sessions are restored. A session that fails is reported in
-    /// [`ProjectRestoreReport::sessions_failed`]; the rest continue. A cancel after the first
-    /// write returns `Ok` with [`ProjectRestoreReport::cancelled`] set and what was done.
+    /// for; each restored file gets its backed-up mtime. A session whose id exists locally is
+    /// handled per `conflicts` (key = session id, missing = [`ConflictChoice::KeepLocal`]):
+    /// kept (nothing written), restored under a fresh id, or replaced: its local copies are
+    /// saved with `omp session pack` under `sessions/` in the safety directory, removed by omp,
+    /// and the backup unpacked with the original id; a failure after a copy was removed puts
+    /// the copies back. `omp` may be `None` only when no sessions are restored. A session that
+    /// fails is reported in [`ProjectRestoreReport::sessions_failed`]; the rest continue. A
+    /// cancel after the first write returns `Ok` with [`ProjectRestoreReport::cancelled`] set
+    /// and what was done.
     pub fn apply_project_restore(
         &self,
         prepared: PreparedProjectRestore,
+        conflicts: &BTreeMap<String, ConflictChoice>,
         omp: Option<&Omp>,
         cancel: &AtomicBool,
         progress: &(dyn Fn(Progress) + Sync),
     ) -> Result<ProjectRestoreReport> {
-        restore::apply(&prepared, &self.safety_root, omp, cancel, progress)
+        restore::apply(
+            &prepared,
+            conflicts,
+            &self.safety_root,
+            omp,
+            cancel,
+            progress,
+        )
     }
 }
 

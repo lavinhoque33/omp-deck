@@ -14,7 +14,7 @@
 //! ([`GatewayError::Refused`]), a failed operation ([`GatewayError::Failed`]) and an uncertain
 //! outcome after an owner crash ([`GatewayError::Uncertain`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use deck_core::agents::{AgentsSnapshot, AgentsTarget, TranscriptItem};
@@ -23,8 +23,9 @@ use deck_core::config::GatewayMode;
 use deck_core::ctl::{CtlCommand, LiveSnapshot};
 use deck_core::fleet::{FleetSnapshot, FleetTarget};
 use deck_core::gdrive::{
-    BackupFile, BackupOutcome, LastBackup, Parts, ProjectBackup, ProjectBackupOutcome,
-    ProjectRestorePlan, ProjectRestoreReport, ProjectSizes, ProjectSyncState, RestoreReport,
+    BackupFile, BackupOutcome, ConflictChoice, LastBackup, Parts, ProjectBackup,
+    ProjectBackupOutcome, ProjectRestorePlan, ProjectRestoreReport, ProjectSizes, ProjectSyncState,
+    RestoreReport,
 };
 use deck_core::inventory::{InventoryEntry, SessionStats};
 use deck_core::mux::MuxKind;
@@ -780,7 +781,14 @@ pub enum Mutation {
         target: PathBuf,
         parts: Parts,
     },
-    ProjectApplyRestore(u64),
+    /// Apply a prepared restore. `conflicts` decides each backed-up session whose id exists
+    /// locally (missing = keep the local one); `stop` = backend sessions to kill first (the
+    /// local copies being overwritten).
+    ProjectApplyRestore {
+        handle: u64,
+        conflicts: BTreeMap<String, ConflictChoice>,
+        stop: Vec<String>,
+    },
     ProjectDiscardRestore(u64),
     AppUpdateCheck,
     AppUpdateDownload,
@@ -844,7 +852,7 @@ impl Mutation {
             Mutation::ProjectBackup { .. } => "project-backup",
             Mutation::ProjectDeleteBackup(_) => "project-delete-backup",
             Mutation::ProjectPrepareRestore { .. } => "project-prepare-restore",
-            Mutation::ProjectApplyRestore(_) => "project-restore",
+            Mutation::ProjectApplyRestore { .. } => "project-restore",
             Mutation::ProjectDiscardRestore(_) => "project-discard-restore",
             Mutation::AppUpdateCheck => "app-update-check",
             Mutation::AppUpdateDownload => "app-update-download",

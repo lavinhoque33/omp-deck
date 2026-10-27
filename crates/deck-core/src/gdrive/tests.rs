@@ -1404,7 +1404,13 @@ mod project_sync {
 
         let report = w
             .service
-            .apply_project_restore(prepared, None, &AtomicBool::new(false), &quiet)
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::new(),
+                None,
+                &AtomicBool::new(false),
+                &quiet,
+            )
             .unwrap();
         assert_eq!((report.omp_written, report.omp_overwritten), (3, 1));
         assert_eq!(read(&target.join(".omp/AGENTS.md")), "remote rules\n");
@@ -1444,7 +1450,13 @@ mod project_sync {
         assert_eq!(prepared.plan.omp_added.len(), 3);
         let report = w
             .service
-            .apply_project_restore(prepared, None, &AtomicBool::new(false), &quiet)
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::new(),
+                None,
+                &AtomicBool::new(false),
+                &quiet,
+            )
             .unwrap();
         assert!(report.safety_dir.is_none());
         assert_eq!(read(&fresh.join(".omp/config.yml")), "a: 1\n");
@@ -2263,6 +2275,12 @@ mod project_sync {
             eprintln!("omp not found on PATH; skipping the session restore test");
             return None;
         };
+        Some(sandboxed(omp, base, name))
+    }
+
+    /// `omp` (the real one, or a wrapper that runs it) with its own agent dir and home below
+    /// `base/name`.
+    fn sandboxed(omp: Omp, base: &Path, name: &str) -> (Omp, PathBuf) {
         let base = base.join(name);
         let (agent, home) = (base.join("agent"), base.join("home"));
         for d in [&agent, &home] {
@@ -2276,7 +2294,7 @@ mod project_sync {
             .with_env("PI_CONFIG_DIR", ".omp")
             .with_env("HOME", &home)
             .with_env("USERPROFILE", &home);
-        Some((omp, agent))
+        (omp, agent)
     }
 
     /// omp unpacks a ~120 MB native addon into `$HOME/.omp/natives` on first use, which a
@@ -2325,6 +2343,7 @@ mod project_sync {
             &format!("{{\"img\":\"blob:sha256:{blob_name}\"}}\n"),
         );
         write(&stem.join("files/out.txt"), "artifact text");
+        touch(&original, BACKED_UP_AT);
         let before = fs::read(&original).unwrap();
         w.backup(&src, SESSIONS, false).unwrap().unwrap();
         let backup = w.service.list_projects().unwrap().remove(0);
@@ -2337,10 +2356,20 @@ mod project_sync {
         let omp = omp.with_env("PI_CODING_AGENT_DIR", &w.agent);
         let prepared = w.prepare(&backup, &dst, SESSIONS, &w.root).unwrap();
         assert_eq!(prepared.plan.sessions.len(), 1);
-        assert!(prepared.plan.sessions[0].new_id);
+        assert_eq!(prepared.plan.sessions[0].local.len(), 1);
+        assert_eq!(prepared.plan.sessions[0].modified_unix, BACKED_UP_AT);
         let report = w
             .service
-            .apply_project_restore(prepared, Some(&omp), &AtomicBool::new(false), &quiet)
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::from([(
+                    "01920000-0000-7000-8000-000000000001".to_owned(),
+                    ConflictChoice::KeepBoth,
+                )]),
+                Some(&omp),
+                &AtomicBool::new(false),
+                &quiet,
+            )
             .unwrap();
         assert!(
             report.sessions_failed.is_empty(),
@@ -2356,6 +2385,11 @@ mod project_sync {
         assert_ne!(new_id, "01920000-0000-7000-8000-000000000001");
         assert_eq!(new_id.len(), 36);
         assert_eq!(new_id.as_bytes()[14], b'7', "UUIDv7-shaped");
+        assert_eq!(
+            mtime(added),
+            BACKED_UP_AT,
+            "the copy keeps the backed-up age"
+        );
         assert!(
             fs::read(&original).unwrap() == before,
             "the original is untouched"
@@ -2375,10 +2409,16 @@ mod project_sync {
         let dst2 = w.tmp.path().join("dst2");
         let prepared = w.prepare(&backup, &dst2, SESSIONS, &root2).unwrap();
         assert!(prepared.plan.create_target);
-        assert!(!prepared.plan.sessions[0].new_id);
+        assert!(prepared.plan.sessions[0].local.is_empty());
         let report = w
             .service
-            .apply_project_restore(prepared, Some(&omp2), &AtomicBool::new(false), &quiet)
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::new(),
+                Some(&omp2),
+                &AtomicBool::new(false),
+                &quiet,
+            )
             .unwrap();
         assert!(
             report.sessions_failed.is_empty(),
@@ -2400,9 +2440,243 @@ mod project_sync {
         let prepared = w.prepare(&backup, &dst2, SESSIONS, &root2).unwrap();
         assert!(
             w.service
-                .apply_project_restore(prepared, None, &AtomicBool::new(false), &quiet)
+                .apply_project_restore(
+                    prepared,
+                    &BTreeMap::new(),
+                    None,
+                    &AtomicBool::new(false),
+                    &quiet
+                )
                 .is_err()
         );
+    }
+
+    /// A session `id` backed up from `src` (with its jsonl mtime set to `BACKED_UP_AT`), then
+    /// edited locally (extra line, mtime `LOCAL_AT`). Returns (backup, local path, bytes of the
+    /// edited file).
+    fn edited_after_backup(w: &World, src: &Path, id: &str) -> (ProjectBackup, PathBuf, Vec<u8>) {
+        let local = session(&w.agent, id, src, "");
+        write(&local.with_extension("").join("files/out.txt"), "artifact");
+        touch(&local, BACKED_UP_AT);
+        w.backup(src, SESSIONS, false).unwrap().unwrap();
+        let backup = w.service.list_projects().unwrap().remove(0);
+        let mut f = fs::OpenOptions::new().append(true).open(&local).unwrap();
+        f.write_all(b"{\"type\":\"local edit\"}\n").unwrap();
+        drop(f);
+        touch(&local, LOCAL_AT);
+        let edited = fs::read(&local).unwrap();
+        (backup, local, edited)
+    }
+
+    const BACKED_UP_AT: i64 = 1_700_000_000;
+    const LOCAL_AT: i64 = 1_800_000_000;
+    const ID: &str = "01920000-0000-7000-8000-0000000000aa";
+
+    fn touch(path: &Path, unix: i64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH
+                    + Duration::from_secs(u64::try_from(unix).unwrap()),
+            )
+            .unwrap();
+    }
+
+    fn mtime(path: &Path) -> i64 {
+        i64::try_from(
+            fs::metadata(path)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_local_session_with_the_same_id_is_kept_unless_told_otherwise() {
+        let w = world();
+        let src = w.tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let (backup, local, edited) = edited_after_backup(&w, &src, ID);
+        let marker = w.tmp.path().join("omp-ran");
+        // Must never run: nothing is to be written for a kept session.
+        #[cfg(unix)]
+        let omp = fake_omp(
+            w.tmp.path(),
+            "never.sh",
+            &format!("touch {}\nexit 1", marker.display()),
+        );
+        #[cfg(not(unix))]
+        let omp = Omp::at(&marker);
+        let target = w.tmp.path().join("dst");
+        let prepared = w.prepare(&backup, &target, SESSIONS, &w.root).unwrap();
+        let copies = &prepared.plan.sessions[0].local;
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].path, local);
+        assert_eq!(copies[0].cwd.as_deref(), Some(src.as_path()));
+        assert_eq!(copies[0].modified_unix, LOCAL_AT);
+        assert_eq!(
+            copies[0].bytes,
+            edited.len() as u64 + "artifact".len() as u64
+        );
+        assert_eq!(prepared.plan.sessions[0].modified_unix, BACKED_UP_AT);
+        // No entry in the map is the same as `KeepLocal`.
+        let report = w
+            .service
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::new(),
+                Some(&omp),
+                &AtomicBool::new(false),
+                &quiet,
+            )
+            .unwrap();
+        assert_eq!(report.sessions_kept, ["t"]);
+        assert!(report.sessions_added.is_empty() && report.sessions_failed.is_empty());
+        assert_eq!(report.sessions_replaced, 0);
+        assert!(!marker.exists(), "omp was started");
+        assert!(fs::read(&local).unwrap() == edited);
+        assert_eq!(mtime(&local), LOCAL_AT);
+    }
+
+    #[test]
+    fn overwriting_saves_the_local_copy_then_restores_the_backup_with_its_id_and_age() {
+        let w = world();
+        let cache = dirs::cache_dir().unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        let disk = tempfile::Builder::new()
+            .prefix("omp-deck-sync-test-")
+            .tempdir_in(&cache)
+            .unwrap();
+        let Some((omp, _)) = real_omp(disk.path(), "overwrite") else {
+            return;
+        };
+        let src = w.tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let (backup, local, edited) = edited_after_backup(&w, &src, ID);
+        let prepared = w.prepare(&backup, &src, SESSIONS, &w.root).unwrap();
+        let report = w
+            .service
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::from([(ID.to_owned(), ConflictChoice::Overwrite)]),
+                Some(&omp),
+                &AtomicBool::new(false),
+                &quiet,
+            )
+            .unwrap();
+        assert!(
+            report.sessions_failed.is_empty(),
+            "{:?}",
+            report.sessions_failed
+        );
+        assert_eq!(
+            (report.sessions_added.len(), report.sessions_replaced),
+            (1, 1)
+        );
+        assert!(report.sessions_kept.is_empty());
+        // The backup is back under the same id (and name), with the backed-up age.
+        let added = &report.sessions_added[0];
+        assert_eq!(*added, local);
+        let text = read(added);
+        assert!(text.contains("\"content\":\"hi\"") && !text.contains("local edit"));
+        assert_eq!(header_of(added)["id"], ID);
+        assert_eq!(mtime(added), BACKED_UP_AT);
+        assert_eq!(
+            read(&added.with_extension("").join("files/out.txt")),
+            "artifact"
+        );
+        // The edited copy was saved first, in the restore's safety directory.
+        let safety = report.safety_dir.as_ref().unwrap();
+        let tar = safety.join("sessions").join(format!("{ID}.tar"));
+        let mut archive = tar::Archive::new(fs::File::open(&tar).unwrap());
+        let saved: Vec<u8> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap())
+            .find(|e| e.path().unwrap().ends_with("session.jsonl"))
+            .map(|mut e| {
+                let mut data = Vec::new();
+                e.read_to_end(&mut data).unwrap();
+                data
+            })
+            .unwrap();
+        assert!(saved == edited);
+        let all: usize = sessions::scan(&w.root)
+            .iter()
+            .map(|g| g.sessions.len())
+            .sum();
+        assert_eq!(all, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_overwrite_puts_the_local_copy_back_with_its_time() {
+        let w = world();
+        let cache = dirs::cache_dir().unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        let disk = tempfile::Builder::new()
+            .prefix("omp-deck-sync-test-")
+            .tempdir_in(&cache)
+            .unwrap();
+        if Omp::detect().is_none() {
+            eprintln!("omp not found on PATH; skipping the rollback test");
+            return;
+        }
+        let src = w.tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let (backup, local, _) = edited_after_backup(&w, &src, ID);
+        // An omp that is the real one except that unpacking the backup (its tar is built in
+        // the staging `work` folder) fails; the safety tars unpack normally.
+        let flaky = fake_omp(
+            w.tmp.path(),
+            "flaky.sh",
+            "case \"$*\" in\n  \"session unpack \"*/work/*) echo 'error: disk is on fire' >&2; exit 1;;\nesac\n\
+             exec omp \"$@\"",
+        );
+        let (omp, _) = sandboxed(flaky, disk.path(), "flaky");
+        // The restore target is another folder: the copy must go back into its own cwd.
+        let target = w.tmp.path().join("dst");
+        let prepared = w.prepare(&backup, &target, SESSIONS, &w.root).unwrap();
+        let report = w
+            .service
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::from([(ID.to_owned(), ConflictChoice::Overwrite)]),
+                Some(&omp),
+                &AtomicBool::new(false),
+                &quiet,
+            )
+            .unwrap();
+        assert!(report.sessions_added.is_empty() && report.sessions_replaced == 0);
+        assert_eq!(
+            report.sessions_failed,
+            [(
+                "t".to_owned(),
+                "disk is on fire; the local copy was put back".to_owned()
+            )]
+        );
+        assert!(local.is_file(), "the local copy is back");
+        // omp rewrites the header while unpacking: the content is what counts.
+        assert!(read(&local).contains("local edit"));
+        assert_eq!(mtime(&local), LOCAL_AT);
+        assert_eq!(header_of(&local)["cwd"], src.display().to_string());
+        assert_eq!(
+            read(&local.with_extension("").join("files/out.txt")),
+            "artifact"
+        );
+        let safety = report.safety_dir.unwrap();
+        assert!(safety.join("sessions").join(format!("{ID}.tar")).is_file());
+        let all: usize = sessions::scan(&w.root)
+            .iter()
+            .map(|g| g.sessions.len())
+            .sum();
+        assert_eq!(all, 1);
     }
 
     // ------------------------------------------------------------ links, skips, conflicts
@@ -2619,7 +2893,13 @@ mod project_sync {
         let skipped = plan.omp_skipped.clone();
         let report = w
             .service
-            .apply_project_restore(prepared, None, &AtomicBool::new(false), &quiet)
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::new(),
+                None,
+                &AtomicBool::new(false),
+                &quiet,
+            )
             .unwrap();
         assert_eq!((report.omp_written, report.omp_overwritten), (1, 0));
         assert_eq!(report.omp_skipped, skipped);
@@ -2966,6 +3246,17 @@ mod project_sync {
     #[cfg(unix)]
     const OK_OMP: &str = "echo /store/sessions/x/new.jsonl; echo 'Unpacked session (abc).' >&2";
 
+    /// Every session of the plan restored next to a local copy of the same id.
+    #[cfg(unix)]
+    fn keep_both(prepared: &PreparedProjectRestore) -> BTreeMap<String, ConflictChoice> {
+        prepared
+            .plan
+            .sessions
+            .iter()
+            .map(|s| (s.id.clone(), ConflictChoice::KeepBoth))
+            .collect()
+    }
+
     #[cfg(unix)]
     #[test]
     fn session_unpack_runs_in_the_prepared_store_with_its_scratch_in_the_staging_dir() {
@@ -2989,7 +3280,13 @@ mod project_sync {
         let prepared = w.prepare(&backup, &target, SESSIONS, &root).unwrap();
         let report = w
             .service
-            .apply_project_restore(prepared, Some(&omp), &AtomicBool::new(false), &quiet)
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::new(),
+                Some(&omp),
+                &AtomicBool::new(false),
+                &quiet,
+            )
             .unwrap();
         assert!(
             report.sessions_failed.is_empty(),
@@ -3041,9 +3338,16 @@ mod project_sync {
         let prepared = w
             .prepare(&backup, &w.tmp.path().join("t"), SESSIONS, &w.root)
             .unwrap();
+        let keep_both = keep_both(&prepared);
         let report = w
             .service
-            .apply_project_restore(prepared, Some(&omp), &AtomicBool::new(false), &quiet)
+            .apply_project_restore(
+                prepared,
+                &keep_both,
+                Some(&omp),
+                &AtomicBool::new(false),
+                &quiet,
+            )
             .unwrap();
         assert!(report.sessions_added.is_empty());
         assert_eq!(
@@ -3081,10 +3385,12 @@ mod project_sync {
         let cancel = AtomicBool::new(false);
         let target = w.tmp.path().join("t1");
         let prepared = w.prepare(&backup, &target, both, &w.root).unwrap();
+        let keep_both = keep_both(&prepared);
         let report = w
             .service
             .apply_project_restore(
                 prepared,
+                &keep_both,
                 Some(&omp),
                 &cancel,
                 &stop_after(Stage::RestoringSessions, &cancel),
@@ -3102,6 +3408,7 @@ mod project_sync {
             .service
             .apply_project_restore(
                 prepared,
+                &BTreeMap::new(),
                 Some(&omp),
                 &cancel,
                 &stop_after(Stage::RestoringOmp, &cancel),
@@ -3120,7 +3427,13 @@ mod project_sync {
         let prepared = w.prepare(&backup, &target, both, &w.root).unwrap();
         let err = w
             .service
-            .apply_project_restore(prepared, Some(&omp), &AtomicBool::new(true), &quiet)
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::new(),
+                Some(&omp),
+                &AtomicBool::new(true),
+                &quiet,
+            )
             .unwrap_err();
         assert_eq!(err.to_string(), "cancelled");
         assert!(!target.exists());
@@ -3151,7 +3464,13 @@ mod project_sync {
 
     fn apply(w: &World, prepared: PreparedProjectRestore) -> ProjectRestoreReport {
         w.service
-            .apply_project_restore(prepared, None, &AtomicBool::new(false), &quiet)
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::new(),
+                None,
+                &AtomicBool::new(false),
+                &quiet,
+            )
             .unwrap()
     }
 
@@ -3327,7 +3646,13 @@ mod project_sync {
         };
         let report = w
             .service
-            .apply_project_restore(prepared, None, &AtomicBool::new(false), &record)
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::new(),
+                None,
+                &AtomicBool::new(false),
+                &record,
+            )
             .unwrap();
         assert_eq!((report.omp_written, report.omp_overwritten), (1, 1));
         assert_eq!((report.memory_written, report.memory_overwritten), (2, 1));
@@ -3440,7 +3765,7 @@ mod project_sync {
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             });
             w.service
-                .apply_project_restore(prepared, None, &cancel, &quiet)
+                .apply_project_restore(prepared, &BTreeMap::new(), None, &cancel, &quiet)
                 .unwrap()
         });
         assert!(
@@ -3475,9 +3800,16 @@ mod project_sync {
             .unwrap();
         let omp = fake_omp(w.tmp.path(), "ok.sh", OK_OMP);
         let prepared = w.prepare(&newest(&w), &target, all, &w.root).unwrap();
+        let keep_both = keep_both(&prepared);
         let report = w
             .service
-            .apply_project_restore(prepared, Some(&omp), &AtomicBool::new(false), &quiet)
+            .apply_project_restore(
+                prepared,
+                &keep_both,
+                Some(&omp),
+                &AtomicBool::new(false),
+                &quiet,
+            )
             .unwrap();
         assert!(report.memory_error.is_some() && report.memory_written == 0);
         assert_eq!(report.sessions_added.len(), 1);
@@ -3503,7 +3835,7 @@ mod project_sync {
         let cancel = AtomicBool::new(false);
         let report = w
             .service
-            .apply_project_restore(prepared, None, &cancel, &|p: Progress| {
+            .apply_project_restore(prepared, &BTreeMap::new(), None, &cancel, &|p: Progress| {
                 if p.stage == Stage::RestoringMemory && p.done == 1 {
                     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
