@@ -22,6 +22,7 @@ mod dashboard;
 mod dashboard_model;
 mod deco;
 mod drive_view;
+mod file_drop;
 mod folder_scope;
 mod gw;
 mod icons;

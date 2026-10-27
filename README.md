@@ -223,6 +223,7 @@ The default session store is `$PI_CODING_AGENT_DIR/sessions` if set, otherwise `
 | Shift+drag | Always select locally, even when the app uses mouse reporting |
 | Ctrl+click | Open a hyperlink or a plain `http(s)://` / `mailto:` URL |
 | Right click | Terminal menu: copy, paste, open / copy the link under the pointer |
+| Drop files on the terminal | Paste their paths (omp attaches dropped images) |
 
 Ctrl+C, Ctrl+X and Ctrl+V go straight to omp (omp uses Ctrl+V for image paste).
 

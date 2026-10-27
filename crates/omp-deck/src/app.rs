@@ -478,6 +478,8 @@ pub struct App {
     app_update: app_update::AppUpdateUi,
     /// Window raise and what this window last told the gateway about itself.
     notify: notifications::NotifyUi,
+    /// File drags from other applications (the Wayland drop target; X11/Windows come via winit).
+    file_drops: crate::file_drop::FileDrops,
     /// The command palette / quick switcher while open.
     palette: Option<PaletteState>,
 }
@@ -659,6 +661,7 @@ impl App {
             changes: changes::ChangesUi::default(),
             app_update: app_update::AppUpdateUi::new(),
             notify: notifications::NotifyUi::new(&cc.egui_ctx),
+            file_drops: crate::file_drop::FileDrops::new(),
             palette: None,
         };
         if let Some(e) = startup_error {
@@ -3100,16 +3103,18 @@ impl eframe::App for App {
         Palette::of(visuals.dark_mode).bg.to_normalized_gamma_f32()
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         if !self.terminal_focused {
             clipboard_bridge::rewrite_raw_input(raw, &self.clipboard);
         }
+        self.file_drops.feed(ctx, raw);
     }
 
     /// Runs every tick, also while the window is minimized or on another desktop (when eframe
     /// skips `ui`): gateway results, terminal polling and what the gateway is told about this
     /// window must not depend on painting.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.file_drops.attach_window(ctx, frame);
         self.pump_gateway();
         self.poll_tabs();
         self.poll_settings();

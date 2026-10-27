@@ -6,7 +6,7 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 
 #[cfg(target_os = "linux")]
-mod wayland;
+pub(crate) mod wayland;
 
 /// The Windows AppUserModelID of OmpDeck (the Start-menu shortcut and the gateway's toasts carry
 /// the same one).

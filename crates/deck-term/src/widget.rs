@@ -10,7 +10,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{TermMode, viewport_to_point};
 use egui::{
     CursorIcon, Event, EventFilter, IMEPurpose, ImeEvent, Modifiers, MouseWheelUnit, PointerButton,
-    Pos2, Rect, Sense, Ui, pos2,
+    Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2,
 };
 
 use crate::core::{Terminal, TerminalEvents};
@@ -373,6 +373,30 @@ impl<'a> TerminalView<'a> {
             &mut open_url,
         );
 
+        // File drops (winit on X11/Windows, the app's bridge on Wayland) paste the paths like
+        // Konsole/kitty. The view under the pointer takes them; the focused one when the
+        // platform reports no pointer position during the drag.
+        let drop = ui.input(|i| {
+            let dropped = input::encode_dropped_paths(i.raw.dropped_files.iter().map(|f| f.path()));
+            let hovering = !i.raw.hovered_files.is_empty();
+            (hovering || !dropped.is_empty())
+                .then(|| (i.pointer.hover_pos().is_some(), hovering, dropped))
+        });
+        let mut drop_hover = false;
+        if let Some((has_pos, hovering, dropped)) = drop
+            && (if has_pos {
+                response.contains_pointer()
+            } else {
+                focused
+            })
+        {
+            drop_hover = hovering;
+            if !dropped.is_empty() && !term.input_held() {
+                let mode = term.mode();
+                paste(term, Some(dropped), mode);
+            }
+        }
+
         // Snapshot under the lock, paint without it.
         {
             let term_guard = term.term.lock();
@@ -442,6 +466,10 @@ impl<'a> TerminalView<'a> {
             &mut view.scratch,
             &params,
         );
+        if drop_hover {
+            let accent = ui.visuals().selection.stroke.color;
+            painter.rect_stroke(rect, 0.0, Stroke::new(2.0, accent), StrokeKind::Inside);
+        }
 
         if focused {
             let cursor_rect = view.frame.cursor.map_or(

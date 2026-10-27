@@ -822,6 +822,52 @@ pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
     }
 }
 
+/// The text a file drop types, as Konsole/kitty do: the paths separated by spaces, each quoted so
+/// a shell and omp's pasted-path parser (which attaches image paths) read it back verbatim.
+/// Unix: backslash before whitespace, quotes, `\` and the shell metacharacters (omp unescapes
+/// exactly that set). Windows: `\` is the separator, so a path that needs it is wrapped in `"`.
+pub fn encode_dropped_paths<'p>(paths: impl IntoIterator<Item = &'p std::path::Path>) -> String {
+    let mut out = String::new();
+    for path in paths {
+        let path = path.to_string_lossy();
+        if path.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        quote_dropped_path(&path, &mut out);
+    }
+    out
+}
+
+fn needs_quote(c: char) -> bool {
+    // JavaScript's `\s`, which omp splits and unescapes on: Unicode whitespace plus U+FEFF.
+    c.is_whitespace() || c == '\u{feff}' || "'\"()[]{}&;<>|?*!$`".contains(c)
+}
+
+#[cfg(not(windows))]
+fn quote_dropped_path(path: &str, out: &mut String) {
+    for c in path.chars() {
+        if c == '\\' || needs_quote(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+}
+
+#[cfg(windows)]
+fn quote_dropped_path(path: &str, out: &mut String) {
+    // `"` cannot occur in a Windows file name.
+    if path.chars().any(needs_quote) {
+        out.push('"');
+        out.push_str(path);
+        out.push('"');
+    } else {
+        out.push_str(path);
+    }
+}
+
 /// Focus report (`ESC[I` / `ESC[O`) if the app enabled ?1004. Also in win32-input-mode:
 /// Windows Terminal sends no win32 FOCUS_EVENT record (`TerminalInput::HandleFocus`,
 /// microsoft/terminal `src/terminal/input/terminalInput.cpp`).
@@ -1884,6 +1930,41 @@ mod tests {
         assert_eq!(encode_paste("\n\n", LEGACY), b"\r\r");
         assert_eq!(encode_paste("tail\r", LEGACY), b"tail\r");
         assert_eq!(encode_paste("漢\n", LEGACY), "漢\r".as_bytes());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn dropped_paths_are_escaped_and_space_separated() {
+        use std::path::Path;
+        let paths = [
+            Path::new("/tmp/shot.png"),
+            Path::new("/home/me/My Pics/it's (1) [x] $5 & more!.jpg"),
+            Path::new("/a\\b\tc\u{a0}d"),
+            Path::new(""),
+            Path::new("~/é-漢.txt"),
+        ];
+        assert_eq!(
+            encode_dropped_paths(paths),
+            "/tmp/shot.png \
+             /home/me/My\\ Pics/it\\'s\\ \\(1\\)\\ \\[x\\]\\ \\$5\\ \\&\\ more\\!.jpg \
+             /a\\\\b\\\tc\\\u{a0}d \
+             ~/é-漢.txt"
+        );
+        assert_eq!(encode_dropped_paths(std::iter::empty()), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dropped_paths_are_quoted_when_needed() {
+        use std::path::Path;
+        let paths = [
+            Path::new(r"C:\Users\me\shot.png"),
+            Path::new(r"C:\Program Files (x86)\a b.jpg"),
+        ];
+        assert_eq!(
+            encode_dropped_paths(paths),
+            r#"C:\Users\me\shot.png "C:\Program Files (x86)\a b.jpg""#
+        );
     }
 
     #[test]
