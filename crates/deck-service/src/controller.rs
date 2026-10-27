@@ -1483,11 +1483,11 @@ mod tests {
     #[test]
     fn a_submission_for_another_generation_is_refused_and_queues_nothing() {
         let (mut ctl, _fake) = controller("", None);
-        let mut s = submission(&ctl, 1, Command::Action(Action::Context));
+        let mut s = submission(&ctl, 1, Command::Action(Action::AutoName));
         s.target.generation += 1;
         assert!(matches!(ctl.submit(s), Err(Rejected::Stale { .. })));
         assert!(!ctl.is_busy());
-        let mut s = submission(&ctl, 2, Command::Action(Action::Context));
+        let mut s = submission(&ctl, 2, Command::Action(Action::AutoName));
         s.target.key = SessionKey::tmux("omp-deck-test", "other");
         assert!(matches!(ctl.submit(s), Err(Rejected::Stale { .. })));
         assert!(!ctl.is_busy());
@@ -1496,7 +1496,7 @@ mod tests {
     #[test]
     fn a_resubmitted_request_is_typed_once_and_a_reused_key_is_refused() {
         let (mut ctl, fake) = controller("", None);
-        let s = submission(&ctl, 1, Command::Action(Action::Context));
+        let s = submission(&ctl, 1, Command::Action(Action::AutoName));
         let first = ctl.submit(s.clone()).expect("accepted");
         assert!(!first.duplicate);
         let again = ctl.submit(s.clone()).expect("same request");
@@ -1509,7 +1509,7 @@ mod tests {
         let late = ctl.submit(s.clone()).expect("same request");
         assert_eq!((late.id, late.duplicate), (first.id, true));
         assert!(!ctl.is_busy());
-        assert_eq!(fake.omp().submitted, vec!["/context".to_owned()]);
+        assert_eq!(fake.omp().submitted, vec!["/rename".to_owned()]);
         let reused = Submission {
             command: Command::Action(Action::Compact(CompactMode::Soft)),
             ..s
@@ -1564,7 +1564,7 @@ mod tests {
         );
         let mut ctl = SessionController::new(SessionKey::direct(), terminal, None);
         assert_eq!(
-            ctl.submit(submission(&ctl, 1, Command::Action(Action::Context))),
+            ctl.submit(submission(&ctl, 1, Command::Action(Action::AutoName))),
             Err(Rejected::ReadOnly)
         );
     }
@@ -1634,7 +1634,7 @@ mod tests {
     fn declining_one_draft_leaves_an_unrelated_queued_switch_pending() {
         let (mut ctl, _fake) = controller("half typed", None);
         let context = ctl
-            .submit(submission(&ctl, 1, Command::Action(Action::Context)))
+            .submit(submission(&ctl, 1, Command::Action(Action::AutoName)))
             .expect("accepted")
             .id;
         let sw = ctl.submit(switch(&ctl, 2, "a/new")).expect("accepted").id;
@@ -1660,7 +1660,7 @@ mod tests {
     fn closing_an_exited_session_ends_every_request_still_under_way() {
         let (mut ctl, fake) = controller("half typed", None);
         let id = ctl
-            .submit(submission(&ctl, 1, Command::Action(Action::Context)))
+            .submit(submission(&ctl, 1, Command::Action(Action::AutoName)))
             .expect("accepted")
             .id;
         let _ = fake.out.send(RemoteEvent::Exited(Some(0)));
@@ -1692,7 +1692,7 @@ mod tests {
         let (mut ctl, fake) = controller("", None);
         fake.omp().block_enter = true;
         let id = ctl
-            .submit(submission(&ctl, 1, Command::Action(Action::Context)))
+            .submit(submission(&ctl, 1, Command::Action(Action::AutoName)))
             .expect("accepted")
             .id;
         // All bytes written, the Enter stuck in the transport.
@@ -1726,7 +1726,7 @@ mod tests {
         fake.omp().block_enter = true;
         let target = ctl.target().clone();
         let id = ctl
-            .submit(submission(&ctl, 1, Command::Action(Action::Context)))
+            .submit(submission(&ctl, 1, Command::Action(Action::AutoName)))
             .expect("accepted")
             .id;
         // The command is written; its Enter is still in the transport, so input stays held.
@@ -1791,7 +1791,7 @@ mod tests {
     fn closing_after_the_transport_took_the_bytes_keeps_them_delivered() {
         let (mut ctl, _fake) = controller("", None);
         let id = ctl
-            .submit(submission(&ctl, 1, Command::Action(Action::Context)))
+            .submit(submission(&ctl, 1, Command::Action(Action::AutoName)))
             .expect("accepted")
             .id;
         run(&mut ctl, |c, _| {
@@ -1810,7 +1810,7 @@ mod tests {
         let (mut ctl, fake) = controller("", None);
         fake.omp().fail_enter = true;
         let id = ctl
-            .submit(submission(&ctl, 1, Command::Action(Action::Context)))
+            .submit(submission(&ctl, 1, Command::Action(Action::AutoName)))
             .expect("accepted")
             .id;
         let events = run(&mut ctl, |_, ev| {
@@ -1836,7 +1836,7 @@ mod tests {
     fn a_session_change_cancels_an_unanswered_draft_confirmation_and_ignores_its_answer() {
         let (mut ctl, fake) = controller("half typed", Some("/s/a.jsonl"));
         let id = ctl
-            .submit(submission(&ctl, 1, Command::Action(Action::Context)))
+            .submit(submission(&ctl, 1, Command::Action(Action::AutoName)))
             .expect("accepted")
             .id;
         let events = run(&mut ctl, |_, ev| {
@@ -1845,7 +1845,7 @@ mod tests {
         });
         assert!(events.contains(&ControllerEvent::Confirm {
             id,
-            label: "Context".to_owned(),
+            label: "Auto-name".to_owned(),
             draft: "half typed".to_owned(),
         }));
         let old = ctl.target().clone();

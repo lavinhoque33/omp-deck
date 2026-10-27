@@ -13,7 +13,6 @@ use crate::icons::{
     ICON_DOWNLOAD, ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_FOLDER_GIT_2,
     ICON_GIT_BRANCH, ICON_GIT_FORK, ICON_GIT_MERGE, ICON_HANDSHAKE, ICON_HISTORY, ICON_LIST_TREE,
     ICON_MAP, ICON_NETWORK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE,
-    ICON_TERMINAL,
 };
 use deck_core::ctl::{ContextBreakdown, LiveModel};
 use deck_core::omp::ModelInfo;
@@ -1572,20 +1571,6 @@ fn overflow_menu(ui: &mut Ui, c: &ActionCtx, out: &mut Vec<BarAction>) {
         "Session tree",
         Kind::Tree,
         BarAction::OpenTree,
-    );
-    item(
-        ui,
-        ICON_TERMINAL,
-        "Open omp's Agent Hub (TUI)",
-        Kind::AgentHub,
-        BarAction::Run(Action::AgentHub),
-    );
-    item(
-        ui,
-        ICON_CHART_PIE,
-        "Context usage",
-        Kind::Context,
-        BarAction::Run(Action::Context),
     );
     ui.separator();
     item(

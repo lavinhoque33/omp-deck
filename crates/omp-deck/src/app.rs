@@ -1732,7 +1732,6 @@ impl App {
             BarAction::Refresh => self.refresh_sessions(),
             BarAction::FontLarger => self.set_font_size(self.cfg.font_size + 1.0),
             BarAction::FontSmaller => self.set_font_size(self.cfg.font_size - 1.0),
-            BarAction::OpenUsage => self.open_usage(),
             BarAction::OpenSessions => self.open_sessions(None),
             BarAction::OpenAgents => self.toggle_dashboard(false),
             BarAction::FontReset => self.set_font_size(DEFAULT_FONT),

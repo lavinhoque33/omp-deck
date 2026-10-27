@@ -476,13 +476,6 @@ impl App {
             session_why(Kind::PlanMode),
         );
         add(
-            "session.context",
-            "Session: Show context",
-            None,
-            ICON_GAUGE,
-            session_why(Kind::Context),
-        );
-        add(
             "session.retry",
             "Session: Retry last turn",
             None,
@@ -509,13 +502,6 @@ impl App {
             None,
             ICON_EXTERNAL_LINK,
             session_why(Kind::Export),
-        );
-        add(
-            "session.tui_hub",
-            "Session: Open omp's agent hub (terminal)",
-            None,
-            ICON_NETWORK,
-            session_why(Kind::AgentHub),
         );
         add(
             "session.tree",
@@ -1207,12 +1193,10 @@ impl App {
             }
             "session.autoname" => self.run_action(Action::AutoName),
             "session.plan" => self.run_action(Action::PlanMode),
-            "session.context" => self.run_action(Action::Context),
             "session.retry" => self.run_action(Action::Retry),
             "session.stop_turn" => self.run_action(Action::Stop),
             "session.copy_last" => self.run_action(Action::CopyLast),
             "session.export" => self.run_action(Action::ExportHtml),
-            "session.tui_hub" => self.run_action(Action::AgentHub),
             "session.tree" => match entry {
                 Some(e) => self.apply_sidebar_action(SidebarAction::Tree(e)),
                 None => self.open_tree_active(),

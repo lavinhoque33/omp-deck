@@ -1186,6 +1186,7 @@ pub fn restore_dialog(
             confirm_enabled: enabled,
             danger,
             enter_confirms: false,
+            ctrl_enter_confirms: false,
             icon: match &d.step {
                 Step::Confirm(p) if p.danger() => None,
                 Step::Report(r) if report_has_problems(r) => Some(ICON_TRIANGLE_ALERT),

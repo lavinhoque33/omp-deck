@@ -4,7 +4,7 @@
 //!
 //! | Family | Executor |
 //! |---|---|
-//! | Composer/hotkey commands: handoff, compact ×4, rename/auto-name, context, retry, plan mode, omp's agent hub, stop; model/effort switch; review insert/send; worktree move/finish prompt | [`crate::controller::SessionController::submit`] (the session's one [`crate::inject::Injector`]) |
+//! | Composer/hotkey commands: handoff, compact ×4, rename/auto-name, retry, plan mode, stop; model/effort switch; review insert/send; worktree move/finish prompt | [`crate::controller::SessionController::submit`] (the session's one [`crate::inject::Injector`]) |
 //! | Export HTML | [`crate::session_actions::export_html`] (`omp --export`) |
 //! | Fork / copy | `deck_core::omp::fork_argv` (launched as a new session), `deck_core::omp::Omp::copy_session`, `deck_core::sessions::find_fork` |
 //! | Fork at entry / navigate / subagent kill, revive, chat | `deck_core::ctl` (`CtlCommand`) over the session's control socket |

@@ -3,10 +3,9 @@
 //! Also the edge/corner resize zones and outline for the undecorated window.
 
 use crate::icons::{
-    ICON_APP_WINDOW, ICON_ARROW_LEFT_RIGHT, ICON_CIRCLE_ARROW_UP, ICON_COPY, ICON_DOWNLOAD,
-    ICON_HISTORY, ICON_LOG_OUT, ICON_MENU, ICON_MINUS, ICON_MOON, ICON_PLUS, ICON_PUZZLE,
-    ICON_REFRESH_CW, ICON_ROCKET, ICON_ROTATE_CCW, ICON_SETTINGS, ICON_SQUARE, ICON_SUN,
-    ICON_TERMINAL, ICON_X,
+    ICON_APP_WINDOW, ICON_ARROW_LEFT_RIGHT, ICON_COPY, ICON_DOWNLOAD, ICON_HISTORY, ICON_LOG_OUT,
+    ICON_MENU, ICON_MINUS, ICON_MOON, ICON_PLUS, ICON_PUZZLE, ICON_REFRESH_CW, ICON_ROCKET,
+    ICON_ROTATE_CCW, ICON_SETTINGS, ICON_SQUARE, ICON_SUN, ICON_TERMINAL, ICON_X,
 };
 use deck_core::config::Theme;
 use deck_core::omp::UpdateKind;
@@ -69,7 +68,6 @@ pub enum BarAction {
     OpenSettings,
     Reopen,
     Refresh,
-    OpenUsage,
     /// Open the session manager hub.
     OpenSessions,
     /// Show or hide the agents dashboard.
@@ -509,18 +507,6 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
         }
         if menu_item(
             ui,
-            crate::icons::ICON_GAUGE,
-            "Usage…",
-            Some("Ctrl+Shift+U"),
-            true,
-            false,
-        )
-        .clicked()
-        {
-            pick(ui, &mut action, BarAction::OpenUsage);
-        }
-        if menu_item(
-            ui,
             crate::icons::ICON_HARD_DRIVE,
             "Session manager…",
             Some("Ctrl+Shift+S"),
@@ -544,15 +530,6 @@ fn app_menu(button: &egui::Response, input: &BarInput<'_>) -> Option<BarAction> 
             pick(ui, &mut action, BarAction::OpenAgents);
         }
         if let Some(o) = &input.omp {
-            let checking = *o.state == UpdateState::Checking;
-            let label = if checking {
-                "Checking for updates…"
-            } else {
-                "Check for updates"
-            };
-            if menu_item(ui, ICON_CIRCLE_ARROW_UP, label, None, !checking, false).clicked() {
-                pick(ui, &mut action, BarAction::CheckUpdates);
-            }
             omp_submenu(ui, o, &mut action);
         }
         if menu_item(
@@ -797,9 +774,9 @@ fn update_actions(ui: &mut egui::Ui, o: &OmpBar<'_>, action: &mut Option<BarActi
     ui.separator();
     let checking = *o.state == UpdateState::Checking;
     let check = if checking {
-        "Checking…"
+        "Checking for updates…"
     } else {
-        "Check again"
+        "Check for updates"
     };
     if menu_item(ui, ICON_REFRESH_CW, check, None, !checking, false).clicked() {
         pick(ui, action, BarAction::CheckUpdates);

@@ -2958,3 +2958,13 @@ deleted).
   Neutral/Neon get the framed central panel too. Changes panel uses `skin::right_panel_frame` (Islands panel in every
   Islands look). Tab row stays full width (user choice). Settings → Appearance toggle + palette
   `layout.separated_panels`.
+
+## Legacy TUI shortcuts removed (user, 2026-10-27)
+
+- `session_actions::{Kind, Action}` lose `AgentHub` (Alt+A) and `Context` (`/context`): the status-bar ⋯ menu and the
+  palette no longer open omp's TUI agent hub or context overlay (the agents dashboard and the context tooltip replace
+  them). Supersedes the "Open omp's Agent Hub (TUI)" line of Wave 5 and the Agent hub / Context actions of the status bar.
+- App menu (title bar ⋯): no "Usage…" (status-bar chip, status-bar ⋯ and Ctrl+Shift+U remain) and no top-level
+  "Check for updates"; the omp submenu's check is labelled "Check for updates" ("Checking for updates…" while running).
+- `confirm::Dialog.ctrl_enter_confirms`: Ctrl+Enter (consumed before the body, so the multiline editor never sees it)
+  confirms; footer hint "Ctrl+Enter confirms". Used by the Handoff dialog.

@@ -510,6 +510,7 @@ pub fn show_secret_modal(ctx: &egui::Context, m: &mut SecretModal) -> ModalOutco
             confirm_enabled: ok,
             danger: false,
             enter_confirms: true,
+            ctrl_enter_confirms: false,
             icon: Some(ICON_KEY_ROUND),
             subtitle: Some("Writes via omp config set"),
             tone: Some(pal.warn),

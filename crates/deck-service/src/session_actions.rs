@@ -17,8 +17,6 @@ pub enum Kind {
     Rename,
     AutoName,
     PlanMode,
-    AgentHub,
-    Context,
     Retry,
     Stop,
     CopyLast,
@@ -42,8 +40,6 @@ pub enum Action {
     Rename(String),
     AutoName,
     PlanMode,
-    AgentHub,
-    Context,
     Retry,
     Stop,
     CopyLast,
@@ -145,13 +141,7 @@ pub fn availability(kind: Kind, c: &ActionCtx) -> Availability {
                 Enabled
             }
         }
-        Kind::Stop
-        | Kind::Tree
-        | Kind::Rename
-        | Kind::AutoName
-        | Kind::PlanMode
-        | Kind::AgentHub
-        | Kind::Context => Enabled,
+        Kind::Stop | Kind::Tree | Kind::Rename | Kind::AutoName | Kind::PlanMode => Enabled,
     }
 }
 
@@ -209,8 +199,6 @@ pub fn job(action: &Action) -> Option<Job> {
         }
         Action::AutoName => Job::slash("Auto-name", "/rename", Requires::Any),
         Action::PlanMode => Job::key("Plan mode", Key::Char('p'), ALT_SHIFT, Requires::Any),
-        Action::AgentHub => Job::key("omp's Agent Hub", Key::Char('a'), Mods::ALT, Requires::Any),
-        Action::Context => Job::slash("Context", "/context", Requires::Any),
         Action::Retry => Job::key("Retry", Key::F(5), Mods::NONE, Requires::Idle),
         Action::Stop => Job::stop(),
         Action::Fork | Action::CopyLast | Action::ExportHtml => return None,
@@ -322,7 +310,7 @@ mod tests {
         ] {
             assert!(!availability(k, &fresh).is_enabled(), "{k:?}");
         }
-        for k in [Kind::Rename, Kind::PlanMode, Kind::AgentHub, Kind::Context] {
+        for k in [Kind::Rename, Kind::PlanMode] {
             assert!(availability(k, &fresh).is_enabled(), "{k:?}");
         }
     }
@@ -396,14 +384,10 @@ mod tests {
             Some((Payload::Key(k, m), r)) => (k, m, r),
             other => panic!("not a key: {other:?}"),
         };
-        // omp-actions.md §7: Alt+Shift+P (`ESC P`), Alt+A (`ESC a`), F5 (`ESC[15~`).
+        // omp-actions.md §7: Alt+Shift+P (`ESC P`), F5 (`ESC[15~`).
         assert_eq!(
             keys(Action::PlanMode),
             (Key::Char('p'), ALT_SHIFT, Requires::Any)
-        );
-        assert_eq!(
-            keys(Action::AgentHub),
-            (Key::Char('a'), Mods::ALT, Requires::Any)
         );
         assert_eq!(keys(Action::Retry), (Key::F(5), Mods::NONE, Requires::Idle));
         assert_eq!(

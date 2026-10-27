@@ -210,7 +210,7 @@ a service-instance epoch; no cross-daemon-restart request persistence is claimed
 | Inventory, project/session search, running processes/RAM | Existing `deck_core::{sessions,inventory,mux,platform,fleet}` read/worker APIs |
 | New, resume, attach, restart, stop/kill | `deck_service::backend`, `deck_core::mux::Mux`, `deck_service::host_remote::HostRemote`; tab/focus effects remain native |
 | Fork/copy, move, delete and bulk operations | Existing `deck_core::omp::Omp`; shared `lifecycle::stop_then_move` / `stop_then_delete` preserve stop-first and live-writer retry rules |
-| Handoff, compact variants, rename/auto-name, plan, retry, context, omp's agent hub, interrupt | `SessionController::submit(Command::Action)` using the one moved injector/composer implementation |
+| Handoff, compact variants, rename/auto-name, plan, retry, interrupt | `SessionController::submit(Command::Action)` using the one moved injector/composer implementation |
 | Model and thinking effort | `Command::{SwitchModel,SetEffort}` plus `observe_model`; delivery and observed runtime effect remain separate |
 | Terminal typing and paste | Native widget's existing encoder/hold checks; headless `write_input(target, bytes)` checks identity, ownership and hold before accepting already-encoded bytes |
 | Tree fork-at/navigation and subagent kill/revive/chat | Existing `deck_core::ctl` operations; native link/confirmation presentation remains client-local |

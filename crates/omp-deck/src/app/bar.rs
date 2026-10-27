@@ -658,6 +658,7 @@ impl App {
                     confirm_enabled: true,
                     danger: false,
                     enter_confirms: false,
+                    ctrl_enter_confirms: true,
                     icon: Some(ICON_HANDSHAKE),
                     subtitle: Some("Continues in a new context from a summary"),
                     ..Default::default()
