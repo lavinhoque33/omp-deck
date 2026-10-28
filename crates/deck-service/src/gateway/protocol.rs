@@ -841,11 +841,12 @@ pub enum Mutation {
         parts: Parts,
     },
     /// Apply a prepared restore. `conflicts` decides each backed-up session whose id exists
-    /// locally (missing = keep the local one); `stop` = backend sessions to kill first (the
-    /// local copies being overwritten).
+    /// locally (missing = keep the local one); `excluded` = backed-up sessions left out of the
+    /// restore; `stop` = backend sessions to kill first (the local copies being overwritten).
     ProjectApplyRestore {
         handle: u64,
         conflicts: BTreeMap<String, ConflictChoice>,
+        excluded: BTreeSet<String>,
         stop: Vec<String>,
     },
     ProjectDiscardRestore(u64),

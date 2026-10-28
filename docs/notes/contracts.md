@@ -2816,9 +2816,16 @@ earlier "always alongside, never replace" rule for that case only; the default s
   unpacked back from its safety tar with `--cwd` = its header cwd when that folder exists, else the restore target,
   and its mtime restored; the failure text says the local copy was put back (or names the safety tar if that failed).
   A live omp holding a copy makes the delete fail (`Live`) → session failed, local copy untouched.
-- `deck-service`: `Mutation::ProjectApplyRestore { handle: u64, conflicts: BTreeMap<String, ConflictChoice>, stop:
-  Vec<String> }`; the job runs `lifecycle::kill_all(&ctx.backends, &stop, "restore")` and then the apply.
-- `omp-deck` confirm step: a **"Sessions already here"** section when any plan session has `local`: an "All:" choice
+- `deck-service`: `Mutation::ProjectApplyRestore { handle: u64, conflicts: BTreeMap<String, ConflictChoice>, excluded:
+  BTreeSet<String>, stop: Vec<String> }`; the job calls `PreparedProjectRestore::leave_out_sessions(&excluded)`
+  (drops those ids from `plan.sessions` and the manifest's items together, they stay index-aligned; unknown ids
+  ignored), runs `lifecycle::kill_all(&ctx.backends, &stop, "restore")` and then the apply.
+- `omp-deck` confirm step: a **Sessions** row ("N sessions" / "K of N sessions" / "none selected") with
+  **Choose…**, which opens the shared session chooser as `SessionsTarget::Restore` ("Sessions to restore", rows
+  from the plan's `SessionPlan`s with the backed-up age; Save sets `PlanView.excluded`). Left-out sessions are
+  dropped from the conflicts, the problems list, the danger check and the apply's `conflicts`/`stop`; Restore is
+  disabled when nothing would be written. A **"Sessions already here"** section when any restored plan session has
+  `local`: an "All:" choice
   (Keep current / Overwrite / Keep both) and one row per conflict (title, backup age vs local age with a Newer
   badge on the newer side, the local copy's folder `~`-abbreviated when it differs from the target, Running badge)
   with its own three-way choice; default Keep current. Any Overwrite → danger box "N local session(s) will be

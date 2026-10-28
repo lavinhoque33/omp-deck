@@ -12,7 +12,8 @@ use std::time::{Duration, SystemTime};
 use deck_core::config::SyncRow;
 use deck_core::gdrive::{
     ConflictChoice, MemoryBank, OmpDir, Parts, ProjectBackup, ProjectBackupOutcome,
-    ProjectRestorePlan, ProjectRestoreReport, ProjectSizes, ProjectSyncState, hostname, path_id,
+    ProjectRestorePlan, ProjectRestoreReport, ProjectSizes, ProjectSyncState, SessionPlan,
+    hostname, path_id,
 };
 use deck_core::sessions::{SessionEntry, abbreviate_home};
 use deck_service::controller::RequestKey;
@@ -82,8 +83,10 @@ struct Restore {
     backups: Vec<ProjectBackup>,
     /// The restore the gateway prepared and holds under this handle.
     prepared: Option<u64>,
-    /// Sessions in the prepared plan (for the "3 of 11" wording of a cancelled restore).
+    /// Sessions the apply was sent with (for the "3 of 11" wording of a cancelled restore).
     session_total: usize,
+    /// The prepared plan's sessions, for the "Sessions to restore" chooser.
+    plan_sessions: Vec<SessionPlan>,
     /// Sidebar restore: only this folder's backups are listed.
     only: Option<PathBuf>,
     probe_generation: u64,
@@ -278,6 +281,31 @@ fn cells_of(sizes: Option<&Result<ProjectSizes, String>>, excluded: &BTreeSet<St
     }
 }
 
+/// One chooser row; an untitled session shows its id.
+fn session_item(
+    now: SystemTime,
+    id: &str,
+    title: &str,
+    modified: SystemTime,
+    bytes: u64,
+    on: bool,
+) -> SessionItem {
+    let age = format_age(now, modified);
+    SessionItem {
+        id: id.to_owned(),
+        title: clip(if title.is_empty() { id } else { title }, 80),
+        haystack: format!("{title} {id}").to_lowercase(),
+        age: if age == "now" {
+            "just now".to_owned()
+        } else {
+            format!("{age} ago")
+        },
+        size: human_size(bytes),
+        bytes,
+        on,
+    }
+}
+
 /// The chooser rows of `sizes`: checked = backed up, so every id in `excluded` is off.
 fn session_items(sizes: &ProjectSizes, excluded: &BTreeSet<String>) -> Vec<SessionItem> {
     let now = SystemTime::now();
@@ -285,20 +313,23 @@ fn session_items(sizes: &ProjectSizes, excluded: &BTreeSet<String>) -> Vec<Sessi
         .session_list
         .iter()
         .map(|s| {
-            let age = format_age(now, s.modified);
-            SessionItem {
-                id: s.id.clone(),
-                title: clip(&s.title, 80),
-                haystack: format!("{} {}", s.title, s.id).to_lowercase(),
-                age: if age == "now" {
-                    "just now".to_owned()
-                } else {
-                    format!("{age} ago")
-                },
-                size: human_size(s.bytes),
-                bytes: s.bytes,
-                on: !excluded.contains(&s.id),
-            }
+            let on = !excluded.contains(&s.id);
+            session_item(now, &s.id, &s.title, s.modified, s.bytes, on)
+        })
+        .collect()
+}
+
+/// The chooser rows of a prepared restore: checked = restored, so every id in `excluded` is off.
+/// The age is the backed-up session's.
+fn restore_items(sessions: &[SessionPlan], excluded: &BTreeSet<String>) -> Vec<SessionItem> {
+    let now = SystemTime::now();
+    sessions
+        .iter()
+        .map(|s| {
+            let modified = SystemTime::UNIX_EPOCH
+                + Duration::from_secs(u64::try_from(s.modified_unix).unwrap_or(0));
+            let on = !excluded.contains(&s.id);
+            session_item(now, &s.id, &s.title, modified, s.bytes, on)
         })
         .collect()
 }
@@ -931,6 +962,7 @@ impl App {
             backups: Vec::new(),
             prepared: None,
             session_total: 0,
+            plan_sessions: Vec::new(),
             only,
             probe_generation: 0,
             target_touched: false,
@@ -1123,6 +1155,7 @@ impl App {
             RestoreAction::Select(p, v) => self.select_version(p, v),
             RestoreAction::Delete(p, v) => self.ask_delete_version(p, v),
             RestoreAction::Continue => self.restore_prepare(),
+            RestoreAction::ChooseSessions => self.open_restore_sessions_dialog(),
             RestoreAction::Confirm => self.restore_apply(),
             RestoreAction::Cancel => match r.dlg.step {
                 Step::Applying => {
@@ -1256,13 +1289,17 @@ impl App {
                     session_problems: plan
                         .sessions
                         .iter()
-                        .filter_map(|s| Some(format!("{}: {}", s.title, s.problem.as_ref()?)))
+                        .filter_map(|s| {
+                            let why = s.problem.as_ref()?;
+                            Some((s.id.clone(), format!("{}: {why}", s.title)))
+                        })
                         .collect(),
                     sessions,
+                    excluded: BTreeSet::new(),
                     conflicts,
                     safety: "OmpDeck's restore-safety folder".to_owned(),
                 });
-                r.session_total = plan.sessions.len();
+                r.plan_sessions = plan.sessions;
                 r.prepared = Some(handle);
             }
         }
@@ -1273,14 +1310,18 @@ impl App {
             return;
         };
         let mut choices = BTreeMap::new();
+        let mut excluded = BTreeSet::new();
         let mut overwritten: Vec<(String, PathBuf)> = Vec::new();
+        let mut total = 0;
         if let Some(Step::Confirm(plan)) = self.sync.restore.as_ref().map(|r| &r.dlg.step) {
-            for row in &plan.conflicts {
+            for row in plan.included_conflicts() {
                 choices.insert(row.id.clone(), row.choice);
                 if row.choice == ConflictChoice::Overwrite {
                     overwritten.extend(row.paths.iter().map(|p| (row.id.clone(), p.clone())));
                 }
             }
+            excluded.clone_from(&plan.excluded);
+            total = plan.included();
         }
         if !self.begin_job(Kind::Restoring) {
             self.toasts.info(&self.ctx, LANE_BUSY);
@@ -1298,12 +1339,14 @@ impl App {
         }
         if let Some(r) = &mut self.sync.restore {
             r.prepared = None;
+            r.session_total = total;
             r.dlg.cancelling = false;
             r.dlg.step = Step::Applying;
         }
         let job = Mutation::ProjectApplyRestore {
             handle,
             conflicts: choices,
+            excluded,
             stop,
         };
         self.send_job(job, |app, r| {
@@ -1510,6 +1553,22 @@ impl App {
         ));
     }
 
+    /// The chooser for the restore dialog's confirm step, toggles from the plan's exclusions.
+    fn open_restore_sessions_dialog(&mut self) {
+        let Some(r) = &self.sync.restore else {
+            return;
+        };
+        let Step::Confirm(plan) = &r.dlg.step else {
+            return;
+        };
+        self.sync.sessions = Some(SessionsDialog::new(
+            PathBuf::from(&plan.target),
+            plan.target.clone(),
+            restore_items(&r.plan_sessions, &plan.excluded),
+            SessionsTarget::Restore,
+        ));
+    }
+
     fn show_sessions_dialog(&mut self, ctx: &egui::Context) {
         let Some(d) = &mut self.sync.sessions else {
             return;
@@ -1540,6 +1599,13 @@ impl App {
                     SessionsTarget::Backup => {
                         if let Some(b) = self.sync.backup.as_mut().filter(|b| b.path == d.path) {
                             b.excluded_ids = excluded;
+                        }
+                    }
+                    SessionsTarget::Restore => {
+                        if let Some(Step::Confirm(plan)) =
+                            self.sync.restore.as_mut().map(|r| &mut r.dlg.step)
+                        {
+                            plan.excluded = excluded;
                         }
                     }
                 }

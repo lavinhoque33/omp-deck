@@ -1015,10 +1015,12 @@ pub struct PlanView {
     pub memory_added: usize,
     /// Memory files that will NOT be written ("<name>: <reason>").
     pub memory_skipped: Vec<String>,
-    /// Sessions that cannot be restored ("<title>: <reason>").
-    pub session_problems: Vec<String>,
+    /// Sessions that cannot be restored: (id, "<title>: <reason>").
+    pub session_problems: Vec<(String, String)>,
     /// How many sessions the backup holds (`None` = the backup has none).
     pub sessions: Option<usize>,
+    /// Backed-up sessions the user left out of this restore (ids of the plan's sessions).
+    pub excluded: std::collections::BTreeSet<String>,
     /// Backed-up sessions whose id already exists in the sessions root, with the user's choice.
     pub conflicts: Vec<ConflictRow>,
     pub safety: String,
@@ -1044,9 +1046,31 @@ impl PlanView {
         self.omp_danger() || self.memory_danger() || self.sessions_overwritten() > 0
     }
 
-    fn sessions_overwritten(&self) -> usize {
+    /// Something would be written: Restore is offered.
+    pub fn any_work(&self) -> bool {
+        self.sessions.is_none()
+            || self.included() > 0
+            || self.omp_overwritten_total + self.omp_added > 0
+            || !self.memory_overwritten.is_empty()
+            || self.memory_added > 0
+    }
+
+    /// Sessions of the backup that are restored (not left out).
+    pub fn included(&self) -> usize {
+        self.sessions
+            .unwrap_or(0)
+            .saturating_sub(self.excluded.len())
+    }
+
+    /// The conflicts of the sessions that are restored.
+    pub fn included_conflicts(&self) -> impl Iterator<Item = &ConflictRow> {
         self.conflicts
             .iter()
+            .filter(|c| !self.excluded.contains(&c.id))
+    }
+
+    fn sessions_overwritten(&self) -> usize {
+        self.included_conflicts()
             .filter(|c| c.choice == ConflictChoice::Overwrite)
             .count()
     }
@@ -1156,6 +1180,8 @@ pub enum RestoreAction {
     /// Delete the version (project, version) from Drive (asks first).
     Delete(usize, usize),
     Continue,
+    /// Open the chooser of the sessions this restore brings back (confirm step).
+    ChooseSessions,
     Confirm,
     Close,
 }
@@ -1172,7 +1198,7 @@ pub fn restore_dialog(
     let (label, enabled, danger) = match &d.step {
         Step::Pick => ("Continue", d.can_continue(lane_busy), false),
         Step::Preparing => ("Continue", false, false),
-        Step::Confirm(p) => ("Restore", true, p.danger()),
+        Step::Confirm(p) => ("Restore", p.any_work(), p.danger()),
         Step::Applying => ("Restore", false, false),
         Step::Report(_) => ("Close", true, false),
     };
@@ -1209,7 +1235,7 @@ pub fn restore_dialog(
         },
         |ui| {
             if let Step::Confirm(plan) = &mut d.step {
-                confirm_body(ui, plan);
+                confirm_body(ui, plan, &mut act);
                 return;
             }
             match &d.step {
@@ -1520,7 +1546,7 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
     }
 }
 
-fn confirm_body(ui: &mut Ui, plan: &mut PlanView) {
+fn confirm_body(ui: &mut Ui, plan: &mut PlanView, act: &mut Option<RestoreAction>) {
     let pal = Palette::of_ui(ui);
     let wrap = |ui: &mut Ui, text: RichText| {
         ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Wrap));
@@ -1612,14 +1638,35 @@ fn confirm_body(ui: &mut Ui, plan: &mut PlanView) {
         });
     }
     if let Some(n) = plan.sessions {
-        let fresh = n.saturating_sub(plan.conflicts.len());
-        if fresh > 0 || plan.conflicts.is_empty() {
+        let included = plan.included();
+        let s = |n: usize| if n == 1 { "" } else { "s" };
+        ui.add_space(6.0);
+        deck_card::kv(ui, 84.0, "Sessions", |ui| {
+            let (text, hue) = if included == 0 {
+                ("none selected".to_owned(), Hue::Amber)
+            } else if included < n {
+                (format!("{included} of {n} sessions"), Hue::Teal)
+            } else {
+                (format!("{n} session{}", s(n)), Hue::Teal)
+            };
+            badge::show(ui, None, &text, hue, 11.0);
             ui.add_space(6.0);
-            deck_card::kv(ui, 84.0, "Sessions", |ui| {
+            if DraftButton::new("Choose…")
+                .min_width(CHOOSE_W)
+                .show(ui)
+                .on_hover_text("Pick which sessions are restored")
+                .clicked()
+            {
+                *act = Some(RestoreAction::ChooseSessions);
+            }
+        });
+        let fresh = included.saturating_sub(plan.included_conflicts().count());
+        if fresh > 0 {
+            deck_card::kv(ui, 84.0, "Added", |ui| {
                 badge::show(
                     ui,
                     None,
-                    &format!("{fresh} session{} added", if fresh == 1 { "" } else { "s" }),
+                    &format!("{fresh} session{}", s(fresh)),
                     Hue::Teal,
                     11.0,
                 );
@@ -1643,11 +1690,13 @@ fn confirm_body(ui: &mut Ui, plan: &mut PlanView) {
         "Memory files that will NOT be written:",
         &plan.memory_skipped,
     );
-    warn_list(
-        ui,
-        "Sessions that cannot be restored:",
-        &plan.session_problems,
-    );
+    let problems: Vec<String> = plan
+        .session_problems
+        .iter()
+        .filter(|(id, _)| !plan.excluded.contains(id))
+        .map(|(_, text)| text.clone())
+        .collect();
+    warn_list(ui, "Sessions that cannot be restored:", &problems);
 }
 
 const CONFLICT_CHOICES: [(ConflictChoice, &str, &str); 3] = [
@@ -1690,11 +1739,21 @@ fn unix_time(secs: i64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(secs).unwrap_or(0))
 }
 
-/// "Sessions already here": an All selector and one row per session whose id exists locally.
+/// "Sessions already here": an All selector and one row per restored session whose id exists
+/// locally (left-out sessions are not listed).
 fn conflicts_section(ui: &mut Ui, plan: &mut PlanView) {
-    if plan.conflicts.is_empty() {
+    let PlanView {
+        conflicts,
+        excluded,
+        ..
+    } = plan;
+    let mut rows: Vec<&mut ConflictRow> = conflicts
+        .iter_mut()
+        .filter(|c| !excluded.contains(&c.id))
+        .collect();
+    let Some(all) = rows.first().map(|c| c.choice) else {
         return;
-    }
+    };
     let pal = Palette::of_ui(ui);
     let now = std::time::SystemTime::now();
     ui.add_space(8.0);
@@ -1707,13 +1766,7 @@ fn conflicts_section(ui: &mut Ui, plan: &mut PlanView) {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(theme::strong("Sessions already here").color(pal.text_strong));
-                badge::show(
-                    ui,
-                    None,
-                    &plan.conflicts.len().to_string(),
-                    Hue::Amber,
-                    10.5,
-                );
+                badge::show(ui, None, &rows.len().to_string(), Hue::Amber, 10.5);
             });
             ui.label(
                 RichText::new("These backed-up sessions have the same id as a local one.")
@@ -1721,12 +1774,11 @@ fn conflicts_section(ui: &mut Ui, plan: &mut PlanView) {
                     .color(pal.weak),
             );
             ui.add_space(4.0);
-            let all = plan.conflicts[0].choice;
-            let uniform = plan.conflicts.iter().all(|c| c.choice == all);
+            let uniform = rows.iter().all(|c| c.choice == all);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("All:").small().color(pal.weak));
                 if let Some(c) = choice_pills(ui, uniform.then_some(all)) {
-                    for row in &mut plan.conflicts {
+                    for row in &mut rows {
                         row.choice = c;
                     }
                 }
@@ -1736,16 +1788,12 @@ fn conflicts_section(ui: &mut Ui, plan: &mut PlanView) {
                 .id_salt("restore-conflicts")
                 .max_height(220.0)
                 .show(ui, |ui| {
-                    for row in &mut plan.conflicts {
+                    for row in &mut rows {
                         conflict_row(ui, pal, now, row);
                     }
                 });
         });
-    let n = plan
-        .conflicts
-        .iter()
-        .filter(|c| c.choice == ConflictChoice::Overwrite)
-        .count();
+    let n = plan.sessions_overwritten();
     if n > 0 {
         overwrite_warning(
             ui,
@@ -1868,7 +1916,7 @@ fn warn_list(ui: &mut Ui, title: &str, items: &[String]) {
 
 // ------------------------------------------------------------------ sessions to back up
 
-/// One session in the "Sessions to back up" list.
+/// One session in the "Sessions to back up" / "Sessions to restore" list.
 pub struct SessionItem {
     pub id: String,
     pub title: String,
@@ -1888,6 +1936,28 @@ pub enum SessionsTarget {
     Row,
     /// The open sidebar backup dialog (this one backup only).
     Backup,
+    /// The confirm step of the open restore dialog (checked = restored).
+    Restore,
+}
+
+impl SessionsTarget {
+    /// (title, subtitle, folder label, closing note).
+    fn wording(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            SessionsTarget::Row | SessionsTarget::Backup => (
+                "Sessions to back up",
+                "New sessions are included automatically",
+                "Folder",
+                "New sessions are backed up automatically.",
+            ),
+            SessionsTarget::Restore => (
+                "Sessions to restore",
+                "Only the checked sessions are restored",
+                "Into",
+                "Sessions left out stay in the backup; nothing local is touched for them.",
+            ),
+        }
+    }
 }
 
 pub struct SessionsDialog {
@@ -1950,25 +2020,26 @@ impl SessionsDialog {
     }
 }
 
-/// "Sessions to back up": checkbox list, checked = backed up.
+/// "Sessions to back up" / "Sessions to restore": checkbox list, checked = included.
 pub fn sessions_dialog(ctx: &Context, d: &mut SessionsDialog) -> SessionsAnswer {
     let pal = Palette::of_ctx(ctx);
+    let (title, subtitle, folder, note) = d.target.wording();
     let answer = show_dialog(
         ctx,
         &Dialog {
             id: "sync-sessions",
-            title: "Sessions to back up",
+            title,
             width: 560.0,
             confirm_label: "Save",
             confirm_enabled: true,
             danger: false,
             enter_confirms: false,
             icon: Some(ICON_LIST_CHECKS),
-            subtitle: Some("New sessions are included automatically"),
+            subtitle: Some(subtitle),
             ..Default::default()
         },
         |ui| {
-            deck_card::kv(ui, 84.0, "Folder", |ui| {
+            deck_card::kv(ui, 84.0, folder, |ui| {
                 ui.add(
                     egui::Label::new(RichText::new(&d.display).color(pal.text_strong)).truncate(),
                 );
@@ -2035,7 +2106,7 @@ pub fn sessions_dialog(ctx: &Context, d: &mut SessionsDialog) -> SessionsAnswer 
                 );
                 badge::show(ui, None, &crate::app::human_size(bytes), Hue::Amber, 11.0);
             });
-            weak_note(ui, "New sessions are backed up automatically.");
+            weak_note(ui, note);
         },
     );
     match answer {
@@ -2420,6 +2491,7 @@ mod tests {
             memory_skipped: Vec::new(),
             session_problems: Vec::new(),
             sessions: None,
+            excluded: Default::default(),
             conflicts: Vec::new(),
             safety: String::new(),
         }
@@ -2447,6 +2519,22 @@ mod tests {
         assert!(!p.danger());
         p.conflicts[0].choice = ConflictChoice::Overwrite;
         assert!(p.danger());
+    }
+
+    #[test]
+    fn left_out_sessions_neither_count_nor_endanger_and_leaving_out_all_disables_restore() {
+        let mut p = plan(false, 0);
+        p.sessions = Some(2);
+        p.conflicts = vec![conflict_row("a", ConflictChoice::Overwrite)];
+        assert!(p.danger() && p.any_work());
+        p.excluded = ["a".to_owned()].into();
+        assert!(!p.danger(), "the overwritten session is not restored");
+        assert_eq!((p.included(), p.included_conflicts().count()), (1, 0));
+        assert!(p.any_work());
+        p.excluded.insert("b".into());
+        assert!(!p.any_work(), "nothing left to write");
+        p.omp_added = 1;
+        assert!(p.any_work(), ".omp files are still restored");
     }
 
     #[test]
@@ -2682,7 +2770,12 @@ mod render_tests {
                 memory_exists: true,
                 memory_overwritten: vec!["product.md".into()],
                 memory_skipped: vec!["style.md: symlink".into()],
-                sessions: Some(2),
+                sessions: Some(3),
+                excluded: ["c".to_owned()].into(),
+                session_problems: vec![
+                    ("b".into(), "b: too big".into()),
+                    ("c".into(), "c: too big".into()),
+                ],
                 conflicts: vec![
                     super::tests::conflict_row("a", ConflictChoice::KeepLocal),
                     super::tests::conflict_row("b", ConflictChoice::Overwrite),

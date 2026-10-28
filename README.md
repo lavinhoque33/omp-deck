@@ -74,8 +74,8 @@ host), so closing a tab or the whole app leaves omp running.
   [below](#google-drive-backup).
 - **Project sync**: back up chosen project folders' `.omp` folder, omp sessions and omp's project memory
   to the same private Drive app folder (Settings → Sync, or right-click a project in the sidebar), and
-  restore them into any folder on any machine; restored sessions keep their original age, and sessions that
-  already exist locally are kept, overwritten or added as a copy, as you choose.
+  restore them into any folder on any machine, picking which sessions come back; restored sessions keep their
+  original age, and sessions that already exist locally are kept, overwritten or added as a copy, as you choose.
   See [below](#project-sync).
 - **Worktree sessions**: run several agents on one repository in parallel, each in its own git worktree
   and branch: start a session in a new worktree, move a running session into one, finish it (the agent
@@ -332,7 +332,9 @@ versions selectable. Pick the folder to restore into (it is created if missing) 
   OmpDeck waits for omp to finish merging memory for that folder; if omp is still busy after 10 s the
   memory is left untouched and the summary says so.
 - **Sessions**: each session is added through `omp session unpack --cwd <folder>`, so omp moves it to the
-  new folder and tells the agent where it now lives. Restored sessions keep the last-activity time they had
+  new folder and tells the agent where it now lives. **Choose…** next to the session count opens the backup's
+  session list: untick the sessions to leave out (they are neither written nor listed as conflicts).
+  Restored sessions keep the last-activity time they had
   when backed up, so the sidebar's newest/oldest order survives. When a session already exists on this machine,
   the dialog lists it with both ages and lets you pick, per session or for all: **Keep current** (the default;
   the backup's copy is skipped), **Overwrite** (the local copy is stopped if running, saved as an

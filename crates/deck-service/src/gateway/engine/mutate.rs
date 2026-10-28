@@ -995,6 +995,7 @@ impl Engine {
             Mutation::ProjectApplyRestore {
                 handle,
                 conflicts,
+                excluded,
                 stop,
             } => {
                 self.accepted(conn, id, &key);
@@ -1006,7 +1007,7 @@ impl Engine {
                     Post::Refresh,
                     move |ctx, cancel, progress| {
                         jobs::project_apply_restore(
-                            ctx, handle, &conflicts, &stop, cancel, progress,
+                            ctx, handle, &conflicts, &excluded, &stop, cancel, progress,
                         )
                     },
                 );

@@ -772,21 +772,24 @@ pub fn project_prepare_restore(
 }
 
 /// Kills the backend sessions in `stop` (the local copies the restore overwrites), then applies
-/// the prepared restore with the user's per-session `conflicts` choices.
+/// the prepared restore with the user's per-session `conflicts` choices, leaving the sessions in
+/// `excluded` out.
 pub fn project_apply_restore(
     ctx: &JobCtx,
     handle: u64,
     conflicts: &std::collections::BTreeMap<String, gdrive::ConflictChoice>,
+    excluded: &std::collections::BTreeSet<String>,
     stop: &[String],
     cancel: &AtomicBool,
     progress: &(dyn Fn(Progress) + Sync),
 ) -> Result<Done, GatewayError> {
     let service = ctx.drive()?;
-    let prepared = lock(&ctx.handles.project_restores)
+    let mut prepared = lock(&ctx.handles.project_restores)
         .remove(&handle)
         .ok_or_else(|| {
             GatewayError::Refused("that restore is gone; prepare it again".to_owned())
         })?;
+    prepared.leave_out_sessions(excluded);
     lifecycle::kill_all(&ctx.backends, stop, "restore");
     service
         .apply_project_restore(prepared, conflicts, ctx.omp.as_ref(), cancel, &|p| {

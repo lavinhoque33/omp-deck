@@ -322,6 +322,21 @@ pub struct PreparedProjectRestore {
     stage: Staging,
 }
 
+impl PreparedProjectRestore {
+    /// Leaves the backed-up sessions whose id is in `ids` out of this restore: applying neither
+    /// writes nor reports them. Unknown ids are ignored.
+    pub fn leave_out_sessions(&mut self, ids: &BTreeSet<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        // `plan.sessions` is index-aligned with the manifest's items; both lose the same rows.
+        self.plan.sessions.retain(|s| !ids.contains(&s.id));
+        if let Some(s) = &mut self.manifest.sessions {
+            s.items.retain(|i| !ids.contains(&i.id));
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProjectRestoreReport {
     pub omp_written: usize,

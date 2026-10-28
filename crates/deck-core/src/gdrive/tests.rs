@@ -3359,6 +3359,76 @@ mod project_sync {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn left_out_sessions_are_neither_restored_nor_reported() {
+        let w = world();
+        let (_, backup) = backed_up(&w, &["s1", "s2", "s3"], &[]);
+        let seen = w.tmp.path().join("seen");
+        // Records the id of every pack omp is asked to unpack (`session unpack <tar> --cwd …`).
+        let omp = fake_omp(
+            w.tmp.path(),
+            "omp.sh",
+            &format!(
+                "tar -xOf \"$3\" manifest.json >> {seen}\necho >> {seen}\n{OK_OMP}",
+                seen = seen.display()
+            ),
+        );
+        let root = SessionsRoot::at(w.tmp.path().join("store/sessions"));
+        let target = w.tmp.path().join("target");
+        let mut prepared = w.prepare(&backup, &target, SESSIONS, &root).unwrap();
+        prepared.leave_out_sessions(&ids(&["s2", "not-in-the-backup"]));
+        let planned: BTreeSet<&str> = prepared
+            .plan
+            .sessions
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(planned, BTreeSet::from(["s1", "s3"]));
+        let report = w
+            .service
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::new(),
+                Some(&omp),
+                &AtomicBool::new(false),
+                &quiet,
+            )
+            .unwrap();
+        assert!(
+            report.sessions_failed.is_empty(),
+            "{:?}",
+            report.sessions_failed
+        );
+        assert_eq!(report.sessions_added.len(), 2);
+        let unpacked: BTreeSet<String> = read(&seen)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(unpacked, ids(&["s1", "s3"]));
+
+        // Leaving out every session needs no omp at all.
+        let mut prepared = w.prepare(&backup, &target, SESSIONS, &root).unwrap();
+        prepared.leave_out_sessions(&ids(&["s1", "s2", "s3"]));
+        let report = w
+            .service
+            .apply_project_restore(
+                prepared,
+                &BTreeMap::new(),
+                None,
+                &AtomicBool::new(false),
+                &quiet,
+            )
+            .unwrap();
+        assert!(report.sessions_added.is_empty() && report.sessions_failed.is_empty());
+    }
+
     /// A progress callback that cancels once `stage` has finished its first item.
     #[cfg(unix)]
     fn stop_after(stage: Stage, cancel: &AtomicBool) -> impl Fn(Progress) + Sync + '_ {
