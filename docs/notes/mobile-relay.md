@@ -92,9 +92,17 @@ Code contract: `deck_remote::relay` (`crates/deck-remote/src/relay.rs`, orchestr
   registers the invite's one-use pairing token.
 - **Pairing-token handover** (R3 sequencing; the relay has no token promotion): the invite's token stays in the set while
   its pairing connection is open, including the desktop approval wait. The gateway serves one pairing connection per
-  invite (a second peer with the same token is closed `UNAUTHORIZED`). After message 2 and the device's first encrypted
-  message, the device closes and reconnects with its own token; the gateway then removes the invite token (also on
-  denial or expiry). Publishing a set without the invite token while that connection is open would close it.
+  invite (a second peer with the same token is closed `UNAUTHORIZED`). After message 2 the device closes and reconnects
+  with its own token; the gateway removes the invite token when the pairing peer's connection ends, and on denial,
+  cancel or expiry. Publishing a set without the invite token while that connection is open would close it.
+- **Gateway epoch** (R3 review): `Hello::Gateway` carries `epoch: u64` (big-endian after the secret), sent as
+  `max(unix ms, last epoch + 1)` per connection attempt and persisted by the gateway. The relay lets a gateway hello
+  displace the room's current gateway only when its epoch is ≥ the current one's; an older one is closed `REPLACED`.
+  This fences an already-sent hello of a connection its gateway abandoned (relay change) from taking the room back from
+  that gateway's newer connection, which would otherwise leave the newer link `Refused`. A gateway that receives
+  `REPLACED` stays down (`Refused`, no automatic retry, so two machines sharing a room cannot flap); it reconnects on
+  `Mutation::RelayReconnect` (Mobile access → Reconnect), an owner restart, a relay change, or mode Off → on. An
+  exhausted epoch (`u64::MAX`) is an error, never a reuse.
 - A second gateway hello for the same room replaces the first (`REPLACED`); a gateway disconnect closes its devices with
   `GATEWAY_OFFLINE`; devices retry with backoff.
 - Limits (configurable): max message by role, per-connection byte and message token buckets, devices per room, per-IP and
@@ -135,9 +143,9 @@ a phone view is an observer unless the user explicitly takes control).
 |---|---|---|---|
 | R1 | `deck_remote::noise` (`crates/deck-remote`): snow-based pairing (IKpsk1)/reconnect (IK) sessions, replay timestamps, rekey, framing, strict payloads; TS port in `pwa/src/remote` | vectors pass both ways; tampered/replayed/reordered frames rejected | **done** (2026-10-27): shared `noise-v1.json` + `payload-v1.json` and official cacophony IK/IKpsk1 vectors reproduced by Rust and TS; low-order keys rejected on both sides |
 | R2 | `crates/deck-relay` (`omp-deck-relay`): routing, admission, limits, health, graceful shutdown; Caddy/nginx/systemd/container docs (`docs/relay.md`) | load + abuse tests (floods, slow readers, oversize frames) on localhost | **done** (2026-10-27): 29 tests incl. stalled TLS/HTTP caps, pre-hello rate limits, locked room edits; real-process smoke: pairing, echo, IK reconnect with 300/250 KB messages, revocation `4003`, SIGTERM exit 0 |
-| R3 | Gateway relay link + device registry + pairing window + desktop approval/revocation UI + Mobile access settings (relay URL, devices) | real pairing over a local relay with the Rust test client; revocation kills a live session | next |
+| R3 | Gateway relay link + device registry + pairing window + desktop approval/revocation UI + Mobile access settings (relay URL, devices) | real pairing over a local relay with the Rust test client; revocation kills a live session | **done** (2026-10-28): `remote_pairing` e2e (real owner + in-test relay); native Xvfb smoke: relay form, link Connected, QR decoded from the screenshot paired a Rust device, approve/online/revoke `4003`, deny `4003`; review: 5 findings fixed |
 | R4 | `Role::Device` capability layer, typed remote operations, byte-bounded remote outbox, outcome recovery across reconnect, terminal stream over the link | headless e2e: real omp controlled through relay with the GUI closed; reconnect mid-request recovers the outcome without resend | |
-| R5 | Security review of R1–R4; freeze protocol v1 | findings fixed or accepted in writing | R1/R2 code review done (5 findings fixed) |
+| R5 | Security review of R1–R4; freeze protocol v1 | findings fixed or accepted in writing | R1/R2 (5) and R3 (5) code-review findings fixed |
 
 Slice 4 (PWA) starts after R5. Web Push (`web-push-native`, VAPID, fits the existing blocking `ureq`) belongs there.
 
@@ -195,6 +203,69 @@ prologue `ompdeck-remote-v1`.
 - Behaviour as in "Relay protocol" above; graceful shutdown on SIGINT/SIGTERM (Windows Ctrl+C) closes every socket with
   `GOING_AWAY`. Builds on Linux and Windows.
 - Packaging: systemd unit, multi-stage container build, Caddy and nginx examples, self-hosting guide `docs/relay.md`.
+
+## R3 contract: gateway relay link, device registry, pairing (`deck-service` + `omp-deck`)
+
+Decisions made by the orchestrator for R3 (conservative defaults):
+
+- **Plain `ws://` only for loopback** relay hosts (`localhost`, `127.0.0.0/8`, `::1`); anything else must be `wss://`
+  (a cleartext `Hello` exposes the room secret and tokens). TLS trusts the webpki roots (the same set ureq uses); a
+  private CA or an HTTP proxy is not supported (documented in `docs/relay.md`).
+- **QR target**: `<pwa origin>/#pair=<invite>`; the PWA origin is the relay's own origin (`wss://h[:p]` → `https://h[:p]`,
+  `ws://` → `http://`), because slice 4 serves the PWA from the relay. The dialog also offers copying the link.
+- **No desktop notification** for a pairing request: the user just opened the window on this desktop.
+- **R3 sessions carry no application messages yet** (R4 defines them): an application message from a device closes
+  that peer with `close::PROTOCOL`.
+
+Gateway (`crates/deck-service/src/gateway/remote/` + `engine/remote.rs`):
+
+- Files in the gateway state dir (`Profile::state_dir()`), owner-only via `gateway::write_private`: `remote.key` (32-byte
+  X25519 secret, load-or-create like `ctl.rs`), `relay.json` (`{url, room_key}`), `devices.json` (id, name, platform,
+  public key, relay token hash, permissions, `last_ts`, created, last seen). Relay settings are device-local, never in
+  `AppConfig`/`SettingsService`. `last_ts` is persisted before a reconnect is accepted.
+- Relay link: one thread (`RunningMonitor`-style handle), running while `gateway_mode != Off` and a relay is configured;
+  started/stopped from `refresh_settings`, stopped in `Engine::shutdown`; blocking `tungstenite` 0.29 + rustls/ring with a
+  short read timeout (`WouldBlock` and `TimedOut` = no data), reconnect backoff 1 s → 60 s with jitter. It owns the socket
+  and per-peer Noise state; the engine owns the registry and every decision (`Msg::Relay(Event)` in, `Cmd` out). DNS,
+  TCP, TLS, WebSocket and Noise work never run on the engine thread. The link and an open pairing window are not
+  "work" for drain; a maintenance barrier cancels an open pairing window.
+- Reconnect acceptance: device known by static key, admission token hash = the device's, `timestamp_fresh(last_ts, ts)`;
+  otherwise the peer is closed `UNAUTHORIZED` without message 2.
+- Pairing window: one at a time, 2 min (env `OMP_DECK_PAIRING_TTL_MS` overrides, verification only); the approval wait
+  has its own 2 min limit; deadlines are checked inside every transition, not only by the periodic step. A window serves
+  at most **one PSK-verified device**: if it disconnects (or the link drops) before approval, the window ends like a
+  deny, so an approval can never apply to a different device than the one whose fingerprint was shown (a wrong-PSK peer
+  never consumes the window). Approve stores the device (new id, new random relay token, chosen permissions) before
+  message 2 is sent; the pairing connection then counts as that device's session. Revoke deletes the record,
+  republishes the token set (the relay closes the live peer with `UNAUTHORIZED`), closes any session of that key
+  (including a still-open pairing connection), persists, then answers.
+- Stopping the link (relay change/clear, mode Off) never blocks the engine: it signals the thread and cuts an
+  unconnected socket; the bounded join runs on a `gateway-relay-stop` thread (only `Engine::shutdown` waits); a link
+  generation filters late events of a stopped link.
+- An authentic application message from a device closes it with `close::PROTOCOL` (1002), which the relay forwards as
+  1000 (it only passes 4000–4999); the token set reaches the relay unacknowledged, so a device connecting within
+  milliseconds of `PairingStarted` may be refused once and retries. `tungstenite`/`rustls` logging is capped at `info`
+  (their trace output dumps frames that carry the room secret and tokens).
+- Protocol (`gateway/protocol.rs`): always-on `Topic::Mobile` → `TopicValue::Mobile(MobileView { relay: Option<RelayView
+  { url, room_id }>, link: RelayLink, fingerprint, devices: Vec<DeviceView>, pairing: Option<PairingView> })`;
+  `RelayLink = Off | Connecting { attempt, error } | Up | Refused { reason }`; `DeviceView { id, name, platform,
+  fingerprint, permissions, created_unix_ms, last_seen_unix_ms, online }`; `Permissions { control, manage }` (view is
+  implied); `PairingView { pairing, expires_unix_ms, state: Waiting | Approval { name, platform, fingerprint } }`. No
+  secret ever appears in a topic, a log or a `Debug` output. Mutations: `RelaySet { url, room_key: SecretText }`,
+  `RelayClear`, `RelayReconnect`, `PairingBegin`, `PairingCancel`, `PairingApprove { pairing, permissions }`, `PairingDeny { pairing }`,
+  `DeviceRevoke { id }`, `DeviceRename { id, name }`, `DeviceSetPermissions { id, permissions }`; `PairingBegin` answers
+  `Done::PairingStarted { pairing, invite, link, expires_unix_ms }` (the only place the PSK leaves the gateway).
+  Allowed under the maintenance barrier: `PairingCancel`, `PairingDeny`, `DeviceRevoke`, `RelayClear`.
+- Gate: `crates/deck-service/tests/remote_pairing.rs` with an in-test `deck_relay` and a Rust device client: pair,
+  approve, reconnect (IK), replayed timestamp refused, owner restart keeps devices and `last_ts`, deny, cancel, expiry,
+  revocation closes a live device (`4003`) and refuses its reconnect, wrong PSK never reaches approval.
+
+Desktop (`crates/omp-deck`): Settings → General → Mobile access card gains the relay (Set relay… with a write-only room
+key field, link state, Clear), the gateway fingerprint, the device list (name, platform, fingerprint, online / last
+seen, permission badges; hover row buttons Rename, Permissions, Revoke with confirm) and **Pair a device** (QR painted
+from `qrcodegen`, countdown, copy link, Cancel). An open pairing in `Topic::Mobile` shows the approval dialog in every
+GUI (name, platform, fingerprint to compare with the phone, Control on / Manage off by default, Approve / Deny).
+Dialogs hold terminal input like the other modals.
 
 ## Sources (verified 2026-10-27)
 

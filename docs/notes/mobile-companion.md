@@ -275,5 +275,5 @@ modes with systemd-user / Windows logon-task supervision, install/update/uninsta
 outdated owner. Step 1's "Windows runtime still requires Windows CI" is now answered for the transport, host,
 real-omp live control and the GUI-through-gateway path (CI), plus the gateway CLI/e2e and task trigger measured
 on Windows 11 (see `contracts.md`). Not shown by CI: `install.ps1` drain/resume, enabling Always on from the
-Mobile access card on Windows, and gateway-originated toast delivery. Relay, pairing and the PWA (slices 3-4) remain
-unimplemented.
+Mobile access card on Windows, and gateway-originated toast delivery. Slice 3 progress (relay, Noise, pairing) is
+tracked in `mobile-relay.md`; the PWA (slice 4) remains unimplemented.

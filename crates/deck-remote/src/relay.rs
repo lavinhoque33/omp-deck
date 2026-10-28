@@ -93,45 +93,69 @@ pub fn hash(secret: &[u8; 32]) -> Hash {
 }
 
 /// A client's first message.
+///
+/// `epoch` fences gateway registrations: a gateway hello only displaces the room's current gateway
+/// when its epoch is not older (an already-sent hello of a connection its gateway abandoned must not
+/// take the room back from that gateway's newer connection). Gateways send
+/// `max(unix ms, last epoch + 1)` per connection attempt, persisted, so it rises on one machine even
+/// if the clock steps back, and roughly follows wall time across machines (the newer start wins).
 #[derive(Clone, PartialEq, Eq)]
 pub enum Hello {
-    Gateway { room: Room, secret: Secret },
-    Device { room: Room, token: Token },
+    Gateway {
+        room: Room,
+        secret: Secret,
+        epoch: u64,
+    },
+    Device {
+        room: Room,
+        token: Token,
+    },
 }
 
 const HELLO_GATEWAY: u8 = b'G';
 const HELLO_DEVICE: u8 = b'D';
-const HELLO_LEN: usize = 2 + ROOM_LEN + 32;
+const HELLO_DEVICE_LEN: usize = 2 + ROOM_LEN + 32;
+const HELLO_GATEWAY_LEN: usize = HELLO_DEVICE_LEN + 8;
 
 impl Hello {
     pub fn encode(&self) -> Vec<u8> {
-        let (tag, room, key) = match self {
-            Hello::Gateway { room, secret } => (HELLO_GATEWAY, room, secret),
-            Hello::Device { room, token } => (HELLO_DEVICE, room, token),
+        let (tag, room, key, epoch) = match self {
+            Hello::Gateway {
+                room,
+                secret,
+                epoch,
+            } => (HELLO_GATEWAY, room, secret, Some(*epoch)),
+            Hello::Device { room, token } => (HELLO_DEVICE, room, token, None),
         };
-        let mut out = Vec::with_capacity(HELLO_LEN);
+        let mut out = Vec::with_capacity(HELLO_GATEWAY_LEN);
         out.push(tag);
         out.push(VERSION);
         out.extend_from_slice(room);
         out.extend_from_slice(key);
+        if let Some(epoch) = epoch {
+            out.extend_from_slice(&epoch.to_be_bytes());
+        }
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Hello, WireError> {
         let (&tag, rest) = bytes.split_first().ok_or(WireError::Empty)?;
-        if tag != HELLO_GATEWAY && tag != HELLO_DEVICE {
-            return Err(WireError::UnknownType(tag));
-        }
+        let len = match tag {
+            HELLO_GATEWAY => HELLO_GATEWAY_LEN,
+            HELLO_DEVICE => HELLO_DEVICE_LEN,
+            _ => return Err(WireError::UnknownType(tag)),
+        };
         let (&version, rest) = rest
             .split_first()
             .ok_or(WireError::Malformed(bytes.len()))?;
         if version != VERSION {
             return Err(WireError::Version(version));
         }
-        if rest.len() != ROOM_LEN + 32 {
+        if bytes.len() != len {
             return Err(WireError::Malformed(bytes.len()));
         }
-        let (room, key) = rest.split_at(ROOM_LEN);
+        let (room, rest) = rest.split_at(ROOM_LEN);
+        let (key, epoch) = rest.split_at(32);
         let room: Room = room
             .try_into()
             .map_err(|_| WireError::Malformed(bytes.len()))?;
@@ -139,7 +163,14 @@ impl Hello {
             .try_into()
             .map_err(|_| WireError::Malformed(bytes.len()))?;
         Ok(if tag == HELLO_GATEWAY {
-            Hello::Gateway { room, secret: key }
+            let epoch: [u8; 8] = epoch
+                .try_into()
+                .map_err(|_| WireError::Malformed(bytes.len()))?;
+            Hello::Gateway {
+                room,
+                secret: key,
+                epoch: u64::from_be_bytes(epoch),
+            }
         } else {
             Hello::Device { room, token: key }
         })
@@ -383,13 +414,27 @@ mod tests {
         let g = Hello::Gateway {
             room: [1; ROOM_LEN],
             secret: [2; 32],
+            epoch: 0x0102_0304_0506_0708,
         };
+        assert_eq!(g.encode().len(), HELLO_GATEWAY_LEN);
+        assert_eq!(
+            g.encode()[HELLO_DEVICE_LEN..],
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            "epoch is big-endian after the secret"
+        );
         let d = Hello::Device {
             room: [3; ROOM_LEN],
             token: [4; 32],
         };
         assert_eq!(Hello::decode(&g.encode()), Ok(g.clone()));
-        assert_eq!(Hello::decode(&d.encode()), Ok(d));
+        assert_eq!(Hello::decode(&d.encode()), Ok(d.clone()));
+        // A device hello's length is not a gateway hello's, and the other way round.
+        let mut short_gateway = d.encode();
+        short_gateway[0] = b'G';
+        assert!(Hello::decode(&short_gateway).is_err());
+        let mut long_device = g.encode();
+        long_device[0] = b'D';
+        assert!(Hello::decode(&long_device).is_err());
 
         let mut v2 = g.encode();
         v2[1] = 2;

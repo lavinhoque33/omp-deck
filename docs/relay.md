@@ -80,6 +80,13 @@ Phones only connect over `wss://`, so the relay needs a certificate. Two ways:
 
 `GET /healthz` answers `200 ok` for load balancers and uptime checks.
 
+OmpDeck's gateway connects to the relay itself (rustls) and trusts the public web PKI roots it ships
+with (webpki-roots), not the operating system's certificate store: use a certificate from a public CA
+such as Let's Encrypt. Certificates from a private CA and HTTP(S) proxies between OmpDeck and the
+relay are not supported. Plain `ws://` relay URLs are accepted only for a loopback host
+(`localhost`, `127.0.0.0/8`, `[::1]`), because without TLS the room secret and device tokens would
+cross the network in clear text.
+
 ## Enrolling a room
 
 A room is one gateway (one desktop) and its paired devices. The relay only admits gateways of
@@ -98,9 +105,9 @@ podman exec omp-deck-relay omp-deck-relay enroll --state-dir /var/lib/omp-deck-r
 
 It prints the room id and the **room key** (`ompdeck-relay-v1:…`). The key is shown only once and is
 not stored on the relay (only `sha256(secret)` is); treat it like a password. It belongs in OmpDeck
-together with the relay URL (`wss://relay.example.com`): **Settings → Mobile access**. That settings
-page is not wired up yet (a later implementation step); until then keep the key somewhere safe. A lost
-key cannot be recovered: remove the room and enroll a new one.
+together with the relay URL (`wss://relay.example.com`): **Settings → General → Mobile access → Set relay…**
+(Mobile access must be on). The card then shows the link state; **Pair a device** opens a QR code for the
+phone. A lost key cannot be recovered: remove the room and enroll a new one.
 
 The running relay picks up new rooms at the next gateway hello and removed rooms within 30 s.
 

@@ -199,6 +199,9 @@ impl Engine {
                 "Another Google Drive job is running ({busy}); try again."
             )));
         }
+        if super::remote::is_mobile(op) {
+            return self.mobile_precheck(op);
+        }
         match op {
             Mutation::Launch(spec) if spec.argv.is_empty() => refused("there is nothing to run"),
             Mutation::Close {
@@ -806,6 +809,23 @@ impl Engine {
                 self.accepted(conn, id, &key);
                 self.mode_queue.push_back((key, mode));
                 self.pump_mode();
+            }
+            op @ (Mutation::RelaySet { .. }
+            | Mutation::RelayClear
+            | Mutation::RelayReconnect
+            | Mutation::PairingBegin
+            | Mutation::PairingCancel
+            | Mutation::PairingApprove { .. }
+            | Mutation::PairingDeny { .. }
+            | Mutation::DeviceRevoke { .. }
+            | Mutation::DeviceRename { .. }
+            | Mutation::DeviceSetPermissions { .. }) => {
+                self.accepted(conn, id, &key);
+                let outcome = match self.mobile_execute(op) {
+                    Ok(done) => Outcome::Done(Box::new(done)),
+                    Err(e) => Outcome::Failed(e.to_string()),
+                };
+                self.finish_journal(&key, outcome);
             }
             Mutation::DriveLoginBegin => {
                 self.accepted(conn, id, &key);

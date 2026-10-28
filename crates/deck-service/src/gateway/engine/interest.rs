@@ -338,7 +338,8 @@ impl Engine {
             | Topic::AppUpdate
             | Topic::Drive
             | Topic::Live(_)
-            | Topic::OmpUpdate => {
+            | Topic::OmpUpdate
+            | Topic::Mobile => {
                 return Err(GatewayError::Refused(format!(
                     "{topic:?} is not an interest-driven topic"
                 )));

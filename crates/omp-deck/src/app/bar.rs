@@ -151,6 +151,7 @@ impl App {
             || self.usage_open
             || self.sessions.open
             || self.palette.is_some()
+            || self.mobile_modal_open()
             || egui::Popup::is_any_open(&self.ctx)
         {
             let visible = self.visible_uids();

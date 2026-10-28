@@ -10,6 +10,8 @@
 //! - [`lifetime`]: modes, OS supervision (`omp-deck-gateway supervise`) and the maintenance barrier.
 //! - [`running`]: which backend sessions are alive and what they hold.
 //! - [`desktop`]: the OS notification adapter (delivery and activation, never classification).
+//! - [`remote`]: mobile access: the gateway key, relay settings, paired devices, the pairing
+//!   window and the relay link thread.
 //!
 //! Identity: one owner per user and base host namespace ([`GatewayId`]). The profile (settings
 //! file, sessions root) is part of the handshake, not of the identity: a client with another
@@ -25,6 +27,7 @@ pub mod jobs;
 pub mod journal;
 pub mod lifetime;
 pub mod protocol;
+pub mod remote;
 pub mod running;
 pub mod server;
 mod wire;

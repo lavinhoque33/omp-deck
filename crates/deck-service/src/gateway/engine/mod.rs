@@ -11,6 +11,7 @@
 mod interest;
 mod mutate;
 mod notify;
+mod remote;
 mod schedules;
 mod sessions;
 
@@ -105,6 +106,11 @@ pub(crate) enum Msg {
     Wake,
     /// A worker finished.
     Fin(Box<Fin>),
+    /// The relay link of generation `link` reports.
+    Relay {
+        link: u64,
+        event: super::remote::link::Event,
+    },
 }
 
 /// One frontend view operation.
@@ -319,6 +325,7 @@ struct Dirty {
     drive: bool,
     omp: bool,
     gateway: bool,
+    mobile: bool,
 }
 
 pub(crate) struct Engine {
@@ -368,6 +375,7 @@ pub(crate) struct Engine {
     notify: notify::Notify,
     sched: schedules::Schedules,
     interest: interest::Interest,
+    mobile: remote::Mobile,
 
     barrier: Option<MaintenanceMarker>,
     exit_requested: bool,
@@ -443,6 +451,7 @@ impl Engine {
         let notify = notify::Notify::new(wake.clone());
         let manifest = state_dir.join(sessions::MANIFEST);
         let omp_found = omp.is_some();
+        let mobile = remote::Mobile::open(&state_dir);
         let mut engine = Engine {
             profile,
             context: Arc::new(context),
@@ -484,6 +493,7 @@ impl Engine {
             notify,
             sched: schedules::Schedules::new(now, omp_found),
             interest: interest::Interest::default(),
+            mobile,
             barrier: None,
             exit_requested: false,
             stopping: false,
@@ -561,6 +571,7 @@ impl Engine {
             Msg::ViewGone { view } => self.on_view_gone(view),
             Msg::Wake => {}
             Msg::Fin(fin) => self.on_fin(*fin),
+            Msg::Relay { link, event } => self.on_relay(link, event),
         }
     }
 
@@ -572,6 +583,7 @@ impl Engine {
         self.step_notifications(now);
         self.step_schedules(now);
         self.step_lifetime(now);
+        self.step_mobile(now);
         self.publish();
     }
 
@@ -878,6 +890,7 @@ impl Engine {
                             .unwrap_or_else(|| marker(purpose)),
                     );
                 }
+                self.cancel_pairing();
                 self.dirty.gateway = true;
                 Ok(Answer::Maintenance(self.drain_state()))
             }
@@ -890,6 +903,7 @@ impl Engine {
                     );
                 }
                 self.exit_requested = true;
+                self.cancel_pairing();
                 self.dirty.gateway = true;
                 Ok(Answer::Done)
             }
@@ -1085,6 +1099,7 @@ impl Engine {
     /// keep running (their clients detach); the manifest lets the next owner re-attach them.
     fn shutdown(mut self) -> i32 {
         self.stopping = true;
+        self.stop_mobile();
         for (_, v) in self.views.drain() {
             v.side
                 .push(SideItem::Ended(super::protocol::ViewEnd::Shutdown));
@@ -1135,6 +1150,7 @@ impl Engine {
             self.dirty.gateway = true;
             self.registration_at = None;
         }
+        self.sync_mobile_link();
         self.changed(Topic::Settings);
     }
 
@@ -1191,6 +1207,9 @@ impl Engine {
         if std::mem::take(&mut self.dirty.omp) {
             self.changed(Topic::OmpUpdate);
         }
+        if std::mem::take(&mut self.dirty.mobile) {
+            self.changed(Topic::Mobile);
+        }
     }
 
     fn topic_value(
@@ -1232,6 +1251,7 @@ impl Engine {
             Topic::AppUpdate => TopicValue::AppUpdate(self.sched.app_view()),
             Topic::Drive => TopicValue::Drive(self.drive_view()),
             Topic::OmpUpdate => TopicValue::OmpUpdate(self.sched.omp_view()),
+            Topic::Mobile => TopicValue::Mobile(self.mobile_view()),
             Topic::Live(key) => self.live_value(key),
             Topic::Inventory
             | Topic::Changes(_)
@@ -1263,6 +1283,7 @@ fn always_on(t: &Topic) -> bool {
             | Topic::AppUpdate
             | Topic::Drive
             | Topic::OmpUpdate
+            | Topic::Mobile
     )
 }
 

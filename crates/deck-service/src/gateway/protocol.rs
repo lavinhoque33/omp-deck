@@ -291,6 +291,9 @@ pub enum Topic {
     Live(SessionKey),
     /// omp's version and update check.
     OmpUpdate,
+    /// Mobile access: the relay link, the gateway's key fingerprint, paired devices and the
+    /// open pairing window (never a secret).
+    Mobile,
 }
 
 impl Topic {
@@ -464,6 +467,7 @@ pub enum TopicValue {
         snapshot: Option<LiveSnapshot>,
     },
     OmpUpdate(OmpUpdateView),
+    Mobile(MobileView),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -660,6 +664,137 @@ pub struct DriveView {
     pub last_auto_unix_ms: Option<u64>,
 }
 
+/// [`Topic::Mobile`]: everything the desktop shows about mobile access. Never carries a secret
+/// (room secret, admission tokens, PSK or invite).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileView {
+    pub relay: Option<RelayView>,
+    pub link: RelayLink,
+    /// The gateway's static key fingerprint (empty when its key is unavailable).
+    pub fingerprint: String,
+    pub devices: Vec<DeviceView>,
+    pub pairing: Option<PairingView>,
+}
+
+/// The configured relay: its base URL and printable room id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayView {
+    pub url: String,
+    pub room_id: String,
+}
+
+/// State of the gateway's relay connection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelayLink {
+    /// Not running (mode `Off` or no relay configured).
+    Off,
+    /// Connecting (`attempt` counts from 1 since the last time it was up); `error` is why the
+    /// previous attempt ended.
+    Connecting {
+        attempt: u32,
+        error: Option<String>,
+    },
+    Up,
+    /// The relay (or this gateway's own state) refuses the link; retried slowly.
+    Refused {
+        reason: String,
+    },
+}
+
+/// A paired device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceView {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    /// The device's static key fingerprint.
+    pub fingerprint: String,
+    pub permissions: Permissions,
+    pub created_unix_ms: u64,
+    pub last_seen_unix_ms: u64,
+    /// An encrypted session with it is open now.
+    pub online: bool,
+}
+
+/// What a device may do beyond viewing (view is implied).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Permissions {
+    /// Prompts, runtime commands, terminal input, stop.
+    pub control: bool,
+    /// Copy/move/delete, git discard, worktree remove, restores, omp config.
+    pub manage: bool,
+}
+
+impl Default for Permissions {
+    /// The approval proposal: View + Control, Manage opt-in.
+    fn default() -> Permissions {
+        Permissions {
+            control: true,
+            manage: false,
+        }
+    }
+}
+
+/// The open pairing window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingView {
+    /// Identifies this window in [`Mutation::PairingApprove`]/[`Mutation::PairingDeny`] (not a
+    /// secret).
+    pub pairing: String,
+    /// When the current stage times out: the window while waiting, the approval wait once a
+    /// device asks.
+    pub expires_unix_ms: u64,
+    pub state: PairingState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairingState {
+    /// Waiting for a device to scan the invite.
+    Waiting,
+    /// A device proved the invite's PSK and waits for the desktop's decision; compare
+    /// `fingerprint` with the one the phone shows.
+    Approval {
+        name: String,
+        platform: String,
+        fingerprint: String,
+    },
+}
+
+/// Text that must never reach a log: serialized as a plain string, but `Debug`/`Display` print
+/// `<redacted>`, and the memory is wiped on drop.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretText(String);
+
+impl SecretText {
+    pub fn new(text: impl Into<String>) -> SecretText {
+        SecretText(text.into())
+    }
+
+    /// The secret itself (for the one place that needs it).
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for SecretText {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::fmt::Display for SecretText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// A mutation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Mutation {
@@ -839,6 +974,43 @@ pub enum Mutation {
     OmpUpdateCheck,
     /// Rescan the sessions and poll the backends now.
     RefreshSessions,
+    /// Configure the relay: its base URL (`wss://`, or `ws://` for a loopback host) and the
+    /// room key printed by `omp-deck-relay enroll`. Stored only in the gateway's state dir.
+    RelaySet {
+        url: String,
+        room_key: SecretText,
+    },
+    /// Forget the relay (stops the link and closes an open pairing window; devices stay).
+    RelayClear,
+    /// Reconnect to the configured relay now: after another gateway took the room over (the
+    /// link then stays down until asked), or to skip a long backoff. Needs a relay and mobile
+    /// access on.
+    RelayReconnect,
+    /// Open the pairing window; answers [`Done::PairingStarted`].
+    PairingBegin,
+    /// Close the open pairing window (and any device connection on it).
+    PairingCancel,
+    /// Let the device waiting in `pairing` in, with these permissions.
+    PairingApprove {
+        pairing: String,
+        permissions: Permissions,
+    },
+    /// Turn the device waiting in `pairing` away and close the window.
+    PairingDeny {
+        pairing: String,
+    },
+    /// Delete a paired device: its relay token is withdrawn and its live session closed.
+    DeviceRevoke {
+        id: String,
+    },
+    DeviceRename {
+        id: String,
+        name: String,
+    },
+    DeviceSetPermissions {
+        id: String,
+        permissions: Permissions,
+    },
 }
 
 impl Mutation {
@@ -899,6 +1071,16 @@ impl Mutation {
             Mutation::UsageRefresh { .. } => "usage-refresh",
             Mutation::OmpUpdateCheck => "omp-update-check",
             Mutation::RefreshSessions => "refresh-sessions",
+            Mutation::RelaySet { .. } => "relay-set",
+            Mutation::RelayClear => "relay-clear",
+            Mutation::RelayReconnect => "relay-reconnect",
+            Mutation::PairingBegin => "pairing-begin",
+            Mutation::PairingCancel => "pairing-cancel",
+            Mutation::PairingApprove { .. } => "pairing-approve",
+            Mutation::PairingDeny { .. } => "pairing-deny",
+            Mutation::DeviceRevoke { .. } => "device-revoke",
+            Mutation::DeviceRename { .. } => "device-rename",
+            Mutation::DeviceSetPermissions { .. } => "device-permissions",
         }
     }
 
@@ -937,6 +1119,10 @@ impl Mutation {
                 | Mutation::DriveLoginCancel(_)
                 | Mutation::DriveDiscardRestore(_)
                 | Mutation::ProjectDiscardRestore(_)
+                | Mutation::PairingCancel
+                | Mutation::PairingDeny { .. }
+                | Mutation::DeviceRevoke { .. }
+                | Mutation::RelayClear
         )
     }
 }
@@ -1053,6 +1239,15 @@ pub enum Done {
     Ctl(deck_core::ctl::CtlReply),
     /// [`Mutation::KillNames`]: the sessions that failed, with why.
     Killed(Vec<(String, String)>),
+    /// [`Mutation::PairingBegin`]: the window's id, the invite (`v1.…`) and the link the QR code
+    /// shows (`<pwa origin>/#pair=<invite>`). The only place the PSK leaves the gateway, and
+    /// only to the requesting client.
+    PairingStarted {
+        pairing: String,
+        invite: SecretText,
+        link: SecretText,
+        expires_unix_ms: u64,
+    },
 }
 
 /// What a Drive restore would change ([`deck_core::gdrive::RestorePlan`]).
@@ -1242,6 +1437,31 @@ pub fn decode_palette(b: &[u8]) -> Option<[[u8; 3]; 19]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_text_is_redacted_in_debug_but_serialized_plainly() {
+        let op = Mutation::RelaySet {
+            url: "wss://relay.example".into(),
+            room_key: SecretText::new("ompdeck-relay-v1:topsecret"),
+        };
+        let debug = format!("{op:?}");
+        assert!(!debug.contains("topsecret"), "{debug}");
+        assert!(debug.contains("<redacted>"));
+        let json = serde_json::to_string(&op).unwrap();
+        assert!(json.contains("\"ompdeck-relay-v1:topsecret\""), "{json}");
+        let back: Mutation = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(back, Mutation::RelaySet { room_key, .. } if room_key.expose() == "ompdeck-relay-v1:topsecret")
+        );
+        let done = Done::PairingStarted {
+            pairing: "p".into(),
+            invite: SecretText::new("v1.invite"),
+            link: SecretText::new("https://h/#pair=v1.invite"),
+            expires_unix_ms: 1,
+        };
+        assert!(!format!("{done:?}").contains("v1.invite"));
+        assert_eq!(format!("{}", SecretText::new("x")), "<redacted>");
+    }
 
     #[test]
     fn binary_frontend_payloads_round_trip() {

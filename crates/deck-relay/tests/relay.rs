@@ -66,12 +66,17 @@ impl Relay {
     }
 
     async fn gateway_with(&self, key: &RoomKey) -> Ws {
+        self.gateway_hello(key, 0).await
+    }
+
+    async fn gateway_hello(&self, key: &RoomKey, epoch: u64) -> Ws {
         let mut ws = self.ws(GATEWAY_PATH).await;
         send(
             &mut ws,
             Hello::Gateway {
                 room: key.room,
                 secret: key.secret,
+                epoch,
             }
             .encode(),
         )
@@ -81,7 +86,12 @@ impl Relay {
 
     /// An admitted gateway that registered `tokens`.
     async fn gateway(&self, tokens: &[Token]) -> Ws {
-        let mut ws = self.gateway_with(&self.key).await;
+        self.gateway_at(0, tokens).await
+    }
+
+    /// An admitted gateway with hello `epoch` that registered `tokens`.
+    async fn gateway_at(&self, epoch: u64, tokens: &[Token]) -> Ws {
+        let mut ws = self.gateway_hello(&self.key, epoch).await;
         assert_eq!(recv(&mut ws).await, HELLO_OK);
         set_tokens(&mut ws, tokens).await;
         ws
@@ -301,6 +311,7 @@ async fn bad_hellos_are_rejected() {
         Hello::Gateway {
             room: r.key.room,
             secret: r.key.secret,
+            epoch: 0,
         }
         .encode(),
     )
@@ -369,6 +380,50 @@ async fn a_new_gateway_replaces_the_old_and_a_leaving_gateway_closes_its_devices
     assert_eq!(closed(&mut d2).await, close::GATEWAY_OFFLINE);
     let mut d = r.device_hello(T1).await;
     assert_eq!(closed(&mut d).await, close::GATEWAY_OFFLINE);
+    r.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn gateway_epochs_fence_stale_hellos() {
+    let r = Relay::start(|_| {}).await;
+    // (a) A newer epoch replaces the older gateway.
+    let mut g1 = r.gateway_at(10, &[T1]).await;
+    let mut g2 = r.gateway_at(20, &[T1]).await;
+    assert_eq!(closed(&mut g1).await, close::REPLACED);
+
+    // (b) A stale hello after the newer gateway is admitted is refused; the current gateway keeps
+    // its devices and keeps serving.
+    let (mut d, p) = r.device(&mut g2, T1).await;
+    let mut stale = r.gateway_hello(&r.key, 15).await;
+    assert_eq!(closed(&mut stale).await, close::REPLACED);
+    send(&mut d, b"up".to_vec()).await;
+    assert_eq!(
+        FromRelay::decode(&recv(&mut g2).await).unwrap(),
+        FromRelay::Data {
+            peer: p,
+            payload: b"up"
+        }
+    );
+    send(&mut g2, data(p, b"down")).await;
+    assert_eq!(recv(&mut d).await, b"down");
+    let (mut d2, _) = r.device(&mut g2, T1).await;
+    quiet(&mut d2, Duration::from_millis(100)).await;
+
+    // (c) The same epoch again (the gateway retrying) replaces it.
+    let mut g3 = r.gateway_at(20, &[T1]).await;
+    assert_eq!(closed(&mut g2).await, close::REPLACED);
+    assert_eq!(closed(&mut d).await, close::GATEWAY_OFFLINE);
+    assert_eq!(closed(&mut d2).await, close::GATEWAY_OFFLINE);
+    let (mut d3, p3) = r.device(&mut g3, T1).await;
+    send(&mut g3, data(p3, b"hi")).await;
+    assert_eq!(recv(&mut d3).await, b"hi");
+
+    // Epochs are not kept once the gateway leaves (its devices are closed by then): any epoch is
+    // admitted again.
+    g3.close(None).await.unwrap();
+    assert_eq!(closed(&mut d3).await, close::GATEWAY_OFFLINE);
+    let mut g4 = r.gateway_hello(&r.key, 1).await;
+    assert_eq!(recv(&mut g4).await, HELLO_OK);
     r.stop().await.unwrap();
 }
 
@@ -466,6 +521,73 @@ async fn message_floods_are_rate_limited() {
     r2.stop().await.unwrap();
 }
 
+/// A device that keeps writing large messages after the relay closed it still receives the close
+/// frame: the relay drains its unread input instead of dropping the socket with data pending (which
+/// makes the OS answer with a reset that can destroy the close frame in flight, as on Windows).
+#[tokio::test]
+async fn a_device_that_keeps_flooding_still_gets_the_close_code() {
+    let r = Relay::start(|c| {
+        c.device_rate = RateLimit {
+            messages_per_sec: 1,
+            messages_burst: 3,
+            ..RateLimit::DEVICE
+        };
+    })
+    .await;
+    let mut g = r.gateway(&[T1]).await;
+    for (first, code) in [
+        (vec![1; 16 * 1024], close::RATE_LIMITED),
+        (vec![1; MAX_PAYLOAD + 1], close::TOO_LARGE),
+    ] {
+        let (d, p) = r.device(&mut g, T1).await;
+        let (mut tx, mut rx) = d.split();
+        // Writes until the client notices the close (at most 64 MiB): unread input is
+        // guaranteed to be pending at the relay when it closes.
+        let flood = tokio::spawn(async move {
+            tx.send(Message::Binary(first.into())).await?;
+            for _ in 0..4096 {
+                tx.send(Message::Binary(vec![2; 16 * 1024].into())).await?;
+            }
+            Ok::<_, tungstenite::Error>(())
+        });
+        let got = loop {
+            match timeout(WAIT, rx.next()).await.expect("close in time") {
+                Some(Ok(Message::Close(frame))) => break frame.map_or(0, |f| u16::from(f.code)),
+                Some(Ok(_)) => {}
+                other => panic!("expected a close frame, got {other:?}"),
+            }
+        };
+        assert_eq!(got, code);
+        // The close handshake completes cleanly: no reset on either half.
+        match timeout(WAIT, rx.next()).await.expect("end in time") {
+            None | Some(Err(tungstenite::Error::ConnectionClosed)) => {}
+            other => panic!("expected a clean end, got {other:?}"),
+        }
+        match flood.await.unwrap() {
+            Err(tungstenite::Error::Io(e)) => panic!("the flood ended with a reset: {e}"),
+            Err(_) => {}
+            Ok(()) => panic!("64 MiB flood was never closed"),
+        }
+        // Discarded input is not forwarded: at most the burst reached the gateway.
+        let mut forwarded = 0;
+        loop {
+            match FromRelay::decode(&recv(&mut g).await).unwrap() {
+                FromRelay::Data { peer, .. } => {
+                    assert_eq!(peer, p);
+                    forwarded += 1;
+                }
+                FromRelay::Closed { peer } => {
+                    assert_eq!(peer, p);
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(forwarded <= 3, "{forwarded} messages passed a burst of 3");
+    }
+    r.stop().await.unwrap();
+}
+
 /// A client with a tiny receive buffer (it fills up fast when the client stops reading).
 async fn small_buffer_ws(r: &Relay, path: &str) -> Ws {
     let socket = TcpSocket::new_v4().unwrap();
@@ -514,6 +636,7 @@ async fn a_slow_gateway_is_closed_and_its_devices_go_offline() {
         Hello::Gateway {
             room: r.key.room,
             secret: r.key.secret,
+            epoch: 0,
         }
         .encode(),
     )
@@ -674,6 +797,7 @@ async fn try_gateway(r: &Relay) -> Option<Ws> {
     let hello = Hello::Gateway {
         room: r.key.room,
         secret: r.key.secret,
+        epoch: 0,
     };
     ws.send(Message::Binary(hello.encode().into())).await.ok()?;
     Some(ws)
@@ -967,6 +1091,7 @@ async fn in_process_tls() {
         Hello::Gateway {
             room: r.key.room,
             secret: r.key.secret,
+            epoch: 0,
         }
         .encode(),
     )

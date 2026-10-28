@@ -1210,6 +1210,7 @@ const WATCH_TOPICS: &[Topic] = &[
     Topic::AppUpdate,
     Topic::Drive,
     Topic::OmpUpdate,
+    Topic::Mobile,
 ];
 
 /// `watch`: prints every event as one JSON line until the owner closes the link (0), or 3 when
@@ -1507,7 +1508,7 @@ struct FileLog {
 
 impl log::Log for FileLog {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= self.level
+        metadata.level() <= self.level.min(target_cap(metadata.target()))
     }
 
     fn log(&self, record: &log::Record) {
@@ -1579,8 +1580,29 @@ pub fn init_file_log(path: &Path) -> io::Result<()> {
 
 /// Logs of a foreground command to stderr (`warn` unless [`LOG_ENV`] says otherwise).
 pub fn init_stderr_log() {
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().filter_or(LOG_ENV, "warn"))
-        .try_init();
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().filter_or(LOG_ENV, "warn"));
+    for target in WIRE_TARGETS {
+        builder.filter_module(target, log::LevelFilter::Info);
+    }
+    let _ = builder.try_init();
+}
+
+/// Crates whose debug/trace output dumps raw wire bytes (the relay hello carries the room
+/// secret, device payloads the tokens): never below `info`, whatever [`LOG_ENV`] asks.
+const WIRE_TARGETS: [&str; 2] = ["tungstenite", "rustls"];
+
+fn target_cap(target: &str) -> log::LevelFilter {
+    let wire = WIRE_TARGETS.iter().any(|w| {
+        target
+            .strip_prefix(w)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    });
+    if wire {
+        log::LevelFilter::Info
+    } else {
+        log::LevelFilter::Trace
+    }
 }
 
 #[cfg(test)]
@@ -1905,5 +1927,15 @@ mod tests {
         // A failed supervisor restart is a real error.
         let err = resume_in(root, &new_gateway, None, |_, _| Err("no systemd".into())).unwrap_err();
         assert!(err.contains("no systemd"));
+    }
+
+    #[test]
+    fn wire_crates_never_log_below_info() {
+        use log::LevelFilter::{Info, Trace};
+        assert_eq!(target_cap("tungstenite"), Info);
+        assert_eq!(target_cap("tungstenite::protocol::frame"), Info);
+        assert_eq!(target_cap("rustls::client::hs"), Info);
+        assert_eq!(target_cap("rustlsish"), Trace);
+        assert_eq!(target_cap("deck_service::gateway::remote::link"), Trace);
     }
 }

@@ -161,6 +161,8 @@ struct Device {
 struct LiveRoom {
     room: Room,
     gateway: Option<Arc<Conn>>,
+    /// The hello epoch of `gateway` (meaningless without one; never kept after it leaves).
+    gateway_epoch: u64,
     tokens: HashSet<Hash>,
     devices: HashMap<PeerId, Device>,
     last_peer: PeerId,
@@ -175,6 +177,7 @@ impl LiveRoom {
         LiveRoom {
             room,
             gateway: None,
+            gateway_epoch: 0,
             tokens: HashSet::new(),
             devices: HashMap::new(),
             last_peer: 0,
@@ -305,7 +308,15 @@ impl Relay {
         }
     }
 
-    fn admit_gateway(&self, conn: &Arc<Conn>, room: Room, secret: &Secret) -> Result<(), u16> {
+    /// Admits a gateway, displacing the current one unless `epoch` is older than its epoch (a
+    /// stale hello is refused with `REPLACED` and the current gateway is left alone).
+    fn admit_gateway(
+        &self,
+        conn: &Arc<Conn>,
+        room: Room,
+        secret: &Secret,
+        epoch: u64,
+    ) -> Result<(), u16> {
         self.reload_rooms();
         let rooms = lock(&self.rooms);
         let stored = rooms.get(&room).ok_or(close::UNAUTHORIZED)?;
@@ -315,10 +326,23 @@ impl Relay {
         let mut live = lock(&self.live);
         let lr = live.entry(room).or_insert_with(|| LiveRoom::new(room));
         if let Some(old) = &lr.gateway {
+            if epoch < lr.gateway_epoch {
+                log::info!(
+                    "room {}: stale gateway hello #{} (epoch {epoch}) refused; gateway #{} \
+                     (epoch {}) stays ({})",
+                    lr.id(),
+                    conn.id,
+                    old.id,
+                    lr.gateway_epoch,
+                    close::REPLACED
+                );
+                return Err(close::REPLACED);
+            }
             log::info!(
-                "room {}: gateway #{} replaced by #{} ({})",
+                "room {}: gateway #{} (epoch {}) replaced by #{} (epoch {epoch}) ({})",
                 lr.id(),
                 old.id,
+                lr.gateway_epoch,
                 conn.id,
                 close::REPLACED
             );
@@ -327,6 +351,7 @@ impl Relay {
         // A fresh queue: the hello answer is always its first message.
         let _ = conn.push(Bytes::from_static(&HELLO_OK));
         lr.gateway = Some(conn.clone());
+        lr.gateway_epoch = epoch;
         Ok(())
     }
 
@@ -550,25 +575,32 @@ async fn run(relay: Arc<Relay>, role: Role, ip: IpAddr, socket: WebSocket, _slot
     let reg = OnceLock::new();
     let (mut sink, mut stream) = socket.split();
     {
-        let mut reader = pin!(read_loop(&relay, &conn, role, ip, &mut stream, &reg));
         let mut writer = pin!(write_loop(&relay.config, &conn, &mut sink));
-        tokio::select! {
-            () = &mut reader => {
-                if conn.close_code().is_some() {
-                    relay.gone(&conn, reg.get());
-                    // A violation or a relay-side close: let the writer send the close frame.
-                    let _ = timeout(close_timeout * 2, &mut writer).await;
-                } else {
-                    // The peer left; nothing more to send.
-                    conn.close(close::NORMAL);
-                    relay.gone(&conn, reg.get());
-                }
+        let reader_first = {
+            let mut reader = pin!(read_loop(&relay, &conn, role, ip, &mut stream, &reg));
+            tokio::select! {
+                () = &mut reader => true,
+                () = &mut writer => false,
             }
-            () = &mut writer => {
-                relay.gone(&conn, reg.get());
-                // Read until the peer answers the close frame, so it is not cut off by a reset.
-                let _ = timeout(close_timeout, &mut reader).await;
-            }
+        };
+        // The peer left (close frame, EOF or reset) without a relay-side close.
+        let peer_left = reader_first && conn.close_code().is_none();
+        if peer_left {
+            // Nothing more to send.
+            conn.close(close::NORMAL);
+        }
+        relay.gone(&conn, reg.get());
+        // A relay-side close: read until the peer answers it, so the socket is not dropped with
+        // unread input.
+        if reader_first && !peer_left {
+            // A violation: the writer sends the close frame while the input is drained.
+            let _ = timeout(close_timeout * 2, async {
+                tokio::join!(&mut writer, drain(&mut stream));
+            })
+            .await;
+        } else if !reader_first {
+            // The close frame is out (or the socket failed).
+            let _ = timeout(close_timeout, drain(&mut stream)).await;
         }
     }
     log::debug!(
@@ -580,6 +612,28 @@ async fn run(relay: Arc<Relay>, role: Role, ip: IpAddr, socket: WebSocket, _slot
     conns.remove(&id);
     if conns.is_empty() {
         relay.idle.notify_waiters();
+    }
+}
+
+/// Bytes [`drain`] discards before giving up on a closing peer.
+const MAX_DRAIN_BYTES: usize = 16 * 1024 * 1024;
+
+/// After a relay-side close: reads and discards (neither charged nor forwarded) until the peer's
+/// close reply or the end of the socket. Dropping a socket with unread input makes the OS send a
+/// reset instead of a FIN, which can destroy the close frame before the peer reads it (Windows
+/// discards the peer's receive buffer on a reset) and breaks the peer's close reply.
+async fn drain(stream: &mut SplitStream<WebSocket>) {
+    let mut left = MAX_DRAIN_BYTES;
+    while let Some(Ok(msg)) = stream.next().await {
+        let len = match msg {
+            Message::Close(_) => return,
+            Message::Binary(b) | Message::Ping(b) | Message::Pong(b) => b.len(),
+            Message::Text(t) => t.len(),
+        };
+        match left.checked_sub(len) {
+            Some(l) => left = l,
+            None => return,
+        }
     }
 }
 
@@ -662,19 +716,24 @@ async fn read_loop(
         return reject(close::RATE_LIMITED, "rate limit");
     }
     let registration = match (role, Hello::decode(&first)) {
-        (Role::Gateway, Ok(Hello::Gateway { room, secret })) => {
-            match relay.admit_gateway(conn, room, &secret) {
-                Ok(()) => {
-                    log::info!(
-                        "room {}: gateway #{} from {ip} connected",
-                        relay::room_id(&room),
-                        conn.id
-                    );
-                    Registration::Gateway(room)
-                }
-                Err(code) => return reject(code, &format!("room {}", relay::room_id(&room))),
+        (
+            Role::Gateway,
+            Ok(Hello::Gateway {
+                room,
+                secret,
+                epoch,
+            }),
+        ) => match relay.admit_gateway(conn, room, &secret, epoch) {
+            Ok(()) => {
+                log::info!(
+                    "room {}: gateway #{} from {ip} connected",
+                    relay::room_id(&room),
+                    conn.id
+                );
+                Registration::Gateway(room)
             }
-        }
+            Err(code) => return reject(code, &format!("room {}", relay::room_id(&room))),
+        },
         (Role::Device, Ok(Hello::Device { room, token })) => {
             match relay.admit_device(conn, room, &token) {
                 Ok(peer) => {

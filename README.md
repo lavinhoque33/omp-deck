@@ -413,7 +413,9 @@ registration, `install.ps1` drain/resume and gateway toasts are not covered by C
 The phone transport is being built ([slice 3 design](docs/notes/mobile-relay.md)): `deck-remote` holds the relay
 wire format and the Noise device protocol (pairing `IKpsk1`, reconnect `IK`), with a TypeScript port for the future
 PWA in `pwa/` (`bun test` checks it against shared vectors). `omp-deck-relay` (`crates/deck-relay`) is the
-self-hosted relay; see [docs/relay.md](docs/relay.md). OmpDeck does not connect to a relay yet.
+self-hosted relay; see [docs/relay.md](docs/relay.md). The gateway links to a configured relay, and Settings →
+General → Mobile access pairs phones (QR + fingerprint approval), lists, renames and revokes them; phones cannot
+run commands yet (next step) and the PWA itself is not built.
 
 Packaging scripts live in `packaging/`: `build-tarball.sh`, `appimage/build-appimage.sh`, `install.sh`,
 `install.ps1`, `windows/fetch-conpty.ps1`. CI runs on Linux and Windows; releases are built by GitHub Actions

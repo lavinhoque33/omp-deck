@@ -886,8 +886,11 @@ dependencies = [
 name = "deck-service"
 version = "0.18.3"
 dependencies = [
+ "base64 0.22.1",
  "deck-core",
  "deck-host",
+ "deck-relay",
+ "deck-remote",
  "deck-term",
  "dirs",
  "env_logger",
@@ -895,14 +898,19 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
  "log",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
+ "tungstenite",
+ "webpki-roots",
  "windows",
  "windows-sys 0.61.2",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]
@@ -2772,6 +2780,7 @@ dependencies = [
  "futures-lite",
  "log",
  "png",
+ "qrcodegen",
  "raw-window-handle",
  "rfd",
  "serde",
@@ -2782,6 +2791,7 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]
@@ -3094,6 +3104,12 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "qrcodegen"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4339fc7a1021c9c1621d87f5e3505f2805c8c105420ba2f2a4df86814590c142"
 
 [[package]]
 name = "quick-error"
@@ -4042,6 +4058,8 @@ dependencies = [
  "httparse",
  "log",
  "rand",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.21",
 ]

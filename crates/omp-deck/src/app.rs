@@ -73,6 +73,7 @@ mod bar;
 mod changes;
 mod ctl;
 mod drive;
+mod mobile;
 mod notifications;
 mod palette;
 mod project_sync;
@@ -472,6 +473,7 @@ pub struct App {
     drive: drive::DriveUi,
     /// Project sync (per-folder `.omp` + sessions backups).
     sync: project_sync::SyncUi,
+    mobile: mobile::MobileUi,
     /// Changes panel.
     changes: changes::ChangesUi,
     /// OmpDeck self-update.
@@ -659,6 +661,7 @@ impl App {
             shot,
             drive: drive::DriveUi::new(),
             sync: project_sync::SyncUi::new(),
+            mobile: mobile::MobileUi::new(),
             changes: changes::ChangesUi::default(),
             app_update: app_update::AppUpdateUi::new(),
             notify: notifications::NotifyUi::new(&cc.egui_ctx),
@@ -1963,6 +1966,7 @@ impl App {
             Some(Tab::Settings) => {
                 self.terminal_focused = false;
                 let gateway = self.gw.gateway();
+                let mobile = self.gw.mobile();
                 let backends = gateway
                     .as_deref()
                     .map_or(&[][..], |g| g.backends.as_slice());
@@ -2000,6 +2004,8 @@ impl App {
                         status: gateway.as_deref(),
                         link_up: self.gw.is_up(),
                         pending: self.mode_change.is_some(),
+                        view: mobile.as_deref(),
+                        now_ms: mobile::now_ms(),
                         error: self.mode_error.as_deref(),
                     },
                 };
@@ -2038,6 +2044,7 @@ impl App {
                         SettingsAction::Notify(a) => self.apply_notify_action(a),
                         SettingsAction::AppUpdate(a) => self.apply_app_update_setting(a),
                         SettingsAction::GatewayMode(mode) => self.set_gateway_mode(mode),
+                        SettingsAction::Mobile(a) => self.apply_mobile_action(a),
                     }
                 }
             }
@@ -2103,6 +2110,7 @@ impl App {
             || self.wt.dialog.is_some()
             || self.drive.modal_open()
             || self.sync.modal_open()
+            || self.mobile_modal_open()
             || self.sessions.open
             || self.palette.is_some()
     }
@@ -3180,6 +3188,7 @@ impl eframe::App for App {
             && self.wt.dialog.is_none()
             && self.dialog.is_none()
             && !self.sync.modal_open()
+            && !self.mobile_modal_open()
             && self.popup.is_none()
             && !self.dash.open
             && self.tree.is_none()
@@ -3212,6 +3221,7 @@ impl eframe::App for App {
         self.show_sessions(&ctx);
         self.show_drive_picker(&ctx);
         self.show_sync_dialogs(&ctx);
+        self.show_mobile_dialogs(&ctx);
         self.show_confirm(&ctx);
         self.show_palette(&ctx);
         self.show_action_dialog(&ctx);

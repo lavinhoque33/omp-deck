@@ -12,7 +12,7 @@ use deck_core::status::SessionStatus;
 
 use crate::controller::SessionTarget;
 use crate::gateway::protocol::{
-    AppUpdateView, ControllerInfo, DriveView, GatewayStatus, InboxView, OmpUpdateView,
+    AppUpdateView, ControllerInfo, DriveView, GatewayStatus, InboxView, MobileView, OmpUpdateView,
     SessionsView, Topic, TopicValue, UsageView,
 };
 use crate::gateway::running::RunningSnapshot;
@@ -35,6 +35,7 @@ pub const ALWAYS_ON: &[Topic] = &[
     Topic::AppUpdate,
     Topic::Drive,
     Topic::OmpUpdate,
+    Topic::Mobile,
 ];
 
 /// The latest value of one topic and its client-side revision.
@@ -82,6 +83,8 @@ pub struct StateCache {
     pub app_update: Slot<AppUpdateView>,
     pub drive: Slot<DriveView>,
     pub omp_update: Slot<OmpUpdateView>,
+    /// [`Topic::Mobile`]: relay link, devices, pairing window.
+    pub mobile: Slot<MobileView>,
     /// [`Topic::Fleet`] (interest-driven).
     pub fleet: Slot<Option<FleetSnapshot>>,
     /// [`Topic::Agents`] (interest-driven).
@@ -109,6 +112,7 @@ impl StateCache {
             Topic::AppUpdate => arc(&self.app_update).map(TopicValue::AppUpdate),
             Topic::Drive => arc(&self.drive).map(TopicValue::Drive),
             Topic::OmpUpdate => arc(&self.omp_update).map(TopicValue::OmpUpdate),
+            Topic::Mobile => arc(&self.mobile).map(TopicValue::Mobile),
             Topic::Fleet => arc(&self.fleet).map(TopicValue::Fleet),
             Topic::Agents => arc(&self.agents).map(TopicValue::Agents),
             other => lock(&self.other).get(other).map(|(_, v)| v.clone()),
@@ -129,6 +133,7 @@ impl StateCache {
             Topic::AppUpdate => self.app_update.revision(),
             Topic::Drive => self.drive.revision(),
             Topic::OmpUpdate => self.omp_update.revision(),
+            Topic::Mobile => self.mobile.revision(),
             Topic::Fleet => self.fleet.revision(),
             Topic::Agents => self.agents.revision(),
             other => lock(&self.other).get(other).map_or(0, |(r, _)| *r),
@@ -154,6 +159,7 @@ impl StateCache {
             TopicValue::AppUpdate(v) => self.app_update.set(rev, v),
             TopicValue::Drive(v) => self.drive.set(rev, v),
             TopicValue::OmpUpdate(v) => self.omp_update.set(rev, v),
+            TopicValue::Mobile(v) => self.mobile.set(rev, v),
             TopicValue::Fleet(v) => self.fleet.set(rev, v),
             TopicValue::Agents(v) => self.agents.set(rev, v),
             other => {

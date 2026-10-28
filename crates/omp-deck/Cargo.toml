@@ -24,6 +24,9 @@ anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 egui_commonmark.workspace = true
+# Mobile access: the pairing QR code is painted from its module grid; the typed room key is wiped after use.
+qrcodegen.workspace = true
+zeroize.workspace = true
 # Hidden `--screenshot` flag encodes the egui screenshot; png 0.18 is already in the lockfile via eframe.
 png = "0.18"
 # Self-update downloads into a temporary folder that is removed afterwards.

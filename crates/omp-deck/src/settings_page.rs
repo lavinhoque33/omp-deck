@@ -10,12 +10,13 @@ use crate::icons::{
     ICON_SEARCH, ICON_SEARCH_X, ICON_SETTINGS_2, ICON_SLIDERS_HORIZONTAL, ICON_SPARKLES, ICON_SUN,
     ICON_TERMINAL, ICON_TRIANGLE_ALERT, ICON_WRENCH,
 };
+use crate::mobile_view::{self, MobileAction, MobileInput};
 use deck_core::config::{
     Density, GatewayMode, MAX_UI_SCALE, MIN_UI_SCALE, Theme, UiFont, UiFontKind, UiStyle,
 };
 use deck_core::mux::BackendChoice;
 use deck_core::omp::{Setting, SettingsCatalog};
-use deck_service::gateway::protocol::{Effective, GatewayStatus, Supervision};
+use deck_service::gateway::protocol::{Effective, GatewayStatus, MobileView, Supervision};
 use egui::{
     Align2, Color32, CursorIcon, FontId, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind,
     Ui, Vec2, pos2, vec2,
@@ -272,6 +273,8 @@ pub enum SettingsAction {
     Notify(NotifyAction),
     /// The gateway lifetime mode (Settings → Mobile access).
     GatewayMode(GatewayMode),
+    /// The Mobile access card's relay, devices and pairing.
+    Mobile(MobileAction),
     AppUpdate(crate::app_update::SettingsAction),
 }
 
@@ -1120,6 +1123,10 @@ pub struct MobileCard<'a> {
     pub pending: bool,
     /// Why the last change failed.
     pub error: Option<&'a str>,
+    /// Relay, link, devices and open pairing (`None` until the gateway reported).
+    pub view: Option<&'a MobileView>,
+    /// Now, unix milliseconds (relative "last seen" times).
+    pub now_ms: u64,
 }
 
 fn requested_text(mode: GatewayMode) -> &'static str {
@@ -1193,6 +1200,7 @@ fn mobile_card(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Setting
     let pal = Palette::of_ui(ui);
     let m = &input.mobile;
     card(ui, "Mobile access", |ui| {
+        let mut mobile_actions = Vec::new();
         let mode = m.status.map_or(GatewayMode::Off, |s| s.mode);
         let editable = m.link_up && m.status.is_some() && !m.pending;
         let note = if m.pending {
@@ -1256,6 +1264,17 @@ fn mobile_card(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Setting
         if let Some(e) = m.error {
             ui.add(egui::Label::new(RichText::new(e).color(pal.warn)).wrap());
         }
+        mobile_view::show(
+            ui,
+            &MobileInput {
+                view: m.view,
+                mode_off: mode == GatewayMode::Off,
+                gateway_up: m.link_up,
+                now_ms: m.now_ms,
+            },
+            &mut mobile_actions,
+        );
+        actions.extend(mobile_actions.into_iter().map(SettingsAction::Mobile));
     });
 }
 
