@@ -705,7 +705,9 @@ fn pairing_reconnect_and_revocation_over_a_real_relay() {
     // -- an owner restart keeps the device and its last timestamp --
     let pid = sb.owner_pid().expect("owner pid");
     let epoch_before = sb.relay_epoch().expect("the hello epoch is persisted");
-    kill_process(pid, false);
+    // Graceful on Unix (SIGTERM); forced on Windows, where `taskkill` without /F only posts
+    // WM_CLOSE and the windowless gateway never receives it.
+    kill_process(pid, cfg!(windows));
     wait_for("a new owner", Duration::from_secs(60), || {
         sb.owner_pid().filter(|p| *p != pid)
     });

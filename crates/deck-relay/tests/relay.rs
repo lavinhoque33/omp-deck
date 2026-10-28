@@ -89,12 +89,32 @@ impl Relay {
         self.gateway_at(0, tokens).await
     }
 
-    /// An admitted gateway with hello `epoch` that registered `tokens`.
+    /// An admitted gateway with hello `epoch` that registered `tokens` (and the relay applied them).
     async fn gateway_at(&self, epoch: u64, tokens: &[Token]) -> Ws {
         let mut ws = self.gateway_hello(&self.key, epoch).await;
         assert_eq!(recv(&mut ws).await, HELLO_OK);
         set_tokens(&mut ws, tokens).await;
+        self.tokens_applied().await;
         ws
+    }
+
+    /// Waits until the room's gateway registered a token set: before that a device hello is
+    /// refused `GATEWAY_OFFLINE`, after it a probe with an unknown token gets `UNAUTHORIZED`.
+    async fn tokens_applied(&self) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let mut probe = self.device_hello(PROBE).await;
+            let code = closed(&mut probe).await;
+            finish(probe).await;
+            match code {
+                close::UNAUTHORIZED => return,
+                close::GATEWAY_OFFLINE => {
+                    assert!(Instant::now() < deadline, "token set never applied");
+                    sleep(Duration::from_millis(10)).await;
+                }
+                other => panic!("unexpected probe close {other}"),
+            }
+        }
     }
 
     async fn device_hello(&self, token: Token) -> Ws {
@@ -143,6 +163,17 @@ async fn send<S: AsyncRead + AsyncWrite + Unpin>(ws: &mut WebSocketStream<S>, by
 async fn set_tokens(gateway: &mut Ws, tokens: &[Token]) {
     let hashes: Vec<Hash> = tokens.iter().map(relay::hash).collect();
     send(gateway, ToRelay::Tokens(hashes).encode().unwrap()).await;
+}
+
+/// Never in a token set: probes whether a gateway's set is applied.
+const PROBE: Token = [0xee; 32];
+
+/// After the close frame: answers it (tungstenite sends the reply on the next read) and waits
+/// until the relay dropped the socket, so its connection slot is free again.
+async fn finish(mut ws: Ws) {
+    let _ = timeout(WAIT, async { while let Some(Ok(_)) = ws.next().await {} }).await;
+    let mut buf = [0u8; 1];
+    let _ = timeout(WAIT, ws.get_mut().read(&mut buf)).await;
 }
 
 /// The next binary message (pings are skipped); panics on close.
@@ -358,6 +389,35 @@ async fn admission_follows_the_gateway_token_set() {
             payload: b"still here"
         }
     );
+    let mut d = r.device_hello(T1).await;
+    assert_eq!(closed(&mut d).await, close::UNAUTHORIZED);
+    r.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn devices_wait_for_the_gateway_token_set() {
+    let r = Relay::start(|_| {}).await;
+    // Between the gateway hello and its first token set: retryable, not "revoked".
+    let mut g = r.gateway_hello(&r.key, 0).await;
+    assert_eq!(recv(&mut g).await, HELLO_OK);
+    let mut d = r.device_hello(T1).await;
+    assert_eq!(closed(&mut d).await, close::GATEWAY_OFFLINE);
+    // After it: admitted or unauthorized as usual.
+    set_tokens(&mut g, &[T1]).await;
+    r.tokens_applied().await;
+    let (_d1, _) = r.device(&mut g, T1).await;
+    let mut d = r.device_hello(T2).await;
+    assert_eq!(closed(&mut d).await, close::UNAUTHORIZED);
+
+    // A replacing gateway starts without a token set again.
+    let mut g2 = r.gateway_hello(&r.key, 0).await;
+    assert_eq!(recv(&mut g2).await, HELLO_OK);
+    assert_eq!(closed(&mut g).await, close::REPLACED);
+    let mut d = r.device_hello(T1).await;
+    assert_eq!(closed(&mut d).await, close::GATEWAY_OFFLINE);
+    set_tokens(&mut g2, &[T2]).await;
+    r.tokens_applied().await;
+    let (_d2, _) = r.device(&mut g2, T2).await;
     let mut d = r.device_hello(T1).await;
     assert_eq!(closed(&mut d).await, close::UNAUTHORIZED);
     r.stop().await.unwrap();

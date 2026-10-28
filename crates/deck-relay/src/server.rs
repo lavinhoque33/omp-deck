@@ -163,7 +163,9 @@ struct LiveRoom {
     gateway: Option<Arc<Conn>>,
     /// The hello epoch of `gateway` (meaningless without one; never kept after it leaves).
     gateway_epoch: u64,
-    tokens: HashSet<Hash>,
+    /// The admission token hashes of `gateway`; `None` until its first `Tokens` (devices are then
+    /// refused `GATEWAY_OFFLINE`, retryable, not `UNAUTHORIZED`).
+    tokens: Option<HashSet<Hash>>,
     devices: HashMap<PeerId, Device>,
     last_peer: PeerId,
 }
@@ -178,7 +180,7 @@ impl LiveRoom {
             room,
             gateway: None,
             gateway_epoch: 0,
-            tokens: HashSet::new(),
+            tokens: None,
             devices: HashMap::new(),
             last_peer: 0,
         }
@@ -230,7 +232,7 @@ impl LiveRoom {
             );
             d.conn.close(devices_code);
         }
-        self.tokens.clear();
+        self.tokens = None;
     }
 
     fn drop_gateway(&mut self, code: Option<u16>) {
@@ -352,6 +354,8 @@ impl Relay {
         let _ = conn.push(Bytes::from_static(&HELLO_OK));
         lr.gateway = Some(conn.clone());
         lr.gateway_epoch = epoch;
+        // Devices wait (GATEWAY_OFFLINE) until this gateway registers its token set.
+        lr.tokens = None;
         Ok(())
     }
 
@@ -362,7 +366,8 @@ impl Relay {
             .get_mut(&room)
             .filter(|lr| lr.gateway.is_some())
             .ok_or(close::GATEWAY_OFFLINE)?;
-        if !lr.tokens.contains(&token) {
+        let tokens = lr.tokens.as_ref().ok_or(close::GATEWAY_OFFLINE)?;
+        if !tokens.contains(&token) {
             return Err(close::UNAUTHORIZED);
         }
         if lr.devices.len() >= self.config.max_devices_per_room {
@@ -417,17 +422,17 @@ impl Relay {
                 }
             }
             ToRelay::Tokens(set) => {
-                lr.tokens = set.into_iter().collect();
+                let tokens = lr.tokens.insert(set.into_iter().collect());
                 let revoked: Vec<PeerId> = lr
                     .devices
                     .iter()
-                    .filter(|(_, d)| !lr.tokens.contains(&d.token))
+                    .filter(|(_, d)| !tokens.contains(&d.token))
                     .map(|(peer, _)| *peer)
                     .collect();
+                let count = tokens.len();
                 log::debug!(
-                    "room {}: {} admission token(s), {} device(s) revoked",
+                    "room {}: {count} admission token(s), {} device(s) revoked",
                     lr.id(),
-                    lr.tokens.len(),
                     revoked.len()
                 );
                 for peer in revoked {

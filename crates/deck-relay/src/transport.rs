@@ -119,8 +119,10 @@ impl Drop for Slot {
 /// the request deadline passes: slow or never-sent request headers and idle keep-alive both end
 /// there, which hyper on its own (no timer configured by `axum::serve`) would wait out forever.
 pub(crate) struct Guarded<S> {
-    io: S,
+    /// Declared first so it is dropped first: once the peer sees the socket close, the slot is
+    /// already free.
     _slot: Slot,
+    io: S,
     deadline: Option<Pin<Box<Sleep>>>,
     upgraded: Arc<AtomicBool>,
 }

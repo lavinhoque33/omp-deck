@@ -89,7 +89,10 @@ Code contract: `deck_remote::relay` (`crates/deck-remote/src/relay.rs`, orchestr
 - **Admission tokens** live only in relay memory: the gateway sends its full set (`ToRelay::Tokens`, SHA-256 hashes) right
   after every hello, so a relay restart needs no database. Removing a hash closes that device (`UNAUTHORIZED`). Each
   paired device gets its own random 256-bit relay token inside the encrypted pairing reply; an open pairing window
-  registers the invite's one-use pairing token.
+  registers the invite's one-use pairing token. Until a newly admitted gateway's first `Tokens` arrives, device hellos
+  are refused `GATEWAY_OFFLINE` (retryable), never `UNAUTHORIZED`, so a gateway reconnect cannot look like a
+  revocation. The relay does not acknowledge `Tokens`: a phone that scans a fresh invite within milliseconds of the
+  window opening may get `UNAUTHORIZED` once; the PWA retries a pairing admission briefly before reporting it.
 - **Pairing-token handover** (R3 sequencing; the relay has no token promotion): the invite's token stays in the set while
   its pairing connection is open, including the desktop approval wait. The gateway serves one pairing connection per
   invite (a second peer with the same token is closed `UNAUTHORIZED`). After message 2 the device closes and reconnects
