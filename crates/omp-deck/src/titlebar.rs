@@ -974,6 +974,72 @@ mod tests {
         assert_eq!(window_title(Some(""), Some("work")), "OmpDeck — work");
     }
 
+    /// A tab on a connection that stays silent until the terminal is dropped (no process, no
+    /// PTY).
+    fn test_tab(ctx: &Context, uid: u64, title: &str) -> tabs::Tab {
+        use deck_service::controller::{ServiceEpoch, SessionKey, SessionTarget};
+        use deck_term::{Remote, RemoteEvent, RemoteRx, RemoteTx, TermOptions, Terminal};
+        use std::io;
+        use std::sync::mpsc;
+
+        struct Silent(mpsc::Sender<()>, mpsc::Receiver<()>);
+        struct SilentRx(mpsc::Receiver<()>);
+        struct SilentTx(#[allow(dead_code)] mpsc::Sender<()>);
+        impl Remote for Silent {
+            fn split(self: Box<Self>) -> (Box<dyn RemoteRx>, Box<dyn RemoteTx>) {
+                (Box::new(SilentRx(self.1)), Box::new(SilentTx(self.0)))
+            }
+        }
+        impl RemoteRx for SilentRx {
+            fn recv(&mut self) -> io::Result<RemoteEvent> {
+                // The sender lives in the tx half: this unblocks when the terminal is dropped.
+                let _ = self.0.recv();
+                Ok(RemoteEvent::Closed)
+            }
+        }
+        impl RemoteTx for SilentTx {
+            fn input(&self, _: &[u8]) -> io::Result<()> {
+                Ok(())
+            }
+            fn resize(&self, _: u16, _: u16, _: u16, _: u16) -> io::Result<()> {
+                Ok(())
+            }
+            fn palette(&self, _: [[u8; 3]; 19]) -> io::Result<()> {
+                Ok(())
+            }
+            fn kill(&self) -> io::Result<()> {
+                Ok(())
+            }
+            fn detach(&self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let term = Terminal::connect(
+            Box::new(Silent(tx, rx)),
+            TermOptions::default(),
+            ctx.clone(),
+        );
+        let target = SessionTarget {
+            epoch: ServiceEpoch([0; 16]),
+            key: SessionKey::tmux("test", title),
+            generation: 1,
+        };
+        tabs::Tab::new(
+            term,
+            target,
+            uid,
+            tabs::TabLaunch {
+                mux_name: None,
+                cwd: std::path::PathBuf::from("/p"),
+                session_path: None,
+                title: title.to_owned(),
+                role: tabs::TabRole::Session,
+            },
+        )
+    }
+
     /// Every text and glyph of the tab row (logo, tab icons and titles, ✕, the update badge, the
     /// bell, settings and menu buttons) is vertically centred on the row, in every density.
     fn assert_row_centered(style: deck_core::config::UiStyle, density: deck_core::config::Density) {
@@ -986,7 +1052,7 @@ mod tests {
         crate::ui_fonts::finalize(&ctx);
         let font = deck_core::config::UiFont::Auto;
         let compact = density == deck_core::config::Density::Compact;
-        let tabs = [crate::tabs::Tab::Settings, crate::tabs::Tab::Settings];
+        let tabs = [test_tab(&ctx, 1, "alpha"), test_tab(&ctx, 2, "beta")];
         let labels = HashMap::new();
         let busy = HashSet::new();
         let finishing = HashMap::new();

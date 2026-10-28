@@ -67,13 +67,12 @@ fn collect_sources<'a>(
         .map_or(0, |d| d.as_secs() / NOW_BUCKET_SECS * NOW_BUCKET_SECS);
     let bucket_time = SystemTime::UNIX_EPOCH + Duration::from_secs(now_bucket);
     let mut out = Vec::new();
-    for (i, tab) in tabs.iter().enumerate() {
-        let Tab::Terminal(t) = tab else { continue };
+    for (i, t) in tabs.iter().enumerate() {
         if t.role != TabRole::Session {
             continue;
         }
         let entry = t.session_path().and_then(|p| index.entries.get(p));
-        let title = tab.label(labels);
+        let title = t.label(labels);
         out.push(Src {
             card: CardSrc {
                 key: CardKey::Tab(t.uid),
@@ -85,7 +84,7 @@ fn collect_sources<'a>(
                 cwd: &t.cwd,
                 session: t.session_path(),
                 id: entry.map_or_else(|| t.session_path().map_or("", file_stem), |e| e.id.as_str()),
-                status: Status::of_tab(tab.status(false)),
+                status: Status::of_tab(t.status(false)),
                 // A session without a file yet was just started: it is the most recent thing.
                 activity_at: entry.map(|e| e.modified).or(Some(bucket_time)),
                 active: i == active,
@@ -95,7 +94,7 @@ fn collect_sources<'a>(
     }
     let Some(running) = running else { return out };
     let backs_a_tab = |name: &str, file: Option<&Path>| {
-        tabs.iter().filter_map(Tab::term).any(|t| {
+        tabs.iter().any(|t| {
             t.role == TabRole::Session
                 && (t.mux_name.as_deref() == Some(name)
                     || file.is_some_and(|f| t.session_path() == Some(f)))
@@ -154,7 +153,7 @@ impl App {
     pub(super) fn active_session_tab(&self) -> bool {
         matches!(
             self.tabs.get(self.active),
-            Some(Tab::Terminal(t)) if t.role == TabRole::Session
+            Some(t) if t.role == TabRole::Session
         )
     }
 
@@ -163,7 +162,7 @@ impl App {
     pub(super) fn drive_agents(&mut self) {
         self.drive_ctl();
         let want = match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) if t.role == TabRole::Session => {
+            Some(t) if t.role == TabRole::Session => {
                 t.session_path_owned().map(|session| AgentsTarget {
                     session,
                     owner_alive: !t.terminal().is_exited(),
@@ -265,18 +264,17 @@ impl App {
         self.models.generation.hash(&mut h);
         live_ctx.hash(&mut h);
         self.active.hash(&mut h);
-        for (i, tab) in self.tabs.iter().enumerate() {
-            let Tab::Terminal(t) = tab else { continue };
+        for (i, t) in self.tabs.iter().enumerate() {
             if t.role != TabRole::Session {
                 continue;
             }
             i.hash(&mut h);
             t.uid.hash(&mut h);
-            tab.label(&self.labels).hash(&mut h);
+            t.label(&self.labels).hash(&mut h);
             t.cwd.hash(&mut h);
             t.session_path().hash(&mut h);
             t.mux_name.hash(&mut h);
-            Status::of_tab(tab.status(false)).hash(&mut h);
+            Status::of_tab(t.status(false)).hash(&mut h);
             t.terminal().is_exited().hash(&mut h);
         }
         h.finish()
@@ -320,13 +318,13 @@ impl App {
         }
         let focus = focus_active
             .then(|| match self.tabs.get(self.active) {
-                Some(Tab::Terminal(t)) if t.role == TabRole::Session => Some(CardKey::Tab(t.uid)),
+                Some(t) if t.role == TabRole::Session => Some(CardKey::Tab(t.uid)),
                 _ => None,
             })
             .flatten();
         self.dash.show_with(focus);
         // The terminals leave the screen: tell omp its focus is gone.
-        for t in self.tabs.iter_mut().filter_map(Tab::term_mut) {
+        for t in self.tabs.iter_mut() {
             t.terminal_mut().set_focused(false);
         }
         self.ctx.request_repaint();
@@ -348,7 +346,7 @@ impl App {
             self.close_popup_topic();
         }
         // The active terminal is on screen again: it has been seen.
-        if let Some(t) = self.tabs.get_mut(self.active).and_then(Tab::term_mut) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
             t.bell = false;
         }
         self.focus_pending = true;
@@ -477,10 +475,10 @@ impl App {
     /// Subagent clicked in the dashboard: activate the session's tab when there is one (live
     /// control follows the active tab), keep the dashboard, show the popup.
     fn open_dash_agent(&mut self, session: &Path, id: &str) {
-        let tab = self.tabs.iter().position(|t| {
-            t.term().is_some_and(|t| t.role == TabRole::Session)
-                && t.session_path() == Some(session)
-        });
+        let tab = self
+            .tabs
+            .iter()
+            .position(|t| t.role == TabRole::Session && t.session_path() == Some(session));
         if let Some(i) = tab
             && i != self.active
         {
@@ -594,7 +592,7 @@ impl App {
     }
 
     /// Open a file with the desktop's default handler off the UI thread.
-    fn open_path(&mut self, path: PathBuf) {
+    pub(super) fn open_path(&mut self, path: PathBuf) {
         self.gw.native(
             move || {
                 if !path.is_absolute() || !path.is_file() {

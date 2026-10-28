@@ -110,7 +110,7 @@ impl App {
                 self.run_command(&id);
             }
             Target::Tab(uid) => {
-                if let Some(i) = self.tabs.iter().position(|t| t.uid() == Some(uid)) {
+                if let Some(i) = self.tabs.iter().position(|t| t.uid == uid) {
                     self.activate(i);
                 }
             }
@@ -142,31 +142,20 @@ impl App {
     fn switcher_items(&self) -> Vec<Item> {
         let running = self.gw.running();
         let mut items = Vec::new();
-        for tab in &self.tabs {
-            match tab {
-                Tab::Settings => items.push(Item {
-                    target: Target::Command("app.settings".to_owned()),
-                    label: "Settings".to_owned(),
-                    detail: "open tab".to_owned(),
-                    hint: None,
-                    icon: ICON_SETTINGS,
-                    disabled: None,
-                    running: false,
-                }),
-                Tab::Terminal(t) => items.push(Item {
-                    target: Target::Tab(t.uid),
-                    label: tab.label(&self.labels).to_owned(),
-                    detail: abbreviate_home(&t.cwd),
-                    hint: None,
-                    icon: if t.role == TabRole::Session {
-                        ICON_TERMINAL
-                    } else {
-                        ICON_DOWNLOAD
-                    },
-                    disabled: None,
-                    running: !t.terminal().is_exited(),
-                }),
-            }
+        for t in &self.tabs {
+            items.push(Item {
+                target: Target::Tab(t.uid),
+                label: t.label(&self.labels).to_owned(),
+                detail: abbreviate_home(&t.cwd),
+                hint: None,
+                icon: if t.role == TabRole::Session {
+                    ICON_TERMINAL
+                } else {
+                    ICON_DOWNLOAD
+                },
+                disabled: None,
+                running: !t.terminal().is_exited(),
+            });
         }
         let Some(groups) = self.groups() else {
             return items;
@@ -210,7 +199,7 @@ impl App {
     /// The linked worktree of the active tab's folder: from the sidebar groups, else from the git
     /// status snapshot (a fresh worktree session has no session file, hence no group yet).
     fn active_worktree(&self) -> Option<deck_core::worktree::Worktree> {
-        let term = self.tabs.get(self.active).and_then(Tab::term);
+        let term = self.tabs.get(self.active);
         let cwd = term.map(|t| t.cwd.clone()).or_else(|| self.scope.clone())?;
         let from_group = self.groups().and_then(|gs| {
             gs.iter()
@@ -235,7 +224,6 @@ impl App {
         let cwd = self
             .tabs
             .get(self.active)
-            .and_then(Tab::term)
             .map(|t| t.cwd.clone())
             .or_else(|| self.scope.clone())?;
         self.groups()
@@ -250,7 +238,7 @@ impl App {
     // ------------------------------------------------------------ commands
 
     fn palette_commands(&self) -> Vec<Item> {
-        let term = self.tabs.get(self.active).and_then(Tab::term);
+        let term = self.tabs.get(self.active);
         let session_tab = term.filter(|t| t.role == TabRole::Session);
         let actx: Option<ActionCtx> = session_tab.map(|t| self.action_ctx(t));
         let omp = self.omp_found();
@@ -784,6 +772,7 @@ impl App {
             );
         }
         add("settings.sync", "Settings: Sync", None, ICON_CLOUD, None);
+        add("settings.agents", "Settings: Agents", None, ICON_BOT, None);
         for (id, label) in self.settings.omp_pages() {
             add(
                 &format!("settings.omp.{id}"),
@@ -1127,7 +1116,6 @@ impl App {
         let cwd = self
             .tabs
             .get(active)
-            .and_then(Tab::term)
             .map(|t| t.cwd.clone())
             .or_else(|| self.scope.clone());
         let entry = self.active_session().and_then(|p| self.find_entry(&p));
@@ -1293,6 +1281,10 @@ impl App {
             "settings.sync" => {
                 self.open_settings();
                 self.settings.show_sync();
+            }
+            "settings.agents" => {
+                self.open_settings();
+                self.settings.show_agents();
             }
             id if id.starts_with("settings.ompdeck.") => {
                 if let Some(page) = OmpDeckPage::ALL

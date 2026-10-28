@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod activate;
+mod agent_config;
 mod agent_ctl;
 mod agent_hub;
 mod agent_model;

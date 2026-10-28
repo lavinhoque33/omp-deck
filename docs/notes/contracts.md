@@ -412,8 +412,8 @@ pub fn parse_settings(list_text: &str, list_json: &str, defaults_json: &str) -> 
 - Client-side title bar unless `native_decorations`: logo, inline tab strip, update badge, settings
   button, app menu, minimize/maximize/close; drag → `ViewportCommand::StartDrag`, double-click toggles
   maximize, 6 px edge/corner zones → `BeginResize` with matching cursors (not when maximized).
-- Settings page = a special non-terminal tab (at most one; not persisted) with omp's tabs as a nav
-  rail plus an "OmpDeck" section (font size, theme, title bar style, update checks).
+- Settings = an overlay window (see "Settings is a window" below; it was a special non-terminal tab) with omp's
+  tabs as a nav rail plus an "OmpDeck" section (font size, theme, title bar style, update checks).
 - Sidebar context menus (session row, project header); copy = new tab running `fork_argv` in a fresh
   `omp-new-<ms>` tmux session; move = confirm modal → stop the session if alive (tmux kill, close its tab)
   → `move_session` (retry ≤ 10 × 300 ms on the live-writer error) → rescan → reopen in a tab if it had one.
@@ -2284,7 +2284,7 @@ omp-deck (hub):
 ### Wave 20 as built
 - Settings: selection is `Entry { OmpDeck(OmpDeckPage), Sync, Omp(i) }`; `OmpDeckPage` = General, Appearance, Notifications,
   Updates, Backup (label, subtitle, icon, palette slug). `SettingsState::show_ompdeck_page(page)` replaces `show_ompdeck()`;
-  `App::open_settings_page(page)` focuses the Settings tab on a page. `view_key` = `Option<(Option<Entry>, String)>`
+  `App::open_settings_page(page)` opens the Settings window on a page. `view_key` = `Option<(Option<Entry>, String)>`
   (`None` while searching). Palette: `settings.ompdeck.<slug>` ("Settings: OmpDeck — <page>") and `notify.while_viewing`.
   No update/Drive entry point opened Settings before (badges are popovers, Drive commands act directly), so only the bell
   gear and the palette navigate to a subpage.
@@ -2968,3 +2968,104 @@ deleted).
   "Check for updates"; the omp submenu's check is labelled "Check for updates" ("Checking for updates…" while running).
 - `confirm::Dialog.ctrl_enter_confirms`: Ctrl+Enter (consumed before the body, so the multiline editor never sees it)
   confirms; footer hint "Ctrl+Enter confirms". Used by the Handoff dialog.
+
+## Custom agent configuration (Settings → Agents)
+
+- `deck_core::agent_defs` reads and edits the task agents omp discovers (`task/discovery.ts`): the user dir
+  `<agent dir>/agents/*.md` (`agent dir` = the sessions root's parent), per project the nearest
+  `<ancestor>/.omp/agents/*.md` walking up from its cwd, and omp's built-ins. Precedence (omp's): project > user >
+  plugins > bundled, so a file of a built-in's name replaces it. Extension/plugin agents are not listed.
+  `discover(agent_dir, cwds)` → `Catalog{dirs, bare_roots, settings}`: the user `AgentDir` first (even when
+  missing), then project dirs deduped and sorted; `bare_roots` = project cwds with no `.omp/agents` above them
+  (where a new project agent would go: `<cwd>/.omp/agents`).
+- Built-ins: `Omp::bundled_agent_sources()` runs `omp agents unpack --dir <temp dir> --json` and reads back only
+  the `written` files directly in that temp dir (removed afterwards); `bundled(&[(file, content)])` parses them
+  like files into an `AgentDir{scope: Scope::Bundled}` under pseudo paths `omp:bundled/<file>` (`BUNDLED_PREFIX`,
+  `is_bundled`), sorted. They are never written: every writer refuses those paths.
+- Reading mirrors omp's `parseAgent`: CRLF normalized, leading HTML comments skipped, frontmatter up to the first
+  `\n---`, trimmed body. `AgentFile.issue` says why omp skips a file (unreadable, no frontmatter, missing name or
+  description, reserved `main`/`sub`, name already declared by an earlier file of the same dir). `revision` = first
+  16 bytes of the content's SHA-256, hex.
+- Edits are textual (`Edit::Model(Option<String>)`, `Edit::Body(String)`): a model change rewrites only the `model`
+  entry (inserted after `description`, written JSON-quoted; `None` removes it), a body change replaces only the
+  trimmed body. Every other byte, comments, key order and line endings included, is kept. `save(path, agent_dir,
+  revision, edit)` refuses anything but an existing `*.md` directly in an agents dir (`is_agents_dir`: the user
+  dir or any absolute `…/.omp/agents`; `NotAgentFile`), re-reads and refuses a moved revision (`Changed`, text
+  `CHANGED_ON_DISK`, tested with `is_changed_error` by clients that only see the message), then replaces the file
+  atomically (through a symlink to its target, keeping its permissions).
+- `create(dir, agent_dir, name, content)` writes `<dir>/<name>.md` with `create_new`: `dir` must be an agents dir
+  (`NotAgentsDir`) whose project root exists (the user dir is created if missing), `name` passes `check_name`
+  (`[a-z0-9]` words joined by single hyphens, ≤ `NAME_MAX` = 64, not `main`/`sub`; `BadName`), and no file in
+  `dir` may already declare it (`Exists`). `NewAgent{name, description, model, body}.content()` is omp's own
+  `saveAgent` layout: JSON-quoted `name`/`description`/`model` frontmatter, a blank line, the trimmed body
+  (frontmatter only when empty; empty description → `NoDescription`). `delete(path, agent_dir, revision)`: same
+  path and revision checks as `save`.
+- `Omp::agent_settings()` reads `task.agentModelOverrides`, `task.disabledAgents` and `modelRoles` (`omp config get
+  --json`, side by side) into `AgentSettings`; override entries are kept whole, malformed ones included, so a write
+  changes only the agent it names: `overrides_with(name, Option<&str>)` / `disabled_with(name, bool)` return the
+  full new value for `OVERRIDES_KEY` / `DISABLED_KEY` (written with `Mutation::OmpSet`, as omp's `/agents` hub
+  does). `role_model(alias)` resolves `@role`, `pi/role` and `@role:level` through `modelRoles` (`ROLES_KEY`).
+  omp's model precedence: explicit request > config override > the agent's `model` > the spawning session's
+  model, so an override hides the file's model; an explicit `:level` suffix beats `thinkingLevel`, which beats the
+  role's level.
+- Gateway (`PROTOCOL` unchanged): `Query::AgentDefs{projects}` → `Answer::AgentDefs(Catalog)` (discovery, the three
+  config reads and the unpack in parallel; a failed unpack is the built-in dir's `error`). Mutations, serialized
+  by one lock: `AgentEdit{path, revision, edit}` ("agent-edit") and `AgentCreate{dir, agent: NewAgent}`
+  ("agent-create") → `Done::AgentFile(Box<AgentFile>)`; `AgentCustomize{dir, name}` ("agent-customize") unpacks
+  the built-ins, copies the one omp loads as `name` verbatim through `create` → `Done::AgentFile` (no such
+  built-in: `Refused`); `AgentDelete{path, revision}` ("agent-delete") → `Done::Unit`. `NotAgentFile` and
+  `NotAgentsDir` are `Refused`, every other agent error `Failed`.
+- UI (`agent_config.rs`, app glue `app/agent_config.rs`): Settings nav entry "Agents" at the top of the omp section
+  (badge = files with unsaved prompt edits) and the palette command `settings.agents`. Rendered full height outside
+  the settings scroll area (max 1600 px), without the omp search field. Projects = the sidebar groups' cwds. The
+  page rereads the files whenever it is opened (the page or the Settings window on it) and on its refresh button.
+  - Header: "New agent" opens the create dialog. List: filter box (name, description, model, file name,
+    "built-in"); a "User" group, one per project folder (with their path) and "Built-in" last; a "+" on the user
+    and project groups opens the dialog for that location. Rows show the model (or the overriding one; roles as
+    `@smol · <model>`) and glyphs for issue, disabled, override, replaced built-in and unsaved edits. A selection
+    made by the page (a new file, what a delete gives way to, "Show it") is scrolled into view.
+  - Enabled switch (every agent): writes `task.disabledAgents` with or without its name.
+  - Model: a chip opening `model_picker::show` (the status bar's dropdown; `PickerInput.unset` is its "no current
+    model" text). Custom agents: a pick writes `selector[:level]` to the file, keeping the agent's level when the
+    new model supports it; effort pills re-level the current model; × removes `model`. Built-ins: a pick writes
+    `task.agentModelOverrides[name]`, ↶ removes it (omp's default applies). Fallback lists show as written and
+    mark no model current. Reload, stars and provider filter are the app's shared ones.
+  - Override notice on custom agents: "Remove override" writes `task.agentModelOverrides` without this agent.
+    Settings writes update the omp settings row, toast, and reread.
+  - Built-in pane: read-only prompt, "replaced by" banner with "Show it" when a user (everywhere) or project file
+    (there) of its name exists, and "Customize ▾": one entry per location (user, each project), disabled where a
+    file already declares the name; the copy is selected once listed.
+  - Create dialog (`agent_config/create.rs`): name (live `check_name`, clash with the location's files, note when
+    it replaces a user agent or a built-in), location (user, every project folder, those without `.omp/agents`
+    included), description (required), optional prompt; Ctrl+Enter creates. A refusal stays in the dialog; the
+    new file is selected once listed and its model is picked in the editor.
+  - Delete (custom agents): asks first, saying what applies afterwards (the user agent of that name in the
+    project, else the built-in, else nothing) and selects it after the reread.
+  - System prompt: monospace editor per file, Save / Revert, Ctrl+S. Drafts live per file for the app's lifetime;
+    a reread keeps dirty drafts and, when the file moved on under one, shows "The file changed on disk…" with
+    "Keep my edits" (rebase onto the disk revision; saving then replaces only the prompt) / "Use the file". A save
+    that loses the race rereads and shows that choice (info toast); a lost model pick is an error notice.
+  - Changes apply to the next task an agent runs, in running sessions too (omp rediscovers agents per spawn and
+    watches its config).
+- `omp_settings::split_level` is the shared `provider/id:level` splitter (`auto` and omp's levels);
+  `widgets::card_frame` is `card`'s surface without a caption.
+
+## Settings is a window (user, 2026-10-27)
+
+- `Tab::Settings` is gone: Settings opens as an overlay window like the session tree, Usage and Sessions windows
+  (scrim + `egui::Window`, title bar off, `card::chrome`, resizable/movable, default 94 % × 92 % of the screen
+  clamped to 860–1800 × 520–1300, min 760 × 440). It covers the sidebar and the tab strip; the tabs and the active
+  tab are untouched, so closing it returns to the tab that was active.
+- `settings_page::window(ctx, state, input, blocked) -> Vec<SettingsAction>` (replaces `show(ui, …)`): header row
+  (gear tile, "Settings", ✕ → `SettingsAction::Close`) over the nav rail and the content, both rounded panes.
+  `SettingsState::opened()` releases keyboard focus held outside the window (the terminal) on its next frame and
+  rereads the agents when the Agents page is selected. Agents page width cap 1200 → 1600 px.
+- Close: ✕, a click on the scrim, or Esc when, at the start of the frame, no widget had focus (a text field being
+  edited lets go first), no menu/popup and no egui modal was open, and the key is still unconsumed after the page and
+  its dialogs were drawn. `blocked` (app dialogs, palette, Sessions/Usage/tree windows, agent popup) disables Esc and
+  the scrim click.
+- App: `settings_open: bool`; `open_settings()` (no-op while open) / `close_settings()` (returns focus to the
+  terminal). `modal_open()` includes it (no palette, tab switching or split shortcuts behind it); the terminal does not
+  take focus back and its input is held while it is open (`hold_input_during_modals`). Drawn right after the central
+  panel, so the other windows and dialogs stack above it. `SettingsAction::InstallOmp` closes it before opening the
+  installer tab. The title-bar gear shows active while it is open; the quick switcher no longer lists a Settings tab.

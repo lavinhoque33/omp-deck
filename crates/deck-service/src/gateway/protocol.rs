@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use deck_core::agent_defs::{AgentFile, Catalog as AgentCatalog, Edit as AgentEdit, NewAgent};
 use deck_core::agents::{AgentsSnapshot, AgentsTarget, TranscriptItem};
 use deck_core::changes::{ChangedFile, Changes, DiffSide, FileDiff};
 use deck_core::config::GatewayMode;
@@ -372,6 +373,11 @@ pub enum Query {
     /// Every live backend session with its memory, and the tmux server's own (the session
     /// manager's Running view and RAM column).
     RunningDetail,
+    /// The custom agent definitions omp reads: the user's and those of the projects these
+    /// session cwds resolve to, with omp's agent settings.
+    AgentDefs {
+        projects: Vec<PathBuf>,
+    },
 }
 
 /// A query's result.
@@ -410,6 +416,7 @@ pub enum Answer {
     /// Subscribe/Unsubscribe/ClientState done.
     Done,
     RunningDetail(RunningDetail),
+    AgentDefs(AgentCatalog),
 }
 
 /// [`Query::RunningDetail`].
@@ -784,6 +791,27 @@ pub enum Mutation {
     OmpReset {
         key: String,
     },
+    /// Edit one agent definition file if it still has `revision` (see `agent_defs::save`).
+    AgentEdit {
+        path: PathBuf,
+        revision: String,
+        edit: AgentEdit,
+    },
+    /// Write a new definition `<dir>/<name>.md` (see `agent_defs::create`); never replaces one.
+    AgentCreate {
+        dir: PathBuf,
+        agent: NewAgent,
+    },
+    /// Copy omp's built-in `name` into `dir` as an editable definition that replaces it.
+    AgentCustomize {
+        dir: PathBuf,
+        name: String,
+    },
+    /// Delete one agent definition file if it still has `revision`.
+    AgentDelete {
+        path: PathBuf,
+        revision: String,
+    },
     /// An omp update/install run in a session of its own; the result is its target.
     RunTool(Tool),
     Settings(Edit),
@@ -871,6 +899,10 @@ impl Mutation {
             Mutation::SwitchBranch { .. } => "git-switch",
             Mutation::OmpSet { .. } => "omp-set",
             Mutation::OmpReset { .. } => "omp-reset",
+            Mutation::AgentEdit { .. } => "agent-edit",
+            Mutation::AgentCreate { .. } => "agent-create",
+            Mutation::AgentCustomize { .. } => "agent-customize",
+            Mutation::AgentDelete { .. } => "agent-delete",
             Mutation::RunTool(_) => "run-tool",
             Mutation::Settings(_) => "settings",
             Mutation::SetGatewayMode(_) => "gateway-mode",
@@ -1053,6 +1085,8 @@ pub enum Done {
     Ctl(deck_core::ctl::CtlReply),
     /// [`Mutation::KillNames`]: the sessions that failed, with why.
     Killed(Vec<(String, String)>),
+    /// [`Mutation::AgentEdit`]: the definition as now on disk.
+    AgentFile(Box<AgentFile>),
 }
 
 /// What a Drive restore would change ([`deck_core::gdrive::RestorePlan`]).

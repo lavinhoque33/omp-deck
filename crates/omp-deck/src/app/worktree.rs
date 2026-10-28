@@ -20,7 +20,7 @@ use deck_service::statusfmt::Activity;
 
 use super::{App, PendingConfirm};
 use crate::confirm::Confirm;
-use crate::tabs::{Tab, TabRole};
+use crate::tabs::TabRole;
 use crate::transfer;
 use crate::worktree_dialog::{Kind, Outcome, Plan, WorktreeDialog, brief};
 use crate::worktree_ui::{
@@ -95,7 +95,7 @@ struct Leftover {
 }
 
 /// The folder a tab's omp runs in now (the gateway's record), else the one it was launched in.
-fn tab_dir(t: &crate::tabs::TermTab) -> PathBuf {
+fn tab_dir(t: &crate::tabs::Tab) -> PathBuf {
     t.info()
         .and_then(|i| i.live_cwd.clone())
         .unwrap_or_else(|| t.cwd.clone())
@@ -169,7 +169,7 @@ impl App {
         if !self.omp_found() || self.wt.dialog.is_some() {
             return;
         }
-        let tab = self.tabs.iter().filter_map(Tab::term).find(|t| {
+        let tab = self.tabs.iter().find(|t| {
             t.session_path()
                 .is_some_and(|p| worktree_ui::same_session(p, &entry.path))
         });
@@ -311,7 +311,6 @@ impl App {
                 let open = self
                     .tabs
                     .iter()
-                    .filter_map(Tab::term)
                     .any(|t| t.uid == uid && !t.terminal().is_exited());
                 if !open {
                     self.toasts
@@ -604,8 +603,8 @@ impl App {
     }
 
     /// The running session tab whose folder is inside the worktree.
-    fn tab_in(&self, wt: &Worktree) -> Option<&crate::tabs::TermTab> {
-        self.tabs.iter().filter_map(Tab::term).find(|t| {
+    fn tab_in(&self, wt: &Worktree) -> Option<&crate::tabs::Tab> {
+        self.tabs.iter().find(|t| {
             t.role == TabRole::Session
                 && !t.terminal().is_exited()
                 && worktree_ui::inside(wt, &t.cwd)
@@ -666,7 +665,6 @@ impl App {
             .filter(|u| {
                 self.tabs
                     .iter()
-                    .filter_map(Tab::term)
                     .any(|t| t.uid == *u && !t.terminal().is_exited())
             })
             .or_else(|| self.tab_in(&wt).map(|t| t.uid));
@@ -689,21 +687,15 @@ impl App {
             return;
         };
         f.uid = Some(uid);
-        let Some((activity, busy, session)) = self
-            .tabs
-            .iter()
-            .filter_map(Tab::term)
-            .find(|t| t.uid == uid)
-            .map(|t| {
-                (
-                    t.activity(),
-                    t.is_busy(),
-                    // The tab was just found through its session file: its current target is the
-                    // conversation the worktree belongs to.
-                    t.target().clone(),
-                )
-            })
-        else {
+        let Some((activity, busy, session)) = self.tabs.iter().find(|t| t.uid == uid).map(|t| {
+            (
+                t.activity(),
+                t.is_busy(),
+                // The tab was just found through its session file: its current target is the
+                // conversation the worktree belongs to.
+                t.target().clone(),
+            )
+        }) else {
             return;
         };
         match f.observe(activity) {
@@ -759,11 +751,9 @@ impl App {
         {
             // An exited tab still shows this session: opening would only focus it.
             let exited = self.tabs.iter().position(|t| {
-                t.term().is_some_and(|t| {
-                    t.terminal().is_exited()
-                        && t.session_path()
-                            .is_some_and(|p| worktree_ui::same_session(p, &entry.path))
-                })
+                t.terminal().is_exited()
+                    && t.session_path()
+                        .is_some_and(|p| worktree_ui::same_session(p, &entry.path))
             });
             if let Some(i) = exited {
                 self.close_tab(i, false);
@@ -829,7 +819,6 @@ impl App {
     fn tab_cwds(&self) -> Vec<TabCwd> {
         self.tabs
             .iter()
-            .filter_map(Tab::term)
             .filter(|t| t.role == TabRole::Session && !t.terminal().is_exited())
             .map(|t| TabCwd {
                 uid: t.uid,
@@ -851,7 +840,6 @@ impl App {
         let moving: Vec<(u64, Option<PathBuf>)> = self
             .tabs
             .iter()
-            .filter_map(Tab::term)
             .filter(|t| {
                 t.role == TabRole::Session
                     && !t.terminal().is_exited()
@@ -911,12 +899,7 @@ impl App {
             let mut gone = Vec::new();
             let mut send = Vec::new();
             for uid in pending {
-                match self
-                    .tabs
-                    .iter()
-                    .filter_map(Tab::term)
-                    .find(|t| t.uid == uid)
-                {
+                match self.tabs.iter().find(|t| t.uid == uid) {
                     None => gone.push(uid),
                     Some(t) if t.terminal().is_exited() => gone.push(uid),
                     Some(t) => {
@@ -969,7 +952,6 @@ impl App {
             for t in self
                 .tabs
                 .iter_mut()
-                .filter_map(Tab::term_mut)
                 .filter(|t| left.iter().any(|(u, _)| *u == t.uid))
             {
                 if t.cwd != dest {
@@ -1009,12 +991,7 @@ impl App {
 
     /// Records `new` as tab `uid`'s session file (here and in the gateway) when it differs.
     fn fix_tab_path(&mut self, uid: u64, new: &Path) {
-        let Some(t) = self
-            .tabs
-            .iter_mut()
-            .filter_map(Tab::term_mut)
-            .find(|t| t.uid == uid)
-        else {
+        let Some(t) = self.tabs.iter_mut().find(|t| t.uid == uid) else {
             return;
         };
         if t.session_path() == Some(new) {
@@ -1071,7 +1048,6 @@ impl App {
         let targets_of = |app: &App, uids: &[u64]| -> Vec<_> {
             app.tabs
                 .iter()
-                .filter_map(Tab::term)
                 .filter(|t| uids.contains(&t.uid))
                 .map(|t| t.target().clone())
                 .collect()
@@ -1079,7 +1055,7 @@ impl App {
         let targets = targets_of(self, &stop);
         let moved_targets = targets_of(self, &moved);
         for i in (0..self.tabs.len()).rev() {
-            if matches!(self.tabs.get(i), Some(Tab::Terminal(t)) if stop.contains(&t.uid)) {
+            if matches!(self.tabs.get(i), Some(t) if stop.contains(&t.uid)) {
                 self.close_tab(i, false);
             }
         }
@@ -1463,7 +1439,7 @@ impl App {
             .unwrap_or_default();
         // A closed tab still showing a session would keep a path that is about to move.
         for i in (0..self.tabs.len()).rev() {
-            let stale = self.tabs.get(i).and_then(Tab::term).is_some_and(|t| {
+            let stale = self.tabs.get(i).is_some_and(|t| {
                 t.terminal().is_exited()
                     && t.session_path().is_some_and(|p| {
                         members.iter().any(|(_, m)| worktree_ui::same_session(m, p))
@@ -1476,7 +1452,6 @@ impl App {
         let tab_of = |app: &App, path: &Path| {
             app.tabs
                 .iter()
-                .filter_map(Tab::term)
                 .find(|t| {
                     !t.terminal().is_exited()
                         && t.session_path()
@@ -1487,7 +1462,6 @@ impl App {
         let moving: Vec<(u64, Option<PathBuf>)> = self
             .tabs
             .iter()
-            .filter_map(Tab::term)
             .filter(|t| {
                 t.role == TabRole::Session
                     && !t.terminal().is_exited()
@@ -1615,10 +1589,7 @@ impl App {
             );
         }
         if let Some(uid) = plan.focus.filter(|u| moved.contains(u))
-            && let Some(i) = self
-                .tabs
-                .iter()
-                .position(|t| t.term().is_some_and(|t| t.uid == uid))
+            && let Some(i) = self.tabs.iter().position(|t| t.uid == uid)
         {
             self.activate(i);
         }
@@ -1721,7 +1692,6 @@ impl App {
         let tab_label = |path: &Path| -> Option<String> {
             self.tabs
                 .iter()
-                .filter_map(Tab::term)
                 .find(|t| {
                     t.session_path()
                         .is_some_and(|p| worktree_ui::same_session(p, path))
@@ -1884,7 +1854,6 @@ impl App {
         let open: Vec<PathBuf> = self
             .tabs
             .iter()
-            .filter_map(Tab::term)
             .filter_map(|t| t.session_path_owned())
             .collect();
         let leftovers: Vec<Leftover> = self
@@ -2084,17 +2053,12 @@ impl App {
     /// of the new file; a pending move that landed in a worktree records its merge target.
     fn track_relocations(&mut self) {
         let generation = self.gw.sessions_generation();
-        let live: HashSet<u64> = self
-            .tabs
-            .iter()
-            .filter_map(Tab::term)
-            .map(|t| t.uid)
-            .collect();
+        let live: HashSet<u64> = self.tabs.iter().map(|t| t.uid).collect();
         self.wt.seen.retain(|u, _| live.contains(u));
         self.wt.seen_cwd.retain(|u, _| live.contains(u));
         self.wt.tried.retain(|u, _| live.contains(u));
         let mut changed = Vec::new();
-        for tab in self.tabs.iter().filter_map(Tab::term) {
+        for tab in self.tabs.iter() {
             let live_cwd = tab.info().and_then(|i| i.live_cwd.clone());
             let path = tab.session_path_owned();
             let (Some(prev_path), Some(prev_cwd)) = (
@@ -2147,11 +2111,7 @@ impl App {
             }
             self.wt.seen.insert(uid, Some(entry.path.clone()));
             let folder = live_cwd.unwrap_or_else(|| entry.cwd.clone());
-            if let Some(t) = self
-                .tabs
-                .iter_mut()
-                .filter_map(Tab::term_mut)
-                .find(|t| t.uid == uid)
+            if let Some(t) = self.tabs.iter_mut().find(|t| t.uid == uid)
                 && t.cwd != folder
             {
                 t.cwd = folder;

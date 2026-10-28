@@ -1,14 +1,16 @@
-//! The preferences page shown in the central area when the Settings tab is active: a nav rail on
-//! the left (OmpDeck's own preferences, then omp's settings tabs) and the selected section on the
-//! right, with a search field that filters across every omp tab.
+//! The Settings window: an overlay over the whole app (like the session tree and Usage windows)
+//! with a nav rail on the left (OmpDeck's own preferences, then omp's settings tabs) and the
+//! selected section on the right, with a search field that filters across every omp tab.
 
+use crate::agent_config::{self, AgentsAction, AgentsInput, AgentsState};
 use crate::icons::Icon;
 use crate::icons::{
-    ICON_BELL, ICON_BRAIN, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CIRCLE_ARROW_UP,
-    ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_CPU, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_KEYBOARD,
-    ICON_LIST_CHECKS, ICON_LIST_TREE, ICON_MOON, ICON_NEWSPAPER, ICON_PALETTE, ICON_REFRESH_CW,
-    ICON_SEARCH, ICON_SEARCH_X, ICON_SETTINGS_2, ICON_SLIDERS_HORIZONTAL, ICON_SPARKLES, ICON_SUN,
-    ICON_TERMINAL, ICON_TRIANGLE_ALERT, ICON_WRENCH,
+    ICON_BELL, ICON_BOT, ICON_BRAIN, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT,
+    ICON_CIRCLE_ARROW_UP, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_CPU, ICON_FOLD_VERTICAL, ICON_FOLDER,
+    ICON_KEYBOARD, ICON_LIST_CHECKS, ICON_LIST_TREE, ICON_MOON, ICON_NEWSPAPER, ICON_PALETTE,
+    ICON_REFRESH_CW, ICON_SEARCH, ICON_SEARCH_X, ICON_SETTINGS, ICON_SETTINGS_2,
+    ICON_SLIDERS_HORIZONTAL, ICON_SPARKLES, ICON_SUN, ICON_TERMINAL, ICON_TRIANGLE_ALERT,
+    ICON_WRENCH,
 };
 use deck_core::config::{
     Density, GatewayMode, MAX_UI_SCALE, MIN_UI_SCALE, Theme, UiFont, UiFontKind, UiStyle,
@@ -17,8 +19,8 @@ use deck_core::mux::BackendChoice;
 use deck_core::omp::{Setting, SettingsCatalog};
 use deck_service::gateway::protocol::{Effective, GatewayStatus, Supervision};
 use egui::{
-    Align2, Color32, CursorIcon, FontId, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind,
-    Ui, Vec2, pos2, vec2,
+    Align2, Color32, CursorIcon, FontId, Frame, Id, Key, Margin, Modifiers, Order, Rect, RichText,
+    Sense, Sides, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 use serde_json::Value;
 
@@ -36,11 +38,13 @@ use crate::widgets::{
     card, empty_state, icon_button, icon_text, paint_icon, segmented, setting_row, stepper, toggle,
 };
 
-/// One page of the settings area: an OmpDeck subpage, project sync, or omp's catalog tab `i`.
+/// One page of the settings area: an OmpDeck subpage, project sync, the custom agents, or omp's
+/// catalog tab `i`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Entry {
     OmpDeck(OmpDeckPage),
     Sync,
+    Agents,
     Omp(usize),
 }
 
@@ -114,6 +118,8 @@ impl OmpDeckPage {
 }
 
 const CONTENT_MAX_W: f32 = 760.0;
+/// The agents page lays out a list and an editor side by side: the editor takes the width.
+const AGENTS_MAX_W: f32 = 1600.0;
 
 enum Modal {
     Json(JsonModal),
@@ -138,9 +144,24 @@ pub struct SettingsState {
     /// (selected page or `None` while searching, search query) last shown; used to reset scroll.
     view_key: Option<(Option<Entry>, String)>,
     omp: OmpPane,
+    pub agents: AgentsState,
+    /// Drop keyboard focus held outside the window (the terminal) on its next frame.
+    release_focus: bool,
+    /// A widget had the keyboard at the end of the last frame (egui drops it on Esc before the
+    /// next frame runs, so this is how Esc tells "stop editing" from "close").
+    focus_held: bool,
 }
 
 impl SettingsState {
+    /// The window opens: it takes the keyboard, and the agents page rereads the files.
+    pub fn opened(&mut self) {
+        self.release_focus = true;
+        self.focus_held = false;
+        if self.selected == Entry::Agents {
+            self.agents.opened();
+        }
+    }
+
     /// A catalog load finished (success or failure).
     pub fn catalog_loaded(&mut self, result: Result<SettingsCatalog, String>, config_dir: String) {
         let pane = &mut self.omp;
@@ -165,6 +186,13 @@ impl SettingsState {
     pub fn show_sync(&mut self) {
         self.selected = Entry::Sync;
         self.omp.query.clear();
+    }
+
+    /// Show the custom agents page (rereading the agent files).
+    pub fn show_agents(&mut self) {
+        self.selected = Entry::Agents;
+        self.omp.query.clear();
+        self.agents.opened();
     }
 
     /// `(id, label)` of omp's settings categories once the catalog is loaded.
@@ -226,6 +254,7 @@ pub struct SettingsInput<'a> {
     pub notify: NotifyInput<'a>,
     pub app_update: crate::app_update::SettingsCard<'a>,
     pub mobile: MobileCard<'a>,
+    pub agents: AgentsInput<'a>,
 }
 
 /// The session-backend card: the stored choice and which backends exist on this machine.
@@ -238,6 +267,8 @@ pub struct BackendCard {
 
 #[derive(Debug, PartialEq)]
 pub enum SettingsAction {
+    /// Close the window (✕, Esc, a click outside it).
+    Close,
     FontSize(f32),
     /// App-wide zoom factor (1.0 = 100 %).
     UiScale(f32),
@@ -273,6 +304,8 @@ pub enum SettingsAction {
     /// The gateway lifetime mode (Settings → Mobile access).
     GatewayMode(GatewayMode),
     AppUpdate(crate::app_update::SettingsAction),
+    /// Settings → Agents.
+    Agents(AgentsAction),
 }
 
 fn tab_icon(id: &str) -> Icon {
@@ -292,11 +325,102 @@ fn tab_icon(id: &str) -> Icon {
     }
 }
 
-pub fn show(
-    ui: &mut Ui,
+/// Draws the window (scrim + resizable window) while it is open. `blocked`: another dialog is in
+/// front of it, so Esc and clicks outside are not the window's.
+pub fn window(
+    ctx: &egui::Context,
     state: &mut SettingsState,
     input: &SettingsInput<'_>,
+    blocked: bool,
 ) -> Vec<SettingsAction> {
+    let mut out = Vec::new();
+    let pal = Palette::of_ctx(ctx);
+    let screen = ctx.content_rect();
+
+    egui::Area::new(Id::unique("settings-scrim"))
+        .order(Order::Background)
+        .fixed_pos(screen.min)
+        .interactable(true)
+        .show(ctx, |ui| {
+            let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+            let dark = ctx.global_style().visuals.dark_mode;
+            ui.painter().rect_filled(rect, 0, theme::backdrop(dark));
+            if resp.clicked() && !blocked {
+                out.push(SettingsAction::Close);
+            }
+        });
+
+    if std::mem::take(&mut state.release_focus)
+        && let Some(id) = ctx.memory(|m| m.focused())
+    {
+        ctx.memory_mut(|m| m.surrender_focus(id));
+    }
+    // Esc belongs to whatever holds it first: a text field being edited (it lets go of the
+    // focus), an open menu, or a dialog of the page (it consumes the key while drawn below).
+    let esc_free = !blocked
+        && !state.focus_held
+        && ctx.memory(|m| m.top_modal_layer().is_none())
+        && !egui::Popup::is_any_open(ctx);
+
+    let size = vec2(
+        (screen.width() * 0.94)
+            .clamp(860.0, 1800.0)
+            .min(screen.width() - 24.0),
+        (screen.height() * 0.92)
+            .clamp(520.0, 1300.0)
+            .min(screen.height() - 24.0),
+    );
+    let margin = Margin::symmetric(16, 14);
+    egui::Window::new("settings-window")
+        .id(Id::unique("settings-window"))
+        .title_bar(false)
+        .frame(Frame::NONE.inner_margin(margin))
+        .resizable(true)
+        .movable(true)
+        .collapsible(false)
+        .constrain_to(screen)
+        .min_size(vec2(760.0, 440.0))
+        .default_size(size)
+        .default_pos(screen.center() - size / 2.0)
+        .show(ctx, |ui| {
+            crate::card::chrome(ui, margin, pal.bar, |ui| {
+                if header(ui) {
+                    out.push(SettingsAction::Close);
+                }
+                ui.add_space(10.0);
+                out.extend(body(ui, state, input));
+            });
+        });
+    if esc_free && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        out.push(SettingsAction::Close);
+    }
+    state.focus_held = ctx.memory(|m| m.focused().is_some());
+    out
+}
+
+/// Title row and rule; true when its ✕ was clicked.
+fn header(ui: &mut Ui) -> bool {
+    let pal = Palette::of_ui(ui);
+    let mut close = false;
+    Sides::new().height(32.0).show(
+        ui,
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            crate::card::icon_tile(ui, 30.0, ICON_SETTINGS, Color32::TRANSPARENT, true);
+            ui.label(theme::strong("Settings").size(19.0).color(pal.text_strong));
+        },
+        |ui| close = crate::card::close_button_sized(ui, 30.0, 18.0).clicked(),
+    );
+    let (left, right, y) = (
+        ui.min_rect().left(),
+        ui.min_rect().left() + ui.available_width(),
+        ui.min_rect().bottom() + 3.0,
+    );
+    crate::card::header_rule(ui, left, right, y, Color32::TRANSPARENT);
+    close
+}
+
+fn body(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>) -> Vec<SettingsAction> {
     let pal = Palette::of_ui(ui);
     let mut actions = Vec::new();
 
@@ -306,71 +430,94 @@ pub fn show(
         pane.loading = true;
         actions.push(SettingsAction::LoadCatalog);
     }
-    let searching = input.omp_found && !pane.query.trim().is_empty();
+    let searching =
+        input.omp_found && state.selected != Entry::Agents && !pane.query.trim().is_empty();
     if searching {
         ensure_hits(pane);
     }
 
+    let pane_frame = || {
+        Frame::NONE
+            .stroke(Stroke::new(1.0, pal.stroke))
+            .corner_radius(theme::rad(8, 12))
+    };
     egui::Panel::left("settings-nav")
         .exact_size(230.0)
         .resizable(false)
         .frame(
-            Frame::NONE
+            pane_frame()
                 .fill(pal.panel)
-                .inner_margin(Margin::symmetric(12, 18)),
+                .inner_margin(Margin::symmetric(12, 14)),
         )
         .show(ui, |ui| {
-            ui.label(theme::strong("Settings").size(20.0).color(pal.text_strong));
-            ui.add_space(12.0);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| nav(ui, state, input, searching));
         });
 
-    egui::CentralPanel::no_frame().show(ui, |ui| {
-        theme::skin::paint_canvas(ui.painter(), ui.max_rect(), pal);
-        Frame::NONE
-            .inner_margin(Margin::symmetric(32, 24))
-            .show(ui, |ui| {
-                ui.set_min_size(ui.available_size());
-                if input.omp_found {
-                    search_field(ui, &mut state.omp.query);
-                    ui.add_space(14.0);
-                }
-                // Scroll resets to the top whenever the category or the search query changes.
-                let view_key = if searching {
-                    (None, state.omp.query.trim().to_owned())
-                } else {
-                    (Some(state.selected), String::new())
-                };
-                let mut scroll = egui::ScrollArea::vertical()
-                    .id_salt("settings-content")
-                    .auto_shrink([false, false]);
-                if state.view_key.as_ref() != Some(&view_key) {
-                    state.view_key = Some(view_key);
-                    scroll = scroll.vertical_scroll_offset(0.0);
-                }
-                scroll.show(ui, |ui| {
-                    ui.set_max_width(ui.available_width().min(CONTENT_MAX_W));
-                    if searching {
-                        omp_view(ui, &mut state.omp, View::Search, &mut actions);
+    let content = pane_frame().fill(pal.bg).outer_margin(Margin {
+        left: 10,
+        ..Margin::ZERO
+    });
+    egui::CentralPanel::default_margins()
+        .frame(content)
+        .show(ui, |ui| {
+            theme::skin::paint_canvas(ui.painter(), ui.max_rect(), pal);
+            Frame::NONE
+                .inner_margin(Margin::symmetric(32, 24))
+                .show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    if state.selected == Entry::Agents {
+                        // Full height: the list and the prompt editor scroll on their own.
+                        ui.set_max_width(ui.available_width().min(AGENTS_MAX_W));
+                        actions.extend(
+                            agent_config::show(ui, &mut state.agents, &input.agents)
+                                .into_iter()
+                                .map(SettingsAction::Agents),
+                        );
+                        return;
+                    }
+                    if input.omp_found {
+                        search_field(ui, &mut state.omp.query);
+                        ui.add_space(14.0);
+                    }
+                    // Scroll resets to the top whenever the category or the search query changes.
+                    let view_key = if searching {
+                        (None, state.omp.query.trim().to_owned())
                     } else {
-                        match state.selected {
-                            Entry::OmpDeck(page) => ompdeck_page(ui, page, input, &mut actions),
-                            Entry::Sync => actions.extend(
-                                sync_view::page(ui, &input.sync)
-                                    .into_iter()
-                                    .map(SettingsAction::Sync),
-                            ),
-                            Entry::Omp(_) if !input.omp_found => not_found_card(ui, &mut actions),
-                            Entry::Omp(tab) => {
-                                omp_view(ui, &mut state.omp, View::Tab(tab), &mut actions);
+                        (Some(state.selected), String::new())
+                    };
+                    let mut scroll = egui::ScrollArea::vertical()
+                        .id_salt("settings-content")
+                        .auto_shrink([false, false]);
+                    if state.view_key.as_ref() != Some(&view_key) {
+                        state.view_key = Some(view_key);
+                        scroll = scroll.vertical_scroll_offset(0.0);
+                    }
+                    scroll.show(ui, |ui| {
+                        ui.set_max_width(ui.available_width().min(CONTENT_MAX_W));
+                        if searching {
+                            omp_view(ui, &mut state.omp, View::Search, &mut actions);
+                        } else {
+                            match state.selected {
+                                Entry::OmpDeck(page) => ompdeck_page(ui, page, input, &mut actions),
+                                Entry::Sync => actions.extend(
+                                    sync_view::page(ui, &input.sync)
+                                        .into_iter()
+                                        .map(SettingsAction::Sync),
+                                ),
+                                Entry::Agents => {}
+                                Entry::Omp(_) if !input.omp_found => {
+                                    not_found_card(ui, &mut actions)
+                                }
+                                Entry::Omp(tab) => {
+                                    omp_view(ui, &mut state.omp, View::Tab(tab), &mut actions);
+                                }
                             }
                         }
-                    }
+                    });
                 });
-            });
-    });
+        });
     show_modals(ui.ctx(), &mut state.omp, &mut actions);
     actions
 }
@@ -417,6 +564,24 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
     ui.add_space(12.0);
     ui.label(theme::section_caption("omp", pal.weak));
     ui.add_space(4.0);
+    let unsaved = state.agents.unsaved();
+    let unsaved_text = unsaved.to_string();
+    if nav_item(
+        ui,
+        ICON_BOT,
+        "Agents",
+        state.selected == Entry::Agents && !searching,
+        (unsaved > 0).then_some((unsaved_text.as_str(), true)),
+    )
+    .on_hover_text(if unsaved > 0 {
+        "Custom task agents · unsaved prompt edits"
+    } else {
+        "Custom task agents: model and system prompt"
+    })
+    .clicked()
+    {
+        state.show_agents();
+    }
     match (&state.omp.model, input.omp_found) {
         (Some(model), true) => {
             let hits = state.omp.hits.as_ref().filter(|_| searching);

@@ -31,7 +31,7 @@ use crate::confirm::{self, Confirm, Dialog};
 use crate::icons::{ICON_FOLD_VERTICAL, ICON_HANDSHAKE, ICON_PENCIL};
 use crate::model_picker::PickerAction;
 use crate::statusbar::{self, BarAction, BarInput};
-use crate::tabs::{Tab, TabRole, TermTab};
+use crate::tabs::{Tab, TabRole};
 use crate::theme::Palette;
 
 /// Terminal input is dropped for this long (renewed every frame) while a dialog is open.
@@ -68,7 +68,7 @@ impl App {
     /// about the model to the gateway (which resolves the optimistic switches).
     pub(super) fn drive_status(&mut self) {
         let want_uid = match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) if t.role == TabRole::Session => Some(t.uid),
+            Some(t) if t.role == TabRole::Session => Some(t.uid),
             _ => None,
         };
         if want_uid != self.status_uid {
@@ -83,7 +83,7 @@ impl App {
         let snap = self.status_snapshot();
         let live = self.live_snapshot();
         let mut observed = None;
-        if let Some(Tab::Terminal(tab)) = self.tabs.get(self.active)
+        if let Some(tab) = self.tabs.get(self.active)
             && tab.role == TabRole::Session
         {
             let live_model = live.as_deref().and_then(|l| l.model.as_ref());
@@ -148,13 +148,14 @@ impl App {
             || self.wt.dialog.is_some()
             || self.popup.is_some()
             || self.tree.is_some()
+            || self.settings_open
             || self.usage_open
             || self.sessions.open
             || self.palette.is_some()
             || egui::Popup::is_any_open(&self.ctx)
         {
             let visible = self.visible_uids();
-            for t in self.tabs.iter().filter_map(Tab::term) {
+            for t in self.tabs.iter() {
                 if visible.contains(&t.uid) {
                     t.terminal().hold_input_until(now + MODAL_HOLD);
                 }
@@ -168,7 +169,6 @@ impl App {
         let Some(uid) = self
             .tabs
             .iter()
-            .filter_map(Tab::term)
             .find(|t| t.target().key == target.key)
             .map(|t| t.uid)
         else {
@@ -283,7 +283,6 @@ impl App {
         let target = self
             .tabs
             .iter()
-            .filter_map(Tab::term)
             .find(|t| t.uid == uid)
             .map(|t| t.target().clone());
         if let Some(target) = target {
@@ -306,7 +305,7 @@ impl App {
     }
 
     /// What the availability rules of the session actions see for `tab` (status bar and palette).
-    pub(super) fn action_ctx(&self, tab: &TermTab) -> ActionCtx {
+    pub(super) fn action_ctx(&self, tab: &Tab) -> ActionCtx {
         tab.action_ctx(ActionFacts {
             last_turn_failed: self.bar_view.last_turn_failed,
             has_last_reply: self.bar_view.has_reply,
@@ -315,7 +314,7 @@ impl App {
     }
 
     pub(super) fn show_status_bar(&mut self, ui: &mut Ui) {
-        let Some(Tab::Terminal(tab)) = self.tabs.get(self.active) else {
+        let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
         if tab.role != TabRole::Session {
@@ -402,7 +401,7 @@ impl App {
     /// the bar can only show omp's defaults (the same rule as the model chip).
     pub(super) fn current_model(&self) -> Option<String> {
         match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) => t.current_model(),
+            Some(t) => t.current_model(),
             _ => self.bar_view.model_selector.clone(),
         }
     }
@@ -410,7 +409,7 @@ impl App {
     /// The session the status bar and palette act on now: the active session tab's current target.
     pub(super) fn active_target(&self) -> Option<SessionTarget> {
         match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) if t.role == TabRole::Session => Some(t.target().clone()),
+            Some(t) if t.role == TabRole::Session => Some(t.target().clone()),
             _ => None,
         }
     }
@@ -629,10 +628,7 @@ impl App {
         let session = active.map_or("", |t| {
             crate::titlebar::strip_omp_prefix(t.title(&self.labels))
         });
-        let project = active
-            .and_then(Tab::term)
-            .map(|t| abbreviate_home(&t.cwd))
-            .unwrap_or_default();
+        let project = active.map(|t| abbreviate_home(&t.cwd)).unwrap_or_default();
         let facts = |ui: &mut Ui| {
             let pal = Palette::of_ui(ui);
             card::kv(ui, 84.0, "Session", |ui| {

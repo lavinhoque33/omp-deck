@@ -300,6 +300,15 @@ pub fn pretty_json(kind: &SettingKind, value: Option<&Value>) -> String {
 
 const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+/// `provider/id:level` → (`provider/id`, `Some(level)`) when the suffix is a thinking level omp
+/// knows (`auto` included); anything else is returned whole.
+pub fn split_level(selector: &str) -> (&str, Option<&str>) {
+    match selector.rsplit_once(':') {
+        Some((m, l)) if l == "auto" || THINKING_LEVELS.contains(&l) => (m, Some(l)),
+        _ => (selector, None),
+    }
+}
+
 /// The default model (`modelRoles.default`, an optional `:level` suffix split off) and thinking
 /// level (`defaultThinkingLevel`) a fresh omp session starts with.
 pub fn defaults_from_catalog(catalog: &SettingsCatalog) -> Defaults {
@@ -314,11 +323,9 @@ pub fn defaults_from_catalog(catalog: &SettingsCatalog) -> Defaults {
     let role = value("modelRoles")
         .and_then(|v| v.get("default").and_then(Value::as_str).map(str::to_owned))
         .filter(|m| !m.trim().is_empty());
-    let (model, suffix) = match role.as_deref().and_then(|r| r.rsplit_once(':')) {
-        Some((m, l)) if l == "auto" || THINKING_LEVELS.contains(&l) => {
-            (Some(m.to_owned()), Some(l.to_owned()))
-        }
-        _ => (role, None),
+    let (model, suffix) = match role.as_deref().map(split_level) {
+        Some((m, l)) => (Some(m.to_owned()), l.map(str::to_owned)),
+        None => (None, None),
     };
     let level = suffix.or_else(|| {
         value("defaultThinkingLevel")

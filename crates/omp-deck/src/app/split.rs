@@ -134,7 +134,7 @@ impl PaneClaim {
 
 impl App {
     /// The split is on screen: more than one pane, and the active tab is a session tab (the
-    /// settings page and update/installer tabs take the full width).
+    /// update and installer tabs take the full width).
     pub(super) fn split_shown(&self) -> bool {
         !self.dash.open
             && self.split.is_split()
@@ -153,7 +153,7 @@ impl App {
         } else {
             self.tabs
                 .get(self.active)
-                .and_then(Tab::uid)
+                .map(|t| t.uid)
                 .into_iter()
                 .collect()
         }
@@ -180,7 +180,7 @@ impl App {
     }
 
     pub(super) fn tab_index(&self, uid: u64) -> Option<usize> {
-        self.tabs.iter().position(|t| t.uid() == Some(uid))
+        self.tabs.iter().position(|t| t.uid == uid)
     }
 
     /// The focused pane changed (shortcut, palette, closed pane): its tab becomes the active one.
@@ -414,7 +414,7 @@ impl App {
                 }
                 let mut hit = pressed && header.pressed;
                 let body = panes::body_of(pane, HEADER_H);
-                if let Some(Tab::Terminal(t)) = index.map(|i| &mut self.tabs[i]) {
+                if let Some(t) = index.map(|i| &mut self.tabs[i]) {
                     let mut child = ui.new_child(
                         UiBuilder::new()
                             .max_rect(body)

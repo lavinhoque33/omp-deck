@@ -766,6 +766,54 @@ impl Engine {
                     move |ctx, _, _| jobs::omp_reset(ctx, &setting),
                 );
             }
+            Mutation::AgentEdit {
+                path,
+                revision,
+                edit,
+            } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "agent-edit",
+                    false,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::agent_edit(ctx, &path, &revision, &edit),
+                );
+            }
+            Mutation::AgentCreate { dir, agent } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "agent-create",
+                    false,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::agent_create(ctx, &dir, &agent),
+                );
+            }
+            Mutation::AgentCustomize { dir, name } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "agent-customize",
+                    false,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::agent_customize(ctx, &dir, &name),
+                );
+            }
+            Mutation::AgentDelete { path, revision } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "agent-delete",
+                    false,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::agent_delete(ctx, &path, &revision),
+                );
+            }
             Mutation::RunTool(tool) => {
                 let (argv, label) = match &tool {
                     Tool::Update(kind) => (deck_core::omp::update_argv(*kind), "omp update"),

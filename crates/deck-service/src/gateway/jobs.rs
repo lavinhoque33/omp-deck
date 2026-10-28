@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use deck_core::agent_defs::{self, EditError};
 use deck_core::changes::{self, ChangedFile};
 use deck_core::ctl::{CtlClient, CtlCommand, CtlReply};
 use deck_core::gdrive::{self, LoginFlow, PreparedProjectRestore, PreparedRestore, Service};
@@ -232,6 +233,7 @@ pub fn query(ctx: &JobCtx, q: &Query) -> Option<Result<Answer, GatewayError>> {
             &ctx.backends,
             &ctx.root.path,
         ))),
+        Query::AgentDefs { projects } => Ok(Answer::AgentDefs(agent_catalog(ctx, projects))),
         Query::Topic(_) | Query::Screen(_) | Query::WorktreeSessions(_) => return None,
     };
     Some(r)
@@ -434,6 +436,102 @@ pub fn omp_reset(ctx: &JobCtx, key: &str) -> Result<Done, GatewayError> {
         .reset_setting(key)
         .map(|()| Done::Unit)
         .map_err(failed)
+}
+
+/// The definition directories (file reads), omp's agent settings (`omp config get`) and its
+/// built-in agents (`omp agents unpack`), side by side.
+fn agent_catalog(ctx: &JobCtx, projects: &[PathBuf]) -> agent_defs::Catalog {
+    std::thread::scope(|s| {
+        let settings = s.spawn(|| {
+            ctx.omp()
+                .map_err(|e| e.to_string())
+                .and_then(|o| o.agent_settings().map_err(|e| e.to_string()))
+        });
+        let bundled = s.spawn(|| {
+            ctx.omp()
+                .map_err(|e| e.to_string())
+                .and_then(|o| o.bundled_agent_sources().map_err(|e| e.to_string()))
+        });
+        let mut catalog = agent_defs::discover(&ctx.root.agent_dir(), projects);
+        let bundled = bundled
+            .join()
+            .unwrap_or_else(|_| Err("built-in agents worker panicked".to_owned()));
+        catalog.dirs.push(match bundled {
+            Ok(sources) => agent_defs::bundled(&sources),
+            Err(e) => agent_defs::AgentDir {
+                error: Some(e),
+                ..agent_defs::bundled(&[])
+            },
+        });
+        catalog.settings = Some(
+            settings
+                .join()
+                .unwrap_or_else(|_| Err("settings worker panicked".to_owned())),
+        );
+        catalog
+    })
+}
+
+/// Agent file writes run one at a time, so two of them can never both pass the revision check
+/// (or the exists check) of the same file.
+static AGENT_WRITES: Mutex<()> = Mutex::new(());
+
+fn agent_error(e: EditError) -> GatewayError {
+    match e {
+        EditError::NotAgentFile(_) | EditError::NotAgentsDir(_) => {
+            GatewayError::Refused(e.to_string())
+        }
+        e => failed(e),
+    }
+}
+
+/// One agent definition edit.
+pub fn agent_edit(
+    ctx: &JobCtx,
+    path: &Path,
+    revision: &str,
+    edit: &agent_defs::Edit,
+) -> Result<Done, GatewayError> {
+    let _one = lock(&AGENT_WRITES);
+    agent_defs::save(path, &ctx.root.agent_dir(), revision, edit)
+        .map(|f| Done::AgentFile(Box::new(f)))
+        .map_err(agent_error)
+}
+
+/// A new definition in `dir`.
+pub fn agent_create(
+    ctx: &JobCtx,
+    dir: &Path,
+    agent: &agent_defs::NewAgent,
+) -> Result<Done, GatewayError> {
+    let content = agent.content().map_err(agent_error)?;
+    let _one = lock(&AGENT_WRITES);
+    agent_defs::create(dir, &ctx.root.agent_dir(), &agent.name, &content)
+        .map(|f| Done::AgentFile(Box::new(f)))
+        .map_err(agent_error)
+}
+
+/// omp's built-in `name`, copied as is into `dir` (`<name>.md`), where it replaces the built-in.
+pub fn agent_customize(ctx: &JobCtx, dir: &Path, name: &str) -> Result<Done, GatewayError> {
+    let sources = ctx.omp()?.bundled_agent_sources().map_err(failed)?;
+    let (_, content) = sources
+        .iter()
+        .find(|(file, content)| {
+            agent_defs::parse(Path::new(file), content.as_bytes()).loaded_name() == Some(name)
+        })
+        .ok_or_else(|| GatewayError::Refused(format!("omp has no built-in agent {name}")))?;
+    let _one = lock(&AGENT_WRITES);
+    agent_defs::create(dir, &ctx.root.agent_dir(), name, content)
+        .map(|f| Done::AgentFile(Box::new(f)))
+        .map_err(agent_error)
+}
+
+/// Deletes one definition file.
+pub fn agent_delete(ctx: &JobCtx, path: &Path, revision: &str) -> Result<Done, GatewayError> {
+    let _one = lock(&AGENT_WRITES);
+    agent_defs::delete(path, &ctx.root.agent_dir(), revision)
+        .map(|()| Done::Unit)
+        .map_err(agent_error)
 }
 
 pub fn copy_session(ctx: &JobCtx, file: &Path, dest_cwd: &Path) -> Result<Done, GatewayError> {

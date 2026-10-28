@@ -18,7 +18,7 @@ use deck_service::statusfmt::Activity;
 use super::{App, PendingConfirm, RestartTarget};
 use crate::agent_ctl::{self, Link, LinkFacts, Req, ReqKind, Restart, RestartFacts};
 use crate::confirm::Confirm;
-use crate::tabs::{ClosedTab, Tab, TabRole};
+use crate::tabs::{ClosedTab, TabRole};
 
 /// The session whose live-control state this window follows, and what was last read from it.
 #[derive(Default)]
@@ -32,7 +32,7 @@ impl App {
     /// Per frame: follow the active tab's live-control topic (one session at a time).
     pub(super) fn drive_ctl(&mut self) {
         let want: Option<SessionKey> = match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t))
+            Some(t)
                 if t.role == TabRole::Session && t.info().is_some_and(|i| i.ctl_key.is_some()) =>
             {
                 Some(t.target().key.clone())
@@ -92,13 +92,13 @@ impl App {
     /// The session file of the active session tab: the root commands are addressed to.
     pub(super) fn ctl_root(&self) -> Option<&std::path::Path> {
         match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) if t.role == TabRole::Session => t.session_path(),
+            Some(t) if t.role == TabRole::Session => t.session_path(),
             _ => None,
         }
     }
 
     pub(super) fn ctl_link(&self) -> Link {
-        let Some(Tab::Terminal(t)) = self.tabs.get(self.active) else {
+        let Some(t) = self.tabs.get(self.active) else {
             return Link::ReadOnly;
         };
         agent_ctl::link_state(&LinkFacts {
@@ -111,7 +111,7 @@ impl App {
 
     /// Whether the active tab can be restarted into a controlled session.
     pub(super) fn restart_offer(&self) -> Restart {
-        let Some(Tab::Terminal(t)) = self.tabs.get(self.active) else {
+        let Some(t) = self.tabs.get(self.active) else {
             return Restart::Hidden;
         };
         if t.role != TabRole::Session || t.terminal().is_exited() {
@@ -132,7 +132,7 @@ impl App {
     pub(super) fn request_kill_agent(&mut self, id: String) {
         // Bind the question to the tab (and session) it is asked about.
         let Some((uid, key, session)) = (match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t)) if t.role == TabRole::Session => t
+            Some(t) if t.role == TabRole::Session => t
                 .info()
                 .and_then(|i| i.ctl_key.clone())
                 .map(|key| (t.uid, key, t.session_path_owned())),
@@ -182,15 +182,13 @@ impl App {
         key: &str,
         session: Option<&std::path::Path>,
     ) {
-        let same_tab = matches!(
-            self.tabs.get(self.active),
-            Some(Tab::Terminal(t))
-                if t.uid == uid
-                    && t.role == TabRole::Session
-                    && !t.terminal().is_exited()
-                    && t.info().and_then(|i| i.ctl_key.as_deref()) == Some(key)
-                    && t.session_path() == session
-        );
+        let same_tab = self.tabs.get(self.active).is_some_and(|t| {
+            t.uid == uid
+                && t.role == TabRole::Session
+                && !t.terminal().is_exited()
+                && t.info().and_then(|i| i.ctl_key.as_deref()) == Some(key)
+                && t.session_path() == session
+        });
         if !same_tab {
             self.toasts.error(
                 &self.ctx,
@@ -219,7 +217,7 @@ impl App {
     /// The active session tab's target, when live control can be addressed.
     fn ctl_target(&self) -> Option<SessionTarget> {
         match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t))
+            Some(t)
                 if t.role == TabRole::Session && t.info().is_some_and(|i| i.ctl_key.is_some()) =>
             {
                 Some(t.target().clone())
@@ -318,7 +316,7 @@ impl App {
         if self.restart_offer() != Restart::Ready {
             return;
         }
-        let Some(Tab::Terminal(t)) = self.tabs.get(self.active) else {
+        let Some(t) = self.tabs.get(self.active) else {
             return;
         };
         let Some(session) = t.session_path_owned() else {
@@ -348,7 +346,7 @@ impl App {
         let unchanged = self.restart_offer() == Restart::Ready
             && matches!(
                 self.tabs.get(self.active),
-                Some(Tab::Terminal(t)) if t.uid == uid && t.session_path() == Some(session)
+                Some(t) if t.uid == uid && t.session_path() == Some(session)
             );
         if !unchanged {
             self.toasts.error(
@@ -365,7 +363,6 @@ impl App {
         let Some(target) = self
             .tabs
             .iter()
-            .filter_map(Tab::term)
             .find(|t| t.uid == uid)
             .map(|t| t.target().clone())
         else {
@@ -395,17 +392,11 @@ impl App {
                 return;
             }
         };
-        let Some(i) = self
-            .tabs
-            .iter()
-            .position(|t| t.term().is_some_and(|t| t.uid == uid))
-        else {
+        let Some(i) = self.tabs.iter().position(|t| t.uid == uid) else {
             return; // the tab was closed meanwhile; the session lives on in the gateway
         };
         let term = self.open_view(&target);
-        if let Some(t) = self.tabs[i].term_mut() {
-            t.reattach(target, term);
-        }
+        self.tabs[i].reattach(target, term);
         self.dirty = true;
         self.focus_pending = true;
     }
@@ -415,18 +406,18 @@ impl App {
         if !self.backends_available() {
             return;
         }
-        let tab = self.tabs.iter().find_map(|t| match t {
-            Tab::Terminal(t)
-                if t.role == TabRole::Session
-                    && !t.terminal().is_exited()
-                    && t.session_path() == Some(entry.path.as_path()) =>
+        let tab = self.tabs.iter().find_map(|t| {
+            if t.role == TabRole::Session
+                && !t.terminal().is_exited()
+                && t.session_path() == Some(entry.path.as_path())
             {
                 t.mux_name.clone().map(|n| {
                     let busy = Activity::from_title(t.terminal().title()) != Activity::Idle;
                     (t.uid, n, busy)
                 })
+            } else {
+                None
             }
-            _ => None,
         });
         let (uid, mux_name, busy) = match tab {
             Some((uid, name, busy)) => (Some(uid), name, busy),
@@ -472,12 +463,10 @@ impl App {
             return;
         }
         let at = self.tabs.iter().position(|t| {
-            matches!(t, Tab::Terminal(x)
-                if x.session_path() == Some(target.session.as_path()) && !x.terminal().is_exited())
+            t.session_path() == Some(target.session.as_path()) && !t.terminal().is_exited()
         });
         match (target.uid, at) {
-            (Some(uid), Some(at)) if matches!(self.tabs.get(at), Some(Tab::Terminal(t)) if t.uid == uid) =>
-            {
+            (Some(uid), Some(at)) if self.tabs.get(at).is_some_and(|t| t.uid == uid) => {
                 self.restart_tab_in_place(uid);
             }
             (None, None) => {

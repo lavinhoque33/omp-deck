@@ -252,7 +252,7 @@ pub struct SidebarInput<'a> {
 
 /// Which project groups are open. A group is open while filtering, else by its user override,
 /// else when it is the active group. The active group is the group of the most recent tab that
-/// has one (a Settings tab keeps the previous group). Becoming the active group drops a
+/// has one (a tab without one, e.g. an update tab, keeps the previous group). Becoming the active group drops a
 /// collapsed (`false`) override so it opens; an open (`true`) override survives. Re-activating
 /// the same group changes nothing. Never persisted.
 #[derive(Default)]
@@ -1603,10 +1603,7 @@ fn open_tab_row(
     let active = i == input.active_tab;
     let status = tab.status(active);
     let label = tab.label(input.labels);
-    let folder = tab
-        .term()
-        .and_then(|t| t.cwd.file_name())
-        .and_then(|n| n.to_str());
+    let folder = tab.cwd.file_name().and_then(|n| n.to_str());
     let neutral = theme::flat();
 
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h()), Sense::click());
@@ -2283,11 +2280,8 @@ pub fn tab_menu(ui: &mut Ui, i: usize, tab: &Tab, env: &MenuEnv<'_>, out: &mut S
     if tab.pane_uid().is_some() {
         split_items(ui, out, |side| SidebarAction::SplitTab { index: i, side });
     }
-    let Some(t) = tab.term() else {
-        return;
-    };
-    let running = !t.terminal().is_exited();
-    let entry = t.session_path().and_then(|p| env.entry(p));
+    let running = !tab.terminal().is_exited();
+    let entry = tab.session_path().and_then(|p| env.entry(p));
     // The session menu's "Stop session process" covers this whenever it is offered.
     if (entry.is_none() || !env.can_stop)
         && menu_item(ui, ICON_POWER, "Kill session process", None, running, false).clicked()
@@ -2845,7 +2839,7 @@ mod tests {
         let groups = [proj("/a", &["a1"]), proj("/b", &["b1"])];
         let mut ex = Expansion::default();
         ex.on_activation(group_at(&groups, "/b/b1.jsonl"), None);
-        ex.on_activation(None, None); // Settings tab
+        ex.on_activation(None, None); // a tab without a group
         assert_eq!(open_set(&ex, &groups), [false, true]);
     }
 

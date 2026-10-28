@@ -56,6 +56,18 @@ host), so closing a tab or the whole app leaves omp running.
   Missing or unreadable earlier usage is marked with `≥`; hover for a higher-precision subtotal
   and scope details. Unrecorded live subagent spend is not included.
 - **omp updates and settings**: update check badge, update actions, and a searchable editor for every `omp config` key.
+  Settings (the title-bar gear, or "Settings" in the palette) opens as a large window over the app, like the session
+  tree; Esc, ✕ or a click outside closes it and you are back on the tab you were on.
+- **Task agents** (Settings → Agents, or "Settings: Agents" in the palette): omp's built-in agents (task,
+  scout, reviewer, …) and every custom one omp finds, yours (`~/.omp/agent/agents`) and each project's
+  (`.omp/agents`). Enable or disable any agent (`task.disabledAgents`). Built-ins are read-only: pick a model
+  for one (written to `task.agentModelOverrides`; role aliases such as `@smol` show the model the role is set
+  to) or **Customize** it, which copies it into your agents or a project's, where the copy replaces it. **New
+  agent** creates a custom agent for you or for any project with sessions. For custom agents, pick the model
+  from the same dropdown as the status bar (written to the file's `model` field, with the chosen thinking
+  level), edit the system prompt (Ctrl+S saves) or delete the file (deleting a copy brings the built-in back).
+  Files omp skips, agents that replace others and model overrides in omp's config are marked. Changes apply
+  to the next task an agent runs, in running sessions too.
 - **Google Drive backup**: sign in with Google and back up your omp config (settings, models,
   custom agents, skills, …) and prompt history to a private Drive app folder, automatically when it
   changes or on demand, and restore it on any machine (Settings → OmpDeck). See

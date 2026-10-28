@@ -1213,6 +1213,7 @@ fn model_chip(
             level: assumed_level.or(v.current_level()),
             favorites: input.favorites,
             provider: input.provider,
+            unset: "Current model unknown yet",
         },
     );
     out.extend(acts.into_iter().map(BarAction::Picker));

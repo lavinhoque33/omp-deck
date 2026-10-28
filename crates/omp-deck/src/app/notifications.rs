@@ -13,7 +13,7 @@ use crate::notify::WindowRaiser;
 use crate::notify_panel::{self, PanelAction};
 use crate::notify_view::NotifyAction;
 use crate::settings_page::OmpDeckPage;
-use crate::tabs::{ClosedTab, Tab, TabRole};
+use crate::tabs::{ClosedTab, TabRole};
 
 pub(super) struct NotifyUi {
     raiser: WindowRaiser,
@@ -52,7 +52,6 @@ impl App {
             visible: self
                 .tabs
                 .iter()
-                .filter_map(Tab::term)
                 .filter(|t| t.role == TabRole::Session && visible.contains(&t.uid))
                 .map(|t| t.target().clone())
                 .collect(),
@@ -73,19 +72,12 @@ impl App {
     /// The tab showing exactly this session generation, if one is open: a click on a pop-up of a
     /// replaced conversation finds nothing instead of activating the new one.
     fn tab_of_target(&self, target: &SessionTarget) -> Option<usize> {
-        self.tabs
-            .iter()
-            .position(|t| t.term().is_some_and(|t| t.target() == target))
+        self.tabs.iter().position(|t| t.target() == target)
     }
 
     /// A finished turn of `target`: the tab's bell marker.
     pub(super) fn on_bell(&mut self, target: &SessionTarget) {
-        if let Some(t) = self
-            .tabs
-            .iter_mut()
-            .filter_map(Tab::term_mut)
-            .find(|t| t.target() == target)
-        {
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.target() == target) {
             t.bell = true;
         }
     }

@@ -1,6 +1,7 @@
 //! GUI-free core of OmpDeck: omp session store scanning, session backends (tmux / OmpDeck host),
 //! app config, and the per-OS glue in [`platform`].
 
+pub mod agent_defs;
 pub mod agents;
 pub mod changes;
 pub mod config;
