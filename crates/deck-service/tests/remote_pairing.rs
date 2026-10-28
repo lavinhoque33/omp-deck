@@ -36,6 +36,72 @@ const GATEWAY: &str = env!("CARGO_BIN_EXE_omp-deck-gateway");
 const TTL: Duration = Duration::from_secs(6);
 const STEP: Duration = Duration::from_secs(20);
 
+// ---- failure diagnostics ------------------------------------------------------------------------
+
+/// The owner's state dir (its `gateway.log`), for the failure report.
+static OWNER_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+/// The in-test relay's log lines (`deck_relay` targets, debug and up), newest last.
+static RELAY_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static LOG_START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+const RELAY_LOG_LINES: usize = 2_000;
+
+struct RelayLog;
+
+impl log::Log for RelayLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.target().starts_with("deck_relay") && m.level() <= log::Level::Debug
+    }
+
+    fn log(&self, r: &log::Record) {
+        if !self.enabled(r.metadata()) {
+            return;
+        }
+        let at = LOG_START.elapsed();
+        let mut lines = RELAY_LOG.lock().unwrap_or_else(|e| e.into_inner());
+        if lines.len() >= RELAY_LOG_LINES {
+            lines.remove(0);
+        }
+        lines.push(format!("{at:>10.3?} {:<5} {}", r.level(), r.args()));
+    }
+
+    fn flush(&self) {}
+}
+
+/// Any failure (an admission refused, a wait timed out …) prints the owner log and the relay's
+/// log below the panic message, so a CI-only failure can be read from the job log.
+fn report_failures(owner_dir: PathBuf) {
+    *OWNER_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(owner_dir);
+    std::sync::LazyLock::force(&LOG_START);
+    if log::set_logger(&RelayLog).is_ok() {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        let owner = OWNER_DIR
+            .lock()
+            .ok()
+            .and_then(|d| d.clone())
+            .map(|dir| logs_in(&dir))
+            .unwrap_or_default();
+        let relay = RELAY_LOG.lock().map(|l| l.join("\n")).unwrap_or_default();
+        eprintln!(
+            "==== owner gateway.log ====\n{owner}\n==== relay log ====\n{relay}\n==== end ===="
+        );
+    }));
+}
+
+/// Every `gateway.log` under the owner's state dir.
+fn logs_in(dir: &std::path::Path) -> String {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path().join("gateway.log")).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ---- sandbox ------------------------------------------------------------------------------------
 
 struct Sandbox {
@@ -124,15 +190,12 @@ impl Sandbox {
         v["status"]["pid"].as_u64().map(|p| p as u32)
     }
 
+    fn owner_dir(&self) -> PathBuf {
+        self.profile.settings.with_file_name("gateway")
+    }
+
     fn owner_log(&self) -> String {
-        let dir = self.profile.settings.with_file_name("gateway");
-        std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| std::fs::read_to_string(e.path().join("gateway.log")).ok())
-            .collect::<Vec<_>>()
-            .join("\n")
+        logs_in(&self.owner_dir())
     }
 
     /// The owner's last relay hello epoch (`relay-epoch` in its state dir).
@@ -448,6 +511,7 @@ fn claim(
 #[test]
 fn pairing_reconnect_and_revocation_over_a_real_relay() {
     let sb = Sandbox::new();
+    report_failures(sb.owner_dir());
     let relay = Relay::start(sb.root.join("relay"));
     let client = sb.client();
     wait_for("the gateway link", Duration::from_secs(30), || {

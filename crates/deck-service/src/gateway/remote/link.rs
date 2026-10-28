@@ -9,7 +9,7 @@
 //! and `TimedOut` both mean "no data") lets it drain the command queue between reads.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -363,31 +363,40 @@ impl Worker {
         }
     }
 
-    fn connect(&self, tls: Option<&Arc<rustls::ClientConfig>>) -> Result<Ws, String> {
+    /// Resolves and connects on a helper thread, polling for a stop meanwhile: neither DNS nor
+    /// a TCP connect can be interrupted, and on Windows even a refused loopback connect takes
+    /// about 2 s (SYN retries after the RST). A stop abandons the helper, which ends on its own
+    /// within [`CONNECT_TIMEOUT`] and drops whatever it connected (no hello is ever sent on it).
+    fn dial(&self) -> Result<TcpStream, String> {
         let url = &self.relay.url;
-        let addrs = (url.host(), url.port())
-            .to_socket_addrs()
-            .map_err(|e| format!("cannot resolve {}: {e}", url.host()))?;
-        let mut last = None;
-        let mut stream = None;
-        for addr in addrs {
-            if self.shared.stopped() {
-                return Err("stopped".into());
-            }
-            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-                Ok(s) => {
-                    stream = Some(s);
-                    break;
+        let (host, port, shown) = (url.host().to_owned(), url.port(), url.as_str().to_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("gateway-relay-dial".into())
+            .spawn(move || {
+                let _ = tx.send(dial(&host, port, &shown));
+            })
+            .map_err(|e| format!("cannot start connecting: {e}"))?;
+        loop {
+            match rx.recv_timeout(POLL) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Timeout) if self.shared.stopped() => {
+                    return Err("stopped".into());
                 }
-                Err(e) => last = Some(e),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Err("connecting failed".into()),
             }
         }
-        let stream = stream.ok_or_else(|| match last {
-            Some(e) => format!("cannot connect to {}: {e}", url.as_str()),
-            None => format!("{} has no address", url.host()),
-        })?;
+    }
+
+    fn connect(&self, tls: Option<&Arc<rustls::ClientConfig>>) -> Result<Ws, String> {
+        let url = &self.relay.url;
+        let stream = self.dial()?;
         let io_err = |e: io::Error| format!("connection to {}: {e}", url.as_str());
         stream.set_nodelay(true).map_err(io_err)?;
+        // Blocking with timeouts for the one-shot TLS/upgrade/hello exchange only: a timeout
+        // there abandons the connection (on Windows a timed-out receive leaves the socket in an
+        // indeterminate state, so it must not be reused). Routing then runs non-blocking.
         stream
             .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
             .map_err(io_err)?;
@@ -451,9 +460,15 @@ impl Worker {
             }
         }
         self.shared.up.store(true, Ordering::Release);
-        if let Some(s) = lock(&self.shared.socket).as_ref()
-            && let Err(e) = s.set_read_timeout(Some(POLL))
-        {
+        // Routing polls a non-blocking socket instead of using a short read timeout: on Windows
+        // a timed-out blocking receive leaves the connection indeterminate (SO_RCVTIMEO), while
+        // `WouldBlock` is well defined everywhere. Set on the stream itself, not the clone.
+        let nonblocking = match ws.get_ref() {
+            MaybeTlsStream::Plain(s) => s.set_nonblocking(true),
+            MaybeTlsStream::Rustls(s) => s.sock.set_nonblocking(true),
+            _ => Err(io::Error::other("unsupported stream")),
+        };
+        if let Err(e) = nonblocking {
             return lost(format!("socket: {e}"), false);
         }
         let mut conn = Conn {
@@ -470,51 +485,72 @@ impl Worker {
             relay::room_id(&self.relay.room_key.room)
         );
         loop {
-            if self.shared.stopped() {
-                conn.goodbye();
-                return End::Stopped;
-            }
-            loop {
-                match self.cmds.try_recv() {
-                    Ok(cmd) => {
-                        if let Err(e) = self.command(&mut conn, cmd) {
-                            return lost(e, true);
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        conn.goodbye();
-                        return End::Stopped;
-                    }
-                }
-            }
-            match conn.ws.read() {
-                Ok(Message::Binary(b)) => {
-                    let msg = match FromRelay::decode(&b) {
-                        Ok(m) => m,
-                        Err(e) => return lost(format!("undecodable relay message: {e}"), true),
-                    };
-                    if let Err(e) = self.relayed(&mut conn, msg) {
-                        return lost(e, true);
-                    }
-                }
-                Ok(Message::Close(frame)) => return closed_by_relay(frame, true),
-                Ok(Message::Text(_)) => return lost("the relay sent text".into(), true),
-                Ok(_) => {}
-                Err(e) if is_timeout(&e) => {
-                    // Queued control replies (pongs) go out with the next write or flush.
-                    match conn.ws.flush() {
-                        Ok(()) => {}
-                        Err(e) if is_timeout(&e) => {}
-                        Err(e) => return lost(format!("relay connection: {e}"), true),
-                    }
-                }
-                Err(e) => return lost(format!("relay connection: {e}"), true),
+            if let Some(end) = self.pump(&mut conn) {
+                return end;
             }
         }
     }
 
-    fn command(&mut self, conn: &mut Conn, cmd: Cmd) -> Result<(), String> {
+    /// One round of routing on a non-blocking connection: queued commands, every message
+    /// already readable, the pending writes, then a wait of at most [`POLL`] for the next
+    /// command. `Some` = the connection is over.
+    fn pump<S: Read + Write>(&mut self, conn: &mut Conn<S>) -> Option<End> {
+        if self.shared.stopped() {
+            conn.goodbye();
+            return Some(End::Stopped);
+        }
+        loop {
+            match self.cmds.try_recv() {
+                Ok(cmd) => {
+                    if let Err(e) = self.command(conn, cmd) {
+                        return Some(lost(e, true));
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    conn.goodbye();
+                    return Some(End::Stopped);
+                }
+            }
+        }
+        loop {
+            match conn.ws.read() {
+                Ok(Message::Binary(b)) => {
+                    let msg = match FromRelay::decode(&b) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return Some(lost(format!("undecodable relay message: {e}"), true));
+                        }
+                    };
+                    if let Err(e) = self.relayed(conn, msg) {
+                        return Some(lost(e, true));
+                    }
+                }
+                Ok(Message::Close(frame)) => return Some(closed_by_relay(frame, true)),
+                Ok(Message::Text(_)) => return Some(lost("the relay sent text".into(), true)),
+                Ok(_) => {}
+                Err(e) if would_block(&e) => break,
+                Err(e) => return Some(lost(format!("relay connection: {e}"), true)),
+            }
+        }
+        // Frames a full socket buffer held back (and automatic pongs) go out now; tungstenite
+        // keeps them queued in order until a flush completes.
+        match conn.ws.flush() {
+            Ok(()) => {}
+            Err(e) if would_block(&e) => {}
+            Err(e) => return Some(lost(format!("relay connection: {e}"), true)),
+        }
+        match self.cmds.recv_timeout(POLL) {
+            Ok(cmd) => self.command(conn, cmd).err().map(|e| lost(e, true)),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                conn.goodbye();
+                Some(End::Stopped)
+            }
+        }
+    }
+
+    fn command<S: Read + Write>(&mut self, conn: &mut Conn<S>, cmd: Cmd) -> Result<(), String> {
         match cmd {
             Cmd::Tokens(t) => {
                 self.tokens = t;
@@ -550,7 +586,11 @@ impl Worker {
         }
     }
 
-    fn relayed(&mut self, conn: &mut Conn, msg: FromRelay<'_>) -> Result<(), String> {
+    fn relayed<S: Read + Write>(
+        &mut self,
+        conn: &mut Conn<S>,
+        msg: FromRelay<'_>,
+    ) -> Result<(), String> {
         match msg {
             FromRelay::Open { peer, token } => {
                 conn.peers.insert(peer, Slot::Open { token });
@@ -611,19 +651,26 @@ impl Worker {
     }
 }
 
-struct Conn {
-    ws: Ws,
+/// One routed relay connection. Generic over the stream so the routing round can be driven
+/// by a scripted stream in tests.
+struct Conn<S: Read + Write = MaybeTlsStream<TcpStream>> {
+    ws: WebSocket<S>,
     peers: HashMap<PeerId, Slot>,
 }
 
-impl Conn {
+impl<S: Read + Write> Conn<S> {
+    /// Queues a message and pushes it out as far as the socket takes it. `WouldBlock` is not a
+    /// loss: tungstenite keeps the unwritten bytes (`write_out_buffer` drains only what was
+    /// written) and the next round's flush continues them in order.
     fn send(&mut self, msg: &ToRelay<'_>) -> Result<(), String> {
         let bytes = msg
             .encode()
             .map_err(|e| format!("encoding a relay message: {e}"))?;
-        self.ws
-            .send(Message::binary(bytes))
-            .map_err(|e| format!("relay connection: {e}"))
+        match self.ws.send(Message::binary(bytes)) {
+            Ok(()) => Ok(()),
+            Err(e) if would_block(&e) => Ok(()),
+            Err(e) => Err(format!("relay connection: {e}")),
+        }
     }
 
     fn close(&mut self, peer: PeerId, code: u16) -> Result<(), String> {
@@ -664,8 +711,33 @@ fn closed_by_relay(frame: Option<CloseFrame>, up: bool) -> End {
     }
 }
 
+/// A blocking exchange's timeout (the handshake): `WouldBlock` on Unix, `TimedOut` (WSAETIMEDOUT)
+/// on Windows.
 fn is_timeout(e: &tungstenite::Error) -> bool {
     matches!(e, tungstenite::Error::Io(io) if matches!(io.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
+}
+
+/// Nothing to read, or the socket buffer is full, on a non-blocking stream.
+fn would_block(e: &tungstenite::Error) -> bool {
+    matches!(e, tungstenite::Error::Io(io) if io.kind() == io::ErrorKind::WouldBlock)
+}
+
+/// Resolves `host` and connects to its addresses in turn (runs on the dial thread).
+fn dial(host: &str, port: u16, shown: &str) -> Result<TcpStream, String> {
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {host}: {e}"))?;
+    let mut last = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(match last {
+        Some(e) => format!("cannot connect to {shown}: {e}"),
+        None => format!("{host} has no address"),
+    })
 }
 
 /// 1 s, 2 s, 4 s … 60 s, plus up to 25 % jitter.
@@ -782,8 +854,220 @@ mod tests {
         assert!(first.contains("Connecting"), "{first}");
         let started = Instant::now();
         link.stop_and_wait();
-        assert!(started.elapsed() < STOP_WAIT, "{:?}", started.elapsed());
+        // Well inside GRACE: the stop is noticed between dial polls, never waited out. (On
+        // Windows a refused loopback connect alone takes ~2 s, which a blocking connect on the
+        // link thread made the stop wait for.)
+        assert!(started.elapsed() < GRACE, "{:?}", started.elapsed());
         assert!(ended(&rx, Duration::from_secs(1)));
+    }
+
+    /// A loopback listener with a zero backlog whose accept queue is already full: further
+    /// SYNs are dropped, so a connect to it hangs in the kernel until its timeout (the way a
+    /// refused connect takes ~2 s on Windows).
+    #[cfg(target_os = "linux")]
+    fn saturated_listener() -> (std::net::TcpListener, u16, Vec<TcpStream>) {
+        use std::os::fd::FromRawFd;
+        // SAFETY: plain socket calls on a fresh descriptor, owned by the listener right away.
+        let listener = unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0);
+            let listener = std::net::TcpListener::from_raw_fd(fd);
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+            let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            assert_eq!(libc::bind(fd, (&raw const addr).cast(), len), 0);
+            assert_eq!(libc::listen(fd, 0), 0);
+            listener
+        };
+        let addr = listener.local_addr().unwrap();
+        let mut held = Vec::new();
+        while let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
+            held.push(s);
+            assert!(held.len() < 64, "the backlog never filled");
+        }
+        (listener, addr.port(), held)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_during_a_hanging_connect_is_not_waited_out() {
+        let (_listener, port, _held) = saturated_listener();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let link = start(port, tx);
+        let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(first.contains("Connecting"), "{first}");
+        // The link thread is now inside the connect (it would hang for CONNECT_TIMEOUT).
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        link.stop_and_wait();
+        assert!(started.elapsed() < GRACE, "{:?}", started.elapsed());
+        assert!(ended(&rx, Duration::from_secs(1)));
+    }
+
+    /// A non-blocking socket double: reads hand out scripted bytes, then `WouldBlock`; writes
+    /// take at most `chunk` bytes and refuse every other call with `WouldBlock`.
+    #[derive(Default)]
+    struct Wire {
+        inbound: std::collections::VecDeque<u8>,
+        outbound: Vec<u8>,
+        writes: usize,
+        chunk: usize,
+    }
+
+    struct Scripted(Arc<Mutex<Wire>>);
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut w = self.0.lock().unwrap();
+            if w.inbound.is_empty() {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let n = buf.len().min(w.inbound.len());
+            for (slot, b) in buf.iter_mut().zip(w.inbound.drain(..n)) {
+                *slot = b;
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut w = self.0.lock().unwrap();
+            w.writes += 1;
+            if w.writes % 2 == 1 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let n = buf.len().min(w.chunk);
+            w.outbound.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Frames as the relay (server side) would send them.
+    fn relay_frames(msgs: &[FromRelay<'_>]) -> Vec<u8> {
+        let mut ws = WebSocket::from_raw_socket(
+            io::Cursor::new(Vec::new()),
+            tungstenite::protocol::Role::Server,
+            None,
+        );
+        for m in msgs {
+            ws.send(Message::binary(m.encode().unwrap())).unwrap();
+        }
+        ws.get_ref().get_ref().clone()
+    }
+
+    /// What the relay received so far, decoded (a partial last frame is left out).
+    fn received(wire: &Arc<Mutex<Wire>>) -> Vec<String> {
+        let bytes = wire.lock().unwrap().outbound.clone();
+        let mut ws = WebSocket::from_raw_socket(
+            io::Cursor::new(bytes),
+            tungstenite::protocol::Role::Server,
+            None,
+        );
+        let mut out = Vec::new();
+        while let Ok(Message::Binary(b)) = ws.read() {
+            out.push(format!("{:?}", ToRelay::decode(&b).unwrap()));
+        }
+        out
+    }
+
+    #[test]
+    fn queued_sends_survive_would_block_reads_and_writes_and_routing_continues() {
+        let wire = Arc::new(Mutex::new(Wire {
+            chunk: 16,
+            ..Wire::default()
+        }));
+        let mut conn = Conn {
+            ws: WebSocket::from_raw_socket(
+                Scripted(wire.clone()),
+                tungstenite::protocol::Role::Client,
+                None,
+            ),
+            peers: HashMap::new(),
+        };
+        let (cmds_tx, cmds) = std::sync::mpsc::channel();
+        let (events_tx, events) = std::sync::mpsc::channel();
+        let dir = tempfile::tempdir().unwrap();
+        let key = relay::RoomKey {
+            room: [1; 16],
+            secret: [2; 32],
+        };
+        let mut worker = Worker {
+            relay: RelayConfig::new("ws://127.0.0.1:9", &key.encode()).unwrap(),
+            identity: Keypair::generate().unwrap(),
+            epochs: Arc::new(Mutex::new(Epochs::load(&dir.path().join("epoch")))),
+            cmds,
+            shared: Arc::new(Shared {
+                stop: AtomicBool::new(false),
+                up: AtomicBool::new(true),
+                socket: Mutex::new(None),
+            }),
+            events: Box::new(move |e| {
+                let _ = events_tx.send(format!("{e:?}"));
+            }),
+            tokens: Vec::new(),
+            invite: None,
+        };
+        let rounds = |worker: &mut Worker, conn: &mut Conn<Scripted>, n: usize| {
+            for _ in 0..n {
+                assert!(worker.pump(conn).is_none(), "the connection ended");
+            }
+        };
+        // Rounds until the relay has `want` messages (each round moves one chunk at most).
+        let deliver = |worker: &mut Worker, conn: &mut Conn<Scripted>, want: usize| {
+            for _ in 0..400 {
+                if received(&wire).len() >= want {
+                    return;
+                }
+                assert!(worker.pump(conn).is_none(), "the connection ended");
+            }
+        };
+
+        // The first token set's write is refused (WouldBlock) mid-send: not a loss.
+        cmds_tx.send(Cmd::Tokens(vec![[7; 32]])).unwrap();
+        rounds(&mut worker, &mut conn, 1);
+        // Nothing to read in between (WouldBlock reads) and a second set queued behind it.
+        cmds_tx.send(Cmd::Tokens(vec![[7; 32], [8; 32]])).unwrap();
+        deliver(&mut worker, &mut conn, 2);
+        let sent = received(&wire);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[0].starts_with("Tokens") && sent[1].starts_with("Tokens"));
+        assert!(
+            sent[1].contains("8, 8"),
+            "the newer set went last: {sent:?}"
+        );
+
+        // Inbound routing still works after all of that.
+        wire.lock()
+            .unwrap()
+            .inbound
+            .extend(relay_frames(&[FromRelay::Open {
+                peer: 3,
+                token: [7; 32],
+            }]));
+        rounds(&mut worker, &mut conn, 1);
+        let opened = events.try_iter().collect::<Vec<_>>();
+        assert!(
+            opened
+                .iter()
+                .any(|e| e.contains("Opened") && e.contains("peer: 3")),
+            "{opened:?}"
+        );
+        // And so do sends after it.
+        cmds_tx
+            .send(Cmd::Close {
+                peer: 3,
+                code: close::UNAUTHORIZED,
+            })
+            .unwrap();
+        deliver(&mut worker, &mut conn, 3);
+        let sent = received(&wire);
+        assert_eq!(sent.len(), 3, "{sent:?}");
+        assert!(sent[2].starts_with("Close"), "{sent:?}");
     }
 
     #[test]
