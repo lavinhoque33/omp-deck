@@ -1,0 +1,35 @@
+# nginx in front of omp-deck-relay (docs/relay.md); include it in the http { } block. Run the relay
+# with
+#   omp-deck-relay serve --listen 127.0.0.1:8080 --trust-forwarded-for --state-dir …
+# $proxy_add_x_forwarded_for appends the real client address, so the last hop is what the relay's
+# per-IP limits key on (anything a client sends itself comes before it).
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name relay.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/relay.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/relay.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # The relay pings every 25 s and drops silent peers after 75 s; nginx must not close an
+        # idle WebSocket before that (its default is 60 s).
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+        # Relay messages are small and interactive.
+        proxy_buffering off;
+    }
+}

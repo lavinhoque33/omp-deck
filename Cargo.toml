@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/deck-service", "crates/omp-deck"]
+members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/deck-service", "crates/deck-remote", "crates/deck-relay", "crates/omp-deck"]
 
 [workspace.package]
 edition = "2024"
@@ -18,6 +18,7 @@ deck-core = { path = "crates/deck-core" }
 deck-host = { path = "crates/deck-host" }
 deck-term = { path = "crates/deck-term" }
 deck-service = { path = "crates/deck-service" }
+deck-remote = { path = "crates/deck-remote", default-features = false }
 # Already in Cargo.lock via eframe/arboard/polling; crates add the API features they call.
 windows-sys = "0.61"
 libc = "0.2"
@@ -55,6 +56,14 @@ wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # Sharpshooter memory restore takes omp's consolidation lock: pi-natives names it with xxh64.
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+# Mobile companion slice 3 (docs/notes/mobile-relay.md): Noise device protocol (gateway + test client)
+# and the self-hosted relay (axum/tokio; tungstenite clients matching axum's ws). Crates add features.
+snow = { version = "0.10", default-features = false }
+zeroize = "1"
+axum = { version = "0.8", default-features = false }
+tokio = "1"
+tokio-tungstenite = "0.29"
+tungstenite = { version = "0.29", default-features = false }
 
 [profile.dev.package."*"]
 opt-level = 2

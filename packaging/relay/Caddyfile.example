@@ -1,0 +1,12 @@
+# Caddy in front of omp-deck-relay (docs/relay.md). Caddy obtains and renews the certificate and
+# proxies WebSockets without extra configuration. Run the relay with
+#   omp-deck-relay serve --listen 127.0.0.1:8080 --trust-forwarded-for --state-dir …
+# Caddy replaces a client-sent X-Forwarded-For with the real client address (unless
+# trusted_proxies says otherwise), so the last hop is what the relay's per-IP limits key on.
+
+relay.example.com {
+	reverse_proxy 127.0.0.1:8080 {
+		# Keep relay WebSockets open across `caddy reload` instead of cutting them at once.
+		stream_close_delay 5m
+	}
+}

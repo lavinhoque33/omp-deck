@@ -1,0 +1,40 @@
+[package]
+name = "deck-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "omp-deck-relay: self-hosted WebSocket relay between an OmpDeck gateway and its paired devices"
+
+[lib]
+name = "deck_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "omp-deck-relay"
+path = "src/main.rs"
+
+[dependencies]
+deck-remote.workspace = true
+axum = { workspace = true, features = ["http1", "tokio", "ws"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# In-process TLS (`--tls-cert`/`--tls-key`) on the in-tree rustls 0.23 + ring.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+subtle = "2"
+# axum's WebSocket errors wrap tungstenite's (size-limit and protocol errors map to close codes).
+tungstenite.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+log.workspace = true
+anyhow.workspace = true
+env_logger.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }
+tempfile.workspace = true

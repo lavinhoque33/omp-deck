@@ -1,9 +1,9 @@
 # Mobile companion: design contract
 
-Status: step 1's in-process shared service is implemented; gateway/OS integration,
-relay/pairing and the PWA remain planned. Decisions agreed on 2026-10-25: relay
-connectivity, background gateway by default with an app-open-only option, installable
-PWA, full control. The implementation boundary and command routes are recorded below.
+Status: steps 1 (shared service) and 2 (gateway and OS integration, released in 0.15.0) are implemented; relay/pairing
+(proposal in `mobile-relay.md`) and the PWA remain planned. Decisions agreed on 2026-10-25: relay connectivity,
+background gateway by default with an app-open-only option, installable PWA, full control; on 2026-10-27: the relay is
+self-hosted only for now and written in Rust. The implementation boundary and command routes are recorded below.
 
 ## Product boundary
 

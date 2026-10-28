@@ -28,6 +28,15 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: PWA transport tests (Noise interop vectors)
+        working-directory: pwa
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun test
 
   windows:
     runs-on: windows-latest

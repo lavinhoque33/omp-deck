@@ -1,0 +1,30 @@
+# omp-deck-relay container (docs/relay.md). Build from the repository root:
+#   podman build -f packaging/relay/Containerfile -t omp-deck-relay .
+# Run (plain HTTP on 8080 behind a TLS proxy; rooms.json lives in the volume):
+#   podman run -d --name omp-deck-relay -p 127.0.0.1:8080:8080 \
+#     -v omp-deck-relay:/var/lib/omp-deck-relay omp-deck-relay
+# Enroll a room:
+#   podman exec omp-deck-relay omp-deck-relay enroll --state-dir /var/lib/omp-deck-relay --label phone
+
+FROM docker.io/library/rust:1-slim-trixie AS build
+WORKDIR /src
+# The whole workspace manifest set is needed to resolve the lockfile; only deck-relay is built.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --locked --release -p deck-relay \
+    && install -m 0755 target/release/omp-deck-relay /usr/local/bin/omp-deck-relay
+
+FROM docker.io/library/debian:trixie-slim
+RUN useradd --system --uid 10001 --home-dir /var/lib/omp-deck-relay --shell /usr/sbin/nologin relay \
+    && install -d -m 0700 -o relay -g relay /var/lib/omp-deck-relay
+COPY --from=build /usr/local/bin/omp-deck-relay /usr/local/bin/omp-deck-relay
+USER relay
+VOLUME /var/lib/omp-deck-relay
+EXPOSE 8080
+ENV RUST_LOG=info
+STOPSIGNAL SIGTERM
+# Liveness: GET /healthz answers 200 "ok" (no curl in the image; probe from the orchestrator).
+ENTRYPOINT ["/usr/local/bin/omp-deck-relay"]
+CMD ["serve", "--listen", "0.0.0.0:8080", "--state-dir", "/var/lib/omp-deck-relay"]
