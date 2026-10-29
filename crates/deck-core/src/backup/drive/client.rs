@@ -1,95 +1,28 @@
 //! Drive v3 client limited to the `appDataFolder`: list, multipart and resumable upload,
 //! streaming download, delete.
 
-use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use ureq::Body;
 use ureq::http::Response;
 
-use super::{BACKUP_PREFIX, Error, PROJECT_PREFIX, Result, Service, google_error, network, oauth};
-use crate::usage::parse_iso_ms;
+use super::{google_error, network, oauth};
+use crate::backup::remote::{
+    BackupFile, MAX_DOWNLOAD, PROJECT_KIND, Remote, is_config_backup, is_project_backup,
+};
+use crate::backup::{BACKUP_PREFIX, Error, Result, Service, http, transfer_http};
 
-/// Downloads larger than this are refused (a backup is config + prompt history).
-const MAX_DOWNLOAD: u64 = 1 << 30;
 const LIST_FIELDS: &str = "nextPageToken,files(id,name,size,createdTime,appProperties)";
 const FILE_FIELDS: &str = "id,name,size,createdTime,appProperties";
 /// Resumable upload chunk: a multiple of 256 KiB, as Drive requires for all but the last.
 const CHUNK: usize = 8 << 20;
 /// Consecutive failed attempts before a transfer gives up.
 const MAX_ATTEMPTS: u32 = 5;
-/// The `kind` appProperty of a project backup.
-pub(super) const PROJECT_KIND: &str = "project";
-
-/// One backup in the app folder.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
-pub struct BackupFile {
-    pub id: String,
-    pub name: String,
-    #[serde(default, deserialize_with = "size_string")]
-    pub size: u64,
-    /// RFC 3339, as Drive reports it.
-    #[serde(rename = "createdTime", default)]
-    pub created: String,
-    #[serde(rename = "appProperties", default)]
-    pub props: BTreeMap<String, String>,
-}
-
-impl BackupFile {
-    /// The machine that uploaded it.
-    pub fn host(&self) -> Option<&str> {
-        self.props.get("host").map(String::as_str)
-    }
-
-    /// Creation time, unix seconds.
-    pub fn created_unix(&self) -> Option<i64> {
-        parse_iso_ms(&self.created).map(|ms| ms.div_euclid(1000))
-    }
-}
-
-/// Drive sends `size` as a decimal string; our own serialization (gateway replies) writes a
-/// number.
-fn size_string<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<u64, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Size {
-        Number(u64),
-        Text(String),
-    }
-    Ok(match Option::<Size>::deserialize(d)? {
-        Some(Size::Number(n)) => n,
-        Some(Size::Text(s)) => s.parse().unwrap_or(0),
-        None => 0,
-    })
-}
-
-/// Newest first by creation time, then name (names carry a UTC timestamp).
-pub(super) fn sort_newest_first(files: &mut [BackupFile]) {
-    files.sort_by(newest_first);
-}
-
-fn newest_first(a: &BackupFile, b: &BackupFile) -> CmpOrdering {
-    (b.created_unix(), &b.name).cmp(&(a.created_unix(), &a.name))
-}
-
-/// Retention: the backups to delete so that only the newest `keep` remain.
-pub fn to_delete(files: &[BackupFile], keep: usize) -> Vec<&BackupFile> {
-    let mut sorted: Vec<&BackupFile> = files.iter().collect();
-    sorted.sort_by(|a, b| newest_first(a, b));
-    sorted.split_off(keep.min(sorted.len()))
-}
-
-/// A config backup of this app, as [`Drive::list`] keeps them: an [`BACKUP_PREFIX`] name and no
-/// `kind` appProperty (project backups carry `kind = project`; config uploads set only `host` and
-/// `fingerprint`).
-pub(super) fn is_config_backup(f: &BackupFile) -> bool {
-    f.name.starts_with(BACKUP_PREFIX) && !f.props.contains_key("kind")
-}
 
 /// Which HTTP agent a request uses: the API agent has a global timeout; the transfer agents
 /// only a stall timeout (a multi-GB transfer is legitimately long).
@@ -101,7 +34,7 @@ enum Lane {
     Download,
 }
 
-pub(super) struct Drive<'a> {
+pub(in crate::backup) struct Drive<'a> {
     service: &'a Service,
     http: ureq::Agent,
     upload: ureq::Agent,
@@ -111,24 +44,25 @@ pub(super) struct Drive<'a> {
 }
 
 impl<'a> Drive<'a> {
-    pub(super) fn new(service: &'a Service, refresh_token: String) -> Drive<'a> {
+    pub(in crate::backup) fn new(service: &'a Service, refresh_token: String) -> Drive<'a> {
         Drive {
             service,
-            http: super::http(),
-            upload: super::transfer_http(false),
-            download: super::transfer_http(true),
+            http: http(),
+            upload: transfer_http(false),
+            download: transfer_http(true),
             refresh_token,
             access: None,
         }
     }
 
-    pub(super) fn token(&mut self) -> Result<String> {
+    pub(in crate::backup) fn token(&mut self) -> Result<String> {
         if let Some(t) = &self.access {
             return Ok(t.clone());
         }
+        let creds = self.service.creds.as_ref().ok_or(Error::DriveUnavailable)?;
         let result = oauth::refresh(
             &self.http,
-            &self.service.creds,
+            creds,
             &self.service.endpoints,
             &self.refresh_token,
         );
@@ -198,7 +132,7 @@ impl<'a> Drive<'a> {
     }
 
     /// Every backup in the app folder (unordered).
-    pub(super) fn list(&mut self) -> Result<Vec<BackupFile>> {
+    pub(in crate::backup) fn list(&mut self) -> Result<Vec<BackupFile>> {
         let query = format!("name contains '{BACKUP_PREFIX}' and trashed = false");
         let mut files = self.list_where(&query, "Listing backups")?;
         files.retain(is_config_backup);
@@ -241,20 +175,20 @@ impl<'a> Drive<'a> {
     }
 
     /// Multipart upload into the app folder.
-    pub(super) fn upload(
+    pub(in crate::backup) fn upload(
         &mut self,
         name: &str,
-        host: &str,
-        fingerprint: &str,
+        props: &BTreeMap<String, String>,
         bytes: &[u8],
     ) -> Result<BackupFile> {
         let metadata = serde_json::json!({
             "name": name,
             "parents": ["appDataFolder"],
             "mimeType": "application/gzip",
-            "appProperties": { "host": host, "fingerprint": fingerprint },
+            "appProperties": props,
         });
-        let boundary = format!("omp-deck-{}", fingerprint.get(..24).unwrap_or(fingerprint));
+        let tag = props.get("fingerprint").map_or(name, String::as_str);
+        let boundary = format!("omp-deck-{}", tag.get(..24).unwrap_or(tag));
         let mut body = Vec::with_capacity(bytes.len() + 512);
         body.extend_from_slice(
             format!(
@@ -278,7 +212,7 @@ impl<'a> Drive<'a> {
         read_json(resp, "Uploading the backup")
     }
 
-    pub(super) fn download(&mut self, id: &str) -> Result<Vec<u8>> {
+    pub(in crate::backup) fn download(&mut self, id: &str) -> Result<Vec<u8>> {
         let url = self.file_url(id)?;
         let mut resp = self.authed("Downloading the backup", |http, auth| {
             http.get(&url)
@@ -294,7 +228,7 @@ impl<'a> Drive<'a> {
     }
 
     /// The metadata Drive holds for `id`; `None` when the file no longer exists (404).
-    pub(super) fn metadata(&mut self, id: &str) -> Result<Option<BackupFile>> {
+    pub(in crate::backup) fn metadata(&mut self, id: &str) -> Result<Option<BackupFile>> {
         const WHAT: &str = "Reading the backup's details";
         let url = self.file_url(id)?;
         let mut resp = self.raw(Lane::Api, |http, auth| {
@@ -314,7 +248,7 @@ impl<'a> Drive<'a> {
         read_json(resp, WHAT).map(Some)
     }
 
-    pub(super) fn delete(&mut self, id: &str) -> Result<()> {
+    pub(in crate::backup) fn delete(&mut self, id: &str) -> Result<()> {
         let url = self.file_url(id)?;
         self.authed("Deleting an old backup", |http, auth| {
             http.delete(&url).header("Authorization", auth).call()
@@ -325,7 +259,7 @@ impl<'a> Drive<'a> {
     /// Permanent `files.delete` (bypasses the trash). A file that is already gone (404) counts as
     /// deleted. Network errors and 429/5xx answers are retried ([`MAX_ATTEMPTS`] in a row, backing
     /// off).
-    pub(super) fn delete_permanently(&mut self, id: &str) -> Result<()> {
+    pub(in crate::backup) fn delete_permanently(&mut self, id: &str) -> Result<()> {
         const WHAT: &str = "Deleting the backup";
         let url = self.file_url(id)?;
         let never = AtomicBool::new(false);
@@ -375,7 +309,7 @@ impl<'a> Drive<'a> {
     /// Network errors and 5xx answers are retried (`bytes */total` asks Drive how much it has,
     /// then the upload continues from there) up to [`MAX_ATTEMPTS`] times in a row; an expired
     /// session (404/410) is restarted once. `progress` gets the acknowledged byte count.
-    pub(super) fn upload_file(
+    pub(in crate::backup) fn upload_file(
         &mut self,
         name: &str,
         props: &BTreeMap<String, String>,
@@ -539,7 +473,7 @@ impl<'a> Drive<'a> {
     /// dropped connection, a network error or a 429/5xx answer. [`MAX_ATTEMPTS`] failures in a
     /// row end the download; a request that delivered bytes resets the count. `progress` gets
     /// the byte count.
-    pub(super) fn download_to(
+    pub(in crate::backup) fn download_to(
         &mut self,
         id: &str,
         size: u64,
@@ -649,16 +583,75 @@ impl<'a> Drive<'a> {
     }
 
     /// Every project backup in the app folder (unordered).
-    pub(super) fn list_projects(&mut self) -> Result<Vec<BackupFile>> {
+    pub(in crate::backup) fn list_projects(&mut self) -> Result<Vec<BackupFile>> {
         let query = format!(
             "appProperties has {{ key='kind' and value='{PROJECT_KIND}' }} and trashed = false"
         );
         let mut files = self.list_where(&query, "Listing project backups")?;
-        files.retain(|f| {
-            f.name.starts_with(PROJECT_PREFIX)
-                && f.props.get("kind").map(String::as_str) == Some(PROJECT_KIND)
-        });
+        files.retain(is_project_backup);
         Ok(files)
+    }
+}
+
+impl Remote for Drive<'_> {
+    fn check(&mut self) -> Result<()> {
+        self.token().map(drop)
+    }
+
+    fn list_config(&mut self) -> Result<Vec<BackupFile>> {
+        self.list()
+    }
+
+    fn list_projects(&mut self) -> Result<Vec<BackupFile>> {
+        Drive::list_projects(self)
+    }
+
+    fn upload_bytes(
+        &mut self,
+        name: &str,
+        props: &BTreeMap<String, String>,
+        bytes: &[u8],
+    ) -> Result<BackupFile> {
+        self.upload(name, props, bytes)
+    }
+
+    fn upload_file(
+        &mut self,
+        name: &str,
+        props: &BTreeMap<String, String>,
+        file: &mut File,
+        total: u64,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<BackupFile> {
+        Drive::upload_file(self, name, props, file, total, cancel, progress)
+    }
+
+    fn download(&mut self, id: &str) -> Result<Vec<u8>> {
+        Drive::download(self, id)
+    }
+
+    fn download_to(
+        &mut self,
+        id: &str,
+        size: u64,
+        out: &mut File,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<()> {
+        Drive::download_to(self, id, size, out, cancel, progress)
+    }
+
+    fn metadata(&mut self, id: &str) -> Result<Option<BackupFile>> {
+        Drive::metadata(self, id)
+    }
+
+    fn delete(&mut self, id: &str) -> Result<()> {
+        Drive::delete(self, id)
+    }
+
+    fn delete_permanently(&mut self, id: &str) -> Result<()> {
+        Drive::delete_permanently(self, id)
     }
 }
 

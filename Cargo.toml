@@ -4,7 +4,7 @@ members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/d
 
 [workspace.package]
 edition = "2024"
-version = "0.19.1"
+version = "0.20.0"
 license = "MIT OR Apache-2.0"
 publish = false
 description = "Desktop wrapper for the omp coding-agent TUI: session sidebar, tabs, embedded terminal backed by tmux or its own session host (Linux, Windows)"
@@ -55,6 +55,14 @@ wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # Sharpshooter memory restore takes omp's consolidation lock: pi-natives names it with xxh64.
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+# Server backup destination (deck-core `backup::server`): FTP/explicit FTPS (sync API, rustls + ring like
+# ureq; no OpenSSL/aws-lc) and SFTP (russh on ring, driven from a private current-thread runtime).
+suppaftp = { version = "12.2", default-features = false, features = ["rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
+russh-sftp = "3"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 
 [profile.dev.package."*"]
 opt-level = 2

@@ -3,11 +3,11 @@
 
 pub mod agent_defs;
 pub mod agents;
+pub mod backup;
 pub mod changes;
 pub mod config;
 pub mod ctl;
 pub mod fleet;
-pub mod gdrive;
 pub(crate) mod git;
 pub mod inventory;
 pub mod mux;

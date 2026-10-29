@@ -1,29 +1,41 @@
 //! Project sync UI (pure: state in, actions out; the logic lives in `app/project_sync.rs` and
-//! `deck_core::gdrive`): the Settings "Sync" page, the restore dialog, the sidebar's backup dialog
+//! `deck_core::backup`): the Settings "Sync" page, the restore dialog, the sidebar's backup dialog
 //! and the typed-path prompt.
 
+use deck_core::backup::ConflictChoice;
 use deck_core::config::SyncInterval;
-use deck_core::gdrive::ConflictChoice;
 use egui::{Button, Context, Frame, Id, Margin, RichText, ScrollArea, Stroke, Ui, vec2};
 
+use crate::backup_view::{BackupAction, BackupCard, DriveAccount};
 use crate::badge::{self, Hue};
 use crate::card as deck_card;
 use crate::confirm::{Dialog, show_dialog, show_dialog_labeled};
-use crate::drive_view::{DriveAction, DriveCard};
 use crate::icons::{
     ICON_ARCHIVE_RESTORE, ICON_CIRCLE_CHECK, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_FOLDER,
     ICON_FOLDER_OPEN, ICON_FOLDER_PLUS, ICON_LIST_CHECKS, ICON_LOG_IN, ICON_PENCIL,
-    ICON_REFRESH_CW, ICON_TRASH_2, ICON_TRIANGLE_ALERT, ICON_X,
+    ICON_REFRESH_CW, ICON_SETTINGS, ICON_TRASH_2, ICON_TRIANGLE_ALERT, ICON_X,
 };
 use crate::theme::{self, Palette};
 use crate::widgets::{DraftButton, DraftKind, Spin, card, icon_text, setting_row, toggle};
+use deck_core::backup::Destination;
 
 const PLAN_LIST_MAX: usize = 8;
 
-/// Wording shared by the page, the sidebar menus and the dialogs.
-pub const NOTE: &str = "Stored in OmpDeck's private Google Drive app folder and counted toward your \
-     Drive storage. A project's .omp folder may contain secrets (API tokens in config.yml, \
-     mcp.json, secrets.yml).";
+/// Where project backups are stored and what to mind (the page and the backup dialog).
+pub fn note(destination: Destination) -> &'static str {
+    match destination {
+        Destination::Drive => {
+            "Stored in OmpDeck's private Google Drive app folder and counted toward your Drive \
+             storage. A project's .omp folder may contain secrets (API tokens in config.yml, \
+             mcp.json, secrets.yml)."
+        }
+        Destination::Server => {
+            "Stored in the folder you chose on your server, readable by whoever can read that \
+             folder. A project's .omp folder may contain secrets (API tokens in config.yml, \
+             mcp.json, secrets.yml)."
+        }
+    }
+}
 
 // ------------------------------------------------------------------ shared cells
 
@@ -232,7 +244,7 @@ pub struct RowView {
 }
 
 pub struct SyncPage<'a> {
-    pub account: &'a DriveCard,
+    pub account: &'a BackupCard,
     pub rows: &'a [RowView],
     pub interval: SyncInterval,
     /// A project job (any row, a restore) is running: starting another is disabled.
@@ -245,7 +257,8 @@ pub struct SyncPage<'a> {
 pub enum SyncAction {
     /// The page was drawn this frame (the app measures sizes when it newly appears).
     Visible,
-    Drive(DriveAction),
+    /// The destination strip (sign-in, or opening Settings → Backup).
+    Backup(BackupAction),
     Add,
     Change(usize),
     Remove(usize),
@@ -259,16 +272,47 @@ pub enum SyncAction {
     OpenManager,
 }
 
-fn account_strip(ui: &mut Ui, account: &DriveCard, actions: &mut Vec<SyncAction>) {
+/// The active destination: the Google account (with sign-in) or the saved server.
+fn account_strip(ui: &mut Ui, account: &BackupCard, actions: &mut Vec<SyncAction>) {
     let pal = Palette::of_ui(ui);
-    match account {
-        DriveCard::Unavailable => setting_row(
+    let settings = |ui: &mut Ui, actions: &mut Vec<SyncAction>, primary: bool| {
+        let kind = if primary {
+            DraftKind::Primary
+        } else {
+            DraftKind::Secondary
+        };
+        if button(ui, true, kind, ICON_SETTINGS, "Backup settings…").clicked() {
+            actions.push(SyncAction::Backup(BackupAction::OpenBackupSettings));
+        }
+    };
+    if account.destination == Destination::Server {
+        match &account.server {
+            Some(s) => setting_row(
+                ui,
+                &s.label,
+                &format!(
+                    "Project backups go to the folder {} on this server",
+                    s.folder
+                ),
+                |ui| settings(ui, actions, false),
+            ),
+            None => setting_row(
+                ui,
+                "No backup server yet",
+                "Set up your FTP, FTPS or SFTP server in Settings → Backup",
+                |ui| settings(ui, actions, true),
+            ),
+        }
+        return;
+    }
+    match &account.drive {
+        DriveAccount::Unavailable => setting_row(
             ui,
-            "Not available in this build",
-            "This OmpDeck was built without a Google OAuth client",
-            |_| {},
+            "Google Drive is not available in this build",
+            "Back up to your own FTP or SFTP server instead (Settings → Backup)",
+            |ui| settings(ui, actions, true),
         ),
-        DriveCard::SignedOut => setting_row(
+        DriveAccount::SignedOut => setting_row(
             ui,
             "Sign in to back up projects",
             "Uses the same Google account as the config backup",
@@ -282,22 +326,22 @@ fn account_strip(ui: &mut Ui, account: &DriveCard, actions: &mut Vec<SyncAction>
                 )
                 .clicked()
                 {
-                    actions.push(SyncAction::Drive(DriveAction::SignIn));
+                    actions.push(SyncAction::Backup(BackupAction::SignIn));
                 }
             },
         ),
-        DriveCard::Waiting => setting_row(
+        DriveAccount::Waiting => setting_row(
             ui,
             "Waiting for the browser…",
             "Finish signing in on the Google page that just opened.",
             |ui| {
                 if button(ui, true, DraftKind::Secondary, ICON_X, "Cancel").clicked() {
-                    actions.push(SyncAction::Drive(DriveAction::CancelSignIn));
+                    actions.push(SyncAction::Backup(BackupAction::CancelSignIn));
                 }
                 ui.add(Spin::new(18.0, pal.accent_b));
             },
         ),
-        DriveCard::SignedIn { email, .. } => {
+        DriveAccount::SignedIn { email } => {
             let who = email
                 .as_deref()
                 .map_or_else(|| "Signed in".to_owned(), |e| format!("Signed in as {e}"));
@@ -315,25 +359,30 @@ fn account_strip(ui: &mut Ui, account: &DriveCard, actions: &mut Vec<SyncAction>
 pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
     let pal = Palette::of_ui(ui);
     let mut actions = vec![SyncAction::Visible];
+    let place = page.account.place.as_str();
     ui.label(theme::strong("Sync").size(22.0).color(pal.text_strong));
     ui.label(
-        RichText::new(
-            "Back up a project's .omp folder, its omp sessions and omp's project memory to Google Drive",
-        )
-            .color(pal.weak),
+        RichText::new(format!(
+            "Back up a project's .omp folder, its omp sessions and omp's project memory to {place}"
+        ))
+        .color(pal.weak),
     );
     ui.add_space(16.0);
 
-    let signed_in = matches!(page.account, DriveCard::SignedIn { .. });
-    card(ui, "Google account", |ui| {
+    let linked = page.account.linked();
+    let title = match page.account.destination {
+        Destination::Drive => "Google account",
+        Destination::Server => "Backup server",
+    };
+    card(ui, title, |ui| {
         account_strip(ui, page.account, &mut actions);
     });
 
-    let idle = signed_in && !page.lane_busy;
-    let why_not = if !signed_in {
-        "Sign in with Google first"
+    let idle = linked && !page.lane_busy;
+    let why_not = if linked {
+        "Another backup or restore is running"
     } else {
-        "Another project backup or restore is running"
+        page.account.unlinked_reason()
     };
     card(ui, "Projects", |ui| {
         if page.rows.is_empty() {
@@ -391,7 +440,7 @@ pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
     card(ui, "Restore", |ui| {
         setting_row(
             ui,
-            "Restore a project from Google Drive",
+            &format!("Restore a project from {place}"),
             "Pick a backup, a folder on this computer and what to bring back",
             |ui| {
                 let resp = button(
@@ -410,7 +459,7 @@ pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
                     idle,
                     DraftKind::Secondary,
                     ICON_LIST_CHECKS,
-                    "Manage cloud backups…",
+                    "Manage project backups…",
                 );
                 if resp.clicked() {
                     actions.push(SyncAction::OpenManager);
@@ -418,7 +467,7 @@ pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
                 resp.on_disabled_hover_text(why_not);
             },
         );
-        weak_note(ui, NOTE);
+        weak_note(ui, note(page.account.destination));
     });
     actions
 }
@@ -459,7 +508,7 @@ fn project_row(
                             .min_size(vec2(0.0, theme::dens(28.0, 30.0))),
                     );
                     if rm
-                        .on_hover_text("Remove from Sync (Drive backups stay)")
+                        .on_hover_text("Remove from Sync (its backups stay)")
                         .clicked()
                     {
                         actions.push(SyncAction::Remove(i));
@@ -827,12 +876,13 @@ pub enum BackupAnswer {
     ChooseSessions,
 }
 
-/// "Back up to Google Drive": both parts with their sizes, "Keep this folder in Sync", Back up now.
+/// "Back up to {place}": the parts with their sizes, "Keep this folder in Sync", Back up now.
 pub fn backup_dialog(
     ctx: &Context,
     d: &mut BackupDialog,
     cells: &Cells,
     busy: bool,
+    account: &BackupCard,
 ) -> BackupAnswer {
     let pal = Palette::of_ctx(ctx);
     let mut choose = false;
@@ -843,14 +893,17 @@ pub fn backup_dialog(
         ctx,
         &Dialog {
             id: "sync-backup",
-            title: "Back up to Google Drive",
+            title: &format!("Back up to {}", account.place),
             width: 480.0,
             confirm_label: "Back up now",
             confirm_enabled: any && !busy,
             danger: false,
             enter_confirms: false,
             icon: Some(ICON_CLOUD_UPLOAD),
-            subtitle: Some("Project folder to OmpDeck's private Drive folder"),
+            subtitle: Some(match account.destination {
+                Destination::Drive => "Project folder to OmpDeck's private Drive folder",
+                Destination::Server => "Project folder to the backup folder on your server",
+            }),
             ..Default::default()
         },
         |ui| {
@@ -938,7 +991,7 @@ pub fn backup_dialog(
             ui.checkbox(&mut d.keep, "Keep this folder in Sync")
                 .on_hover_text("Adds the folder to the Sync page so it is backed up automatically");
             ui.add_space(6.0);
-            weak_note(ui, NOTE);
+            weak_note(ui, note(account.destination));
             if busy {
                 ui.add_space(6.0);
                 weak_note(
@@ -974,7 +1027,7 @@ pub struct VersionRow {
     pub has_memory: bool,
 }
 
-/// A project on Drive: every version of one (host, path).
+/// A project at the backup destination: every version of one (host, path).
 pub struct CloudProject {
     pub name: String,
     pub path: String,
@@ -1177,7 +1230,7 @@ pub enum RestoreAction {
     /// The target text was edited.
     TargetEdited,
     Select(usize, usize),
-    /// Delete the version (project, version) from Drive (asks first).
+    /// Delete the version (project, version) from the destination (asks first).
     Delete(usize, usize),
     Continue,
     /// Open the chooser of the sessions this restore brings back (confirm step).
@@ -1192,6 +1245,7 @@ pub fn restore_dialog(
     d: &mut RestoreDialog,
     progress: Option<&ProgView>,
     lane_busy: bool,
+    place: &str,
 ) -> Option<RestoreAction> {
     let pal = Palette::of_ctx(ctx);
     let mut act = None;
@@ -1206,7 +1260,7 @@ pub fn restore_dialog(
         ctx,
         &Dialog {
             id: "sync-restore",
-            title: "Restore a project from Google Drive",
+            title: &format!("Restore a project from {place}"),
             width: 560.0,
             confirm_label: label,
             confirm_enabled: enabled,
@@ -1239,7 +1293,7 @@ pub fn restore_dialog(
                 return;
             }
             match &d.step {
-                Step::Pick => pick_body(ui, d, lane_busy, &mut act),
+                Step::Pick => pick_body(ui, d, lane_busy, place, &mut act),
                 Step::Preparing => {
                     progress_or_wait(ui, progress, "Downloading and checking the backup…");
                 }
@@ -1357,7 +1411,13 @@ fn progress_or_wait(ui: &mut Ui, p: Option<&ProgView>, fallback: &str) {
     }
 }
 
-fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Option<RestoreAction>) {
+fn pick_body(
+    ui: &mut Ui,
+    d: &mut RestoreDialog,
+    lane_busy: bool,
+    place: &str,
+    act: &mut Option<RestoreAction>,
+) {
     let pal = Palette::of_ui(ui);
     if let Some(e) = &d.error {
         ui.horizontal(|ui| {
@@ -1390,9 +1450,9 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
         }
         ListState::Ready(p) if p.is_empty() => {
             let msg = if d.target_fixed {
-                "No backups of this folder on Google Drive yet."
+                format!("No backups of this folder on {place} yet.")
             } else {
-                "No project backups on Google Drive yet."
+                format!("No project backups on {place} yet.")
             };
             ui.label(RichText::new(msg).color(pal.weak));
             return;
@@ -1442,7 +1502,7 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
                                     Button::new(icon_text(ICON_TRASH_2, 14.0, pal.danger))
                                         .min_size(vec2(26.0, 24.0)),
                                 )
-                                .on_hover_text("Delete this backup from Google Drive")
+                                .on_hover_text(format!("Delete this backup from {place}"))
                                 .on_disabled_hover_text("Another project job is running");
                             if del.clicked() {
                                 *act = Some(RestoreAction::Delete(pi, vi));
@@ -2215,6 +2275,7 @@ pub fn manager_dialog(
     d: &mut ManagerDialog,
     progress: Option<&ProgView>,
     lane_busy: bool,
+    place: &str,
 ) -> Option<ManagerAction> {
     let pal = Palette::of_ctx(ctx);
     let mut act = None;
@@ -2248,23 +2309,27 @@ pub fn manager_dialog(
             } else {
                 ICON_LIST_CHECKS
             }),
-            subtitle: Some(match d.step {
-                ManagerStep::Browse => "Delete old versions or another PC's project backups",
-                ManagerStep::Confirm => "Permanent — cannot be undone",
-                ManagerStep::Deleting => "Deleting from Google Drive…",
+            subtitle: Some(&match d.step {
+                ManagerStep::Browse => {
+                    "Delete old versions or another PC's project backups".to_owned()
+                }
+                ManagerStep::Confirm => "Permanent — cannot be undone".to_owned(),
+                ManagerStep::Deleting => format!("Deleting from {place}…"),
             }),
             ..Default::default()
         },
         cancel_label,
         |ui| match d.step {
-            ManagerStep::Browse => manager_body(ui, d, selected, bytes, lane_busy, &mut act),
+            ManagerStep::Browse => {
+                manager_body(ui, d, selected, bytes, lane_busy, place, &mut act);
+            }
             ManagerStep::Confirm => {
                 let wrap = |ui: &mut Ui, t: RichText| {
                     ui.add(egui::Label::new(t).wrap_mode(egui::TextWrapMode::Wrap));
                 };
                 wrap(
                     ui,
-                    RichText::new("Permanently delete these backups from Google Drive?")
+                    RichText::new(format!("Permanently delete these backups from {place}?"))
                         .color(pal.text_strong),
                 );
                 ui.add_space(6.0);
@@ -2275,7 +2340,7 @@ pub fn manager_dialog(
                     badge::show(ui, None, &crate::app::human_size(bytes), Hue::Teal, 11.0);
                 });
                 deck_card::kv(ui, 84.0, "Target", |ui| {
-                    badge::show(ui, Some(ICON_CLOUD), "Google Drive", Hue::Blue, 11.0);
+                    badge::show(ui, Some(ICON_CLOUD), place, Hue::Blue, 11.0);
                 });
                 ui.add_space(4.0);
                 wrap(
@@ -2341,6 +2406,7 @@ fn manager_body(
     selected: usize,
     bytes: u64,
     lane_busy: bool,
+    place: &str,
     act: &mut Option<ManagerAction>,
 ) {
     let pal = Palette::of_ui(ui);
@@ -2366,7 +2432,7 @@ fn manager_body(
         ListState::Ready(g) => g,
     };
     if groups.is_empty() {
-        ui.label(RichText::new("No project backups on Google Drive.").color(pal.weak));
+        ui.label(RichText::new(format!("No project backups on {place}.")).color(pal.weak));
         ui.add_space(8.0);
         if button(
             ui,
@@ -2718,11 +2784,17 @@ mod render_tests {
                 fraction: Some(0.4),
             }),
         }];
-        let account = DriveCard::SignedIn {
-            email: Some("a@b.c".into()),
+        let account = BackupCard {
+            destination: Destination::Drive,
+            drive: DriveAccount::SignedIn {
+                email: Some("a@b.c".into()),
+            },
+            server: None,
+            place: "Google Drive".into(),
             last: None,
             interval: SyncInterval::Every10Minutes,
             busy: None,
+            picker: false,
         };
         let page_state = SyncPage {
             account: &account,
@@ -2794,13 +2866,13 @@ mod render_tests {
         for step in steps {
             d.step = step;
             frames(|_, ctx| {
-                restore_dialog(ctx, &mut d, Some(&progress), false);
+                restore_dialog(ctx, &mut d, Some(&progress), false, "Google Drive");
             });
         }
         d.list = ListState::Failed("offline".into());
         d.step = Step::Pick;
         frames(|_, ctx| {
-            restore_dialog(ctx, &mut d, None, false);
+            restore_dialog(ctx, &mut d, None, false, "sftp://nas");
         });
     }
 
@@ -2817,9 +2889,19 @@ mod render_tests {
             excluded: 2,
         };
         let mut p = PathPrompt::new(PathPurpose::Add);
+        let account = BackupCard {
+            destination: Destination::Server,
+            drive: DriveAccount::Unavailable,
+            server: None,
+            place: "sftp://nas".into(),
+            last: None,
+            interval: SyncInterval::Daily,
+            busy: None,
+            picker: false,
+        };
         frames(|_, ctx| {
             assert!(matches!(
-                backup_dialog(ctx, &mut b, &cells(), false),
+                backup_dialog(ctx, &mut b, &cells(), false, &account),
                 BackupAnswer::Open
             ));
             assert!(matches!(path_dialog(ctx, &mut p), PathAnswer::Open));

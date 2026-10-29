@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,7 +12,30 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 use super::archive::Snapshot;
+use super::drive::client::Drive;
+use super::drive::{Account, AccountStore, Credentials, Endpoints, LoginFlow};
 use super::*;
+
+impl Service {
+    /// A Drive client signed in as `account`.
+    fn drive(&self, account: &Account) -> Drive<'_> {
+        Drive::new(self, account.refresh_token.clone())
+    }
+}
+
+/// A Drive service over the mock Google at `base`, state under `dir`.
+fn drive_service(dir: &Path, store: &str, base: &str, agent: PathBuf) -> Service {
+    Service {
+        creds: Some(creds()),
+        endpoints: endpoints(base),
+        store: AccountStore::at(dir.join(store)),
+        server_store: server::ServerStore::at(dir.join("cfg/backup-server.json")),
+        destination: Destination::Drive,
+        agent_dir: agent,
+        safety_root: dir.join("safety"),
+        cache_root: dir.join("cache"),
+    }
+}
 
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -553,7 +576,10 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         .filter(|kv| !kv.is_empty())
         .map(|kv| {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (super::oauth::decode(k), super::oauth::decode(v))
+            (
+                super::drive::oauth::decode(k),
+                super::drive::oauth::decode(v),
+            )
         })
         .collect();
     Some(Request {
@@ -570,7 +596,10 @@ fn form(body: &[u8]) -> BTreeMap<String, String> {
         .split('&')
         .map(|kv| {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (super::oauth::decode(k), super::oauth::decode(v))
+            (
+                super::drive::oauth::decode(k),
+                super::drive::oauth::decode(v),
+            )
         })
         .collect()
 }
@@ -875,14 +904,12 @@ fn backup_list_restore_and_prune_against_a_mock_google() {
         mock.files.insert(f.id.clone(), (f, Vec::new()));
     }
     let mock = Arc::new(Mutex::new(mock));
-    let service = Service {
-        creds: creds(),
-        endpoints: endpoints(&serve(mock.clone())),
-        store: AccountStore::at(tmp.path().join("cfg/google-drive.json")),
-        agent_dir: agent.clone(),
-        safety_root: tmp.path().join("safety"),
-        cache_root: tmp.path().join("cache"),
-    };
+    let service = drive_service(
+        tmp.path(),
+        "cfg/google-drive.json",
+        &serve(mock.clone()),
+        agent.clone(),
+    );
     assert!(matches!(service.backup(true), Err(Error::NotSignedIn)));
     service
         .store
@@ -966,14 +993,12 @@ fn a_revoked_grant_signs_out() {
     let tmp = tempfile::tempdir().unwrap();
     let agent = tmp.path().join("agent");
     write(&agent.join("config.yml"), "a\n");
-    let service = Service {
-        creds: creds(),
-        endpoints: endpoints(&serve(Arc::default())),
-        store: AccountStore::at(tmp.path().join("google-drive.json")),
-        agent_dir: agent,
-        safety_root: tmp.path().join("safety"),
-        cache_root: tmp.path().join("cache"),
-    };
+    let service = drive_service(
+        tmp.path(),
+        "google-drive.json",
+        &serve(Arc::default()),
+        agent,
+    );
     service
         .store
         .save(&Account {
@@ -995,14 +1020,12 @@ fn signed_in_with(files: &[BackupFile]) -> (tempfile::TempDir, Service, Arc<Mute
         mock.files.insert(f.id.clone(), (f.clone(), vec![1]));
     }
     let mock = Arc::new(Mutex::new(mock));
-    let service = Service {
-        creds: creds(),
-        endpoints: endpoints(&serve(mock.clone())),
-        store: AccountStore::at(tmp.path().join("cfg/google-drive.json")),
-        agent_dir: agent,
-        safety_root: tmp.path().join("safety"),
-        cache_root: tmp.path().join("cache"),
-    };
+    let service = drive_service(
+        tmp.path(),
+        "cfg/google-drive.json",
+        &serve(mock.clone()),
+        agent,
+    );
     service
         .store
         .save(&Account {
@@ -1125,7 +1148,7 @@ mod project_sync {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::gdrive::archive::hex;
+    use crate::backup::archive::hex;
     use crate::omp::Omp;
     use crate::sessions::{self, SessionsRoot};
     use crate::sharpshooter;
@@ -1168,14 +1191,12 @@ mod project_sync {
         let agent = tmp.path().join("agent");
         fs::create_dir_all(&agent).unwrap();
         let mock = Arc::new(Mutex::new(mock));
-        let service = Service {
-            creds: creds(),
-            endpoints: endpoints(&serve(mock.clone())),
-            store: AccountStore::at(tmp.path().join("cfg/google-drive.json")),
-            agent_dir: agent.clone(),
-            safety_root: tmp.path().join("safety"),
-            cache_root: tmp.path().join("cache"),
-        };
+        let service = drive_service(
+            tmp.path(),
+            "cfg/google-drive.json",
+            &serve(mock.clone()),
+            agent.clone(),
+        );
         service
             .store
             .save(&Account {
@@ -4091,3 +4112,5 @@ mod project_sync {
         ));
     }
 }
+
+mod server_destination;

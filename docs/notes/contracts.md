@@ -1097,7 +1097,7 @@ impl SyncInterval { pub fn period(self) -> Option<Duration>; pub const ALL: [Syn
 // AppConfig gains: pub project_sync: Vec<SyncRow> (default empty), pub project_sync_interval: SyncInterval.
 ```
 
-### deck_core::gdrive::project (new; re-exported from `gdrive`)
+### deck_core::backup::project (new; re-exported from `backup`)
 
 ```rust
 pub const PROJECT_PREFIX: &str = "omp-project-";
@@ -1252,7 +1252,7 @@ impl Service {
   `drive_backup_interval` key → `Off`; `true`/absent → `Every10Minutes`. The old key is never written again.
 - `config::SyncRow` gains `#[serde(default)] excluded_sessions: BTreeSet<String>` (session ids opted out; every
   other session, including ones created later, is backed up).
-- `gdrive::ProjectSizes` (now `Clone`, not `Copy`) gains `session_list: Vec<SessionSize>`, newest first, for every
+- `backup::ProjectSizes` (now `Clone`, not `Copy`) gains `session_list: Vec<SessionSize>`, newest first, for every
   session of the project (exclusions not applied; `sessions`/`session_bytes` stay totals over all of them).
   `SessionSize { id: String, title: String /* title, else first-prompt snippet, else "(untitled)" */,
   modified: SystemTime, bytes: u64 /* jsonl + artifacts */ }`.
@@ -1389,7 +1389,7 @@ payloads raw (`Input`, `Output`, `Snapshot` chunks), control payloads JSON (unkn
 - omp on Windows: `Omp::detect` searches PATH (PATHEXT), `%LOCALAPPDATA%\omp\omp.exe`,
   `%USERPROFILE%\.bun\bin\omp.exe`; `.cmd` runs through `cmd.exe /d /c`; install argv = PowerShell
   `& ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary` (`-NoProfile -ExecutionPolicy Bypass`).
-- gdrive on Windows: no POSIX modes (stored as 0o644/0o755 by origin), `path_id` over `as_encoded_bytes()`,
+- backup on Windows: no POSIX modes (stored as 0o644/0o755 by origin), `path_id` over `as_encoded_bytes()`,
   restore skips (and lists in `omp_skipped`) names invalid on Windows (`<>:"|?*`, control chars, reserved
   CON/PRN/AUX/NUL/COM1-9/LPT1-9, trailing dot/space) and never writes through reparse points.
 - `status.rs` breadcrumb trust uses `Mux::pane`; a bare `omp` title is noise on Windows.
@@ -1916,7 +1916,7 @@ pub struct BankLock { /* platform handle */ }
 ### deck_core::config
 - `SyncRow` gains `#[serde(default)] pub memory: bool` (new rows: off, per Wave 11).
 
-### deck_core::gdrive::project
+### deck_core::backup::project
 - `Parts` gains `#[serde(default)] pub memory: bool`; `any()` includes it.
 - `pub enum MemoryBank { Missing, Present { files: u64, bytes: u64 } }` (Missing = bank dir absent or all three
   files missing/empty/non-regular). `ProjectSizes` gains `pub memory: MemoryBank` and `pub memory_dir: PathBuf`
@@ -2699,8 +2699,8 @@ chosen by the user from 10 rendered mockups.
   = 10×8 Compact / 12×10 Comfortable; `theme::menu_style` keeps 6/8 for context menus, dropdowns, notification and
   scope popovers.
 - **Settings-backup manager**:
-  - `deck_core::gdrive::Service::delete_backup(&self, &BackupFile) -> Result<()>`: permanent `files.delete`;
-    re-reads the file's metadata and refuses anything that is not a config backup (`drive::is_config_backup`,
+  - `deck_core::backup::Service::delete_backup(&self, &BackupFile) -> Result<()>`: permanent `files.delete`;
+    re-reads the file's metadata and refuses anything that is not a config backup (`remote::is_config_backup`,
     the same rule as `list()`: `omp-backup-` name, no `kind` property) or whose name changed; 404 = deleted.
     Deleting the recorded `last_backup` clears it and `synced_fingerprint`; deleting a file with the synced
     fingerprint clears that; the next automatic pass then uploads again.
@@ -2788,7 +2788,7 @@ earlier "always alongside, never replace" rule for that case only; the default s
   session failure). Both OmpDeck's sidebar and omp's own picker order/age sessions by file mtime
   (`session-listing.ts` `modified: mtime`, newest-mtime-first). User-approved exception to "OmpDeck never writes
   `~/.omp/**`". A rolled-back local copy (below) gets its own previous mtime back the same way.
-- `deck_core::gdrive` (re-exported like the other project types):
+- `deck_core::backup` (re-exported like the other project types):
   ```rust
   #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
   pub enum ConflictChoice { #[default] KeepLocal, Overwrite, KeepBoth }
@@ -3076,3 +3076,87 @@ deleted).
   take focus back and its input is held while it is open (`hold_input_during_modals`). Drawn right after the central
   panel, so the other windows and dialogs stack above it. `SettingsAction::InstallOmp` closes it before opening the
   installer tab. The title-bar gear shows active while it is open; the quick switcher no longer lists a Settings tab.
+
+## Backup destinations: Google Drive or an FTP/FTPS/SFTP server (deck-core)
+
+- Module `deck_core::gdrive` is now `deck_core::backup`: `archive`, `project` and the shared `Service` logic at the
+  root; `backup::drive` (`Account`, `AccountStore`, `Credentials`, `Endpoints`, `LoginFlow`, `LOGIN_TIMEOUT`,
+  `SCOPES`; private `client` = Drive v3, `oauth`); `backup::server` (FTP/FTPS/SFTP); private `remote` (the
+  `Remote` trait every operation goes through, `BackupFile`, `is_config_backup`/`is_project_backup`, `to_delete`).
+- `pub enum Destination { #[default] Drive, Server }` (serde: `"Drive"`, `"Server"`);
+  `AppConfig.backup_destination: Destination` (default Drive). One destination is active at a time.
+- `Service { creds: Option<Credentials> /* None = Drive unavailable */, endpoints, store: AccountStore,
+  server_store: ServerStore, destination, agent_dir, safety_root, cache_root }`; `Service::new(Option<Credentials>,
+  agent_dir)` (Drive active); `with_destination(Destination) -> Service` (clone). `backup`, `list`,
+  `prepare_restore`, `apply_restore`, `delete_backup`, `backup_project`, `list_projects`, `prepare_project_restore`,
+  `apply_project_restore`, `delete_project_backup`, `project_state` act on `destination`. Without a linked
+  destination: Drive → `NotSignedIn` (`DriveUnavailable` when `creds` is `None`), Server → `NoServer`.
+- State per destination, all under `config_dir()`, mode 0600: Drive `google-drive.json` + `project-sync.json`
+  (unchanged); Server `backup-server.json` (`ServerAccount { config, last_backup, synced_fingerprint }`, holds the
+  password) + `project-sync-server.json`. Switching destinations never reads the other's sync state, so the first
+  pass after a switch uploads. `server_connect` keeps `last_backup`/`synced_fingerprint` and the project state only
+  when protocol, host, port, user and folder are unchanged; otherwise both reset. `server_forget` deletes both server
+  files and nothing on the server.
+- `server::{Protocol { Ftp, Ftps /* explicit AUTH TLS */, Sftp }, ServerAuth { Anonymous /* FTP/FTPS */,
+  Password { user, password }, Key { user, key_path, passphrase } /* SFTP */ } /* serde tag "kind" */,
+  ServerConfig { protocol, host, port /* 0 = 21/22 */, auth, folder /* "" = DEFAULT_FOLDER "omp-deck-backups",
+  relative to the login dir unless it starts with "/" */, pinned: Option<String> }, ServerAccount, ServerStore}`.
+  `ServerConfig::normalized()` → `InvalidServer` for impossible combinations; `label()` = `scheme://host[:port]`.
+  `Debug` of `ServerAuth` redacts secrets.
+- `Service::server_connect(ServerConfig) -> Result<ServerAccount>`: normalize, connect, log in, create the folder,
+  write + rename + delete a probe file, then save. Nothing is saved on failure. `server_account()` reads the file.
+- Trust on first use: `Error::UntrustedServer { fingerprint }` when nothing is pinned (SFTP: any host key; FTPS: a
+  certificate the WebPKI roots reject) — the UI shows the fingerprint and retries with `pinned = Some(fingerprint)`.
+  `Error::ServerChanged { pinned, presented }` when the server shows another key/certificate than the pinned one.
+  SFTP fingerprint = OpenSSH `SHA256:<base64>` (`ssh-keygen -l`); FTPS = `SHA256:` + uppercase colon hex of the leaf
+  DER (`openssl x509 -fingerprint -sha256`). A pinned FTPS certificate is accepted on an exact match only (no
+  WebPKI, name or expiry check). Other server failures are `Error::Server(String)`, worded for the user.
+- Server folder layout: each backup = `<name>.tar.gz` + sidecar `<name>.tar.gz.json`
+  (`{"created": RFC 3339, "size", "props"}` = Drive's `createdTime`/`size`/`appProperties`). Both are uploaded as
+  `.part` and renamed, archive first; a failed or cancelled upload removes its parts. `BackupFile.id` = the archive
+  name. Listing needs the sidecar; only `omp-backup-*`/`omp-project-*` `.tar.gz` names with no `/`, `\`, `..` or
+  control characters are valid ids; other files in the folder are never listed, pruned or deleted. Delete removes
+  the sidecar, then the archive; a missing file counts as deleted. Retention (30 config, 3 per host+project) and
+  the delete safety checks are the Drive rules.
+- Transports (blocking, on the caller's worker thread; connect 15 s, stall 60 s): FTP/FTPS via `suppaftp` 12.2
+  (`rustls-ring`), passive mode with the data connection dialled to the control address, binary type; SFTP via
+  `russh` 0.65 (`ring`) + `russh-sftp` 3 on a private current-thread tokio runtime. No OpenSSL / aws-lc.
+- Wired into the gateway and the GUI in 0.20.0 (next section).
+
+## Backup destinations in the gateway and the GUI (0.20.0)
+
+- Protocol (`PROTOCOL` stays 1; the 0.20.0 gateway version makes a newer GUI replace an older gateway):
+  - `Topic::Drive`/`TopicValue::Drive(DriveView)` → `Topic::Backup`/`TopicValue::Backup(BackupView)`;
+    `StateCache.backup` (always on). `BackupView { destination, drive_available, drive_signed_in, drive_email,
+    server: Option<ServerView>, last_backup /* active destination */, busy /* lane label */, last_error
+    /* automatic backup at the active destination */, last_auto_unix_ms }`, `linked()`, `place()`.
+  - `ServerView { protocol, host, port /* effective */, user /* None = anonymous */, key_path, folder, pinned:
+    bool, label }` = `ServerView::of(&ServerAccount)`: never the password or passphrase.
+  - Renamed (they act on the active destination): queries `BackupList`, `ProjectBackups`, `ProjectSyncState`,
+    `ProjectMeasure { project }` (same `Answer` names); mutations `Backup { force }`, `PrepareRestore(BackupFile)`,
+    `ApplyRestore(u64)`, `DiscardRestore(u64)`, `DeleteBackup(BackupFile)` (journal keys `backup`,
+    `prepare-restore`, `restore`, `discard-restore`, `delete-backup`); `Done::{Backup, Prepared { handle, plan },
+    Restored}`. Google-only ops keep their names: `DriveLoginBegin/Finish/Cancel`, `DriveSignOut`,
+    `Done::{DriveLogin, DriveAccount}`.
+  - `Mutation::ServerConnect { config: ServerConfig, keep_secret: bool }` (`server-connect`) →
+    `Done::ServerConnect(ServerConnectOutcome::{Connected(ServerView), Untrusted { fingerprint }, Changed { pinned,
+    presented }})`: trust answers are results, not errors. Before connecting, `jobs::inherit` fills from the saved
+    server when protocol, host (case-insensitive) and effective port match: a missing `pinned`, and with
+    `keep_secret` an empty password / missing passphrase for the same trimmed user. Remove + add again drops both.
+  - `Mutation::ServerForget` (`server-forget`): deletes the local server files only.
+- Engine: one backup lane for every destination (`backup_lane`; login finish, sign-out, backup, restores, deletes,
+  project jobs, `ServerConnect`, `ServerForget`); refusal "Another backup job is running (…); try again.".
+  `Service` is always built (`Credentials::detect()` may be `None`); jobs use `service.with_destination(
+  cfg.backup_destination)`. Schedules arm per `(destination, linked)` and re-arm on a change; a destination switch
+  clears the shown error; an automatic failure is recorded only while its destination is still active.
+- Settings: `BackupDestination(backup_destination: Destination)`, `Shared`; the GUI switches it through the
+  settings path like any other shared field.
+- GUI: `backup_view.rs` (was `drive_view.rs`) — `BackupCard { destination, drive: DriveAccount, server, place,
+  last, interval, busy, picker }`, `BackupAction`, `ServerForm` (kept in `SettingsState.server_form`); the card
+  shows a "Back up to" picker (Drive disabled with a reason when unavailable), the Drive rows or the server
+  summary/form (protocol FTP/FTPS/SFTP, plain-FTP warning, host, port, anonymous, user, password or key file with
+  Browse… = `transfer::pick_file`, passphrase, folder), the trust dialog with the fingerprint, then the shared
+  schedule/backup/restore/manage rows. `app/backup.rs` (was `app/drive.rs`, `BackupUi`). Dialogs, toasts, the
+  sidebar `BackupMenu { place, off }` and the palette (`project.backup`, `project.restore`, `backup.now`,
+  `backup.restore`, `backup.manage`; `sync.*` unchanged) name the active destination; the Sync page's strip shows
+  the server or a "Backup settings…" button.

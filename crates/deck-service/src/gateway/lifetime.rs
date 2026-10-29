@@ -1208,7 +1208,7 @@ const WATCH_TOPICS: &[Topic] = &[
     Topic::Status,
     Topic::Usage,
     Topic::AppUpdate,
-    Topic::Drive,
+    Topic::Backup,
     Topic::OmpUpdate,
 ];
 

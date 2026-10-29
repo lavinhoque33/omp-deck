@@ -1069,7 +1069,10 @@ mod tests {
                     omp_available: true,
                     can_stop: true,
                     busy: &busy,
-                    drive: crate::sidebar::DriveMenu::Hidden,
+                    backup: crate::sidebar::BackupMenu {
+                        place: "Google Drive",
+                        off: None,
+                    },
                     live_tabs: &[],
                     finishing: &finishing,
                     parked: crate::worktree_ui::ParkView {

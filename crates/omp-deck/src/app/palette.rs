@@ -13,13 +13,13 @@ use egui::{Key, Modifiers};
 
 use super::bar::ActionDialog;
 use super::{App, DEFAULT_FONT};
-use crate::drive_view::DriveAction;
+use crate::backup_view::BackupAction;
 use crate::icons::*;
 use crate::model_picker;
 use crate::notify_view::NotifyAction;
 use crate::palette::{Item, Mode, Outcome, PaletteState, Target};
 use crate::settings_page::OmpDeckPage;
-use crate::sidebar::{DriveMenu, SidebarAction, resume_command};
+use crate::sidebar::{SidebarAction, resume_command};
 use crate::sync_view::SyncAction;
 use crate::tabs::{self, Tab, TabRole};
 use crate::transfer::TransferKind;
@@ -246,7 +246,9 @@ impl App {
         let cwd: Option<PathBuf> = term.map(|t| t.cwd.clone()).or_else(|| self.scope.clone());
         let groups = self.groups();
         let worktree = self.active_worktree();
-        let drive = self.drive_menu();
+        let place = self.backup_place();
+        let project_backup_why = self.backup_menu_off();
+        let config_backup_why = self.backup_unlinked_reason();
         let live = term.is_some_and(|t| !t.terminal().is_exited());
         let can_stop = self.backends_available();
         let cfg = &self.cfg;
@@ -264,11 +266,6 @@ impl App {
             });
         };
         let need = |ok: bool, why: &'static str| (!ok).then_some(why);
-        let drive_why = |d: DriveMenu| match d {
-            DriveMenu::On => None,
-            DriveMenu::Off(why) => Some(why),
-            DriveMenu::Hidden => Some("Google Drive is not configured"),
-        };
         let kind_why = |kind: Kind| -> Why {
             let c = actx.as_ref()?;
             if !session_actions::visible(kind, c) {
@@ -673,22 +670,20 @@ impl App {
             ICON_COPY,
             project_why,
         );
-        if drive != DriveMenu::Hidden {
-            add(
-                "project.drive_backup",
-                "Project: Back up to Google Drive…",
-                None,
-                ICON_CLOUD_UPLOAD,
-                project_why.or(drive_why(drive)),
-            );
-            add(
-                "project.drive_restore",
-                "Project: Restore from Google Drive…",
-                None,
-                ICON_ARCHIVE_RESTORE,
-                project_why.or(drive_why(drive)),
-            );
-        }
+        add(
+            "project.backup",
+            &format!("Project: Back up to {place}…"),
+            None,
+            ICON_CLOUD_UPLOAD,
+            project_why.or(project_backup_why),
+        );
+        add(
+            "project.restore",
+            &format!("Project: Restore from {place}…"),
+            None,
+            ICON_ARCHIVE_RESTORE,
+            project_why.or(project_backup_why),
+        );
         let finishing = worktree
             .as_ref()
             .is_some_and(|w| self.wt.finishing.contains_key(&w.path));
@@ -1059,45 +1054,42 @@ impl App {
             None,
         );
 
-        // Google Drive.
-        if drive != DriveMenu::Hidden {
-            let why = drive_why(drive);
-            add(
-                "drive.backup_now",
-                "Drive: Back up omp config now",
-                None,
-                ICON_CLOUD_UPLOAD,
-                why,
-            );
-            add(
-                "drive.restore",
-                "Drive: Restore omp config…",
-                None,
-                ICON_ARCHIVE_RESTORE,
-                why,
-            );
-            add(
-                "drive.manage",
-                "Drive: Manage settings backups…",
-                None,
-                ICON_LIST_CHECKS,
-                why,
-            );
-            add(
-                "sync.restore",
-                "Drive: Restore a project backup…",
-                None,
-                ICON_ARCHIVE_RESTORE,
-                why,
-            );
-            add(
-                "sync.manage",
-                "Drive: Manage cloud backups…",
-                None,
-                ICON_CLOUD,
-                why,
-            );
-        }
+        // Backups (Google Drive or the user's server).
+        add(
+            "backup.now",
+            &format!("Backup: Back up omp config to {place} now"),
+            None,
+            ICON_CLOUD_UPLOAD,
+            config_backup_why,
+        );
+        add(
+            "backup.restore",
+            &format!("Backup: Restore omp config from {place}…"),
+            None,
+            ICON_ARCHIVE_RESTORE,
+            config_backup_why,
+        );
+        add(
+            "backup.manage",
+            "Backup: Manage settings backups…",
+            None,
+            ICON_LIST_CHECKS,
+            config_backup_why,
+        );
+        add(
+            "sync.restore",
+            "Backup: Restore a project backup…",
+            None,
+            ICON_ARCHIVE_RESTORE,
+            project_backup_why,
+        );
+        add(
+            "sync.manage",
+            "Backup: Manage project backups…",
+            None,
+            ICON_CLOUD,
+            project_backup_why,
+        );
 
         // Sessions list and app.
         add(
@@ -1256,12 +1248,12 @@ impl App {
                     self.copy_text(&cwd.to_string_lossy(), "project path");
                 }
             }
-            "project.drive_backup" => {
+            "project.backup" => {
                 if let Some(cwd) = cwd {
                     self.open_backup_dialog(cwd);
                 }
             }
-            "project.drive_restore" => self.open_restore(cwd),
+            "project.restore" => self.open_restore(cwd),
             "worktree.finish" | "worktree.cancel" | "worktree.remove" => {
                 match self.worktree_to_act_on() {
                     Some(wt) => match id {
@@ -1352,9 +1344,9 @@ impl App {
                 self.apply_notify_action(NotifyAction::WhileViewing(!self.cfg.notify.while_viewing))
             }
             "notify.test" => self.send_test_notification(),
-            "drive.backup_now" => self.apply_drive_action(DriveAction::BackupNow),
-            "drive.restore" => self.apply_drive_action(DriveAction::OpenRestore),
-            "drive.manage" => self.apply_drive_action(DriveAction::OpenManager),
+            "backup.now" => self.apply_backup_action(BackupAction::BackupNow),
+            "backup.restore" => self.apply_backup_action(BackupAction::OpenRestore),
+            "backup.manage" => self.apply_backup_action(BackupAction::OpenManager),
             "sync.restore" => self.apply_sync_action(SyncAction::OpenRestore),
             "sync.manage" => self.apply_sync_action(SyncAction::OpenManager),
             "app.refresh" => self.refresh_sessions(),

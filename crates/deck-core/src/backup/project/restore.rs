@@ -24,8 +24,8 @@ use super::{
     PreparedProjectRestore, Progress, ProjectRestorePlan, ProjectRestoreReport, Pump, SessionPlan,
     Stage, invalid, job_io,
 };
-use crate::gdrive::archive::{ManifestFile, PROJECT_SAFETY_PREFIX, hex, prune_safety};
-use crate::gdrive::{Error, KEEP_SAFETY_COPIES, Result, compact_stamp, io_err, unix_now};
+use crate::backup::archive::{ManifestFile, PROJECT_SAFETY_PREFIX, hex, prune_safety};
+use crate::backup::{Error, KEEP_SAFETY_COPIES, Result, compact_stamp, io_err, unix_now};
 use crate::omp::{DeleteError, DeleteTarget, MoveKind, MoveOutcome, Omp};
 use crate::platform;
 use crate::sharpshooter::{self, MEMORY_FILES};

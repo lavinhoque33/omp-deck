@@ -70,10 +70,10 @@ use crate::widgets::{empty_state, icon_text, menu_item};
 mod agent_config;
 mod agents;
 mod app_update;
+mod backup;
 mod bar;
 mod changes;
 mod ctl;
-mod drive;
 mod notifications;
 mod palette;
 mod project_sync;
@@ -181,8 +181,10 @@ enum PendingConfirm {
     StopSessions(Vec<PathBuf>),
     /// Kill the live sessions (by backend name) checked in the session manager's Running view.
     KillRunning(Vec<String>),
-    /// Restore a downloaded Google Drive backup over the local omp config.
-    RestoreBackup(drive::PendingRestore),
+    /// Restore a downloaded config backup over the local omp config.
+    RestoreBackup(backup::PendingRestore),
+    /// Forget the saved backup server.
+    RemoveServer,
     /// Remove a clean worktree after moving the tabs inside it into the primary checkout:
     /// merged ones with their branch, pushed ones parked (the branch stays).
     RemoveWorktree {
@@ -471,8 +473,8 @@ pub struct App {
 
     started: Instant,
     shot: Option<ShotPlan>,
-    /// Google Drive backup of the omp config.
-    drive: drive::DriveUi,
+    /// Backups of the omp config (Google Drive or the user's server).
+    backup: backup::BackupUi,
     /// Project sync (per-folder `.omp` + sessions backups).
     sync: project_sync::SyncUi,
     /// Changes panel.
@@ -661,7 +663,7 @@ impl App {
                 .unwrap_or_else(Instant::now),
             started: Instant::now(),
             shot,
-            drive: drive::DriveUi::new(),
+            backup: backup::BackupUi::new(),
             sync: project_sync::SyncUi::new(),
             changes: changes::ChangesUi::default(),
             app_update: app_update::AppUpdateUi::new(),
@@ -1650,6 +1652,7 @@ impl App {
             .filter(|t| !t.terminal().is_exited())
             .filter_map(|t| t.session_path())
             .collect();
+        let place = self.backup_place();
         let input = BarInput {
             tabs: TabBarInput {
                 tabs: &self.tabs,
@@ -1668,7 +1671,10 @@ impl App {
                     omp_available: omp_found,
                     can_stop: self.backends_available(),
                     busy: &self.moving,
-                    drive: self.drive_menu(),
+                    backup: crate::sidebar::BackupMenu {
+                        place: &place,
+                        off: self.backup_menu_off(),
+                    },
                     live_tabs: &live_tabs,
                     finishing: &self.wt.finishing,
                     parked: crate::worktree_ui::ParkView {
@@ -1801,6 +1807,7 @@ impl App {
             .filter(|(_, s)| matches!(s, TabStatus::Busy | TabStatus::Attention))
             .collect();
         let generation = self.gw.sessions_generation();
+        let place = self.backup_place();
         let input = SidebarInput {
             groups: groups_ref,
             running: snap,
@@ -1823,7 +1830,10 @@ impl App {
             labels: &self.labels,
             active_tab: self.active,
             tab_activity: &tab_activity,
-            drive: self.drive_menu(),
+            backup: crate::sidebar::BackupMenu {
+                place: &place,
+                off: self.backup_menu_off(),
+            },
             finishing: &self.wt.finishing,
             removed: &self.cfg.removed_worktrees,
             parked: crate::worktree_ui::ParkView {
@@ -1962,9 +1972,7 @@ impl App {
         let backends = gateway
             .as_deref()
             .map_or(&[][..], |g| g.backends.as_slice());
-        let account = self
-            .drive
-            .card(self.gw.drive().as_deref(), self.cfg.drive_backup_interval);
+        let account = self.backup_card();
         let rows = self.sync_rows();
         let input = SettingsInput {
             font_size: self.cfg.font_size,
@@ -1986,7 +1994,7 @@ impl App {
                 tmux: backends.contains(&MuxKind::Tmux),
                 host: backends.contains(&MuxKind::Host),
             },
-            drive: account.clone(),
+            backup: account.clone(),
             sync: self.sync_page(&account, &rows),
             app_update: self.app_update.card(self.cfg.check_app_updates),
             notify: NotifyInput {
@@ -2009,7 +2017,7 @@ impl App {
             || self.dialog.is_some()
             || self.folder_dialog.is_some()
             || self.wt.dialog.is_some()
-            || self.drive.modal_open()
+            || self.backup.modal_open()
             || self.sync.modal_open()
             || self.sessions.open
             || self.palette.is_some()
@@ -2048,7 +2056,7 @@ impl App {
                     self.close_settings();
                     self.open_install_tab();
                 }
-                SettingsAction::Drive(a) => self.apply_drive_action(a),
+                SettingsAction::Backup(a) => self.apply_backup_action(a),
                 SettingsAction::Sync(a) => self.apply_sync_action(a),
                 SettingsAction::Notify(a) => self.apply_notify_action(a),
                 SettingsAction::AppUpdate(a) => self.apply_app_update_setting(a),
@@ -2113,7 +2121,7 @@ impl App {
             || self.dialog.is_some()
             || self.folder_dialog.is_some()
             || self.wt.dialog.is_some()
-            || self.drive.modal_open()
+            || self.backup.modal_open()
             || self.sync.modal_open()
             || self.sessions.open
             || self.palette.is_some()
@@ -2158,6 +2166,7 @@ impl App {
                 self.execute_restart_live(uid, &session);
             }
             PendingConfirm::RestartSession(target) => self.execute_restart_session(target),
+            PendingConfirm::RemoveServer => self.remove_server(),
             PendingConfirm::DeleteSession(entry) => self.execute_delete(entry),
             PendingConfirm::DeleteSessions(paths) => self.execute_delete_sessions(paths),
             PendingConfirm::MoveSessions { paths, dest } => {
@@ -3156,7 +3165,7 @@ impl eframe::App for App {
         self.refresh_sessions_cache();
         self.tick_omp();
         self.tick_omp_update();
-        self.drive_tick(&ctx);
+        self.backup_tick(&ctx);
 
         // Panes follow the tab list; then only the tabs on screen repaint promptly on output
         // (the others coalesce). Polling for title/bell/exit happens in `logic`.
@@ -3213,7 +3222,7 @@ impl eframe::App for App {
         self.show_tree(&ctx);
         self.show_usage(&ctx);
         self.show_sessions(&ctx);
-        self.show_drive_picker(&ctx);
+        self.show_backup_dialogs(&ctx);
         self.show_sync_dialogs(&ctx);
         self.show_confirm(&ctx);
         self.show_palette(&ctx);

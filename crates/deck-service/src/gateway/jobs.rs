@@ -10,9 +10,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deck_core::agent_defs::{self, EditError};
+use deck_core::backup::drive::{LOGIN_TIMEOUT, LoginFlow};
+use deck_core::backup::server::{ServerAuth, ServerConfig};
+use deck_core::backup::{self, Destination, PreparedProjectRestore, PreparedRestore, Service};
 use deck_core::changes::{self, ChangedFile};
 use deck_core::ctl::{CtlClient, CtlCommand, CtlReply};
-use deck_core::gdrive::{self, LoginFlow, PreparedProjectRestore, PreparedRestore, Service};
 use deck_core::inventory::{InventoryEntry, SessionStats, StatsCache};
 use deck_core::omp::{Omp, SECRET_PLACEHOLDER, SettingsCatalog};
 use deck_core::sessions::{SessionsRoot, find_copy, find_fork, sessions_under};
@@ -20,6 +22,7 @@ use deck_core::worktree::{self, Removal, Removed, Worktree};
 
 use super::protocol::{
     Answer, Done, GatewayError, Progress, Query, RestorePlanView, RunningDetail,
+    ServerConnectOutcome, ServerView,
 };
 use crate::backend::Backends;
 use crate::lifecycle;
@@ -94,7 +97,10 @@ pub struct JobCtx {
     pub root: SessionsRoot,
     pub backends: Backends,
     pub ctl_ns: String,
-    pub drive: Option<Arc<Service>>,
+    /// The backup service (all destinations).
+    pub service: Arc<Service>,
+    /// The active destination when the job started.
+    pub destination: Destination,
     pub handles: Arc<Handles>,
     pub stats: Arc<Mutex<StatsCache>>,
     /// The latest inventory scan (stats are computed for its entries).
@@ -108,10 +114,19 @@ impl JobCtx {
             .ok_or_else(|| GatewayError::Refused("omp was not found".to_owned()))
     }
 
+    /// The Google side, for sign-in and sign-out.
     fn drive(&self) -> Result<&Service, GatewayError> {
-        self.drive.as_deref().ok_or_else(|| {
-            GatewayError::Refused("Google Drive backup is not available in this build".to_owned())
-        })
+        if self.service.creds.is_none() {
+            return Err(GatewayError::Refused(
+                "Google Drive backup is not available in this build".to_owned(),
+            ));
+        }
+        Ok(&self.service)
+    }
+
+    /// The backup service acting on the active destination.
+    fn backup(&self) -> Service {
+        self.service.with_destination(self.destination)
     }
 }
 
@@ -130,7 +145,7 @@ pub fn sanitize(mut catalog: SettingsCatalog) -> SettingsCatalog {
     catalog
 }
 
-/// The plan of a prepared Drive restore, without its archive.
+/// The plan of a prepared config restore, without its archive.
 pub fn plan_view(p: &PreparedRestore) -> RestorePlanView {
     RestorePlanView {
         name: p.name.clone(),
@@ -193,19 +208,15 @@ pub fn query(ctx: &JobCtx, q: &Query) -> Option<Result<Answer, GatewayError>> {
         } => worktree::branch_state(primary, branch, base)
             .map(Answer::BranchState)
             .map_err(failed),
-        Query::DriveList => ctx
-            .drive()
-            .and_then(|s| s.list().map_err(failed))
-            .map(Answer::DriveList),
-        Query::DriveProjects => ctx
-            .drive()
-            .and_then(|s| s.list_projects().map_err(failed))
-            .map(Answer::DriveProjects),
-        Query::DriveProjectState => ctx
-            .drive()
-            .map(|s| Answer::DriveProjectState(s.project_state())),
-        Query::DriveMeasure { project } => gdrive::measure(&ctx.root, project)
-            .map(Answer::DriveMeasure)
+        Query::BackupList => ctx.backup().list().map(Answer::BackupList).map_err(failed),
+        Query::ProjectBackups => ctx
+            .backup()
+            .list_projects()
+            .map(Answer::ProjectBackups)
+            .map_err(failed),
+        Query::ProjectSyncState => Ok(Answer::ProjectSyncState(ctx.backup().project_state())),
+        Query::ProjectMeasure { project } => backup::measure(&ctx.root, project)
+            .map(Answer::ProjectMeasure)
             .map_err(failed),
         Query::Stats(paths) => Ok(Answer::Stats(stats(ctx, paths))),
         Query::FindFork {
@@ -665,13 +676,13 @@ pub fn drive_login_finish(ctx: &JobCtx, handle: u64) -> Result<Done, GatewayErro
             .ok_or_else(|| GatewayError::Refused("that sign-in is already waiting".to_owned()))?;
         (flow, login.cancel.clone())
     };
-    let result = service.finish_login(flow, &cancel, gdrive::LOGIN_TIMEOUT);
+    let result = service.finish_login(flow, &cancel, LOGIN_TIMEOUT);
     lock(&ctx.handles.logins).remove(&handle);
     match result {
         Ok(account) => Ok(Done::DriveAccount {
             email: account.email,
         }),
-        Err(gdrive::Error::Cancelled) => Err(GatewayError::Cancelled),
+        Err(backup::Error::Cancelled) => Err(GatewayError::Cancelled),
         Err(e) => Err(failed(format!("Google {e}"))),
     }
 }
@@ -680,43 +691,109 @@ pub fn drive_sign_out(ctx: &JobCtx) -> Result<Done, GatewayError> {
     ctx.drive()?.sign_out().map(|()| Done::Unit).map_err(failed)
 }
 
-pub fn drive_backup(ctx: &JobCtx, force: bool) -> Result<Done, GatewayError> {
-    ctx.drive()?
-        .backup(force)
-        .map(Done::DriveBackup)
-        .map_err(failed)
+pub fn backup(ctx: &JobCtx, force: bool) -> Result<Done, GatewayError> {
+    ctx.backup().backup(force).map(Done::Backup).map_err(failed)
 }
 
-pub fn drive_prepare_restore(
-    ctx: &JobCtx,
-    file: &gdrive::BackupFile,
-) -> Result<Done, GatewayError> {
-    let prepared = ctx.drive()?.prepare_restore(file).map_err(failed)?;
+pub fn prepare_restore(ctx: &JobCtx, file: &backup::BackupFile) -> Result<Done, GatewayError> {
+    let prepared = ctx.backup().prepare_restore(file).map_err(failed)?;
     let plan = plan_view(&prepared);
     let handle = ctx.handles.next();
     lock(&ctx.handles.restores).insert(handle, prepared);
-    Ok(Done::DrivePrepared { handle, plan })
+    Ok(Done::Prepared { handle, plan })
 }
 
-pub fn drive_apply_restore(ctx: &JobCtx, handle: u64) -> Result<Done, GatewayError> {
-    let service = ctx.drive()?;
+pub fn apply_restore(ctx: &JobCtx, handle: u64) -> Result<Done, GatewayError> {
     let prepared = lock(&ctx.handles.restores).remove(&handle).ok_or_else(|| {
         GatewayError::Refused("that restore is gone; prepare it again".to_owned())
     })?;
-    service
+    ctx.backup()
         .apply_restore(&prepared)
-        .map(Done::DriveRestored)
+        .map(Done::Restored)
         .map_err(failed)
 }
 
-pub fn drive_delete_backup(ctx: &JobCtx, file: &gdrive::BackupFile) -> Result<Done, GatewayError> {
-    ctx.drive()?
+pub fn delete_backup(ctx: &JobCtx, file: &backup::BackupFile) -> Result<Done, GatewayError> {
+    ctx.backup()
         .delete_backup(file)
         .map(|()| Done::Unit)
         .map_err(failed)
 }
 
-fn progress_of(p: gdrive::Progress) -> Progress {
+// ---- Backup server ------------------------------------------------------------------------------
+
+/// Checks and saves the backup server. An unknown or changed identity is an answer the client
+/// acts on (trust prompt, "remove and add again"), not a failure.
+pub fn server_connect(
+    ctx: &JobCtx,
+    mut config: ServerConfig,
+    keep_secret: bool,
+) -> Result<Done, GatewayError> {
+    if let Some(saved) = ctx.service.server_account().map_err(failed)? {
+        inherit(&mut config, &saved.config, keep_secret);
+    }
+    let outcome = match ctx.service.server_connect(config) {
+        Ok(account) => ServerConnectOutcome::Connected(ServerView::of(&account)),
+        Err(backup::Error::UntrustedServer { fingerprint }) => {
+            ServerConnectOutcome::Untrusted { fingerprint }
+        }
+        Err(backup::Error::ServerChanged { pinned, presented }) => {
+            ServerConnectOutcome::Changed { pinned, presented }
+        }
+        Err(e) => return Err(failed(e)),
+    };
+    Ok(Done::ServerConnect(outcome))
+}
+
+/// An edit of the saved server at the same address keeps its pinned identity and, with
+/// `keep_secret`, the saved password / key passphrase of the same login when none was given.
+/// Nothing is carried to another protocol, host or port.
+fn inherit(config: &mut ServerConfig, saved: &ServerConfig, keep_secret: bool) {
+    let Ok(n) = config.clone().normalized() else {
+        return;
+    };
+    if n.protocol != saved.protocol
+        || !n.host.eq_ignore_ascii_case(&saved.host)
+        || n.effective_port() != saved.effective_port()
+    {
+        return;
+    }
+    if config.pinned.is_none() {
+        config.pinned.clone_from(&saved.pinned);
+    }
+    if !keep_secret {
+        return;
+    }
+    match (&mut config.auth, &saved.auth) {
+        (
+            ServerAuth::Password { user, password },
+            ServerAuth::Password {
+                user: was,
+                password: secret,
+            },
+        ) if password.is_empty() && user.trim() == was => password.clone_from(secret),
+        (
+            ServerAuth::Key {
+                user, passphrase, ..
+            },
+            ServerAuth::Key {
+                user: was,
+                passphrase: secret,
+                ..
+            },
+        ) if passphrase.is_none() && user.trim() == was => passphrase.clone_from(secret),
+        _ => {}
+    }
+}
+
+pub fn server_forget(ctx: &JobCtx) -> Result<Done, GatewayError> {
+    ctx.service
+        .server_forget()
+        .map(|()| Done::Unit)
+        .map_err(failed)
+}
+
+fn progress_of(p: backup::Progress) -> Progress {
     Progress {
         stage: format!("{:?}", p.stage),
         done: p.done,
@@ -727,13 +804,13 @@ fn progress_of(p: gdrive::Progress) -> Progress {
 pub fn project_backup(
     ctx: &JobCtx,
     project: &Path,
-    parts: gdrive::Parts,
+    parts: backup::Parts,
     excluded: &std::collections::BTreeSet<String>,
     force: bool,
     cancel: &AtomicBool,
     progress: &(dyn Fn(Progress) + Sync),
 ) -> Result<Done, GatewayError> {
-    ctx.drive()?
+    ctx.backup()
         .backup_project(&ctx.root, project, parts, excluded, force, cancel, &|p| {
             progress(progress_of(p));
         })
@@ -743,9 +820,9 @@ pub fn project_backup(
 
 pub fn project_delete_backup(
     ctx: &JobCtx,
-    backup: &gdrive::ProjectBackup,
+    backup: &backup::ProjectBackup,
 ) -> Result<Done, GatewayError> {
-    ctx.drive()?
+    ctx.backup()
         .delete_project_backup(backup)
         .map(|()| Done::Unit)
         .map_err(failed)
@@ -753,14 +830,14 @@ pub fn project_delete_backup(
 
 pub fn project_prepare_restore(
     ctx: &JobCtx,
-    backup: &gdrive::ProjectBackup,
+    backup: &backup::ProjectBackup,
     target: &Path,
-    parts: gdrive::Parts,
+    parts: backup::Parts,
     cancel: &AtomicBool,
     progress: &(dyn Fn(Progress) + Sync),
 ) -> Result<Done, GatewayError> {
     let prepared = ctx
-        .drive()?
+        .backup()
         .prepare_project_restore(backup, target, parts, &ctx.root, cancel, &|p| {
             progress(progress_of(p));
         })
@@ -777,13 +854,13 @@ pub fn project_prepare_restore(
 pub fn project_apply_restore(
     ctx: &JobCtx,
     handle: u64,
-    conflicts: &std::collections::BTreeMap<String, gdrive::ConflictChoice>,
+    conflicts: &std::collections::BTreeMap<String, backup::ConflictChoice>,
     excluded: &std::collections::BTreeSet<String>,
     stop: &[String],
     cancel: &AtomicBool,
     progress: &(dyn Fn(Progress) + Sync),
 ) -> Result<Done, GatewayError> {
-    let service = ctx.drive()?;
+    let service = ctx.backup();
     let mut prepared = lock(&ctx.handles.project_restores)
         .remove(&handle)
         .ok_or_else(|| {
@@ -835,5 +912,49 @@ mod tests {
             out.tabs[0].settings[1].value,
             Some(serde_json::Value::String("dark".to_owned()))
         );
+    }
+
+    #[test]
+    fn an_edit_keeps_pin_and_secret_only_for_the_same_server_and_login() {
+        use deck_core::backup::server::Protocol;
+        let password = |user: &str, pw: &str| ServerAuth::Password {
+            user: user.into(),
+            password: pw.into(),
+        };
+        let saved = ServerConfig {
+            protocol: Protocol::Ftps,
+            host: "nas.local".into(),
+            port: 21,
+            auth: password("me", "secret"),
+            folder: "omp-deck-backups".into(),
+            pinned: Some("SHA256:AA".into()),
+        };
+        let edit = |host: &str, auth: ServerAuth| ServerConfig {
+            protocol: Protocol::Ftps,
+            host: host.into(),
+            port: 0,
+            auth,
+            folder: "other".into(),
+            pinned: None,
+        };
+
+        let mut same = edit(" NAS.local ", password(" me ", ""));
+        inherit(&mut same, &saved, true);
+        assert_eq!(same.pinned.as_deref(), Some("SHA256:AA"));
+        assert_eq!(same.auth, password(" me ", "secret"));
+
+        let mut no_keep = edit("nas.local", password("me", ""));
+        inherit(&mut no_keep, &saved, false);
+        assert_eq!(no_keep.pinned.as_deref(), Some("SHA256:AA"));
+        assert_eq!(no_keep.auth, password("me", ""));
+
+        let mut other_user = edit("nas.local", password("you", ""));
+        inherit(&mut other_user, &saved, true);
+        assert_eq!(other_user.auth, password("you", ""));
+
+        let mut other_host = edit("elsewhere", password("me", ""));
+        inherit(&mut other_host, &saved, true);
+        assert_eq!(other_host.pinned, None);
+        assert_eq!(other_host.auth, password("me", ""));
     }
 }

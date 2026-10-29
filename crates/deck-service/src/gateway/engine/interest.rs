@@ -336,7 +336,7 @@ impl Engine {
             | Topic::Status
             | Topic::Usage
             | Topic::AppUpdate
-            | Topic::Drive
+            | Topic::Backup
             | Topic::Live(_)
             | Topic::OmpUpdate => {
                 return Err(GatewayError::Refused(format!(

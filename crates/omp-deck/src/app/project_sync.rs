@@ -1,4 +1,5 @@
-//! App-side glue for project sync (wave 10): per-folder `.omp` + sessions backups to Google Drive,
+//! App-side glue for project sync (wave 10): per-folder `.omp` + sessions backups to the active
+//! backup destination (Google Drive or the user's server),
 //! the Settings "Sync" page, the restore flow and the sidebar entries.
 //!
 //! Packing, uploading, downloading and measuring run in the gateway, which also runs the
@@ -9,20 +10,20 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use deck_core::config::SyncRow;
-use deck_core::gdrive::{
+use deck_core::backup::{
     ConflictChoice, MemoryBank, OmpDir, Parts, ProjectBackup, ProjectBackupOutcome,
     ProjectRestorePlan, ProjectRestoreReport, ProjectSizes, ProjectSyncState, SessionPlan,
     hostname, path_id,
 };
+use deck_core::config::SyncRow;
 use deck_core::sessions::{SessionEntry, abbreviate_home};
 use deck_service::controller::RequestKey;
 use deck_service::gateway::protocol::{Answer, Done, Mutation, Progress, Query, Topic};
 
 use super::{App, human_size};
+use crate::backup_view::BackupCard;
 use crate::confirm::{self, Confirm};
-use crate::drive_view::DriveCard;
-use crate::sidebar::{DriveMenu, format_age};
+use crate::sidebar::format_age;
 use crate::sync_view::{
     self, BackupAnswer, BackupDialog, Cells, CloudProject, ConflictRow, LastView, ListState,
     ManagerAction, ManagerDialog, ManagerStep, MemoryCell, OmpCell, PathAnswer, PathPrompt,
@@ -61,7 +62,7 @@ enum Kind {
     Deleting { done: usize, total: usize },
 }
 
-/// The one project job this window has sent (the gateway runs one Drive job at a time).
+/// The one project job this window has sent (the gateway runs one backup job at a time).
 struct Job {
     kind: Kind,
     /// The gateway request, to cancel it; `None` for queries and the locally sequenced deletion.
@@ -115,7 +116,7 @@ pub(super) struct SyncUi {
     job: Option<Job>,
     deletion: Option<Deletion>,
     state: ProjectSyncState,
-    /// The gateway's Drive revision the local sync state was read at.
+    /// The gateway's backup record revision the local sync state was read at.
     state_rev: Option<u64>,
     /// Measured sizes by folder; absent = being measured for the first time.
     sizes: HashMap<PathBuf, Result<ProjectSizes, String>>,
@@ -366,19 +367,17 @@ impl App {
     // ---------------------------------------------------------------- gating
 
     fn sync_signed_in(&self) -> bool {
-        self.drive_signed_in()
+        self.backup_linked()
     }
 
-    /// The sidebar's "Google Drive" entries.
-    pub(super) fn drive_menu(&self) -> DriveMenu {
-        if !self.drive_available() {
-            DriveMenu::Hidden
-        } else if !self.sync_signed_in() {
-            DriveMenu::Off("Sign in to Google Drive in Settings → Sync first")
-        } else if self.sync.job.is_some() || self.drive_view().is_some_and(|v| v.busy.is_some()) {
-            DriveMenu::Off("Another project backup or restore is running")
+    /// Why the project backup entries (sidebar, palette) are disabled; `None` = usable.
+    pub(super) fn backup_menu_off(&self) -> Option<&'static str> {
+        if let Some(why) = self.backup_unlinked_reason() {
+            Some(why)
+        } else if self.sync.job.is_some() || self.backup_view().is_some_and(|v| v.busy.is_some()) {
+            Some("Another backup or restore is running")
         } else {
-            DriveMenu::On
+            None
         }
     }
 
@@ -438,9 +437,9 @@ impl App {
         }
         let project = path.clone();
         self.gw
-            .query(Query::DriveMeasure { project }, move |app, r| {
+            .query(Query::ProjectMeasure { project }, move |app, r| {
                 let sizes = match r {
-                    Ok(Answer::DriveMeasure(s)) => Ok(s),
+                    Ok(Answer::ProjectMeasure(s)) => Ok(s),
                     Ok(_) => Err("the gateway answered with something else".to_owned()),
                     Err(e) => Err(format!("reading {}: {e}", path.display())),
                 };
@@ -485,9 +484,9 @@ impl App {
         let path = path.to_path_buf();
         let project = path.clone();
         self.gw
-            .query(Query::DriveMeasure { project }, move |app, r| {
+            .query(Query::ProjectMeasure { project }, move |app, r| {
                 let result = match r {
-                    Ok(Answer::DriveMeasure(s)) => Ok(s),
+                    Ok(Answer::ProjectMeasure(s)) => Ok(s),
                     Ok(_) => Err("the gateway answered with something else".to_owned()),
                     Err(e) => Err(e),
                 };
@@ -499,9 +498,9 @@ impl App {
 
     /// Reads the gateway's record of what was backed up when.
     fn refresh_sync_state(&mut self) {
-        self.sync.state_rev = Some(self.gw.revision(&Topic::Drive));
-        self.gw.query(Query::DriveProjectState, |app, r| {
-            if let Ok(Answer::DriveProjectState(s)) = r {
+        self.sync.state_rev = Some(self.gw.revision(&Topic::Backup));
+        self.gw.query(Query::ProjectSyncState, |app, r| {
+            if let Ok(Answer::ProjectSyncState(s)) = r {
                 app.sync.state = s;
             }
         });
@@ -626,7 +625,7 @@ impl App {
     /// The page, as the settings view needs it.
     pub(super) fn sync_page<'a>(
         &self,
-        account: &'a DriveCard,
+        account: &'a BackupCard,
         rows: &'a [RowView],
     ) -> SyncPage<'a> {
         SyncPage {
@@ -646,12 +645,12 @@ impl App {
                 }
                 self.sync.seen = true;
                 // The gateway's own passes move the record: read it again when it did.
-                let rev = self.gw.revision(&Topic::Drive);
+                let rev = self.gw.revision(&Topic::Backup);
                 if self.sync.state_rev != Some(rev) && self.sync.job.is_none() {
                     self.refresh_sync_state();
                 }
             }
-            SyncAction::Drive(a) => self.apply_drive_action(a),
+            SyncAction::Backup(a) => self.apply_backup_action(a),
             SyncAction::Add => self.pick_folder(Pick::Add),
             SyncAction::Change(i) => self.pick_folder(Pick::Change(i)),
             SyncAction::Remove(i) => self.remove_sync_row(i),
@@ -835,7 +834,8 @@ impl App {
                         self.sync.skipped.insert(path.clone(), o.skipped);
                     }
                     let mut text = format!(
-                        "Backed up {name} to Google Drive ({})",
+                        "Backed up {name} to {} ({})",
+                        self.backup_place(),
                         human_size(o.backup.file.size)
                     );
                     if skipped > 0 {
@@ -863,7 +863,7 @@ impl App {
     // ---------------------------------------------------------------- sidebar backup dialog
 
     pub(super) fn open_backup_dialog(&mut self, path: PathBuf) {
-        if !matches!(self.drive_menu(), DriveMenu::On) {
+        if self.backup_menu_off().is_some() {
             return;
         }
         let row = self.cfg.project_sync.iter().find(|r| r.path == path);
@@ -882,6 +882,7 @@ impl App {
 
     fn show_backup_dialog(&mut self, ctx: &egui::Context) {
         let busy = self.sync.job.is_some();
+        let account = self.backup_card();
         let Some(d) = &mut self.sync.backup else {
             return;
         };
@@ -892,7 +893,7 @@ impl App {
             } => usize::try_from(count.saturating_sub(included)).unwrap_or(0),
             _ => 0,
         };
-        match sync_view::backup_dialog(ctx, d, &cells, busy) {
+        match sync_view::backup_dialog(ctx, d, &cells, busy, &account) {
             BackupAnswer::Open => {}
             BackupAnswer::Cancel => {
                 self.sync.backup = None;
@@ -1008,10 +1009,10 @@ impl App {
             }
             return;
         }
-        self.gw.query(Query::DriveProjects, |app, r| {
+        self.gw.query(Query::ProjectBackups, |app, r| {
             app.sync.job = None;
             let result = match r {
-                Ok(Answer::DriveProjects(list)) => Ok(list),
+                Ok(Answer::ProjectBackups(list)) => Ok(list),
                 Ok(_) => Err("the gateway answered with something else".to_owned()),
                 Err(e) => Err(e),
             };
@@ -1137,10 +1138,12 @@ impl App {
     fn show_restore_dialog(&mut self, ctx: &egui::Context) {
         let progress = self.restore_progress();
         let busy = self.sync.job.is_some();
+        let place = self.backup_place();
         let Some(r) = &mut self.sync.restore else {
             return;
         };
-        let Some(action) = sync_view::restore_dialog(ctx, &mut r.dlg, progress.as_ref(), busy)
+        let Some(action) =
+            sync_view::restore_dialog(ctx, &mut r.dlg, progress.as_ref(), busy, &place)
         else {
             self.show_delete_confirm(ctx);
             return;
@@ -1415,7 +1418,11 @@ impl App {
                     (false, true) => {
                         format!("Restore cancelled. Already restored: {}.", parts.join(", "))
                     }
-                    (false, false) => format!("Restored from Google Drive: {}.", parts.join(", ")),
+                    (false, false) => format!(
+                        "Restored from {}: {}.",
+                        self.backup_place(),
+                        parts.join(", ")
+                    ),
                 };
                 if let Some(dir) = &report.safety_dir {
                     summary += &format!(
@@ -1745,10 +1752,12 @@ impl App {
     fn show_manager_dialog(&mut self, ctx: &egui::Context) {
         let progress = self.delete_progress();
         let busy = self.sync.job.is_some();
+        let place = self.backup_place();
         let Some(m) = &mut self.sync.manager else {
             return;
         };
-        let Some(action) = sync_view::manager_dialog(ctx, &mut m.dlg, progress.as_ref(), busy)
+        let Some(action) =
+            sync_view::manager_dialog(ctx, &mut m.dlg, progress.as_ref(), busy, &place)
         else {
             return;
         };
@@ -1840,6 +1849,7 @@ impl App {
     }
 
     fn ask_delete_version(&mut self, p: usize, v: usize) {
+        let place = self.backup_place();
         let Some(r) = &mut self.sync.restore else {
             return;
         };
@@ -1862,9 +1872,10 @@ impl App {
                 title: "Delete this backup permanently?".to_owned(),
                 body: format!(
                     "{} from {host}, {when} ({}).\n\nThis can't be undone: the file is removed \
-                     from Google Drive, not moved to the trash.",
+                     from {}, not moved to the trash.",
                     b.name,
-                    human_size(b.file.size)
+                    human_size(b.file.size),
+                    place
                 ),
                 confirm_label: "Delete permanently".to_owned(),
                 danger: true,
@@ -1961,7 +1972,7 @@ fn version_row(index: usize, b: &ProjectBackup) -> VersionRow {
 mod tests {
     use std::collections::BTreeMap;
 
-    use deck_core::gdrive::{BackupFile, SessionSize};
+    use deck_core::backup::{BackupFile, SessionSize};
 
     use super::*;
 

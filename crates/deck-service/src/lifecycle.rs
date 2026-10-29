@@ -12,7 +12,7 @@
 //! | Move to another folder | [`stop_then_move`] (`deck_core::omp::Omp::move_session` after stopping) |
 //! | Delete | [`stop_then_delete`] (`deck_core::omp::Omp::delete_sessions` after stopping) |
 //! | Create / attach / restart | `deck_core::mux::Mux` launch commands; host sessions through [`crate::host_remote::HostRemote`], read-only viewers through [`crate::host_remote::HostObserver`] |
-//! | Worktree create/inspect/remove, project sync, backup, CLI updates | `deck_core::{worktree, gdrive, omp, selfupdate}` |
+//! | Worktree create/inspect/remove, project sync, backup, CLI updates | `deck_core::{worktree, backup, omp, selfupdate}` |
 //!
 //! Native shell, clipboard, window raising and file dialogs are client effects, not operations.
 

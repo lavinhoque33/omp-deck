@@ -1,8 +1,8 @@
 //! Per-project backups: a project folder's `<folder>/.omp` directory, its omp "sharpshooter"
-//! memory bank (`docs/notes/sharpshooter-memory.md`) and its omp sessions, kept on
-//! Drive as one `.tar.gz` per backup (see `docs/notes/contracts.md`, "Wave 10", and
+//! memory bank (`docs/notes/sharpshooter-memory.md`) and its omp sessions, kept at the active
+//! destination as one `.tar.gz` per backup (see `docs/notes/contracts.md`, "Wave 10", and
 //! `docs/notes/project-sync.md`). Independent of the config backup in the sibling modules: own
-//! file prefix, own Drive query, own local state file, own retention.
+//! file prefix, own listing, own local state file per destination, own retention.
 //!
 //! * [`snapshot`]: what a project consists of, found with metadata only (sizes, fingerprint).
 //! * [`pack`]: builds the archive in the cache directory, streaming, manifest last.
@@ -25,10 +25,12 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::account::write_private;
 use super::archive::{ManifestFile, hex};
-use super::drive::{BackupFile, PROJECT_KIND, to_delete};
-use super::{Error, LastBackup, Result, Service, compact_stamp, hostname, io_err, unix_now};
+use super::remote::{self, BackupFile, PROJECT_KIND, Remote, to_delete};
+use super::{
+    Destination, Error, LastBackup, Result, Service, compact_stamp, hostname, io_err, unix_now,
+    write_private,
+};
 use crate::omp::Omp;
 use crate::platform;
 use crate::sessions::SessionsRoot;
@@ -49,7 +51,9 @@ const STALE_STAGING: Duration = Duration::from_secs(24 * 3600);
 const REPORT_STEP: u64 = 1 << 20;
 /// omp refuses pack members above 2 GiB (`session pack`/`unpack`).
 const MAX_MEMBER: u64 = 2 << 30;
-const STATE_FILE: &str = "project-sync.json";
+/// Per-destination project sync state files, beside the destination's account file.
+const DRIVE_STATE_FILE: &str = "project-sync.json";
+const SERVER_STATE_FILE: &str = "project-sync-server.json";
 
 /// Which parts of a project a backup or restore covers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,8 +173,9 @@ pub struct Progress {
     pub total: u64,
 }
 
-/// Per-path local sync state, `config_dir()/project-sync.json` (0600, atomic write); separate
-/// from `google-drive.json` so the two Drive lanes never race on one file.
+/// Per-path local sync state of one destination (0600, atomic write):
+/// `config_dir()/project-sync.json` for Drive, `project-sync-server.json` for the server. Separate
+/// from the account files so the config and project lanes never race on one file.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProjectSyncState {
     pub projects: BTreeMap<PathBuf, ProjectSynced>,
@@ -187,7 +192,7 @@ pub struct ProjectSynced {
     pub unresolved_blobs: BTreeMap<String, String>,
 }
 
-/// One Drive file, described by its appProperties (nothing is downloaded).
+/// One project backup at the destination, described by its properties (nothing is downloaded).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectBackup {
     pub file: BackupFile,
@@ -635,7 +640,8 @@ fn fit_tail(s: &str, max: usize) -> &str {
     &s[start..]
 }
 
-/// Drive allows 124 bytes per appProperty, key and value together.
+/// Drive allows 124 bytes per appProperty, key and value together (server sidecars keep the same
+/// properties).
 const PROP_LIMIT: usize = 124;
 
 fn put_prop(props: &mut BTreeMap<String, String>, key: &str, value: &str) {
@@ -705,9 +711,10 @@ fn blob_state(blob_dir: &Path, hex: &str) -> String {
 // ---------------------------------------------------------------- Service
 
 impl Service {
-    /// Local sync state; missing or corrupt → default (corrupt is logged).
+    /// The active destination's local sync state; missing or corrupt → default (corrupt is
+    /// logged).
     pub fn project_state(&self) -> ProjectSyncState {
-        let path = self.store.sibling(STATE_FILE);
+        let path = self.project_state_path(self.destination);
         match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 log::warn!("corrupt {}: {e}; starting empty", path.display());
@@ -722,9 +729,17 @@ impl Service {
         }
     }
 
+    /// Where `destination` keeps its project sync state.
+    pub(super) fn project_state_path(&self, destination: Destination) -> PathBuf {
+        match destination {
+            Destination::Drive => self.store.sibling(DRIVE_STATE_FILE),
+            Destination::Server => self.server_store.sibling(SERVER_STATE_FILE),
+        }
+    }
+
     fn save_project_state(&self, state: &ProjectSyncState) -> Result<()> {
         let json = serde_json::to_vec_pretty(state).map_err(|e| Error::Io(e.to_string()))?;
-        write_private(&self.store.sibling(STATE_FILE), &json)
+        write_private(&self.project_state_path(self.destination), &json)
     }
 
     /// Backs up the chosen `parts` of `project`; sessions whose id is in `excluded` are left out
@@ -742,7 +757,7 @@ impl Service {
         cancel: &AtomicBool,
         progress: &(dyn Fn(Progress) + Sync),
     ) -> Result<Option<ProjectBackupOutcome>> {
-        let account = self.signed_in()?;
+        let linked = self.linked()?;
         let nothing = || Error::NothingToBackUp(project.display().to_string());
         if !parts.any() {
             return Err(nothing());
@@ -770,8 +785,8 @@ impl Service {
             return Ok(None);
         }
         // Fail fast: offline or signed-out ends the job before anything is packed.
-        let mut drive = self.drive(&account);
-        drive.token()?;
+        let mut remote = self.remote(&linked)?;
+        remote.check()?;
         let stage = Staging::create(&self.cache_root)?;
         let now = unix_now();
         let host = hostname();
@@ -826,18 +841,19 @@ impl Service {
             done: 0,
             total,
         });
-        let uploaded = drive.upload_file(&name, &props, &mut file, total, cancel, &mut |done| {
-            progress(Progress {
-                stage: Stage::Uploading,
-                done,
-                total,
-            });
-        })?;
+        let uploaded =
+            remote.upload_file(&name, &props, &mut file, total, cancel, &mut |done| {
+                progress(Progress {
+                    stage: Stage::Uploading,
+                    done,
+                    total,
+                });
+            })?;
         if uploaded.size != 0 && uploaded.size != total {
-            return Err(Error::Google(format!(
-                "Uploading the backup failed: Drive stored {} bytes instead of {total}",
-                uploaded.size
-            )));
+            return Err(self.remote_failure(
+                "Uploading the backup",
+                &format!("stored {} bytes instead of {total}", uploaded.size),
+            ));
         }
         // The state seen while packing, not a fresh sample: a blob that changed since is then
         // noticed as a change.
@@ -872,7 +888,7 @@ impl Service {
         self.save_project_state(&state)?;
         // Retention is housekeeping: the backup itself already succeeded.
         let pid = path_id(project);
-        let pruned = match prune_project(&mut drive, &host, &pid) {
+        let pruned = match prune_project(remote.as_mut(), &host, &pid) {
             Ok(n) => n,
             Err(e) => {
                 log::warn!("pruning old project backups: {e}");
@@ -898,10 +914,9 @@ impl Service {
         }))
     }
 
-    /// Permanently deletes `backup` from Drive (`files.delete` bypasses the trash); a file that is
-    /// already gone counts as deleted. Only project backups are accepted. When it is the last
-    /// backup recorded for a project, that project's local state is dropped so the next pass
-    /// uploads it again.
+    /// Permanently deletes `backup` (bypassing any trash); a file that is already gone counts as
+    /// deleted. Only project backups are accepted. When it is the last backup recorded for a
+    /// project, that project's local state is dropped so the next pass uploads it again.
     pub fn delete_project_backup(&self, backup: &ProjectBackup) -> Result<()> {
         if backup.file.props.get("kind").map(String::as_str) != Some(PROJECT_KIND) {
             return Err(invalid(format!(
@@ -909,8 +924,8 @@ impl Service {
                 backup.file.name
             )));
         }
-        let account = self.signed_in()?;
-        self.drive(&account).delete_permanently(&backup.file.id)?;
+        let linked = self.linked()?;
+        self.remote(&linked)?.delete_permanently(&backup.file.id)?;
         let mut state = self.project_state();
         let before = state.projects.len();
         state
@@ -924,9 +939,9 @@ impl Service {
 
     /// All project backups, newest first.
     pub fn list_projects(&self) -> Result<Vec<ProjectBackup>> {
-        let account = self.signed_in()?;
-        let mut files = self.drive(&account).list_projects()?;
-        super::drive::sort_newest_first(&mut files);
+        let linked = self.linked()?;
+        let mut files = self.remote(&linked)?.list_projects()?;
+        remote::sort_newest_first(&mut files);
         Ok(files
             .into_iter()
             .filter_map(ProjectBackup::from_file)
@@ -954,11 +969,9 @@ impl Service {
             ));
         }
         if backup.file.size == 0 {
-            return Err(Error::Google(
-                "Downloading the backup failed: Drive reports an empty file".to_owned(),
-            ));
+            return Err(self.remote_failure("Downloading the backup", "reports an empty file"));
         }
-        let account = self.signed_in()?;
+        let linked = self.linked()?;
         let stage = Staging::create(&self.cache_root)?;
         let archive = stage.dir.join("backup.tar.gz");
         let size = backup.file.size;
@@ -970,7 +983,7 @@ impl Service {
                 done: 0,
                 total: size,
             });
-            self.drive(&account).download_to(
+            self.remote(&linked)?.download_to(
                 &backup.file.id,
                 size,
                 &mut out,
@@ -1043,8 +1056,8 @@ impl Service {
 }
 
 /// Deletes everything beyond the newest [`KEEP_PROJECT_BACKUPS`] of one (host, path id).
-fn prune_project(drive: &mut super::drive::Drive<'_>, host: &str, pid: &str) -> Result<usize> {
-    let files: Vec<BackupFile> = drive
+fn prune_project(remote: &mut dyn Remote, host: &str, pid: &str) -> Result<usize> {
+    let files: Vec<BackupFile> = remote
         .list_projects()?
         .into_iter()
         .filter(|f| f.props.get("pid").map(String::as_str) == Some(pid))
@@ -1052,7 +1065,7 @@ fn prune_project(drive: &mut super::drive::Drive<'_>, host: &str, pid: &str) -> 
         .collect();
     let doomed = to_delete(&files, KEEP_PROJECT_BACKUPS);
     for f in &doomed {
-        drive.delete(&f.id)?;
+        remote.delete(&f.id)?;
     }
     Ok(doomed.len())
 }

@@ -24,7 +24,7 @@ use egui::{
 };
 use serde_json::Value;
 
-use crate::drive_view::{self, DriveAction, DriveCard};
+use crate::backup_view::{self, BackupAction, BackupCard, ServerForm};
 use crate::notify_view::{self, NotifyAction, NotifyInput};
 use crate::omp_rows::{
     JsonModal, ModalOutcome, RowEvent, SecretModal, note_banner, show_json_modal, show_row,
@@ -102,7 +102,7 @@ impl OmpDeckPage {
             }
             Self::Notifications => "What the bell and desktop pop-ups tell you about your sessions",
             Self::Updates => "Keep OmpDeck and omp up to date",
-            Self::Backup => "Back up your omp configuration to Google Drive",
+            Self::Backup => "Back up your omp configuration to Google Drive or your own server",
         }
     }
 
@@ -145,6 +145,8 @@ pub struct SettingsState {
     view_key: Option<(Option<Entry>, String)>,
     omp: OmpPane,
     pub agents: AgentsState,
+    /// The backup server form (kept while switching pages).
+    pub server_form: ServerForm,
     /// Drop keyboard focus held outside the window (the terminal) on its next frame.
     release_focus: bool,
     /// A widget had the keyboard at the end of the last frame (egui drops it on Esc before the
@@ -249,7 +251,7 @@ pub struct SettingsInput<'a> {
     pub check_updates: bool,
     pub update: &'a UpdateState,
     pub backend: BackendCard,
-    pub drive: DriveCard,
+    pub backup: BackupCard,
     pub sync: SyncPage<'a>,
     pub notify: NotifyInput<'a>,
     pub app_update: crate::app_update::SettingsCard<'a>,
@@ -294,8 +296,8 @@ pub enum SettingsAction {
     CopyDetails(String),
     /// Run omp's official installer in a tab (omp was not found).
     InstallOmp,
-    /// The Google Drive backup card.
-    Drive(DriveAction),
+    /// The Backup card (destination, account or server, schedule).
+    Backup(BackupAction),
     /// Where new sessions run (Unix: tmux or the OmpDeck host).
     SessionBackend(BackendChoice),
     /// The project sync page.
@@ -500,7 +502,13 @@ fn body(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>) -> Ve
                             omp_view(ui, &mut state.omp, View::Search, &mut actions);
                         } else {
                             match state.selected {
-                                Entry::OmpDeck(page) => ompdeck_page(ui, page, input, &mut actions),
+                                Entry::OmpDeck(page) => ompdeck_page(
+                                    ui,
+                                    page,
+                                    input,
+                                    &mut state.server_form,
+                                    &mut actions,
+                                ),
                                 Entry::Sync => actions.extend(
                                     sync_view::page(ui, &input.sync)
                                         .into_iter()
@@ -992,6 +1000,7 @@ fn ompdeck_page(
     ui: &mut Ui,
     page: OmpDeckPage,
     input: &SettingsInput<'_>,
+    server_form: &mut ServerForm,
     actions: &mut Vec<SettingsAction>,
 ) {
     let pal = Palette::of_ui(ui);
@@ -1011,7 +1020,7 @@ fn ompdeck_page(
                 .map(SettingsAction::Notify),
         ),
         OmpDeckPage::Updates => updates_cards(ui, input, actions),
-        OmpDeckPage::Backup => backup_card(ui, input, actions),
+        OmpDeckPage::Backup => backup_card(ui, input, server_form, actions),
     }
 }
 
@@ -1471,12 +1480,17 @@ fn updates_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Setti
     });
 }
 
-fn backup_card(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<SettingsAction>) {
-    card(ui, "Google Drive backup", |ui| {
+fn backup_card(
+    ui: &mut Ui,
+    input: &SettingsInput<'_>,
+    server_form: &mut ServerForm,
+    actions: &mut Vec<SettingsAction>,
+) {
+    card(ui, "Backup", |ui| {
         actions.extend(
-            drive_view::card(ui, &input.drive)
+            backup_view::card(ui, &input.backup, server_form)
                 .into_iter()
-                .map(SettingsAction::Drive),
+                .map(SettingsAction::Backup),
         );
     });
 }

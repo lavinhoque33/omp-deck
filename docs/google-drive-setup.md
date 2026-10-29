@@ -77,5 +77,5 @@ Local state:
 - `~/.local/share/omp-deck/restore-safety/<UTC timestamp>/` holds the pre-restore safety copies.
   OmpDeck keeps the last 5.
 
-The tests (`cargo test -p deck-core gdrive`) run against a local mock of Google's endpoints and
+The tests (`cargo test -p deck-core backup`) run against a local mock of Google's endpoints and
 need no credentials.

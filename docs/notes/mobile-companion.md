@@ -219,7 +219,7 @@ a service-instance epoch; no cross-daemon-restart request persistence is claimed
 | Worktree create/inspect/remove, move and finish | Existing `deck_core::worktree`; `Command::{WorktreeMove,WorktreeFinish}` for injected operations |
 | Usage, context, transcript and agent data | Existing `deck_core::{usage,status,agents,tree}` sources/control snapshots |
 | Export and last-response copy | Shared `session_actions::export_html`; native clipboard/download presentation remains a client effect |
-| Drive config backup, project sync/restore/delete and memory | Existing `deck_core::{gdrive,sharpshooter}` operations; confirmations and OAuth/native folder selection remain client interaction |
+| Config backup, project sync/restore/delete and memory | Existing `deck_core::{backup,sharpshooter}` operations; confirmations and OAuth/native folder selection remain client interaction |
 | OmpDeck preferences and omp configuration | `SettingsService` transactions for OmpDeck; existing `deck_core::omp` config operations for omp |
 | omp/plugin install/update/channel and OmpDeck self-update | Existing core CLI/self-update executors and mux-backed command tabs; elevation/restart remain explicit native effects |
 | Inbox and notifications | Shared `NotificationCenter`, keyed by full `SessionTarget`; native notifier/activation adapter only |

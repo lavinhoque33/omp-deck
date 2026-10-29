@@ -1,30 +1,34 @@
-//! App-side glue for the Google Drive backup: sign-in, manual backups, restore, deleting backups.
-//! Everything runs in the gateway (OAuth flows and prepared restores stay there as handles; the
-//! automatic backups follow its schedule). This window only opens the consent page, shows the
-//! account and the dialogs, and asks.
+//! App-side glue for the backups (Google Drive or the user's FTP/FTPS/SFTP server): sign-in,
+//! server setup, manual backups, restore, deleting backups. Everything runs in the gateway
+//! (OAuth flows and prepared restores stay there as handles; the automatic backups follow its
+//! schedule). This window only opens the consent page, shows the destination and the dialogs,
+//! and asks.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use deck_core::backup::server::ServerConfig;
+use deck_core::backup::{BackupFile, Destination, HISTORY_DB, hostname};
 use deck_core::config::SyncInterval;
-use deck_core::gdrive::{BackupFile, HISTORY_DB, hostname};
 use deck_core::sessions::abbreviate_home;
 use deck_core::usage::parse_iso_ms;
 use deck_service::gateway::protocol::{
-    Answer, Done, DriveView, GatewayError, Mutation, Query, RestorePlanView,
+    Answer, BackupView, Done, GatewayError, Mutation, Query, RestorePlanView, ServerConnectOutcome,
 };
 
 use super::{App, PendingConfirm, human_size};
-use crate::confirm::{self, Confirm};
-use crate::drive_view::{
-    self, BackupManager, Busy, DriveAction, DriveCard, HostGroup, ManagedBackup, ManagerAction,
-    ManagerList, ManagerStep, RestoreList, RestorePick, RestoreRow,
+use crate::backup_view::{
+    self, BackupAction, BackupCard, BackupManager, Busy, DriveAccount, HostGroup, ManagedBackup,
+    ManagerAction, ManagerList, ManagerStep, RestoreList, RestorePick, RestoreRow, ServerForm,
 };
+use crate::confirm::{self, Confirm};
+use crate::transfer;
 use crate::tree_layout::{age, clock};
 
 /// Restore-confirmation lists show at most this many paths per line.
 const LIST_MAX: usize = 6;
-const JOB_BUSY: &str = "Another Google Drive job is running; try again in a moment.";
+const JOB_BUSY: &str = "Another backup job is running; try again in a moment.";
 
 /// A restore the gateway prepared and holds under `handle`, waiting for the user's answer.
 pub(super) struct PendingRestore {
@@ -71,18 +75,18 @@ struct Deletion {
     cancelled: bool,
 }
 
-pub(super) struct DriveUi {
+pub(super) struct BackupUi {
     phase: Phase,
-    /// The gateway's last Drive error that was already shown; a new one is shown once.
+    /// The gateway's last automatic-backup error that was already shown; a new one is shown once.
     seen_error: Option<String>,
     picker: Option<RestorePicker>,
     manager: Option<Manager>,
     deletion: Option<Deletion>,
 }
 
-impl DriveUi {
-    pub(super) fn new() -> DriveUi {
-        DriveUi {
+impl BackupUi {
+    pub(super) fn new() -> BackupUi {
+        BackupUi {
             phase: Phase::Idle,
             seen_error: None,
             picker: None,
@@ -91,33 +95,43 @@ impl DriveUi {
         }
     }
 
-    /// The settings card's state. `view` is the gateway's Drive record (`None` before the first
-    /// one arrived: the card then reads as unavailable rather than guessing).
-    pub(super) fn card(&self, view: Option<&DriveView>, interval: SyncInterval) -> DriveCard {
-        let Some(view) = view else {
-            return DriveCard::Unavailable;
+    /// The settings card's state. `view` is the gateway's backup record (`None` before the first
+    /// one arrived: Drive then reads as unavailable rather than guessing).
+    pub(super) fn card(
+        &self,
+        view: Option<&BackupView>,
+        interval: SyncInterval,
+        destination: Destination,
+        picker: bool,
+    ) -> BackupCard {
+        let drive = match view {
+            None => DriveAccount::Unavailable,
+            Some(v) if !v.drive_available => DriveAccount::Unavailable,
+            Some(_) if matches!(self.phase, Phase::Starting { .. } | Phase::Waiting { .. }) => {
+                DriveAccount::Waiting
+            }
+            Some(v) if !v.drive_signed_in => DriveAccount::SignedOut,
+            Some(v) => DriveAccount::SignedIn {
+                email: v.drive_email.clone(),
+            },
         };
-        if !view.available {
-            return DriveCard::Unavailable;
-        }
-        if matches!(self.phase, Phase::Starting { .. } | Phase::Waiting { .. }) {
-            return DriveCard::Waiting;
-        }
-        if !view.signed_in {
-            return DriveCard::SignedOut;
-        }
-        DriveCard::SignedIn {
-            email: view.email.clone(),
-            last: view
-                .last_backup
-                .as_ref()
+        // The setting changes here first; the gateway's record follows a moment later.
+        let current = view.filter(|v| v.destination == destination);
+        BackupCard {
+            destination,
+            drive,
+            server: view.and_then(|v| v.server.clone()),
+            place: place_of(destination, view),
+            last: current
+                .and_then(|v| v.last_backup.as_ref())
                 .map(|l| format!("{} from {}", clock(l.unix), l.host)),
             interval,
             busy: match self.phase {
                 Phase::Busy(b) => Some(b),
                 // A backup the gateway runs on its own schedule.
-                _ => view.busy.as_ref().map(|_| Busy::BackingUp),
+                _ => view.and_then(|v| v.busy.as_ref()).map(|_| Busy::BackingUp),
             },
+            picker,
         }
     }
 
@@ -131,27 +145,60 @@ impl DriveUi {
     }
 }
 
+/// The destination's name in titles and toasts: "Google Drive", `sftp://host`, "server".
+fn place_of(destination: Destination, view: Option<&BackupView>) -> String {
+    match (destination, view.and_then(|v| v.server.as_ref())) {
+        (Destination::Drive, _) => "Google Drive".to_owned(),
+        (Destination::Server, Some(s)) => s.label.clone(),
+        (Destination::Server, None) => "your server".to_owned(),
+    }
+}
+
 impl App {
-    /// The gateway's Drive record.
-    pub(super) fn drive_view(&self) -> Option<Arc<DriveView>> {
-        self.gw.drive()
+    /// The gateway's backup record.
+    pub(super) fn backup_view(&self) -> Option<Arc<BackupView>> {
+        self.gw.backup()
     }
 
-    /// Google Drive is configured in this build.
-    pub(super) fn drive_available(&self) -> bool {
-        self.drive_view().is_some_and(|v| v.available)
+    /// The Backup card's (and the Sync page's destination strip's) state.
+    pub(super) fn backup_card(&self) -> BackupCard {
+        self.backup.card(
+            self.backup_view().as_deref(),
+            self.cfg.drive_backup_interval,
+            self.cfg.backup_destination,
+            self.picker_available,
+        )
     }
 
-    /// Signed in with a usable account.
-    pub(super) fn drive_signed_in(&self) -> bool {
-        self.drive_view()
-            .is_some_and(|v| v.available && v.signed_in)
+    /// The active destination's name ("Google Drive", `sftp://host`).
+    pub(super) fn backup_place(&self) -> String {
+        place_of(self.cfg.backup_destination, self.backup_view().as_deref())
     }
 
-    pub(super) fn apply_drive_action(&mut self, action: DriveAction) {
+    /// The active destination is set up: signed in to Drive / a server saved.
+    pub(super) fn backup_linked(&self) -> bool {
+        let destination = self.cfg.backup_destination;
+        self.backup_view().is_some_and(|v| match destination {
+            Destination::Drive => v.drive_available && v.drive_signed_in,
+            Destination::Server => v.server.is_some(),
+        })
+    }
+
+    /// Why the active destination takes no backups yet (`None` = it does).
+    pub(super) fn backup_unlinked_reason(&self) -> Option<&'static str> {
+        let unavailable = !self.backup_view().is_some_and(|v| v.drive_available);
+        (!self.backup_linked())
+            .then(|| backup_view::unlinked_reason(self.cfg.backup_destination, unavailable))
+    }
+
+    pub(super) fn apply_backup_action(&mut self, action: BackupAction) {
         match action {
-            DriveAction::SignIn => self.start_sign_in(),
-            DriveAction::CancelSignIn => match &mut self.drive.phase {
+            BackupAction::SetDestination(d) => {
+                self.cfg.backup_destination = d;
+                self.dirty = true;
+            }
+            BackupAction::SignIn => self.start_sign_in(),
+            BackupAction::CancelSignIn => match &mut self.backup.phase {
                 Phase::Starting { cancel } => *cancel = true,
                 Phase::Waiting { handle } => {
                     let handle = *handle;
@@ -160,13 +207,13 @@ impl App {
                 }
                 _ => {}
             },
-            DriveAction::SetInterval(v) => {
+            BackupAction::SetInterval(v) => {
                 self.cfg.drive_backup_interval = v;
                 self.dirty = true;
             }
-            DriveAction::BackupNow => self.start_backup(),
-            DriveAction::OpenRestore => {
-                self.drive.picker = Some(RestorePicker {
+            BackupAction::BackupNow => self.start_backup(),
+            BackupAction::OpenRestore => {
+                self.backup.picker = Some(RestorePicker {
                     files: None,
                     rows: Vec::new(),
                     selected: None,
@@ -174,26 +221,52 @@ impl App {
                 });
                 self.start_listing();
             }
-            DriveAction::OpenManager => self.open_drive_manager(),
-            DriveAction::SignOut => self.start_sign_out(),
+            BackupAction::OpenManager => self.open_backup_manager(),
+            BackupAction::SignOut => self.start_sign_out(),
+            BackupAction::Connect {
+                config,
+                keep_secret,
+            } => self.start_server_connect(*config, keep_secret),
+            BackupAction::BrowseKey => self.browse_key(),
+            BackupAction::RemoveServer => {
+                let label = self
+                    .backup_view()
+                    .and_then(|v| v.server.as_ref().map(|s| s.label.clone()))
+                    .unwrap_or_else(|| "the server".to_owned());
+                self.confirm = Some((
+                    Confirm {
+                        title: "Remove the backup server?".into(),
+                        body: format!(
+                            "OmpDeck forgets {label}, its login and its trusted key here. The \
+                             backups on the server stay; add the server again to reach them."
+                        ),
+                        confirm_label: "Remove server".into(),
+                        danger: true,
+                    },
+                    PendingConfirm::RemoveServer,
+                ));
+            }
+            BackupAction::OpenBackupSettings => {
+                self.open_settings_page(crate::settings_page::OmpDeckPage::Backup);
+            }
         }
     }
 
-    /// Marks a local Drive job as running; false when another one is.
-    fn drive_begin(&mut self, busy: Busy) -> bool {
-        if !self.drive.idle() || !self.gw.is_up() {
+    /// Marks a local backup job as running; false when another one is.
+    fn backup_begin(&mut self, busy: Busy) -> bool {
+        if !self.backup.idle() || !self.gw.is_up() {
             return false;
         }
-        self.drive.phase = Phase::Busy(busy);
+        self.backup.phase = Phase::Busy(busy);
         true
     }
 
     fn start_sign_out(&mut self) {
-        if !self.drive_begin(Busy::SigningOut) {
+        if !self.backup_begin(Busy::SigningOut) {
             return;
         }
         self.gw.mutate(Mutation::DriveSignOut, |app, r| {
-            app.drive.phase = Phase::Idle;
+            app.backup.phase = Phase::Idle;
             match r {
                 Ok(_) => app.toasts.info(&app.ctx, "Signed out of Google Drive"),
                 Err(e) => app.toasts.error(
@@ -205,19 +278,20 @@ impl App {
     }
 
     fn start_sign_in(&mut self) {
-        if !self.drive.idle() || !self.drive_available() || !self.gw.is_up() {
+        let available = self.backup_view().is_some_and(|v| v.drive_available);
+        if !self.backup.idle() || !available || !self.gw.is_up() {
             return;
         }
-        self.drive.phase = Phase::Starting { cancel: false };
+        self.backup.phase = Phase::Starting { cancel: false };
         self.gw.mutate(Mutation::DriveLoginBegin, |app, r| match r {
             Ok(Done::DriveLogin { handle, url }) => app.on_login_begun(handle, url),
             Ok(_) => {
-                app.drive.phase = Phase::Idle;
+                app.backup.phase = Phase::Idle;
                 app.toasts
                     .error(&app.ctx, "Google sign-in failed: unexpected reply");
             }
             Err(e) => {
-                app.drive.phase = Phase::Idle;
+                app.backup.phase = Phase::Idle;
                 app.toasts.error(&app.ctx, e);
             }
         });
@@ -225,21 +299,21 @@ impl App {
 
     /// The gateway holds the OAuth flow: open the consent page here, then wait for the browser.
     fn on_login_begun(&mut self, handle: u64, url: String) {
-        let cancelled = matches!(self.drive.phase, Phase::Starting { cancel: true });
+        let cancelled = matches!(self.backup.phase, Phase::Starting { cancel: true });
         if cancelled {
-            self.drive.phase = Phase::Idle;
+            self.backup.phase = Phase::Idle;
             self.gw
                 .mutate(Mutation::DriveLoginCancel(handle), |_, _| {});
             return;
         }
-        self.drive.phase = Phase::Waiting { handle };
+        self.backup.phase = Phase::Waiting { handle };
         self.open_external(url);
         self.gw
             .mutate(Mutation::DriveLoginFinish(handle), |app, r| {
-                app.drive.phase = Phase::Idle;
+                app.backup.phase = Phase::Idle;
                 match r {
                     Ok(Done::DriveAccount { email }) => {
-                        app.drive.seen_error = None;
+                        app.backup.seen_error = None;
                         let who = email.unwrap_or_else(|| "your account".into());
                         app.toasts
                             .success(&app.ctx, format!("Google Drive backup: signed in as {who}"));
@@ -251,21 +325,109 @@ impl App {
             });
     }
 
-    fn start_backup(&mut self) {
-        if !self.drive_begin(Busy::BackingUp) {
+    /// Checks and saves the server (the gateway logs in, tests writing, then stores it). An
+    /// unknown key or certificate comes back as a fingerprint to trust.
+    fn start_server_connect(&mut self, config: ServerConfig, keep_secret: bool) {
+        if !self.backup_begin(Busy::Connecting) {
+            self.settings.server_form.error = Some(JOB_BUSY.to_owned());
             return;
         }
-        self.gw
-            .mutate(Mutation::DriveBackup { force: true }, |app, r| {
-                app.drive.phase = Phase::Idle;
+        self.settings.server_form.error = None;
+        self.gw.mutate(
+            Mutation::ServerConnect {
+                config,
+                keep_secret,
+            },
+            |app, r| {
+                app.backup.phase = Phase::Idle;
+                let form = &mut app.settings.server_form;
                 match r {
-                    Ok(Done::DriveBackup(outcome)) => {
-                        app.drive.seen_error = None;
+                    Ok(Done::ServerConnect(ServerConnectOutcome::Connected(view))) => {
+                        *form = ServerForm::default();
+                        app.backup.seen_error = None;
+                        app.toasts
+                            .success(&app.ctx, format!("Backups go to {} now", view.label));
+                    }
+                    Ok(Done::ServerConnect(ServerConnectOutcome::Untrusted { fingerprint })) => {
+                        form.trust = Some(fingerprint);
+                    }
+                    Ok(Done::ServerConnect(ServerConnectOutcome::Changed {
+                        pinned,
+                        presented,
+                    })) => {
+                        form.error = Some(format!(
+                            "The server's identity changed: OmpDeck trusts {pinned}, the server \
+                             now presents {presented}. If the server's owner changed its key or \
+                             certificate, remove the server and add it again."
+                        ));
+                    }
+                    Ok(_) => form.error = Some("Unexpected reply from the gateway".to_owned()),
+                    Err(e) => form.error = Some(e),
+                }
+            },
+        );
+    }
+
+    /// The user confirmed removing the saved server.
+    pub(super) fn remove_server(&mut self) {
+        if !self.backup_begin(Busy::RemovingServer) {
+            self.toasts.info(&self.ctx, JOB_BUSY);
+            return;
+        }
+        self.gw.mutate(Mutation::ServerForget, |app, r| {
+            app.backup.phase = Phase::Idle;
+            match r {
+                Ok(_) => {
+                    app.settings.server_form = ServerForm::default();
+                    app.toasts.info(&app.ctx, "Backup server removed");
+                }
+                Err(e) => app
+                    .toasts
+                    .error(&app.ctx, format!("Cannot remove the server: {e}")),
+            }
+        });
+    }
+
+    /// The native file dialog for the SFTP key, starting in `~/.ssh` (or the typed file's folder).
+    fn browse_key(&mut self) {
+        let typed = PathBuf::from(self.settings.server_form.key_path.trim());
+        let start = typed
+            .parent()
+            .filter(|p| p.is_dir())
+            .map(PathBuf::from)
+            .or_else(|| {
+                dirs::home_dir()
+                    .map(|h| h.join(".ssh"))
+                    .filter(|p| p.is_dir())
+            })
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        self.gw.native(
+            move || transfer::pick_file(&start),
+            |app, path| {
+                if let Some(path) = path {
+                    app.settings.server_form.key_path = path.to_string_lossy().into_owned();
+                }
+            },
+        );
+    }
+
+    fn start_backup(&mut self) {
+        if !self.backup_begin(Busy::BackingUp) {
+            return;
+        }
+        let place = self.backup_place();
+        self.gw
+            .mutate(Mutation::Backup { force: true }, move |app, r| {
+                app.backup.phase = Phase::Idle;
+                match r {
+                    Ok(Done::Backup(outcome)) => {
+                        app.backup.seen_error = None;
                         if let Some(o) = outcome {
                             log::info!("uploaded {} ({} pruned)", o.file.name, o.pruned);
                             app.toasts.success(
                                 &app.ctx,
-                                format!("Backed up to Google Drive ({})", human_size(o.file.size)),
+                                format!("Backed up to {place} ({})", human_size(o.file.size)),
                             );
                         }
                     }
@@ -277,30 +439,30 @@ impl App {
 
     /// Lists the backups for whichever of the restore picker and the manager is open.
     fn start_listing(&mut self) {
-        if let Some(p) = &mut self.drive.picker {
+        if let Some(p) = &mut self.backup.picker {
             p.files = None;
             p.selected = None;
         }
-        if let Some(m) = &mut self.drive.manager {
+        if let Some(m) = &mut self.backup.manager {
             m.dlg.set_list(ManagerList::Loading);
         }
-        if !self.drive_begin(Busy::Listing) {
-            self.on_drive_listed(Err(JOB_BUSY.to_owned()));
+        if !self.backup_begin(Busy::Listing) {
+            self.on_backups_listed(Err(JOB_BUSY.to_owned()));
             return;
         }
-        self.gw.query(Query::DriveList, |app, r| {
-            app.drive.phase = Phase::Idle;
+        self.gw.query(Query::BackupList, |app, r| {
+            app.backup.phase = Phase::Idle;
             let result = match r {
-                Ok(Answer::DriveList(files)) => Ok(files),
+                Ok(Answer::BackupList(files)) => Ok(files),
                 Ok(_) => Err("unexpected reply".to_owned()),
                 Err(e) => Err(e),
             };
-            app.on_drive_listed(result);
+            app.on_backups_listed(result);
         });
     }
 
-    fn on_drive_listed(&mut self, result: Result<Vec<BackupFile>, String>) {
-        if let Some(m) = &mut self.drive.manager {
+    fn on_backups_listed(&mut self, result: Result<Vec<BackupFile>, String>) {
+        if let Some(m) = &mut self.backup.manager {
             match &result {
                 Ok(files) => {
                     m.dlg.set_list(ManagerList::Ready(host_groups(
@@ -316,26 +478,23 @@ impl App {
                 }
             }
         }
-        if let Some(p) = &mut self.drive.picker {
+        if let Some(p) = &mut self.backup.picker {
             p.rows = result.as_ref().map_or_else(|_| Vec::new(), |f| rows(f));
             p.files = Some(result);
         }
     }
 
-    /// "Manage backups…" on the Google Drive card or in the palette.
-    fn open_drive_manager(&mut self) {
-        if !self.drive_signed_in() {
-            self.toasts.info(
-                &self.ctx,
-                "Sign in to Google Drive in Settings → Backup first.",
-            );
+    /// "Manage backups…" on the Backup card or in the palette.
+    fn open_backup_manager(&mut self) {
+        if let Some(why) = self.backup_unlinked_reason() {
+            self.toasts.info(&self.ctx, why);
             return;
         }
-        if !self.drive.idle() {
+        if !self.backup.idle() {
             self.toasts.info(&self.ctx, JOB_BUSY);
             return;
         }
-        self.drive.manager = Some(Manager {
+        self.backup.manager = Some(Manager {
             dlg: BackupManager::new(),
             files: Vec::new(),
         });
@@ -343,13 +502,14 @@ impl App {
     }
 
     /// The backup manager, while open.
-    fn show_drive_manager(&mut self, ctx: &egui::Context) {
-        let progress = self.drive.deletion.as_ref().map(|d| (d.done, d.total));
-        let busy = !self.drive.idle() || self.drive_view().is_some_and(|v| v.busy.is_some());
-        let Some(m) = &mut self.drive.manager else {
+    fn show_backup_manager(&mut self, ctx: &egui::Context) {
+        let progress = self.backup.deletion.as_ref().map(|d| (d.done, d.total));
+        let busy = !self.backup.idle() || self.backup_view().is_some_and(|v| v.busy.is_some());
+        let place = self.backup_place();
+        let Some(m) = &mut self.backup.manager else {
             return;
         };
-        let Some(action) = drive_view::manager_dialog(ctx, &m.dlg, progress, busy) else {
+        let Some(action) = backup_view::manager_dialog(ctx, &m.dlg, progress, busy, &place) else {
             return;
         };
         match action {
@@ -366,11 +526,11 @@ impl App {
                 if m.dlg.step == ManagerStep::Deleting {
                     m.dlg.cancelling = true;
                     // The deletion in flight finishes; none is sent after it.
-                    if let Some(d) = &mut self.drive.deletion {
+                    if let Some(d) = &mut self.backup.deletion {
                         d.cancelled = true;
                     }
                 } else {
-                    self.drive.manager = None;
+                    self.backup.manager = None;
                     self.focus_pending = true;
                 }
             }
@@ -385,14 +545,14 @@ impl App {
                     m.dlg.step = ManagerStep::Browse;
                     return;
                 }
-                if self.start_drive_delete(files) {
-                    if let Some(m) = &mut self.drive.manager {
+                if self.start_backup_delete(files) {
+                    if let Some(m) = &mut self.backup.manager {
                         m.dlg.step = ManagerStep::Deleting;
                         m.dlg.cancelling = false;
                         m.dlg.failures.clear();
                     }
                 } else {
-                    if let Some(m) = &mut self.drive.manager {
+                    if let Some(m) = &mut self.backup.manager {
                         m.dlg.step = ManagerStep::Browse;
                     }
                     self.toasts.info(&self.ctx, JOB_BUSY);
@@ -401,13 +561,13 @@ impl App {
         }
     }
 
-    /// Deletes `files` permanently, one request after the other; false when another Drive job
+    /// Deletes `files` permanently, one request after the other; false when another backup job
     /// runs.
-    fn start_drive_delete(&mut self, files: Vec<BackupFile>) -> bool {
-        if files.is_empty() || !self.drive_begin(Busy::Deleting) {
+    fn start_backup_delete(&mut self, files: Vec<BackupFile>) -> bool {
+        if files.is_empty() || !self.backup_begin(Busy::Deleting) {
             return false;
         }
-        self.drive.deletion = Some(Deletion {
+        self.backup.deletion = Some(Deletion {
             total: files.len(),
             queue: files.into(),
             done: 0,
@@ -415,13 +575,13 @@ impl App {
             failed: Vec::new(),
             cancelled: false,
         });
-        self.drive_delete_next();
+        self.backup_delete_next();
         true
     }
 
     /// Sends the next deletion, or reports when the queue is done (or cancelled).
-    fn drive_delete_next(&mut self) {
-        let Some(d) = &mut self.drive.deletion else {
+    fn backup_delete_next(&mut self) {
+        let Some(d) = &mut self.backup.deletion else {
             return;
         };
         let next = if d.cancelled {
@@ -430,28 +590,27 @@ impl App {
             d.queue.pop_front()
         };
         let Some(file) = next else {
-            let Some(d) = self.drive.deletion.take() else {
+            let Some(d) = self.backup.deletion.take() else {
                 return;
             };
-            self.drive.phase = Phase::Idle;
-            self.on_drive_deleted(d);
+            self.backup.phase = Phase::Idle;
+            self.on_backups_deleted(d);
             return;
         };
         let label = backup_label(&file);
-        self.gw
-            .mutate(Mutation::DriveDeleteBackup(file), move |app, r| {
-                if let Some(d) = &mut app.drive.deletion {
-                    d.done += 1;
-                    match r {
-                        Ok(_) => d.deleted += 1,
-                        Err(e) => d.failed.push(format!("{label}: {e}")),
-                    }
+        self.gw.mutate(Mutation::DeleteBackup(file), move |app, r| {
+            if let Some(d) = &mut app.backup.deletion {
+                d.done += 1;
+                match r {
+                    Ok(_) => d.deleted += 1,
+                    Err(e) => d.failed.push(format!("{label}: {e}")),
                 }
-                app.drive_delete_next();
-            });
+            }
+            app.backup_delete_next();
+        });
     }
 
-    fn on_drive_deleted(&mut self, d: Deletion) {
+    fn on_backups_deleted(&mut self, d: Deletion) {
         let s = |n: usize| if n == 1 { "" } else { "s" };
         let stopped = if d.cancelled { " (stopped early)" } else { "" };
         if let Some(first) = d.failed.first() {
@@ -479,30 +638,30 @@ impl App {
         } else if d.cancelled {
             self.toasts.info(&self.ctx, "Deletion cancelled");
         }
-        if let Some(m) = &mut self.drive.manager {
+        if let Some(m) = &mut self.backup.manager {
             m.dlg.step = ManagerStep::Browse;
             m.dlg.cancelling = false;
             m.dlg.failures = d.failed;
         }
-        if self.drive.picker.is_some() || self.drive.manager.is_some() {
+        if self.backup.picker.is_some() || self.backup.manager.is_some() {
             self.start_listing();
         }
     }
 
     /// Per frame: the gateway runs the automatic backups; a failure of one is reported once.
-    pub(super) fn drive_tick(&mut self, _ctx: &egui::Context) {
-        let Some(view) = self.drive_view() else {
+    pub(super) fn backup_tick(&mut self, _ctx: &egui::Context) {
+        let Some(view) = self.backup_view() else {
             return;
         };
         match &view.last_error {
-            None => self.drive.seen_error = None,
-            Some(e) if self.drive.seen_error.as_ref() != Some(e) => {
-                self.drive.seen_error = Some(e.clone());
+            None => self.backup.seen_error = None,
+            Some(e) if self.backup.seen_error.as_ref() != Some(e) => {
+                self.backup.seen_error = Some(e.clone());
                 // A failure of this window's own job was shown by that job.
-                if self.drive.idle() {
+                if self.backup.idle() {
                     self.toasts.error(
                         &self.ctx,
-                        format!("Automatic Google Drive backup failed: {e}"),
+                        format!("Automatic backup to {} failed: {e}", self.backup_place()),
                     );
                 }
             }
@@ -510,12 +669,13 @@ impl App {
         }
     }
 
-    /// The Drive dialogs, while open: the backup manager and the restore picker.
-    pub(super) fn show_drive_picker(&mut self, ctx: &egui::Context) {
-        self.show_drive_manager(ctx);
-        let preparing = matches!(self.drive.phase, Phase::Busy(Busy::Preparing));
-        let busy = !self.drive.idle() || self.drive_view().is_some_and(|v| v.busy.is_some());
-        let Some(p) = &mut self.drive.picker else {
+    /// The backup dialogs, while open: the backup manager and the restore picker.
+    pub(super) fn show_backup_dialogs(&mut self, ctx: &egui::Context) {
+        self.show_backup_manager(ctx);
+        let preparing = matches!(self.backup.phase, Phase::Busy(Busy::Preparing));
+        let busy = !self.backup.idle() || self.backup_view().is_some_and(|v| v.busy.is_some());
+        let place = self.backup_place();
+        let Some(p) = &mut self.backup.picker else {
             return;
         };
         let list = match &p.files {
@@ -523,10 +683,11 @@ impl App {
             Some(Err(e)) => RestoreList::Failed(e),
             Some(Ok(_)) => RestoreList::Rows(&p.rows),
         };
-        let pick = drive_view::restore_dialog(ctx, &list, &mut p.selected, preparing, busy);
+        let pick =
+            backup_view::restore_dialog(ctx, &list, &mut p.selected, preparing, busy, &place);
         if let Some((i, question)) = &p.pending_delete {
             let i = *i;
-            match confirm::show(ctx, "drive-delete-backup", question) {
+            match confirm::show(ctx, "backup-delete-backup", question) {
                 None => {}
                 Some(false) => p.pending_delete = None,
                 Some(true) => {
@@ -536,8 +697,8 @@ impl App {
                         .as_ref()
                         .and_then(|f| f.as_ref().ok()?.get(i).cloned());
                     if let Some(file) = file {
-                        if self.start_drive_delete(vec![file]) {
-                            if let Some(p) = &mut self.drive.picker {
+                        if self.start_backup_delete(vec![file]) {
+                            if let Some(p) = &mut self.backup.picker {
                                 p.files = None;
                                 p.selected = None;
                             }
@@ -549,7 +710,7 @@ impl App {
                 }
             }
         }
-        let Some(p) = &mut self.drive.picker else {
+        let Some(p) = &mut self.backup.picker else {
             return;
         };
         match pick {
@@ -557,13 +718,13 @@ impl App {
             Some(RestorePick::Delete(i)) => {
                 let file = p.files.as_ref().and_then(|f| f.as_ref().ok()?.get(i));
                 if let Some(file) = file {
-                    p.pending_delete = Some((i, delete_question(file)));
+                    p.pending_delete = Some((i, delete_question(file, &place)));
                 }
             }
             Some(RestorePick::Cancel) => {
                 // Closing while a download runs just drops its result.
                 if !preparing {
-                    self.drive.picker = None;
+                    self.backup.picker = None;
                 }
             }
             Some(RestorePick::Retry) => self.start_listing(),
@@ -575,26 +736,25 @@ impl App {
                 else {
                     return;
                 };
-                if !self.drive_begin(Busy::Preparing) {
+                if !self.backup_begin(Busy::Preparing) {
                     return;
                 }
-                self.gw
-                    .mutate(Mutation::DrivePrepareRestore(file), |app, r| {
-                        app.drive.phase = Phase::Idle;
-                        match r {
-                            Ok(Done::DrivePrepared { handle, plan }) => {
-                                app.drive.picker = None;
-                                app.confirm = Some((
-                                    restore_question(&plan),
-                                    PendingConfirm::RestoreBackup(PendingRestore { handle }),
-                                ));
-                            }
-                            Ok(_) => {}
-                            Err(e) => app
-                                .toasts
-                                .error(&app.ctx, format!("Cannot restore that backup: {e}")),
+                self.gw.mutate(Mutation::PrepareRestore(file), |app, r| {
+                    app.backup.phase = Phase::Idle;
+                    match r {
+                        Ok(Done::Prepared { handle, plan }) => {
+                            app.backup.picker = None;
+                            app.confirm = Some((
+                                restore_question(&plan),
+                                PendingConfirm::RestoreBackup(PendingRestore { handle }),
+                            ));
                         }
-                    });
+                        Ok(_) => {}
+                        Err(e) => app
+                            .toasts
+                            .error(&app.ctx, format!("Cannot restore that backup: {e}")),
+                    }
+                });
             }
         }
     }
@@ -603,27 +763,28 @@ impl App {
     pub(super) fn answer_restore(&mut self, p: PendingRestore, yes: bool) {
         if !yes {
             self.gw
-                .mutate(Mutation::DriveDiscardRestore(p.handle), |_, _| {});
+                .mutate(Mutation::DiscardRestore(p.handle), |_, _| {});
             return;
         }
-        if !self.drive_begin(Busy::Restoring) {
+        if !self.backup_begin(Busy::Restoring) {
             self.toasts.info(
                 &self.ctx,
-                "Another Google Drive job is running; restore again in a moment.",
+                "Another backup job is running; restore again in a moment.",
             );
             self.gw
-                .mutate(Mutation::DriveDiscardRestore(p.handle), |_, _| {});
+                .mutate(Mutation::DiscardRestore(p.handle), |_, _| {});
             return;
         }
+        let place = self.backup_place();
         self.gw
-            .mutate(Mutation::DriveApplyRestore(p.handle), |app, r| {
-                app.drive.phase = Phase::Idle;
+            .mutate(Mutation::ApplyRestore(p.handle), move |app, r| {
+                app.backup.phase = Phase::Idle;
                 match r {
-                    Ok(Done::DriveRestored(report)) => {
+                    Ok(Done::Restored(report)) => {
                         app.toasts.success(
                             &app.ctx,
                             format!(
-                                "Restored from Google Drive. Restart running omp sessions to pick up the \
+                                "Restored from {place}. Restart running omp sessions to pick up the \
                                  restored config. The previous files are in {}",
                                 abbreviate_home(&report.safety_dir)
                             ),
@@ -652,7 +813,7 @@ fn backup_label(f: &BackupFile) -> String {
 }
 
 /// The restore picker's "delete this backup" confirmation.
-fn delete_question(f: &BackupFile) -> Confirm {
+fn delete_question(f: &BackupFile, place: &str) -> Confirm {
     let host = match f.host() {
         Some(h) if h == hostname() => "this PC".to_owned(),
         Some(h) => h.to_owned(),
@@ -662,7 +823,7 @@ fn delete_question(f: &BackupFile) -> Confirm {
         title: "Delete this backup permanently?".to_owned(),
         body: format!(
             "Settings backup from {host}, {} ({}).\n\nThis can't be undone: the file is removed \
-             from Google Drive, not moved to the trash.",
+             from {place}, not moved to the trash.",
             when(f),
             human_size(f.size)
         ),

@@ -19,15 +19,18 @@ use std::path::PathBuf;
 
 use deck_core::agent_defs::{AgentFile, Catalog as AgentCatalog, Edit as AgentEdit, NewAgent};
 use deck_core::agents::{AgentsSnapshot, AgentsTarget, TranscriptItem};
+use deck_core::backup::server::{
+    Protocol as ServerProtocol, ServerAccount, ServerAuth, ServerConfig,
+};
+use deck_core::backup::{
+    BackupFile, BackupOutcome, ConflictChoice, Destination, LastBackup, Parts, ProjectBackup,
+    ProjectBackupOutcome, ProjectRestorePlan, ProjectRestoreReport, ProjectSizes, ProjectSyncState,
+    RestoreReport,
+};
 use deck_core::changes::{ChangedFile, Changes, DiffSide, FileDiff};
 use deck_core::config::GatewayMode;
 use deck_core::ctl::{CtlCommand, LiveSnapshot};
 use deck_core::fleet::{FleetSnapshot, FleetTarget};
-use deck_core::gdrive::{
-    BackupFile, BackupOutcome, ConflictChoice, LastBackup, Parts, ProjectBackup,
-    ProjectBackupOutcome, ProjectRestorePlan, ProjectRestoreReport, ProjectSizes, ProjectSyncState,
-    RestoreReport,
-};
 use deck_core::inventory::{InventoryEntry, SessionStats};
 use deck_core::mux::MuxKind;
 use deck_core::omp::{
@@ -278,7 +281,8 @@ pub enum Topic {
     Status,
     Usage,
     AppUpdate,
-    Drive,
+    /// The backup destinations ([`BackupView`]).
+    Backup,
     Inventory,
     Changes(PathBuf),
     Tree(PathBuf),
@@ -354,10 +358,13 @@ pub enum Query {
         branch: String,
         base: String,
     },
-    DriveList,
-    DriveProjects,
-    DriveProjectState,
-    DriveMeasure {
+    /// Config backups at the active destination, newest first.
+    BackupList,
+    /// Project backups at the active destination.
+    ProjectBackups,
+    /// The active destination's project sync record.
+    ProjectSyncState,
+    ProjectMeasure {
         project: PathBuf,
     },
     Stats(Vec<PathBuf>),
@@ -401,10 +408,10 @@ pub enum Answer {
     MergeTarget(MergeTarget),
     WorktreeSessions(Vec<(SessionTarget, String)>),
     BranchState(BranchState),
-    DriveList(Vec<BackupFile>),
-    DriveProjects(Vec<ProjectBackup>),
-    DriveProjectState(ProjectSyncState),
-    DriveMeasure(ProjectSizes),
+    BackupList(Vec<BackupFile>),
+    ProjectBackups(Vec<ProjectBackup>),
+    ProjectSyncState(ProjectSyncState),
+    ProjectMeasure(ProjectSizes),
     Stats(Vec<(PathBuf, Option<SessionStats>)>),
     Path(Option<PathBuf>),
     Flushed,
@@ -451,7 +458,7 @@ pub enum TopicValue {
     Status(Box<Option<(SessionTarget, SessionStatus)>>),
     Usage(UsageView),
     AppUpdate(AppUpdateView),
-    Drive(DriveView),
+    Backup(BackupView),
     Inventory(Vec<InventoryEntry>),
     Changes(Result<Option<Changes>, String>),
     Tree {
@@ -654,17 +661,94 @@ pub struct AppUpdateView {
     pub phase: UpdatePhase,
 }
 
+/// Where backups go and how that destination stands. Secrets (Google tokens, the server's
+/// password or key passphrase) never appear here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DriveView {
+pub struct BackupView {
+    /// The active destination (`AppConfig::backup_destination`).
+    pub destination: Destination,
     /// Google client credentials are built in / configured.
-    pub available: bool,
-    pub signed_in: bool,
-    pub email: Option<String>,
+    pub drive_available: bool,
+    pub drive_signed_in: bool,
+    pub drive_email: Option<String>,
+    /// The saved backup server.
+    pub server: Option<ServerView>,
+    /// The active destination's last upload from this machine.
     pub last_backup: Option<LastBackup>,
-    /// A Drive job is running (only one at a time).
+    /// A backup-lane job is running (only one at a time, any destination).
     pub busy: Option<String>,
+    /// The last automatic backup's failure at the active destination.
     pub last_error: Option<String>,
     pub last_auto_unix_ms: Option<u64>,
+}
+
+impl BackupView {
+    /// The active destination is set up (signed in / a server saved).
+    pub fn linked(&self) -> bool {
+        match self.destination {
+            Destination::Drive => self.drive_available && self.drive_signed_in,
+            Destination::Server => self.server.is_some(),
+        }
+    }
+
+    /// The active destination's name for the UI: "Google Drive", `sftp://host` or "server".
+    pub fn place(&self) -> String {
+        match (self.destination, &self.server) {
+            (Destination::Drive, _) => "Google Drive".to_owned(),
+            (Destination::Server, Some(s)) => s.label.clone(),
+            (Destination::Server, None) => "server".to_owned(),
+        }
+    }
+}
+
+/// A saved backup server without its password or key passphrase.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerView {
+    pub protocol: ServerProtocol,
+    pub host: String,
+    /// The port dialled.
+    pub port: u16,
+    /// `None` = anonymous.
+    pub user: Option<String>,
+    /// SFTP key authentication: the private key file.
+    pub key_path: Option<PathBuf>,
+    pub folder: String,
+    /// A trusted host key / certificate fingerprint is pinned.
+    pub pinned: bool,
+    /// `sftp://host[:port]`.
+    pub label: String,
+}
+
+impl ServerView {
+    pub fn of(account: &ServerAccount) -> ServerView {
+        let c = &account.config;
+        ServerView {
+            protocol: c.protocol,
+            host: c.host.clone(),
+            port: c.effective_port(),
+            user: c.auth.user().map(str::to_owned),
+            key_path: match &c.auth {
+                ServerAuth::Key { key_path, .. } => Some(key_path.clone()),
+                _ => None,
+            },
+            folder: c.folder.clone(),
+            pinned: c.pinned.is_some(),
+            label: c.label(),
+        }
+    }
+}
+
+/// [`Mutation::ServerConnect`]'s answer. Other failures are [`GatewayError::Failed`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServerConnectOutcome {
+    /// Checked and saved.
+    Connected(ServerView),
+    /// Trust on first use: nothing was saved. Show `fingerprint`; connect again with it as
+    /// `pinned` once the user trusts it.
+    Untrusted { fingerprint: String },
+    /// The server presented another key or certificate than the pinned one: refused. The user
+    /// removes the server and adds it again if the change is expected.
+    Changed { pinned: String, presented: String },
 }
 
 /// A mutation.
@@ -820,14 +904,23 @@ pub enum Mutation {
     DriveLoginFinish(u64),
     DriveLoginCancel(u64),
     DriveSignOut,
-    DriveBackup {
+    /// Back up the omp config to the active destination.
+    Backup {
         force: bool,
     },
-    DrivePrepareRestore(BackupFile),
-    DriveApplyRestore(u64),
-    DriveDiscardRestore(u64),
+    PrepareRestore(BackupFile),
+    ApplyRestore(u64),
+    DiscardRestore(u64),
     /// Permanently deletes a config backup (only config backups are accepted).
-    DriveDeleteBackup(BackupFile),
+    DeleteBackup(BackupFile),
+    /// Check and save the backup server. `keep_secret`: an empty password / missing passphrase
+    /// takes the saved server's (same login), so editing never needs the secret again.
+    ServerConnect {
+        config: ServerConfig,
+        keep_secret: bool,
+    },
+    /// Forget the saved server (local settings only; nothing on the server is touched).
+    ServerForget,
     ProjectBackup {
         project: PathBuf,
         parts: Parts,
@@ -911,11 +1004,13 @@ impl Mutation {
             Mutation::DriveLoginFinish(_) => "drive-login-finish",
             Mutation::DriveLoginCancel(_) => "drive-login-cancel",
             Mutation::DriveSignOut => "drive-sign-out",
-            Mutation::DriveBackup { .. } => "drive-backup",
-            Mutation::DrivePrepareRestore(_) => "drive-prepare-restore",
-            Mutation::DriveApplyRestore(_) => "drive-restore",
-            Mutation::DriveDiscardRestore(_) => "drive-discard-restore",
-            Mutation::DriveDeleteBackup(_) => "drive-delete-backup",
+            Mutation::Backup { .. } => "backup",
+            Mutation::PrepareRestore(_) => "prepare-restore",
+            Mutation::ApplyRestore(_) => "restore",
+            Mutation::DiscardRestore(_) => "discard-restore",
+            Mutation::DeleteBackup(_) => "delete-backup",
+            Mutation::ServerConnect { .. } => "server-connect",
+            Mutation::ServerForget => "server-forget",
             Mutation::ProjectBackup { .. } => "project-backup",
             Mutation::ProjectDeleteBackup(_) => "project-delete-backup",
             Mutation::ProjectPrepareRestore { .. } => "project-prepare-restore",
@@ -968,7 +1063,7 @@ impl Mutation {
                 | Mutation::CancelJob(_)
                 | Mutation::RefreshSessions
                 | Mutation::DriveLoginCancel(_)
-                | Mutation::DriveDiscardRestore(_)
+                | Mutation::DiscardRestore(_)
                 | Mutation::ProjectDiscardRestore(_)
         )
     }
@@ -1070,12 +1165,13 @@ pub enum Done {
     DriveAccount {
         email: Option<String>,
     },
-    DriveBackup(Option<BackupOutcome>),
-    DrivePrepared {
+    Backup(Option<BackupOutcome>),
+    Prepared {
         handle: u64,
         plan: RestorePlanView,
     },
-    DriveRestored(RestoreReport),
+    Restored(RestoreReport),
+    ServerConnect(ServerConnectOutcome),
     ProjectBackup(Option<ProjectBackupOutcome>),
     ProjectPrepared {
         handle: u64,
@@ -1090,7 +1186,7 @@ pub enum Done {
     AgentFile(Box<AgentFile>),
 }
 
-/// What a Drive restore would change ([`deck_core::gdrive::RestorePlan`]).
+/// What a config restore would change ([`deck_core::backup::RestorePlan`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestorePlanView {
     pub name: String,
@@ -1303,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn drive_delete_backup_round_trips_with_its_journal_key() {
+    fn delete_backup_round_trips_with_its_journal_key() {
         let file = BackupFile {
             id: "1AbC-x_9".into(),
             name: "omp-backup-20261022T135201Z-host.tar.gz".into(),
@@ -1311,17 +1407,71 @@ mod tests {
             created: "2026-10-22T13:52:01.000Z".into(),
             props: [("host".to_owned(), "host".to_owned())].into(),
         };
-        let op = Mutation::DriveDeleteBackup(file.clone());
-        assert_eq!(op.label(), "drive-delete-backup");
+        let op = Mutation::DeleteBackup(file.clone());
+        assert_eq!(op.label(), "delete-backup");
         assert!(op.target().is_none());
         assert!(!op.allowed_in_maintenance());
         let back: Mutation = serde_json::from_slice(&serde_json::to_vec(&op).unwrap()).unwrap();
         match back {
-            Mutation::DriveDeleteBackup(f) => assert_eq!(f, file),
+            Mutation::DeleteBackup(f) => assert_eq!(f, file),
             other => panic!("decoded as {}", other.label()),
         }
         // The reply mirrors ProjectDeleteBackup's.
         let done: Done = serde_json::from_slice(&serde_json::to_vec(&Done::Unit).unwrap()).unwrap();
         assert!(matches!(done, Done::Unit));
+    }
+
+    #[test]
+    fn server_connect_round_trips_and_its_view_carries_no_secret() {
+        let config = ServerConfig {
+            protocol: ServerProtocol::Sftp,
+            host: "nas.local".into(),
+            port: 2222,
+            auth: ServerAuth::Key {
+                user: "me".into(),
+                key_path: "/home/me/.ssh/id_ed25519".into(),
+                passphrase: Some("hunter2-passphrase".into()),
+            },
+            folder: "backups".into(),
+            pinned: Some("SHA256:abc".into()),
+        };
+        let op = Mutation::ServerConnect {
+            config: config.clone(),
+            keep_secret: true,
+        };
+        assert_eq!(op.label(), "server-connect");
+        assert!(!op.allowed_in_maintenance());
+        let back: Mutation = serde_json::from_slice(&serde_json::to_vec(&op).unwrap()).unwrap();
+        match back {
+            Mutation::ServerConnect {
+                config: c,
+                keep_secret: true,
+            } => assert_eq!(c, config),
+            other => panic!("decoded as {}", other.label()),
+        }
+
+        let account = ServerAccount {
+            config,
+            last_backup: None,
+            synced_fingerprint: None,
+        };
+        let view = ServerView::of(&account);
+        assert_eq!(view.port, 2222);
+        assert!(view.pinned);
+        let done = Done::ServerConnect(ServerConnectOutcome::Connected(view.clone()));
+        let bytes = serde_json::to_vec(&done).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("hunter2-passphrase"));
+        match serde_json::from_slice::<Done>(&bytes).unwrap() {
+            Done::ServerConnect(ServerConnectOutcome::Connected(v)) => assert_eq!(v, view),
+            _ => panic!("decoded as something else"),
+        }
+        let untrusted = Done::ServerConnect(ServerConnectOutcome::Untrusted {
+            fingerprint: "SHA256:xyz".into(),
+        });
+        let back: Done = serde_json::from_slice(&serde_json::to_vec(&untrusted).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            Done::ServerConnect(ServerConnectOutcome::Untrusted { fingerprint }) if fingerprint == "SHA256:xyz"
+        ));
     }
 }

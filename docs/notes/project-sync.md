@@ -1,6 +1,6 @@
 # Project sync facts (Google Drive, per-project `.omp` + sessions)
 
-Facts behind wave 10 (`deck_core::gdrive::project`, `crates/omp-deck/src/app/project_sync.rs`, `sync_view.rs`).
+Facts behind wave 10 (`deck_core::backup::project`, `crates/omp-deck/src/app/project_sync.rs`, `sync_view.rs`).
 Verified 2026-10-22 against omp 18.12.6 (bundle extracted with `strings -n 6 ~/.local/bin/omp`, citations
 `bundle:<line>`) in a sandbox (`PI_CODING_AGENT_DIR`/`HOME` temp dirs), Google Drive v3 docs, and ureq 3.5.0
 sources. The existing config backup (`docs/notes/google-drive-backup.md`) is a separate workflow and is unchanged.

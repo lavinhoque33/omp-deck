@@ -22,8 +22,8 @@ use super::{
     BlobManifest, FORMAT, ItemManifest, KIND, MAX_MEMBER, Manifest, MemoryManifest, Meter,
     OmpManifest, Progress, Pump, SessionsManifest, Stage, job_io,
 };
-use crate::gdrive::archive::{ManifestFile, hex};
-use crate::gdrive::{Error, Result, rfc3339};
+use crate::backup::archive::{ManifestFile, hex};
+use crate::backup::{Error, Result, rfc3339};
 use crate::platform;
 
 const BLOB_PREFIX: &[u8] = b"blob:sha256:";

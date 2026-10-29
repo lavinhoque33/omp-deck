@@ -104,7 +104,7 @@ impl Subject {
     }
 }
 
-/// Native directory picker available on this machine.
+/// Native file or directory picker available on this machine.
 #[cfg(not(windows))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Picker {
@@ -112,28 +112,34 @@ pub struct Picker {
     pub args: Vec<String>,
 }
 
-/// `kdialog --getexistingdirectory <start>`, else `zenity --file-selection --directory`.
+/// kdialog (`--getexistingdirectory` / `--getopenfilename`), else zenity `--file-selection`
+/// (`--directory` for folders).
 #[cfg(not(windows))]
-fn picker_command(start: &Path, have: impl Fn(&str) -> bool) -> Option<Picker> {
+fn picker_command(start: &Path, folder: bool, have: impl Fn(&str) -> bool) -> Option<Picker> {
     let start = start.to_string_lossy().into_owned();
     if have("kdialog") {
+        let mode = if folder {
+            "--getexistingdirectory"
+        } else {
+            "--getopenfilename"
+        };
         Some(Picker {
             program: "kdialog",
-            args: vec!["--getexistingdirectory".into(), start],
+            args: vec![mode.into(), start],
         })
     } else if have("zenity") {
         let mut with_slash = start;
         if !with_slash.ends_with('/') {
             with_slash.push('/');
         }
+        let mut args = vec!["--file-selection".into()];
+        if folder {
+            args.push("--directory".into());
+        }
+        args.extend(["--filename".into(), with_slash]);
         Some(Picker {
             program: "zenity",
-            args: vec![
-                "--file-selection".into(),
-                "--directory".into(),
-                "--filename".into(),
-                with_slash,
-            ],
+            args,
         })
     } else {
         None
@@ -158,7 +164,19 @@ pub fn pick_folder(start: &Path) -> Option<PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        picker_command(start, has_program).and_then(|p| run_picker(&p))
+        picker_command(start, true, has_program).and_then(|p| run_picker(&p))
+    }
+}
+
+/// Asks for a file in `start` (a folder). Blocking like [`pick_folder`].
+pub fn pick_file(start: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        rfd::FileDialog::new().set_directory(start).pick_file()
+    }
+    #[cfg(not(windows))]
+    {
+        picker_command(start, false, has_program).and_then(|p| run_picker(&p))
     }
 }
 
@@ -546,12 +564,17 @@ mod tests {
     #[test]
     fn picker_prefers_kdialog_then_zenity() {
         let start = Path::new("/home/u");
-        let both = picker_command(start, |_| true).expect("picker");
+        let both = picker_command(start, true, |_| true).expect("picker");
         assert_eq!(both.program, "kdialog");
         assert_eq!(both.args, ["--getexistingdirectory", "/home/u"]);
-        let zen = picker_command(start, |p| p == "zenity").expect("picker");
+        let zen = picker_command(start, true, |p| p == "zenity").expect("picker");
         assert_eq!(zen.program, "zenity");
+        assert!(zen.args.iter().any(|a| a == "--directory"));
         assert_eq!(zen.args.last().map(String::as_str), Some("/home/u/"));
-        assert!(picker_command(start, |_| false).is_none());
+        let file = picker_command(start, false, |p| p == "zenity").expect("picker");
+        assert!(!file.args.iter().any(|a| a == "--directory"));
+        let kfile = picker_command(start, false, |_| true).expect("picker");
+        assert_eq!(kfile.args, ["--getopenfilename", "/home/u"]);
+        assert!(picker_command(start, true, |_| false).is_none());
     }
 }

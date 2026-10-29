@@ -1162,7 +1162,7 @@ impl App {
                 Confirm {
                     title: "Stop backing up the removed worktree?".to_owned(),
                     body: format!(
-                        "{} is in the project backups list but no longer exists. Backups already in Google Drive stay.",
+                        "{} is in the project backups list but no longer exists. Its existing backups stay.",
                         wt.path.display()
                     ),
                     confirm_label: "Remove from list".to_owned(),
