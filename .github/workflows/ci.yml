@@ -95,6 +95,17 @@ jobs:
           $env:OMPDECK_TEST_OMP = Join-Path $env:LOCALAPPDATA 'omp\omp.exe'
           cargo test -p deck-core --test ctl_live -- --nocapture
 
+      # The mobile R4 gate: paired devices drive a real omp session through an in-test relay with the
+      # GUI client gone (skipped in the workspace run above, which has no omp yet).
+      - name: Remote device gate through the relay (real omp)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: |
+          cargo test -p deck-service --test remote_device -- --nocapture 2>&1 | Tee-Object -Variable out
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "remote_device failed ($code)" }
+          if (($out | Out-String) -match 'skipped: omp is not installed') { throw "remote_device skipped: omp is not on PATH" }
+
       - name: Host smoke (omp in ConPTY)
         if: ${{ !cancelled() }}
         run: |
