@@ -753,9 +753,15 @@ fn pairing_reconnect_and_revocation_over_a_real_relay() {
         },
     )
     .expect("revoked");
-    match read(&mut live) {
-        Reply::Closed(c) => assert_eq!(c, close::UNAUTHORIZED, "revoked live device"),
-        other => panic!("revoked device got {other:?}"),
+    // A reconnect session carries application records (its `WELCOME` first) before the close.
+    loop {
+        match read(&mut live) {
+            Reply::Data(_) => {}
+            Reply::Closed(c) => {
+                assert_eq!(c, close::UNAUTHORIZED, "revoked live device");
+                break;
+            }
+        }
     }
     wait_mobile(&client, "no devices", |m| m.devices.is_empty());
     assert_closed(admit(&relay, &token), close::UNAUTHORIZED, "revoked token");

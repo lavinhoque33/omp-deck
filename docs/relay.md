@@ -147,10 +147,17 @@ network loss) is logged as `connection lost`, not as a protocol violation. Behin
 `--trust-forwarded-for` the total cap also counts the proxy's idle keep-alive connections. The
 inbound rate limits apply from the first message on: the hello and any ping before it are charged.
 
+The OmpDeck gateway paces what it sends to stay inside the defaults: at most 6 MiB/s and 3000
+messages/s over all phones, and at most 1 MiB (32 messages) unacknowledged per phone. Do not lower
+`--gateway-bytes-per-sec`, `--gateway-messages-per-sec`, `--queue-messages` or `--queue-bytes` below
+their defaults: the relay would close the gateway (taking every phone offline) or drop busy phones.
+
 Close codes the relay uses: 1000 normal, 1001 relay shutting down, 1002 protocol violation (text or
 undecodable message), 4001 bad or late hello, 4003 unauthorized (unknown room, wrong secret, unknown
 or revoked device), 4004 the room's gateway is offline, 4008 slow consumer, 4009 replaced by a newer
-gateway connection, 4013 message too large, 4029 rate limited.
+gateway connection, 4013 message too large, 4029 rate limited. The gateway can also close a phone through
+the relay with 4002 (the phone broke the application protocol) or 4010 (the phone stopped
+acknowledging what it received).
 
 ## Upgrading
 

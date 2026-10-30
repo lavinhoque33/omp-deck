@@ -414,8 +414,11 @@ The phone transport is being built ([slice 3 design](docs/notes/mobile-relay.md)
 wire format and the Noise device protocol (pairing `IKpsk1`, reconnect `IK`), with a TypeScript port for the future
 PWA in `pwa/` (`bun test` checks it against shared vectors). `omp-deck-relay` (`crates/deck-relay`) is the
 self-hosted relay; see [docs/relay.md](docs/relay.md). The gateway links to a configured relay, and Settings →
-General → Mobile access pairs phones (QR + fingerprint approval), lists, renames and revokes them; phones cannot
-run commands yet (next step) and the PWA itself is not built.
+General → Mobile access pairs phones (QR + fingerprint approval), lists, renames and revokes them. Paired phones
+speak a typed device protocol (`deck_remote::api`: sessions, live control, prompts and actions, transcripts, changes,
+terminal view/input, permission-checked per request; flow-controlled, outcomes recoverable after a reconnect),
+verified end to end with real omp and the GUI closed (`cargo test -p deck-service --test remote_device`). The PWA
+itself is not built yet.
 
 Packaging scripts live in `packaging/`: `build-tarball.sh`, `appimage/build-appimage.sh`, `install.sh`,
 `install.ps1`, `windows/fetch-conpty.ps1`. CI runs on Linux and Windows; releases are built by GitHub Actions

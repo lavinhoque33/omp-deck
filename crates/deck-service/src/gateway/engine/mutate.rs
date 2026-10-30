@@ -83,6 +83,8 @@ fn uses_lane(op: &Mutation) -> bool {
 }
 
 impl Engine {
+    /// `work`: the hash deciding "same work" for a repeated key (a device's request in device
+    /// terms); `None` hashes `op`.
     pub(super) fn on_mutate(
         &mut self,
         conn: u64,
@@ -90,11 +92,12 @@ impl Engine {
         key: RequestKey,
         epoch: ServiceEpoch,
         op: Mutation,
+        work: Option<String>,
     ) {
         let Some(c) = self.conns.get(&conn) else {
             return;
         };
-        if c.role == Role::Supervisor {
+        if c.is(Role::Supervisor) {
             self.reply(
                 conn,
                 id,
@@ -108,9 +111,7 @@ impl Engine {
             self.reply(
                 conn,
                 id,
-                Err(GatewayError::Refused(
-                    "this request key belongs to another client".to_owned(),
-                )),
+                Err(GatewayError::Refused(super::FOREIGN_KEY.to_owned())),
             );
             return;
         }
@@ -139,7 +140,7 @@ impl Engine {
                 return;
             }
         }
-        match self.journal.admit(&key, &op, self.epoch) {
+        match self.journal.admit(&key, &op, work, self.epoch) {
             Err(e) => self.reply(
                 conn,
                 id,
@@ -148,10 +149,7 @@ impl Engine {
                 ))),
             ),
             Ok(Admission::Accepted) => self.execute(conn, id, key, op),
-            Ok(Admission::Duplicate(Outcome::Rejected(r))) => {
-                self.reply(conn, id, Err(GatewayError::Rejected(r)));
-            }
-            Ok(Admission::Duplicate(outcome)) => {
+            Ok(other) => {
                 let submitted = match &op {
                     Mutation::Submit { target, .. } => self
                         .sess
@@ -163,6 +161,25 @@ impl Engine {
                         }),
                     _ => None,
                 };
+                self.answer_known(conn, id, key, other, submitted);
+            }
+        }
+    }
+
+    /// Answers a key the journal knew: its record (duplicate), or why it cannot be used.
+    pub(super) fn answer_known(
+        &mut self,
+        conn: u64,
+        id: u64,
+        key: RequestKey,
+        known: Admission,
+        submitted: Option<Submitted>,
+    ) {
+        match known {
+            Admission::Duplicate(Outcome::Rejected(r)) => {
+                self.reply(conn, id, Err(GatewayError::Rejected(r)));
+            }
+            Admission::Duplicate(outcome) => {
                 self.reply(
                     conn,
                     id,
@@ -176,8 +193,10 @@ impl Engine {
                     self.to_client(&key.client.clone(), &ServerEvent::Outcome { key, outcome });
                 }
             }
-            Ok(Admission::KeyReused) => self.reply(conn, id, Err(GatewayError::KeyReused)),
-            Ok(Admission::Expired) => self.reply(conn, id, Err(GatewayError::Expired)),
+            Admission::KeyReused => self.reply(conn, id, Err(GatewayError::KeyReused)),
+            Admission::Expired => self.reply(conn, id, Err(GatewayError::Expired)),
+            // Not a known key: never passed here.
+            Admission::Accepted => {}
         }
     }
 
@@ -266,6 +285,10 @@ impl Engine {
             Mutation::UsageRefresh { .. } if self.omp.is_none() => refused("omp was not found"),
             Mutation::AppUpdateDownload => self.sched.download_refusal(),
             Mutation::AppUpdateApply => self.sched.apply_refusal(),
+            // Only the client's own jobs; another client's keys are refused before any lookup.
+            Mutation::CancelJob(k) if k.client != key.client => {
+                Some(GatewayError::Refused(super::FOREIGN_KEY.to_owned()))
+            }
             Mutation::CancelJob(k) => match self.jobs.get(k) {
                 None => Some(GatewayError::NoSuchJob),
                 Some(j) if j.cancel.is_none() => refused("this job cannot be cancelled"),

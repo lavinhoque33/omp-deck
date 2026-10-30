@@ -147,7 +147,7 @@ a phone view is an observer unless the user explicitly takes control).
 | R1 | `deck_remote::noise` (`crates/deck-remote`): snow-based pairing (IKpsk1)/reconnect (IK) sessions, replay timestamps, rekey, framing, strict payloads; TS port in `pwa/src/remote` | vectors pass both ways; tampered/replayed/reordered frames rejected | **done** (2026-10-27): shared `noise-v1.json` + `payload-v1.json` and official cacophony IK/IKpsk1 vectors reproduced by Rust and TS; low-order keys rejected on both sides |
 | R2 | `crates/deck-relay` (`omp-deck-relay`): routing, admission, limits, health, graceful shutdown; Caddy/nginx/systemd/container docs (`docs/relay.md`) | load + abuse tests (floods, slow readers, oversize frames) on localhost | **done** (2026-10-27): 29 tests incl. stalled TLS/HTTP caps, pre-hello rate limits, locked room edits; real-process smoke: pairing, echo, IK reconnect with 300/250 KB messages, revocation `4003`, SIGTERM exit 0 |
 | R3 | Gateway relay link + device registry + pairing window + desktop approval/revocation UI + Mobile access settings (relay URL, devices) | real pairing over a local relay with the Rust test client; revocation kills a live session | **done** (2026-10-28): `remote_pairing` e2e (real owner + in-test relay); native Xvfb smoke: relay form, link Connected, QR decoded from the screenshot paired a Rust device, approve/online/revoke `4003`, deny `4003`; review: 5 findings fixed |
-| R4 | `Role::Device` capability layer, typed remote operations, byte-bounded remote outbox, outcome recovery across reconnect, terminal stream over the link | headless e2e: real omp controlled through relay with the GUI closed; reconnect mid-request recovers the outcome without resend | |
+| R4 | `Role::Device` capability layer, typed remote operations, byte-bounded remote outbox, outcome recovery across reconnect, terminal stream over the link | headless e2e: real omp controlled through relay with the GUI closed; reconnect mid-request recovers the outcome without resend | **done** (2026-10-29): `deck_remote::api` v1 + shared vectors (Rust + `pwa/` mirror, 202 bun tests); `remote_device` e2e (real `omp-deck-gateway` in Always on with the GUI client dropped, in-test relay, omp 18.14.0): new_session, observe snapshot→output, rename, Manage `not_allowed`, socket dropped mid-`new_session` → `outcome` after IK reconnect with one session, `duplicate`/`key_reused`/`expired`, `STALLED` isolation, foreign key refused, `maintenance`; review: 9 + 3 findings fixed |
 | R5 | Security review of R1–R4; freeze protocol v1 | findings fixed or accepted in writing | R1/R2 (5) and R3 (5) code-review findings fixed |
 
 Slice 4 (PWA) starts after R5. Web Push (`web-push-native`, VAPID, fits the existing blocking `ureq`) belongs there.
@@ -269,6 +269,168 @@ seen, permission badges; hover row buttons Rename, Permissions, Revoke with conf
 from `qrcodegen`, countdown, copy link, Cancel). An open pairing in `Topic::Mobile` shows the approval dialog in every
 GUI (name, platform, fingerprint to compare with the phone, Control on / Manage off by default, Approve / Deny).
 Dialogs hold terminal input like the other modals.
+
+## R4 contract: device application protocol and capability layer
+
+Decisions made by the orchestrator for R4 (conservative defaults):
+
+- **A dedicated device protocol, never the local IPC.** The PWA is served by the relay and may be a different version
+  than the gateway, and the local `Request`/`Mutation` enums change every release and carry raw paths and argv. Devices
+  speak `deck_remote::api` (v1, frozen at R5); the gateway translates each operation into its internal
+  queries/mutations. Anything without a device operation is unreachable by construction (pairing, devices, relay,
+  gateway mode, settings snapshot, Drive OAuth, installer/self-update, window focus, `Launch` argv, raw paths).
+- **Ids, not paths.** A project is `ProjectId` = `"p-"` + the first 16 hex of SHA-256 of its cwd's UTF-8 (lossy) bytes,
+  resolved against the current session inventory; a session is its omp session id resolved against the inventory
+  (ambiguous or unknown → `not_found`); a live session is `LiveRef { key, generation }` where `key` is the gateway's
+  `SessionKey` string (opaque to the device) and the epoch is implied by the link. Changed files are repo-relative
+  paths that must appear in the gateway's current changes listing. Device views carry `display` strings (`~`-abbreviated
+  under HOME; a project elsewhere shows its folder, display only, never accepted back), never other absolute paths, ctl
+  keys, other clients' request keys or any secret.
+- **Permissions are read from the registry per request** (so `DeviceSetPermissions` applies to live devices at once).
+  Every `Op` has a class (`View`, `Control`, `Manage`) defined in `api.rs` by an exhaustive match; View is always
+  allowed, Control needs `permissions.control`, Manage needs `permissions.manage`. Lowering `control` ends the device's
+  input/control terminal views (`T_END` `not_allowed`).
+- **Client identity** = the registry device id (`d-<16 hex>`), set by the engine, never taken from the device.
+  `RequestKey { client: device id, seq }`. Outcome lookups and job cancels are limited to the device's own keys. The
+  same rule applies to every local client from now on: `Request::Outcome` and `CancelJob` refuse other clients' keys.
+- **Draft confirmations** of a device are declined when its last session ends (clean or not): a vanished phone never
+  holds a session's injector. The decline is the request's final outcome, recoverable by lookup.
+- **Lifetime**: device links do not count as clients. With Always on (Background) the gateway serves devices with the
+  GUI closed; with While open, closing the last GUI ends the owner and devices see `GATEWAY_OFFLINE`.
+- **One live session per device**: an accepted reconnect of a device closes its previous session (`NORMAL`).
+- **Prompt** is a new controller command `Command::Prompt { text }` (own label "Send prompt", `CommandKind::Prompt`):
+  composer text submitted with Enter, idle only (`Rejected::Busy` while omp works), reusing `Job::text(.., true)`.
+  Steering a busy session from the phone is not part of v1's typed set (the terminal input path can type it).
+
+**Wire format** (`crates/deck-remote/src/api.rs`, serde JSON for control records, binary for terminal records):
+
+- One Noise application message (≤ `MAX_APP_MESSAGE` = 1 MiB in both directions; the gateway sets its session's
+  reassembly limit to it) holds one or more **records**: `kind: u8 | len: u32 BE | body[len]`. A device message that is
+  not a whole sequence of known records closes it with `close::APP_PROTOCOL` (4002).
+- Device → gateway: `REQUEST 0x01` (JSON `Request`), `ACK 0x02` (`messages: u64 BE`, cumulative count of gateway
+  messages processed), `INPUT 0x03` (`view: u32 BE | flags: u8` (bit 0 = Ctrl+C) `| bytes ≤ 64 KiB`), `RESIZE 0x04`
+  (`view: u32 | cols: u16 | rows: u16`, BE; control views only).
+- Gateway → device: `WELCOME 0x10` (JSON, always the first record of a session), `REPLY 0x11` (JSON), `EVENT 0x12`
+  (JSON), `T_SNAPSHOT 0x20` (`view | last: u8 | bytes ≤ 256 KiB`; chunks of one snapshot are consecutive for that
+  view), `T_OUTPUT 0x21` (`view | bytes`), `T_RESIZE 0x22` (`view | cols | rows`), `T_END 0x23` (`view | JSON TermEnd`).
+  A device ignores record kinds it does not know.
+- Application records run only on reconnect (IK) sessions: a pairing session ends after message 2 (the device closes
+  and reconnects with its own token, R3), and a record on it closes it with `close::APP_PROTOCOL`.
+- JSON enums are internally tagged (`"op"`, `"feed"`, `"type"`, `"state"`, `"code"` as listed in `api.rs`),
+  `snake_case`, struct variants only. Device→gateway JSON is parsed strictly (unknown fields refused); an unknown `op`
+  with a readable `id` is answered `unsupported`, not closed.
+- `Welcome { protocol: 1, gateway_version, epoch (32 hex), device, name, permissions, next_seq, limits { max_message,
+  window_bytes, window_messages, max_inflight, max_views, max_feeds }, features: [] }`. `next_seq` = one above the
+  highest seq the journal remembers for this device (record or watermark): new journaled ops must use `seq >=
+  next_seq`; lower seqs are only valid for `outcome` lookups.
+- `Request { id: u64, seq: Option<u64>, op: Op }`; `seq` is required exactly for journaled ops (every Control/Manage op
+  except `attach`/`detach`). `Reply { id, ok: Resp } | { id, err: ApiError }`. A journaled op replies `accepted { seq,
+  duplicate }` once admitted, then `Event::Outcome { seq, outcome }` when final (and `progress` events meanwhile).
+  Re-sending a seq with the same op returns `duplicate: true` and never re-executes.
+
+**Operations v1** (`Op`, tag `op`):
+
+| Class | Ops |
+|---|---|
+| View | `subscribe { feed }`, `unsubscribe { feed }`, `outcome { seq }`, `models {}`, `diff { project, file, side }`, `attach { live, mode: observe }`, `detach { view }`, `ping {}` |
+| Control | `new_session { project }`, `resume { session }`, `restart { live }`, `stop { live }`, `kill { live }`, `prompt { live, text }`, `interrupt { live }`, `switch_model { live, selector, level? }`, `set_effort { live, level }`, `action { live, action }` (`handoff { focus? }`, `compact { mode: default\|soft\|snapcompact\|focus, focus? }`, `rename { name }`, `auto_name`, `plan`, `retry`), `answer { live, request, proceed }`, `cancel { seq }`, `inbox_open { live }`, `inbox_dismiss { live }`, `inbox_clear {}`, `attach { live, mode: input\|control }`, `stage { project, files }`, `unstage { project, files }` |
+| Manage | `delete_sessions { sessions }` (running ones stopped first), `copy_session { session, project }`, `move_session { session, project }` (stop first), `discard { project, files }`, `delete_untracked { project, files }` |
+
+`new_session`/`resume` build the `LaunchSpec` in the gateway exactly as the desktop does (detected omp + live-control
+extension, `session_name_for`/`new_session_name`, existing holders re-used) and answer `done { session { live } }`.
+`attach` mode `input` types but leaves geometry/focus/clipboard with the desktop (`ViewRole::Input`); `control`
+(`ViewRole::Controlling`) is refused with `geometry_owned` while another controlling view exists, and a desktop that
+attaches later takes geometry over as usual. Views per device ≤ `max_views` (4).
+
+**Feeds** (`Feed`, tag `feed`; `Event::Feed { feed, value }`, latest value only — a lagging device skips
+intermediate values, never queues them): `projects {}` (id, display, worktree, session count, newest modification —
+no session lists), `sessions { project, limit ≤ 500 }` (`{ project, total, sessions }`, newest first: id, title, first
+prompt ≤ 200 chars, modified), `live {}` (controlled sessions: `LiveRef`, kind, label, title, session/project id,
+activity/status, exit code, busy, model, pending switch, live control, desktop-controlled, view count, and this
+device's own requests with their delivery state, so a reconnecting device re-learns pending confirmations), `inbox {}`,
+`cards { sessions }`
+(agents-dashboard cards: model, thinking, context/in/out tokens, cost, last reply, failed turn, git counts, subagent
+counts; ≤ 64 sessions; through the fleet watcher's per-client targets), `transcript { session, agent?, tail ≤ 500 }`
+(the session's — or a subagent's — transcript items: the last `tail` items first, then appends as `{ start, items,
+reset }`; a rewritten file sends `reset`), `changes { project }`. Feeds per device ≤ `max_feeds` (16).
+
+**Events** (tag `type`): `feed`, `outcome { seq, outcome }`, `progress { seq, stage, done, total? }`, `confirm { live,
+request, label, draft }`, `term_state { view, input_held }`, `input_refused { view, reason }`, `model_unconfirmed { live,
+selector?, level? }`, `resync {}` (events were dropped: re-read outcomes of open requests; feeds re-send themselves).
+`OutcomeView` (tag `state`): `running`, `done { result }`, `failed { message }`, `rejected { reason }`, `cancelled`,
+`uncertain`, `recorded { succeeded }`, `unknown` (never reached this gateway — the phone may offer a user-initiated
+resend, never an automatic one), `expired`. `ApiError` (tag `code`): `unsupported`, `not_allowed { need }`, `bad_request
+{ message }`, `not_found { what }`, `stale { current? }`, `rejected { reason }`, `geometry_owned`, `too_many_requests`,
+`too_large`, `maintenance`, `key_reused`, `expired`, `failed { message }`.
+
+**Flow control and bounds** (gateway side; the relay drops a device whose queue passes 256 messages / 4 MiB and closes
+the whole gateway link above 8 MiB/s or 4000 messages/s):
+
+- Per device, unacknowledged gateway messages ≤ `window_messages` (32) and ≤ `window_bytes` (1 MiB); devices `ACK` at
+  least every 8 messages / 256 KiB / 100 ms. No ack for 60 s while messages are outstanding closes the device with
+  `close::STALLED` (4010). Records are batched into as few Noise messages as the window allows.
+- Gateway egress over all devices is paced to 6 MiB/s and 3000 relay frames/s (`docs/relay.md`: relay limits must not
+  be set below the defaults).
+- Feeds and outcome/progress/confirm events are per-device latest-only slots / a bounded queue (1024 events, 4 MiB;
+  overflow → cleared + one `resync`). Replies are bounded by `max_inflight` (32 requests without a reply: further
+  requests answer `too_many_requests` at once). No record exceeds one app message (`MAX_REPLY` = 1 MiB − 5): every
+  feed and reply is bounded by design (caps documented in `api.rs`, `truncated` flags, chunked transcript appends);
+  a reply that still cannot fit answers `too_large`.
+- Terminal output is pulled from the session's `OutputSubscription` only within the window; its 4 MiB subscriber
+  budget turns a slow phone into `T_END overflow` (re-attach = fresh snapshot). Snapshots are paced by the same window;
+  one over 16 MiB ends the view with `too_large`.
+- DNS/TLS/WebSocket I/O, Noise seal/open, record batching and terminal pulls stay on the relay link thread; the engine
+  decides (capability, translation, projection). JSON decoding of device records happens off the engine thread.
+
+Gate (`crates/deck-service/tests/remote_device.rs`, own file; skipped without omp like `gateway_e2e.rs`): owner in
+Always-on mode with its GUI client dropped, in-test relay, Rust device client (pairing with Control, reconnect):
+`new_session` in a project → attach observe (snapshot then output) → `prompt`-free runtime check via `action rename`
+delivered and visible in `live`; Manage refused without the permission (`not_allowed`); a journaled op whose socket
+is dropped before its outcome is recovered after an IK reconnect by `outcome` (running → final, no second execution:
+one journal record); a reused seq returns `duplicate`; a slow device that stops acking is closed `STALLED` without
+affecting another device; outcome lookup of another client's key is refused. Unit tests cover the record codec,
+shared JSON vectors (`crates/deck-remote/tests/vectors/api-v1.json`, also read by `pwa/test`), class table, id
+resolution and projection hygiene (no absolute path, ctl key or foreign request key in any device view).
+
+Deferred to slice 4 with their PWA screens (additive ops/feeds behind `Welcome.features`, same capability layer):
+usage and context breakdown, session tree/fork-at/navigate, subagent kill/revive/chat, worktree flows, project
+backups/restores and Drive, omp settings, update jobs, running-process RAM, export/copy-last, attachments, review
+comments, the desktop-folder browser, explicit "open on desktop" actions, steering a busy session, Web Push.
+
+As built (R4, `deck_remote::api` behind the `noise` feature; engine side `gateway/engine/device.rs`, link side
+`gateway/remote/device.rs`):
+
+- `MAX_REPLY` = `MAX_APP_MESSAGE` − 5 (record header). Caps in `api.rs`: transcript appends ≤ `MAX_TRANSCRIPT_BYTES`
+  (512 KiB) per record, item text ≤ `MAX_ITEM_TEXT` (64 KiB, cut with `…`), diffs ≤ `MAX_DIFF_TEXT` (768 KiB); feed
+  values and `Resp::Models` carry `truncated` flags. `TermEnd` is tagged `reason`.
+- The journal work hash of a device op is the hash of the `api::Op` (its translation depends on current state, so a
+  retry of the same op must count as the same work); known keys are answered from the journal before translation.
+  Foreign keys (`Request::Outcome`, `CancelJob`) answer `Refused` for every client.
+- Device connections have no local `Role` (never lifetime clients); one `sync_devices` step owns their teardown.
+  Permissions are re-read per request and per engine step. More than 16 feeds or 4 views answers `bad_request`.
+  Device resize uses an 8×16 cell size; device control views never own the clipboard. Changed-file ops need a current
+  `changes` subscription of that project. Subagent transcripts are found by a bounded search below the session folder
+  (depth 4, ≤ 4096 entries; agent ids must be single file names). Error text sent to devices abbreviates HOME as `~`.
+- While a device follows `live`, the gateway holds each controlled session's live-control link open like a desktop tab
+  (without a GUI, busy/model/live-control state would otherwise go stale).
+- Test hook `OMP_DECK_DEVICE_STALL_MS` overrides the 60 s stall timeout (verification only). Test sandboxes need short
+  host namespaces: the ctl socket path is bounded by `sun_path`.
+- Ingress bounds (review fixes): terminal input reaches the engine through a per-device 256 KiB backlog (bytes + 64
+  per engine item, released when the engine drops it; beyond it `input_refused` `rejected`); consecutive plain inputs
+  of one view in a message are merged, empty input ignored; observe-view input is refused `not_allowed`, unknown/ended
+  view `detached` (one refusal per view per message); resize only on control views, latest per view per message; the
+  engine re-checks the Control permission when input arrives. Link-local replies (unknown/invalid/over-inflight) over
+  256 replies or 256 KiB close the device `APP_PROTOCOL`.
+- Egress: a message never exceeds the remaining window byte credit (a whole message only when nothing is outstanding);
+  global pacing is round-robin over devices, one message per turn, resuming where the pace ran out. WELCOME is always
+  the first record; a view ended on both sides keeps its queued `T_END`.
+- An unknown journaled seq below the session's WELCOME `next_seq` answers `expired` before translation (known keys
+  still answer `duplicate`/`key_reused`); device attach is refused `maintenance` while the barrier is up.
+- Input refusals: at most one `input_refused` per held view per message; input to view ids the gateway does not hold
+  gets one `detached` refusal per message in total (naming the first such id). An ended view drops its terminal
+  subscription at once; its `T_END` goes out right after the WELCOME and before replies/events/feeds/output. A device
+  holds at most 2 × `max_views` views (open + ended with an unsent `T_END`); attaches beyond that answer
+  `too_many_requests` until those ends go out.
 
 ## Sources (verified 2026-10-27)
 

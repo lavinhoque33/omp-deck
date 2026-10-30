@@ -43,6 +43,8 @@ struct Peer {
     token: Hash,
     /// Its session is established as this device.
     device: Option<String>,
+    /// The engine link of its application session (reconnects only).
+    conn: Option<u64>,
 }
 
 pub(super) struct Mobile {
@@ -119,8 +121,25 @@ impl Mobile {
     fn close_peer(&mut self, peer: PeerId, code: u16) {
         if let Some(p) = self.peers.get_mut(&peer) {
             p.device = None;
+            p.conn = None;
         }
         self.send(Cmd::Close { peer, code });
+    }
+
+    /// Engine link `conn` is a device session the link still carries.
+    pub(super) fn serves(&self, conn: u64) -> bool {
+        self.peers.values().any(|p| p.conn == Some(conn))
+    }
+
+    /// The engine link of `peer`'s application session, while it lasts.
+    pub(super) fn peer_conn(&self, peer: PeerId) -> Option<u64> {
+        self.peers.get(&peer).and_then(|p| p.conn)
+    }
+
+    /// What paired device `id` may do now (`None`: revoked or unknown).
+    pub(super) fn permissions(&self, id: &str) -> Option<crate::gateway::protocol::Permissions> {
+        let parts = self.parts.as_ref().ok()?;
+        parts.registry.get(id).map(|d| d.permissions)
     }
 
     /// Ends the pairing window: its connection (if any) is closed and its token withdrawn.
@@ -372,9 +391,17 @@ impl Engine {
         if link != self.mobile.link_gen || self.mobile.link.is_none() {
             return;
         }
+        if let Event::Device { peer, inbound } = event {
+            // A session closed meanwhile (revoked, replaced) is not served any more.
+            if let Some(conn) = self.mobile.peer_conn(peer) {
+                self.on_device_inbound(conn, inbound);
+            }
+            return;
+        }
         let now = Instant::now();
         let m = &mut self.mobile;
         match event {
+            Event::Device { .. } => {}
             Event::Link(state) => {
                 if state != RelayLink::Up {
                     // Every device connection went with the old socket.
@@ -396,6 +423,7 @@ impl Engine {
                     Peer {
                         token,
                         device: None,
+                        conn: None,
                     },
                 );
                 let known = m
@@ -464,6 +492,7 @@ impl Engine {
             }
         }
         self.dirty.mobile = true;
+        self.sync_devices();
     }
 
     /// A paired device's message 1: known key, its own token, a fresh timestamp. The timestamp
@@ -507,16 +536,40 @@ impl Engine {
             m.close_peer(peer, close::UNAUTHORIZED);
             return;
         }
+        let found = parts
+            .registry
+            .get(&id)
+            .map(|d| (d.name.clone(), d.permissions));
+        // One live session per device: a reconnect replaces the previous one.
+        let previous: Vec<PeerId> = m
+            .peers
+            .iter()
+            .filter(|(p, x)| **p != peer && x.conn.is_some() && x.device.as_deref() == Some(&id))
+            .map(|(p, _)| *p)
+            .collect();
+        for p in previous {
+            m.close_peer(p, close::NORMAL);
+        }
+        let (Some(wake), Some((name, permissions))) = (m.link.as_ref().map(Link::waker), found)
+        else {
+            m.close_peer(peer, close::UNAUTHORIZED);
+            return;
+        };
+        let label = m.label.clone();
+        let (conn, out) = self.open_device(&id, name, permissions, wake);
+        let m = &mut self.mobile;
         m.send(Cmd::Accept {
             peer,
             welcome: Welcome {
                 device: id.clone(),
-                gateway: m.label.clone(),
+                gateway: label,
                 token: None,
             },
+            device: Some(out),
         });
         if let Some(p) = m.peers.get_mut(&peer) {
             p.device = Some(id);
+            p.conn = Some(conn);
         }
     }
 
@@ -671,6 +724,7 @@ impl Engine {
                         gateway: m.label.clone(),
                         token: Some(token),
                     },
+                    device: None,
                 });
                 Ok(Done::Unit)
             }

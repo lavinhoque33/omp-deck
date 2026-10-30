@@ -1,16 +1,18 @@
-//! Mobile access, gateway side (`docs/notes/mobile-relay.md`, "R3 contract"): the gateway's
+//! Mobile access, gateway side (`docs/notes/mobile-relay.md`, "R3/R4 contract"): the gateway's
 //! static key ([`identity`]), the relay settings ([`config`]), the paired devices
-//! ([`registry`]), the pairing window state machine ([`pairing`]) and the relay link thread
-//! ([`link`]). The engine owns every decision (`engine/remote.rs`); the link thread owns the
-//! socket and the per-peer Noise state.
+//! ([`registry`]), the pairing window state machine ([`pairing`]), the relay link thread
+//! ([`link`]) and a device's application session on it ([`device`]). The engine owns every
+//! decision (`engine/remote.rs`, `engine/device.rs`); the link thread owns the socket, the
+//! per-peer Noise state and the device record traffic.
 //!
 //! Every file lives in the gateway's private state dir, written owner-only. No secret (room
 //! secret, admission token, PSK, invite, key) reaches a topic, a log or a `Debug` output.
 
 pub mod config;
+pub(crate) mod device;
 pub mod epoch;
 pub mod identity;
-pub mod link;
+pub(crate) mod link;
 pub mod pairing;
 pub mod registry;
 

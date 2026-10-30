@@ -35,11 +35,7 @@ impl Notify {
 impl Engine {
     pub(super) fn step_notifications(&mut self, now: Instant) {
         self.handle_signals();
-        let guis: Vec<_> = self
-            .conns
-            .values()
-            .filter(|c| c.role == Role::Gui)
-            .collect();
+        let guis: Vec<_> = self.conns.values().filter(|c| c.is(Role::Gui)).collect();
         // The window focus of any GUI; what the user looks at: the views of the focused GUIs,
         // else of every GUI (none focused: they still show what they show).
         let focused = guis.iter().any(|c| c.state.focused);
@@ -143,10 +139,10 @@ impl Engine {
         let gui = self
             .conns
             .values()
-            .filter(|c| c.role == Role::Gui)
+            .filter(|c| c.is(Role::Gui))
             .max_by_key(|c| (c.state.focused, c.seq));
-        if let Some(c) = gui {
-            c.out.event(&ServerEvent::Activate { target, token });
+        if let Some(out) = gui.and_then(|c| c.local()) {
+            out.event(&ServerEvent::Activate { target, token });
             return;
         }
         // Only a session this owner still runs can be shown.

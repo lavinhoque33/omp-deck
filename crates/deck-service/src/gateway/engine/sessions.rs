@@ -126,6 +126,11 @@ impl Managed {
         self.live_cwd.as_deref().unwrap_or(&self.cwd)
     }
 
+    /// The view owning focus and geometry.
+    pub(super) fn controlling(&self) -> Option<u64> {
+        self.controlling
+    }
+
     pub(super) fn display_label(&self) -> String {
         if !self.label.is_empty() {
             return self.label.clone();
@@ -439,13 +444,28 @@ impl Engine {
         let Some(Attach { target, view: role }) = hello.attach else {
             return Err(Refusal::NotAllowed("not a view".to_owned()));
         };
+        self.attach_view(view, target, role, side, None)
+            .map_err(|current| Refusal::Stale { current })?;
+        Ok(self.welcome())
+    }
+
+    /// Registers view `view` of `target` (`owner`: the device link it belongs to). `Err` holds
+    /// the session's current target when `target` is not current.
+    pub(super) fn attach_view(
+        &mut self,
+        view: u64,
+        target: SessionTarget,
+        role: ViewRole,
+        side: Arc<ViewSide>,
+        owner: Option<u64>,
+    ) -> Result<(), Option<SessionTarget>> {
         let found = self.sess.find(&target.key);
         let current = found.map(|i| self.sess.managed[i].ctl.target().clone());
         let Some(i) = found.filter(|_| target.epoch == self.epoch) else {
-            return Err(Refusal::Stale { current });
+            return Err(current);
         };
         if current.as_ref() != Some(&target) {
-            return Err(Refusal::Stale { current });
+            return Err(current);
         }
         let notify: deck_term::OutputNotify = {
             let weak: Weak<ViewSide> = Arc::downgrade(&side);
@@ -459,14 +479,16 @@ impl Engine {
         let sub = Arc::new(m.ctl.terminal().subscribe_output(notify));
         if role == ViewRole::Controlling {
             // The previous controlling view keeps typing; focus, geometry and the clipboard
-            // move to the new one.
+            // move to the new one (a device has no clipboard: it gets focus and geometry).
             if let Some(prev) = m.controlling.replace(view)
                 && let Some(pv) = self.views.get_mut(&prev)
             {
                 pv.role = ViewRole::Input;
                 pv.sub.set_clipboard_owner(false);
             }
-            sub.set_clipboard_owner(true);
+            if owner.is_none() {
+                sub.set_clipboard_owner(true);
+            }
         }
         m.ctl.terminal().set_visible(true);
         side.set_subscription(sub.clone());
@@ -477,10 +499,11 @@ impl Engine {
                 target,
                 role,
                 sub,
+                owner,
             },
         );
         self.dirty.controllers = true;
-        Ok(self.welcome())
+        Ok(())
     }
 
     pub(super) fn on_view_op(&mut self, view: u64, op: ViewOp) {
@@ -1208,7 +1231,7 @@ impl Engine {
         let gui = self
             .conns
             .values()
-            .filter(|c| c.role == Role::Gui && c.state.active.is_some())
+            .filter(|c| c.is(Role::Gui) && c.state.active.is_some())
             .max_by_key(|c| (c.state.focused, c.seq));
         let found = gui
             .and_then(|c| c.state.active.as_ref())

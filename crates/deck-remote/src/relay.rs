@@ -50,12 +50,17 @@ pub mod close {
     pub const BAD_HELLO: u16 = 4001;
     /// Unknown room, wrong room secret, unknown or revoked device token.
     pub const UNAUTHORIZED: u16 = 4003;
+    /// The gateway closed a device that broke the application protocol (undecodable record,
+    /// unknown record kind, message over the device limit).
+    pub const APP_PROTOCOL: u16 = 4002;
     /// A device connected while its room's gateway is not connected.
     pub const GATEWAY_OFFLINE: u16 = 4004;
     /// The peer did not read fast enough; its queue filled up.
     pub const SLOW_CONSUMER: u16 = 4008;
     /// A newer gateway connection for the same room took over.
     pub const REPLACED: u16 = 4009;
+    /// The gateway closed a device that stopped acknowledging its messages.
+    pub const STALLED: u16 = 4010;
     /// A message exceeded its size limit.
     pub const TOO_LARGE: u16 = 4013;
     /// Too many connections, devices or bytes/messages per second.

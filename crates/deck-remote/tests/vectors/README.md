@@ -19,6 +19,19 @@ JSON object, string or integer values only (bare digits up to 2^53 − 1), no du
 no lone surrogate escapes, character limits in Unicode scalar values. Payloads are hex bytes; accepted entries carry
 the decoded fields. `tests/payload.rs` and `pwa/test/payload.test.ts` both run every entry. Edit by hand.
 
+## `api-v1.json` (OmpDeck, generated)
+
+The device application protocol (`deck_remote::api`): `records` (whole application messages as hex, with their records;
+`origin` is the sender), `rejected_records` (messages refused whole, by error name; long ones are `hex` followed by
+`pad.count` copies of `pad.byte`), `messages` (the canonical JSON text of every request, reply, event, welcome and
+`T_END` variant: decoding gives the value, encoding gives the exact text; `None` is `null`) and `rejected_requests`
+(`REQUEST` bodies answered `unsupported`/`bad_request` by id, or closing the session as `unreadable`).
+`tests/api.rs` regenerates and checks them; the PWA tests read the same file.
+
+```sh
+OMPDECK_WRITE_VECTORS=1 cargo test -p deck-remote --test api
+```
+
 ## `cacophony-ik.json` (official, copied)
 
 The `Noise_IK_25519_ChaChaPoly_BLAKE2s` and `Noise_IKpsk1_25519_ChaChaPoly_BLAKE2s` entries, unchanged, from

@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use deck_remote::api;
 use deck_remote::noise::{
-    self, DeviceHello, Keypair, Mode, Pending, Psk, PublicKey, Session, Welcome,
+    self, DeviceHello, Keypair, Mode, Pending, Psk, PublicKey, Session, SessionConfig, Welcome,
 };
 use deck_remote::relay::{
     self, FromRelay, GATEWAY_PATH, HELLO_OK, Hash, Hello, MAX_GATEWAY_MESSAGE, PeerId, ToRelay,
@@ -32,6 +33,7 @@ use tungstenite::{Connector, Message, WebSocket};
 use zeroize::Zeroizing;
 
 use super::config::RelayConfig;
+use super::device::{DeviceOut, Inbound, Pace, Runtime};
 use super::epoch::Epochs;
 use crate::gateway::protocol::RelayLink;
 
@@ -64,16 +66,21 @@ pub enum Cmd {
     /// The full admission token set (sent now and after every hello).
     Tokens(Vec<Hash>),
     Invite(Option<Invite>),
-    /// Answer the held message 1 of `peer` with message 2.
+    /// Answer the held message 1 of `peer` with message 2. A reconnect carries the device's
+    /// application session (`device`); a pairing connection carries none (it ends after
+    /// message 2, and any record on it closes it).
     Accept {
         peer: PeerId,
         welcome: Welcome,
+        device: Option<Arc<DeviceOut>>,
     },
     /// Close the device connection (the relay reports `Closed`).
     Close {
         peer: PeerId,
         code: u16,
     },
+    /// A device's queue has something ([`Link::waker`]).
+    Wake,
 }
 
 /// Link → engine.
@@ -96,6 +103,11 @@ pub enum Event {
     Closed {
         peer: PeerId,
     },
+    /// A device session asked for something.
+    Device {
+        peer: PeerId,
+        inbound: Inbound,
+    },
 }
 
 struct Shared {
@@ -104,6 +116,8 @@ struct Shared {
     up: AtomicBool,
     /// A clone of the connected socket: a stop shuts it down to unblock the thread.
     socket: Mutex<Option<TcpStream>>,
+    /// A [`Cmd::Wake`] is queued (wakeups coalesce).
+    woken: AtomicBool,
 }
 
 impl Shared {
@@ -155,6 +169,7 @@ impl Link {
             stop: AtomicBool::new(false),
             up: AtomicBool::new(false),
             socket: Mutex::new(None),
+            woken: AtomicBool::new(false),
         });
         let worker = Worker {
             relay,
@@ -165,6 +180,8 @@ impl Link {
             events,
             tokens,
             invite,
+            pace: Pace::new(Instant::now()),
+            next_peer: 0,
         };
         let thread = std::thread::Builder::new()
             .name("gateway-relay".into())
@@ -182,6 +199,16 @@ impl Link {
 
     pub fn send(&self, cmd: Cmd) {
         let _ = self.cmds.send(cmd);
+    }
+
+    /// Makes the thread pull from the device queues soon (coalesced).
+    pub fn waker(&self) -> super::device::Wake {
+        let (cmds, shared) = (self.cmds.clone(), self.shared.clone());
+        Arc::new(move || {
+            if !shared.woken.swap(true, Ordering::AcqRel) {
+                let _ = cmds.send(Cmd::Wake);
+            }
+        })
     }
 
     /// Stops the thread without blocking the caller: a link that is up closes with
@@ -261,7 +288,13 @@ enum Slot {
     /// Message 1 verified; the engine decides.
     Held(Box<Pending>),
     /// Message 2 sent.
-    Live(Box<Session>),
+    Live(Box<Live>),
+}
+
+/// An established session: a reconnect runs the device's application session on it.
+struct Live {
+    session: Session,
+    device: Option<Runtime>,
 }
 
 struct Worker {
@@ -273,6 +306,44 @@ struct Worker {
     events: Box<dyn Fn(Event) + Send>,
     tokens: Vec<Hash>,
     invite: Option<Invite>,
+    pace: Pace,
+    /// The device that goes first in the next flush (where the pace ran out).
+    next_peer: PeerId,
+}
+
+/// What one device's turn in a flush did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flush {
+    Sent,
+    /// Nothing to send (or it was closed).
+    Idle,
+    /// The egress pace ran out before it could send.
+    Paced,
+}
+
+/// Gives `peers` turns of one message each (starting at the first one at or after `next`,
+/// wrapping around) until every one is idle or the pace runs out. Returns the device that
+/// should go first next time when the pace ran out.
+fn round_robin<E>(
+    mut peers: Vec<PeerId>,
+    next: PeerId,
+    mut turn: impl FnMut(PeerId) -> Result<Flush, E>,
+) -> Result<Option<PeerId>, E> {
+    peers.sort_unstable();
+    let start = peers.partition_point(|p| *p < next);
+    peers.rotate_left(start);
+    while !peers.is_empty() {
+        let mut more = Vec::with_capacity(peers.len());
+        for &peer in &peers {
+            match turn(peer)? {
+                Flush::Sent => more.push(peer),
+                Flush::Idle => {}
+                Flush::Paced => return Ok(Some(peer)),
+            }
+        }
+        peers = more;
+    }
+    Ok(None)
 }
 
 impl Worker {
@@ -357,7 +428,8 @@ impl Worker {
                 // Peers are gone while disconnected: answers and closes have nothing to act on.
                 Ok(Cmd::Tokens(t)) => self.tokens = t,
                 Ok(Cmd::Invite(i)) => self.invite = i,
-                Ok(Cmd::Accept { .. } | Cmd::Close { .. }) | Err(RecvTimeoutError::Timeout) => {}
+                Ok(Cmd::Accept { .. } | Cmd::Close { .. } | Cmd::Wake)
+                | Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return true,
             }
         }
@@ -499,6 +571,8 @@ impl Worker {
             conn.goodbye();
             return Some(End::Stopped);
         }
+        // Wakeups from now on queue a new `Wake`.
+        self.shared.woken.store(false, Ordering::Release);
         loop {
             match self.cmds.try_recv() {
                 Ok(cmd) => {
@@ -533,6 +607,9 @@ impl Worker {
                 Err(e) => return Some(lost(format!("relay connection: {e}"), true)),
             }
         }
+        if let Err(e) = self.flush_devices(conn) {
+            return Some(lost(e, true));
+        }
         // Frames a full socket buffer held back (and automatic pongs) go out now; tungstenite
         // keeps them queued in order until a flush completes.
         match conn.ws.flush() {
@@ -550,6 +627,78 @@ impl Worker {
         }
     }
 
+    /// Sends what every device session has ready, within its window and the egress pace, and
+    /// closes devices that stopped acknowledging. Devices take turns one message at a time,
+    /// starting where the pace ran out last time, so a backlogged device cannot keep the
+    /// shared egress credit to itself.
+    fn flush_devices<S: Read + Write>(&mut self, conn: &mut Conn<S>) -> Result<(), String> {
+        let now = Instant::now();
+        let peers: Vec<PeerId> = conn
+            .peers
+            .iter()
+            .filter(|(_, s)| matches!(s, Slot::Live(l) if l.device.is_some()))
+            .map(|(p, _)| *p)
+            .collect();
+        let mut gone: Vec<(PeerId, u64)> = Vec::new();
+        let next = round_robin(peers, self.next_peer, |peer| {
+            self.flush_one(conn, peer, now, &mut gone)
+        })?;
+        if let Some(peer) = next {
+            self.next_peer = peer;
+        }
+        for (peer, view) in gone {
+            (self.events)(Event::Device {
+                peer,
+                inbound: Inbound::ViewGone(view),
+            });
+        }
+        Ok(())
+    }
+
+    /// One message of device `peer`, if it has one and the pace allows.
+    fn flush_one<S: Read + Write>(
+        &mut self,
+        conn: &mut Conn<S>,
+        peer: PeerId,
+        now: Instant,
+        gone: &mut Vec<(PeerId, u64)>,
+    ) -> Result<Flush, String> {
+        let Some(Slot::Live(live)) = conn.peers.get_mut(&peer) else {
+            return Ok(Flush::Idle);
+        };
+        let Some(rt) = live.device.as_mut() else {
+            return Ok(Flush::Idle);
+        };
+        if rt.stalled(now) {
+            log::info!("relay peer {peer}: the device stopped acknowledging");
+            conn.close(peer, close::STALLED)?;
+            return Ok(Flush::Idle);
+        }
+        if !self.pace.open(now) {
+            return Ok(Flush::Paced);
+        }
+        let mut ended = Vec::new();
+        let msg = rt.next_message(now, &mut ended);
+        gone.extend(ended.into_iter().map(|v| (peer, v)));
+        let Some(msg) = msg else {
+            return Ok(Flush::Idle);
+        };
+        let frames = match live.session.seal(&msg) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("relay peer {peer}: sealing failed: {e}");
+                conn.close(peer, close::PROTOCOL)?;
+                return Ok(Flush::Idle);
+            }
+        };
+        let bytes: usize = frames.iter().map(Vec::len).sum();
+        self.pace.spend(bytes, frames.len());
+        for f in &frames {
+            conn.send(&ToRelay::Data { peer, payload: f })?;
+        }
+        Ok(Flush::Sent)
+    }
+
     fn command<S: Read + Write>(&mut self, conn: &mut Conn<S>, cmd: Cmd) -> Result<(), String> {
         match cmd {
             Cmd::Tokens(t) => {
@@ -560,14 +709,30 @@ impl Worker {
                 self.invite = i;
                 Ok(())
             }
-            Cmd::Accept { peer, welcome } => match conn.peers.remove(&peer) {
+            Cmd::Accept {
+                peer,
+                welcome,
+                device,
+            } => match conn.peers.remove(&peer) {
                 Some(Slot::Held(pending)) => match pending.accept(&welcome) {
-                    Ok((session, msg2)) => {
+                    Ok((mut session, msg2)) => {
                         conn.send(&ToRelay::Data {
                             peer,
                             payload: &msg2,
                         })?;
-                        conn.peers.insert(peer, Slot::Live(Box::new(session)));
+                        if device.is_some() {
+                            session.set_config(SessionConfig {
+                                max_message: api::MAX_APP_MESSAGE,
+                                ..*session.config()
+                            });
+                        }
+                        conn.peers.insert(
+                            peer,
+                            Slot::Live(Box::new(Live {
+                                session,
+                                device: device.map(Runtime::new),
+                            })),
+                        );
                         Ok(())
                     }
                     Err(e) => {
@@ -583,6 +748,7 @@ impl Worker {
                 None => Ok(()),
             },
             Cmd::Close { peer, code } => conn.close(peer, code),
+            Cmd::Wake => Ok(()),
         }
     }
 
@@ -636,15 +802,33 @@ impl Worker {
                     log::info!("relay peer {peer}: spoke before its answer");
                     conn.close(peer, close::PROTOCOL)
                 }
-                Some(Slot::Live(session)) => {
-                    // No application messages exist yet (R4): an authentic one is a protocol
-                    // error, anything else a forgery.
-                    let code = match session.open(payload) {
-                        Ok(_) => close::PROTOCOL,
-                        Err(_) => close::UNAUTHORIZED,
+                Some(Slot::Live(live)) => {
+                    let message = match live.session.open(payload) {
+                        Ok(Some(m)) => m,
+                        // More frames of the message follow.
+                        Ok(None) => return Ok(()),
+                        Err(e) => {
+                            log::info!("relay peer {peer}: undecryptable message ({e})");
+                            return conn.close(peer, close::UNAUTHORIZED);
+                        }
                     };
-                    log::info!("relay peer {peer}: unexpected message ({code})");
-                    conn.close(peer, code)
+                    // A pairing session carries no records.
+                    let result = match live.device.as_mut() {
+                        Some(rt) => rt.receive(&message, Instant::now()),
+                        None => Err(close::APP_PROTOCOL),
+                    };
+                    match result {
+                        Ok(inbound) => {
+                            for inbound in inbound {
+                                (self.events)(Event::Device { peer, inbound });
+                            }
+                            Ok(())
+                        }
+                        Err(code) => {
+                            log::info!("relay peer {peer}: unreadable application message");
+                            conn.close(peer, code)
+                        }
+                    }
                 }
             },
         }
@@ -767,6 +951,36 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, rustls::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devices_share_the_egress_pace_one_message_per_turn() {
+        let mut queued: HashMap<PeerId, usize> = HashMap::from([(1, 3), (2, 1), (3, 2)]);
+        let mut budget = 4;
+        let mut order = Vec::new();
+        let next = round_robin(vec![3, 1, 2], 2, |peer| -> Result<Flush, ()> {
+            let left = queued.get_mut(&peer).ok_or(())?;
+            if *left == 0 {
+                return Ok(Flush::Idle);
+            }
+            if budget == 0 {
+                return Ok(Flush::Paced);
+            }
+            budget -= 1;
+            *left -= 1;
+            order.push(peer);
+            Ok(Flush::Sent)
+        });
+        assert_eq!(
+            order,
+            [2, 3, 1, 3],
+            "a backlogged device does not go twice in a row"
+        );
+        assert_eq!(next, Ok(Some(1)), "where the pace ran out starts next time");
+        let next = round_robin(vec![1, 2, 3], 1, |_| -> Result<Flush, ()> {
+            Ok(Flush::Idle)
+        });
+        assert_eq!(next, Ok(None));
+    }
 
     #[test]
     fn backoff_grows_to_a_minute_with_bounded_jitter() {
@@ -1005,12 +1219,15 @@ mod tests {
                 stop: AtomicBool::new(false),
                 up: AtomicBool::new(true),
                 socket: Mutex::new(None),
+                woken: AtomicBool::new(false),
             }),
             events: Box::new(move |e| {
                 let _ = events_tx.send(format!("{e:?}"));
             }),
             tokens: Vec::new(),
             invite: None,
+            pace: Pace::new(Instant::now()),
+            next_peer: 0,
         };
         let rounds = |worker: &mut Worker, conn: &mut Conn<Scripted>, n: usize| {
             for _ in 0..n {

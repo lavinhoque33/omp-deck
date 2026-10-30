@@ -50,6 +50,8 @@ pub const MODEL_SWITCH_LABEL: &str = "Model switch";
 /// Job labels of the two ways to hand a review to omp.
 pub const REVIEW_INSERT_LABEL: &str = "Insert review";
 pub const REVIEW_SEND_LABEL: &str = "Send review";
+/// Job label of a typed prompt submitted for the user (mobile devices).
+pub const PROMPT_LABEL: &str = "Send prompt";
 /// Job label of the `/wt <branch>` move into a worktree.
 pub const WORKTREE_MOVE_LABEL: &str = "Move to worktree";
 /// Job label of the injected worktree finish prompt.
@@ -241,6 +243,8 @@ pub enum Command {
     SetEffort { level: String },
     /// A review prompt: inserted at omp's cursor (`send=false`) or sent (`send=true`).
     Review { text: String, send: bool },
+    /// Composer text submitted with Enter; only while omp is idle.
+    Prompt { text: String },
     /// `/wt <branch>`: omp moves the session into the worktree.
     WorktreeMove { branch: String },
     /// The worktree finish prompt.
@@ -255,6 +259,7 @@ pub enum CommandKind {
     Action,
     ModelSwitch,
     Review { send: bool },
+    Prompt,
     WorktreeMove,
     WorktreeFinish,
     MoveTo,
@@ -266,6 +271,7 @@ impl Command {
             Command::Action(_) => CommandKind::Action,
             Command::SwitchModel { .. } | Command::SetEffort { .. } => CommandKind::ModelSwitch,
             Command::Review { send, .. } => CommandKind::Review { send: *send },
+            Command::Prompt { .. } => CommandKind::Prompt,
             Command::WorktreeMove { .. } => CommandKind::WorktreeMove,
             Command::WorktreeFinish { .. } => CommandKind::WorktreeFinish,
             Command::MoveTo { .. } => CommandKind::MoveTo,
@@ -924,6 +930,18 @@ impl SessionController {
                 };
                 Ok((Job::text(label, text, *send), None))
             }
+            Command::Prompt { text } => {
+                if text.trim().is_empty() {
+                    return Err(Rejected::Empty);
+                }
+                if self.terminal.paste_bytes("x").is_none() {
+                    return Err(Rejected::NoBracketedPaste);
+                }
+                if self.is_busy() || self.activity().is_busy() {
+                    return Err(Rejected::Busy);
+                }
+                Ok((Job::text(PROMPT_LABEL, text, true), None))
+            }
             Command::WorktreeMove { branch } => Ok((
                 Job::slash(
                     WORKTREE_MOVE_LABEL,
@@ -1518,6 +1536,74 @@ mod tests {
             ctl.submit(reused),
             Err(Rejected::KeyReused { id: first.id })
         );
+    }
+
+    /// The fake omp enables bracketed paste (?2004) and shows an idle title, like omp at rest.
+    fn idle_composer(ctl: &mut SessionController, fake: &Fake) {
+        let _ = fake.out.send(RemoteEvent::Output(
+            "\x1b[?2004h\x1b]0;π > app\x07".as_bytes().to_vec(),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ctl.terminal().paste_bytes("x").is_none() || ctl.activity() != Activity::Idle {
+            assert!(
+                Instant::now() < deadline,
+                "?2004 and the idle title never applied"
+            );
+            ctl.terminal_mut().poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_prompt_is_submitted_with_enter_when_omp_is_idle() {
+        let (mut ctl, fake) = controller("", None);
+        idle_composer(&mut ctl, &fake);
+        let s = submission(
+            &ctl,
+            1,
+            Command::Prompt {
+                text: "explain main".into(),
+            },
+        );
+        let first = ctl.submit(s).expect("accepted");
+        let record = ctl.request(first.id).expect("recorded");
+        assert_eq!(
+            (record.kind, record.label.as_str()),
+            (CommandKind::Prompt, PROMPT_LABEL)
+        );
+        run(&mut ctl, |c, _| {
+            c.request(first.id)
+                .is_some_and(|r| r.delivery == Delivery::Delivered)
+        });
+        assert_eq!(fake.omp().submitted, vec!["explain main".to_owned()]);
+    }
+
+    #[test]
+    fn a_prompt_is_refused_while_omp_works_or_a_command_runs() {
+        let (mut ctl, fake) = controller("", None);
+        idle_composer(&mut ctl, &fake);
+        assert_eq!(
+            ctl.submit(submission(&ctl, 1, Command::Prompt { text: " \n".into() })),
+            Err(Rejected::Empty)
+        );
+        // A queued command holds the injector.
+        ctl.submit(submission(&ctl, 2, Command::Action(Action::AutoName)))
+            .expect("accepted");
+        assert_eq!(
+            ctl.submit(submission(&ctl, 3, Command::Prompt { text: "a".into() })),
+            Err(Rejected::Busy)
+        );
+        run(&mut ctl, |c, _| !c.is_busy());
+        // omp streams a turn (its title shows a spinner).
+        let _ = fake.out.send(RemoteEvent::Output(
+            "\x1b]0;π ⠋ work\x07".as_bytes().to_vec(),
+        ));
+        run(&mut ctl, |c, _| c.activity().is_busy());
+        assert_eq!(
+            ctl.submit(submission(&ctl, 4, Command::Prompt { text: "a".into() })),
+            Err(Rejected::Busy)
+        );
+        assert_eq!(fake.omp().submitted, vec!["/rename".to_owned()]);
     }
 
     #[test]

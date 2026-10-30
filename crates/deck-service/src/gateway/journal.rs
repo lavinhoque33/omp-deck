@@ -125,7 +125,13 @@ pub struct Journal {
 
 /// Hash of an operation: what decides "same work" for a repeated key.
 pub fn hash(op: &Mutation) -> String {
-    let bytes = serde_json::to_vec(op).unwrap_or_default();
+    hash_of(op)
+}
+
+/// Hash of any serializable description of the work (a device's request names its work in
+/// device terms: the mutation it becomes may depend on state that changes between retries).
+pub fn hash_of(work: &impl serde::Serialize) -> String {
+    let bytes = serde_json::to_vec(work).unwrap_or_default();
     let digest = Sha256::digest(&bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -179,25 +185,31 @@ impl Journal {
         Ok(j)
     }
 
-    /// Decides about `key`; a new key is journaled (synced) before this returns.
+    /// What a repeated `key` with work hash `work` is answered (`None`: the key is new).
+    pub fn recall(&self, key: &RequestKey, work: &str) -> Option<Admission> {
+        let c = self.clients.get(&key.client)?;
+        if let Some(r) = c.records.iter().find(|r| r.seq == key.seq) {
+            return Some(if r.hash == work {
+                Admission::Duplicate(r.outcome.clone())
+            } else {
+                Admission::KeyReused
+            });
+        }
+        (key.seq <= c.watermark).then_some(Admission::Expired)
+    }
+
+    /// Decides about `key`; a new key is journaled (synced) before this returns. `work` is the
+    /// hash deciding "same work" ([`hash`] of `op` when `None`).
     pub fn admit(
         &mut self,
         key: &RequestKey,
         op: &Mutation,
+        work: Option<String>,
         epoch: ServiceEpoch,
     ) -> io::Result<Admission> {
-        let h = hash(op);
-        if let Some(c) = self.clients.get(&key.client) {
-            if let Some(r) = c.records.iter().find(|r| r.seq == key.seq) {
-                return Ok(if r.hash == h {
-                    Admission::Duplicate(r.outcome.clone())
-                } else {
-                    Admission::KeyReused
-                });
-            }
-            if key.seq <= c.watermark {
-                return Ok(Admission::Expired);
-            }
+        let h = work.unwrap_or_else(|| hash(op));
+        if let Some(known) = self.recall(key, &h) {
+            return Ok(known);
         }
         let target = op.target().map(|t| format!("{}#{}", t.key, t.generation));
         self.append(&Line::Accept {
@@ -278,6 +290,15 @@ impl Journal {
             return Err(Admission::Expired);
         }
         Ok(None)
+    }
+
+    /// One above the highest seq remembered for `client` (record or watermark): new keys of
+    /// that client must not go below it.
+    pub fn next_seq(&self, client: &str) -> u64 {
+        self.clients.get(client).map_or(1, |c| {
+            let top = c.records.iter().map(|r| r.seq).max().unwrap_or(0);
+            top.max(c.watermark).saturating_add(1)
+        })
     }
 
     /// Accepted records of this instance that are still running.
@@ -439,7 +460,8 @@ mod tests {
         {
             let mut j = Journal::open(&path).expect("open");
             let admit = |j: &mut Journal, seq, name| {
-                j.admit(&key("a", seq), &op(name), epoch).expect("admit")
+                j.admit(&key("a", seq), &op(name), None, epoch)
+                    .expect("admit")
             };
             assert!(matches!(admit(&mut j, 1, "x"), Admission::Accepted));
             assert!(matches!(
@@ -468,7 +490,7 @@ mod tests {
         assert_eq!(j.running(), 0, "nothing is resumed");
         assert!(
             matches!(
-                j.admit(&key("a", 1), &op("x"), epoch).expect("admit"),
+                j.admit(&key("a", 1), &op("x"), None, epoch).expect("admit"),
                 Admission::Duplicate(Outcome::Uncertain)
             ),
             "a retry after the crash recovers the uncertain record instead of running again"
@@ -492,7 +514,7 @@ mod tests {
             let mut j = Journal::open(&path).expect("open");
             for seq in 1..=(PER_CLIENT as u64 + 3) {
                 assert!(matches!(
-                    j.admit(&key("c", seq), &op("secret-setting-name"), epoch)
+                    j.admit(&key("c", seq), &op("secret-setting-name"), None, epoch)
                         .expect("admit"),
                     Admission::Accepted
                 ));
@@ -500,7 +522,7 @@ mod tests {
             }
             assert!(matches!(j.lookup(&key("c", 1)), Err(Admission::Expired)));
             assert!(matches!(
-                j.admit(&key("c", 2), &op("secret-setting-name"), epoch)
+                j.admit(&key("c", 2), &op("secret-setting-name"), None, epoch)
                     .expect("admit"),
                 Admission::Expired
             ));

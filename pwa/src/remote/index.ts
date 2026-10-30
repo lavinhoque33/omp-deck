@@ -39,3 +39,25 @@ export {
 } from './protocol.ts';
 export { isLowOrder } from './noise.ts';
 export { CLOSE, DEVICE_PATH, encodeRelayHello, HEALTH_PATH, HELLO_OK, MAX_PAYLOAD, VERSION } from './relay.ts';
+export {
+  ACK_EVERY_BYTES,
+  ACK_EVERY_MESSAGES,
+  ACK_EVERY_MS,
+  AckPolicy,
+  type AppRecord,
+  decodeRecords,
+  encodeRecords,
+  INPUT_CTRL_C,
+  KIND,
+  MAX_APP_MESSAGE,
+  MAX_INPUT,
+  MAX_SNAPSHOT_CHUNK,
+  type Origin,
+  RECORD_HEADER,
+  RecordError,
+  type RecordErrorCode,
+  type RecordKindName,
+} from './records.ts';
+// The application protocol's JSON types and codecs; namespaced because `Welcome` and
+// `decodeWelcome` also exist for the Noise handshake payload.
+export * as api from './api.ts';

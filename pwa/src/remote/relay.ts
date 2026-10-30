@@ -31,12 +31,19 @@ export const CLOSE = {
   BAD_HELLO: 4001,
   /** Unknown room, wrong room secret, unknown or revoked device token. */
   UNAUTHORIZED: 4003,
+  /**
+   * The gateway closed a device that broke the application protocol (undecodable record,
+   * unknown record kind, message over the device limit).
+   */
+  APP_PROTOCOL: 4002,
   /** A device connected while its room's gateway is not connected. */
   GATEWAY_OFFLINE: 4004,
   /** The peer did not read fast enough; its queue filled up. */
   SLOW_CONSUMER: 4008,
   /** A newer gateway connection for the same room took over. */
   REPLACED: 4009,
+  /** The gateway closed a device that stopped acknowledging its messages. */
+  STALLED: 4010,
   /** A message exceeded its size limit. */
   TOO_LARGE: 4013,
   /** Too many connections, devices or bytes/messages per second. */

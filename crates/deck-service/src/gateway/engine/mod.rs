@@ -8,6 +8,7 @@
 //! workers talk to it only through [`Msg`]; nothing that blocks on the network, git, omp or a
 //! backend runs here (workers report back with [`Fin`]).
 
+mod device;
 mod interest;
 mod mutate;
 mod notify;
@@ -65,6 +66,8 @@ const START_GRACE: Duration = Duration::from_secs(30);
 const LINGER: Duration = Duration::from_secs(10);
 /// How often the OS registration is re-read while Background is requested.
 const REGISTRATION_EVERY: Duration = Duration::from_secs(60);
+/// Refusal of a request key (journal lookup, job cancel, mutation) of another client.
+const FOREIGN_KEY: &str = "this request key belongs to another client";
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -270,10 +273,19 @@ impl Waker {
     }
 }
 
-/// One control link.
+/// Where a link's replies and events go.
+enum Sink {
+    Local(Arc<Outbox>),
+    /// A paired device's application session: replies and events are translated to the
+    /// device protocol ([`device`]).
+    Device(Box<device::DeviceConn>),
+}
+
+/// One control link: a local client, or a paired device's session over the relay.
 struct Conn {
-    out: Arc<Outbox>,
-    role: Role,
+    sink: Sink,
+    /// `None`: a paired device (never a client for the lifetime, never a GUI).
+    role: Option<Role>,
     client_id: String,
     /// Order of arrival (the most recent GUI receives activations when none is focused).
     seq: u64,
@@ -285,12 +297,40 @@ struct Conn {
     agents_seq: u64,
 }
 
+impl Conn {
+    fn is(&self, role: Role) -> bool {
+        self.role == Some(role)
+    }
+
+    /// A GUI or CLI: keeps an on-demand owner alive.
+    fn is_client(&self) -> bool {
+        matches!(self.role, Some(Role::Gui | Role::Cli))
+    }
+
+    /// The outbox of a local link.
+    fn local(&self) -> Option<&Arc<Outbox>> {
+        match &self.sink {
+            Sink::Local(out) => Some(out),
+            Sink::Device(_) => None,
+        }
+    }
+
+    fn close(&self) {
+        match &self.sink {
+            Sink::Local(out) => out.close(),
+            Sink::Device(d) => d.out.close(),
+        }
+    }
+}
+
 /// One frontend view.
 struct View {
     side: Arc<ViewSide>,
     target: SessionTarget,
     role: ViewRole,
     sub: Arc<OutputSubscription>,
+    /// The device link whose view it is (`None`: a local frontend).
+    owner: Option<u64>,
 }
 
 /// A journaled job that has not finished.
@@ -376,6 +416,8 @@ pub(crate) struct Engine {
     sched: schedules::Schedules,
     interest: interest::Interest,
     mobile: remote::Mobile,
+    /// Device-protocol state shared by every device session.
+    devices: device::Devices,
 
     barrier: Option<MaintenanceMarker>,
     exit_requested: bool,
@@ -494,6 +536,7 @@ impl Engine {
             sched: schedules::Schedules::new(now, omp_found),
             interest: interest::Interest::default(),
             mobile,
+            devices: device::Devices::default(),
             barrier: None,
             exit_requested: false,
             stopping: false,
@@ -585,6 +628,7 @@ impl Engine {
         self.step_lifetime(now);
         self.step_mobile(now);
         self.publish();
+        self.step_devices();
     }
 
     /// The soonest a controller or observation needs another step.
@@ -703,8 +747,8 @@ impl Engine {
         self.conns.insert(
             conn,
             Conn {
-                out,
-                role: hello.role,
+                sink: Sink::Local(out),
+                role: Some(hello.role),
                 client_id: hello.client_id,
                 seq: self.next_seq,
                 state: ClientState::default(),
@@ -722,13 +766,8 @@ impl Engine {
         let Some(c) = self.conns.remove(&conn) else {
             return;
         };
-        c.out.close();
-        if matches!(c.role, Role::Gui | Role::Cli)
-            && !self
-                .conns
-                .values()
-                .any(|o| matches!(o.role, Role::Gui | Role::Cli))
-        {
+        c.close();
+        if c.is_client() && !self.conns.values().any(Conn::is_client) {
             self.linger_until = Instant::now() + LINGER;
         }
         // A client that left cleanly will not answer its draft confirmations: decline them
@@ -741,28 +780,47 @@ impl Engine {
 
     /// Queues `reply` on link `conn` (gone links are skipped).
     fn reply(&self, conn: u64, id: u64, reply: Reply) {
-        if let Some(c) = self.conns.get(&conn) {
-            c.out.reply(id, &reply);
+        match self.conns.get(&conn).map(|c| &c.sink) {
+            Some(Sink::Local(out)) => out.reply(id, &reply),
+            Some(Sink::Device(d)) => d.out.reply(id, self.device_reply(reply)),
+            None => {}
         }
     }
 
     /// Sends `ev` to every control link of `client`.
     fn to_client(&self, client: &str, ev: &ServerEvent) {
         for c in self.conns.values().filter(|c| c.client_id == client) {
-            c.out.event(ev);
+            match &c.sink {
+                Sink::Local(out) => out.event(ev),
+                Sink::Device(d) => {
+                    if let Some(ev) = self.device_event(ev) {
+                        d.out.event(&ev);
+                    }
+                }
+            }
         }
     }
 
-    /// Sends `ev` to every GUI link.
+    /// Sends `ev` to every GUI link (and what a device shows of it to every device).
     fn to_guis(&self, ev: &ServerEvent) {
-        for c in self.conns.values().filter(|c| c.role == Role::Gui) {
-            c.out.event(ev);
+        for c in self.conns.values() {
+            match &c.sink {
+                Sink::Local(out) if c.is(Role::Gui) => out.event(ev),
+                Sink::Device(d) => {
+                    if let ServerEvent::ModelUnconfirmed { .. } = ev
+                        && let Some(ev) = self.device_event(ev)
+                    {
+                        d.out.event(&ev);
+                    }
+                }
+                Sink::Local(_) => {}
+            }
         }
     }
 
     fn on_request(&mut self, conn: u64, env: Envelope) {
         let Envelope { id, body } = env;
-        let Some(role) = self.conns.get(&conn).map(|c| c.role) else {
+        let Some(role) = self.conns.get(&conn).and_then(|c| c.role) else {
             return;
         };
         match body {
@@ -785,12 +843,22 @@ impl Engine {
                 self.reply(conn, id, Ok(Answer::Done));
             }
             Request::Query(q) => self.on_query(conn, id, q),
-            Request::Mutate { key, epoch, op } => self.on_mutate(conn, id, key, epoch, *op),
+            Request::Mutate { key, epoch, op } => self.on_mutate(conn, id, key, epoch, *op, None),
             Request::Outcome(key) => {
-                let reply = match self.journal.lookup(&key) {
-                    Ok(Some(o)) => Ok(Answer::Outcome(o)),
-                    Ok(None) => Err(GatewayError::NoSuchJob),
-                    Err(_) => Err(GatewayError::Expired),
+                // Only a client's own requests: another client's keys are refused whether or
+                // not they exist (no probing of foreign requests).
+                let own = self
+                    .conns
+                    .get(&conn)
+                    .is_some_and(|c| c.client_id == key.client);
+                let reply = if !own {
+                    Err(GatewayError::Refused(FOREIGN_KEY.to_owned()))
+                } else {
+                    match self.journal.lookup(&key) {
+                        Ok(Some(o)) => Ok(Answer::Outcome(o)),
+                        Ok(None) => Err(GatewayError::NoSuchJob),
+                        Err(_) => Err(GatewayError::Expired),
+                    }
                 };
                 self.reply(conn, id, reply);
             }
@@ -945,13 +1013,11 @@ impl Engine {
     }
 
     fn has_clients(&self) -> bool {
-        self.conns
-            .values()
-            .any(|c| matches!(c.role, Role::Gui | Role::Cli))
+        self.conns.values().any(Conn::is_client)
     }
 
     fn gui_count(&self) -> usize {
-        self.conns.values().filter(|c| c.role == Role::Gui).count()
+        self.conns.values().filter(|c| c.is(Role::Gui)).count()
     }
 
     /// Background work (schedules) runs for a GUI, for a supervised owner, and while the owner
@@ -1028,7 +1094,7 @@ impl Engine {
 
     fn gateway_status(&self) -> GatewayStatus {
         let mode = self.mode();
-        let supervisor = self.conns.values().any(|c| c.role == Role::Supervisor);
+        let supervisor = self.conns.values().any(|c| c.is(Role::Supervisor));
         let supervision = if mode != GatewayMode::Background {
             match &self.mode_failed {
                 Some(e) => Supervision::Failed(e.clone()),
@@ -1078,7 +1144,7 @@ impl Engine {
             effective,
             supervision,
             gui_clients: self.gui_count(),
-            cli_clients: self.conns.values().filter(|c| c.role == Role::Cli).count(),
+            cli_clients: self.conns.values().filter(|c| c.is(Role::Cli)).count(),
             supervisor,
             jobs,
             direct_programs: self.sess.direct_programs(),
@@ -1105,7 +1171,7 @@ impl Engine {
                 .push(SideItem::Ended(super::protocol::ViewEnd::Shutdown));
         }
         for c in self.conns.values() {
-            c.out.close();
+            c.close();
         }
         self.save_manifest();
         self.settings.flush();
@@ -1125,9 +1191,14 @@ impl Engine {
             revision: *rev,
         };
         let always = always_on(&topic);
-        for c in self.conns.values() {
-            if (always && c.role == Role::Gui) || c.subs.contains(&topic) {
-                c.out.event(&ev);
+        for c in self.conns.values_mut() {
+            match &mut c.sink {
+                Sink::Local(out) => {
+                    if (always && c.role == Some(Role::Gui)) || c.subs.contains(&topic) {
+                        out.event(&ev);
+                    }
+                }
+                Sink::Device(d) => d.topic_changed(&topic),
             }
         }
     }

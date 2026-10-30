@@ -157,7 +157,7 @@ impl Engine {
                     .filter(|c| c.subs.contains(&Topic::Agents) && c.agents.is_some())
             };
             let target = subscribed()
-                .filter(|c| c.role == Role::Gui && c.state.focused)
+                .filter(|c| c.is(Role::Gui) && c.state.focused)
                 .max_by_key(|c| c.agents_seq)
                 .or_else(|| subscribed().max_by_key(|c| c.agents_seq))
                 .and_then(|c| c.agents.clone());
@@ -278,6 +278,24 @@ impl Engine {
             w.value = Some(result);
             self.changed(Topic::Changes(root));
         }
+    }
+
+    /// The followed changes listing of `root` (`None`: not computed yet or not followed).
+    pub(super) fn changes_of(&self, root: &Path) -> Option<&ChangesResult> {
+        self.interest.changes.get(root)?.value.as_ref()
+    }
+
+    /// The items of a followed transcript (`None`: not followed yet).
+    pub(super) fn transcript_of(
+        &self,
+        path: &Path,
+    ) -> Option<Arc<Vec<deck_core::agents::TranscriptItem>>> {
+        self.interest.transcripts.get(path).map(|(w, _)| w.latest())
+    }
+
+    /// The fleet's latest snapshot, while followed.
+    pub(super) fn fleet_latest(&self) -> Option<Arc<deck_core::fleet::FleetSnapshot>> {
+        self.interest.fleet.as_ref()?.watcher.latest()
     }
 
     /// The value of an interest-driven topic (the caller checked the subscription).
