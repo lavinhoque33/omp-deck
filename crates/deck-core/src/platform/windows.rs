@@ -369,16 +369,37 @@ fn apply_dacl(path: &Path, sd: PSECURITY_DESCRIPTOR) -> io::Result<()> {
     }
 }
 
-/// The DACL of `path` as tests check it: (protected, ACE count, SDDL of the DACL).
+/// One ACE of a DACL as tests check it. `sid` is the full `S-1-…` form: SDDL text abbreviates
+/// well-known accounts (the built-in Administrator prints as `LA`), so tests compare SIDs.
 #[cfg(test)]
-pub(super) fn dacl_of(path: &Path) -> io::Result<(bool, u32, String)> {
+pub(super) struct Ace {
+    pub allow: bool,
+    pub flags: u8,
+    pub mask: u32,
+    pub sid: String,
+}
+
+/// The DACL of `path` as tests check it; `sddl` only for failure messages.
+#[cfg(test)]
+pub(super) struct Dacl {
+    pub protected: bool,
+    pub aces: Vec<Ace>,
+    pub sddl: String,
+}
+
+#[cfg(test)]
+pub(super) fn dacl_of(path: &Path) -> io::Result<Dacl> {
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
-        ACL_SIZE_INFORMATION, AclSizeInformation, GetAclInformation, GetSecurityDescriptorControl,
-        SE_DACL_PROTECTED,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation, GetAce,
+        GetAclInformation, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
     };
+    // `ACCESS_ALLOWED_ACE_TYPE` / `ACCESS_DENIED_ACE_TYPE` (winnt.h); both share
+    // `ACCESS_ALLOWED_ACE`'s layout. The constants live in a windows-sys feature we don't enable.
+    const ALLOWED: u8 = 0;
+    const DENIED: u8 = 1;
     let name = wide(path.as_os_str());
     let mut dacl: *mut ACL = ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
@@ -399,7 +420,7 @@ pub(super) fn dacl_of(path: &Path) -> io::Result<(bool, u32, String)> {
     if code != 0 {
         return Err(io::Error::from_raw_os_error(code as i32));
     }
-    let read = || -> io::Result<(bool, u32, String)> {
+    let read = || -> io::Result<Dacl> {
         let (mut control, mut revision) = (0u16, 0u32);
         // SAFETY: `sd` is valid; the out-pointers are live.
         if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
@@ -419,6 +440,41 @@ pub(super) fn dacl_of(path: &Path) -> io::Result<(bool, u32, String)> {
         {
             return Err(io::Error::last_os_error());
         }
+        let mut aces = Vec::with_capacity(size.AceCount as usize);
+        for i in 0..size.AceCount {
+            let mut ace: *mut core::ffi::c_void = ptr::null_mut();
+            // SAFETY: `dacl` is valid while `sd` lives and `i` < its ACE count.
+            if unsafe { GetAce(dacl, i, &mut ace) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: every ACE starts with an `ACE_HEADER`.
+            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+            if header.AceType != ALLOWED && header.AceType != DENIED {
+                aces.push(Ace {
+                    allow: false,
+                    flags: header.AceFlags,
+                    mask: 0,
+                    sid: String::new(),
+                });
+                continue;
+            }
+            let body = ace.cast::<ACCESS_ALLOWED_ACE>();
+            // SAFETY: allowed/denied ACEs have this layout; the SID starts at `SidStart`.
+            let (mask, sid) = unsafe { ((*body).Mask, (&raw const (*body).SidStart) as PSID) };
+            let mut text: PWSTR = ptr::null_mut();
+            // SAFETY: `sid` points at a valid SID inside the ACE; `text` receives a LocalAlloc'ed
+            // NUL-terminated string.
+            if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            aces.push(Ace {
+                allow: header.AceType == ALLOWED,
+                flags: header.AceFlags,
+                mask,
+                // SAFETY: NUL-terminated, LocalAlloc'ed and not used again.
+                sid: unsafe { local_wide_string(text) },
+            });
+        }
         let mut text: PWSTR = ptr::null_mut();
         // SAFETY: `sd` is valid; `text` receives a LocalAlloc'ed string.
         if unsafe {
@@ -435,7 +491,11 @@ pub(super) fn dacl_of(path: &Path) -> io::Result<(bool, u32, String)> {
         }
         // SAFETY: NUL-terminated, LocalAlloc'ed and not used again.
         let sddl = unsafe { local_wide_string(text) };
-        Ok((control & SE_DACL_PROTECTED != 0, size.AceCount, sddl))
+        Ok(Dacl {
+            protected: control & SE_DACL_PROTECTED != 0,
+            aces,
+            sddl,
+        })
     };
     let result = read();
     // SAFETY: allocated by GetNamedSecurityInfoW; not used again.

@@ -374,28 +374,44 @@ fn secret_dirs_are_owner_only() {
 
 /// Runs only on Windows (CI's windows job); on Linux it is compiled by the xwin clippy check.
 /// A fresh and an already existing (inheriting) directory both end with a protected DACL of
-/// exactly SYSTEM + the current user, which files created inside inherit.
+/// exactly SYSTEM + the current user, which files created inside inherit. Trustees are compared
+/// as SIDs: SDDL text prints well-known accounts as aliases (CI's built-in Administrator is `LA`).
 #[cfg(windows)]
 #[test]
 fn secret_dirs_get_a_protected_user_and_system_dacl() {
-    let d = tempfile::tempdir().unwrap();
+    use windows_sys::Win32::Security::{CONTAINER_INHERIT_ACE, INHERITED_ACE, OBJECT_INHERIT_ACE};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    const SYSTEM: &str = "S-1-5-18";
     let user = imp::current_sid_string().expect("current user's SID");
+    let mut want = vec![SYSTEM, user.as_str()];
+    want.sort_unstable();
+    // Every ACE allows full control with `flags`; together they name exactly SYSTEM + the user.
+    let check = |path: &std::path::Path, flags: u32| {
+        let dacl = imp::dacl_of(path).unwrap();
+        let ctx = format!("{}: {}", path.display(), dacl.sddl);
+        let mut sids: Vec<&str> = dacl.aces.iter().map(|a| a.sid.as_str()).collect();
+        sids.sort_unstable();
+        assert_eq!(sids, want, "{ctx}");
+        for ace in &dacl.aces {
+            assert!(ace.allow, "{ctx}");
+            assert_eq!(ace.mask, FILE_ALL_ACCESS, "{ctx}");
+            assert_eq!(u32::from(ace.flags), flags, "{ctx}");
+        }
+        dacl.protected
+    };
+    let d = tempfile::tempdir().unwrap();
     let fresh = d.path().join("a/secrets");
     let existing = d.path().join("existing");
     fs::create_dir(&existing).unwrap();
     for dir in [&fresh, &existing] {
         create_secret_dir_all(dir).unwrap();
-        let (protected, aces, sddl) = imp::dacl_of(dir).unwrap();
-        assert!(protected, "{}: DACL not protected: {sddl}", dir.display());
-        assert_eq!(aces, 2, "{}: {sddl}", dir.display());
-        assert!(sddl.contains("(A;OICI;FA;;;SY)"), "{sddl}");
-        assert!(sddl.contains(&format!("(A;OICI;FA;;;{user})")), "{sddl}");
-
+        assert!(
+            check(dir, OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE),
+            "{}: DACL not protected",
+            dir.display()
+        );
         let file = dir.join("remote.key");
         write_private(&file, b"k").unwrap();
-        let (_, file_aces, file_sddl) = imp::dacl_of(&file).unwrap();
-        assert_eq!(file_aces, 2, "{file_sddl}");
-        assert!(file_sddl.contains("FA;;;SY)"), "{file_sddl}");
-        assert!(file_sddl.contains(&format!("FA;;;{user})")), "{file_sddl}");
+        check(&file, INHERITED_ACE);
     }
 }
