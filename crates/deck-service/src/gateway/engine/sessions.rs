@@ -232,6 +232,20 @@ impl Sessions {
     pub(super) fn queue(&mut self, job: LaunchJob) {
         self.launches.push_back(job);
     }
+
+    /// Removes the queued launches `client` asked for (not one already being prepared) and
+    /// returns their keys; the others keep their order.
+    pub(super) fn take_launches_of(&mut self, client: &str) -> Vec<RequestKey> {
+        let mut taken = Vec::new();
+        self.launches.retain_mut(|j| match &j.key {
+            Some(k) if k.client == client => {
+                taken.extend(j.key.take());
+                false
+            }
+            _ => true,
+        });
+        taken
+    }
 }
 
 /// `omp` or `omp --resume <abs path>`.
@@ -609,6 +623,29 @@ impl Engine {
             }
         }
         self.dirty.controllers = true;
+    }
+
+    /// Client `client` lost the right to run commands (a paired device revoked, or its
+    /// `control` lowered): its controller requests that have not written a byte yet (draft
+    /// confirmations included) and its queued launches are cancelled and journaled so. Work
+    /// already writing, or a launch already starting, finishes.
+    pub(super) fn cancel_client_work(&mut self, client: &str) {
+        let mut cancelled = false;
+        for m in &mut self.sess.managed {
+            cancelled |= m.ctl.cancel_client(client);
+        }
+        let gone = self.sess.take_launches_of(client);
+        if !gone.is_empty() {
+            self.sync_ctl_keep();
+        }
+        for key in gone {
+            self.job_finished(key, Err::<Box<Done>, _>(GatewayError::Cancelled));
+        }
+        if cancelled {
+            // Their ends reach the journal and the clients on the next tick.
+            self.dirty.controllers = true;
+            self.waker.now();
+        }
     }
 
     // ---- model observations -------------------------------------------------------------------
@@ -1718,6 +1755,48 @@ fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_client_losing_its_rights_loses_only_its_own_queued_launches() {
+        let job = |label: &str, key: Option<(&str, u64)>| LaunchJob {
+            spec: LaunchSpec {
+                mux_name: None,
+                cwd: PathBuf::from("/p"),
+                session_path: None,
+                label: label.into(),
+                argv: omp_argv(None),
+                role: SessionRole::Session,
+                copy_of: None,
+            },
+            key: key.map(|(client, seq)| RequestKey {
+                client: client.into(),
+                seq,
+            }),
+            exact: false,
+            restore: false,
+            tool: None,
+        };
+        let mut sess = Sessions::new(PathBuf::from("/nowhere/sessions.json"));
+        sess.queue(job("phone 1", Some(("d-phone", 1))));
+        sess.queue(job("desk", Some(("gui", 1))));
+        sess.queue(job("re-attach", None));
+        sess.queue(job("phone 2", Some(("d-phone", 2))));
+        let taken = sess.take_launches_of("d-phone");
+        assert_eq!(
+            taken
+                .iter()
+                .map(|k| (k.client.as_str(), k.seq))
+                .collect::<Vec<_>>(),
+            [("d-phone", 1), ("d-phone", 2)]
+        );
+        let left: Vec<&str> = sess
+            .launches
+            .iter()
+            .map(|j| j.spec.label.as_str())
+            .collect();
+        assert_eq!(left, ["desk", "re-attach"]);
+        assert!(sess.take_launches_of("d-phone").is_empty());
+    }
 
     #[test]
     fn a_session_follows_its_only_open_file_and_adopts_the_first_when_unknown() {

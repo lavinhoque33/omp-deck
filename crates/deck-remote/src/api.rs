@@ -9,7 +9,26 @@
 //! JSON conventions: tagged enums are internally tagged (`op`, `feed`, `type`, `state`, `code`,
 //! `reason`), `snake_case`, struct variants only; plain value enums are strings. `None` is
 //! written as `null`; device → gateway types also accept a missing optional field and refuse
-//! unknown fields. A device ignores fields and record kinds it does not know.
+//! unknown fields. A device ignores fields and record kinds it does not know. Every timestamp
+//! is milliseconds since the Unix epoch in a field named `*_unix_ms`. Every fractional number
+//! is an `Option<f64>`: `null` when unknown or not finite (JSON has no NaN or infinity).
+//!
+//! A request that is well-formed JSON with a numeric `id` but names an op, feed, session
+//! action type or enum value ([`ViewMode`], [`DiffSide`], [`CompactMode`]) this gateway does
+//! not know is answered [`ApiError::Unsupported`], any other bad request
+//! [`ApiError::BadRequest`] ([`Request::parse`]): a newer device probing an older gateway can
+//! tell the two apart.
+//!
+//! Record kinds are partitioned by sender: device kinds are `0x01..=0x0f`
+//! ([`kind::DEVICE`]), gateway kinds `0x10..=0x7f` ([`kind::GATEWAY`]); `0x00` and
+//! `0x80..=0xff` are reserved. A receiver refuses a kind of the other side's range
+//! ([`RecordError::WrongDirection`]) and a reserved kind ([`RecordError::UnknownKind`]); the
+//! gateway refuses an unknown device kind, a device skips an unknown gateway kind.
+//!
+//! Terminal records carry the session's raw output. The device's terminal emulator answers no
+//! queries and sends no reports (no DA, DSR, OSC 10/11/4 colour queries, title or size reports:
+//! its only input is what the user types) and ignores OSC 52 (clipboard). The gateway does not
+//! strip these sequences from the output.
 //!
 //! Devices never see absolute paths, ctl keys, other clients' request keys or secrets: projects
 //! are [`project_id`]s, sessions omp session ids, live sessions [`LiveRef`]s and changed files
@@ -24,7 +43,7 @@ pub const PROTOCOL: u32 = 1;
 pub const MAX_APP_MESSAGE: usize = 1 << 20;
 /// `kind` + `len` in front of every record body.
 pub const RECORD_HEADER: usize = 5;
-/// Largest JSON reply body: the contract's 4 MiB cap, bounded by what one message carries.
+/// Largest JSON reply body: what one application message carries after a record header.
 pub const MAX_REPLY: usize = MAX_APP_MESSAGE - RECORD_HEADER;
 /// Bytes of one `INPUT` record (after `view` and `flags`).
 pub const MAX_INPUT: usize = 64 * 1024;
@@ -84,6 +103,13 @@ pub const MAX_DIFF_TEXT: usize = 768 * 1024;
 
 /// Record kinds.
 pub mod kind {
+    use std::ops::RangeInclusive;
+
+    /// Every device → gateway kind, present and future.
+    pub const DEVICE: RangeInclusive<u8> = 0x01..=0x0f;
+    /// Every gateway → device kind, present and future.
+    pub const GATEWAY: RangeInclusive<u8> = 0x10..=0x7f;
+
     /// Device → gateway: JSON [`super::Request`].
     pub const REQUEST: u8 = 0x01;
     /// Device → gateway: `messages: u64 BE`.
@@ -161,7 +187,8 @@ pub enum Record {
 pub enum Origin {
     /// Strict: only device kinds, nothing unknown.
     Device,
-    /// Gateway kinds; unknown kinds are skipped (a newer gateway), device kinds refused.
+    /// Gateway kinds; unknown ones of [`kind::GATEWAY`] are skipped (a newer gateway), device
+    /// and reserved kinds refused.
     Gateway,
 }
 
@@ -292,14 +319,18 @@ impl Record {
 
     /// `None`: an unknown gateway kind (skipped).
     fn decode_one(kind: u8, body: &[u8], origin: Origin) -> Result<Option<Record>, RecordError> {
-        let (mine, theirs) = match origin {
-            Origin::Device => (Record::device_kind(kind), Record::gateway_kind(kind)),
-            Origin::Gateway => (Record::gateway_kind(kind), Record::device_kind(kind)),
+        let (mine, theirs, known) = match origin {
+            Origin::Device => (kind::DEVICE, kind::GATEWAY, Record::device_kind(kind)),
+            Origin::Gateway => (kind::GATEWAY, kind::DEVICE, Record::gateway_kind(kind)),
         };
-        if theirs {
+        if theirs.contains(&kind) {
             return Err(RecordError::WrongDirection(kind));
         }
-        if !mine {
+        if !mine.contains(&kind) {
+            // `0x00` and `0x80..=0xff`: reserved.
+            return Err(RecordError::UnknownKind(kind));
+        }
+        if !known {
             return match origin {
                 Origin::Device => Err(RecordError::UnknownKind(kind)),
                 Origin::Gateway => Ok(None),
@@ -539,7 +570,8 @@ pub enum RequestError {
     /// Not a JSON object with a numeric `id`: the session is closed (`close::APP_PROTOCOL`).
     #[error("unreadable request")]
     Unreadable,
-    /// An op this gateway does not know: answered [`ApiError::Unsupported`].
+    /// An op, feed, action type or enum value this gateway does not know: answered
+    /// [`ApiError::Unsupported`].
     #[error("unsupported operation")]
     Unsupported { id: u64 },
     /// Answered [`ApiError::BadRequest`].
@@ -559,16 +591,13 @@ impl Request {
                     .get("id")
                     .and_then(serde_json::Value::as_u64)
                     .ok_or(RequestError::Unreadable)?;
-                match value.get("op").and_then(|o| o.get("op")) {
-                    Some(serde_json::Value::String(name))
-                        if !Op::NAMES.contains(&name.as_str()) =>
-                    {
-                        Err(RequestError::Unsupported { id })
-                    }
-                    _ => Err(RequestError::Bad {
+                if value.get("op").is_some_and(names_unknown) {
+                    Err(RequestError::Unsupported { id })
+                } else {
+                    Err(RequestError::Bad {
                         id,
                         message: e.to_string(),
-                    }),
+                    })
                 }
             }
         }
@@ -584,6 +613,31 @@ impl Request {
     }
 }
 
+/// The op names a tag or string enum value outside v1's sets: every place an [`Op`] holds a
+/// tag or a plain enum (keep in step when one is added; `tests/api.rs` checks it against serde).
+fn names_unknown(op: &serde_json::Value) -> bool {
+    let unknown = |v: Option<&serde_json::Value>, names: &[&str]| matches!(v, Some(serde_json::Value::String(s)) if !names.contains(&s.as_str()));
+    let Some(serde_json::Value::String(name)) = op.get("op") else {
+        return false;
+    };
+    match name.as_str() {
+        name if !Op::NAMES.contains(&name) => true,
+        "subscribe" | "unsubscribe" => {
+            unknown(op.get("feed").and_then(|f| f.get("feed")), Feed::NAMES)
+        }
+        "diff" => unknown(op.get("side"), DiffSide::NAMES),
+        "attach" => unknown(op.get("mode"), ViewMode::NAMES),
+        "action" => {
+            let action = op.get("action");
+            let kind = action.and_then(|a| a.get("type"));
+            unknown(kind, SessionAction::NAMES)
+                || (kind.and_then(serde_json::Value::as_str) == Some("compact")
+                    && unknown(action.and_then(|a| a.get("mode")), CompactMode::NAMES))
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewMode {
@@ -595,12 +649,22 @@ pub enum ViewMode {
     Control,
 }
 
+impl ViewMode {
+    /// Every value.
+    pub const NAMES: &'static [&'static str] = &["observe", "input", "control"];
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffSide {
     Staged,
     Unstaged,
     Untracked,
+}
+
+impl DiffSide {
+    /// Every value.
+    pub const NAMES: &'static [&'static str] = &["staged", "unstaged", "untracked"];
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -611,6 +675,11 @@ pub enum CompactMode {
     Snapcompact,
     /// With [`SessionAction::Compact::focus`].
     Focus,
+}
+
+impl CompactMode {
+    /// Every value.
+    pub const NAMES: &'static [&'static str] = &["default", "soft", "snapcompact", "focus"];
 }
 
 /// A session runtime command ([`Op::Action`]).
@@ -632,6 +701,12 @@ pub enum SessionAction {
     AutoName {},
     Plan {},
     Retry {},
+}
+
+impl SessionAction {
+    /// Every `type` tag.
+    pub const NAMES: &'static [&'static str] =
+        &["handoff", "compact", "rename", "auto_name", "plan", "retry"];
 }
 
 /// Operations v1 (tag `op`).
@@ -910,6 +985,17 @@ pub enum Feed {
 }
 
 impl Feed {
+    /// Every `feed` tag, in [`Feed::name`] order.
+    pub const NAMES: &'static [&'static str] = &[
+        "projects",
+        "sessions",
+        "live",
+        "inbox",
+        "cards",
+        "transcript",
+        "changes",
+    ];
+
     pub fn name(&self) -> &'static str {
         match self {
             Feed::Projects {} => "projects",
@@ -1001,7 +1087,7 @@ pub struct SessionSummary {
     pub title: Option<String>,
     /// At most [`FIRST_PROMPT_CHARS`] characters.
     pub first_prompt: Option<String>,
-    pub modified_ms: u64,
+    pub modified_unix_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1086,7 +1172,7 @@ pub struct InboxItem {
     pub title: String,
     pub project: String,
     pub body: String,
-    pub at_ms: u64,
+    pub at_unix_ms: u64,
     pub armed: bool,
 }
 
@@ -1109,7 +1195,8 @@ pub struct Card {
     pub context_tokens: Option<u64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cost: f64,
+    /// Dollars; `None` when unknown or not finite.
+    pub cost: Option<f64>,
     pub last_reply: Option<String>,
     pub last_turn_failed: bool,
     pub git: Option<GitCounts>,
@@ -1141,12 +1228,12 @@ pub enum Item {
     User {
         text: String,
         from_agent: bool,
-        at_ms: Option<u64>,
+        at_unix_ms: Option<u64>,
     },
     Assistant {
         text: String,
         model: Option<String>,
-        at_ms: Option<u64>,
+        at_unix_ms: Option<u64>,
     },
     Thinking {
         text: String,
@@ -1241,6 +1328,7 @@ pub struct Model {
     /// Effort levels; empty = no thinking.
     pub thinking: Vec<String>,
     pub input: Vec<String>,
+    /// omp's prices (`cost.input`/`cost.output`); `None` when unknown or not finite.
     pub cost_input: Option<f64>,
     pub cost_output: Option<f64>,
 }
@@ -1390,6 +1478,9 @@ pub enum CancelReason {
     Detached,
     Closing,
     SessionChanged,
+    /// The device lost the permission the command needs (revoked or `control` lowered) before
+    /// its first byte.
+    NotAllowed,
 }
 
 /// How far a command got toward the terminal (tag `state`).
@@ -1536,13 +1627,47 @@ mod tests {
         );
         assert_eq!(decode(&[], Origin::Device), Err(RecordError::Empty));
         assert_eq!(encode(&[]), Err(RecordError::Empty));
-        // Unknown kinds: refused from a device, skipped from a gateway.
-        let unknown = [0x7f, 0, 0, 0, 1, 9];
+        // The kind partition: an unknown device-range kind is refused from a device, an
+        // unknown gateway-range kind skipped from a gateway; the other side's range is the
+        // wrong direction and reserved kinds are refused both ways.
+        let one = |k: u8| [k, 0, 0, 0, 1, 9];
         assert_eq!(
-            decode(&unknown, Origin::Device),
-            Err(RecordError::UnknownKind(0x7f))
+            decode(&one(0x05), Origin::Device),
+            Err(RecordError::UnknownKind(0x05))
         );
-        assert_eq!(decode(&unknown, Origin::Gateway).unwrap(), vec![]);
+        assert_eq!(decode(&one(0x7f), Origin::Gateway).unwrap(), vec![]);
+        assert_eq!(decode(&one(0x13), Origin::Gateway).unwrap(), vec![]);
+        assert_eq!(
+            decode(&one(0x7f), Origin::Device),
+            Err(RecordError::WrongDirection(0x7f))
+        );
+        assert_eq!(
+            decode(&one(0x0f), Origin::Gateway),
+            Err(RecordError::WrongDirection(0x0f))
+        );
+        for reserved in [0x00, 0x80, 0xff] {
+            for origin in [Origin::Device, Origin::Gateway] {
+                assert_eq!(
+                    decode(&one(reserved), origin),
+                    Err(RecordError::UnknownKind(reserved)),
+                    "{reserved:#04x} {origin:?}"
+                );
+            }
+        }
+        for k in [kind::REQUEST, kind::ACK, kind::INPUT, kind::RESIZE] {
+            assert!(kind::DEVICE.contains(&k) && Record::device_kind(k));
+        }
+        for k in [
+            kind::WELCOME,
+            kind::REPLY,
+            kind::EVENT,
+            kind::T_SNAPSHOT,
+            kind::T_OUTPUT,
+            kind::T_RESIZE,
+            kind::T_END,
+        ] {
+            assert!(kind::GATEWAY.contains(&k) && Record::gateway_kind(k));
+        }
         // Truncated body, bad flags, bad ack length.
         assert_eq!(
             decode(&[kind::ACK, 0, 0, 0, 8, 1], Origin::Device),
@@ -1675,6 +1800,52 @@ mod tests {
             Request::parse(br#"{"id":5,"op":{"op":"teleport"}}"#),
             Err(RequestError::Unsupported { id: 5 })
         );
+        // Unknown nested tags and enum values are unsupported too; a non-string is not.
+        for (id, body) in [
+            (
+                6,
+                r#"{"id":6,"op":{"op":"subscribe","feed":{"feed":"weather"}}}"#,
+            ),
+            (
+                7,
+                r#"{"id":7,"op":{"op":"unsubscribe","feed":{"feed":"weather"}}}"#,
+            ),
+            (
+                8,
+                r#"{"id":8,"op":{"op":"diff","project":"p","file":"f","side":"both"}}"#,
+            ),
+            (
+                9,
+                r#"{"id":9,"op":{"op":"attach","live":{"key":"k","generation":1},"mode":"x"}}"#,
+            ),
+            (
+                10,
+                r#"{"id":10,"seq":1,"op":{"op":"action","live":{"key":"k","generation":1},"action":{"type":"undo"}}}"#,
+            ),
+            (
+                11,
+                r#"{"id":11,"seq":1,"op":{"op":"action","live":{"key":"k","generation":1},"action":{"type":"compact","mode":"turbo"}}}"#,
+            ),
+        ] {
+            assert_eq!(
+                Request::parse(body.as_bytes()),
+                Err(RequestError::Unsupported { id }),
+                "{body}"
+            );
+        }
+        for body in [
+            r#"{"id":12,"op":{"op":"diff","project":"p","file":"f","side":1}}"#,
+            r#"{"id":12,"op":{"op":"subscribe","feed":{}}}"#,
+            r#"{"id":12,"seq":1,"op":{"op":"action","live":{"key":"k","generation":1},"action":{"type":"compact"}}}"#,
+        ] {
+            assert!(
+                matches!(
+                    Request::parse(body.as_bytes()),
+                    Err(RequestError::Bad { id: 12, .. })
+                ),
+                "{body}"
+            );
+        }
         assert_eq!(
             Request::parse(br#"{"op":{"op":"ping"}}"#),
             Err(RequestError::Unreadable)

@@ -18,7 +18,9 @@ export {
   fingerprint,
   INVITE_PREFIX,
   Initiator,
+  isDisplaySafe,
   Keypair,
+  MAX_FEATURES,
   MAX_FRAGMENT_DATA,
   MAX_HANDSHAKE_PAYLOAD,
   type Mode,
@@ -30,6 +32,7 @@ export {
   Pending,
   PROLOGUE,
   parsePairingInvite,
+  type ReceivedHello,
   RECONNECT_PATTERN,
   respond,
   Session,
@@ -38,7 +41,16 @@ export {
   type Welcome,
 } from './protocol.ts';
 export { isLowOrder } from './noise.ts';
-export { CLOSE, DEVICE_PATH, encodeRelayHello, HEALTH_PATH, HELLO_OK, MAX_PAYLOAD, VERSION } from './relay.ts';
+export {
+  CLOSE,
+  DEVICE_PATH,
+  encodeRelayHello,
+  HEALTH_PATH,
+  HELLO_OK,
+  isHelloOk,
+  MAX_PAYLOAD,
+  VERSION,
+} from './relay.ts';
 export {
   ACK_EVERY_BYTES,
   ACK_EVERY_MESSAGES,

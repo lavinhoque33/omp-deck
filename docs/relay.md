@@ -13,12 +13,21 @@ relay, and the relay holds no key that decrypts it.
 | The relay sees | The relay never sees |
 |---|---|
 | room ids and relay-assigned peer ids | prompts, transcripts, terminal output, files, commands |
-| connection times, client IP addresses, message sizes and timing | device or gateway keys, pairing secrets |
-| SHA-256 hashes of room secrets and device admission tokens | room secrets or admission tokens themselves (only in the hello, never stored or logged) |
+| connection times, client IP addresses, message sizes and timing | device or gateway keys, the pairing PSK |
+| room secrets and admission tokens (the invite's one-use pairing token included) in each connection's hello, held only in memory; SHA-256 hashes of them | — (secrets and tokens are never stored or logged) |
 
 Logs contain room ids, peer ids, close codes and addresses; never secrets, tokens, token hashes or
-payload bytes. A malicious relay operator can drop or delay traffic, or record metadata, but cannot
-read or forge it.
+payload bytes. The wire libraries' own logging (`tungstenite`, `tokio_tungstenite`, `rustls`,
+`tokio_rustls`, `hyper`, `hyper_util`) is clamped to `info` whatever `RUST_LOG` says, because their
+trace output prints raw frames. A relay operator who only routes can drop or delay traffic, or
+record metadata, but cannot read or forge it.
+
+**The relay host also serves the phone app** (slice 4: the PWA loads from the relay's own origin).
+Whoever controls the relay *host* can therefore serve modified app code that reads the phone's keys
+and acts with every paired phone's permissions; for a phone with Control that means running commands
+on your desktop. End-to-end encryption protects against a relay that only routes, the network path
+and log readers, not against the server delivering the app. Secure and patch the relay host like the
+desktop itself, and restrict who can administer it.
 
 ## Install
 
@@ -56,11 +65,15 @@ builder, Debian slim runtime, non-root user, state volume). Build from the repos
 podman build -f packaging/relay/Containerfile -t omp-deck-relay .
 podman run -d --name omp-deck-relay -p 127.0.0.1:8080:8080 \
   -v omp-deck-relay:/var/lib/omp-deck-relay omp-deck-relay \
-  serve --listen 0.0.0.0:8080 --state-dir /var/lib/omp-deck-relay --trust-forwarded-for
+  serve --listen 0.0.0.0:8080 --state-dir /var/lib/omp-deck-relay \
+  --trust-forwarded-for --trusted-proxy 10.88.0.1
 ```
 
-Only add `--trust-forwarded-for` when the published port is reachable by your proxy alone (as with
-`127.0.0.1:8080` above). `docker` works the same way.
+Inside the container the host's proxy connects from the bridge gateway (rootful podman `10.88.0.1`, docker
+`172.17.0.1`; rootless podman with slirp4netns `10.0.2.2`; when unsure, use the source address the relay logs for the
+proxy's connections), so name it with `--trusted-proxy`; `X-Forwarded-For` from any other peer is ignored.
+Without `--trust-forwarded-for` behind a proxy every client shares the proxy's address, so the
+per-address limit (32) becomes a global cap. `docker` works the same way.
 
 ## TLS
 
@@ -73,7 +86,11 @@ Phones only connect over `wss://`, so the relay needs a certificate. Two ways:
      `proxy_read_timeout` above 75 s (nginx closes idle proxied connections after 60 s by default).
 
    Pass `--trust-forwarded-for` so the per-IP limits apply to the real client address (the last
-   `X-Forwarded-For` hop, the one your proxy appends) instead of the proxy's.
+   `X-Forwarded-For` hop, the one your proxy appends) instead of the proxy's. The header is honoured
+   only from a loopback peer or one listed with `--trusted-proxy <ip|cidr>` (repeatable); any local
+   user can connect from loopback and forge it. With a CDN or a second proxy in front, or a hop that
+   carries a port, every client falls back to one shared bucket. `--trust-forwarded-for` together
+   with `--tls-cert` is refused (clients then connect directly).
 2. **In-process TLS.** `--tls-cert <pem> --tls-key <pem>` (rustls; certificate chain in PEM, key as
    PKCS#8, PKCS#1 or SEC1 PEM). Restart the relay after renewing the certificate. Binding port 443
    needs `CAP_NET_BIND_SERVICE` (see the comment in the systemd unit).
@@ -109,7 +126,8 @@ together with the relay URL (`wss://relay.example.com`): **Settings → General 
 (Mobile access must be on). The card then shows the link state; **Pair a device** opens a QR code for the
 phone. A lost key cannot be recovered: remove the room and enroll a new one.
 
-The running relay picks up new rooms at the next gateway hello and removed rooms within 30 s.
+The running relay picks up a new room at the first gateway hello for it (within about a second) and
+removed rooms within 30 s.
 
 ```sh
 omp-deck-relay list --state-dir /var/lib/omp-deck-relay            # id, created (UTC), label
@@ -128,20 +146,24 @@ everything. Defaults:
 | Limit | Default | Flag | When exceeded |
 |---|---|---|---|
 | connections in total (WebSockets plus sockets still in the TLS handshake or HTTP request) | 1024 | `--max-connections` | socket closed right after accept |
-| connections per client address | 32 | `--max-connections-per-ip` | socket closed right after accept; with `--trust-forwarded-for` (the socket peer is the proxy) HTTP 429 before the upgrade instead |
+| connections per client address (IPv4-mapped IPv6 counts as IPv4; IPv6 per /64) | 32 | `--max-connections-per-ip` | socket closed right after accept; through a trusted proxy (the socket peer is the proxy) HTTP 429 before the upgrade instead |
+| concurrent connections per device token | 2 | — | close 4029 (a half-open connection keeps its slot until the 75 s idle timeout) |
+| device admissions per token | 2/s, burst 4 | — | close 4029 before the gateway hears of it (checked before the room rate, so one token holder cannot use up the room's admissions) |
+| device admissions per room | 10/s, burst 20 | `--device-admissions-per-sec` (burst 2×) | close 4029 before the gateway hears of it |
 | devices per room | 16 | `--max-devices-per-room` | close 4029 |
 | device inbound bytes | 1 MiB/s, burst 4 MiB | `--device-bytes-per-sec` (burst scales 4×) | close 4029 |
 | device inbound messages | 500/s, burst 1000 | `--device-messages-per-sec` (burst 2×) | close 4029 |
 | gateway inbound bytes | 8 MiB/s, burst 16 MiB | `--gateway-bytes-per-sec` (burst 2×) | close 4029 |
 | gateway inbound messages | 4000/s, burst 8000 | `--gateway-messages-per-sec` (burst 2×) | close 4029 |
-| outbound queue per connection | 256 messages or 4 MiB | `--queue-messages`, `--queue-bytes` | close 4008 (a slow gateway also takes its devices offline) |
+| outbound queue per connection | 256 messages or 4 MiB | `--queue-messages`, `--queue-bytes` | close 4008. Toward the gateway, device data may fill at most ¼ of the queue per device token (both its connections, counted across reconnects, released as the gateway reads) and ¾ in total: the sending device is closed 4008 and the gateway stays. A gateway that stops reading is still dropped once the rest fills (taking its devices offline) |
 | message size | 65 535 bytes (device), 65 540 (gateway) | — (protocol) | close 4013 |
 | silence | 75 s (pings every 25 s) | `--idle-timeout-secs` | close 1000 |
 | WebSocket upgrade (counted from accept, or from the end of the TLS handshake with `--tls-cert`; also ends idle HTTP keep-alive such as health checks) | 10 s | — | socket closed |
 | TLS handshake (`--tls-cert`) | 10 s | — | socket closed |
 | first message (hello) | 10 s | — | close 4001 |
 
-Other flags: `--trust-forwarded-for`, `--tls-cert`/`--tls-key`. Logging: `RUST_LOG` (default `info`;
+Other flags: `--trust-forwarded-for`, `--trusted-proxy`, `--device-admissions-per-sec`, `--tls-cert`/`--tls-key`.
+Logging: `RUST_LOG` (default `info`;
 `debug` adds per-connection detail). A client that vanishes without a WebSocket close (process exit,
 network loss) is logged as `connection lost`, not as a protocol violation. Behind
 `--trust-forwarded-for` the total cap also counts the proxy's idle keep-alive connections. The
@@ -156,8 +178,11 @@ Close codes the relay uses: 1000 normal, 1001 relay shutting down, 1002 protocol
 undecodable message), 4001 bad or late hello, 4003 unauthorized (unknown room, wrong secret, unknown
 or revoked device), 4004 the room's gateway is offline, 4008 slow consumer, 4009 replaced by a newer
 gateway connection, 4013 message too large, 4029 rate limited. The gateway can also close a phone through
-the relay with 4002 (the phone broke the application protocol) or 4010 (the phone stopped
-acknowledging what it received).
+the relay with 4002 (the phone broke the application protocol), 4010 (the phone stopped
+acknowledging what it received) or 4026 (the phone's app speaks a protocol version this desktop does
+not support; update OmpDeck or the app). Close codes are unauthenticated hints: a phone never deletes
+its pairing because of one. 4029 is always temporary (connection caps, admission rate, inbound rate
+limits): phones retry with backoff up to about 75 s.
 
 ## Upgrading
 
@@ -166,9 +191,14 @@ every connection with code 1001 and exits within 5 s; gateways and devices recon
 backoff. Admission tokens live only in memory: each gateway re-registers its set right after
 reconnecting, so a restart needs no migration. `rooms.json` is the only persistent state.
 
+The relay protocol (`/v1/gateway`, `/v1/device`) is frozen: an incompatible change ships as new
+`/v2/*` paths served next to `/v1`, so a newer desktop or phone keeps working with an older relay and
+the reverse.
+
 ## Backup
 
-Back up `<state-dir>/rooms.json` (owner-only, replaced atomically on every change; copying it while
+Back up `<state-dir>/rooms.json` (owner-only on Unix, inherits the state directory's ACL on Windows;
+replaced atomically on every change; copying it while
 the relay runs is safe). It holds room ids, hashes of the room secrets, labels and creation times; no
 secret that lets anyone join a room. Restoring it brings back the same rooms, so existing desktops
 keep working with the keys they already have. Without a backup, enroll new rooms and enter the new

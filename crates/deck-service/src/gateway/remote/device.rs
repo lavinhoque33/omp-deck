@@ -27,6 +27,15 @@ pub const STALL_ENV: &str = "OMP_DECK_DEVICE_STALL_MS";
 const OUTPUT_CHUNK: usize = 256 * 1024;
 /// Cell size handed to the terminal with a device's resize (devices report cells only).
 const CELL: (u16, u16) = (8, 16);
+/// The largest terminal a device may size a session to: a phone screen is far smaller, and a
+/// huge grid would make the terminal allocate gigabytes.
+pub const MAX_COLS: u16 = 500;
+pub const MAX_ROWS: u16 = 200;
+
+/// A device's requested terminal size, within `1..=MAX_COLS` × `1..=MAX_ROWS`.
+pub fn device_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_ROWS))
+}
 /// Terminal traffic (input, resize) of one device handed to the engine and not processed yet,
 /// in budget units: its bytes plus [`RECORD_COST`] per engine message. Input beyond it is
 /// refused on the link (`input_refused` `rejected`), so a flood never queues on the engine.
@@ -522,6 +531,7 @@ impl Runtime {
                     }
                 }
                 Record::Resize { view, cols, rows } => {
+                    let (cols, rows) = device_size(cols, rows);
                     let Some(v) = self
                         .views
                         .get(&view)
@@ -1123,6 +1133,30 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_device_resize_is_clamped_to_a_sane_terminal() {
+        let (out, _) = out();
+        let mut rt = Runtime::new(out.clone());
+        attach(&out, 3, 30, ViewMode::Control);
+        for ((cols, rows), want) in [
+            ((u16::MAX, u16::MAX), (MAX_COLS, MAX_ROWS)),
+            ((0, 0), (1, 1)),
+            ((120, 40), (120, 40)),
+        ] {
+            let msg = api::encode(&[Record::Resize {
+                view: 3,
+                cols,
+                rows,
+            }])
+            .expect("encode");
+            let got = rt.receive(&msg, Instant::now()).expect("admitted");
+            let [Inbound::Resize { cols, rows, .. }] = &got[..] else {
+                panic!("{got:?}");
+            };
+            assert_eq!((*cols, *rows), want);
+        }
     }
 
     #[test]

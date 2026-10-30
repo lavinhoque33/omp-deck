@@ -38,6 +38,24 @@ jobs:
           bun run typecheck
           bun test
 
+  # RustSec advisories (policy in deny.toml) and the PWA's npm advisories.
+  audit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check advisories
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: PWA dependency audit
+        working-directory: pwa
+        run: |
+          bun install --frozen-lockfile
+          bun audit
+
   windows:
     runs-on: windows-latest
     timeout-minutes: 60

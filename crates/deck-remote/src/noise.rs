@@ -12,8 +12,20 @@
 //!
 //! Message 1 carries a [`DeviceHello`] (with a strictly increasing timestamp, see
 //! [`timestamp_fresh`]); message 2 carries a [`Welcome`]. Both are small flat JSON objects,
-//! read by a strict scanner (`noise/payload.rs`) that the PWA mirrors exactly.
+//! read by a strict scanner (`noise/payload.rs`) that the PWA mirrors exactly. A payload whose
+//! `v` is an integer other than 1 is [`NoiseError::UnsupportedVersion`], distinct from a
+//! malformed one, so the gateway can answer `relay::close::UPGRADE_REQUIRED` (the device keeps
+//! its pairing). Device-supplied names are [`is_display_safe`] text.
+//!
+//! **Secrets in memory.** [`Keypair`] and [`PairingInvite::psk`] zeroize their own buffers on
+//! drop, and nothing here prints them. That is the whole guarantee: `snow` 0.10 zeroizes
+//! nothing, so its copies of the static key, the PSK, the ephemeral keys, the chaining key
+//! and the transport keys stay in freed memory until reused, and so do stack copies made
+//! while deriving a public key. The PWA (`pwa/src/remote/protocol.ts`) zeroes its own handshake
+//! copies after `split` or a failure, but not engine or library copies (see its module comment).
+//! Treat process memory as holding every session secret.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -26,6 +38,8 @@ use zeroize::Zeroizing;
 
 use crate::relay::{ROOM_LEN, Room, TOKEN_LEN, Token};
 
+#[cfg(test)]
+mod forge;
 mod payload;
 #[cfg(test)]
 mod vectors;
@@ -56,7 +70,11 @@ pub const MAX_PLATFORM_CHARS: usize = 32;
 pub const MAX_DEVICE_ID_CHARS: usize = 64;
 pub const MAX_GATEWAY_LABEL_CHARS: usize = 64;
 /// Timestamps stay exactly representable as JavaScript numbers (2^53 − 1).
-pub const MAX_TIMESTAMP: u64 = (1 << 53) - 1;
+pub const MAX_TIMESTAMP: u64 = MAX_PAYLOAD_INT;
+/// Largest integer of the payload grammar (2^53 − 1).
+const MAX_PAYLOAD_INT: u64 = (1 << 53) - 1;
+/// [`DeviceHello::features`] names at most.
+pub const MAX_FEATURES: usize = 32;
 
 /// Flags bit: more fragments of this application message follow.
 pub const FLAG_MORE: u8 = 0x01;
@@ -90,6 +108,9 @@ pub enum NoiseError {
     Handshake,
     #[error("invalid handshake payload: {0}")]
     Payload(&'static str),
+    /// The payload's `v` is an integer other than 1: the peer speaks another payload version.
+    #[error("unsupported handshake payload version")]
+    UnsupportedVersion,
     #[error("transport frame of {0} bytes is malformed")]
     FrameSize(usize),
     /// Tampered, replayed, reordered or foreign frame.
@@ -201,13 +222,45 @@ pub fn next_timestamp(last: u64, now_ms: u64) -> u64 {
     now_ms.max(last.saturating_add(1))
 }
 
+/// Whether device-supplied text (a [`DeviceHello`] name or platform, a device rename) is safe
+/// to show: no C0/C1 control character (`char::is_control`), and none of the invisible,
+/// separator and bidirectional formatting characters U+00AD, U+061C, U+180E, U+200B–U+200F,
+/// U+2028–U+202E, U+2060–U+2064, U+2066–U+206F, U+FEFF and U+FFF9–U+FFFB. An explicit list
+/// (no Unicode tables), identical in the PWA; it also refuses ZWJ emoji sequences.
+pub fn is_display_safe(text: &str) -> bool {
+    !text.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{ad}'
+                    | '\u{61c}'
+                    | '\u{180e}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{2028}'..='\u{202e}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{206f}'
+                    | '\u{feff}'
+                    | '\u{fff9}'..='\u{fffb}'
+            )
+    })
+}
+
 /// Message 1 payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceHello {
+    /// At most [`MAX_NAME_CHARS`], [`is_display_safe`].
     pub name: String,
+    /// At most [`MAX_PLATFORM_CHARS`], [`is_display_safe`].
     pub platform: String,
     /// Unix milliseconds, strictly increasing per device ([`next_timestamp`]).
     pub ts: u64,
+    /// The highest application protocol (`api::PROTOCOL`) the device speaks, at least 1.
+    /// Key `api`; absent means 1 (and 1 is not written).
+    pub api: u64,
+    /// Optional application features the device understands: at most [`MAX_FEATURES`]
+    /// distinct non-empty names of `[a-z0-9_.]`. Key `features`, comma-separated; absent
+    /// means none (and none is not written).
+    pub features: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -216,6 +269,10 @@ struct HelloOut<'a> {
     name: &'a str,
     platform: &'a str,
     ts: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    features: Option<String>,
 }
 
 impl DeviceHello {
@@ -226,6 +283,8 @@ impl DeviceHello {
             name: &self.name,
             platform: &self.platform,
             ts: self.ts,
+            api: (self.api != 1).then_some(self.api),
+            features: (!self.features.is_empty()).then(|| self.features.join(",")),
         })
         .map_err(|_| NoiseError::Payload("hello is not serializable"))?;
         check_payload_len(&out)?;
@@ -234,13 +293,23 @@ impl DeviceHello {
 
     pub fn decode(bytes: &[u8]) -> Result<DeviceHello, NoiseError> {
         const INVALID: &str = "hello is not valid";
-        let mut fields = read_payload(bytes, INVALID, "unsupported hello version")?;
+        let mut fields = read_payload(bytes, INVALID)?;
         let hello = DeviceHello {
             name: take_str(&mut fields, "name", INVALID)?,
             platform: take_str(&mut fields, "platform", INVALID)?,
             ts: match fields.take("ts") {
                 Some(payload::Value::Int(ts)) => ts,
                 _ => return Err(NoiseError::Payload(INVALID)),
+            },
+            api: match fields.take("api") {
+                None => 1,
+                Some(payload::Value::Int(api)) => api,
+                Some(payload::Value::Str(_)) => return Err(NoiseError::Payload(INVALID)),
+            },
+            features: match fields.take("features") {
+                None => Vec::new(),
+                Some(payload::Value::Str(list)) => list.split(',').map(str::to_owned).collect(),
+                Some(payload::Value::Int(_)) => return Err(NoiseError::Payload(INVALID)),
             },
         };
         hello.validate()?;
@@ -250,8 +319,29 @@ impl DeviceHello {
     fn validate(&self) -> Result<(), NoiseError> {
         check_chars(&self.name, MAX_NAME_CHARS, "device name too long")?;
         check_chars(&self.platform, MAX_PLATFORM_CHARS, "platform too long")?;
+        if !is_display_safe(&self.name) {
+            return Err(NoiseError::Payload("device name is not display-safe"));
+        }
+        if !is_display_safe(&self.platform) {
+            return Err(NoiseError::Payload("platform is not display-safe"));
+        }
         if self.ts > MAX_TIMESTAMP {
             return Err(NoiseError::Payload("timestamp out of range"));
+        }
+        if self.api == 0 || self.api > MAX_PAYLOAD_INT {
+            return Err(NoiseError::Payload("api version out of range"));
+        }
+        if self.features.len() > MAX_FEATURES {
+            return Err(NoiseError::Payload("too many features"));
+        }
+        for (i, name) in self.features.iter().enumerate() {
+            let valid = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.'));
+            if !valid || self.features[..i].contains(name) {
+                return Err(NoiseError::Payload("features are not valid"));
+            }
         }
         Ok(())
     }
@@ -300,7 +390,7 @@ impl Welcome {
 
     pub fn decode(bytes: &[u8]) -> Result<Welcome, NoiseError> {
         const INVALID: &str = "welcome is not valid";
-        let mut fields = read_payload(bytes, INVALID, "unsupported welcome version")?;
+        let mut fields = read_payload(bytes, INVALID)?;
         let device = take_str(&mut fields, "device", INVALID)?;
         let gateway = take_str(&mut fields, "gateway", INVALID)?;
         let token = match fields.take("token") {
@@ -360,17 +450,13 @@ fn check_payload_len(bytes: &[u8]) -> Result<(), NoiseError> {
 }
 
 /// Checks the size and grammar of a handshake payload and its version (`v` exactly 1).
-fn read_payload(
-    bytes: &[u8],
-    invalid: &'static str,
-    version: &'static str,
-) -> Result<payload::Fields, NoiseError> {
+fn read_payload(bytes: &[u8], invalid: &'static str) -> Result<payload::Fields, NoiseError> {
     check_payload_len(bytes)?;
     let mut fields = payload::parse(bytes).ok_or(NoiseError::Payload(invalid))?;
     match fields.take("v") {
         Some(payload::Value::Int(1)) => Ok(fields),
-        Some(_) => Err(NoiseError::Payload(version)),
-        None => Err(NoiseError::Payload(invalid)),
+        Some(payload::Value::Int(_)) => Err(NoiseError::UnsupportedVersion),
+        Some(payload::Value::Str(_)) | None => Err(NoiseError::Payload(invalid)),
     }
 }
 
@@ -783,7 +869,8 @@ impl Session {
 /// gateway public 32 ‖ psk 32`). Carried in the URL fragment (`#pair=…`), never logged.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingInvite {
-    /// Relay base URL, `ws://` or `wss://`, at most 255 bytes.
+    /// Relay base URL, canonical: `wss://host[:port]` (or `ws://` for a loopback host),
+    /// lowercase, no default port, no userinfo, path or query; at most 255 bytes.
     pub url: String,
     pub room: Room,
     /// One-use relay admission token for this pairing window.
@@ -845,16 +932,64 @@ impl PairingInvite {
     }
 }
 
+/// The canonical relay base URL (what the gateway's relay setting produces), at most
+/// [`MAX_INVITE_URL`] bytes: `wss://host[:port]`, or `ws://` only for a loopback host
+/// (`localhost`, an IPv4 `127.x.y.z`, an IPv6 equal to `::1`).
+///
+/// - `host`: lowercase `[a-z0-9.-]+`, or `[` lowercase IPv6 `]` as `std::net::Ipv6Addr`
+///   parses it;
+/// - `port`: decimal 1–65535 without leading zeros, never the scheme's default (443/80);
+/// - nothing else: no userinfo, path, query, fragment, whitespace or control characters.
 fn check_invite_url(url: &str) -> Result<(), NoiseError> {
-    let rest = url
-        .strip_prefix("wss://")
-        .or_else(|| url.strip_prefix("ws://"))
-        .ok_or(NoiseError::Invite("url must start with ws:// or wss://"))?;
-    if rest.is_empty() {
-        return Err(NoiseError::Invite("url has no host"));
-    }
     if url.len() > MAX_INVITE_URL {
         return Err(NoiseError::Invite("url exceeds 255 bytes"));
+    }
+    let (tls, authority) = match (url.strip_prefix("wss://"), url.strip_prefix("ws://")) {
+        (Some(rest), _) => (true, rest),
+        (None, Some(rest)) => (false, rest),
+        (None, None) => return Err(NoiseError::Invite("url must start with ws:// or wss://")),
+    };
+    let split = if authority.starts_with('[') {
+        authority.find(']').map(|i| i + 1)
+    } else {
+        authority.find(':')
+    };
+    let (host, port) = authority.split_at(split.unwrap_or(authority.len()));
+    if host.is_empty() {
+        return Err(NoiseError::Invite("url has no host"));
+    }
+    let lowercase = |text: &str| !text.bytes().any(|b| b.is_ascii_uppercase());
+    let loopback = match host.strip_prefix('[') {
+        Some(bracketed) => {
+            let address = bracketed
+                .strip_suffix(']')
+                .filter(|inner| lowercase(inner))
+                .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+                .ok_or(NoiseError::Invite("url host is not valid"))?;
+            address == Ipv6Addr::LOCALHOST
+        }
+        None => {
+            if !host
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.'))
+            {
+                return Err(NoiseError::Invite("url host is not valid"));
+            }
+            host == "localhost" || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+        }
+    };
+    if !port.is_empty() {
+        let digits = port.strip_prefix(':').unwrap_or_default();
+        let number = (!digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| digits.parse::<u16>().ok())
+            .flatten()
+            .ok_or(NoiseError::Invite("url port is not valid"))?;
+        if number == if tls { 443 } else { 80 } {
+            return Err(NoiseError::Invite("url names the default port"));
+        }
+    }
+    if !tls && !loopback {
+        return Err(NoiseError::Invite("ws:// is only for a loopback host"));
     }
     Ok(())
 }

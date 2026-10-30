@@ -350,3 +350,52 @@ fn verbatim_prefix_is_dropped_only_for_drive_and_unc_paths() {
     assert_eq!(plain(r"\\srv\share"), PathBuf::from(r"\\srv\share"));
     assert_eq!(plain(r"\\?\Volume{1}\x"), PathBuf::from(r"\\?\Volume{1}\x"));
 }
+
+#[cfg(unix)]
+#[test]
+fn secret_dirs_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("a/b");
+    create_secret_dir_all(&dir).unwrap();
+    let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700);
+    // An existing, looser dir of this user is tightened.
+    let loose = d.path().join("loose");
+    fs::create_dir(&loose).unwrap();
+    fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
+    create_secret_dir_all(&loose).unwrap();
+    assert_eq!(mode(&loose), 0o700);
+    // A file in its place is no folder.
+    let file = d.path().join("file");
+    fs::write(&file, b"").unwrap();
+    assert!(create_secret_dir_all(&file).is_err());
+}
+
+/// Runs only on Windows (CI's windows job); on Linux it is compiled by the xwin clippy check.
+/// A fresh and an already existing (inheriting) directory both end with a protected DACL of
+/// exactly SYSTEM + the current user, which files created inside inherit.
+#[cfg(windows)]
+#[test]
+fn secret_dirs_get_a_protected_user_and_system_dacl() {
+    let d = tempfile::tempdir().unwrap();
+    let user = imp::current_sid_string().expect("current user's SID");
+    let fresh = d.path().join("a/secrets");
+    let existing = d.path().join("existing");
+    fs::create_dir(&existing).unwrap();
+    for dir in [&fresh, &existing] {
+        create_secret_dir_all(dir).unwrap();
+        let (protected, aces, sddl) = imp::dacl_of(dir).unwrap();
+        assert!(protected, "{}: DACL not protected: {sddl}", dir.display());
+        assert_eq!(aces, 2, "{}: {sddl}", dir.display());
+        assert!(sddl.contains("(A;OICI;FA;;;SY)"), "{sddl}");
+        assert!(sddl.contains(&format!("(A;OICI;FA;;;{user})")), "{sddl}");
+
+        let file = dir.join("remote.key");
+        write_private(&file, b"k").unwrap();
+        let (_, file_aces, file_sddl) = imp::dacl_of(&file).unwrap();
+        assert_eq!(file_aces, 2, "{file_sddl}");
+        assert!(file_sddl.contains("FA;;;SY)"), "{file_sddl}");
+        assert!(file_sddl.contains(&format!("FA;;;{user})")), "{file_sddl}");
+    }
+}

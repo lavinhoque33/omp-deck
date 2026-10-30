@@ -76,14 +76,20 @@ fn message(stderr: &str, stdout: &str) -> String {
     }
 }
 
-/// `git [--no-optional-locks] -C <cwd> <args>` with the OmpDeck environment. `read_only` commands
-/// skip the index lock so they never race the user's own git.
+/// Global options that keep git from running the repository's `core.fsmonitor` hook program.
+pub(crate) const NO_FSMONITOR: [&str; 2] = ["-c", "core.fsmonitor=false"];
+
+/// `git [--no-optional-locks] -c core.fsmonitor=false -C <cwd> <args>` with the OmpDeck
+/// environment. `read_only` commands skip the index lock so they never race the user's own git.
+/// `core.fsmonitor` is forced off for every command: a repository's own config could otherwise
+/// name a program git runs on status, diff and add, and browsing a folder must never execute it.
 pub(crate) fn command<S: AsRef<OsStr>>(cwd: &Path, args: &[S], read_only: bool) -> Command {
     let mut cmd = Command::new("git");
     if read_only {
         cmd.arg("--no-optional-locks");
     }
-    cmd.arg("-C")
+    cmd.args(NO_FSMONITOR)
+        .arg("-C")
         .arg(cwd)
         .args(args)
         .env("LC_ALL", "C")

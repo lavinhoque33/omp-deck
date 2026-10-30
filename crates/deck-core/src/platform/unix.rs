@@ -156,6 +156,31 @@ pub fn executable(_path: &Path, meta: &Metadata) -> bool {
     meta.permissions().mode() & 0o111 != 0
 }
 
+/// Creates `path` (and its parents) as 0700. An existing dir of the current user that is looser
+/// is tightened to 0700; one owned by someone else is refused.
+pub fn secret_dir_all(path: &Path) -> io::Result<()> {
+    private_dir_builder(true).create(path)?;
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir() {
+        return Err(io::Error::other(format!(
+            "{} is not a folder",
+            path.display()
+        )));
+    }
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} belongs to another user", path.display()),
+        ));
+    }
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        fs::set_permissions(path, Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 pub fn private_dir_builder(recursive: bool) -> DirBuilder {
     let mut b = DirBuilder::new();
     b.recursive(recursive).mode(0o700);

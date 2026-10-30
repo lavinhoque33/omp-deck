@@ -203,6 +203,14 @@ pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
     imp::private_dir_builder(true).create(path)
 }
 
+/// Creates a directory for secrets (keys, room secrets, device tokens) with every missing
+/// ancestor. Unix: mode 0700 like [`create_private_dir_all`]. Windows: a protected access list
+/// granting full control to the current user and SYSTEM only, inherited by the files created
+/// inside and re-applied when the directory already exists; nothing is inherited from the parent.
+pub fn create_secret_dir_all(path: &Path) -> io::Result<()> {
+    imp::secret_dir_all(path)
+}
+
 /// Creates a new file (it must not exist) for writing, mode 0600 (Windows: parent ACL).
 pub fn open_private_file(path: &Path) -> io::Result<File> {
     let mut o = OpenOptions::new();

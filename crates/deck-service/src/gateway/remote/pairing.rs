@@ -293,6 +293,8 @@ mod tests {
             name: "Pixel".into(),
             platform: "android".into(),
             ts: 5,
+            api: 1,
+            features: Vec::new(),
         }
     }
 

@@ -5,12 +5,17 @@ import { expect, test } from 'bun:test';
 
 import { fromHex, toHex } from '../src/remote/bytes.ts';
 import { type CipherState, HandshakeState, type Pattern, PROTOCOL_NAMES, publicKeyOf } from '../src/remote/noise.ts';
-import { officialVectors } from './vectors.ts';
+import { officialVectors, recordedSha256 } from './vectors.ts';
 
 const vectors = officialVectors();
 
 test('both patterns are covered', () => {
   expect(vectors.map((vector) => vector.protocol_name)).toEqual([PROTOCOL_NAMES.IK, PROTOCOL_NAMES.IKpsk1]);
+});
+
+test('the copied file matches its recorded SHA-256', () => {
+  const { actual, recorded } = recordedSha256('cacophony-ik.json');
+  expect(actual).toBe(recorded ?? 'not recorded in README.md');
 });
 
 function keypair(secretHex: string): { secret: Uint8Array; public: Uint8Array } {

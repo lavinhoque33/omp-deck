@@ -84,3 +84,42 @@ fn usage_errors_help_and_version() {
     let version = relay(&["--version"]);
     assert!(stdout(&version).starts_with("omp-deck-relay "));
 }
+
+#[test]
+fn forwarded_for_flag_combinations() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let (cert, key) = (
+        format!("{fixtures}/cert.pem"),
+        format!("{fixtures}/key.pem"),
+    );
+    let serve = |extra: &[&str]| {
+        let mut args = vec!["serve", "--state-dir", "x", "--listen", "127.0.0.1:0"];
+        args.extend_from_slice(extra);
+        relay(&args)
+    };
+    // In-process TLS: clients connect directly, no proxy header to trust.
+    let out = serve(&[
+        "--trust-forwarded-for",
+        "--tls-cert",
+        &cert,
+        "--tls-key",
+        &key,
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--tls-cert"));
+    // --trusted-proxy needs the flag and an address or CIDR range.
+    assert_eq!(
+        serve(&["--trusted-proxy", "10.88.0.1"]).status.code(),
+        Some(2)
+    );
+    for bad in ["10.88.0.0/33", "proxy.example", "10.88.0.1/"] {
+        let out = serve(&["--trust-forwarded-for", "--trusted-proxy", bad]);
+        assert_eq!(out.status.code(), Some(2), "{bad}: {out:?}");
+    }
+    assert_eq!(
+        relay(&["list", "--state-dir", "x", "--trusted-proxy", "10.88.0.1"])
+            .status
+            .code(),
+        Some(2)
+    );
+}

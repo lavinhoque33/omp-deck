@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use deck_relay::{Config, RateLimit, rooms};
+use deck_relay::{AdmissionRate, Config, ProxyRange, RateLimit, rooms};
 
 const BIN: &str = "omp-deck-relay";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -27,11 +27,15 @@ commands:
 serve options:
   --tls-cert <pem> --tls-key <pem>
                                 terminate TLS in-process (default: plain, behind a TLS proxy)
-  --trust-forwarded-for         key per-IP limits on the last X-Forwarded-For hop (only behind
-                                a proxy that sets it)
+  --trust-forwarded-for         key per-IP limits on the last X-Forwarded-For hop of connections
+                                from loopback or a --trusted-proxy (plain HTTP only)
+  --trusted-proxy <ip or cidr>  a proxy address besides loopback whose X-Forwarded-For counts
+                                (repeatable; needs --trust-forwarded-for)
   --max-connections <n>         connections in total, pending TLS/HTTP included (default 1024)
-  --max-connections-per-ip <n>  per client address (default 32)
+  --max-connections-per-ip <n>  per client address, IPv6 per /64 (default 32)
   --max-devices-per-room <n>    (default 16)
+  --device-admissions-per-sec <n>
+                                device connections admitted per room (default 10, burst 2x)
   --device-bytes-per-sec <n>    inbound per device (default 1048576, burst 4x)
   --device-messages-per-sec <n> inbound per device (default 500, burst 2x)
   --gateway-bytes-per-sec <n>   inbound per gateway (default 8388608, burst 2x)
@@ -41,7 +45,7 @@ serve options:
   --queue-bytes <n>             outbound queue per connection (default 4194304)
   --idle-timeout-secs <n>       close connections silent this long (default 75; pings every 25)
 
-logging: RUST_LOG (default info)
+logging: RUST_LOG (default info; tungstenite, rustls and hyper stay at info or above)
 ";
 
 #[derive(Default)]
@@ -53,6 +57,7 @@ struct Args {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     trust_forwarded_for: bool,
+    trusted_proxies: Vec<ProxyRange>,
     /// `serve` limit overrides, applied in order.
     limits: Vec<(Limit, u64)>,
     positional: Vec<String>,
@@ -64,6 +69,7 @@ enum Limit {
     MaxConnections,
     MaxConnectionsPerIp,
     MaxDevicesPerRoom,
+    DeviceAdmissions,
     DeviceBytes,
     DeviceMessages,
     GatewayBytes,
@@ -73,10 +79,11 @@ enum Limit {
     IdleTimeoutSecs,
 }
 
-const LIMIT_FLAGS: [(&str, Limit); 10] = [
+const LIMIT_FLAGS: [(&str, Limit); 11] = [
     ("--max-connections", Limit::MaxConnections),
     ("--max-connections-per-ip", Limit::MaxConnectionsPerIp),
     ("--max-devices-per-room", Limit::MaxDevicesPerRoom),
+    ("--device-admissions-per-sec", Limit::DeviceAdmissions),
     ("--device-bytes-per-sec", Limit::DeviceBytes),
     ("--device-messages-per-sec", Limit::DeviceMessages),
     ("--gateway-bytes-per-sec", Limit::GatewayBytes),
@@ -98,6 +105,13 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--tls-cert" => a.tls_cert = Some(PathBuf::from(value("--tls-cert")?)),
             "--tls-key" => a.tls_key = Some(PathBuf::from(value("--tls-key")?)),
             "--trust-forwarded-for" => a.trust_forwarded_for = true,
+            "--trusted-proxy" => {
+                a.trusted_proxies.push(
+                    value("--trusted-proxy")?
+                        .parse()
+                        .map_err(|e| format!("--trusted-proxy {e}"))?,
+                );
+            }
             "-h" | "--help" | "help" => return Err(String::new()),
             s if s.starts_with('-') => {
                 let Some(&(name, limit)) = LIMIT_FLAGS.iter().find(|(f, _)| *f == s) else {
@@ -162,6 +176,7 @@ fn only(a: &Args, serve: bool, label: bool, positional: usize) -> anyhow::Result
         || a.tls_cert.is_some()
         || a.tls_key.is_some()
         || a.trust_forwarded_for
+        || !a.trusted_proxies.is_empty()
         || !a.limits.is_empty();
     if serve_only && !serve {
         return Err(usage(format!("{cmd} does not take serve options")));
@@ -230,13 +245,17 @@ fn scaled(rate: u64, default_rate: u64, default_burst: u64) -> u64 {
 }
 
 fn apply_limits(config: &mut Config, limits: &[(Limit, u64)]) {
-    let (d, g) = (RateLimit::DEVICE, RateLimit::GATEWAY);
+    let (d, g, a) = (RateLimit::DEVICE, RateLimit::GATEWAY, AdmissionRate::DEVICE);
     for &(limit, n) in limits {
         let size = usize::try_from(n).unwrap_or(usize::MAX);
         match limit {
             Limit::MaxConnections => config.max_connections = size,
             Limit::MaxConnectionsPerIp => config.max_connections_per_ip = size,
             Limit::MaxDevicesPerRoom => config.max_devices_per_room = size,
+            Limit::DeviceAdmissions => {
+                config.device_admissions.per_sec = n;
+                config.device_admissions.burst = scaled(n, a.per_sec, a.burst);
+            }
             Limit::DeviceBytes => {
                 config.device_rate.bytes_per_sec = n;
                 config.device_rate.bytes_burst = scaled(n, d.bytes_per_sec, d.bytes_burst);
@@ -269,10 +288,20 @@ fn serve(a: &Args, state_dir: PathBuf) -> anyhow::Result<()> {
     let listen: SocketAddr = listen
         .parse()
         .map_err(|_| usage(format!("--listen {listen:?}: expected <ip>:<port>")))?;
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    if !a.trusted_proxies.is_empty() && !a.trust_forwarded_for {
+        return Err(usage("--trusted-proxy needs --trust-forwarded-for"));
+    }
+    if a.trust_forwarded_for && a.tls_cert.is_some() {
+        return Err(usage(
+            "--trust-forwarded-for does not go with --tls-cert: with in-process TLS clients \
+             connect directly, so no proxy sets X-Forwarded-For",
+        ));
+    }
+    deck_relay::init_logging();
 
     let mut config = Config::new(state_dir);
     config.trust_forwarded_for = a.trust_forwarded_for;
+    config.trusted_proxies = a.trusted_proxies.clone();
     apply_limits(&mut config, &a.limits);
     config.tls = match (&a.tls_cert, &a.tls_key) {
         (Some(cert), Some(key)) => Some(deck_relay::load_tls(cert, key)?),

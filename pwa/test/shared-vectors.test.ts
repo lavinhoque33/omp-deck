@@ -14,6 +14,7 @@ import {
   Keypair,
   MAX_FRAGMENT_DATA,
   type Mode,
+  NoiseError,
   PAIRING_PATTERN,
   PROLOGUE,
   parsePairingInvite,
@@ -113,3 +114,62 @@ for (const h of v.handshakes) {
     });
   });
 }
+
+/** The vector name (`snake_case`) of the error `run` fails with. */
+function failure(run: () => unknown): string {
+  try {
+    run();
+    return 'accepted';
+  } catch (error) {
+    if (error instanceof NoiseError) return error.code.replaceAll('-', '_');
+    throw error;
+  }
+}
+
+function vectorMode(name: 'pairing' | 'reconnect'): Mode {
+  return name === 'pairing' ? { kind: 'pairing', psk: fromHex(v.psk) } : { kind: 'reconnect' };
+}
+
+/** Fresh sessions of the vector reconnect handshake, default config. */
+function reconnectSessions(): Record<'device' | 'gateway', Session> {
+  const mode = vectorMode('reconnect');
+  const { initiator, msg1 } = startInitiator(mode, device, gateway.public, v.hello, fromHex(v.device_ephemeral));
+  const welcome = { device: 'device-1', gateway: 'Desk' };
+  const { session: gatewaySession, msg2 } = respondWith(mode, gateway, msg1, fromHex(v.gateway_ephemeral)).accept(
+    welcome,
+  );
+  return { device: initiator.finish(msg2).session, gateway: gatewaySession };
+}
+
+describe('shared rejections', () => {
+  test('handshake messages', () => {
+    expect(v.rejected_handshakes.length).toBeGreaterThan(70);
+    for (const vector of v.rejected_handshakes) {
+      const mode = vectorMode(vector.mode);
+      const start = (gatewayPublic: Uint8Array) =>
+        startInitiator(mode, device, gatewayPublic, v.hello, fromHex(v.device_ephemeral));
+      let error: string;
+      if ('msg1' in vector) {
+        error = failure(() => respondWith(mode, gateway, fromHex(vector.msg1), fromHex(v.gateway_ephemeral)));
+      } else if ('msg2' in vector) {
+        const { initiator } = start(gateway.public);
+        error = failure(() => initiator.finish(fromHex(vector.msg2)));
+      } else {
+        error = failure(() => start(fromHex(vector.gateway_public)));
+      }
+      expect([vector.case, error]).toEqual([vector.case, vector.error]);
+    }
+  });
+
+  test('transport frames', () => {
+    expect(v.rejected_frames.length).toBeGreaterThan(15);
+    for (const vector of v.rejected_frames) {
+      const session = reconnectSessions()[vector.receiver];
+      if (vector.max_message !== null) session.config = { ...session.config, maxMessage: vector.max_message };
+      const frames = vector.frames.map(fromHex);
+      for (const frame of frames.slice(0, -1)) session.open(frame);
+      expect([vector.case, failure(() => session.open(frames.at(-1)!))]).toEqual([vector.case, vector.error]);
+      expect([vector.case, failure(() => session.open(frames[0]!))]).toEqual([vector.case, 'poisoned']);
+    }
+  });
+});

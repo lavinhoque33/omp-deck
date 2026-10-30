@@ -34,7 +34,7 @@ use deck_service::controller::RequestKey;
 use deck_service::gateway::client::{GatewayClient, GatewayOptions, Link};
 use deck_service::gateway::protocol::{
     Done, GatewayError, MaintenanceOp, MobileView, Mutation, Outcome, PairingState, Permissions,
-    RelayLink, Role, SecretText,
+    Refusal, RelayLink, Role, SecretText,
 };
 use deck_service::gateway::{MaintenancePurpose, Profile};
 use tungstenite::stream::MaybeTlsStream;
@@ -371,6 +371,8 @@ fn hello(name: &str) -> DeviceHello {
         name: name.into(),
         platform: "test".into(),
         ts: now_ms(),
+        api: 1,
+        features: Vec::new(),
     }
 }
 
@@ -1111,6 +1113,23 @@ fn devices_drive_a_real_session_through_the_relay() {
         Some(Err(GatewayError::Refused(_))) => {}
         other => panic!("outcome of a device's key: {other:?}"),
     }
+    // -- nor may a local client claim a device's client id --
+    let impostor = {
+        let mut opts = GatewayOptions::new(sb.profile.clone(), Role::Gui, Arc::new(|| {}));
+        opts.gateway_exe = Some(PathBuf::from(GATEWAY));
+        opts.client_id = phone.id.clone();
+        GatewayClient::start(opts)
+    };
+    wait_for(
+        "the impostor's refusal",
+        Duration::from_secs(30),
+        || match impostor.link() {
+            Link::Refused(Refusal::NotAllowed(_)) => Some(()),
+            Link::Up(_) => panic!("a local client was admitted as {}", phone.id),
+            _ => None,
+        },
+    );
+    drop(impostor);
 
     // -- under the maintenance barrier a device gets no new terminal view --
     match client

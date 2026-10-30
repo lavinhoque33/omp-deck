@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -26,10 +27,14 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
 
-use crate::conn::{Conn, Next, RateLimiter};
+use crate::config::{GATEWAY_DATA_SHARE, TOKEN_DATA_SHARE, canonical};
+use crate::conn::{Busy, Charge, Conn, Next, RateLimiter};
 use crate::tls::TlsListener;
 use crate::transport::{Limits, PeerAddr, Plain, Slot};
 use crate::{Config, RelayError, rooms};
+
+/// Gateway hellos for rooms the relay does not know reload `rooms.json` at most this often.
+const HELLO_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Runs the relay on `listener` until `shutdown` resolves, then closes every WebSocket with
 /// `GOING_AWAY` and returns within [`Config::shutdown_timeout`].
@@ -81,7 +86,7 @@ where
             let mut tick = tokio::time::interval_at(Instant::now() + every, every);
             loop {
                 tick.tick().await;
-                relay.reload_rooms();
+                relay.reload_rooms().await;
             }
         }
     });
@@ -150,11 +155,16 @@ struct Relay {
     next_conn: AtomicU64,
     shutting_down: AtomicBool,
     idle: Notify,
+    /// Serializes `rooms.json` reloads; holds when the last one started (hello-triggered reloads
+    /// are debounced to [`HELLO_RELOAD_INTERVAL`]).
+    reload_gate: tokio::sync::Mutex<Option<Instant>>,
 }
 
 struct Device {
     conn: Arc<Conn>,
     token: Hash,
+    /// Its token's data queued on the gateway (shared by the token's connections).
+    charge: Arc<Charge>,
 }
 
 /// Runtime state of one room. Kept after its gateway leaves so peer ids stay unique.
@@ -168,6 +178,13 @@ struct LiveRoom {
     tokens: Option<HashSet<Hash>>,
     devices: HashMap<PeerId, Device>,
     last_peer: PeerId,
+    /// Per admission token: its devices' data queued on the gateway, bounded by
+    /// [`TOKEN_DATA_SHARE`]. Kept across reconnects (queued data outlives its connection).
+    charges: HashMap<Hash, Arc<Charge>>,
+    /// Device admissions (`Config::device_admissions`); kept across gateway reconnects.
+    admissions: RateLimiter,
+    /// Per admission token (`Config::token_admissions`), checked before `admissions`.
+    token_admissions: HashMap<Hash, RateLimiter>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -175,7 +192,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl LiveRoom {
-    fn new(room: Room) -> LiveRoom {
+    fn new(room: Room, config: &Config) -> LiveRoom {
         LiveRoom {
             room,
             gateway: None,
@@ -183,6 +200,9 @@ impl LiveRoom {
             tokens: None,
             devices: HashMap::new(),
             last_peer: 0,
+            charges: HashMap::new(),
+            admissions: RateLimiter::new(config.device_admissions.as_rate_limit()),
+            token_admissions: HashMap::new(),
         }
     }
 
@@ -274,6 +294,7 @@ impl Relay {
             next_conn: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
             idle: Notify::new(),
+            reload_gate: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -281,13 +302,44 @@ impl Relay {
         lock(&self.conns)
     }
 
-    /// Re-reads `rooms.json`. Rooms that disappeared (or whose secret changed) lose their gateway
-    /// and devices (`UNAUTHORIZED`). An unreadable file keeps the previous table.
-    fn reload_rooms(&self) {
-        let table = match rooms::read_table(&self.config.state_dir) {
-            Ok(t) => t,
-            Err(e) => {
+    /// Re-reads `rooms.json` (off the async workers). Rooms that disappeared (or whose secret
+    /// changed) lose their gateway and devices (`UNAUTHORIZED`). An unreadable file keeps the
+    /// previous table.
+    async fn reload_rooms(&self) {
+        let mut last = self.reload_gate.lock().await;
+        self.reload_locked(&mut last).await;
+    }
+
+    /// Before admitting a gateway for `room`: reloads `rooms.json` if `room` is not enrolled as
+    /// far as the relay knows, at most once per [`HELLO_RELOAD_INTERVAL`]. Hellos that arrive
+    /// while a reload waits share it, so a burst of unknown rooms costs one read per interval.
+    async fn refresh_for(&self, room: &Room) {
+        if lock(&self.rooms).contains_key(room) {
+            return;
+        }
+        let arrived = Instant::now();
+        let mut last = self.reload_gate.lock().await;
+        if let Some(started) = *last {
+            if started >= arrived {
+                // A reload that started after this hello arrived already covers it.
+                return;
+            }
+            tokio::time::sleep_until(started + HELLO_RELOAD_INTERVAL).await;
+        }
+        self.reload_locked(&mut last).await;
+    }
+
+    async fn reload_locked(&self, last: &mut Option<Instant>) {
+        *last = Some(Instant::now());
+        let dir = self.config.state_dir.clone();
+        let table = match tokio::task::spawn_blocking(move || rooms::read_table(&dir)).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
                 log::error!("{e}; keeping the previous room table");
+                return;
+            }
+            Err(e) => {
+                log::error!("reading the room table failed: {e}");
                 return;
             }
         };
@@ -319,14 +371,15 @@ impl Relay {
         secret: &Secret,
         epoch: u64,
     ) -> Result<(), u16> {
-        self.reload_rooms();
         let rooms = lock(&self.rooms);
         let stored = rooms.get(&room).ok_or(close::UNAUTHORIZED)?;
         if !bool::from(relay::hash(secret).ct_eq(stored)) {
             return Err(close::UNAUTHORIZED);
         }
         let mut live = lock(&self.live);
-        let lr = live.entry(room).or_insert_with(|| LiveRoom::new(room));
+        let lr = live
+            .entry(room)
+            .or_insert_with(|| LiveRoom::new(room, &self.config));
         if let Some(old) = &lr.gateway {
             if epoch < lr.gateway_epoch {
                 log::info!(
@@ -370,30 +423,87 @@ impl Relay {
         if !tokens.contains(&token) {
             return Err(close::UNAUTHORIZED);
         }
+        if lr.devices.values().filter(|d| d.token == token).count()
+            >= self.config.max_connections_per_token
+        {
+            return Err(close::RATE_LIMITED);
+        }
         if lr.devices.len() >= self.config.max_devices_per_room {
+            return Err(close::RATE_LIMITED);
+        }
+        // Last, so only admissions that would queue an `Open` spend the buckets; the token's
+        // first, so a churning token is refused before it spends the room's.
+        let per_token = self.config.token_admissions;
+        let over = if !lr
+            .token_admissions
+            .entry(token)
+            .or_insert_with(|| RateLimiter::new(per_token.as_rate_limit()))
+            .take(0)
+        {
+            Some(("token", per_token.per_sec))
+        } else if !lr.admissions.take(0) {
+            Some(("room", self.config.device_admissions.per_sec))
+        } else {
+            None
+        };
+        if let Some((scope, per_sec)) = over {
+            log::info!(
+                "room {}: device admissions over {per_sec}/s per {scope} ({})",
+                lr.id(),
+                close::RATE_LIMITED
+            );
             return Err(close::RATE_LIMITED);
         }
         let peer = lr.alloc_peer();
         let _ = conn.push(Bytes::from_static(&HELLO_OK));
+        let charge = lr.charges.entry(token).or_default().clone();
         lr.devices.insert(
             peer,
             Device {
                 conn: conn.clone(),
                 token,
+                charge,
             },
         );
         lr.send_gateway(&FromRelay::Open { peer, token });
         Ok(peer)
     }
 
-    /// A device payload, forwarded to its gateway.
+    /// A device payload, forwarded to its gateway. Device data may fill only part of the
+    /// gateway's queue, and one token's data only a smaller part: beyond either the sending
+    /// device is closed (`SLOW_CONSUMER`), never the gateway, so devices cannot knock their room's
+    /// gateway offline and one token holder cannot get the others closed.
     fn device_message(&self, room: &Room, peer: PeerId, conn: &Conn, payload: &[u8]) {
         let mut live = lock(&self.live);
         let Some(lr) = live.get_mut(room) else {
             return;
         };
-        if lr.devices.get(&peer).is_some_and(|d| d.conn.id == conn.id) {
-            lr.send_gateway(&FromRelay::Data { peer, payload });
+        let Some(device) = lr.devices.get(&peer).filter(|d| d.conn.id == conn.id) else {
+            return;
+        };
+        let Some(gateway) = &lr.gateway else {
+            return;
+        };
+        let msg = FromRelay::Data { peer, payload }
+            .encode()
+            .expect("relay messages are within limits");
+        if let Err(busy) = gateway.push_within(
+            Bytes::from(msg),
+            GATEWAY_DATA_SHARE,
+            &device.charge,
+            TOKEN_DATA_SHARE,
+        ) {
+            let what = match busy {
+                Busy::Sender => "its token's queued data over its share",
+                Busy::Queue => "backlogged",
+            };
+            log::warn!(
+                "room {}: gateway #{} {what}, closing device {peer} ({})",
+                lr.id(),
+                gateway.id,
+                close::SLOW_CONSUMER
+            );
+            lr.remove_device(peer, Some(close::SLOW_CONSUMER));
         }
     }
 
@@ -423,6 +533,10 @@ impl Relay {
             }
             ToRelay::Tokens(set) => {
                 let tokens = lr.tokens.insert(set.into_iter().collect());
+                // Queued messages keep their charge alive; a re-added token starts afresh.
+                lr.charges.retain(|token, _| tokens.contains(token));
+                lr.token_admissions
+                    .retain(|token, _| tokens.contains(token));
                 let revoked: Vec<PeerId> = lr
                     .devices
                     .iter()
@@ -494,10 +608,11 @@ impl Relay {
     }
 }
 
-/// The address the per-IP limits key on: the socket peer, or with `--trust-forwarded-for` the
-/// last `X-Forwarded-For` hop (the one the trusted proxy appended).
+/// The address the per-IP limits key on and logs show: the socket peer, or for a trusted proxy's
+/// connection (`--trust-forwarded-for`, loopback or `--trusted-proxy`) the last `X-Forwarded-For`
+/// hop (the one the proxy appended). IPv4-mapped IPv6 is shown as IPv4.
 fn client_ip(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
-    if config.trust_forwarded_for
+    if config.trusts_proxy(peer.ip())
         && let Some(ip) = headers
             .get_all("x-forwarded-for")
             .iter()
@@ -506,9 +621,9 @@ fn client_ip(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
             .and_then(|v| v.rsplit(',').next())
             .and_then(|hop| hop.trim().parse::<IpAddr>().ok())
     {
-        return ip;
+        return canonical(ip);
     }
-    peer.ip()
+    canonical(peer.ip())
 }
 
 async fn gateway_ws(
@@ -540,7 +655,7 @@ fn upgrade(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let ip = client_ip(&relay.config, peer.addr, headers);
-    let Some(slot) = relay.limits.forwarded(ip) else {
+    let Some(slot) = relay.limits.upgrade(peer.addr.ip(), ip) else {
         log::warn!(
             "refusing {} connection from {ip}: too many connections",
             role.name()
@@ -728,17 +843,20 @@ async fn read_loop(
                 secret,
                 epoch,
             }),
-        ) => match relay.admit_gateway(conn, room, &secret, epoch) {
-            Ok(()) => {
-                log::info!(
-                    "room {}: gateway #{} from {ip} connected",
-                    relay::room_id(&room),
-                    conn.id
-                );
-                Registration::Gateway(room)
+        ) => {
+            relay.refresh_for(&room).await;
+            match relay.admit_gateway(conn, room, &secret, epoch) {
+                Ok(()) => {
+                    log::info!(
+                        "room {}: gateway #{} from {ip} connected",
+                        relay::room_id(&room),
+                        conn.id
+                    );
+                    Registration::Gateway(room)
+                }
+                Err(code) => return reject(code, &format!("room {}", relay::room_id(&room))),
             }
-            Err(code) => return reject(code, &format!("room {}", relay::room_id(&room))),
-        },
+        }
         (Role::Device, Ok(Hello::Device { room, token })) => {
             match relay.admit_device(conn, room, &token) {
                 Ok(peer) => {
@@ -846,6 +964,54 @@ async fn write_loop(config: &Config, conn: &Conn, sink: &mut SplitSink<WebSocket
 mod tests {
     use super::*;
     use tungstenite::error::{CapacityError, ProtocolError};
+
+    #[test]
+    fn forwarded_for_is_read_only_from_trusted_proxies() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.9, 198.51.100.4".parse().unwrap(),
+        );
+        let peer = |s: &str| SocketAddr::new(s.parse().unwrap(), 4000);
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let mut config = Config::new("x");
+        // Flag off: always the socket peer.
+        assert_eq!(
+            client_ip(&config, peer("127.0.0.1"), &headers),
+            ip("127.0.0.1")
+        );
+        config.trust_forwarded_for = true;
+        // Loopback proxies are trusted: the last hop.
+        assert_eq!(
+            client_ip(&config, peer("127.0.0.1"), &headers),
+            ip("198.51.100.4")
+        );
+        assert_eq!(
+            client_ip(&config, peer("::1"), &headers),
+            ip("198.51.100.4")
+        );
+        // Anyone else: the socket peer, mapped IPv4 shown as IPv4.
+        assert_eq!(
+            client_ip(&config, peer("::ffff:10.88.0.1"), &headers),
+            ip("10.88.0.1")
+        );
+        config.trusted_proxies = vec!["10.88.0.0/16".parse().unwrap()];
+        assert_eq!(
+            client_ip(&config, peer("::ffff:10.88.0.1"), &headers),
+            ip("198.51.100.4")
+        );
+        // A forwarded mapped address is folded too; an unparsable hop falls back to the peer.
+        headers.insert("x-forwarded-for", "::ffff:198.51.100.5".parse().unwrap());
+        assert_eq!(
+            client_ip(&config, peer("10.88.0.1"), &headers),
+            ip("198.51.100.5")
+        );
+        headers.insert("x-forwarded-for", "nonsense".parse().unwrap());
+        assert_eq!(
+            client_ip(&config, peer("10.88.0.1"), &headers),
+            ip("10.88.0.1")
+        );
+    }
 
     #[test]
     fn abrupt_disconnects_are_lost_connections_not_violations() {

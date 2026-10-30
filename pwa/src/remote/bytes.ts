@@ -3,7 +3,9 @@
 export type Bytes = Uint8Array<ArrayBuffer>;
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder('utf-8', { fatal: true });
+// `ignoreBOM`: a leading U+FEFF stays in the text (Rust's `from_utf8` keeps it too), so callers
+// refuse it rather than silently accepting different bytes.
+const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 export function utf8(text: string): Bytes {
   return encoder.encode(text);

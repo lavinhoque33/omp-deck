@@ -4,7 +4,9 @@
 // `reason`), snake_case, struct variants only; `None` is `null`.
 //
 // Gateway → device JSON (`Welcome`, `Reply`, `Event`, `TermEnd`) is validated at runtime:
-// unknown fields are ignored, wrong types and unknown variants refused. Device → gateway JSON
+// unknown fields are ignored, wrong types and unknown variants refused, except that an unknown
+// `Event` or transcript `Item` type decodes to `unknown_event` / `unknown_item` (a newer gateway's
+// additions are skipped, not fatal). Device → gateway JSON
 // (`Request`) is built here and serialized canonically (Rust field order, `null` for absent
 // optionals), so it is byte-identical to Rust's serialization.
 
@@ -403,7 +405,7 @@ export interface SessionSummary {
   id: string;
   title: string | null;
   first_prompt: string | null;
-  modified_ms: number;
+  modified_unix_ms: number;
 }
 
 /** A project without its sessions (see the `sessions` feed). */
@@ -434,7 +436,7 @@ export interface SwitchView {
 }
 
 export type Refusal = 'precondition' | 'dialog_open' | 'no_bracketed_paste';
-export type CancelReason = 'exited' | 'detached' | 'closing' | 'session_changed';
+export type CancelReason = 'exited' | 'detached' | 'closing' | 'session_changed' | 'not_allowed';
 
 /** How far a command got toward the terminal (tag `state`). */
 export type DeliveryView =
@@ -489,7 +491,7 @@ export interface InboxItem {
   title: string;
   project: string;
   body: string;
-  at_ms: number;
+  at_unix_ms: number;
   armed: boolean;
 }
 
@@ -522,17 +524,29 @@ export interface Card {
   context_tokens: number | null;
   input_tokens: number;
   output_tokens: number;
-  cost: number;
+  cost: number | null;
   last_reply: string | null;
   last_turn_failed: boolean;
   git: GitCounts | null;
   agents: AgentCounts;
 }
 
-/** A transcript item (tag `type`). */
+/**
+ * A transcript item of a type this client does not know (a newer gateway). It takes the
+ * item's place so `FeedValue.items` keeps its indices (`start + i`); render it as nothing or a
+ * placeholder. Its tag is not a gateway tag, so it never matches a real {@link Item} variant.
+ */
+export interface UnknownItem {
+  type: 'unknown_item';
+  /** The gateway's `type` string. */
+  name: string;
+}
+
+/** A transcript item (tag `type`), or an {@link UnknownItem}. */
 export type Item =
-  | { type: 'user'; text: string; from_agent: boolean; at_ms: number | null }
-  | { type: 'assistant'; text: string; model: string | null; at_ms: number | null }
+  | UnknownItem
+  | { type: 'user'; text: string; from_agent: boolean; at_unix_ms: number | null }
+  | { type: 'assistant'; text: string; model: string | null; at_unix_ms: number | null }
   | { type: 'thinking'; text: string }
   | { type: 'tool_call'; call_id: string; name: string; intent: string | null; summary: string; args: string }
   | { type: 'tool_result'; call_id: string; name: string; text: string; is_error: boolean; truncated: boolean }
@@ -673,8 +687,20 @@ export type Reply = { id: number; ok: Resp } | { id: number; err: ApiError };
 
 export type InputRefusal = 'not_allowed' | 'input_held' | 'exited' | 'read_only' | 'detached' | 'stale' | 'rejected';
 
-/** Something the device reacts to (tag `type`). */
+/**
+ * An event of a type this client does not know (a newer gateway), returned by `decodeEvent`
+ * instead of throwing so the session survives; ignore it. Its tag is not a gateway tag, so it
+ * never matches a real {@link Event} variant.
+ */
+export interface UnknownEvent {
+  type: 'unknown_event';
+  /** The gateway's `type` string. */
+  name: string;
+}
+
+/** Something the device reacts to (tag `type`), or an {@link UnknownEvent}. */
 export type Event =
+  | UnknownEvent
   | { type: 'feed'; feed: Feed; value: FeedValue }
   | { type: 'outcome'; seq: number; outcome: OutcomeView }
   | { type: 'progress'; seq: number; stage: string; done: number; total: number | null }
@@ -787,11 +813,22 @@ type Variants<U, Tag extends string> = {
   >;
 };
 
-function tagged<U, const Tag extends string>(tag: Tag, variants: Variants<U, Tag>): V<U> {
+/**
+ * A tagged union. `unknown` (with `X` the variant it builds) answers a tag string outside
+ * `variants` instead of throwing; a non-string tag still throws.
+ */
+function tagged<U, const Tag extends string, X extends U = never>(
+  tag: Tag,
+  variants: Variants<Exclude<U, X>, Tag>,
+  unknown?: (name: string) => X,
+): V<U> {
   const table: { [name: string]: { [key: string]: V<unknown> } } = variants;
   return (value, path) => {
     if (!isObject(value)) throw new ApiDecodeError(path, 'expected an object');
     const name = value[tag];
+    if (typeof name === 'string' && unknown !== undefined && !Object.hasOwn(table, name)) {
+      return unknown(name);
+    }
     if (typeof name !== 'string' || !Object.hasOwn(table, name)) {
       throw new ApiDecodeError(`${path}.${tag}`, `unknown variant ${JSON.stringify(name)}`);
     }
@@ -841,7 +878,7 @@ const sessionSummary = struct<SessionSummary>({
   id: str,
   title: nullable(str),
   first_prompt: nullable(str),
-  modified_ms: u64,
+  modified_unix_ms: u64,
 });
 const project = struct<Project>({
   id: str,
@@ -861,7 +898,7 @@ const delivery = tagged<DeliveryView, 'state'>('state', {
   declined: {},
   aborted: {},
   stalled: {},
-  cancelled: { reason: oneOf<CancelReason>(['exited', 'detached', 'closing', 'session_changed']) },
+  cancelled: { reason: oneOf<CancelReason>(['exited', 'detached', 'closing', 'session_changed', 'not_allowed']) },
   unobserved: {},
 });
 const ownRequest = struct<OwnRequest>({ request: u64, seq: u64, label: str, delivery });
@@ -896,7 +933,7 @@ const inboxItem = struct<InboxItem>({
   title: str,
   project: str,
   body: str,
-  at_ms: u64,
+  at_unix_ms: u64,
   armed: bool,
 });
 const inbox = struct<Inbox>({ entries: list(inboxItem), warns: bool, badge: nullable(str) });
@@ -916,25 +953,29 @@ const card = struct<Card>({
   context_tokens: nullable(u64),
   input_tokens: u64,
   output_tokens: u64,
-  cost: f64,
+  cost: nullable(f64),
   last_reply: nullable(str),
   last_turn_failed: bool,
   git: nullable(gitCounts),
   agents: agentCounts,
 });
-const item = tagged<Item, 'type'>('type', {
-  user: { text: str, from_agent: bool, at_ms: nullable(u64) },
-  assistant: { text: str, model: nullable(str), at_ms: nullable(u64) },
-  thinking: { text: str },
-  tool_call: { call_id: str, name: str, intent: nullable(str), summary: str, args: str },
-  tool_result: { call_id: str, name: str, text: str, is_error: bool, truncated: bool },
-  notice: { kind: str, text: str },
-  irc: { from: nullable(str), agent: nullable(str), text: str, note: nullable(str) },
-  compaction: { tokens_before: nullable(u64), tokens_after: nullable(u64), summary: str },
-  model_change: { model: str },
-  error: { message: str },
-  exit: { reason: str },
-});
+const item = tagged<Item, 'type', UnknownItem>(
+  'type',
+  {
+    user: { text: str, from_agent: bool, at_unix_ms: nullable(u64) },
+    assistant: { text: str, model: nullable(str), at_unix_ms: nullable(u64) },
+    thinking: { text: str },
+    tool_call: { call_id: str, name: str, intent: nullable(str), summary: str, args: str },
+    tool_result: { call_id: str, name: str, text: str, is_error: bool, truncated: bool },
+    notice: { kind: str, text: str },
+    irc: { from: nullable(str), agent: nullable(str), text: str, note: nullable(str) },
+    compaction: { tokens_before: nullable(u64), tokens_after: nullable(u64), summary: str },
+    model_change: { model: str },
+    error: { message: str },
+    exit: { reason: str },
+  },
+  (name) => ({ type: 'unknown_item', name }),
+);
 const changeKind = oneOf<ChangeKind>(['modified', 'added', 'deleted', 'renamed', 'copied', 'type_changed']);
 const changedFile = struct<ChangedFile>({
   path: str,
@@ -1047,16 +1088,20 @@ const inputRefusal = oneOf<InputRefusal>([
   'stale',
   'rejected',
 ]);
-const event = tagged<Event, 'type'>('type', {
-  feed: { feed, value: feedValue },
-  outcome: { seq: u64, outcome: outcomeView },
-  progress: { seq: u64, stage: str, done: u64, total: nullable(u64) },
-  confirm: { live: liveRef, request: u64, label: str, draft: str },
-  term_state: { view: u32, input_held: bool },
-  input_refused: { view: u32, reason: inputRefusal },
-  model_unconfirmed: { live: liveRef, selector: nullable(str), level: nullable(str) },
-  resync: {},
-});
+const event = tagged<Event, 'type', UnknownEvent>(
+  'type',
+  {
+    feed: { feed, value: feedValue },
+    outcome: { seq: u64, outcome: outcomeView },
+    progress: { seq: u64, stage: str, done: u64, total: nullable(u64) },
+    confirm: { live: liveRef, request: u64, label: str, draft: str },
+    term_state: { view: u32, input_held: bool },
+    input_refused: { view: u32, reason: inputRefusal },
+    model_unconfirmed: { live: liveRef, selector: nullable(str), level: nullable(str) },
+    resync: {},
+  },
+  (name) => ({ type: 'unknown_event', name }),
+);
 const termEnd = tagged<TermEnd, 'reason'>('reason', {
   exited: { code: nullable(i32) },
   closed: {},
@@ -1123,10 +1168,13 @@ function parse<T>(body: Uint8Array, check: V<T>, what: string): T {
   return check(value, what);
 }
 
-/** Decodes a WELCOME body; refuses a protocol version other than {@link PROTOCOL}. */
+/**
+ * Decodes a WELCOME body. The gateway speaks min(device `api`, its own protocol), so any
+ * version from 1 up to {@link PROTOCOL} is accepted; a higher (or 0) one is refused.
+ */
 export function decodeWelcome(body: Uint8Array): Welcome {
   const value = parse(body, welcome, 'welcome');
-  if (value.protocol !== PROTOCOL) {
+  if (value.protocol < 1 || value.protocol > PROTOCOL) {
     throw new ApiDecodeError('welcome.protocol', `unsupported protocol ${value.protocol}`);
   }
   return value;

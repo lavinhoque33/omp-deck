@@ -1,0 +1,12 @@
+# cargo-deny policy: CI's `audit` job runs `cargo deny check advisories` (RustSec database:
+# vulnerabilities, yanked versions, unmaintained direct dependencies). Accepted advisories are
+# listed in docs/notes/mobile-relay.md "R5 security review" with the reason they do not apply;
+# add an `ignore` entry here only together with that written acceptance.
+
+[graph]
+all-features = true
+
+[advisories]
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []

@@ -72,6 +72,16 @@ pub(super) struct DeviceConn {
     /// Device view id → engine view id.
     views: BTreeMap<u32, u64>,
     next_view: u32,
+    /// The application protocol this session speaks: `min(DeviceHello.api, api::PROTOCOL)`.
+    #[expect(
+        dead_code,
+        reason = "protocol 1 is the only one; a later protocol branches on it"
+    )]
+    protocol: u32,
+    /// What the device said it understands (`DeviceHello.features`): a gateway→device variant
+    /// added after v1 is sent only to devices that list its feature.
+    #[expect(dead_code, reason = "v1 has no feature-gated variants yet")]
+    features: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -94,7 +104,13 @@ struct Cursor {
 }
 
 impl DeviceConn {
-    fn new(out: Arc<DeviceOut>, permissions: Permissions, next_seq: u64) -> DeviceConn {
+    fn new(
+        out: Arc<DeviceOut>,
+        permissions: Permissions,
+        next_seq: u64,
+        protocol: u32,
+        features: BTreeSet<String>,
+    ) -> DeviceConn {
         DeviceConn {
             out,
             permissions,
@@ -103,6 +119,8 @@ impl DeviceConn {
             resubscribe: false,
             views: BTreeMap::new(),
             next_view: 1,
+            protocol,
+            features,
         }
     }
 
@@ -174,14 +192,6 @@ fn cut_chars(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((i, _)) => s[..i].to_owned(),
         None => s.to_owned(),
-    }
-}
-
-/// A message for a device: the home folder is never shown in full.
-fn scrub(text: &str) -> String {
-    match dirs::home_dir() {
-        Some(home) if !home.as_os_str().is_empty() => text.replace(&*home.to_string_lossy(), "~"),
-        _ => text.to_owned(),
     }
 }
 
@@ -258,7 +268,7 @@ fn summaries(g: &ProjectGroup, limit: u32) -> (u32, Vec<api::SessionSummary>) {
                 .first_prompt
                 .as_deref()
                 .map(|p| cut_chars(p, api::FIRST_PROMPT_CHARS)),
-            modified_ms: unix_ms(s.modified),
+            modified_unix_ms: unix_ms(s.modified),
         })
         .collect();
     (count(g.sessions.len()), list)
@@ -427,6 +437,7 @@ fn delivery(d: &Delivery) -> api::DeliveryView {
                 Cancel::Detached => api::CancelReason::Detached,
                 Cancel::Closing => api::CancelReason::Closing,
                 Cancel::SessionChanged => api::CancelReason::SessionChanged,
+                Cancel::NotAllowed => api::CancelReason::NotAllowed,
             },
         },
         Delivery::Unobserved => D::Unobserved {},
@@ -456,7 +467,7 @@ fn rejected(r: &Rejected) -> api::RejectedView {
 }
 
 /// A gateway error as a device sees it (messages without the home folder).
-fn api_error(e: &GatewayError) -> ApiError {
+fn api_error(canon: &Canon, e: &GatewayError) -> ApiError {
     match e {
         GatewayError::Maintenance(_) => ApiError::Maintenance {},
         GatewayError::StaleEpoch { .. } => ApiError::Stale { current: None },
@@ -472,11 +483,11 @@ fn api_error(e: &GatewayError) -> ApiError {
         GatewayError::NoSuchJob => ApiError::NotFound {
             what: "job".to_owned(),
         },
-        GatewayError::Refused(m) | GatewayError::Failed(m) => {
-            ApiError::Failed { message: scrub(m) }
-        }
+        GatewayError::Refused(m) | GatewayError::Failed(m) => ApiError::Failed {
+            message: canon.scrub(m),
+        },
         other => ApiError::Failed {
-            message: scrub(&other.to_string()),
+            message: canon.scrub(&other.to_string()),
         },
     }
 }
@@ -568,7 +579,7 @@ fn card(id: &str, s: &FleetSession) -> api::Card {
         context_tokens: s.context_tokens,
         input_tokens: s.input_tokens,
         output_tokens: s.output_tokens,
-        cost: s.cost,
+        cost: Some(s.cost).filter(|c| c.is_finite()),
         last_reply: s.last_reply.clone(),
         last_turn_failed: s.last_turn_failed,
         git: s.git.as_ref().map(|g| api::GitCounts {
@@ -607,11 +618,15 @@ fn changed_file(f: &ChangedFile) -> api::ChangedFile {
     }
 }
 
-fn changes_feed(feed: &Feed, value: &Result<Option<Changes>, String>) -> Option<Vec<u8>> {
+fn changes_feed(
+    canon: &Canon,
+    feed: &Feed,
+    value: &Result<Option<Changes>, String>,
+) -> Option<Vec<u8>> {
     match value {
         Err(e) => fit_feed::<api::ChangedFile>(feed, &[], |_, truncated| FeedValue::Changes {
             changes: None,
-            error: Some(scrub(e)),
+            error: Some(canon.scrub(e)),
             truncated,
         }),
         Ok(None) => fit_feed::<api::ChangedFile>(feed, &[], |_, truncated| FeedValue::Changes {
@@ -633,6 +648,46 @@ fn changes_feed(feed: &Feed, value: &Result<Option<Changes>, String>) -> Option<
     }
 }
 
+/// `path` (work-tree relative, `/`-separated) lies below the folder `prefix` (same form; empty:
+/// the root). On Windows the folder matches in any ASCII case.
+fn below_prefix(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    // The byte after the prefix is `/`, so the prefix ends on a character boundary.
+    if path.as_bytes().get(prefix.len()) != Some(&b'/') {
+        return false;
+    }
+    let head = &path[..prefix.len()];
+    if cfg!(windows) {
+        head.eq_ignore_ascii_case(prefix)
+    } else {
+        head == prefix
+    }
+}
+
+/// `changes` of the work tree around project folder `cwd`, cut to the files below that folder:
+/// a device never sees (or acts on) the rest of an enclosing work tree, such as a home folder
+/// kept in git. `None` until the folder's place in the tree is known.
+fn project_changes(canon: &Canon, cwd: &Path, changes: &Changes) -> Option<Changes> {
+    let rest = canon.below(cwd, &changes.root)?;
+    let prefix = rest
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(Changes {
+        root: changes.root.clone(),
+        branch: changes.branch.clone(),
+        files: changes
+            .files
+            .iter()
+            .filter(|f| below_prefix(&f.path, &prefix))
+            .cloned()
+            .collect(),
+    })
+}
+
 fn item(t: &TranscriptItem) -> api::Item {
     let c = |s: &str| cut(s, api::MAX_ITEM_TEXT);
     let at = |t: &Option<SystemTime>| t.map(unix_ms);
@@ -644,7 +699,7 @@ fn item(t: &TranscriptItem) -> api::Item {
         } => api::Item::User {
             text: c(text),
             from_agent: *from_agent,
-            at_ms: at(when),
+            at_unix_ms: at(when),
         },
         TranscriptItem::Assistant {
             text,
@@ -653,7 +708,7 @@ fn item(t: &TranscriptItem) -> api::Item {
         } => api::Item::Assistant {
             text: c(text),
             model: model.clone(),
-            at_ms: at(when),
+            at_unix_ms: at(when),
         },
         TranscriptItem::Thinking { text } => api::Item::Thinking { text: c(text) },
         TranscriptItem::ToolCall {
@@ -734,8 +789,8 @@ fn models(list: &[deck_core::omp::ModelInfo]) -> Vec<api::Model> {
             reasoning: m.reasoning,
             thinking: m.thinking.clone(),
             input: m.input.clone(),
-            cost_input: m.cost_input,
-            cost_output: m.cost_output,
+            cost_input: m.cost_input.filter(|c| c.is_finite()),
+            cost_output: m.cost_output.filter(|c| c.is_finite()),
         })
         .collect()
 }
@@ -806,21 +861,31 @@ fn api_permissions(p: Permissions) -> api::Permissions {
     }
 }
 
+/// The application protocol spoken with a device whose hello says it speaks up to `api`: the
+/// highest both sides do.
+fn negotiated_protocol(api: u64) -> u32 {
+    u32::try_from(api.min(u64::from(api::PROTOCOL))).unwrap_or(api::PROTOCOL)
+}
+
 // ---- engine -------------------------------------------------------------------------------------
 
 impl Engine {
     /// Opens the application session of device `id`: its link and queue, `WELCOME` first.
+    /// `api` and `features` are what its `DeviceHello` said it speaks.
     pub(super) fn open_device(
         &mut self,
         id: &str,
         name: String,
         permissions: Permissions,
+        api: u64,
+        features: Vec<String>,
         wake: Wake,
     ) -> (u64, Arc<DeviceOut>) {
         let out = DeviceOut::new(wake, self.waker.callback());
         let next_seq = self.journal.next_seq(id);
+        let protocol = negotiated_protocol(api);
         out.welcome(&api::Welcome {
-            protocol: api::PROTOCOL,
+            protocol,
             gateway_version: GATEWAY_VERSION.to_owned(),
             epoch: self.epoch.to_hex(),
             device: id.to_owned(),
@@ -828,6 +893,7 @@ impl Engine {
             permissions: api_permissions(permissions),
             next_seq,
             limits: api::Limits::default(),
+            // This gateway's feature names: none in protocol 1.
             features: Vec::new(),
         });
         let conn = next_id();
@@ -839,6 +905,8 @@ impl Engine {
                     out.clone(),
                     permissions,
                     next_seq,
+                    protocol,
+                    features.into_iter().collect(),
                 ))),
                 role: None,
                 client_id: id.to_owned(),
@@ -922,6 +990,12 @@ impl Engine {
         for c in self.conns.values_mut() {
             if let Sink::Device(d) = &mut c.sink {
                 d.topic_changed(&Topic::Sessions);
+                // A changes feed waits for its folder's place in the work tree.
+                for (feed, st) in &mut d.feeds {
+                    if matches!(feed, Feed::Changes { .. }) {
+                        st.dirty = true;
+                    }
+                }
             }
         }
     }
@@ -1135,15 +1209,16 @@ impl Engine {
                         kind: match &e.kind {
                             InboxKind::Finished => api::InboxKind::Finished {},
                             InboxKind::Error(message) => api::InboxKind::Error {
-                                message: message.as_deref().map(scrub),
+                                message: message.as_deref().map(|m| self.devices.canon.scrub(m)),
                             },
                             InboxKind::Attention => api::InboxKind::Attention {},
                             InboxKind::Exited { code } => api::InboxKind::Exited { code: *code },
                         },
                         title: e.title.clone(),
                         project: e.project.clone(),
-                        body: e.body.clone(),
-                        at_ms: e.at_unix_ms,
+                        // omp's own words: an error's body quotes paths too.
+                        body: self.devices.canon.scrub(&e.body),
+                        at_unix_ms: e.at_unix_ms,
                         armed: e.armed,
                     })
                     .collect();
@@ -1181,12 +1256,29 @@ impl Engine {
                 return;
             }
             Feed::Changes { .. } => {
-                let Some(value) = st.path.as_deref().and_then(|p| self.changes_of(p)) else {
+                let Some((cwd, value)) = st
+                    .path
+                    .as_deref()
+                    .and_then(|p| Some((p, self.changes_of(p)?)))
+                else {
                     // Listed on a worker; its result marks the feed again.
                     st.dirty = false;
                     return;
                 };
-                changes_feed(feed, value)
+                let value = match value {
+                    Ok(Some(c)) => match project_changes(&self.devices.canon, cwd, c) {
+                        Some(c) => Ok(Some(c)),
+                        // Its place in the tree is resolved off this thread; the result marks
+                        // the feed again.
+                        None => {
+                            st.dirty = false;
+                            return;
+                        }
+                    },
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e.clone()),
+                };
+                changes_feed(&self.devices.canon, feed, &value)
             }
         };
         st.dirty = false;
@@ -1285,6 +1377,8 @@ impl Engine {
                 credit: _credit,
             } => {
                 if self.may_type(conn, view) {
+                    // Bounded on the link already; a device never sizes a terminal past it.
+                    let (cols, rows) = crate::gateway::remote::device::device_size(cols, rows);
                     self.on_view_op(view, ViewOp::Resize(cols, rows, cell_width, cell_height));
                 }
             }
@@ -1387,6 +1481,15 @@ impl Engine {
                     let Some(file) = files.pop() else {
                         return self.device_answer(conn, id, Err(not_found("changed file")));
                     };
+                    // An untracked folder's diff reads every file below it: a device asks for
+                    // listed files only.
+                    if file.is_dir {
+                        return self.device_answer(
+                            conn,
+                            id,
+                            Err(bad("an untracked folder has no diff on a device")),
+                        );
+                    }
                     let side = match side {
                         api::DiffSide::Staged => DiffSide::Staged,
                         api::DiffSide::Unstaged => DiffSide::Unstaged,
@@ -1562,10 +1665,16 @@ impl Engine {
         let changes = match self.changes_of(&cwd) {
             None => return Err(bad("subscribe to the project's changes first")),
             Some(Err(e)) => {
-                return Err(ApiError::Failed { message: scrub(e) });
+                return Err(ApiError::Failed {
+                    message: self.devices.canon.scrub(e),
+                });
             }
             Some(Ok(None)) => return Err(bad("the project is not a git work tree")),
             Some(Ok(Some(c))) => c,
+        };
+        // Only what the project folder's own feed lists.
+        let Some(changes) = project_changes(&self.devices.canon, &cwd, changes) else {
+            return Err(bad("the project's changes are still being listed"));
         };
         if files.is_empty() {
             return Err(bad("no files"));
@@ -1581,7 +1690,7 @@ impl Engine {
                     .ok_or_else(|| not_found("changed file"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((changes.root.clone(), list))
+        Ok((changes.root, list))
     }
 
     /// Backend sessions holding `path` open.
@@ -1760,7 +1869,9 @@ impl Engine {
             Outcome::Done(d) => O::Done {
                 result: self.done_view(d),
             },
-            Outcome::Failed(m) => O::Failed { message: scrub(m) },
+            Outcome::Failed(m) => O::Failed {
+                message: self.devices.canon.scrub(m),
+            },
             Outcome::Rejected(r) => O::Rejected {
                 reason: rejected(r),
             },
@@ -1783,7 +1894,7 @@ impl Engine {
                     .iter()
                     .map(|(path, error)| api::SessionResult {
                         session: self.session_of(path).unwrap_or_default(),
-                        error: error.as_deref().map(scrub),
+                        error: error.as_deref().map(|e| self.devices.canon.scrub(e)),
                     })
                     .collect(),
             },
@@ -1810,7 +1921,7 @@ impl Engine {
             Ok(Answer::Models(list)) => models_reply(&list),
             Ok(Answer::Diff(d)) => ReplyResult::Ok(Resp::Diff { diff: diff(&d) }),
             Ok(_) => ReplyResult::Ok(Resp::Unit {}),
-            Err(e) => ReplyResult::Err(api_error(&e)),
+            Err(e) => ReplyResult::Err(api_error(&self.devices.canon, &e)),
         }
     }
 
@@ -2096,6 +2207,60 @@ mod tests {
         assert_eq!(s.project, Some(project_id(Path::new("/srv/beta"))));
     }
 
+    #[test]
+    fn a_folder_prefix_matches_whole_components_only() {
+        assert!(below_prefix("app/src/main.rs", "app"));
+        assert!(below_prefix("app/src/main.rs", "app/src"));
+        assert!(
+            below_prefix("app/", "app"),
+            "an untracked folder that is the project"
+        );
+        assert!(below_prefix("anything", ""));
+        assert!(!below_prefix("apple/x", "app"));
+        assert!(!below_prefix("app", "app"));
+        assert!(!below_prefix("ap", "app"));
+        assert!(!below_prefix("other/app/x", "app"));
+        assert!(!below_prefix("é/x", "e"));
+        assert_eq!(below_prefix("App/x", "app"), cfg!(windows));
+    }
+
+    #[test]
+    fn a_device_sees_only_the_changes_below_its_project_folder() {
+        let file = |path: &str| ChangedFile {
+            path: path.to_owned(),
+            os_path: path.into(),
+            orig_path: None,
+            staged: None,
+            unstaged: Some(deck_core::changes::Change::Modified),
+            untracked: false,
+            conflicted: false,
+            is_dir: false,
+        };
+        let tree = Changes {
+            root: PathBuf::from("/home/u"),
+            branch: Some("main".into()),
+            files: vec![
+                file(".ssh/config"),
+                file("work/app/src/lib.rs"),
+                file("work/apple/x"),
+                file("work/app/README.md"),
+            ],
+        };
+        let canon = Canon::default();
+        let cut = project_changes(&canon, Path::new("/home/u/work/app"), &tree).expect("below");
+        let paths: Vec<&str> = cut.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["work/app/src/lib.rs", "work/app/README.md"]);
+        assert_eq!(
+            (cut.root, cut.branch),
+            (tree.root.clone(), tree.branch.clone())
+        );
+        // The project at the work-tree root sees all of it.
+        let all = project_changes(&canon, Path::new("/home/u"), &tree).expect("root");
+        assert_eq!(all.files, tree.files);
+        // A folder whose place in the tree is not known yet sees nothing.
+        assert!(project_changes(&canon, Path::new("/srv/elsewhere"), &tree).is_none());
+    }
+
     /// Resolves what the projections asked for, as the engine's worker does.
     #[cfg(unix)]
     fn resolve_wanted(canon: &mut Canon) {
@@ -2175,5 +2340,25 @@ mod tests {
             removed: 0,
         });
         assert!(d.truncated && d.text.len() <= api::MAX_DIFF_TEXT);
+    }
+
+    #[test]
+    fn non_finite_costs_project_to_null() {
+        let fleet = |cost| FleetSession {
+            cost,
+            ..Default::default()
+        };
+        assert_eq!(card("s", &fleet(0.25)).cost, Some(0.25));
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(card("s", &fleet(bad)).cost, None);
+        }
+        let model = |cost: f64| deck_core::omp::ModelInfo {
+            cost_input: Some(cost),
+            cost_output: Some(cost),
+            ..Default::default()
+        };
+        let m = models(&[model(3.0), model(f64::NAN), model(f64::INFINITY)]);
+        let costs: Vec<_> = m.iter().map(|m| (m.cost_input, m.cost_output)).collect();
+        assert_eq!(costs, [(Some(3.0), Some(3.0)), (None, None), (None, None)]);
     }
 }

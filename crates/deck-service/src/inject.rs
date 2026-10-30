@@ -405,6 +405,24 @@ impl Injector {
         self.active.is_none()
     }
 
+    /// Drops the jobs `ids` that have not put a byte into the PTY yet (queued, or running and
+    /// unwritten, such as one waiting for a draft confirmation). True when any was dropped; a
+    /// running job that already wrote is left to finish.
+    pub fn drop_unwritten(&mut self, ids: &[JobId]) -> bool {
+        let before = self.queue.len();
+        self.queue.retain(|(id, _)| !ids.contains(id));
+        let mut dropped = self.queue.len() != before;
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|a| !a.wrote && ids.contains(&a.id))
+        {
+            self.active = None;
+            dropped = true;
+        }
+        dropped
+    }
+
     /// Tab closing: true once nothing is left to send, no job is mid-way and the last written byte
     /// is at least [`HOLD_TAIL`] old (the terminal needs that long to deliver it before detaching).
     pub fn can_close(&mut self, now: Instant) -> bool {

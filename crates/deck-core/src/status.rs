@@ -886,8 +886,11 @@ pub fn git_info(cwd: &Path) -> Option<GitInfo> {
 
 pub(crate) fn git_info_cancellable(cwd: &Path, cancel: Option<&AtomicBool>) -> Option<GitInfo> {
     let mut cmd = Command::new("git");
-    // --no-optional-locks: never contend with omp's own git tools for the index lock.
-    cmd.args(["--no-optional-locks", "-C"])
+    // --no-optional-locks: never contend with omp's own git tools for the index lock;
+    // core.fsmonitor=false: never run a program the repository's config names.
+    cmd.arg("--no-optional-locks")
+        .args(crate::git::NO_FSMONITOR)
+        .arg("-C")
         .arg(cwd)
         .args(["status", "--porcelain=v2", "--branch", "-unormal"])
         .env("LC_ALL", "C")
@@ -941,12 +944,11 @@ pub fn parse_git_status_v2(out: &str) -> Option<GitInfo> {
 /// Default branch of the repo at `cwd` from `refs/remotes/origin/HEAD`, if known.
 fn default_branch(cwd: &Path, cancel: &AtomicBool) -> Option<String> {
     let mut cmd = Command::new("git");
-    cmd.args(["--no-optional-locks", "-C"]).arg(cwd).args([
-        "symbolic-ref",
-        "--short",
-        "-q",
-        "refs/remotes/origin/HEAD",
-    ]);
+    cmd.arg("--no-optional-locks")
+        .args(crate::git::NO_FSMONITOR)
+        .arg("-C")
+        .arg(cwd)
+        .args(["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"]);
     let out = run_capture(cmd, GIT_TIMEOUT, Some(cancel))?;
     let name = String::from_utf8_lossy(&out).trim().to_owned();
     let name = name.strip_prefix("origin/").unwrap_or(&name);

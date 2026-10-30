@@ -1,7 +1,8 @@
 //! Per-connection outbound queue and inbound rate limits.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::body::Bytes;
@@ -19,16 +20,62 @@ pub(crate) struct Conn {
 }
 
 struct Outbox {
-    queue: VecDeque<Bytes>,
+    /// Each message with the charge of the sender it is queued for (released when it leaves).
+    queue: VecDeque<(Bytes, Option<Charged>)>,
     bytes: usize,
     max_messages: usize,
     max_bytes: usize,
     close: Option<u16>,
 }
 
+/// What one sender (a device token) has queued on connections (messages, bytes), so one sender's
+/// backlog is bounded on its own, not only together with everyone else's.
+#[derive(Default, Debug)]
+pub(crate) struct Charge {
+    messages: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+impl Charge {
+    pub fn queued(&self) -> (usize, usize) {
+        (
+            self.messages.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// One queued message's share of a [`Charge`], released on drop (written, cleared, or the
+/// connection dropped).
+struct Charged {
+    charge: Arc<Charge>,
+    len: usize,
+}
+
+impl Drop for Charged {
+    fn drop(&mut self) {
+        self.charge.messages.fetch_sub(1, Ordering::Relaxed);
+        self.charge.bytes.fetch_sub(self.len, Ordering::Relaxed);
+    }
+}
+
 /// The queue overflowed; the connection is now closing with `SLOW_CONSUMER`.
 #[derive(Debug)]
 pub(crate) struct Overflow;
+
+/// [`Conn::push_within`] refused a message (the connection stays open).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Busy {
+    /// The queue as a whole is above its share for such messages.
+    Queue,
+    /// The sender's own queued messages are above its share.
+    Sender,
+}
+
+/// `share` (numerator, denominator) of `n`, rounded down.
+fn part(n: usize, (num, den): (usize, usize)) -> usize {
+    n / den * num + n % den * num / den
+}
 
 pub(crate) enum Next {
     Data(Bytes),
@@ -69,7 +116,49 @@ impl Conn {
             return Err(Overflow);
         }
         s.bytes += msg.len();
-        s.queue.push_back(msg);
+        s.queue.push_back((msg, None));
+        drop(s);
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    /// Queues `msg` for the sender charged with `charge`, only while the whole queue stays within
+    /// `queue_share` and the sender's queued messages within `sender_share` of the bounds (numerator,
+    /// denominator), keeping the rest for other messages. Refusing does not close the connection;
+    /// a closing connection drops `msg` silently.
+    pub fn push_within(
+        &self,
+        msg: Bytes,
+        queue_share: (usize, usize),
+        charge: &Arc<Charge>,
+        sender_share: (usize, usize),
+    ) -> Result<(), Busy> {
+        let mut s = self.lock();
+        if s.close.is_some() {
+            return Ok(());
+        }
+        let len = msg.len();
+        let (messages, bytes) = charge.queued();
+        if messages >= part(s.max_messages, sender_share)
+            || bytes + len > part(s.max_bytes, sender_share)
+        {
+            return Err(Busy::Sender);
+        }
+        if s.queue.len() >= part(s.max_messages, queue_share)
+            || s.bytes + len > part(s.max_bytes, queue_share)
+        {
+            return Err(Busy::Queue);
+        }
+        charge.messages.fetch_add(1, Ordering::Relaxed);
+        charge.bytes.fetch_add(len, Ordering::Relaxed);
+        s.bytes += len;
+        s.queue.push_back((
+            msg,
+            Some(Charged {
+                charge: charge.clone(),
+                len,
+            }),
+        ));
         drop(s);
         self.wake.notify_one();
         Ok(())
@@ -100,8 +189,10 @@ impl Conn {
         loop {
             {
                 let mut s = self.lock();
-                if let Some(msg) = s.queue.pop_front() {
+                if let Some((msg, charged)) = s.queue.pop_front() {
                     s.bytes -= msg.len();
+                    // Handed to the writer: the sender's charge is released.
+                    drop(charged);
                     return Next::Data(msg);
                 }
                 if let Some(code) = s.close {
@@ -225,5 +316,77 @@ mod tests {
         let c = Conn::new(2, 8, 10);
         c.push(Bytes::from_static(b"123456")).unwrap();
         assert!(c.push(Bytes::from_static(b"12345")).is_err(), "byte bound");
+    }
+
+    #[test]
+    fn push_within_keeps_headroom_without_closing() {
+        let all = (1, 1);
+        let c = Conn::new(1, 8, 100);
+        let a = Arc::new(Charge::default());
+        for _ in 0..6 {
+            c.push_within(Bytes::from_static(b"1"), (3, 4), &a, all)
+                .unwrap();
+        }
+        assert_eq!(
+            c.push_within(Bytes::from_static(b"1"), (3, 4), &a, all),
+            Err(Busy::Queue)
+        );
+        assert_eq!(c.close_code(), None, "refusing does not close");
+        // The headroom is left for ordinary pushes.
+        c.push(Bytes::from_static(b"1")).unwrap();
+        c.push(Bytes::from_static(b"1")).unwrap();
+        assert_eq!(c.close_code(), None);
+        let c = Conn::new(2, 100, 100);
+        c.push_within(Bytes::from(vec![0; 70]), (3, 4), &a, all)
+            .unwrap();
+        assert_eq!(
+            c.push_within(Bytes::from(vec![0; 6]), (3, 4), &a, all),
+            Err(Busy::Queue),
+            "byte bound"
+        );
+        c.push_within(Bytes::from(vec![0; 5]), (3, 4), &a, all)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn each_sender_is_bounded_by_its_own_charge_until_its_messages_are_written() {
+        let c = Conn::new(1, 8, 1000);
+        let (flood, calm) = (Arc::new(Charge::default()), Arc::new(Charge::default()));
+        for _ in 0..2 {
+            c.push_within(Bytes::from_static(b"f"), (3, 4), &flood, (1, 4))
+                .unwrap();
+        }
+        assert_eq!(
+            c.push_within(Bytes::from_static(b"f"), (3, 4), &flood, (1, 4)),
+            Err(Busy::Sender)
+        );
+        // Another sender still has its own share.
+        c.push_within(Bytes::from_static(b"c"), (3, 4), &calm, (1, 4))
+            .unwrap();
+        assert_eq!(flood.queued(), (2, 2));
+        // Written messages release their sender's charge.
+        assert!(matches!(c.next().await, Next::Data(b) if b == "f"));
+        assert_eq!(flood.queued(), (1, 1));
+        c.push_within(Bytes::from_static(b"f"), (3, 4), &flood, (1, 4))
+            .unwrap();
+        // So do messages dropped with the queue (a slow consumer).
+        c.close(close::SLOW_CONSUMER);
+        assert_eq!(flood.queued(), (0, 0));
+        assert_eq!(calm.queued(), (0, 0));
+        // Byte share: 1000 / 4.
+        let c = Conn::new(2, 100, 1000);
+        let big = Arc::new(Charge::default());
+        c.push_within(Bytes::from(vec![0; 200]), (3, 4), &big, (1, 4))
+            .unwrap();
+        assert_eq!(
+            c.push_within(Bytes::from(vec![0; 51]), (3, 4), &big, (1, 4)),
+            Err(Busy::Sender)
+        );
+        drop(c);
+        assert_eq!(
+            big.queued(),
+            (0, 0),
+            "a dropped connection releases charges"
+        );
     }
 }

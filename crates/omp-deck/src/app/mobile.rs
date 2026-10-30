@@ -31,6 +31,16 @@ use crate::widgets::{setting_row, toggle};
 /// Key column of the dialogs' key/value rows.
 const KEY_W: f32 = 92.0;
 
+/// Permission explanations shared by the approval dialog and the device editor. Control is
+/// arbitrary code execution as the desktop user (omp's `!` shell, terminal typing); say so.
+const VIEW_TEXT: &str =
+    "Always allowed: every session's transcript, terminal output and uncommitted changes.";
+const CONTROL_TEXT: &str = "Full remote control of this computer as your account: prompts and \
+                            terminal typing can run any command. Allow only on a phone you trust \
+                            as much as this computer.";
+const MANAGE_TEXT: &str = "Also delete, copy and move sessions and discard git changes without \
+                           the terminal (Control can already do this through prompts).";
+
 /// Trims `s` where it is: its contents are never copied, so nothing is left behind in freed
 /// memory (the buffer is wiped when the resulting [`SecretText`] drops).
 fn trim_in_place(mut s: String) -> String {
@@ -563,31 +573,15 @@ impl App {
                         );
                         ui.add_space(8.0);
                         card::section(ui, "Permissions");
-                        setting_row(
-                            ui,
-                            "View",
-                            "Always allowed: sessions, status and output.",
-                            |ui| {
-                                badge::show(ui, None, "always", Hue::Blue, 11.0);
-                            },
-                        );
-                        setting_row(
-                            ui,
-                            "Control",
-                            "Send prompts and commands, type into terminals, stop work.",
-                            |ui| {
-                                toggle(ui, &mut approve.control);
-                            },
-                        );
-                        setting_row(
-                            ui,
-                            "Manage",
-                            "Also copy, move and delete files, discard git changes, restore \
-                             backups and change omp's configuration.",
-                            |ui| {
-                                toggle(ui, &mut approve.manage);
-                            },
-                        );
+                        setting_row(ui, "View", VIEW_TEXT, |ui| {
+                            badge::show(ui, None, "always", Hue::Blue, 11.0);
+                        });
+                        setting_row(ui, "Control", CONTROL_TEXT, |ui| {
+                            toggle(ui, &mut approve.control);
+                        });
+                        setting_row(ui, "Manage", MANAGE_TEXT, |ui| {
+                            toggle(ui, &mut approve.manage);
+                        });
                     },
                 );
                 match answer {
@@ -831,35 +825,19 @@ impl App {
                 });
                 card::kv(ui, KEY_W, "Allowed", |ui| permission_badges(ui, f.perms));
                 ui.add_space(6.0);
-                setting_row(
-                    ui,
-                    "View",
-                    "Always allowed: sessions, status and output.",
-                    |ui| {
-                        badge::show(ui, None, "always", Hue::Blue, 11.0);
-                    },
-                );
-                setting_row(
-                    ui,
-                    "Control",
-                    "Send prompts and commands, type into terminals, stop work.",
-                    |ui| {
-                        if toggle(ui, &mut f.perms.control).changed() {
-                            f.error = None;
-                        }
-                    },
-                );
-                setting_row(
-                    ui,
-                    "Manage",
-                    "Also copy, move and delete files, discard git changes, restore backups and \
-                     change omp's configuration.",
-                    |ui| {
-                        if toggle(ui, &mut f.perms.manage).changed() {
-                            f.error = None;
-                        }
-                    },
-                );
+                setting_row(ui, "View", VIEW_TEXT, |ui| {
+                    badge::show(ui, None, "always", Hue::Blue, 11.0);
+                });
+                setting_row(ui, "Control", CONTROL_TEXT, |ui| {
+                    if toggle(ui, &mut f.perms.control).changed() {
+                        f.error = None;
+                    }
+                });
+                setting_row(ui, "Manage", MANAGE_TEXT, |ui| {
+                    if toggle(ui, &mut f.perms.manage).changed() {
+                        f.error = None;
+                    }
+                });
                 if let Some(e) = &f.error {
                     ui.add_space(6.0);
                     ui.add(Label::new(RichText::new(e).small().color(pal.danger)).wrap());

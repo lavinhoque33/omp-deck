@@ -358,6 +358,9 @@ pub enum Cancel {
     Closing,
     /// Another session file took over this session before the request started.
     SessionChanged,
+    /// The client lost the right to send it (a paired device revoked, or its `control`
+    /// lowered) before its first byte.
+    NotAllowed,
 }
 
 /// How far a request got toward the terminal.
@@ -1057,6 +1060,26 @@ impl SessionController {
         self.sweep(why);
         self.pending_switch = None;
         self.settle_switch(Runtime::Abandoned);
+    }
+
+    /// Client `client` may no longer send commands: its requests that have not written a byte
+    /// yet (queued, or waiting for a draft confirmation) are cancelled. One already writing
+    /// finishes. True when any was cancelled.
+    pub fn cancel_client(&mut self, client: &str) -> bool {
+        let ids: Vec<JobId> = self
+            .history
+            .iter()
+            .filter(|r| r.key.client == client && !r.delivery.is_final())
+            .map(|r| JobId(r.id.0))
+            .collect();
+        if ids.is_empty() || !self.injector.drop_unwritten(&ids) {
+            return false;
+        }
+        if self.awaiting.is_some_and(|a| ids.contains(&a)) {
+            self.awaiting = None;
+        }
+        self.sweep(Cancel::NotAllowed);
+        true
     }
 
     fn settle_switch(&mut self, verdict: Runtime) {
@@ -1956,6 +1979,70 @@ mod tests {
         let omp = fake.omp();
         assert_eq!(omp.draft, "half typed", "the new draft was not cleared");
         assert!(omp.input.is_empty(), "nothing was typed");
+    }
+
+    #[test]
+    fn a_client_losing_its_rights_has_its_unwritten_requests_cancelled_and_no_one_elses() {
+        let (mut ctl, fake) = controller("half typed", None);
+        let phone = |ctl: &SessionController, seq: u64, command: Command| Submission {
+            key: RequestKey {
+                client: "d-phone".to_owned(),
+                seq,
+            },
+            ..submission(ctl, seq, command)
+        };
+        // The phone's command waits for a decision on the desktop draft; another of its
+        // commands and one of the desktop's queue behind it.
+        let waiting = ctl
+            .submit(phone(&ctl, 1, Command::Action(Action::AutoName)))
+            .expect("accepted")
+            .id;
+        let queued = ctl
+            .submit(phone(&ctl, 2, Command::Action(Action::AutoName)))
+            .expect("accepted")
+            .id;
+        let desktop = ctl
+            .submit(submission(&ctl, 3, Command::Action(Action::AutoName)))
+            .expect("accepted")
+            .id;
+        run(&mut ctl, |_, ev| {
+            ev.iter()
+                .any(|e| matches!(e, ControllerEvent::Confirm { id, .. } if *id == waiting))
+        });
+        assert!(!ctl.cancel_client("someone-else"));
+        assert!(ctl.cancel_client("d-phone"));
+        for id in [waiting, queued] {
+            assert_eq!(
+                ctl.request(id).map(|r| r.delivery.clone()),
+                Some(Delivery::Cancelled(Cancel::NotAllowed))
+            );
+        }
+        let events = ctl.drive(Instant::now()).events;
+        let ended: Vec<RequestId> = events
+            .iter()
+            .filter_map(|e| match e {
+                ControllerEvent::Ended {
+                    id,
+                    delivery: Delivery::Cancelled(Cancel::NotAllowed),
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ended, [waiting, queued]);
+        // The phone's draft question is gone and nothing of its was typed; the desktop's own
+        // command now asks about the draft itself.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ControllerEvent::Confirm { id, .. } if *id == desktop)),
+            "{events:?}"
+        );
+        assert!(!ctl.answer(&ctl.target().clone(), waiting, true));
+        let omp = fake.omp();
+        assert_eq!(omp.draft, "half typed");
+        assert!(omp.input.is_empty(), "nothing was typed");
+        assert!(!ctl.cancel_client("d-phone"), "nothing of it is left");
     }
 
     #[test]

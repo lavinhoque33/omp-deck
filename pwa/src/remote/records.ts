@@ -68,8 +68,12 @@ const KIND_BY_NAME: Readonly<{ [K in RecordKindName]: number }> = {
   t_end: KIND.T_END,
 };
 
-const DEVICE_KINDS: ReadonlySet<number> = new Set([KIND.REQUEST, KIND.ACK, KIND.INPUT, KIND.RESIZE]);
-const GATEWAY_KINDS: ReadonlySet<number> = new Set([
+/** The kind partition: device kinds `0x01..=0x0f`, gateway kinds `0x10..=0x7f`, the rest reserved. */
+const DEVICE_KINDS = { first: 0x01, last: 0x0f } as const;
+const GATEWAY_KINDS = { first: 0x10, last: 0x7f } as const;
+
+const KNOWN_DEVICE_KINDS: ReadonlySet<number> = new Set([KIND.REQUEST, KIND.ACK, KIND.INPUT, KIND.RESIZE]);
+const KNOWN_GATEWAY_KINDS: ReadonlySet<number> = new Set([
   KIND.WELCOME,
   KIND.REPLY,
   KIND.EVENT,
@@ -213,10 +217,13 @@ export function encodeRecords(records: readonly AppRecord[]): Bytes {
 function decodeOne(kind: number, body: Bytes, origin: Origin): AppRecord | null {
   const mine = origin === 'device' ? DEVICE_KINDS : GATEWAY_KINDS;
   const theirs = origin === 'device' ? GATEWAY_KINDS : DEVICE_KINDS;
-  if (theirs.has(kind)) {
+  const known = origin === 'device' ? KNOWN_DEVICE_KINDS : KNOWN_GATEWAY_KINDS;
+  if (kind >= theirs.first && kind <= theirs.last) {
     throw new RecordError('wrong_direction', `record kind ${hexKind(kind)} is not sent by this side`);
   }
-  if (!mine.has(kind)) {
+  // `0x00` and `0x80..=0xff` are reserved.
+  if (kind < mine.first || kind > mine.last) throw new RecordError('unknown_kind', `reserved record kind ${hexKind(kind)}`);
+  if (!known.has(kind)) {
     if (origin === 'gateway') return null;
     throw new RecordError('unknown_kind', `unknown record kind ${hexKind(kind)}`);
   }

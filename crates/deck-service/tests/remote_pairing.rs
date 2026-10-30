@@ -394,6 +394,8 @@ fn hello(name: &str, ts: u64) -> DeviceHello {
         name: name.into(),
         platform: "test".into(),
         ts,
+        api: 1,
+        features: Vec::new(),
     }
 }
 

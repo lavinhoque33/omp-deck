@@ -1,0 +1,3 @@
+# Protocol v1 vectors are hashed byte-for-byte (crates/deck-remote/tests/wire_freeze.rs): never let a
+# checkout rewrite their line endings.
+crates/deck-remote/tests/vectors/** -text

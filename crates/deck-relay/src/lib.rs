@@ -4,6 +4,7 @@
 
 mod config;
 mod conn;
+mod logging;
 pub mod rooms;
 mod server;
 mod tls;
@@ -11,7 +12,8 @@ mod transport;
 
 use std::path::PathBuf;
 
-pub use config::{Config, RateLimit};
+pub use config::{AdmissionRate, Config, ProxyRange, RateLimit};
+pub use logging::init_logging;
 pub use server::serve;
 pub use tls::load_tls;
 

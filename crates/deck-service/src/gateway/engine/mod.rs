@@ -496,7 +496,8 @@ impl Engine {
         let notify = notify::Notify::new(wake.clone());
         let manifest = state_dir.join(sessions::MANIFEST);
         let omp_found = omp.is_some();
-        let mobile = remote::Mobile::open(&state_dir);
+        // Creates (and protects) the secrets dir; a failure only disables mobile access.
+        let mobile = remote::Mobile::open(&profile.secrets_dir());
         let mut engine = Engine {
             profile,
             context: Arc::new(context),
@@ -739,6 +740,13 @@ impl Engine {
             return Err(Refusal::ProfileMismatch {
                 served: self.profile.clone(),
             });
+        }
+        // Paired devices' work, outcomes and confirmations are keyed by their `d-…` ids: a
+        // local link may never claim one.
+        if remote::is_device_id(&hello.client_id) {
+            return Err(Refusal::NotAllowed(
+                "client ids starting with \"d-\" belong to paired devices".to_owned(),
+            ));
         }
         // The CLI drains over its link and the supervisor watches the owner through the
         // barrier; only a GUI is turned away.

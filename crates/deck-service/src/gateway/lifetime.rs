@@ -1508,7 +1508,7 @@ struct FileLog {
 
 impl log::Log for FileLog {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= self.level.min(target_cap(metadata.target()))
+        metadata.level() <= self.level
     }
 
     fn log(&self, record: &log::Record) {
@@ -1564,11 +1564,11 @@ pub fn init_file_log(path: &Path) -> io::Result<()> {
     let file = options.open(path)?;
     let len = file.metadata()?.len();
     let level = log_level(log::LevelFilter::Info);
-    static LOGGER: std::sync::OnceLock<FileLog> = std::sync::OnceLock::new();
-    let mut fresh = Some(FileLog {
+    static LOGGER: std::sync::OnceLock<WireCap<FileLog>> = std::sync::OnceLock::new();
+    let mut fresh = Some(WireCap(FileLog {
         file: Mutex::new((file, len)),
         level,
-    });
+    }));
     let logger = LOGGER.get_or_init(|| fresh.take().expect("initialized once"));
     if fresh.is_some() {
         return Err(io::Error::other("the gateway log is already initialized"));
@@ -1580,18 +1580,22 @@ pub fn init_file_log(path: &Path) -> io::Result<()> {
 
 /// Logs of a foreground command to stderr (`warn` unless [`LOG_ENV`] says otherwise).
 pub fn init_stderr_log() {
-    let mut builder =
-        env_logger::Builder::from_env(env_logger::Env::default().filter_or(LOG_ENV, "warn"));
-    for target in WIRE_TARGETS {
-        builder.filter_module(target, log::LevelFilter::Info);
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::default().filter_or(LOG_ENV, "warn"))
+            .build();
+    let max = logger.filter();
+    if log::set_boxed_logger(Box::new(WireCap(logger))).is_ok() {
+        log::set_max_level(max);
     }
-    let _ = builder.try_init();
 }
 
 /// Crates whose debug/trace output dumps raw wire bytes (the relay hello carries the room
 /// secret, device payloads the tokens): never below `info`, whatever [`LOG_ENV`] asks.
-const WIRE_TARGETS: [&str; 2] = ["tungstenite", "rustls"];
+const WIRE_TARGETS: [&str; 4] = ["tungstenite", "tokio_tungstenite", "rustls", "tokio_rustls"];
 
+/// The most verbose level `target` may log at: `info` for a [`WIRE_TARGETS`] crate (the crate
+/// name itself or any `crate::module` path below it; `rustlsfoo` is another crate and is not
+/// clamped), else unlimited.
 fn target_cap(target: &str) -> log::LevelFilter {
     let wire = WIRE_TARGETS.iter().any(|w| {
         target
@@ -1602,6 +1606,27 @@ fn target_cap(target: &str) -> log::LevelFilter {
         log::LevelFilter::Info
     } else {
         log::LevelFilter::Trace
+    }
+}
+
+/// Applies [`target_cap`] before the wrapped logger sees a record. A filter inside the logger
+/// is not enough: env_logger lets the most specific directive win, so
+/// `RUST_LOG=tungstenite::protocol=trace` would get past a `tungstenite=info` directive.
+struct WireCap<L>(L);
+
+impl<L: log::Log> log::Log for WireCap<L> {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= target_cap(metadata.target()) && self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        if record.level() <= target_cap(record.target()) {
+            self.0.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.0.flush();
     }
 }
 
@@ -1934,8 +1959,67 @@ mod tests {
         use log::LevelFilter::{Info, Trace};
         assert_eq!(target_cap("tungstenite"), Info);
         assert_eq!(target_cap("tungstenite::protocol::frame"), Info);
+        assert_eq!(target_cap("tokio_tungstenite::compat"), Info);
+        assert_eq!(target_cap("rustls"), Info);
         assert_eq!(target_cap("rustls::client::hs"), Info);
+        assert_eq!(target_cap("tokio_rustls::common"), Info);
         assert_eq!(target_cap("rustlsish"), Trace);
+        assert_eq!(target_cap("rustlsfoo::x"), Trace);
+        assert_eq!(target_cap("tungstenite_extra"), Trace);
         assert_eq!(target_cap("deck_service::gateway::remote::link"), Trace);
+    }
+
+    /// Accepts everything (like `RUST_LOG=trace` or `tungstenite::protocol=trace`) and keeps
+    /// what reached it.
+    #[derive(Default)]
+    struct Capture(Mutex<Vec<(String, log::Level)>>);
+
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((record.target().to_owned(), record.level()));
+        }
+
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn wire_cap_drops_wire_debug_whatever_the_inner_logger_allows() {
+        use log::Log as _;
+        let cap = WireCap(Capture::default());
+        let cases = [
+            ("tungstenite::protocol", log::Level::Trace, false),
+            ("tungstenite::protocol", log::Level::Debug, false),
+            ("tungstenite::protocol", log::Level::Info, true),
+            ("tokio_tungstenite", log::Level::Trace, false),
+            ("rustls::conn", log::Level::Debug, false),
+            ("rustls", log::Level::Warn, true),
+            ("tokio_rustls::client", log::Level::Trace, false),
+            ("rustlsfoo", log::Level::Trace, true),
+            ("deck_service::gateway", log::Level::Trace, true),
+        ];
+        for (target, level, passes) in cases {
+            let meta = log::Metadata::builder().target(target).level(level).build();
+            assert_eq!(cap.enabled(&meta), passes, "{target} {level}");
+            cap.log(
+                &log::Record::builder()
+                    .target(target)
+                    .level(level)
+                    .args(format_args!("payload"))
+                    .build(),
+            );
+        }
+        let expected: Vec<(String, log::Level)> = cases
+            .iter()
+            .filter(|c| c.2)
+            .map(|c| (c.0.to_owned(), c.1))
+            .collect();
+        assert_eq!(*cap.0.0.lock().unwrap(), expected);
     }
 }

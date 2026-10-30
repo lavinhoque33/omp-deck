@@ -60,7 +60,14 @@ describe('records', () => {
     expectCode('wrong_direction', () => decodeRecords(message, 'device'));
     const unknown = Uint8Array.of(0x7f, 0, 0, 0, 1, 9);
     expect(decodeRecords(concat(unknown, message), 'gateway')).toEqual(records);
-    expectCode('unknown_kind', () => decodeRecords(unknown, 'device'));
+    // An unknown gateway-range kind is the gateway's; a device sending it is in the wrong.
+    expectCode('wrong_direction', () => decodeRecords(unknown, 'device'));
+    expectCode('unknown_kind', () => decodeRecords(Uint8Array.of(0x05, 0, 0, 0, 0), 'device'));
+    expectCode('wrong_direction', () => decodeRecords(Uint8Array.of(0x0f, 0, 0, 0, 0), 'gateway'));
+    for (const origin of ['device', 'gateway'] as const) {
+      expectCode('unknown_kind', () => decodeRecords(Uint8Array.of(0x00, 0, 0, 0, 0), origin));
+      expectCode('unknown_kind', () => decodeRecords(Uint8Array.of(0x80, 0, 0, 0, 0), origin));
+    }
   });
 
   test('framing errors', () => {

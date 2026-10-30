@@ -1,6 +1,20 @@
 // The OmpDeck device protocol, mirroring Rust `deck_remote::noise` (docs/notes/mobile-relay.md,
 // "R1 contract"). The device is the Noise initiator; `respond`/`Pending` mirror the gateway side
 // for cross-tests.
+//
+// Secrets in memory. What is zeroed:
+// - `Keypair.wipe()`: the key pair's secret (`secret`/`secretBytes()` hand out copies the caller
+//   must wipe itself).
+// - The handshake (`noise.ts` `HandshakeState`): its own copies of the static secret, the PSK and
+//   the ephemeral secret, the chaining key and the handshake cipher key, once `split()` has made
+//   the transport ciphers, when a step fails, and on `Initiator.abandon()`/`Pending.abandon()`.
+//   Every DH output and HKDF intermediate is zeroed as soon as it is mixed in; superseded
+//   chaining and cipher keys are zeroed when replaced, old transport keys on every rekey.
+// What cannot be: copies the engine or libraries make (`@noble` internal hash/cipher/curve
+// state, JIT and garbage-collector copies), secrets held in strings (the invite text), the
+// caller's own buffers (the `Mode` PSK, invite fields), and the live transport keys of a
+// `Session` until it is collected. Wiping is therefore best effort; the device key's real
+// protection is the storage it is kept in.
 
 import { blake2s } from '@noble/hashes/blake2.js';
 
@@ -45,6 +59,8 @@ export const MAX_PLATFORM_CHARS = 32;
 export const MAX_DEVICE_ID_CHARS = 64;
 export const MAX_GATEWAY_LABEL_CHARS = 64;
 export const MAX_TIMESTAMP = Number.MAX_SAFE_INTEGER;
+/** {@link DeviceHello.features} names at most. */
+export const MAX_FEATURES = 32;
 
 export const FLAG_MORE = 0x01;
 export const FLAG_REKEY = 0x02;
@@ -61,6 +77,7 @@ export type NoiseErrorCode =
   | 'message-size'
   | 'handshake'
   | 'payload'
+  | 'unsupported-version'
   | 'frame-size'
   | 'decrypt'
   | 'bad-flags'
@@ -79,7 +96,11 @@ export class NoiseError extends Error {
   }
 }
 
-/** An X25519 static key pair. `wipe()` overwrites the secret once it is no longer needed. */
+/**
+ * An X25519 static key pair. `wipe()` overwrites the secret once it is no longer needed (best
+ * effort, see the module comment); `secret` and `secretBytes()` hand out copies, so a caller can
+ * neither wipe nor alter the key pair's own secret through them.
+ */
 export class Keypair {
   readonly public: Bytes;
   readonly #secret: Bytes;
@@ -109,7 +130,7 @@ export class Keypair {
   }
 
   get secret(): Bytes {
-    return this.#secret;
+    return Uint8Array.from(this.#secret);
   }
 }
 
@@ -131,12 +152,37 @@ export function nextTimestamp(last: number, nowMs: number): number {
   return Math.max(nowMs, last + 1);
 }
 
+/**
+ * Whether device-supplied text (a hello name or platform, a device rename) is safe to show: no
+ * C0/C1 control character, and none of the invisible, separator and bidirectional formatting
+ * characters U+00AD, U+061C, U+180E, U+200B–U+200F, U+2028–U+202E, U+2060–U+2064,
+ * U+2066–U+206F, U+FEFF and U+FFF9–U+FFFB. The same explicit list as Rust's `is_display_safe`.
+ */
+export function isDisplaySafe(text: string): boolean {
+  return !UNSAFE_TEXT.test(text);
+}
+
+const UNSAFE_TEXT =
+  /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb]/u;
+
 export interface DeviceHello {
+  /** At most {@link MAX_NAME_CHARS}, {@link isDisplaySafe}. */
   name: string;
+  /** At most {@link MAX_PLATFORM_CHARS}, {@link isDisplaySafe}. */
   platform: string;
   /** Unix milliseconds, strictly increasing per device. */
   ts: number;
+  /** The highest application protocol the device speaks, at least 1; absent means 1. */
+  api?: number;
+  /**
+   * Optional application features the device understands: at most {@link MAX_FEATURES}
+   * distinct non-empty names of `[a-z0-9_.]`; absent means none.
+   */
+  features?: readonly string[];
 }
+
+/** A decoded {@link DeviceHello}: the optional keys with their defaults filled in. */
+export type ReceivedHello = Required<DeviceHello>;
 
 export interface Welcome {
   device: string;
@@ -159,12 +205,16 @@ function checkPayloadLen(bytes: Uint8Array): void {
   }
 }
 
-/** Checks the size and grammar of a handshake payload and its version (`v` exactly 1). */
+/**
+ * Checks the size and grammar of a handshake payload and its version: an integer `v` other than
+ * 1 is `unsupported-version`, a missing or string `v` a payload error.
+ */
 function parseObject(bytes: Uint8Array, what: string): Map<string, PayloadValue> {
   checkPayloadLen(bytes);
   const fields = parsePayload(bytes);
-  if (fields === null || !fields.has('v')) throw new NoiseError('payload', `${what} is not valid`);
-  if (fields.get('v') !== 1) throw new NoiseError('payload', `unsupported ${what} version`);
+  const v = fields?.get('v');
+  if (fields === null || typeof v !== 'number') throw new NoiseError('payload', `${what} is not valid`);
+  if (v !== 1) throw new NoiseError('unsupported-version', `unsupported ${what} version ${v}`);
   return fields;
 }
 
@@ -181,26 +231,57 @@ function validTimestamp(ts: unknown): number {
   return ts;
 }
 
-export function encodeDeviceHello(hello: DeviceHello): Bytes {
+const FEATURE_NAME = /^[a-z0-9_.]+$/;
+
+/** Validates a hello, as Rust `DeviceHello::validate`; returns it with its defaults. */
+function checkHello(hello: DeviceHello): ReceivedHello {
   const name = checkChars(hello.name, MAX_NAME_CHARS, 'device name too long');
   const platform = checkChars(hello.platform, MAX_PLATFORM_CHARS, 'platform too long');
+  if (!isDisplaySafe(name)) throw new NoiseError('payload', 'device name is not display-safe');
+  if (!isDisplaySafe(platform)) throw new NoiseError('payload', 'platform is not display-safe');
   const ts = validTimestamp(hello.ts);
-  const out = utf8(JSON.stringify({ v: 1, name, platform, ts }));
+  const api = hello.api ?? 1;
+  if (!Number.isSafeInteger(api) || api < 1) throw new NoiseError('payload', 'api version out of range');
+  const features = hello.features ?? [];
+  if (features.length > MAX_FEATURES) throw new NoiseError('payload', 'too many features');
+  if (features.some((f, i) => !FEATURE_NAME.test(f) || features.indexOf(f) !== i)) {
+    throw new NoiseError('payload', 'features are not valid');
+  }
+  return { name, platform, ts, api, features: [...features] };
+}
+
+/** Writes `api` only when not 1 and `features` (comma-joined) only when not empty, like Rust. */
+export function encodeDeviceHello(hello: DeviceHello): Bytes {
+  const { name, platform, ts, api, features } = checkHello(hello);
+  const out = utf8(
+    JSON.stringify({
+      v: 1,
+      name,
+      platform,
+      ts,
+      ...(api === 1 ? {} : { api }),
+      ...(features.length === 0 ? {} : { features: features.join(',') }),
+    }),
+  );
   checkPayloadLen(out);
   return out;
 }
 
-export function decodeDeviceHello(bytes: Uint8Array): DeviceHello {
+export function decodeDeviceHello(bytes: Uint8Array): ReceivedHello {
   const fields = parseObject(bytes, 'hello');
-  const name = takeStr(fields, 'name', 'hello');
-  const platform = takeStr(fields, 'platform', 'hello');
   const ts = fields.get('ts');
-  if (typeof ts !== 'number') throw new NoiseError('payload', 'hello is not valid');
-  return {
-    name: checkChars(name, MAX_NAME_CHARS, 'device name too long'),
-    platform: checkChars(platform, MAX_PLATFORM_CHARS, 'platform too long'),
+  const api = fields.get('api') ?? 1;
+  const features = fields.get('features');
+  if (typeof ts !== 'number' || typeof api !== 'number' || typeof features === 'number') {
+    throw new NoiseError('payload', 'hello is not valid');
+  }
+  return checkHello({
+    name: takeStr(fields, 'name', 'hello'),
+    platform: takeStr(fields, 'platform', 'hello'),
     ts,
-  };
+    api,
+    features: features === undefined ? [] : features.split(','),
+  });
 }
 
 export function encodeWelcome(welcome: Welcome): Bytes {
@@ -280,6 +361,16 @@ function intoSession(state: HandshakeState): Session {
   return new Session(send, receive, state.handshakeHash);
 }
 
+/** Runs a handshake step; any failure wipes the handshake's secrets before it propagates. */
+function wipingOnError<T>(state: HandshakeState, run: () => T): T {
+  try {
+    return run();
+  } catch (error) {
+    state.wipe();
+    throw error;
+  }
+}
+
 /** The device side between sending message 1 and receiving message 2. */
 export class Initiator {
   readonly #state: HandshakeState;
@@ -301,20 +392,27 @@ export class Initiator {
     return startInitiator(mode, device, gatewayPublic, hello, undefined);
   }
 
-  /** Completes the handshake with the gateway's message 2. One use only. */
+  /** Completes the handshake with the gateway's message 2. One use only; a failure wipes it. */
   finish(msg2: Uint8Array): { session: Session; welcome: Welcome } {
-    if (msg2.length > MAX_MSG2 || msg2.length < KEY_LEN + TAG_LEN) {
-      throw new NoiseError('message-size', `handshake message of ${msg2.length} bytes is malformed`);
-    }
-    let payload: Bytes;
-    try {
-      payload = this.#state.readMessage(msg2);
-    } catch {
-      throw new NoiseError('handshake', 'handshake message failed authentication');
-    }
-    const welcome = decodeWelcome(payload);
-    checkWelcomeMode(welcome, this.#pairing);
-    return { session: intoSession(this.#state), welcome };
+    return wipingOnError(this.#state, () => {
+      if (msg2.length > MAX_MSG2 || msg2.length < KEY_LEN + TAG_LEN) {
+        throw new NoiseError('message-size', `handshake message of ${msg2.length} bytes is malformed`);
+      }
+      let payload: Bytes;
+      try {
+        payload = this.#state.readMessage(msg2);
+      } catch {
+        throw new NoiseError('handshake', 'handshake message failed authentication');
+      }
+      const welcome = decodeWelcome(payload);
+      checkWelcomeMode(welcome, this.#pairing);
+      return { session: intoSession(this.#state), welcome };
+    });
+  }
+
+  /** Gives up before message 2 (connection lost, timeout): wipes the handshake's secrets. */
+  abandon(): void {
+    this.#state.wipe();
   }
 }
 
@@ -338,22 +436,29 @@ export function startInitiator(
 /** A verified message 1 awaiting the gateway's decision. */
 export class Pending {
   readonly devicePublic: Bytes;
-  readonly hello: DeviceHello;
+  readonly hello: ReceivedHello;
   readonly #state: HandshakeState;
   readonly #pairing: boolean;
 
-  constructor(state: HandshakeState, devicePublic: Bytes, hello: DeviceHello, pairing: boolean) {
+  constructor(state: HandshakeState, devicePublic: Bytes, hello: ReceivedHello, pairing: boolean) {
     this.#state = state;
     this.devicePublic = devicePublic;
     this.hello = hello;
     this.#pairing = pairing;
   }
 
-  /** Answers with message 2. `welcome.token` must be present exactly in pairing. */
+  /** Answers with message 2. `welcome.token` must be present exactly in pairing. One use only. */
   accept(welcome: Welcome): { session: Session; msg2: Bytes } {
-    checkWelcomeMode(welcome, this.#pairing);
-    const msg2 = this.#state.writeMessage(encodeWelcome(welcome));
-    return { session: intoSession(this.#state), msg2 };
+    return wipingOnError(this.#state, () => {
+      checkWelcomeMode(welcome, this.#pairing);
+      const msg2 = this.#state.writeMessage(encodeWelcome(welcome));
+      return { session: intoSession(this.#state), msg2 };
+    });
+  }
+
+  /** Refuses the device without answering: wipes the handshake's secrets. */
+  abandon(): void {
+    this.#state.wipe();
   }
 }
 
@@ -379,7 +484,7 @@ export function respondWith(
   } catch {
     throw new NoiseError('handshake', 'handshake message failed authentication');
   }
-  const hello = decodeDeviceHello(payload);
+  const hello = wipingOnError(state, () => decodeDeviceHello(payload));
   return new Pending(state, state.remoteStatic!, hello, mode.kind === 'pairing');
 }
 
@@ -523,7 +628,7 @@ export class Session {
  * gateway public 32 ‖ psk 32`).
  */
 export interface PairingInvite {
-  /** Relay base URL, `ws://` or `wss://`, at most 255 bytes. */
+  /** The canonical relay base URL, see {@link checkInviteUrl}. */
   url: string;
   room: Bytes;
   token: Bytes;
@@ -533,13 +638,149 @@ export interface PairingInvite {
 
 const INVITE_FIXED = ROOM_LEN + TOKEN_LEN + KEY_LEN + PSK_LEN;
 
+/**
+ * Reads IP addresses exactly as Rust's `std::net::Ipv4Addr`/`Ipv6Addr` parsers do (so both sides
+ * accept the same invite URLs): decimal octets of 1–3 digits ≤ 255 without a leading zero; hex
+ * groups of 1–4 digits; one `::` standing for at least one zero group; an embedded IPv4 address
+ * only as the last two groups.
+ */
+class AddressReader {
+  #pos = 0;
+  readonly #text: string;
+
+  constructor(text: string) {
+    this.#text = text;
+  }
+
+  /** Runs `read`; on `null` puts the position back. */
+  #attempt<T>(read: () => T | null): T | null {
+    const start = this.#pos;
+    const out = read();
+    if (out === null) this.#pos = start;
+    return out;
+  }
+
+  #char(c: string): boolean {
+    if (this.#text[this.#pos] !== c) return false;
+    this.#pos++;
+    return true;
+  }
+
+  #number(radix: 10 | 16, maxDigits: number, allowZeroPrefix: boolean, max: number): number | null {
+    return this.#attempt(() => {
+      const leadingZero = this.#text[this.#pos] === '0';
+      let value = 0;
+      let digits = 0;
+      while (digits < maxDigits) {
+        const c = this.#text[this.#pos];
+        const digit = c === undefined || !/^[0-9a-fA-F]$/.test(c) ? NaN : parseInt(c, radix);
+        if (Number.isNaN(digit)) break;
+        value = value * radix + digit;
+        if (value > max) return null;
+        this.#pos++;
+        digits++;
+      }
+      if (digits === 0 || (!allowZeroPrefix && leadingZero && digits > 1)) return null;
+      return value;
+    });
+  }
+
+  #ipv4(): number[] | null {
+    return this.#attempt(() => {
+      const octets: number[] = [];
+      for (let i = 0; i < 4; i++) {
+        if (i > 0 && !this.#char('.')) return null;
+        const octet = this.#number(10, 3, false, 255);
+        if (octet === null) return null;
+        octets.push(octet);
+      }
+      return octets;
+    });
+  }
+
+  /** Reads up to `limit` groups into `groups`; returns how many and whether an IPv4 ended them. */
+  #groups(groups: number[], limit: number): [number, boolean] {
+    for (let i = 0; i < limit; i++) {
+      const separated = (): boolean => i === 0 || this.#char(':');
+      if (i < limit - 1) {
+        const v4 = this.#attempt(() => (separated() ? this.#ipv4() : null));
+        if (v4 !== null) {
+          groups[i] = (v4[0]! << 8) | v4[1]!;
+          groups[i + 1] = (v4[2]! << 8) | v4[3]!;
+          return [i + 2, true];
+        }
+      }
+      const group = this.#attempt(() => (separated() ? this.#number(16, 4, true, 0xffff) : null));
+      if (group === null) return [i, false];
+      groups[i] = group;
+    }
+    return [limit, false];
+  }
+
+  #ipv6(): number[] | null {
+    const head = new Array<number>(8).fill(0);
+    const [headSize, headIpv4] = this.#groups(head, 8);
+    if (headSize === 8) return head;
+    if (headIpv4 || !this.#char(':') || !this.#char(':')) return null;
+    const tail = new Array<number>(7).fill(0);
+    const [tailSize] = this.#groups(tail, 8 - (headSize + 1));
+    head.splice(8 - tailSize, tailSize, ...tail.slice(0, tailSize));
+    return head;
+  }
+
+  static ipv4(text: string): number[] | null {
+    const reader = new AddressReader(text);
+    const out = reader.#ipv4();
+    return reader.#pos === text.length ? out : null;
+  }
+
+  static ipv6(text: string): number[] | null {
+    const reader = new AddressReader(text);
+    const out = reader.#ipv6();
+    return reader.#pos === text.length ? out : null;
+  }
+}
+
+const HOST_NAME = /^[a-z0-9.-]+$/;
+const PORT = /^:[1-9][0-9]*$/;
+
+/**
+ * The canonical relay base URL (what the gateway's relay setting produces), at most
+ * {@link MAX_INVITE_URL} bytes, as Rust's `check_invite_url`: `wss://host[:port]`, or `ws://`
+ * only for a loopback host (`localhost`, an IPv4 `127.x.y.z`, an IPv6 equal to `::1`).
+ *
+ * - `host`: lowercase `[a-z0-9.-]+`, or `[` lowercase IPv6 `]`;
+ * - `port`: decimal 1–65535 without leading zeros, never the scheme's default (443/80);
+ * - nothing else: no userinfo, path, query, fragment, whitespace or control characters.
+ */
 function checkInviteUrl(url: string): Bytes {
-  const rest = url.startsWith('wss://') ? url.slice(6) : url.startsWith('ws://') ? url.slice(5) : null;
-  if (rest === null) throw new NoiseError('invite', 'url must start with ws:// or wss://');
-  if (rest.length === 0) throw new NoiseError('invite', 'url has no host');
-  if (!url.isWellFormed()) throw new NoiseError('invite', 'url is not UTF-8');
   const bytes = utf8(url);
   if (bytes.length > MAX_INVITE_URL) throw new NoiseError('invite', 'url exceeds 255 bytes');
+  const tls = url.startsWith('wss://');
+  if (!tls && !url.startsWith('ws://')) throw new NoiseError('invite', 'url must start with ws:// or wss://');
+  const authority = url.slice(tls ? 6 : 5);
+  const bracketed = authority.startsWith('[');
+  const split = bracketed ? authority.indexOf(']') : authority.indexOf(':');
+  const end = split === -1 ? authority.length : bracketed ? split + 1 : split;
+  const host = authority.slice(0, end);
+  const port = authority.slice(end);
+  if (host.length === 0) throw new NoiseError('invite', 'url has no host');
+  let loopback: boolean;
+  if (host.startsWith('[')) {
+    const inner = host.endsWith(']') ? host.slice(1, -1) : null;
+    const groups = inner === null || /[A-Z]/.test(inner) ? null : AddressReader.ipv6(inner);
+    if (groups === null) throw new NoiseError('invite', 'url host is not valid');
+    loopback = groups.every((group, i) => group === (i === 7 ? 1 : 0));
+  } else {
+    if (!HOST_NAME.test(host)) throw new NoiseError('invite', 'url host is not valid');
+    loopback = host === 'localhost' || AddressReader.ipv4(host)?.[0] === 127;
+  }
+  if (port.length > 0) {
+    const number = PORT.test(port) ? Number(port.slice(1)) : NaN;
+    if (!(number <= 0xffff)) throw new NoiseError('invite', 'url port is not valid');
+    if (number === (tls ? 443 : 80)) throw new NoiseError('invite', 'url names the default port');
+  }
+  if (!tls && !loopback) throw new NoiseError('invite', 'ws:// is only for a loopback host');
   return bytes;
 }
 

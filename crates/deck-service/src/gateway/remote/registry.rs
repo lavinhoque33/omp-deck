@@ -119,15 +119,21 @@ impl Registry {
     }
 
     /// Adds a device; an earlier record of the same key is replaced (re-pairing a phone).
-    pub fn add(&mut self, device: Device) -> Result<(), RemoteError> {
-        let mut next: Vec<Device> = self
+    /// Returns the ids of the records it replaced (other than `device.id` itself).
+    pub fn add(&mut self, device: Device) -> Result<Vec<String>, RemoteError> {
+        let (replaced, mut next): (Vec<Device>, Vec<Device>) = self
             .devices
             .iter()
-            .filter(|d| d.public != device.public && d.id != device.id)
             .cloned()
+            .partition(|d| d.public == device.public || d.id == device.id);
+        let replaced = replaced
+            .into_iter()
+            .map(|d| d.id)
+            .filter(|id| *id != device.id)
             .collect();
         next.push(device);
-        self.commit(next)
+        self.commit(next)?;
+        Ok(replaced)
     }
 
     /// Deletes a device; `Ok(None)` when there is none with `id`.
@@ -232,8 +238,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let mut reg = Registry::load(&path).unwrap();
-        reg.add(device("a", 1)).unwrap();
-        reg.add(device("c", 1)).unwrap();
+        assert!(reg.add(device("a", 1)).unwrap().is_empty());
+        assert!(reg.add(device("b", 2)).unwrap().is_empty());
+        // Re-paired: the old record's id is reported so its work can be cancelled.
+        assert_eq!(reg.add(device("c", 1)).unwrap(), ["a"]);
+        assert!(reg.remove("b").unwrap().is_some());
         assert_eq!(reg.devices().len(), 1);
         assert_eq!(reg.devices()[0].id, "c");
         assert_eq!(reg.remove("a").unwrap(), None);

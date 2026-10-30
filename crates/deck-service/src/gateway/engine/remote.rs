@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use deck_core::config::GatewayMode;
 use deck_remote::noise::{
     Keypair, MAX_GATEWAY_LABEL_CHARS, MAX_NAME_CHARS, PairingInvite, Welcome, fingerprint,
-    timestamp_fresh,
+    is_display_safe, timestamp_fresh,
 };
 use deck_remote::relay::{self, Hash, MAX_TOKENS, PeerId, close};
 
@@ -40,6 +40,9 @@ struct Parts {
 
 /// One device connection the relay admitted.
 struct Peer {
+    /// The link's name for this admission ([`Event::Opened`]): commands carry it, so they
+    /// never reach a later admission on a reused peer number.
+    serial: u64,
     token: Hash,
     /// Its session is established as this device.
     device: Option<String>,
@@ -65,23 +68,33 @@ pub(super) struct Mobile {
 }
 
 impl Mobile {
-    /// Loads the key, the devices and the relay from the gateway's state dir. A broken key or
-    /// device file disables mobile access (reported, never overwritten).
+    /// Loads the key, the devices and the relay from the gateway's secrets dir, created
+    /// owner-only first. A dir that cannot be made private, or a broken key or device file,
+    /// disables mobile access (reported, never overwritten); the engine still starts.
     pub(super) fn open(dir: &Path) -> Mobile {
-        let parts = identity::load_or_create(&dir.join(identity::FILE)).and_then(|identity| {
-            Ok(Parts {
-                identity,
-                registry: Registry::load(&dir.join(registry::FILE))?,
-            })
-        });
+        let parts = crate::gateway::secret_dir(dir)
+            .map_err(|e| format!("protecting {}: {e}", dir.display()))
+            .and_then(|()| {
+                let identity = identity::load_or_create(&dir.join(identity::FILE))
+                    .map_err(|e| e.to_string())?;
+                Ok(Parts {
+                    identity,
+                    registry: Registry::load(&dir.join(registry::FILE))
+                        .map_err(|e| e.to_string())?,
+                })
+            });
         let parts = parts.map_err(|e| {
             log::error!("mobile access is unavailable: {e}");
             format!("mobile access is unavailable: {e}")
         });
-        let relay = RelayConfig::load(&dir.join(config::FILE)).unwrap_or_else(|e| {
-            log::error!("ignoring the relay settings: {e}");
-            None
-        });
+        // Nothing more is read from (or written to) a dir that is not private.
+        let relay = match &parts {
+            Ok(_) => RelayConfig::load(&dir.join(config::FILE)).unwrap_or_else(|e| {
+                log::error!("ignoring the relay settings: {e}");
+                None
+            }),
+            Err(_) => None,
+        };
         Mobile {
             dir: dir.to_path_buf(),
             parts,
@@ -118,12 +131,73 @@ impl Mobile {
         self.send(Cmd::Tokens(self.token_set()));
     }
 
+    /// Closes `peer` and forgets it at once: a closed admission holds no engine state while
+    /// the relay's `Closed` is on its way.
     fn close_peer(&mut self, peer: PeerId, code: u16) {
-        if let Some(p) = self.peers.get_mut(&peer) {
-            p.device = None;
-            p.conn = None;
+        if let Some(p) = self.peers.remove(&peer) {
+            self.send(Cmd::Close {
+                peer,
+                serial: p.serial,
+                code,
+            });
         }
-        self.send(Cmd::Close { peer, code });
+    }
+
+    /// The relay closed `peer`: its device was last seen now, and a pairing candidate on it
+    /// is gone.
+    fn peer_closed(&mut self, peer: PeerId) {
+        if let Some(Peer {
+            device: Some(id), ..
+        }) = self.peers.remove(&peer)
+            && let Ok(parts) = &mut self.parts
+        {
+            let seen = crate::gateway::unix_ms();
+            if let Err(e) = parts.registry.update(&id, |d| d.last_seen_unix_ms = seen) {
+                log::warn!("mobile access: recording when {id} was last seen: {e}");
+            }
+        }
+        match self.pairing.as_mut().map(|w| w.on_closed(peer)) {
+            Some(Left::Finished) => self.end_window(),
+            Some(Left::Abandoned) => {
+                log::info!("mobile access: pairing ended (the device left)");
+                self.end_window();
+            }
+            Some(Left::Released | Left::NotOurs) | None => {}
+        }
+    }
+
+    /// The relay admitted a device connection on `peer` (admission `serial`).
+    fn peer_opened(&mut self, peer: PeerId, serial: u64, token: Hash) {
+        // A reused peer number ends whatever the old admission was doing (a pairing candidate
+        // on it is abandoned), before the new one starts.
+        if self.peers.contains_key(&peer) {
+            self.peer_closed(peer);
+        }
+        self.peers.insert(
+            peer,
+            Peer {
+                serial,
+                token,
+                device: None,
+                conn: None,
+            },
+        );
+        let known = self
+            .parts
+            .as_ref()
+            .is_ok_and(|p| p.registry.token_hashes().any(|h| h == token));
+        match self.pairing.as_mut().map(|w| w.on_open(peer, &token)) {
+            Some(Admit::Claimed) => {}
+            Some(Admit::Refuse) => {
+                log::info!("relay peer {peer}: the pairing window is taken");
+                self.close_peer(peer, close::UNAUTHORIZED);
+            }
+            Some(Admit::NotOurs) | None if !known => {
+                // A token withdrawn while the relay admitted it.
+                self.close_peer(peer, close::UNAUTHORIZED);
+            }
+            Some(Admit::NotOurs) | None => {}
+        }
     }
 
     /// Engine link `conn` is a device session the link still carries.
@@ -269,6 +343,19 @@ pub(super) fn is_mobile(op: &Mutation) -> bool {
     )
 }
 
+/// Every paired device's id (and so its client id) starts with this.
+const DEVICE_ID_PREFIX: &str = "d-";
+
+/// `id` is (or claims to be) a paired device's: reserved for device sessions.
+pub(super) fn is_device_id(id: &str) -> bool {
+    id.starts_with(DEVICE_ID_PREFIX)
+}
+
+/// A new device's id from 8 random bytes.
+fn device_id(random: &[u8; 8]) -> String {
+    format!("{DEVICE_ID_PREFIX}{}", hex(random))
+}
+
 fn valid_name(name: &str) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -278,6 +365,11 @@ fn valid_name(name: &str) -> Result<String, String> {
         return Err(format!(
             "a device name has at most {MAX_NAME_CHARS} characters"
         ));
+    }
+    // No control, invisible or direction-changing characters: a name shown in a dialog must
+    // read the same as what is stored.
+    if !is_display_safe(name) {
+        return Err("a device name cannot contain control or invisible characters".to_owned());
     }
     Ok(name.to_owned())
 }
@@ -417,42 +509,26 @@ impl Engine {
                 }
                 m.link_state = state;
             }
-            Event::Opened { peer, token } => {
-                m.peers.insert(
-                    peer,
-                    Peer {
-                        token,
-                        device: None,
-                        conn: None,
-                    },
-                );
-                let known = m
-                    .parts
-                    .as_ref()
-                    .is_ok_and(|p| p.registry.token_hashes().any(|h| h == token));
-                match m.pairing.as_mut().map(|w| w.on_open(peer, &token)) {
-                    Some(Admit::Claimed) => {}
-                    Some(Admit::Refuse) => {
-                        log::info!("relay peer {peer}: the pairing window is taken");
-                        m.close_peer(peer, close::UNAUTHORIZED);
-                    }
-                    Some(Admit::NotOurs) | None if !known => {
-                        // A token withdrawn while the relay admitted it.
-                        m.close_peer(peer, close::UNAUTHORIZED);
-                    }
-                    Some(Admit::NotOurs) | None => {}
-                }
-            }
+            Event::Opened {
+                peer,
+                serial,
+                token,
+            } => m.peer_opened(peer, serial, token),
             Event::Hello {
                 peer,
+                serial,
                 pairing,
                 public,
                 hello,
             } => {
                 let Some(token) = m.peers.get(&peer).map(|p| p.token) else {
-                    m.close_peer(peer, close::UNAUTHORIZED);
+                    // Closed meanwhile.
                     return;
                 };
+                if m.peers.get(&peer).is_some_and(|p| p.serial != serial) {
+                    // An earlier admission's handshake: the link has dropped it.
+                    return;
+                }
                 if pairing {
                     let unix = crate::gateway::unix_ms();
                     let ok = m.pairing.as_mut().is_some_and(|w| {
@@ -467,29 +543,10 @@ impl Engine {
                         m.close_peer(peer, close::UNAUTHORIZED);
                     }
                 } else {
-                    self.on_reconnect(peer, token, public, hello);
+                    self.on_reconnect(peer, serial, token, public, hello);
                 }
             }
-            Event::Closed { peer } => {
-                if let Some(Peer {
-                    device: Some(id), ..
-                }) = m.peers.remove(&peer)
-                    && let Ok(parts) = &mut m.parts
-                {
-                    let seen = crate::gateway::unix_ms();
-                    if let Err(e) = parts.registry.update(&id, |d| d.last_seen_unix_ms = seen) {
-                        log::warn!("mobile access: recording when {id} was last seen: {e}");
-                    }
-                }
-                match m.pairing.as_mut().map(|w| w.on_closed(peer)) {
-                    Some(Left::Finished) => m.end_window(),
-                    Some(Left::Abandoned) => {
-                        log::info!("mobile access: pairing ended (the device left)");
-                        m.end_window();
-                    }
-                    Some(Left::Released | Left::NotOurs) | None => {}
-                }
-            }
+            Event::Closed { peer } => m.peer_closed(peer),
         }
         self.dirty.mobile = true;
         self.sync_devices();
@@ -500,6 +557,7 @@ impl Engine {
     fn on_reconnect(
         &mut self,
         peer: PeerId,
+        serial: u64,
         token: Hash,
         public: deck_remote::noise::PublicKey,
         hello: deck_remote::noise::DeviceHello,
@@ -556,10 +614,12 @@ impl Engine {
             return;
         };
         let label = m.label.clone();
-        let (conn, out) = self.open_device(&id, name, permissions, wake);
+        let (conn, out) = self.open_device(&id, name, permissions, hello.api, hello.features, wake);
         let m = &mut self.mobile;
         m.send(Cmd::Accept {
             peer,
+            serial,
+            public,
             welcome: Welcome {
                 device: id.clone(),
                 gateway: label,
@@ -639,6 +699,10 @@ impl Engine {
         self.dirty.mobile = true;
         match op {
             Mutation::RelaySet { url, room_key } => {
+                // The room secret goes only into a dir that was made private.
+                if let Err(e) = &self.mobile.parts {
+                    return Err(GatewayError::Refused(e.clone()));
+                }
                 let cfg = RelayConfig::new(&url, room_key.expose())
                     .map_err(|e| GatewayError::Refused(e.to_string()))?;
                 cfg.save(&self.mobile.dir.join(config::FILE))
@@ -684,14 +748,14 @@ impl Engine {
                 let at = Instant::now();
                 let candidate = self.mobile.approvable(&pairing, at)?;
                 let token: relay::Token = random().map_err(failed)?;
-                let id = format!("d-{}", hex(&random::<8>().map_err(failed)?));
+                let id = device_id(&random::<8>().map_err(failed)?);
                 let now = crate::gateway::unix_ms();
                 let name = valid_name(&candidate.hello.name).unwrap_or_else(|_| "Phone".into());
                 let m = &mut self.mobile;
                 let (Ok(parts), Some(w)) = (&mut m.parts, &mut m.pairing) else {
                     return Err(GatewayError::Refused(PAIRING_ENDED.into()));
                 };
-                parts
+                let replaced = parts
                     .registry
                     .add(Device {
                         id: id.clone(),
@@ -712,20 +776,31 @@ impl Engine {
                 );
                 // The pairing connection is this device's session from now on: it shows online
                 // and a revocation closes it.
-                if let Some(p) = m.peers.get_mut(&candidate.peer) {
+                let serial = m.peers.get_mut(&candidate.peer).map(|p| {
                     p.device = Some(id.clone());
-                }
+                    p.serial
+                });
                 // Its token is registered before message 2 reaches the device.
                 m.publish_tokens();
-                m.send(Cmd::Accept {
-                    peer: candidate.peer,
-                    welcome: Welcome {
-                        device: id,
-                        gateway: m.label.clone(),
-                        token: Some(token),
-                    },
-                    device: None,
-                });
+                if let Some(serial) = serial {
+                    m.send(Cmd::Accept {
+                        peer: candidate.peer,
+                        serial,
+                        public: candidate.public,
+                        welcome: Welcome {
+                            device: id.clone(),
+                            gateway: m.label.clone(),
+                            token: Some(token),
+                        },
+                        device: None,
+                    });
+                }
+                // A re-paired key's old record is gone: nothing it asked for runs any more
+                // (the new pairing may well have fewer rights).
+                for old in &replaced {
+                    log::info!("mobile access: {id} replaces {old}");
+                    self.cancel_client_work(old);
+                }
                 Ok(Done::Unit)
             }
             Mutation::DeviceRevoke { id } => {
@@ -761,6 +836,9 @@ impl Engine {
                     "mobile access: revoked {id} ({})",
                     fingerprint(&gone.public)
                 );
+                // Nothing it asked for runs after this: unwritten commands and queued
+                // launches are cancelled.
+                self.cancel_client_work(&id);
                 Ok(Done::Unit)
             }
             Mutation::DeviceRename { id, name } => {
@@ -768,7 +846,14 @@ impl Engine {
                 self.update_device(&id, |d| d.name = name)
             }
             Mutation::DeviceSetPermissions { id, permissions } => {
-                self.update_device(&id, |d| d.permissions = permissions)
+                let had_control = self.mobile.permissions(&id).is_some_and(|p| p.control);
+                let done = self.update_device(&id, |d| d.permissions = permissions)?;
+                // Lowered while offline too: its commands that have not started are cancelled
+                // (its typing views end at the next step).
+                if had_control && !permissions.control {
+                    self.cancel_client_work(&id);
+                }
+                Ok(done)
             }
             other => Err(GatewayError::Failed(format!(
                 "{} is not a mobile-access operation",
@@ -826,5 +911,59 @@ impl Engine {
         m.pairing = Some(w);
         m.publish_tokens();
         Ok(done)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_secrets_dir_that_cannot_be_made_private_only_disables_mobile_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Its parent is a file: the dir can be neither created nor protected.
+        std::fs::write(tmp.path().join("blocker"), b"").unwrap();
+        let dir = tmp.path().join("blocker").join("secrets");
+        let m = Mobile::open(&dir);
+        let Err(e) = &m.parts else {
+            panic!("mobile access stayed available");
+        };
+        assert!(e.starts_with("mobile access is unavailable"), "{e}");
+        assert!(m.relay.is_none());
+        assert!(m.token_set().is_empty());
+
+        // A healthy dir is created and holds the key.
+        let ok = Mobile::open(&tmp.path().join("secrets"));
+        assert!(ok.parts.is_ok());
+        assert!(tmp.path().join("secrets").join(identity::FILE).is_file());
+    }
+
+    #[test]
+    fn device_ids_are_reserved_and_local_ones_are_not() {
+        let id = device_id(&[0xab; 8]);
+        assert_eq!(id, "d-abababababababab");
+        assert!(is_device_id(&id));
+        for local in ["gui-1a2b", "cli-1a2b", "supervisor-1a2b", "D-1", "xd-1"] {
+            assert!(!is_device_id(local), "{local}");
+        }
+    }
+
+    #[test]
+    fn a_device_name_is_trimmed_bounded_and_displays_as_stored() {
+        assert_eq!(valid_name("  Pixel 8 ").as_deref(), Ok("Pixel 8"));
+        assert_eq!(valid_name("Zoë’s phone").as_deref(), Ok("Zoë’s phone"));
+        assert!(valid_name("   ").is_err());
+        assert!(valid_name(&"x".repeat(MAX_NAME_CHARS + 1)).is_err());
+        assert!(valid_name(&"é".repeat(MAX_NAME_CHARS)).is_ok());
+        for bad in [
+            "Pixel\u{1b}[2J",
+            "Pixel\nApprove",
+            "Pixel\u{202e}enohp",
+            "Pi\u{200b}xel",
+            "Pixel\u{2066}x\u{2069}",
+            "Pixel\u{feff}",
+        ] {
+            assert!(valid_name(bad).is_err(), "{bad:?}");
+        }
     }
 }

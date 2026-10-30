@@ -17,9 +17,21 @@ export const HEALTH_PATH = '/healthz';
 /** The relay's answer to an accepted hello. */
 export const HELLO_OK: Readonly<Bytes> = Uint8Array.of(0);
 
+/**
+ * Whether a relay message accepts the hello: its first byte is 0. Later bytes are reserved for
+ * future relay versions and ignored, so a longer answer is accepted too.
+ */
+export function isHelloOk(message: Uint8Array): boolean {
+  return message.length > 0 && message[0] === 0;
+}
+
 const HELLO_DEVICE = 0x44; // 'D'
 
-/** WebSocket close codes the relay uses. */
+/**
+ * WebSocket close codes the relay and the gateway use. A close code is an unauthenticated hint
+ * (the relay, or anyone on the path, chooses it): it may change what the device shows or whether
+ * it retries, but it never deletes or alters a pairing; only the authenticated protocol can.
+ */
 export const CLOSE = {
   /** Normal close. */
   NORMAL: 1000,
@@ -44,6 +56,11 @@ export const CLOSE = {
   REPLACED: 4009,
   /** The gateway closed a device that stopped acknowledging its messages. */
   STALLED: 4010,
+  /**
+   * The gateway closed a device that speaks a handshake payload or application protocol version
+   * it does not support. The device keeps its pairing and asks the user to update.
+   */
+  UPGRADE_REQUIRED: 4026,
   /** A message exceeded its size limit. */
   TOO_LARGE: 4013,
   /** Too many connections, devices or bytes/messages per second. */

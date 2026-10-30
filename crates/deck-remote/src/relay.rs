@@ -61,6 +61,9 @@ pub mod close {
     pub const REPLACED: u16 = 4009;
     /// The gateway closed a device that stopped acknowledging its messages.
     pub const STALLED: u16 = 4010;
+    /// The gateway closed a device that speaks a handshake payload or application protocol
+    /// version it does not support. The device keeps its pairing and asks the user to update.
+    pub const UPGRADE_REQUIRED: u16 = 4026;
     /// A message exceeded its size limit.
     pub const TOO_LARGE: u16 = 4013;
     /// Too many connections, devices or bytes/messages per second.

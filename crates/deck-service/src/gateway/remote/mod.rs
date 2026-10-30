@@ -5,8 +5,10 @@
 //! decision (`engine/remote.rs`, `engine/device.rs`); the link thread owns the socket, the
 //! per-peer Noise state and the device record traffic.
 //!
-//! Every file lives in the gateway's private state dir, written owner-only. No secret (room
-//! secret, admission token, PSK, invite, key) reaches a topic, a log or a `Debug` output.
+//! Every file lives in the gateway's secrets dir ([`crate::gateway::Profile::secrets_dir`]:
+//! device-local, owner-only; on Windows a protected user + SYSTEM access list outside the
+//! roaming profile), written owner-only. No secret (room secret, admission token, PSK, invite,
+//! key) reaches a topic, a log or a `Debug` output.
 
 pub mod config;
 pub(crate) mod device;

@@ -84,6 +84,23 @@ impl Canon {
             None => abbreviate_home(p),
         }
     }
+
+    /// `p` relative to `base` when it lies below it, whichever way either is spelled (`None`:
+    /// not below it, or not known yet; a miss is noted for the next batch).
+    pub(super) fn below(&self, p: &Path, base: &Path) -> Option<PathBuf> {
+        rest_below(p, base).or_else(|| rest_below(self.get(p)?, self.get(base)?))
+    }
+
+    /// `text` (an error message) for a device: every spelling of the home folder in it, as
+    /// given and canonical (on Windows also either separator, any ASCII case and the `\\?\`
+    /// prefix), becomes `~`.
+    pub(super) fn scrub(&self, text: &str) -> String {
+        let Some(home) = dirs::home_dir().filter(|h| !h.as_os_str().is_empty()) else {
+            return text.to_owned();
+        };
+        let canonical = self.get(&home).map(Path::to_path_buf);
+        scrub_home(text, [Some(home), canonical].iter().flatten())
+    }
 }
 
 /// `p`'s canonical form (worker side: file system I/O).
@@ -112,6 +129,65 @@ pub(super) fn same_spelling(a: &Path, b: &Path) -> bool {
         strip_verbatim(b.to_path_buf()),
     );
     a.components().map(fold).eq(b.components().map(fold))
+}
+
+/// The byte of a path spelling at one position matches: on Windows any ASCII case and either
+/// separator.
+fn same_byte(a: u8, b: u8) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(&b) || (matches!(a, b'\\' | b'/') && matches!(b, b'\\' | b'/'))
+    } else {
+        a == b
+    }
+}
+
+/// A byte that continues a file name (so `/home/al` is not the start of `/home/alice`).
+fn continues_name(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-') || c >= 0x80
+}
+
+/// `text` with every occurrence of the home folders `homes` replaced by `~`. A root (`/`,
+/// `C:\`) is never replaced.
+fn scrub_home<'a>(text: &str, homes: impl IntoIterator<Item = &'a PathBuf>) -> String {
+    let mut needles: Vec<String> = Vec::new();
+    for home in homes {
+        if home.parent().is_none() {
+            continue;
+        }
+        let s = home.to_string_lossy();
+        let s = s.trim_end_matches(['/', '\\']);
+        if cfg!(windows) && !s.starts_with(r"\\?\") {
+            needles.push(format!(r"\\?\{s}"));
+        }
+        needles.push(s.to_owned());
+    }
+    needles.retain(|n| !n.is_empty());
+    // Longest first: a `\\?\` spelling before the bare one inside it.
+    needles.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    needles.dedup();
+    let b = text.as_bytes();
+    let at = |i: usize, n: &[u8]| {
+        b.get(i..i + n.len())
+            .is_some_and(|w| w.iter().zip(n).all(|(x, y)| same_byte(*x, *y)))
+            && b.get(i + n.len()).is_none_or(|c| !continues_name(*c))
+    };
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut copied) = (0, 0);
+    while i < b.len() {
+        // A needle is whole UTF-8 and only ASCII bytes compare loosely, so a match starts and
+        // ends on character boundaries.
+        match needles.iter().find(|n| at(i, n.as_bytes())) {
+            Some(n) => {
+                out.push_str(&text[copied..i]);
+                out.push('~');
+                i += n.len();
+                copied = i;
+            }
+            None => i += 1,
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// `p` relative to `base` when `p` lies below it in the same spelling.
@@ -147,6 +223,39 @@ mod tests {
                 })
                 .collect(),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_spelling_of_home_in_an_error_becomes_a_tilde() {
+        let homes = [PathBuf::from("/home/al/"), PathBuf::from("/var/home/al")];
+        assert_eq!(
+            scrub_home(
+                "open /home/al/x: denied; /var/home/al/y.txt in /home/al. /home/alice stays",
+                &homes
+            ),
+            "open ~/x: denied; ~/y.txt in ~. /home/alice stays"
+        );
+        // A root home is never replaced, and other text is left alone (non-ASCII included).
+        assert_eq!(
+            scrub_home("/tmp/é /home/al", &[PathBuf::from("/")]),
+            "/tmp/é /home/al"
+        );
+        assert_eq!(scrub_home("café /home/al", &homes), "café ~");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn every_spelling_of_home_in_an_error_becomes_a_tilde() {
+        let homes = [PathBuf::from(r"C:\Users\Al")];
+        assert_eq!(
+            scrub_home(
+                r"a C:/Users/Al/x b c:\users\AL\y c \\?\C:\Users\Al\z d C:\Users\Alice",
+                &homes
+            ),
+            r"a ~/x b ~\y c ~\z d C:\Users\Alice"
+        );
+        assert_eq!(scrub_home(r"C:\x", &[PathBuf::from(r"C:\")]), r"C:\x");
     }
 
     #[test]

@@ -1,9 +1,7 @@
 // Behaviour and rejection tests of the TypeScript device protocol.
 
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
-
-import { type Bytes, concat, fromBase64Url, toBase64Url, utf8 } from '../src/remote/bytes.ts';
+import { type Bytes, concat, fromBase64Url, fromHex, toBase64Url, toHex, utf8 } from '../src/remote/bytes.ts';
 import { type CipherState, HandshakeState, MAX_MESSAGE, TAG_LEN } from '../src/remote/noise.ts';
 import {
   DEFAULT_SESSION_CONFIG,
@@ -35,7 +33,17 @@ import {
   timestampFresh,
   type Welcome,
 } from '../src/remote/protocol.ts';
-import { CLOSE, encodeRelayHello, HELLO_OK, MAX_PAYLOAD } from '../src/remote/relay.ts';
+import {
+  CLOSE,
+  DEVICE_PATH,
+  encodeRelayHello,
+  HEALTH_PATH,
+  HELLO_OK,
+  isHelloOk,
+  MAX_PAYLOAD,
+  VERSION,
+} from '../src/remote/relay.ts';
+import { relayVectors } from './vectors.ts';
 
 const PSK = new Uint8Array(32).fill(7);
 const TOKEN = new Uint8Array(32).fill(9);
@@ -65,7 +73,7 @@ function connect(mode: Mode): [Session, Session] {
   const { initiator, msg1 } = Initiator.start(mode, device, gateway.public, hello);
   const pending = respond(mode, gateway, msg1);
   expect(pending.devicePublic).toEqual(device.public);
-  expect(pending.hello).toEqual(hello);
+  expect(pending.hello).toEqual({ ...hello, api: 1, features: [] });
   const { session: gatewaySession, msg2 } = pending.accept(welcome(pairing));
   const { session: deviceSession, welcome: got } = initiator.finish(msg2);
   expect(got).toEqual(welcome(pairing));
@@ -181,7 +189,9 @@ describe('handshake', () => {
     const gateway = Keypair.generate();
     const cases: [string, NoiseErrorCode][] = [
       ['not json', 'payload'],
-      ['{"v":2,"name":"a","platform":"b","ts":1}', 'payload'],
+      ['{"v":2,"name":"a","platform":"b","ts":1}', 'unsupported-version'],
+      ['{"v":"1","name":"a","platform":"b","ts":1}', 'payload'],
+      ['{"v":1,"name":"a\\u202e","platform":"b","ts":1}', 'payload'],
       ['{"v":1,"name":"a","ts":1}', 'payload'],
       ['{"v":1,"name":"a","platform":"b","ts":9007199254740992}', 'payload'],
       [`{"v":1,"name":"a","platform":"b","ts":1,"pad":"${'x'.repeat(1100)}"}`, 'message-size'],
@@ -209,7 +219,7 @@ describe('handshake', () => {
 describe('payloads', () => {
   test('limits', () => {
     const name = 'é'.repeat(MAX_NAME_CHARS);
-    expect(decodeDeviceHello(encodeDeviceHello({ ...hello, name }))).toEqual({ ...hello, name });
+    expect(decodeDeviceHello(encodeDeviceHello({ ...hello, name }))).toEqual({ ...hello, name, api: 1, features: [] });
     expectCode('payload', () => encodeDeviceHello({ ...hello, name: `${name}é` }));
     expectCode('payload', () => encodeDeviceHello({ ...hello, platform: 'p'.repeat(MAX_PLATFORM_CHARS + 1) }));
     expectCode('payload', () => encodeDeviceHello({ ...hello, ts: 2 ** 53 }));
@@ -443,11 +453,103 @@ describe('transport', () => {
   test('sessions have distinct ids', () => {
     expect(connect(PAIRING)[0].handshakeHash).not.toEqual(connect(PAIRING)[0].handshakeHash);
   });
+
+  // The two directions use different keys: a frame reflected back to its own sender, at the very
+  // counter it would expect next from the peer, never opens, in either mode and direction.
+  test('reflected frames poison the session', () => {
+    for (const mode of [PAIRING, RECONNECT]) {
+      const [device, gateway] = connect(mode);
+      const frame = device.seal(utf8('to the gateway'))[0]!;
+      expectCode('decrypt', () => device.open(frame));
+      expectPoisoned(device);
+      expect(gateway.open(frame)).toEqual(utf8('to the gateway'));
+
+      const [, other] = connect(mode);
+      const back = other.seal(utf8('to the device'))[0]!;
+      expectCode('decrypt', () => other.open(back));
+      expectPoisoned(other);
+    }
+  });
+
+  test('a key pair hands out copies of its secret', () => {
+    const key = Keypair.generate();
+    const copy = key.secret;
+    copy.fill(0);
+    expect(key.secret).not.toEqual(copy);
+    expect(Keypair.fromSecret(key.secretBytes()).public).toEqual(key.public);
+    // A handshake keeps its own copy: wiping the key pair afterwards does not change it.
+    const gateway = Keypair.generate();
+    const { initiator, msg1 } = Initiator.start(RECONNECT, key, gateway.public, hello);
+    key.wipe();
+    const { msg2 } = respond(RECONNECT, gateway, msg1).accept(welcome(false));
+    expect(initiator.finish(msg2).welcome).toEqual(welcome(false));
+  });
+
+  /** Both sides of one raw handshake, up to (not including) `split`. */
+  function rawHandshake(mode: Mode): { device: HandshakeState; gateway: HandshakeState } {
+    const gatewayKey = Keypair.generate();
+    const options = (initiator: boolean, s: Keypair) => ({
+      pattern: mode.kind === 'pairing' ? ('IKpsk1' as const) : ('IK' as const),
+      initiator,
+      prologue: PROLOGUE,
+      s,
+      ...(initiator ? { rs: gatewayKey.public } : {}),
+      ...(mode.kind === 'pairing' ? { psk: mode.psk } : {}),
+    });
+    const device = new HandshakeState(options(true, Keypair.generate()));
+    const gateway = new HandshakeState(options(false, gatewayKey));
+    gateway.readMessage(device.writeMessage(encodeDeviceHello(hello)));
+    device.readMessage(gateway.writeMessage(encodeWelcome(welcome(mode.kind === 'pairing'))));
+    return { device, gateway };
+  }
+
+  function allZero(buffers: Uint8Array[]): boolean {
+    return buffers.every((buffer) => buffer.every((byte) => byte === 0));
+  }
+
+  test("split zeroes the handshake's own secrets", () => {
+    for (const mode of [PAIRING, RECONNECT]) {
+      const { device, gateway } = rawHandshake(mode);
+      for (const state of [device, gateway]) {
+        const secrets = state.secretBuffers;
+        // Static and ephemeral secrets, chaining key, cipher key (+ PSK in pairing).
+        expect(secrets.length).toBe(mode.kind === 'pairing' ? 5 : 4);
+        expect(allZero(secrets)).toBe(false);
+        const hash = state.handshakeHash;
+        state.split();
+        expect(allZero(secrets)).toBe(true);
+        expect(state.handshakeHash).toEqual(hash);
+        expect(() => state.split()).toThrow();
+      }
+    }
+  });
+
+  test('a failed or abandoned handshake zeroes its secrets', () => {
+    const { device } = rawHandshake(PAIRING);
+    const gateway = Keypair.generate();
+    const responder = new HandshakeState({ pattern: 'IK', initiator: false, prologue: PROLOGUE, s: gateway });
+    const before = responder.secretBuffers;
+    expect(() => responder.readMessage(new Uint8Array(200))).toThrow();
+    expect(allZero([...before, ...responder.secretBuffers])).toBe(true);
+    expect(() => responder.readMessage(new Uint8Array(200))).toThrow('wiped');
+
+    device.wipe();
+    expect(allZero(device.secretBuffers)).toBe(true);
+
+    // Through the protocol API: a refused message 2, and an abandoned initiator.
+    const { initiator, msg1 } = Initiator.start(RECONNECT, Keypair.generate(), gateway.public, hello);
+    expectCode('handshake', () => initiator.finish(new Uint8Array(100)));
+    expect(() => respond(RECONNECT, gateway, msg1).abandon()).not.toThrow();
+    const second = Initiator.start(RECONNECT, Keypair.generate(), gateway.public, hello);
+    second.initiator.abandon();
+    const { msg2 } = respond(RECONNECT, gateway, second.msg1).accept(welcome(false));
+    expectCode('handshake', () => second.initiator.finish(msg2));
+  });
 });
 
 describe('pairing invite', () => {
   const invite: PairingInvite = {
-    url: 'wss://relay.example.org:8443/base',
+    url: 'wss://relay.example.org:8443',
     room: new Uint8Array(16).fill(1),
     token: new Uint8Array(32).fill(2),
     gatewayPublic: new Uint8Array(32).fill(3),
@@ -458,8 +560,10 @@ describe('pairing invite', () => {
     const text = encodePairingInvite(invite);
     expect(text.startsWith(INVITE_PREFIX)).toBe(true);
     expect(parsePairingInvite(text)).toEqual(invite);
-    const ws = { ...invite, url: `ws://${'h'.repeat(250)}` };
-    expect(parsePairingInvite(encodePairingInvite(ws))).toEqual(ws);
+    for (const url of [`wss://${'h'.repeat(249)}`, 'ws://[::1]:8080', 'ws://127.0.0.1:9000', 'wss://[2001:db8::1]']) {
+      const other = { ...invite, url };
+      expect(parsePairingInvite(encodePairingInvite(other))).toEqual(other);
+    }
   });
 
   test('rejects', () => {
@@ -472,7 +576,16 @@ describe('pairing invite', () => {
     const raw = fromBase64Url(body)!;
     expectCode('invite', () => parsePairingInvite(INVITE_PREFIX + toBase64Url(raw.subarray(0, raw.length - 1))));
     expectCode('invite', () => parsePairingInvite(INVITE_PREFIX + toBase64Url(concat(raw, Uint8Array.of(0)))));
-    for (const url of ['https://relay.example.org', 'wss://', 'relay.example.org']) {
+    for (const url of [
+      'https://relay.example.org',
+      'wss://',
+      'relay.example.org',
+      'ws://relay.example.org',
+      'wss://relay.example.org/base',
+      'wss://Relay.example.org',
+      'wss://relay.example.org:443',
+      '\ufeffwss://relay.example.org',
+    ]) {
       expectCode('invite', () => encodePairingInvite({ ...invite, url }));
       const forged = concat(Uint8Array.of(utf8(url).length), utf8(url), new Uint8Array(112));
       expectCode('invite', () => parsePairingInvite(INVITE_PREFIX + toBase64Url(forged)));
@@ -482,19 +595,29 @@ describe('pairing invite', () => {
 });
 
 describe('relay', () => {
-  test('device hello and constants mirror relay.rs', () => {
-    const hello = encodeRelayHello(new Uint8Array(16).fill(1), new Uint8Array(32).fill(2));
-    expect(hello.length).toBe(50);
-    expect([hello[0], hello[1]]).toEqual([0x44, 1]);
-    expect(HELLO_OK).toEqual(Uint8Array.of(0));
+  const vectors = relayVectors();
+
+  test('device hello and constants mirror relay-v1.json', () => {
+    expect(VERSION).toBe(vectors.version);
+    expect(DEVICE_PATH).toBe(vectors.paths.device);
+    expect(HEALTH_PATH).toBe(vectors.paths.health);
+    expect(MAX_PAYLOAD).toBe(vectors.max_payload);
     expect(MAX_PAYLOAD).toBe(MAX_MESSAGE);
-    // Every close code of relay.rs, by name and value.
-    const source = readFileSync(new URL('../../crates/deck-remote/src/relay.rs', import.meta.url), 'utf8');
-    const codes = Object.fromEntries(
-      [...source.matchAll(/pub const ([A-Z_]+): u16 = (\d+);/g)].map((m) => [m[1]!, Number(m[2])]),
-    );
-    expect(Object.keys(codes).length).toBeGreaterThan(5);
-    expect(codes).toEqual({ ...CLOSE });
+    expect(toHex(HELLO_OK)).toBe(vectors.hello_ok);
+    const codes: Record<string, number> = { ...CLOSE };
+    expect(codes).toEqual(vectors.close_codes);
+    const devices = vectors.hellos.filter((h) => h.fields.role === 'device');
+    expect(devices.length).toBeGreaterThan(0);
+    for (const vector of devices) {
+      if (vector.fields.role !== 'device') continue;
+      const hello = encodeRelayHello(fromHex(vector.fields.room), fromHex(vector.fields.token));
+      expect([vector.case, toHex(hello)]).toEqual([vector.case, vector.hex!]);
+    }
     expect(() => encodeRelayHello(new Uint8Array(15), new Uint8Array(32))).toThrow();
+  });
+
+  test('any answer whose first byte is 0 accepts the hello', () => {
+    for (const hex of vectors.hello_ok_accepted) expect([hex, isHelloOk(fromHex(hex))]).toEqual([hex, true]);
+    for (const hex of vectors.hello_ok_rejected) expect([hex, isHelloOk(fromHex(hex))]).toEqual([hex, false]);
   });
 });

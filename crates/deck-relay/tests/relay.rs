@@ -678,19 +678,17 @@ async fn stalled_device(r: &Relay, gateway: &mut Ws, token: Token) -> (Ws, PeerI
     }
 }
 
-#[tokio::test]
-async fn a_slow_gateway_is_closed_and_its_devices_go_offline() {
-    let r = Relay::start(|c| {
-        c.queue_messages = 16;
-        c.device_rate = RateLimit {
-            bytes_per_sec: 1 << 30,
-            bytes_burst: 1 << 30,
-            messages_per_sec: 1 << 20,
-            messages_burst: 1 << 20,
-        };
-    })
-    .await;
-    let mut g = small_buffer_ws(&r, GATEWAY_PATH).await;
+/// Per-device inbound limits high enough that only the queue bounds matter.
+const UNLIMITED: RateLimit = RateLimit {
+    bytes_per_sec: 1 << 30,
+    bytes_burst: 1 << 30,
+    messages_per_sec: 1 << 20,
+    messages_burst: 1 << 20,
+};
+
+/// An admitted gateway with a tiny receive buffer (it stalls as soon as the test stops reading).
+async fn stalled_gateway(r: &Relay, tokens: &[Token]) -> Ws {
+    let mut g = small_buffer_ws(r, GATEWAY_PATH).await;
     send(
         &mut g,
         Hello::Gateway {
@@ -702,30 +700,287 @@ async fn a_slow_gateway_is_closed_and_its_devices_go_offline() {
     )
     .await;
     assert_eq!(recv(&mut g).await, HELLO_OK);
-    set_tokens(&mut g, &[T1]).await;
-    let (mut d, _) = r.device(&mut g, T1).await;
+    set_tokens(&mut g, tokens).await;
+    r.tokens_applied().await;
+    g
+}
+
+/// Sends maximal payloads until the relay closes `d`; returns the close code.
+async fn flood_until_closed(d: &mut Ws) -> u16 {
     let chunk = vec![3u8; MAX_PAYLOAD];
-    let mut offline = None;
     for _ in 0..1500 {
-        if let Err(e) = d.send(Message::Binary(chunk.clone().into())).await {
-            offline = Some(e);
+        if d.send(Message::Binary(chunk.clone().into())).await.is_err() {
             break;
         }
         if let Ok(Some(msg)) = timeout(Duration::ZERO, d.next()).await {
             match msg {
-                Ok(Message::Close(f)) => {
-                    assert_eq!(f.map(|f| u16::from(f.code)), Some(close::GATEWAY_OFFLINE));
-                    offline = Some(tungstenite::Error::ConnectionClosed);
-                    break;
-                }
+                Ok(Message::Close(f)) => return f.map_or(0, |f| u16::from(f.code)),
                 other => panic!("{other:?}"),
             }
         }
     }
-    if offline.is_none() {
-        assert_eq!(closed(&mut d).await, close::GATEWAY_OFFLINE);
+    closed(d).await
+}
+
+/// A gateway that stopped reading: device data fills at most 3/4 of its queue (one token's at
+/// most 1/4), then the sending device is closed `SLOW_CONSUMER` and the gateway stays. Only
+/// `Open`/`Closed` events beyond the headroom (a gateway that really is gone) drop it.
+#[tokio::test]
+async fn a_flood_toward_a_stalled_gateway_closes_the_device_not_the_gateway() {
+    let r = Relay::start(|c| {
+        c.queue_messages = 16;
+        c.device_rate = UNLIMITED;
+        // One token reconnects below: only the room's admission rate applies.
+        c.token_admissions = c.device_admissions;
+    })
+    .await;
+    let mut g = stalled_gateway(&r, &[T1]).await;
+    let (mut d, _) = r.device(&mut g, T1).await;
+    assert_eq!(flood_until_closed(&mut d).await, close::SLOW_CONSUMER);
+
+    // The gateway is still the room's gateway: devices are admitted. Each admission and leave
+    // queues an event in the headroom; once that is spent too, the gateway is dropped.
+    let mut dropped = false;
+    for _ in 0..16 {
+        let mut d = r.device_hello(T1).await;
+        match timeout(WAIT, d.next()).await.expect("hello answer") {
+            Some(Ok(Message::Binary(b))) => {
+                assert_eq!(b.to_vec(), HELLO_OK);
+                d.close(None).await.unwrap();
+                finish(d).await;
+            }
+            Some(Ok(Message::Close(Some(f)))) => {
+                assert_eq!(u16::from(f.code), close::GATEWAY_OFFLINE);
+                dropped = true;
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
     }
+    assert!(dropped, "a gateway that never reads is dropped eventually");
     assert_eq!(closed(&mut g).await, close::SLOW_CONSUMER);
+    r.stop().await.unwrap();
+}
+
+/// The review's reproduction: one device writes 1000 one-byte frames at once toward a gateway
+/// that keeps reading (production limits). The gateway is never dropped.
+#[tokio::test]
+async fn a_device_flood_never_drops_a_reading_gateway() {
+    let r = Relay::start(|_| {}).await;
+    let mut g = r.gateway(&[T1, T2]).await;
+    let (mut d, p) = r.device(&mut g, T1).await;
+    for _ in 0..1000 {
+        d.feed(Message::Binary(vec![1].into())).await.unwrap();
+    }
+    d.flush().await.unwrap();
+
+    // The gateway reads the flood (whatever part was forwarded) and still serves a new device.
+    let mut d2 = r.device_hello(T2).await;
+    let p2 = loop {
+        match FromRelay::decode(&recv(&mut g).await).unwrap() {
+            FromRelay::Data { peer, payload } => {
+                assert_eq!((peer, payload), (p, &[1u8][..]));
+            }
+            FromRelay::Closed { peer } => assert_eq!(peer, p),
+            FromRelay::Open { peer, .. } => break peer,
+        }
+    };
+    assert_eq!(recv(&mut d2).await, HELLO_OK);
+    send(&mut g, data(p2, b"still here")).await;
+    assert_eq!(recv(&mut d2).await, b"still here");
+    send(&mut d2, b"me too".to_vec()).await;
+    loop {
+        match FromRelay::decode(&recv(&mut g).await).unwrap() {
+            FromRelay::Data { peer, payload } if peer == p2 => {
+                assert_eq!(payload, b"me too");
+                break;
+            }
+            FromRelay::Data { peer, .. } | FromRelay::Closed { peer } => assert_eq!(peer, p),
+            other => panic!("{other:?}"),
+        }
+    }
+    r.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_token_admits_at_most_two_concurrent_connections() {
+    let r = Relay::start(|_| {}).await;
+    let mut g = r.gateway(&[T1, T2]).await;
+    let (mut d1, p1) = r.device(&mut g, T1).await;
+    let (_d2, _) = r.device(&mut g, T1).await;
+    let mut d3 = r.device_hello(T1).await;
+    assert_eq!(closed(&mut d3).await, close::RATE_LIMITED);
+    // Other tokens are unaffected.
+    let (_e1, _) = r.device(&mut g, T2).await;
+    // A leaving connection frees its token's slot.
+    d1.close(None).await.unwrap();
+    assert_eq!(
+        FromRelay::decode(&recv(&mut g).await).unwrap(),
+        FromRelay::Closed { peer: p1 }
+    );
+    let (_d4, _) = r.device(&mut g, T1).await;
+    r.stop().await.unwrap();
+}
+
+/// One token holder flooding a gateway that stopped reading fills at most a quarter of its queue
+/// (counted per token, across reconnects) and is closed `SLOW_CONSUMER`; another device sending
+/// afterwards is not, and its data reaches the gateway once it reads again.
+#[tokio::test]
+async fn a_flooding_token_cannot_get_another_device_closed() {
+    let r = Relay::start(|c| {
+        c.queue_messages = 16;
+        c.device_rate = UNLIMITED;
+    })
+    .await;
+    let mut g = stalled_gateway(&r, &[T1, T2]).await;
+    let (mut calm, p2) = r.device(&mut g, T2).await;
+    let (mut flood, p1) = r.device(&mut g, T1).await;
+    assert_eq!(flood_until_closed(&mut flood).await, close::SLOW_CONSUMER);
+    // Reconnecting does not reset the token's share: its queued data still counts.
+    let mut again = r.device_hello(T1).await;
+    assert_eq!(recv(&mut again).await, HELLO_OK);
+    send(&mut again, vec![3; MAX_PAYLOAD]).await;
+    assert_eq!(closed(&mut again).await, close::SLOW_CONSUMER);
+
+    // The other device still has its share of the (stalled) gateway's queue.
+    send(&mut calm, b"hello".to_vec()).await;
+    quiet(&mut calm, Duration::from_millis(300)).await;
+    loop {
+        match FromRelay::decode(&recv(&mut g).await).unwrap() {
+            FromRelay::Data { peer, payload } if peer == p2 => {
+                assert_eq!(payload, b"hello");
+                break;
+            }
+            FromRelay::Data { peer, .. } => assert_eq!(peer, p1, "only the flood is queued"),
+            FromRelay::Closed { peer } => assert_ne!(peer, p2, "the calm device was closed"),
+            FromRelay::Open { .. } => {}
+        }
+    }
+    send(&mut g, data(p2, b"still here")).await;
+    assert_eq!(recv(&mut calm).await, b"still here");
+    r.stop().await.unwrap();
+}
+
+/// Device admissions per room are rate limited (10/s, burst 20) before `Open` is queued, so
+/// connect/leave churn cannot spend a gateway's queue headroom: the excess gets `RATE_LIMITED`
+/// and a reading gateway is never dropped.
+#[tokio::test]
+async fn admission_churn_is_rate_limited_and_never_drops_a_reading_gateway() {
+    let r = Relay::start(|_| {}).await;
+    // Eight churning tokens: their own buckets (burst 4 each) together exceed the room's.
+    let churners: Vec<Token> = (10..18).map(|i| [i; 32]).collect();
+    let mut tokens = churners.clone();
+    tokens.push(T2);
+    let mut g = r.gateway(&tokens).await;
+    // The gateway keeps reading throughout; any close or error fails the test.
+    let (stop, mut stopped) = oneshot::channel::<()>();
+    let reader = tokio::spawn(async move {
+        let mut events = 0usize;
+        loop {
+            tokio::select! {
+                _ = &mut stopped => return (g, events),
+                msg = g.next() => match msg {
+                    Some(Ok(Message::Binary(b))) => {
+                        assert!(matches!(
+                            FromRelay::decode(&b).unwrap(),
+                            FromRelay::Open { .. } | FromRelay::Closed { .. }
+                        ));
+                        events += 1;
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    other => panic!("gateway: {other:?}"),
+                },
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let (mut admitted, mut limited) = (0u64, 0u64);
+    for i in 0..60 {
+        let mut d = r.device_hello(churners[i % churners.len()]).await;
+        match timeout(WAIT, d.next()).await.expect("hello answer") {
+            Some(Ok(Message::Binary(b))) => {
+                assert_eq!(b.to_vec(), HELLO_OK);
+                admitted += 1;
+                d.close(None).await.unwrap();
+            }
+            Some(Ok(Message::Close(Some(f)))) => {
+                assert_eq!(u16::from(f.code), close::RATE_LIMITED);
+                limited += 1;
+            }
+            other => panic!("{other:?}"),
+        }
+        finish(d).await;
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    assert!(
+        limited > 0,
+        "60 admissions in {elapsed:.2}s were not limited"
+    );
+    assert!(
+        admitted as f64 <= 20.0 + 10.0 * elapsed + 1.0,
+        "{admitted} admitted in {elapsed:.2}s"
+    );
+
+    // The gateway saw every admission and leave, and still serves a device once tokens refill.
+    sleep(Duration::from_millis(250)).await;
+    stop.send(()).unwrap();
+    let (mut g, _) = reader.await.unwrap();
+    let mut d = r.device_hello(T2).await;
+    assert_eq!(recv(&mut d).await, HELLO_OK);
+    let p = loop {
+        match FromRelay::decode(&recv(&mut g).await).unwrap() {
+            FromRelay::Open { peer, .. } => break peer,
+            FromRelay::Closed { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    };
+    send(&mut g, data(p, b"ok")).await;
+    assert_eq!(recv(&mut d).await, b"ok");
+    r.stop().await.unwrap();
+}
+
+/// Each token has its own admission bucket (2/s, burst 4), checked before the room's: a token
+/// holder churning connections gets `RATE_LIMITED` without spending the room's admissions, so
+/// another token's device (a reconnecting phone, a new pairing) is still admitted right away.
+#[tokio::test]
+async fn a_churning_token_cannot_starve_another_tokens_admission() {
+    let r = Relay::start(|_| {}).await;
+    let mut g = r.gateway(&[T1, T2]).await;
+    let (mut admitted, mut limited) = (0, 0);
+    for _ in 0..30 {
+        let mut d = r.device_hello(T1).await;
+        match timeout(WAIT, d.next()).await.expect("hello answer") {
+            Some(Ok(Message::Binary(b))) => {
+                assert_eq!(b.to_vec(), HELLO_OK);
+                admitted += 1;
+                d.close(None).await.unwrap();
+            }
+            Some(Ok(Message::Close(Some(f)))) => {
+                assert_eq!(u16::from(f.code), close::RATE_LIMITED);
+                limited += 1;
+            }
+            other => panic!("{other:?}"),
+        }
+        finish(d).await;
+    }
+    assert!(
+        admitted >= 4 && limited > 0,
+        "{admitted} admitted, {limited} limited"
+    );
+    // Right away, while the churning token is limited: another token is admitted.
+    let mut d = r.device_hello(T2).await;
+    assert_eq!(recv(&mut d).await, HELLO_OK);
+    let t2 = relay::hash(&T2);
+    let p = loop {
+        match FromRelay::decode(&recv(&mut g).await).unwrap() {
+            FromRelay::Open { peer, token } if token == t2 => break peer,
+            FromRelay::Open { .. } | FromRelay::Closed { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    };
+    send(&mut g, data(p, b"paired")).await;
+    assert_eq!(recv(&mut d).await, b"paired");
     r.stop().await.unwrap();
 }
 
@@ -1001,8 +1256,67 @@ async fn forwarded_for_keys_the_ip_limit_only_when_trusted() {
     let untrusted = Relay::start(|c| c.max_connections_per_ip = 1).await;
     let _a = connect(&untrusted, "198.51.100.1").await.unwrap();
     assert!(connect(&untrusted, "198.51.100.2").await.is_err());
+    drop(_a);
+
+    // Per-IP keys: IPv6 per /64, IPv4-mapped IPv6 as IPv4.
+    let _v6 = connect(&trusted, "2001:db8::1").await.unwrap();
+    assert!(connect(&trusted, "2001:db8::2").await.is_err(), "same /64");
+    let _v6b = connect(&trusted, "2001:db8:0:1::1").await.unwrap();
+    let _mapped = connect(&trusted, "::ffff:198.51.100.7").await.unwrap();
+    assert!(
+        connect(&trusted, "198.51.100.7").await.is_err(),
+        "same IPv4"
+    );
     trusted.stop().await.unwrap();
     untrusted.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn gateway_hellos_reload_rooms_only_for_unknown_rooms_at_most_once_a_second() {
+    let r = Relay::start(|_| {}).await;
+    // A room in the loaded table is admitted without re-reading rooms.json (its removal on disk
+    // is noticed by the next reload).
+    let mut first = r.gateway_with(&r.key).await;
+    assert_eq!(
+        recv(&mut first).await,
+        HELLO_OK,
+        "the relay loaded its table"
+    );
+    assert!(rooms::remove(r.state(), &relay::room_id(&r.key.room)).unwrap());
+    let mut g = r.gateway_with(&r.key).await;
+    assert_eq!(recv(&mut g).await, HELLO_OK);
+    assert_eq!(closed(&mut first).await, close::REPLACED);
+
+    // An unknown room triggers a reload…
+    let started = Instant::now();
+    let unknown = RoomKey {
+        room: [7; 16],
+        secret: [7; 32],
+    };
+    let mut u = r.gateway_with(&unknown).await;
+    assert_eq!(closed(&mut u).await, close::UNAUTHORIZED);
+    assert_eq!(
+        closed(&mut g).await,
+        close::UNAUTHORIZED,
+        "the reload saw the removal"
+    );
+    // …and the next one waits a second; hellos arriving meanwhile share it.
+    let (key, _) = rooms::enroll(r.state(), "new").unwrap();
+    let mut burst = Vec::new();
+    for _ in 0..5 {
+        burst.push(r.gateway_with(&unknown).await);
+    }
+    let mut n = r.gateway_with(&key).await;
+    assert_eq!(recv(&mut n).await, HELLO_OK);
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    for mut u in burst {
+        assert_eq!(closed(&mut u).await, close::UNAUTHORIZED);
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "one shared reload, not one per hello"
+    );
+    r.stop().await.unwrap();
 }
 
 #[tokio::test]

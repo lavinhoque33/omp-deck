@@ -19,11 +19,12 @@ use std::time::{Duration, Instant};
 
 use deck_remote::api;
 use deck_remote::noise::{
-    self, DeviceHello, Keypair, Mode, Pending, Psk, PublicKey, Session, SessionConfig, Welcome,
+    self, DeviceHello, Keypair, Mode, NoiseError, Pending, Psk, PublicKey, Session, SessionConfig,
+    Welcome,
 };
 use deck_remote::relay::{
-    self, FromRelay, GATEWAY_PATH, HELLO_OK, Hash, Hello, MAX_GATEWAY_MESSAGE, PeerId, ToRelay,
-    close,
+    self, FromRelay, GATEWAY_PATH, HELLO_OK, Hash, Hello, MAX_GATEWAY_MESSAGE, MAX_TOKENS, PeerId,
+    ToRelay, close,
 };
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::protocol::frame::CloseFrame;
@@ -43,6 +44,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// TLS, WebSocket upgrade and the relay's hello answer.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bytes tungstenite may hold unwritten for a relay that stopped reading; past it a send fails
+/// and the link is lost (instead of queueing without bound).
+const MAX_WRITE_BUFFER: usize = 4 * 1024 * 1024;
+/// Device messages wait in their outboxes while this much is unwritten: a slow uplink holds
+/// device output back instead of filling the buffer, and control frames (token sets, closes,
+/// handshake answers, pongs) always fit in the rest. One device message above it is at most
+/// [`api::MAX_APP_MESSAGE`] plus framing, well within [`MAX_WRITE_BUFFER`].
+const DEVICE_SEND_LIMIT: usize = MAX_WRITE_BUFFER / 2;
+/// The largest WebSocket header of a client frame (8-byte length, mask).
+const FRAME_HEADER: usize = 14;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// How long a stopping link that is up gets to close politely before its socket is cut.
@@ -66,17 +77,23 @@ pub enum Cmd {
     /// The full admission token set (sent now and after every hello).
     Tokens(Vec<Hash>),
     Invite(Option<Invite>),
-    /// Answer the held message 1 of `peer` with message 2. A reconnect carries the device's
-    /// application session (`device`); a pairing connection carries none (it ends after
-    /// message 2, and any record on it closes it).
+    /// Answer the held message 1 of admission `serial` (on `peer`) from device key `public`
+    /// with message 2. A reconnect carries the device's application session (`device`); a
+    /// pairing connection carries none (it ends after message 2, and any record on it closes
+    /// it). Dropped unless that admission still holds a message 1 from exactly that key: a
+    /// relay reusing the peer number never gets an answer meant for another handshake.
     Accept {
         peer: PeerId,
+        serial: u64,
+        public: PublicKey,
         welcome: Welcome,
         device: Option<Arc<DeviceOut>>,
     },
-    /// Close the device connection (the relay reports `Closed`).
+    /// Close admission `serial` (on `peer`); the relay reports `Closed`. Dropped when the
+    /// peer number now carries another admission.
     Close {
         peer: PeerId,
+        serial: u64,
         code: u16,
     },
     /// A device's queue has something ([`Link::waker`]).
@@ -87,15 +104,19 @@ pub enum Cmd {
 #[derive(Debug)]
 pub enum Event {
     Link(RelayLink),
-    /// A device was admitted with the token whose hash is `token`.
+    /// A device was admitted with the token whose hash is `token`. `serial` names this
+    /// admission (unique for the link's lifetime, across relay connections): commands for the
+    /// peer carry it. A peer number the relay opens again is reported `Closed` first.
     Opened {
         peer: PeerId,
+        serial: u64,
         token: Hash,
     },
     /// A device's message 1 verified (pairing: with the invite's PSK); its handshake is held
     /// until [`Cmd::Accept`] or [`Cmd::Close`].
     Hello {
         peer: PeerId,
+        serial: u64,
         pairing: bool,
         public: PublicKey,
         hello: DeviceHello,
@@ -182,6 +203,7 @@ impl Link {
             invite,
             pace: Pace::new(Instant::now()),
             next_peer: 0,
+            serial: 0,
         };
         let thread = std::thread::Builder::new()
             .name("gateway-relay".into())
@@ -291,6 +313,12 @@ enum Slot {
     Live(Box<Live>),
 }
 
+/// One admission the relay reported ([`Event::Opened`]).
+struct Admitted {
+    serial: u64,
+    slot: Slot,
+}
+
 /// An established session: a reconnect runs the device's application session on it.
 struct Live {
     session: Session,
@@ -309,6 +337,8 @@ struct Worker {
     pace: Pace,
     /// The device that goes first in the next flush (where the pace ran out).
     next_peer: PeerId,
+    /// The last admission serial handed out ([`Event::Opened`]).
+    serial: u64,
 }
 
 /// What one device's turn in a flush did.
@@ -485,7 +515,8 @@ impl Worker {
         };
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_GATEWAY_MESSAGE))
-            .max_frame_size(Some(MAX_GATEWAY_MESSAGE));
+            .max_frame_size(Some(MAX_GATEWAY_MESSAGE))
+            .max_write_buffer_size(MAX_WRITE_BUFFER);
         let (ws, _) = tungstenite::client_tls_with_config(
             url.endpoint(GATEWAY_PATH),
             stream,
@@ -521,7 +552,7 @@ impl Worker {
         }
         loop {
             match ws.read() {
-                Ok(Message::Binary(b)) if b[..] == HELLO_OK[..] => break,
+                Ok(Message::Binary(b)) if hello_ok(&b) => break,
                 Ok(Message::Close(frame)) => return closed_by_relay(frame, false),
                 Ok(Message::Ping(_) | Message::Pong(_)) => {}
                 Ok(_) => return lost("the relay answered the hello wrongly".into(), false),
@@ -543,10 +574,7 @@ impl Worker {
         if let Err(e) = nonblocking {
             return lost(format!("socket: {e}"), false);
         }
-        let mut conn = Conn {
-            ws,
-            peers: HashMap::new(),
-        };
+        let mut conn = Conn::new(ws);
         if let Err(e) = conn.send(&ToRelay::Tokens(self.tokens.clone())) {
             return lost(e, false);
         }
@@ -612,10 +640,9 @@ impl Worker {
         }
         // Frames a full socket buffer held back (and automatic pongs) go out now; tungstenite
         // keeps them queued in order until a flush completes.
-        match conn.ws.flush() {
+        match conn.flush() {
             Ok(()) => {}
-            Err(e) if would_block(&e) => {}
-            Err(e) => return Some(lost(format!("relay connection: {e}"), true)),
+            Err(e) => return Some(lost(e, true)),
         }
         match self.cmds.recv_timeout(POLL) {
             Ok(cmd) => self.command(conn, cmd).err().map(|e| lost(e, true)),
@@ -636,7 +663,7 @@ impl Worker {
         let peers: Vec<PeerId> = conn
             .peers
             .iter()
-            .filter(|(_, s)| matches!(s, Slot::Live(l) if l.device.is_some()))
+            .filter(|(_, a)| matches!(&a.slot, Slot::Live(l) if l.device.is_some()))
             .map(|(p, _)| *p)
             .collect();
         let mut gone: Vec<(PeerId, u64)> = Vec::new();
@@ -663,7 +690,12 @@ impl Worker {
         now: Instant,
         gone: &mut Vec<(PeerId, u64)>,
     ) -> Result<Flush, String> {
-        let Some(Slot::Live(live)) = conn.peers.get_mut(&peer) else {
+        let backlogged = conn.backlogged();
+        let Some(Admitted {
+            slot: Slot::Live(live),
+            ..
+        }) = conn.peers.get_mut(&peer)
+        else {
             return Ok(Flush::Idle);
         };
         let Some(rt) = live.device.as_mut() else {
@@ -675,6 +707,10 @@ impl Worker {
             return Ok(Flush::Idle);
         }
         if !self.pace.open(now) {
+            return Ok(Flush::Paced);
+        }
+        // The uplink is behind: this device's output waits (in order) for the next round.
+        if backlogged {
             return Ok(Flush::Paced);
         }
         let mut ended = Vec::new();
@@ -711,27 +747,52 @@ impl Worker {
             }
             Cmd::Accept {
                 peer,
+                serial,
+                public,
                 welcome,
                 device,
-            } => match conn.peers.remove(&peer) {
-                Some(Slot::Held(pending)) => match pending.accept(&welcome) {
+            } => {
+                // Only the handshake the engine decided on: same admission, same device key.
+                let held = conn.peers.get(&peer).is_some_and(|a| {
+                    a.serial == serial
+                        && matches!(&a.slot, Slot::Held(p) if *p.device_public() == public)
+                });
+                if !held {
+                    log::info!("relay peer {peer}: dropping an answer for another handshake");
+                    return Ok(());
+                }
+                let Some(Admitted {
+                    slot: Slot::Held(pending),
+                    ..
+                }) = conn.peers.remove(&peer)
+                else {
+                    return Ok(());
+                };
+                match pending.accept(&welcome) {
                     Ok((mut session, msg2)) => {
                         conn.send(&ToRelay::Data {
                             peer,
                             payload: &msg2,
                         })?;
-                        if device.is_some() {
-                            session.set_config(SessionConfig {
-                                max_message: api::MAX_APP_MESSAGE,
-                                ..*session.config()
-                            });
-                        }
+                        // A pairing session carries no records at all: its first fragment
+                        // of any size is refused before anything is buffered.
+                        let max_message = match device {
+                            Some(_) => api::MAX_APP_MESSAGE,
+                            None => 0,
+                        };
+                        session.set_config(SessionConfig {
+                            max_message,
+                            ..*session.config()
+                        });
                         conn.peers.insert(
                             peer,
-                            Slot::Live(Box::new(Live {
-                                session,
-                                device: device.map(Runtime::new),
-                            })),
+                            Admitted {
+                                serial,
+                                slot: Slot::Live(Box::new(Live {
+                                    session,
+                                    device: device.map(Runtime::new),
+                                })),
+                            },
                         );
                         Ok(())
                     }
@@ -739,15 +800,15 @@ impl Worker {
                         log::warn!("relay peer {peer}: answering failed: {e}");
                         conn.close(peer, close::UNAUTHORIZED)
                     }
-                },
-                Some(other) => {
-                    // Not waiting for an answer: leave it as it was.
-                    conn.peers.insert(peer, other);
+                }
+            }
+            Cmd::Close { peer, serial, code } => {
+                if conn.peers.get(&peer).is_some_and(|a| a.serial == serial) {
+                    conn.close(peer, code)
+                } else {
                     Ok(())
                 }
-                None => Ok(()),
-            },
-            Cmd::Close { peer, code } => conn.close(peer, code),
+            }
             Cmd::Wake => Ok(()),
         }
     }
@@ -759,8 +820,33 @@ impl Worker {
     ) -> Result<(), String> {
         match msg {
             FromRelay::Open { peer, token } => {
-                conn.peers.insert(peer, Slot::Open { token });
-                (self.events)(Event::Opened { peer, token });
+                if conn.peers.remove(&peer).is_some() {
+                    // The relay reuses a peer number it never reported closed: the old
+                    // admission is over, and commands meant for it must not reach the new one.
+                    (self.events)(Event::Closed { peer });
+                } else if conn.peers.len() >= MAX_TOKENS {
+                    // More live devices than a room can have tokens: refused, so a relay
+                    // cannot grow the gateway's per-device state without bound.
+                    log::warn!("relay peer {peer}: too many device connections; refusing it");
+                    return conn.send(&ToRelay::Close {
+                        peer,
+                        code: close::RATE_LIMITED,
+                    });
+                }
+                self.serial += 1;
+                let serial = self.serial;
+                conn.peers.insert(
+                    peer,
+                    Admitted {
+                        serial,
+                        slot: Slot::Open { token },
+                    },
+                );
+                (self.events)(Event::Opened {
+                    peer,
+                    serial,
+                    token,
+                });
                 Ok(())
             }
             FromRelay::Closed { peer } => {
@@ -768,69 +854,81 @@ impl Worker {
                 (self.events)(Event::Closed { peer });
                 Ok(())
             }
-            FromRelay::Data { peer, payload } => match conn.peers.get_mut(&peer) {
-                None => Ok(()),
-                Some(Slot::Open { token }) => {
-                    let token = *token;
-                    let psk = self
-                        .invite
-                        .as_ref()
-                        .filter(|i| i.token_hash == token)
-                        .map(|i| i.psk.clone());
-                    let mode = match &psk {
-                        Some(psk) => Mode::Pairing { psk },
-                        None => Mode::Reconnect,
-                    };
-                    match noise::respond(mode, &self.identity, payload) {
-                        Ok(pending) => {
-                            (self.events)(Event::Hello {
-                                peer,
-                                pairing: psk.is_some(),
-                                public: *pending.device_public(),
-                                hello: pending.hello().clone(),
-                            });
-                            conn.peers.insert(peer, Slot::Held(Box::new(pending)));
-                            Ok(())
-                        }
-                        Err(e) => {
-                            log::info!("relay peer {peer}: handshake refused ({e})");
-                            conn.close(peer, close::UNAUTHORIZED)
-                        }
-                    }
-                }
-                Some(Slot::Held(_)) => {
-                    log::info!("relay peer {peer}: spoke before its answer");
-                    conn.close(peer, close::PROTOCOL)
-                }
-                Some(Slot::Live(live)) => {
-                    let message = match live.session.open(payload) {
-                        Ok(Some(m)) => m,
-                        // More frames of the message follow.
-                        Ok(None) => return Ok(()),
-                        Err(e) => {
-                            log::info!("relay peer {peer}: undecryptable message ({e})");
-                            return conn.close(peer, close::UNAUTHORIZED);
-                        }
-                    };
-                    // A pairing session carries no records.
-                    let result = match live.device.as_mut() {
-                        Some(rt) => rt.receive(&message, Instant::now()),
-                        None => Err(close::APP_PROTOCOL),
-                    };
-                    match result {
-                        Ok(inbound) => {
-                            for inbound in inbound {
-                                (self.events)(Event::Device { peer, inbound });
+            FromRelay::Data { peer, payload } => {
+                let Some(Admitted { serial, slot }) = conn.peers.get_mut(&peer) else {
+                    return Ok(());
+                };
+                let serial = *serial;
+                match slot {
+                    Slot::Open { token } => {
+                        let token = *token;
+                        let psk = self
+                            .invite
+                            .as_ref()
+                            .filter(|i| i.token_hash == token)
+                            .map(|i| i.psk.clone());
+                        let mode = match &psk {
+                            Some(psk) => Mode::Pairing { psk },
+                            None => Mode::Reconnect,
+                        };
+                        match noise::respond(mode, &self.identity, payload) {
+                            Ok(pending) => {
+                                (self.events)(Event::Hello {
+                                    peer,
+                                    serial,
+                                    pairing: psk.is_some(),
+                                    public: *pending.device_public(),
+                                    hello: pending.hello().clone(),
+                                });
+                                *slot = Slot::Held(Box::new(pending));
+                                Ok(())
                             }
-                            Ok(())
+                            Err(NoiseError::UnsupportedVersion) => {
+                                // A newer device: it keeps its pairing and is told to wait for
+                                // a gateway that speaks its handshake.
+                                log::info!("relay peer {peer}: unsupported handshake version");
+                                conn.close(peer, close::UPGRADE_REQUIRED)
+                            }
+                            Err(e) => {
+                                log::info!("relay peer {peer}: handshake refused ({e})");
+                                conn.close(peer, close::UNAUTHORIZED)
+                            }
                         }
-                        Err(code) => {
-                            log::info!("relay peer {peer}: unreadable application message");
-                            conn.close(peer, code)
+                    }
+                    Slot::Held(_) => {
+                        log::info!("relay peer {peer}: spoke before its answer");
+                        conn.close(peer, close::PROTOCOL)
+                    }
+                    Slot::Live(live) => {
+                        let message = match live.session.open(payload) {
+                            Ok(Some(m)) => m,
+                            // More frames of the message follow.
+                            Ok(None) => return Ok(()),
+                            Err(e) => {
+                                log::info!("relay peer {peer}: undecryptable message ({e})");
+                                return conn.close(peer, close::UNAUTHORIZED);
+                            }
+                        };
+                        // A pairing session carries no records.
+                        let result = match live.device.as_mut() {
+                            Some(rt) => rt.receive(&message, Instant::now()),
+                            None => Err(close::APP_PROTOCOL),
+                        };
+                        match result {
+                            Ok(inbound) => {
+                                for inbound in inbound {
+                                    (self.events)(Event::Device { peer, inbound });
+                                }
+                                Ok(())
+                            }
+                            Err(code) => {
+                                log::info!("relay peer {peer}: unreadable application message");
+                                conn.close(peer, code)
+                            }
                         }
                     }
                 }
-            },
+            }
         }
     }
 }
@@ -839,10 +937,26 @@ impl Worker {
 /// by a scripted stream in tests.
 struct Conn<S: Read + Write = MaybeTlsStream<TcpStream>> {
     ws: WebSocket<S>,
-    peers: HashMap<PeerId, Slot>,
+    peers: HashMap<PeerId, Admitted>,
+    /// Frame bytes queued since the write buffer was last seen empty: at least what tungstenite
+    /// still holds unwritten (it has no accessor for that), never less.
+    unflushed: usize,
 }
 
 impl<S: Read + Write> Conn<S> {
+    fn new(ws: WebSocket<S>) -> Conn<S> {
+        Conn {
+            ws,
+            peers: HashMap::new(),
+            unflushed: 0,
+        }
+    }
+
+    /// Device output must wait for the uplink.
+    fn backlogged(&self) -> bool {
+        self.unflushed >= DEVICE_SEND_LIMIT
+    }
+
     /// Queues a message and pushes it out as far as the socket takes it. `WouldBlock` is not a
     /// loss: tungstenite keeps the unwritten bytes (`write_out_buffer` drains only what was
     /// written) and the next round's flush continues them in order.
@@ -850,8 +964,27 @@ impl<S: Read + Write> Conn<S> {
         let bytes = msg
             .encode()
             .map_err(|e| format!("encoding a relay message: {e}"))?;
+        let len = bytes.len() + FRAME_HEADER;
         match self.ws.send(Message::binary(bytes)) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.unflushed = 0;
+                Ok(())
+            }
+            Err(e) if would_block(&e) => {
+                self.unflushed += len;
+                Ok(())
+            }
+            Err(e) => Err(format!("relay connection: {e}")),
+        }
+    }
+
+    /// Writes what is queued (frames a full socket held back, automatic pongs).
+    fn flush(&mut self) -> Result<(), String> {
+        match self.ws.flush() {
+            Ok(()) => {
+                self.unflushed = 0;
+                Ok(())
+            }
             Err(e) if would_block(&e) => Ok(()),
             Err(e) => Err(format!("relay connection: {e}")),
         }
@@ -870,6 +1003,12 @@ impl<S: Read + Write> Conn<S> {
         }));
         let _ = self.ws.flush();
     }
+}
+
+/// The relay accepted the hello: `HELLO_OK`'s first byte; trailing bytes are reserved for relay
+/// capabilities.
+fn hello_ok(answer: &[u8]) -> bool {
+    answer.first() == HELLO_OK.first()
 }
 
 fn lost(reason: String, up: bool) -> End {
@@ -1120,13 +1259,15 @@ mod tests {
     }
 
     /// A non-blocking socket double: reads hand out scripted bytes, then `WouldBlock`; writes
-    /// take at most `chunk` bytes and refuse every other call with `WouldBlock`.
+    /// take at most `chunk` bytes and refuse every other call with `WouldBlock` (every call
+    /// while `stuck`: an uplink that takes nothing).
     #[derive(Default)]
     struct Wire {
         inbound: std::collections::VecDeque<u8>,
         outbound: Vec<u8>,
         writes: usize,
         chunk: usize,
+        stuck: bool,
     }
 
     struct Scripted(Arc<Mutex<Wire>>);
@@ -1149,7 +1290,7 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             let mut w = self.0.lock().unwrap();
             w.writes += 1;
-            if w.writes % 2 == 1 {
+            if w.stuck || w.writes % 2 == 1 {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
             let n = buf.len().min(w.chunk);
@@ -1189,20 +1330,26 @@ mod tests {
         out
     }
 
-    #[test]
-    fn queued_sends_survive_would_block_reads_and_writes_and_routing_continues() {
+    /// A worker routing over a scripted socket (writes up to `chunk` bytes at a time).
+    struct Routed {
+        worker: Worker,
+        conn: Conn<Scripted>,
+        wire: Arc<Mutex<Wire>>,
+        cmds: std::sync::mpsc::Sender<Cmd>,
+        events: Receiver<Event>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn routed(identity: Keypair, chunk: usize) -> Routed {
         let wire = Arc::new(Mutex::new(Wire {
-            chunk: 16,
+            chunk,
             ..Wire::default()
         }));
-        let mut conn = Conn {
-            ws: WebSocket::from_raw_socket(
-                Scripted(wire.clone()),
-                tungstenite::protocol::Role::Client,
-                None,
-            ),
-            peers: HashMap::new(),
-        };
+        let conn = Conn::new(WebSocket::from_raw_socket(
+            Scripted(wire.clone()),
+            tungstenite::protocol::Role::Client,
+            None,
+        ));
         let (cmds_tx, cmds) = std::sync::mpsc::channel();
         let (events_tx, events) = std::sync::mpsc::channel();
         let dir = tempfile::tempdir().unwrap();
@@ -1210,9 +1357,9 @@ mod tests {
             room: [1; 16],
             secret: [2; 32],
         };
-        let mut worker = Worker {
+        let worker = Worker {
             relay: RelayConfig::new("ws://127.0.0.1:9", &key.encode()).unwrap(),
-            identity: Keypair::generate().unwrap(),
+            identity,
             epochs: Arc::new(Mutex::new(Epochs::load(&dir.path().join("epoch")))),
             cmds,
             shared: Arc::new(Shared {
@@ -1222,35 +1369,90 @@ mod tests {
                 woken: AtomicBool::new(false),
             }),
             events: Box::new(move |e| {
-                let _ = events_tx.send(format!("{e:?}"));
+                let _ = events_tx.send(e);
             }),
             tokens: Vec::new(),
             invite: None,
             pace: Pace::new(Instant::now()),
             next_peer: 0,
+            serial: 0,
         };
-        let rounds = |worker: &mut Worker, conn: &mut Conn<Scripted>, n: usize| {
+        Routed {
+            worker,
+            conn,
+            wire,
+            cmds: cmds_tx,
+            events,
+            _dir: dir,
+        }
+    }
+
+    impl Routed {
+        fn rounds(&mut self, n: usize) {
             for _ in 0..n {
-                assert!(worker.pump(conn).is_none(), "the connection ended");
+                assert!(
+                    self.worker.pump(&mut self.conn).is_none(),
+                    "the connection ended"
+                );
             }
-        };
-        // Rounds until the relay has `want` messages (each round moves one chunk at most).
-        let deliver = |worker: &mut Worker, conn: &mut Conn<Scripted>, want: usize| {
+        }
+
+        /// Rounds until the relay has `want` messages (each round moves one chunk at most).
+        fn deliver(&mut self, want: usize) {
             for _ in 0..400 {
-                if received(&wire).len() >= want {
+                if received(&self.wire).len() >= want {
                     return;
                 }
-                assert!(worker.pump(conn).is_none(), "the connection ended");
+                self.rounds(1);
             }
-        };
+        }
 
+        fn relay_sends(&mut self, msgs: &[FromRelay<'_>]) {
+            self.wire.lock().unwrap().inbound.extend(relay_frames(msgs));
+            self.rounds(1);
+        }
+
+        fn events(&self) -> Vec<Event> {
+            self.events.try_iter().collect()
+        }
+    }
+
+    fn device_hello() -> DeviceHello {
+        DeviceHello {
+            name: "Pixel".into(),
+            platform: "test".into(),
+            ts: 5,
+            api: 1,
+            features: Vec::new(),
+        }
+    }
+
+    /// A paired device's message 1 to `gateway`, from a fresh key.
+    fn reconnect_msg1(gateway: &PublicKey) -> (Keypair, noise::Initiator, Vec<u8>) {
+        let device = Keypair::generate().unwrap();
+        let (init, msg1) =
+            noise::Initiator::start(Mode::Reconnect, &device, gateway, &device_hello()).unwrap();
+        (device, init, msg1)
+    }
+
+    fn welcome() -> Welcome {
+        Welcome {
+            device: "d-1".into(),
+            gateway: "desk".into(),
+            token: None,
+        }
+    }
+
+    #[test]
+    fn queued_sends_survive_would_block_reads_and_writes_and_routing_continues() {
+        let mut r = routed(Keypair::generate().unwrap(), 16);
         // The first token set's write is refused (WouldBlock) mid-send: not a loss.
-        cmds_tx.send(Cmd::Tokens(vec![[7; 32]])).unwrap();
-        rounds(&mut worker, &mut conn, 1);
+        r.cmds.send(Cmd::Tokens(vec![[7; 32]])).unwrap();
+        r.rounds(1);
         // Nothing to read in between (WouldBlock reads) and a second set queued behind it.
-        cmds_tx.send(Cmd::Tokens(vec![[7; 32], [8; 32]])).unwrap();
-        deliver(&mut worker, &mut conn, 2);
-        let sent = received(&wire);
+        r.cmds.send(Cmd::Tokens(vec![[7; 32], [8; 32]])).unwrap();
+        r.deliver(2);
+        let sent = received(&r.wire);
         assert_eq!(sent.len(), 2, "{sent:?}");
         assert!(sent[0].starts_with("Tokens") && sent[1].starts_with("Tokens"));
         assert!(
@@ -1259,32 +1461,382 @@ mod tests {
         );
 
         // Inbound routing still works after all of that.
-        wire.lock()
-            .unwrap()
-            .inbound
-            .extend(relay_frames(&[FromRelay::Open {
-                peer: 3,
-                token: [7; 32],
-            }]));
-        rounds(&mut worker, &mut conn, 1);
-        let opened = events.try_iter().collect::<Vec<_>>();
-        assert!(
-            opened
-                .iter()
-                .any(|e| e.contains("Opened") && e.contains("peer: 3")),
-            "{opened:?}"
-        );
+        r.relay_sends(&[FromRelay::Open {
+            peer: 3,
+            token: [7; 32],
+        }]);
+        let opened = r.events();
+        let Some(Event::Opened {
+            peer: 3, serial, ..
+        }) = opened.first()
+        else {
+            panic!("{opened:?}");
+        };
         // And so do sends after it.
-        cmds_tx
+        r.cmds
             .send(Cmd::Close {
                 peer: 3,
+                serial: *serial,
                 code: close::UNAUTHORIZED,
             })
             .unwrap();
-        deliver(&mut worker, &mut conn, 3);
-        let sent = received(&wire);
+        r.deliver(3);
+        let sent = received(&r.wire);
         assert_eq!(sent.len(), 3, "{sent:?}");
         assert!(sent[2].starts_with("Close"), "{sent:?}");
+    }
+
+    #[test]
+    fn a_reused_peer_number_never_gets_an_answer_or_close_meant_for_another_handshake() {
+        let gateway = Keypair::generate().unwrap();
+        let gateway_public = *gateway.public();
+        let mut r = routed(gateway, 1 << 20);
+        let (device_a, _, msg1_a) = reconnect_msg1(&gateway_public);
+        r.relay_sends(&[
+            FromRelay::Open {
+                peer: 3,
+                token: [7; 32],
+            },
+            FromRelay::Data {
+                peer: 3,
+                payload: &msg1_a,
+            },
+        ]);
+        let first = r.events();
+        let [
+            Event::Opened {
+                peer: 3,
+                serial: s1,
+                ..
+            },
+            Event::Hello {
+                serial: h1, public, ..
+            },
+        ] = &first[..]
+        else {
+            panic!("{first:?}");
+        };
+        assert_eq!((h1, public), (s1, device_a.public()));
+
+        // The relay opens peer 3 again (never reporting it closed) with another key's message 1
+        // before the engine's answer for device A arrives.
+        let (device_x, init_x, msg1_x) = reconnect_msg1(&gateway_public);
+        r.relay_sends(&[
+            FromRelay::Open {
+                peer: 3,
+                token: [7; 32],
+            },
+            FromRelay::Data {
+                peer: 3,
+                payload: &msg1_x,
+            },
+        ]);
+        let second = r.events();
+        let [
+            Event::Closed { peer: 3 },
+            Event::Opened { serial: s2, .. },
+            Event::Hello {
+                serial: h2,
+                public: px,
+                ..
+            },
+        ] = &second[..]
+        else {
+            panic!("the old admission is reported closed first: {second:?}");
+        };
+        assert!(s2 > s1 && h2 == s2 && px == device_x.public());
+
+        // Device A's answer and close, under its admission or with its key, reach nothing.
+        for (serial, public) in [(*s1, *device_a.public()), (*s2, *device_a.public())] {
+            r.cmds
+                .send(Cmd::Accept {
+                    peer: 3,
+                    serial,
+                    public,
+                    welcome: welcome(),
+                    device: None,
+                })
+                .unwrap();
+        }
+        r.cmds
+            .send(Cmd::Close {
+                peer: 3,
+                serial: *s1,
+                code: close::UNAUTHORIZED,
+            })
+            .unwrap();
+        r.rounds(4);
+        assert!(received(&r.wire).is_empty(), "{:?}", received(&r.wire));
+
+        // The answer for the handshake actually held completes it.
+        r.cmds
+            .send(Cmd::Accept {
+                peer: 3,
+                serial: *s2,
+                public: *device_x.public(),
+                welcome: welcome(),
+                device: None,
+            })
+            .unwrap();
+        r.deliver(1);
+        let sent = received(&r.wire);
+        assert!(
+            sent.len() == 1 && sent[0].starts_with("Data { peer: 3"),
+            "{sent:?}"
+        );
+        // Message 2 is device X's.
+        let msg2 = {
+            let bytes = r.wire.lock().unwrap().outbound.clone();
+            let mut ws = WebSocket::from_raw_socket(
+                io::Cursor::new(bytes),
+                tungstenite::protocol::Role::Server,
+                None,
+            );
+            let Ok(Message::Binary(b)) = ws.read() else {
+                panic!("no frame");
+            };
+            let ToRelay::Data { payload, .. } = ToRelay::decode(&b).unwrap() else {
+                panic!("not data");
+            };
+            payload.to_vec()
+        };
+        assert!(init_x.finish(&msg2).is_ok());
+    }
+
+    #[test]
+    fn device_connections_beyond_the_token_cap_are_refused() {
+        let mut r = routed(Keypair::generate().unwrap(), 1 << 20);
+        let opens: Vec<FromRelay<'_>> = (0..=MAX_TOKENS as u32)
+            .map(|peer| FromRelay::Open {
+                peer,
+                token: [7; 32],
+            })
+            .collect();
+        r.relay_sends(&opens);
+        let opened = r
+            .events()
+            .iter()
+            .filter(|e| matches!(e, Event::Opened { .. }))
+            .count();
+        assert_eq!(opened, MAX_TOKENS);
+        assert_eq!(r.conn.peers.len(), MAX_TOKENS);
+        r.deliver(1);
+        let sent = received(&r.wire);
+        assert_eq!(
+            sent,
+            [format!(
+                "Close {{ peer: {MAX_TOKENS}, code: {} }}",
+                close::RATE_LIMITED
+            )]
+        );
+        // A peer number already admitted may still be opened again at the cap.
+        r.relay_sends(&[FromRelay::Open {
+            peer: 0,
+            token: [7; 32],
+        }]);
+        assert!(matches!(
+            &r.events()[..],
+            [Event::Closed { peer: 0 }, Event::Opened { peer: 0, .. }]
+        ));
+        assert_eq!(r.conn.peers.len(), MAX_TOKENS);
+    }
+
+    #[test]
+    fn a_pairing_session_refuses_its_first_application_byte() {
+        let gateway = Keypair::generate().unwrap();
+        let gateway_public = *gateway.public();
+        let mut r = routed(gateway, 1 << 20);
+        let (device, init, msg1) = reconnect_msg1(&gateway_public);
+        r.relay_sends(&[
+            FromRelay::Open {
+                peer: 3,
+                token: [7; 32],
+            },
+            FromRelay::Data {
+                peer: 3,
+                payload: &msg1,
+            },
+        ]);
+        let Some(Event::Opened { serial, .. }) = r.events().into_iter().next() else {
+            panic!("not opened");
+        };
+        // No application session: the pairing connection's answer.
+        r.cmds
+            .send(Cmd::Accept {
+                peer: 3,
+                serial,
+                public: *device.public(),
+                welcome: welcome(),
+                device: None,
+            })
+            .unwrap();
+        r.deliver(1);
+        let Some(Admitted {
+            slot: Slot::Live(live),
+            ..
+        }) = r.conn.peers.get(&3)
+        else {
+            panic!("not live");
+        };
+        assert_eq!(live.session.config().max_message, 0);
+        let msg2 = {
+            let bytes = r.wire.lock().unwrap().outbound.clone();
+            let mut ws = WebSocket::from_raw_socket(
+                io::Cursor::new(bytes),
+                tungstenite::protocol::Role::Server,
+                None,
+            );
+            let Ok(Message::Binary(b)) = ws.read() else {
+                panic!("no frame");
+            };
+            let ToRelay::Data { payload, .. } = ToRelay::decode(&b).unwrap() else {
+                panic!("not data");
+            };
+            payload.to_vec()
+        };
+        let (mut session, _) = init.finish(&msg2).unwrap();
+        // The first fragment of a large message is refused before anything is buffered.
+        let frames = session.seal(&vec![0u8; 3 * 65_536]).unwrap();
+        r.relay_sends(&[FromRelay::Data {
+            peer: 3,
+            payload: &frames[0],
+        }]);
+        assert!(r.conn.peers.is_empty());
+        r.deliver(2);
+        assert!(received(&r.wire)[1].starts_with("Close { peer: 3"));
+    }
+
+    #[test]
+    fn a_newer_handshake_version_is_told_to_upgrade() {
+        let gateway = Keypair::generate().unwrap();
+        let gateway_public = *gateway.public();
+        let mut r = routed(gateway, 1 << 20);
+        // Message 1 as a device speaking handshake payload v2 writes it.
+        let device = Keypair::generate().unwrap();
+        let mut init = snow::Builder::new(noise::RECONNECT_PATTERN.parse().unwrap())
+            .prologue(noise::PROLOGUE)
+            .unwrap()
+            .local_private_key(device.secret_bytes())
+            .unwrap()
+            .remote_public_key(&gateway_public)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut msg1 = vec![0u8; 1024];
+        let len = init
+            .write_message(
+                br#"{"v":2,"name":"Pixel","platform":"android","ts":5}"#,
+                &mut msg1,
+            )
+            .unwrap();
+        msg1.truncate(len);
+        r.relay_sends(&[
+            FromRelay::Open {
+                peer: 3,
+                token: [7; 32],
+            },
+            FromRelay::Data {
+                peer: 3,
+                payload: &msg1,
+            },
+        ]);
+        assert!(
+            !r.events().iter().any(|e| matches!(e, Event::Hello { .. })),
+            "never offered to the engine"
+        );
+        r.deliver(1);
+        assert_eq!(
+            received(&r.wire),
+            [format!(
+                "Close {{ peer: 3, code: {} }}",
+                close::UPGRADE_REQUIRED
+            )]
+        );
+    }
+
+    #[test]
+    fn a_slow_uplink_holds_device_output_back_instead_of_dropping_the_link() {
+        let gateway = Keypair::generate().unwrap();
+        let gateway_public = *gateway.public();
+        let mut r = routed(gateway, 1 << 20);
+        // The relay stops reading.
+        r.wire.lock().unwrap().stuck = true;
+        let mut outs = Vec::new();
+        for peer in 1..=6 {
+            let (device, _, msg1) = reconnect_msg1(&gateway_public);
+            r.relay_sends(&[
+                FromRelay::Open {
+                    peer,
+                    token: [7; 32],
+                },
+                FromRelay::Data {
+                    peer,
+                    payload: &msg1,
+                },
+            ]);
+            let Some(Event::Opened { serial, .. }) = r.events().into_iter().next() else {
+                panic!("not opened");
+            };
+            let out = DeviceOut::new(Arc::new(|| {}), Arc::new(|| {}));
+            // Close to a full window of output each: together far beyond the write buffer.
+            for i in 0..2 {
+                out.feed(
+                    &api::Feed::Sessions {
+                        project: format!("p{i}"),
+                        limit: 1,
+                    },
+                    vec![b'x'; 900_000],
+                );
+            }
+            r.cmds
+                .send(Cmd::Accept {
+                    peer,
+                    serial,
+                    public: *device.public(),
+                    welcome: welcome(),
+                    device: Some(out.clone()),
+                })
+                .unwrap();
+            outs.push(out);
+        }
+        // A few seconds of egress credit: every round must keep the link.
+        for _ in 0..40 {
+            r.rounds(1);
+            assert!(r.conn.unflushed < MAX_WRITE_BUFFER);
+        }
+        assert!(r.conn.backlogged(), "output reached the limit");
+        assert!(
+            outs.iter().any(|o| o.feed_pending(&api::Feed::Sessions {
+                project: "p0".into(),
+                limit: 1,
+            })),
+            "some device output is still waiting in its outbox"
+        );
+        // Control frames still go out while device output waits.
+        r.cmds.send(Cmd::Tokens(vec![[9; 32]])).unwrap();
+        r.rounds(1);
+        // The relay reads again: everything queued drains and output resumes.
+        r.wire.lock().unwrap().stuck = false;
+        for _ in 0..40 {
+            r.rounds(1);
+        }
+        assert!(!r.conn.backlogged());
+        let sent = received(&r.wire);
+        assert!(
+            sent.iter().any(|m| m.starts_with("Tokens")),
+            "{}",
+            sent.len()
+        );
+        let data = sent.iter().filter(|m| m.starts_with("Data")).count();
+        // 6 handshake answers plus at least one output message per device.
+        assert!(data >= 12, "{data} data frames");
+    }
+
+    #[test]
+    fn a_hello_answer_with_trailing_capability_bytes_is_accepted() {
+        assert!(hello_ok(&HELLO_OK));
+        assert!(hello_ok(&[0, 1, 2]));
+        assert!(!hello_ok(&[1]) && !hello_ok(&[]) && !hello_ok(&[1, 0]));
     }
 
     #[test]

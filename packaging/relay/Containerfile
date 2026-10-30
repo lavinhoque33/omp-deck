@@ -1,8 +1,13 @@
 # omp-deck-relay container (docs/relay.md). Build from the repository root:
 #   podman build -f packaging/relay/Containerfile -t omp-deck-relay .
-# Run (plain HTTP on 8080 behind a TLS proxy; rooms.json lives in the volume):
+# Run (plain HTTP on 8080 behind a TLS proxy on the host; rooms.json lives in the volume). The
+# proxy's connections reach the relay from the container network's gateway (podman's default
+# bridge: 10.88.0.1, docker's: 172.17.0.1), so trust X-Forwarded-For from that address only;
+# without it every client shares the proxy's per-IP limit (docs/relay.md):
 #   podman run -d --name omp-deck-relay -p 127.0.0.1:8080:8080 \
-#     -v omp-deck-relay:/var/lib/omp-deck-relay omp-deck-relay
+#     -v omp-deck-relay:/var/lib/omp-deck-relay omp-deck-relay \
+#     serve --listen 0.0.0.0:8080 --state-dir /var/lib/omp-deck-relay \
+#     --trust-forwarded-for --trusted-proxy 10.88.0.1
 # Enroll a room:
 #   podman exec omp-deck-relay omp-deck-relay enroll --state-dir /var/lib/omp-deck-relay --label phone
 

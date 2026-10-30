@@ -19,16 +19,17 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Sleep;
 
 use crate::Config;
+use crate::config::{ProxyRange, canonical, is_proxy};
 use crate::tls::TlsListener;
 
 /// The connection counters behind `--max-connections` and `--max-connections-per-ip`.
 pub(crate) struct Limits {
     max_total: usize,
     max_per_ip: usize,
-    /// Without `--trust-forwarded-for` the per-IP limit keys on the socket peer and is enforced at
-    /// accept; with it the socket peer is the proxy, so the per-IP slot is taken at the upgrade
-    /// for the forwarded address instead ([`Limits::forwarded`]).
-    per_ip_at_accept: bool,
+    /// With `--trust-forwarded-for`: the proxies (besides loopback) whose connections take their
+    /// per-IP slot at the upgrade, for the forwarded address ([`Limits::upgrade`]). Every other
+    /// connection is keyed on its socket peer at accept.
+    proxies: Option<Vec<ProxyRange>>,
     counts: Mutex<Counts>,
 }
 
@@ -38,12 +39,23 @@ struct Counts {
     total: usize,
 }
 
+/// The per-IP key of a client address: IPv4 as is (IPv4-mapped IPv6 included), IPv6 by its /64
+/// (one subscriber's allocation; per-address keys would give one attacker 2^64 "clients").
+pub(crate) fn limit_key(ip: IpAddr) -> IpAddr {
+    match canonical(ip) {
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !(u128::MAX >> 64)).into()),
+        v4 => v4,
+    }
+}
+
 impl Limits {
     pub fn new(config: &Config) -> Arc<Limits> {
         Arc::new(Limits {
             max_total: config.max_connections,
             max_per_ip: config.max_connections_per_ip,
-            per_ip_at_accept: !config.trust_forwarded_for,
+            proxies: config
+                .trust_forwarded_for
+                .then(|| config.trusted_proxies.clone()),
             counts: Mutex::new(Counts::default()),
         })
     }
@@ -52,19 +64,26 @@ impl Limits {
         self.counts.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn proxied(&self, peer: IpAddr) -> bool {
+        self.proxies
+            .as_deref()
+            .is_some_and(|ranges| is_proxy(ranges, peer))
+    }
+
     /// The slot of a freshly accepted TCP connection from `peer`; `None`: over a cap.
     pub fn accept(self: &Arc<Self>, peer: IpAddr) -> Option<Slot> {
-        let ip = self.per_ip_at_accept.then_some(peer);
+        let ip = (!self.proxied(peer)).then(|| limit_key(peer));
         self.reserve(true, ip)
     }
 
-    /// With `--trust-forwarded-for`: the per-IP slot of the forwarded client address (`None`:
-    /// over the cap). Without it the accept slot already covers the address.
-    pub fn forwarded(self: &Arc<Self>, ip: IpAddr) -> Option<Option<Slot>> {
-        if self.per_ip_at_accept {
+    /// At the WebSocket upgrade of a connection from `peer` for `client` (the forwarded address,
+    /// or `peer`): the per-IP slot of a trusted proxy's client (`None`: over the cap). Other
+    /// connections are covered by their accept slot.
+    pub fn upgrade(self: &Arc<Self>, peer: IpAddr, client: IpAddr) -> Option<Option<Slot>> {
+        if !self.proxied(peer) {
             return Some(None);
         }
-        self.reserve(false, Some(ip)).map(Some)
+        self.reserve(false, Some(limit_key(client))).map(Some)
     }
 
     fn reserve(self: &Arc<Self>, total: bool, ip: Option<IpAddr>) -> Option<Slot> {
@@ -291,6 +310,56 @@ impl Listener for Plain {
 pub(crate) fn refuse(addr: SocketAddr) {
     log::warn!(
         "refusing connection from {}: too many connections",
-        addr.ip()
+        canonical(addr.ip())
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn per_ip_keys_fold_mapped_ipv4_and_ipv6_slash_64() {
+        assert_eq!(limit_key(ip("::ffff:198.51.100.7")), ip("198.51.100.7"));
+        assert_eq!(limit_key(ip("198.51.100.7")), ip("198.51.100.7"));
+        assert_eq!(limit_key(ip("2001:db8:1:2:aaaa::1")), ip("2001:db8:1:2::"));
+        assert_eq!(
+            limit_key(ip("2001:db8:1:2:ffff:ffff:ffff:ffff")),
+            ip("2001:db8:1:2::")
+        );
+        assert_ne!(limit_key(ip("2001:db8:1:3::1")), ip("2001:db8:1:2::"));
+    }
+
+    #[test]
+    fn only_trusted_proxies_skip_the_per_ip_check_at_accept() {
+        let mut config = Config::new("x");
+        config.max_connections_per_ip = 1;
+        config.trust_forwarded_for = true;
+        config.trusted_proxies = vec!["10.88.0.1".parse().unwrap()];
+        let limits = Limits::new(&config);
+        // Proxies: the per-IP slot waits for the forwarded address.
+        let _a = limits.accept(ip("127.0.0.1")).unwrap();
+        let _b = limits.accept(ip("127.0.0.1")).unwrap();
+        let _c = limits.accept(ip("10.88.0.1")).unwrap();
+        let _d = limits.accept(ip("::ffff:10.88.0.1")).unwrap();
+        let _f = limits.upgrade(ip("10.88.0.1"), ip("203.0.113.1")).unwrap();
+        assert!(limits.upgrade(ip("127.0.0.1"), ip("203.0.113.1")).is_none());
+        // Anyone else is keyed on the socket address at accept, whatever header it sends.
+        let direct = limits.accept(ip("198.51.100.7")).unwrap();
+        assert!(limits.accept(ip("::ffff:198.51.100.7")).is_none());
+        assert!(matches!(
+            limits.upgrade(ip("198.51.100.7"), ip("203.0.113.9")),
+            Some(None)
+        ));
+        drop(direct);
+        assert!(limits.accept(ip("198.51.100.7")).is_some());
+        // IPv6: one slot per /64.
+        let _v6 = limits.accept(ip("2001:db8::1")).unwrap();
+        assert!(limits.accept(ip("2001:db8::2")).is_none());
+        assert!(limits.accept(ip("2001:db8:0:1::1")).is_some());
+    }
 }

@@ -1,0 +1,1127 @@
+{
+  "description": "DeviceHello acceptance shared by deck_remote::noise and pwa/src/remote/protocol.ts. `display_safe`: noise::is_display_safe / isDisplaySafe on `text`. `hello`: message-1 payloads as UTF-8 text; an accepted one decodes to `expect` and re-encodes to exactly `encoded`; a rejected one fails with `error` (`payload` or `unsupported_version`). Hand-maintained (see README.md).",
+  "display_safe": [
+    {
+      "case": "empty",
+      "text": "",
+      "safe": true
+    },
+    {
+      "case": "ascii",
+      "text": "Pixel 8 Pro",
+      "safe": true
+    },
+    {
+      "case": "punctuation",
+      "text": "Zo\u00eb's phone (work) #2 <x> & \"y\" \\ /",
+      "safe": true
+    },
+    {
+      "case": "cjk",
+      "text": "\u65e5\u672c\u8a9e\u306e\u96fb\u8a71",
+      "safe": true
+    },
+    {
+      "case": "rtl letters without controls",
+      "text": "\u0647\u0627\u062a\u0641",
+      "safe": true
+    },
+    {
+      "case": "emoji",
+      "text": "\ud83d\udcf1\ud83d\ude00",
+      "safe": true
+    },
+    {
+      "case": "zwj emoji sequence",
+      "text": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67",
+      "safe": false
+    },
+    {
+      "case": "flag (regional indicators)",
+      "text": "\ud83c\udde9\ud83c\uddea",
+      "safe": true
+    },
+    {
+      "case": "variation selector",
+      "text": "\u2764\ufe0f",
+      "safe": true
+    },
+    {
+      "case": "combining mark",
+      "text": "e\u0301",
+      "safe": true
+    },
+    {
+      "case": "private use and plane 16",
+      "text": "\ue000\udbff\udfff",
+      "safe": true
+    },
+    {
+      "case": "language tag (not listed)",
+      "text": "a\udb40\udc01b",
+      "safe": true
+    },
+    {
+      "case": "replacement char",
+      "text": "\ufffd",
+      "safe": true
+    },
+    {
+      "case": "object replacement",
+      "text": "\ufffc",
+      "safe": true
+    },
+    {
+      "case": "nbsp",
+      "text": "a\u00a0b",
+      "safe": true
+    },
+    {
+      "case": "narrow nbsp",
+      "text": "a\u202fb",
+      "safe": true
+    },
+    {
+      "case": "hair space",
+      "text": "a\u200ab",
+      "safe": true
+    },
+    {
+      "case": "fingerprint spoof platform",
+      "text": "\n\n\n1a2b-3c4d",
+      "safe": false
+    },
+    {
+      "case": "right-to-left override",
+      "text": "abc\u202edcba",
+      "safe": false
+    },
+    {
+      "case": "U+0000 between letters",
+      "text": "a\u0000b",
+      "safe": false
+    },
+    {
+      "case": "U+000F between letters",
+      "text": "a\u000fb",
+      "safe": false
+    },
+    {
+      "case": "U+001F between letters",
+      "text": "a\u001fb",
+      "safe": false
+    },
+    {
+      "case": "U+0020 (neighbour, safe)",
+      "text": "a b",
+      "safe": true
+    },
+    {
+      "case": "U+007F between letters",
+      "text": "a\u007fb",
+      "safe": false
+    },
+    {
+      "case": "U+008F between letters",
+      "text": "a\u008fb",
+      "safe": false
+    },
+    {
+      "case": "U+009F between letters",
+      "text": "a\u009fb",
+      "safe": false
+    },
+    {
+      "case": "U+007E (neighbour, safe)",
+      "text": "a~b",
+      "safe": true
+    },
+    {
+      "case": "U+00A0 (neighbour, safe)",
+      "text": "a\u00a0b",
+      "safe": true
+    },
+    {
+      "case": "U+00AD between letters",
+      "text": "a\u00adb",
+      "safe": false
+    },
+    {
+      "case": "U+00AC (neighbour, safe)",
+      "text": "a\u00acb",
+      "safe": true
+    },
+    {
+      "case": "U+00AE (neighbour, safe)",
+      "text": "a\u00aeb",
+      "safe": true
+    },
+    {
+      "case": "U+061C between letters",
+      "text": "a\u061cb",
+      "safe": false
+    },
+    {
+      "case": "U+061B (neighbour, safe)",
+      "text": "a\u061bb",
+      "safe": true
+    },
+    {
+      "case": "U+061D (neighbour, safe)",
+      "text": "a\u061db",
+      "safe": true
+    },
+    {
+      "case": "U+180E between letters",
+      "text": "a\u180eb",
+      "safe": false
+    },
+    {
+      "case": "U+180D (neighbour, safe)",
+      "text": "a\u180db",
+      "safe": true
+    },
+    {
+      "case": "U+180F (neighbour, safe)",
+      "text": "a\u180fb",
+      "safe": true
+    },
+    {
+      "case": "U+200B between letters",
+      "text": "a\u200bb",
+      "safe": false
+    },
+    {
+      "case": "U+200D between letters",
+      "text": "a\u200db",
+      "safe": false
+    },
+    {
+      "case": "U+200F between letters",
+      "text": "a\u200fb",
+      "safe": false
+    },
+    {
+      "case": "U+200A (neighbour, safe)",
+      "text": "a\u200ab",
+      "safe": true
+    },
+    {
+      "case": "U+2010 (neighbour, safe)",
+      "text": "a\u2010b",
+      "safe": true
+    },
+    {
+      "case": "U+2028 between letters",
+      "text": "a\u2028b",
+      "safe": false
+    },
+    {
+      "case": "U+202B between letters",
+      "text": "a\u202bb",
+      "safe": false
+    },
+    {
+      "case": "U+202E between letters",
+      "text": "a\u202eb",
+      "safe": false
+    },
+    {
+      "case": "U+2027 (neighbour, safe)",
+      "text": "a\u2027b",
+      "safe": true
+    },
+    {
+      "case": "U+202F (neighbour, safe)",
+      "text": "a\u202fb",
+      "safe": true
+    },
+    {
+      "case": "U+2060 between letters",
+      "text": "a\u2060b",
+      "safe": false
+    },
+    {
+      "case": "U+2062 between letters",
+      "text": "a\u2062b",
+      "safe": false
+    },
+    {
+      "case": "U+2064 between letters",
+      "text": "a\u2064b",
+      "safe": false
+    },
+    {
+      "case": "U+205F (neighbour, safe)",
+      "text": "a\u205fb",
+      "safe": true
+    },
+    {
+      "case": "U+2065 (neighbour, safe)",
+      "text": "a\u2065b",
+      "safe": true
+    },
+    {
+      "case": "U+2066 between letters",
+      "text": "a\u2066b",
+      "safe": false
+    },
+    {
+      "case": "U+206A between letters",
+      "text": "a\u206ab",
+      "safe": false
+    },
+    {
+      "case": "U+206F between letters",
+      "text": "a\u206fb",
+      "safe": false
+    },
+    {
+      "case": "U+2070 (neighbour, safe)",
+      "text": "a\u2070b",
+      "safe": true
+    },
+    {
+      "case": "U+FEFF between letters",
+      "text": "a\ufeffb",
+      "safe": false
+    },
+    {
+      "case": "U+FEFE (neighbour, safe)",
+      "text": "a\ufefeb",
+      "safe": true
+    },
+    {
+      "case": "U+FF00 (neighbour, safe)",
+      "text": "a\uff00b",
+      "safe": true
+    },
+    {
+      "case": "U+FFF9 between letters",
+      "text": "a\ufff9b",
+      "safe": false
+    },
+    {
+      "case": "U+FFFA between letters",
+      "text": "a\ufffab",
+      "safe": false
+    },
+    {
+      "case": "U+FFFB between letters",
+      "text": "a\ufffbb",
+      "safe": false
+    },
+    {
+      "case": "U+FFF8 (neighbour, safe)",
+      "text": "a\ufff8b",
+      "safe": true
+    },
+    {
+      "case": "U+FFFC (neighbour, safe)",
+      "text": "a\ufffcb",
+      "safe": true
+    },
+    {
+      "case": "U+0001 alone",
+      "text": "\u0001",
+      "safe": false
+    },
+    {
+      "case": "U+0002 alone",
+      "text": "\u0002",
+      "safe": false
+    },
+    {
+      "case": "U+0003 alone",
+      "text": "\u0003",
+      "safe": false
+    },
+    {
+      "case": "U+0004 alone",
+      "text": "\u0004",
+      "safe": false
+    },
+    {
+      "case": "U+0005 alone",
+      "text": "\u0005",
+      "safe": false
+    },
+    {
+      "case": "U+0006 alone",
+      "text": "\u0006",
+      "safe": false
+    },
+    {
+      "case": "U+0007 alone",
+      "text": "\u0007",
+      "safe": false
+    },
+    {
+      "case": "U+0008 alone",
+      "text": "\b",
+      "safe": false
+    },
+    {
+      "case": "U+0009 alone",
+      "text": "\t",
+      "safe": false
+    },
+    {
+      "case": "U+000A alone",
+      "text": "\n",
+      "safe": false
+    },
+    {
+      "case": "U+000B alone",
+      "text": "\u000b",
+      "safe": false
+    },
+    {
+      "case": "U+000C alone",
+      "text": "\f",
+      "safe": false
+    },
+    {
+      "case": "U+000D alone",
+      "text": "\r",
+      "safe": false
+    },
+    {
+      "case": "U+000E alone",
+      "text": "\u000e",
+      "safe": false
+    },
+    {
+      "case": "U+0010 alone",
+      "text": "\u0010",
+      "safe": false
+    },
+    {
+      "case": "U+0011 alone",
+      "text": "\u0011",
+      "safe": false
+    },
+    {
+      "case": "U+0012 alone",
+      "text": "\u0012",
+      "safe": false
+    },
+    {
+      "case": "U+0013 alone",
+      "text": "\u0013",
+      "safe": false
+    },
+    {
+      "case": "U+0014 alone",
+      "text": "\u0014",
+      "safe": false
+    },
+    {
+      "case": "U+0015 alone",
+      "text": "\u0015",
+      "safe": false
+    },
+    {
+      "case": "U+0016 alone",
+      "text": "\u0016",
+      "safe": false
+    },
+    {
+      "case": "U+0017 alone",
+      "text": "\u0017",
+      "safe": false
+    },
+    {
+      "case": "U+0018 alone",
+      "text": "\u0018",
+      "safe": false
+    },
+    {
+      "case": "U+0019 alone",
+      "text": "\u0019",
+      "safe": false
+    },
+    {
+      "case": "U+001A alone",
+      "text": "\u001a",
+      "safe": false
+    },
+    {
+      "case": "U+001B alone",
+      "text": "\u001b",
+      "safe": false
+    },
+    {
+      "case": "U+001C alone",
+      "text": "\u001c",
+      "safe": false
+    },
+    {
+      "case": "U+001D alone",
+      "text": "\u001d",
+      "safe": false
+    },
+    {
+      "case": "U+001E alone",
+      "text": "\u001e",
+      "safe": false
+    },
+    {
+      "case": "U+0080 alone",
+      "text": "\u0080",
+      "safe": false
+    },
+    {
+      "case": "U+0081 alone",
+      "text": "\u0081",
+      "safe": false
+    },
+    {
+      "case": "U+0082 alone",
+      "text": "\u0082",
+      "safe": false
+    },
+    {
+      "case": "U+0083 alone",
+      "text": "\u0083",
+      "safe": false
+    },
+    {
+      "case": "U+0084 alone",
+      "text": "\u0084",
+      "safe": false
+    },
+    {
+      "case": "U+0085 alone",
+      "text": "\u0085",
+      "safe": false
+    },
+    {
+      "case": "U+0086 alone",
+      "text": "\u0086",
+      "safe": false
+    },
+    {
+      "case": "U+0087 alone",
+      "text": "\u0087",
+      "safe": false
+    },
+    {
+      "case": "U+0088 alone",
+      "text": "\u0088",
+      "safe": false
+    },
+    {
+      "case": "U+0089 alone",
+      "text": "\u0089",
+      "safe": false
+    },
+    {
+      "case": "U+008A alone",
+      "text": "\u008a",
+      "safe": false
+    },
+    {
+      "case": "U+008B alone",
+      "text": "\u008b",
+      "safe": false
+    },
+    {
+      "case": "U+008C alone",
+      "text": "\u008c",
+      "safe": false
+    },
+    {
+      "case": "U+008D alone",
+      "text": "\u008d",
+      "safe": false
+    },
+    {
+      "case": "U+008E alone",
+      "text": "\u008e",
+      "safe": false
+    },
+    {
+      "case": "U+0090 alone",
+      "text": "\u0090",
+      "safe": false
+    },
+    {
+      "case": "U+0091 alone",
+      "text": "\u0091",
+      "safe": false
+    },
+    {
+      "case": "U+0092 alone",
+      "text": "\u0092",
+      "safe": false
+    },
+    {
+      "case": "U+0093 alone",
+      "text": "\u0093",
+      "safe": false
+    },
+    {
+      "case": "U+0094 alone",
+      "text": "\u0094",
+      "safe": false
+    },
+    {
+      "case": "U+0095 alone",
+      "text": "\u0095",
+      "safe": false
+    },
+    {
+      "case": "U+0096 alone",
+      "text": "\u0096",
+      "safe": false
+    },
+    {
+      "case": "U+0097 alone",
+      "text": "\u0097",
+      "safe": false
+    },
+    {
+      "case": "U+0098 alone",
+      "text": "\u0098",
+      "safe": false
+    },
+    {
+      "case": "U+0099 alone",
+      "text": "\u0099",
+      "safe": false
+    },
+    {
+      "case": "U+009A alone",
+      "text": "\u009a",
+      "safe": false
+    },
+    {
+      "case": "U+009B alone",
+      "text": "\u009b",
+      "safe": false
+    },
+    {
+      "case": "U+009C alone",
+      "text": "\u009c",
+      "safe": false
+    },
+    {
+      "case": "U+009D alone",
+      "text": "\u009d",
+      "safe": false
+    },
+    {
+      "case": "U+009E alone",
+      "text": "\u009e",
+      "safe": false
+    },
+    {
+      "case": "U+200C alone",
+      "text": "\u200c",
+      "safe": false
+    },
+    {
+      "case": "U+200E alone",
+      "text": "\u200e",
+      "safe": false
+    },
+    {
+      "case": "U+2029 alone",
+      "text": "\u2029",
+      "safe": false
+    },
+    {
+      "case": "U+202A alone",
+      "text": "\u202a",
+      "safe": false
+    },
+    {
+      "case": "U+202C alone",
+      "text": "\u202c",
+      "safe": false
+    },
+    {
+      "case": "U+202D alone",
+      "text": "\u202d",
+      "safe": false
+    },
+    {
+      "case": "U+2061 alone",
+      "text": "\u2061",
+      "safe": false
+    },
+    {
+      "case": "U+2063 alone",
+      "text": "\u2063",
+      "safe": false
+    },
+    {
+      "case": "U+2067 alone",
+      "text": "\u2067",
+      "safe": false
+    },
+    {
+      "case": "U+2068 alone",
+      "text": "\u2068",
+      "safe": false
+    },
+    {
+      "case": "U+2069 alone",
+      "text": "\u2069",
+      "safe": false
+    },
+    {
+      "case": "U+206B alone",
+      "text": "\u206b",
+      "safe": false
+    },
+    {
+      "case": "U+206C alone",
+      "text": "\u206c",
+      "safe": false
+    },
+    {
+      "case": "U+206D alone",
+      "text": "\u206d",
+      "safe": false
+    },
+    {
+      "case": "U+206E alone",
+      "text": "\u206e",
+      "safe": false
+    }
+  ],
+  "hello": [
+    {
+      "case": "no api or features",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5}",
+      "accept": true,
+      "expect": {
+        "name": "Pixel",
+        "platform": "android",
+        "ts": 5,
+        "api": 1,
+        "features": []
+      },
+      "encoded": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5}"
+    },
+    {
+      "case": "api 1 written",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":1}",
+      "accept": true,
+      "expect": {
+        "name": "Pixel",
+        "platform": "android",
+        "ts": 5,
+        "api": 1,
+        "features": []
+      },
+      "encoded": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5}"
+    },
+    {
+      "case": "api 2",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":2}",
+      "accept": true,
+      "expect": {
+        "name": "Pixel",
+        "platform": "android",
+        "ts": 5,
+        "api": 2,
+        "features": []
+      },
+      "encoded": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":2}"
+    },
+    {
+      "case": "api 2^53-1",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":9007199254740991}",
+      "accept": true,
+      "expect": {
+        "name": "Pixel",
+        "platform": "android",
+        "ts": 5,
+        "api": 9007199254740991,
+        "features": []
+      },
+      "encoded": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":9007199254740991}"
+    },
+    {
+      "case": "one feature",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"feed.usage\"}",
+      "accept": true,
+      "expect": {
+        "name": "Pixel",
+        "platform": "android",
+        "ts": 5,
+        "api": 1,
+        "features": [
+          "feed.usage"
+        ]
+      },
+      "encoded": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"feed.usage\"}"
+    },
+    {
+      "case": "features with every allowed character",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"a,b.c,d_e,f0,9,_,.\"}",
+      "accept": true,
+      "expect": {
+        "name": "Pixel",
+        "platform": "android",
+        "ts": 5,
+        "api": 1,
+        "features": [
+          "a",
+          "b.c",
+          "d_e",
+          "f0",
+          "9",
+          "_",
+          "."
+        ]
+      },
+      "encoded": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"a,b.c,d_e,f0,9,_,.\"}"
+    },
+    {
+      "case": "32 features",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"f0,f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13,f14,f15,f16,f17,f18,f19,f20,f21,f22,f23,f24,f25,f26,f27,f28,f29,f30,f31\"}",
+      "accept": true,
+      "expect": {
+        "name": "Pixel",
+        "platform": "android",
+        "ts": 5,
+        "api": 1,
+        "features": [
+          "f0",
+          "f1",
+          "f2",
+          "f3",
+          "f4",
+          "f5",
+          "f6",
+          "f7",
+          "f8",
+          "f9",
+          "f10",
+          "f11",
+          "f12",
+          "f13",
+          "f14",
+          "f15",
+          "f16",
+          "f17",
+          "f18",
+          "f19",
+          "f20",
+          "f21",
+          "f22",
+          "f23",
+          "f24",
+          "f25",
+          "f26",
+          "f27",
+          "f28",
+          "f29",
+          "f30",
+          "f31"
+        ]
+      },
+      "encoded": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"f0,f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13,f14,f15,f16,f17,f18,f19,f20,f21,f22,f23,f24,f25,f26,f27,f28,f29,f30,f31\"}"
+    },
+    {
+      "case": "api and features before the other keys",
+      "payload": "{\"features\":\"x\",\"api\":3,\"ts\":5,\"platform\":\"android\",\"name\":\"Pixel\",\"v\":1}",
+      "accept": true,
+      "expect": {
+        "name": "Pixel",
+        "platform": "android",
+        "ts": 5,
+        "api": 3,
+        "features": [
+          "x"
+        ]
+      },
+      "encoded": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":3,\"features\":\"x\"}"
+    },
+    {
+      "case": "safe unicode name",
+      "payload": "{\"v\":1,\"name\":\"Zo\u00eb \ud83d\udcf1 \u65e5\u672c\",\"platform\":\"iOS 18\",\"ts\":5}",
+      "accept": true,
+      "expect": {
+        "name": "Zo\u00eb \ud83d\udcf1 \u65e5\u672c",
+        "platform": "iOS 18",
+        "ts": 5,
+        "api": 1,
+        "features": []
+      },
+      "encoded": "{\"v\":1,\"name\":\"Zo\u00eb \ud83d\udcf1 \u65e5\u672c\",\"platform\":\"iOS 18\",\"ts\":5}"
+    },
+    {
+      "case": "escaped safe name",
+      "payload": "{\"v\":1,\"name\":\"\\u00e9\\ud83d\\ude00\\\"q\\\\\",\"platform\":\"android\",\"ts\":5}",
+      "accept": true,
+      "expect": {
+        "name": "\u00e9\ud83d\ude00\"q\\",
+        "platform": "android",
+        "ts": 5,
+        "api": 1,
+        "features": []
+      },
+      "encoded": "{\"v\":1,\"name\":\"\u00e9\ud83d\ude00\\\"q\\\\\",\"platform\":\"android\",\"ts\":5}"
+    },
+    {
+      "case": "unknown keys next to api and features",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":2,\"features\":\"a\",\"api2\":\"x\",\"feature\":7}",
+      "accept": true,
+      "expect": {
+        "name": "Pixel",
+        "platform": "android",
+        "ts": 5,
+        "api": 2,
+        "features": [
+          "a"
+        ]
+      },
+      "encoded": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":2,\"features\":\"a\"}"
+    },
+    {
+      "case": "name with raw right-to-left override",
+      "payload": "{\"v\":1,\"name\":\"a\u202eb\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with zero-width space",
+      "payload": "{\"v\":1,\"name\":\"a\u200bb\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with raw line separator",
+      "payload": "{\"v\":1,\"name\":\"a\u2028b\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with raw byte order mark",
+      "payload": "{\"v\":1,\"name\":\"a\ufeffb\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with raw soft hyphen",
+      "payload": "{\"v\":1,\"name\":\"a\u00adb\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with raw C1 control",
+      "payload": "{\"v\":1,\"name\":\"a\u0085b\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with raw interlinear annotation",
+      "payload": "{\"v\":1,\"name\":\"a\ufff9b\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with zwj emoji",
+      "payload": "{\"v\":1,\"name\":\"\ud83d\udc68\u200d\ud83d\udc69\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with escaped newline",
+      "payload": "{\"v\":1,\"name\":\"a\\nb\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with escaped tab",
+      "payload": "{\"v\":1,\"name\":\"a\\tb\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with escaped NUL",
+      "payload": "{\"v\":1,\"name\":\"a\\u0000b\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with escaped DEL",
+      "payload": "{\"v\":1,\"name\":\"a\\u007fb\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with escaped right-to-left override",
+      "payload": "{\"v\":1,\"name\":\"a\\u202eb\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with escaped first strong isolate",
+      "payload": "{\"v\":1,\"name\":\"a\\u2068b\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with escaped word joiner",
+      "payload": "{\"v\":1,\"name\":\"a\\u2060b\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with escaped arabic letter mark",
+      "payload": "{\"v\":1,\"name\":\"a\\u061cb\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "name with escaped mongolian vowel separator",
+      "payload": "{\"v\":1,\"name\":\"a\\u180eb\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "platform spoofing extra lines",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"\\n\\n\\n1a2b-3c4d\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "platform with escaped left-to-right mark",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"\\u200eandroid\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "platform with raw byte order mark",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"\ufeffandroid\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "api 0",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":0}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "api as string",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":\"2\"}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "api 2^53",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":9007199254740992}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "api negative",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"api\":-1}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "empty features",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"\"}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "trailing comma",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"a,\"}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "leading comma",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\",a\"}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "empty item",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"a,,b\"}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "uppercase feature",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"Feed\"}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "space in features",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"a, b\"}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "dash in feature",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"a-b\"}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "duplicate feature",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"a,b,a\"}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "non-ascii feature",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"\\u00e9\"}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "33 features",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":\"f0,f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13,f14,f15,f16,f17,f18,f19,f20,f21,f22,f23,f24,f25,f26,f27,f28,f29,f30,f31,f32\"}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "features as integer",
+      "payload": "{\"v\":1,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5,\"features\":5}",
+      "accept": false,
+      "error": "payload"
+    },
+    {
+      "case": "v 2",
+      "payload": "{\"v\":2,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "unsupported_version"
+    },
+    {
+      "case": "v 0",
+      "payload": "{\"v\":0,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "unsupported_version"
+    },
+    {
+      "case": "v 2^53-1",
+      "payload": "{\"v\":9007199254740991,\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "unsupported_version"
+    },
+    {
+      "case": "v 2 with other keys",
+      "payload": "{\"v\":2,\"device\":\"x\"}",
+      "accept": false,
+      "error": "unsupported_version"
+    },
+    {
+      "case": "v as string \"2\"",
+      "payload": "{\"v\":\"2\",\"name\":\"Pixel\",\"platform\":\"android\",\"ts\":5}",
+      "accept": false,
+      "error": "payload"
+    }
+  ]
+}

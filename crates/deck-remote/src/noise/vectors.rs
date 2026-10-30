@@ -76,18 +76,474 @@ fn frame_json(frame: &[u8], flags: u8) -> Value {
     out
 }
 
-fn generate() -> Value {
-    let device = Keypair::from_secret(seq(0x01));
-    let gateway = Keypair::from_secret(seq(0x41));
-    let device_ephemeral = seq(0x81);
-    let gateway_ephemeral = seq(0xc1);
-    let psk = seq(0x21);
-    let relay_token = seq(0xe1);
-    let hello = DeviceHello {
+fn device_key() -> Keypair {
+    Keypair::from_secret(seq(0x01))
+}
+
+fn gateway_key() -> Keypair {
+    Keypair::from_secret(seq(0x41))
+}
+
+const DEVICE_EPHEMERAL: u8 = 0x81;
+const GATEWAY_EPHEMERAL: u8 = 0xc1;
+const PSK: u8 = 0x21;
+const RELAY_TOKEN: u8 = 0xe1;
+
+fn vector_hello() -> DeviceHello {
+    DeviceHello {
         name: "Test Phone".into(),
         platform: "ios".into(),
         ts: 1_790_000_000_000,
+        api: 1,
+        features: Vec::new(),
+    }
+}
+
+fn vector_welcome(pairing: bool) -> Welcome {
+    Welcome {
+        device: "device-1".into(),
+        gateway: "Desk".into(),
+        token: pairing.then_some(seq(RELAY_TOKEN)),
+    }
+}
+
+fn mode_name(mode: Mode<'_>) -> &'static str {
+    if mode.is_pairing() {
+        "pairing"
+    } else {
+        "reconnect"
+    }
+}
+
+/// The vector handshake of `mode`: the device's message 1.
+fn vector_msg1(mode: Mode<'_>) -> (Initiator, Vec<u8>) {
+    Initiator::start_with(
+        mode,
+        &device_key(),
+        gateway_key().public(),
+        &vector_hello(),
+        Some(&seq(DEVICE_EPHEMERAL)),
+    )
+    .unwrap()
+}
+
+/// Fresh (device, gateway) sessions of the vector handshake of `mode`, default config.
+fn vector_sessions(mode: Mode<'_>) -> (Session, Session) {
+    let (initiator, msg1) = vector_msg1(mode);
+    let pending = respond_with(mode, &gateway_key(), &msg1, Some(&seq(GATEWAY_EPHEMERAL))).unwrap();
+    let (gateway, msg2) = pending.accept(&vector_welcome(mode.is_pairing())).unwrap();
+    let (device, _) = initiator.finish(&msg2).unwrap();
+    (device, gateway)
+}
+
+/// The vector name of an error (`snake_case` variant).
+fn error_name(error: &NoiseError) -> &'static str {
+    match error {
+        NoiseError::Handshake => "handshake",
+        NoiseError::UnsupportedVersion => "unsupported_version",
+        NoiseError::Payload(_) => "payload",
+        NoiseError::Decrypt => "decrypt",
+        NoiseError::BadFlags(_) => "bad_flags",
+        NoiseError::FrameSize(_) => "frame_size",
+        NoiseError::TooLarge { .. } => "too_large",
+        other => panic!("no vector name for {other:?}"),
+    }
+}
+
+/// A raw snow responder: the same handshake without this crate's key and payload checks.
+fn snow_accepts_msg1(mode: Mode<'_>, msg1: &[u8]) -> bool {
+    let psk = match mode {
+        Mode::Pairing { psk } => Some(psk),
+        Mode::Reconnect => None,
     };
+    let gateway = gateway_key();
+    let mut builder = snow::Builder::new(forge::pattern(psk).parse().unwrap())
+        .prologue(PROLOGUE)
+        .unwrap()
+        .local_private_key(gateway.secret_bytes())
+        .unwrap();
+    if let Some(psk) = psk {
+        builder = builder.psk(1, psk).unwrap();
+    }
+    let mut payload = vec![0; MAX_MESSAGE];
+    builder
+        .build_responder()
+        .unwrap()
+        .read_message(msg1, &mut payload)
+        .is_ok()
+}
+
+/// Handshake messages each side must refuse, checked against this implementation.
+fn rejected_handshakes() -> Vec<Value> {
+    let psk = seq(PSK);
+    let wrong_psk = seq(PSK + 1);
+    let gateway = gateway_key();
+    let device = device_key();
+    let e_secret = seq(DEVICE_EPHEMERAL);
+    let e_public = MontgomeryPoint::mul_base_clamped(e_secret).to_bytes();
+    let es = forge::dh(&e_secret, gateway.public());
+    let ss = forge::dh(device.secret_bytes(), gateway.public());
+    let hello = vector_hello().encode().unwrap();
+    let modes = [Mode::Pairing { psk: &psk }, Mode::Reconnect];
+    let forge_psk = |mode: Mode<'_>| mode.is_pairing().then_some(&psk);
+
+    let mut out = Vec::new();
+    let mut gateway_refuses = |case: String, mode: Mode<'_>, msg1: Vec<u8>, expected: &str| {
+        let error =
+            respond_with(mode, &gateway, &msg1, Some(&seq(GATEWAY_EPHEMERAL))).expect_err(&case);
+        assert_eq!(error_name(&error), expected, "{case}");
+        out.push(json!({
+            "case": case,
+            "receiver": "gateway",
+            "mode": mode_name(mode),
+            "msg1": hex(&msg1),
+            "error": expected,
+        }));
+    };
+    let (_, msg1) = vector_msg1(Mode::Pairing { psk: &wrong_psk });
+    gateway_refuses(
+        "pairing message 1 with a wrong PSK".into(),
+        modes[0],
+        msg1,
+        "handshake",
+    );
+    let (_, msg1) = vector_msg1(Mode::Reconnect);
+    gateway_refuses(
+        "reconnect message 1 to a pairing responder".into(),
+        modes[0],
+        msg1,
+        "handshake",
+    );
+    for mode in modes {
+        let name = mode_name(mode);
+        let (_, msg1) = vector_msg1(mode);
+        for (what, index) in [("static key", 40), ("payload tag", msg1.len() - 1)] {
+            let mut tampered = msg1.clone();
+            tampered[index] ^= 0x01;
+            gateway_refuses(
+                format!("{name} message 1 with a tampered {what}"),
+                mode,
+                tampered,
+                "handshake",
+            );
+        }
+        for point in forge::low_order_points() {
+            let forged = forge::forge_msg1(
+                forge_psk(mode),
+                gateway.public(),
+                &point,
+                &[0; 32],
+                device.public(),
+                &ss,
+                &hello,
+            );
+            assert!(snow_accepts_msg1(mode, &forged));
+            gateway_refuses(
+                format!("{name} message 1 with low-order ephemeral {}", hex(&point)),
+                mode,
+                forged,
+                "handshake",
+            );
+        }
+        for point in forge::low_order_points() {
+            let forged = forge::forge_msg1(
+                forge_psk(mode),
+                gateway.public(),
+                &e_public,
+                &es,
+                &point,
+                &[0; 32],
+                &hello,
+            );
+            assert!(snow_accepts_msg1(mode, &forged));
+            gateway_refuses(
+                format!("{name} message 1 with low-order static {}", hex(&point)),
+                mode,
+                forged,
+                "handshake",
+            );
+        }
+        let honest = |payload: &[u8]| {
+            forge::forge_msg1(
+                forge_psk(mode),
+                gateway.public(),
+                &e_public,
+                &es,
+                device.public(),
+                &ss,
+                payload,
+            )
+        };
+        let v2 = br#"{"v":2,"name":"Test Phone","platform":"ios","ts":1790000000000}"#;
+        gateway_refuses(
+            format!("{name} message 1 with payload version 2"),
+            mode,
+            honest(v2),
+            "unsupported_version",
+        );
+        let unsafe_name =
+            "{\"v\":1,\"name\":\"Test\u{202e}Phone\",\"platform\":\"ios\",\"ts\":1790000000000}";
+        gateway_refuses(
+            format!("{name} message 1 with a right-to-left override in the name"),
+            mode,
+            honest(unsafe_name.as_bytes()),
+            "payload",
+        );
+    }
+
+    let mut device_refuses = |case: String, mode: Mode<'_>, msg2: Vec<u8>, expected: &str| {
+        let (initiator, _) = vector_msg1(mode);
+        let error = initiator.finish(&msg2).expect_err(&case);
+        assert_eq!(error_name(&error), expected, "{case}");
+        out.push(json!({
+            "case": case,
+            "receiver": "device",
+            "mode": mode_name(mode),
+            "msg2": hex(&msg2),
+            "error": expected,
+        }));
+    };
+    let gateway_e_secret = seq(GATEWAY_EPHEMERAL);
+    let gateway_e = MontgomeryPoint::mul_base_clamped(gateway_e_secret).to_bytes();
+    for mode in modes {
+        let name = mode_name(mode);
+        let (_, msg1) = vector_msg1(mode);
+        let welcome = vector_welcome(mode.is_pairing()).encode().unwrap();
+        let honest = |payload: &[u8]| {
+            forge::forge_msg2(
+                forge_psk(mode),
+                &gateway,
+                &msg1,
+                &gateway_e,
+                Some(&gateway_e_secret),
+                payload,
+            )
+        };
+        let mut tampered = honest(&welcome);
+        *tampered.last_mut().unwrap() ^= 0x01;
+        device_refuses(
+            format!("{name} message 2 with a tampered tag"),
+            mode,
+            tampered,
+            "handshake",
+        );
+        for point in forge::low_order_points() {
+            let forged =
+                forge::forge_msg2(forge_psk(mode), &gateway, &msg1, &point, None, &welcome);
+            device_refuses(
+                format!("{name} message 2 with low-order ephemeral {}", hex(&point)),
+                mode,
+                forged,
+                "handshake",
+            );
+        }
+        let v2 = br#"{"v":2,"device":"device-1","gateway":"Desk"}"#;
+        device_refuses(
+            format!("{name} message 2 with payload version 2"),
+            mode,
+            honest(v2),
+            "unsupported_version",
+        );
+    }
+    for mode in modes {
+        for point in forge::low_order_points() {
+            let error =
+                Initiator::start_with(mode, &device, &point, &vector_hello(), Some(&e_secret))
+                    .expect_err("low-order gateway key");
+            assert_eq!(error_name(&error), "handshake");
+            out.push(json!({
+                "case": format!("{} invite with low-order gateway key {}", mode_name(mode), hex(&point)),
+                "receiver": "device",
+                "mode": mode_name(mode),
+                "gateway_public": hex(&point),
+                "error": "handshake",
+            }));
+        }
+    }
+    out
+}
+
+/// One frame sealed with arbitrary plaintext (flags byte included), as `seal` never would.
+fn raw_frame(session: &mut Session, plain: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0u8; plain.len() + TAG_LEN];
+    let len = session.transport.write_message(plain, &mut frame).unwrap();
+    frame.truncate(len);
+    frame
+}
+
+/// (case, receiver, reassembly cap override, frames)
+type FrameCase = (&'static str, Side, Option<usize>, Vec<Vec<u8>>);
+
+/// Transport frames a fresh reconnect session must refuse: every frame but the last opens, the
+/// last fails with `error` and poisons the session.
+fn rejected_frames() -> Vec<Value> {
+    let psk = seq(PSK);
+    let reconnect = || vector_sessions(Mode::Reconnect);
+    let seal = |session: &mut Session, msg: &[u8]| session.seal(msg).unwrap();
+    let mut cases: Vec<FrameCase> = Vec::new();
+
+    let (mut device, _) = reconnect();
+    let frame = seal(&mut device, b"ping").remove(0);
+    for (case, edit) in [
+        ("tampered ciphertext byte", 1usize),
+        ("tampered tag", frame.len() - 1),
+    ] {
+        let mut tampered = frame.clone();
+        tampered[edit] ^= 0x01;
+        cases.push((case, Side::Gateway, None, vec![tampered]));
+    }
+    cases.push((
+        "truncated frame",
+        Side::Gateway,
+        None,
+        vec![frame[..frame.len() - 1].to_vec()],
+    ));
+    cases.push((
+        "replayed frame",
+        Side::Gateway,
+        None,
+        vec![frame.clone(), frame.clone()],
+    ));
+    let second = seal(&mut device, b"two").remove(0);
+    cases.push((
+        "second frame first (reordered)",
+        Side::Gateway,
+        None,
+        vec![second],
+    ));
+    let (_, mut gateway) = reconnect();
+    let frame = seal(&mut gateway, b"pong").remove(0);
+    cases.push((
+        "replayed frame to the device",
+        Side::Device,
+        None,
+        vec![frame.clone(), frame],
+    ));
+
+    let (mut device, mut gateway) = reconnect();
+    cases.push((
+        "device frame reflected to the device",
+        Side::Device,
+        None,
+        seal(&mut device, b"ping"),
+    ));
+    cases.push((
+        "gateway frame reflected to the gateway",
+        Side::Gateway,
+        None,
+        seal(&mut gateway, b"pong"),
+    ));
+    let (mut paired, _) = vector_sessions(Mode::Pairing { psk: &psk });
+    cases.push((
+        "frame of another session",
+        Side::Gateway,
+        None,
+        seal(&mut paired, b"ping"),
+    ));
+
+    for (case, flags) in [
+        ("unknown flag bit 0x04", 0x04u8),
+        ("unknown flag bit 0x80", 0x80),
+        ("unknown flag bits with FLAG_MORE", 0xfd),
+    ] {
+        let (mut device, _) = reconnect();
+        cases.push((
+            case,
+            Side::Gateway,
+            None,
+            vec![raw_frame(&mut device, &[flags, b'x'])],
+        ));
+    }
+    let (mut device, _) = reconnect();
+    let mut short = vec![FLAG_MORE];
+    short.extend_from_slice(&[0x55; 10]);
+    cases.push((
+        "short non-final fragment",
+        Side::Gateway,
+        None,
+        vec![raw_frame(&mut device, &short)],
+    ));
+    let (mut device, _) = reconnect();
+    cases.push((
+        "empty non-final fragment",
+        Side::Gateway,
+        None,
+        vec![raw_frame(&mut device, &[FLAG_MORE])],
+    ));
+    cases.push(("empty frame", Side::Gateway, None, vec![Vec::new()]));
+    cases.push((
+        "frame of only a tag",
+        Side::Gateway,
+        None,
+        vec![vec![0xa5; TAG_LEN]],
+    ));
+    let (mut device, _) = reconnect();
+    cases.push((
+        "message over the cap",
+        Side::Gateway,
+        Some(4),
+        seal(&mut device, b"12345"),
+    ));
+    let (mut device, _) = reconnect();
+    cases.push((
+        "reassembly over the cap",
+        Side::Gateway,
+        Some(MAX_FRAGMENT_DATA),
+        seal(&mut device, &generated(MAX_FRAGMENT_DATA + 1)),
+    ));
+    let (mut device, _) = reconnect();
+    let flagged = raw_frame(&mut device, &[FLAG_REKEY, b'a']);
+    let stale = raw_frame(&mut device, &[0, b'b']);
+    cases.push((
+        "sender skipped the flagged rekey",
+        Side::Gateway,
+        None,
+        vec![flagged, stale],
+    ));
+
+    cases
+        .into_iter()
+        .map(|(case, receiver, max_message, frames)| {
+            let (mut device, mut gateway) = reconnect();
+            let session = match receiver {
+                Side::Device => &mut device,
+                Side::Gateway => &mut gateway,
+            };
+            if let Some(max_message) = max_message {
+                session.set_config(SessionConfig {
+                    max_message,
+                    ..SessionConfig::default()
+                });
+            }
+            let (last, opened) = frames.split_last().unwrap();
+            for frame in opened {
+                session
+                    .open(frame)
+                    .unwrap_or_else(|e| panic!("{case}: {e:?}"));
+            }
+            let error = session.open(last).expect_err(case);
+            assert!(matches!(
+                session.open(&frames[0]),
+                Err(NoiseError::Poisoned)
+            ));
+            json!({
+                "case": case,
+                "receiver": match receiver { Side::Device => "device", Side::Gateway => "gateway" },
+                "max_message": max_message,
+                "frames": frames.iter().map(|f| hex(f)).collect::<Vec<_>>(),
+                "error": error_name(&error),
+            })
+        })
+        .collect()
+}
+
+fn generate() -> Value {
+    let device = device_key();
+    let gateway = gateway_key();
+    let device_ephemeral = seq(DEVICE_EPHEMERAL);
+    let gateway_ephemeral = seq(GATEWAY_EPHEMERAL);
+    let psk = seq(PSK);
+    let hello = vector_hello();
     let invite = PairingInvite {
         url: "wss://relay.example.test".into(),
         room: std::array::from_fn(|i| 0x61 + i as u8),
@@ -101,11 +557,7 @@ fn generate() -> Value {
         (Mode::Pairing { psk: &psk }, "pairing"),
         (Mode::Reconnect, "reconnect"),
     ] {
-        let welcome = Welcome {
-            device: "device-1".into(),
-            gateway: "Desk".into(),
-            token: mode.is_pairing().then_some(relay_token),
-        };
+        let welcome = vector_welcome(mode.is_pairing());
         let (initiator, msg1) = Initiator::start_with(
             mode,
             &device,
@@ -187,7 +639,11 @@ fn generate() -> Value {
     json!({
         "description": "OmpDeck device protocol v1 vectors, generated by deck_remote::noise (see README.md). \
             Device = initiator, gateway = responder. Transport frames alternate per the `from` side; \
-            both sessions use rekey_messages = 3. Frames above 4096 bytes are given by len + sha256 only.",
+            both sessions use rekey_messages = 3. Frames above 4096 bytes are given by len + sha256 only. \
+            `rejected_handshakes`: with the keys and ephemerals above, the gateway refuses `msg1`, or the device \
+            (after sending the vector msg1 of `mode`) refuses `msg2`, or refuses to start against `gateway_public`, \
+            with `error`. `rejected_frames`: a fresh reconnect session (`max_message` overriding the reassembly cap) \
+            of `receiver` opens every frame but the last, which fails with `error` and poisons the session.",
         "prologue": hex(PROLOGUE),
         "plaintext_generator": "byte i = (7 * i + 3) mod 256",
         "max_fragment_data": MAX_FRAGMENT_DATA,
@@ -201,7 +657,13 @@ fn generate() -> Value {
         "gateway_fingerprint": fingerprint(gateway.public()),
         "gateway_ephemeral": hex(&gateway_ephemeral),
         "psk": hex(&psk),
-        "hello": { "name": hello.name, "platform": hello.platform, "ts": hello.ts },
+        "hello": {
+            "name": hello.name,
+            "platform": hello.platform,
+            "ts": hello.ts,
+            "api": hello.api,
+            "features": hello.features,
+        },
         "hello_payload": hex(&hello.encode().unwrap()),
         "invite": {
             "url": invite.url,
@@ -214,6 +676,8 @@ fn generate() -> Value {
         // The device's first relay message when pairing with this invite.
         "relay_hello": hex(&crate::relay::Hello::Device { room: invite.room, token: invite.token }.encode()),
         "handshakes": handshakes,
+        "rejected_handshakes": rejected_handshakes(),
+        "rejected_frames": rejected_frames(),
     })
 }
 

@@ -14,6 +14,8 @@ fn hello() -> DeviceHello {
         name: "Pixel".into(),
         platform: "android".into(),
         ts: 1_000,
+        api: 1,
+        features: Vec::new(),
     }
 }
 
@@ -258,23 +260,23 @@ fn malformed_and_oversized_hello_payloads_are_rejected() {
         r#"{{"v":1,"name":"a","platform":"b","ts":1,"pad":"{}"}}"#,
         "x".repeat(1100)
     );
-    let cases: [(&[u8], bool); 5] = [
-        (b"not json", false),
-        (br#"{"v":2,"name":"a","platform":"b","ts":1}"#, false),
-        (br#"{"v":1,"name":"a","ts":1}"#, false),
+    let cases: [(&[u8], &str); 5] = [
+        (b"not json", "payload"),
+        (br#"{"v":2,"name":"a","platform":"b","ts":1}"#, "version"),
+        (br#"{"v":1,"name":"a","ts":1}"#, "payload"),
         (
             br#"{"v":1,"name":"a","platform":"b","ts":9007199254740992}"#,
-            false,
+            "payload",
         ),
-        (big.as_bytes(), true),
+        (big.as_bytes(), "size"),
     ];
-    for (payload, too_big) in cases {
+    for (payload, kind) in cases {
         let msg1 = raw_msg1(true, &PSK, gateway.public(), payload);
         let err = respond(Mode::Pairing { psk: &PSK }, &gateway, &msg1).unwrap_err();
-        if too_big {
-            assert!(matches!(err, NoiseError::MessageSize(_)), "{err:?}");
-        } else {
-            assert!(matches!(err, NoiseError::Payload(_)), "{err:?}");
+        match kind {
+            "size" => assert!(matches!(err, NoiseError::MessageSize(_)), "{err:?}"),
+            "version" => assert!(matches!(err, NoiseError::UnsupportedVersion), "{err:?}"),
+            _ => assert!(matches!(err, NoiseError::Payload(_)), "{err:?}"),
         }
     }
     // Unknown string and integer fields are ignored; any other unknown value is rejected.
@@ -391,6 +393,28 @@ fn reordered_frames_poison_the_session() {
     assert!(matches!(gateway.open(&second), Err(NoiseError::Decrypt)));
     assert_poisoned(&mut gateway);
     assert!(matches!(gateway.open(&first), Err(NoiseError::Poisoned)));
+}
+
+/// The two directions use different keys: a frame reflected back to its own sender, at the
+/// very counter it would expect next from the peer, never opens, in either mode and direction.
+#[test]
+fn reflected_frames_poison_the_session() {
+    for mode in [Mode::Pairing { psk: &PSK }, Mode::Reconnect] {
+        let (mut device, mut gateway) = connect(mode);
+        let frame = device.seal(b"to the gateway").unwrap().remove(0);
+        assert!(matches!(device.open(&frame), Err(NoiseError::Decrypt)));
+        assert_poisoned(&mut device);
+        // The genuine receiver still opens it.
+        assert_eq!(
+            gateway.open(&frame).unwrap().as_deref(),
+            Some(&b"to the gateway"[..])
+        );
+
+        let (_, mut gateway) = connect(mode);
+        let frame = gateway.seal(b"to the device").unwrap().remove(0);
+        assert!(matches!(gateway.open(&frame), Err(NoiseError::Decrypt)));
+        assert_poisoned(&mut gateway);
+    }
 }
 
 #[test]
@@ -664,7 +688,7 @@ fn timestamps() {
 
 fn invite() -> PairingInvite {
     PairingInvite {
-        url: "wss://relay.example.org:8443/base".into(),
+        url: "wss://relay.example.org:8443".into(),
         room: [1; 16],
         token: [2; 32],
         gateway_public: [3; 32],
@@ -678,9 +702,12 @@ fn invite_round_trip() {
     let text = invite.encode().unwrap();
     assert!(text.starts_with(INVITE_PREFIX));
     assert_eq!(PairingInvite::parse(&text).unwrap(), invite);
+    let mut long = invite.clone();
+    long.url = format!("wss://{}", "h".repeat(MAX_INVITE_URL - 6));
+    assert_eq!(long.url.len(), MAX_INVITE_URL);
+    assert_eq!(PairingInvite::parse(&long.encode().unwrap()).unwrap(), long);
     let mut ws = invite.clone();
-    ws.url = format!("ws://{}", "h".repeat(MAX_INVITE_URL - 5));
-    assert_eq!(ws.url.len(), MAX_INVITE_URL);
+    ws.url = "ws://[::1]:8080".into();
     assert_eq!(PairingInvite::parse(&ws.encode().unwrap()).unwrap(), ws);
     assert!(!format!("{invite:?}").contains("[4, 4"));
 }

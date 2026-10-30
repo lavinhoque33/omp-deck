@@ -2465,7 +2465,8 @@ Accepted mutation records are journaled privately before execution. Outcome look
 execute the operation. Duplicate requests recover the accepted record; evicted accepted sequences
 remain expired. After an owner crash, unfinished records are uncertain, never replayed automatically.
 Outcome lookup and `CancelJob` are limited to the caller's own client id (mobile R4): another client's key answers
-`Refused` (`FOREIGN_KEY`), so no client reads another's results (e.g. a pairing invite) or cancels its jobs. Paired
+`Refused` (`FOREIGN_KEY`), so no client reads another's results (e.g. a pairing invite) or cancels its jobs. Client ids
+starting `d-` are reserved for paired devices: a local hello claiming one is refused (mobile R5). Paired
 devices are not local clients: they speak `deck_remote::api` (`docs/notes/mobile-relay.md` "R4 contract").
 Raw typing/paste is ephemeral: while disconnected or held, it is refused/dropped, never queued for
 a later connection. Reconnection restores subscriptions and desired view state only.

@@ -3,6 +3,10 @@
 # Install: copy the binary to /usr/local/bin/omp-deck-relay, this file to
 # /etc/systemd/system/omp-deck-relay.service, then `systemctl enable --now omp-deck-relay`.
 # It listens on 127.0.0.1:8080 behind a TLS reverse proxy (Caddyfile.example, nginx.conf.example).
+# --trust-forwarded-for honours X-Forwarded-For from loopback peers only (the proxy on this host);
+# any local user can connect from loopback too and forge it, so on a shared host its per-IP limits
+# are only as good as the local users. A proxy elsewhere needs --trusted-proxy <ip or cidr>; the
+# in-process TLS example below must not use --trust-forwarded-for (refused).
 #
 # Enroll rooms as the same dynamic user, so rooms.json stays readable by the service:
 #   sudo systemd-run --pipe --wait --quiet -p DynamicUser=yes -p User=omp-deck-relay \

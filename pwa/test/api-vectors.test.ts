@@ -60,6 +60,7 @@ interface ApiVectors {
   }[];
   messages: { type: 'request' | 'reply' | 'event' | 'welcome' | 'term_end'; case: string; json: string }[];
   rejected_requests: { case: string; json: string; error: string; id?: number }[];
+  skipped_records: { case: string; origin: Origin; hex: string; records: VectorRecord[] }[];
 }
 
 // A fixture checked into this repository; every test below fails on a shape mismatch.
@@ -103,6 +104,13 @@ describe('records', () => {
       const expected = vector.records.map(toRecord);
       expect(decodeRecords(fromHex(vector.hex), vector.origin)).toEqual(expected);
       expect(toHex(encodeRecords(expected))).toBe(vector.hex);
+    });
+  }
+
+  // Unknown gateway-range kinds are skipped: decode only, there is nothing to encode.
+  for (const vector of vectors.skipped_records) {
+    test(`skips ${vector.case}`, () => {
+      expect(decodeRecords(fromHex(vector.hex), vector.origin)).toEqual(vector.records.map(toRecord));
     });
   }
 
@@ -311,12 +319,50 @@ describe('gateway messages validate', () => {
     ];
     for (const [decode, json] of bad) expectDecodeError(() => decode(utf8(json)));
     expectDecodeError(() => decodeEvent(Uint8Array.of(0xff)));
+    // Only a string tag outside the known set is tolerated, not other shapes.
+    expectDecodeError(() => decodeEvent(utf8('{"type":7}')));
+    expectDecodeError(() => decodeEvent(utf8('{}')));
   });
 
-  test('a welcome of another protocol version is refused', () => {
+  test('an unknown event type decodes to an UnknownEvent', () => {
+    expect(decodeEvent(utf8('{"type":"hologram","depth":3}'))).toEqual({ type: 'unknown_event', name: 'hologram' });
+  });
+
+  test('an unknown transcript item type keeps its place among the items', () => {
+    const json =
+      '{"type":"feed","feed":{"feed":"transcript","session":"s","agent":null,"tail":3},' +
+      '"value":{"feed":"transcript","start":4,"reset":false,"items":[' +
+      '{"type":"thinking","text":"a"},{"type":"hologram","x":1},{"type":"exit","reason":"done"}]}}';
+    expect(decodeEvent(utf8(json))).toEqual({
+      type: 'feed',
+      feed: { feed: 'transcript', session: 's', agent: null, tail: 3 },
+      value: {
+        feed: 'transcript',
+        start: 4,
+        items: [{ type: 'thinking', text: 'a' }, { type: 'unknown_item', name: 'hologram' }, { type: 'exit', reason: 'done' }],
+        reset: false,
+      },
+    });
+    // A malformed known item is still refused.
+    expectDecodeError(() =>
+      decodeEvent(
+        utf8(
+          '{"type":"feed","feed":{"feed":"transcript","session":"s","agent":null,"tail":3},' +
+            '"value":{"feed":"transcript","start":0,"reset":false,"items":[{"type":"thinking"}]}}',
+        ),
+      ),
+    );
+  });
+
+  test('a welcome of any protocol version from 1 up to PROTOCOL is accepted', () => {
     const welcome = messages('welcome')[0]!;
-    const other = welcome.json.replace('"protocol":1', '"protocol":2');
-    expect(other).not.toBe(welcome.json);
-    expectDecodeError(() => decodeWelcome(utf8(other)));
+    const at = (version: number) => welcome.json.replace('"protocol":1', `"protocol":${version}`);
+    for (let version = 1; version <= PROTOCOL; version++) {
+      expect(decodeWelcome(utf8(at(version))).protocol).toBe(version);
+    }
+    for (const version of [0, PROTOCOL + 1]) {
+      expect(at(version)).not.toBe(welcome.json);
+      expectDecodeError(() => decodeWelcome(utf8(at(version))));
+    }
   });
 });
