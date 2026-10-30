@@ -16,13 +16,14 @@ use deck_core::agents::{AgentStatus, TranscriptItem};
 use deck_core::changes::{ChangedFile, Changes, DiffSide};
 use deck_core::fleet::{FleetSession, FleetTarget};
 use deck_core::omp::DeleteTarget;
-use deck_core::sessions::{ProjectGroup, SessionEntry, abbreviate_home};
+use deck_core::sessions::{ProjectGroup, SessionEntry};
 use deck_remote::api::{
     self, ApiError, Event, Feed, FeedValue, Op, ReplyResult, Resp, TermEnd, ViewMode,
 };
 use deck_term::InputMeta;
 
-use super::{ClientState, Conn, Engine, Sink, ViewOp};
+use super::spelling::{self, Canon, same_spelling};
+use super::{ClientState, Conn, Engine, Fin, Sink, ViewOp};
 use crate::controller::{
     Cancel, Command, ControllerEvent, Delivery, Rejected, RequestId, RequestKey, RequestRecord,
     SessionTarget,
@@ -54,6 +55,8 @@ const AGENT_ID_CHARS: usize = 128;
 pub(super) struct Devices {
     /// Files of sessions a device asked to delete, with their ids.
     deleted: HashMap<PathBuf, String>,
+    /// Canonical forms of the folders and files the projections compare.
+    canon: Canon,
 }
 
 /// One device session's engine side.
@@ -221,12 +224,12 @@ fn fit_feed<T: Clone>(
     encode(lo).filter(fits)
 }
 
-fn projects(groups: &[ProjectGroup]) -> Vec<api::Project> {
+fn projects(groups: &[ProjectGroup], canon: &Canon) -> Vec<api::Project> {
     let mut list: Vec<api::Project> = groups
         .iter()
         .map(|g| api::Project {
             id: project_id(&g.cwd),
-            display: abbreviate_home(&g.cwd),
+            display: canon.display(&g.cwd),
             worktree: g.worktree.is_some(),
             session_count: count(g.sessions.len()),
             modified_unix_ms: g
@@ -293,6 +296,52 @@ fn session_at(groups: &[ProjectGroup], path: &Path) -> Option<String> {
         .flat_map(|g| &g.sessions)
         .find(|s| s.path == path)
         .map(|s| s.id.clone())
+}
+
+/// The inventory group and session of the session file `file` as omp reported it: the same
+/// spelling, else a file of that name that resolves to the same file.
+fn session_in<'a>(
+    groups: &'a [ProjectGroup],
+    canon: &Canon,
+    file: &Path,
+) -> Option<(&'a ProjectGroup, &'a SessionEntry)> {
+    let all = || {
+        groups
+            .iter()
+            .flat_map(|g| g.sessions.iter().map(move |s| (g, s)))
+    };
+    all()
+        .find(|(_, s)| same_spelling(&s.path, file))
+        .or_else(|| {
+            let name = Path::new(file.file_name()?);
+            all().find(|(_, s)| {
+                s.path
+                    .file_name()
+                    .is_some_and(|n| same_spelling(Path::new(n), name))
+                    && canon.same(&s.path, file)
+            })
+        })
+}
+
+/// The inventory project of a controlled session: the group holding its session file, else
+/// the group of its launch folder, else of omp's current folder (each in any spelling).
+fn live_project<'a>(
+    groups: &'a [ProjectGroup],
+    canon: &Canon,
+    info: &ControllerInfo,
+    held: Option<&'a ProjectGroup>,
+) -> Option<&'a ProjectGroup> {
+    let cwds = [Some(info.cwd.as_path()), info.live_cwd.as_deref()];
+    held.or_else(|| {
+        cwds.iter()
+            .flatten()
+            .find_map(|c| groups.iter().find(|g| same_spelling(&g.cwd, c)))
+    })
+    .or_else(|| {
+        cwds.iter()
+            .flatten()
+            .find_map(|c| groups.iter().find(|g| canon.same(&g.cwd, c)))
+    })
 }
 
 /// A subagent id is one file stem: no separators, no parent references.
@@ -453,13 +502,21 @@ fn own_requests(info: &ControllerInfo, device: &str) -> Vec<api::OwnRequest> {
         .collect()
 }
 
-/// A controlled session as `device` sees it.
+/// A controlled session as `device` sees it. Its `project` is always an inventory project's
+/// id when one holds it (see [`live_project`]), whichever way omp spells its folder.
 fn live_session(
     info: &ControllerInfo,
     device: &str,
-    session: Option<String>,
+    groups: &[ProjectGroup],
+    canon: &Canon,
     desktop_controlled: bool,
 ) -> api::LiveSession {
+    let held = info
+        .session_path
+        .as_deref()
+        .and_then(|p| session_in(groups, canon, p));
+    let project = live_project(groups, canon, info, held.map(|(g, _)| g))
+        .map_or_else(|| project_id(&info.cwd), |g| project_id(&g.cwd));
     let cwd = info.live_cwd.as_deref().unwrap_or(&info.cwd);
     api::LiveSession {
         live: live_ref(&info.target),
@@ -469,9 +526,9 @@ fn live_session(
         },
         label: info.label.clone(),
         title: info.title.clone(),
-        session,
-        project: Some(project_id(cwd)),
-        display: abbreviate_home(cwd),
+        session: held.map(|(_, s)| s.id.clone()),
+        project: Some(project),
+        display: canon.display(cwd),
         activity: activity(info.activity),
         status: status(info.status),
         exit_code: info.exit_code,
@@ -843,6 +900,30 @@ impl Engine {
         for conn in conns {
             self.pump_device(conn);
         }
+        // Paths the projections could only compare by spelling are resolved off this thread.
+        if let Some(paths) = self.devices.canon.take_wanted() {
+            self.spawn_worker("paths", move || {
+                Fin::Canonical(
+                    paths
+                        .into_iter()
+                        .map(|p| {
+                            let c = spelling::resolve(&p);
+                            (p, c)
+                        })
+                        .collect(),
+                )
+            });
+        }
+    }
+
+    /// Canonical forms arrived: the projections that compare paths are recomputed.
+    pub(super) fn on_canonical(&mut self, found: Vec<(PathBuf, Option<PathBuf>)>) {
+        self.devices.canon.resolved(found);
+        for c in self.conns.values_mut() {
+            if let Sink::Device(d) = &mut c.sink {
+                d.topic_changed(&Topic::Sessions);
+            }
+        }
     }
 
     fn device_mut(&mut self, conn: u64) -> Option<&mut DeviceConn> {
@@ -1006,14 +1087,10 @@ impl Engine {
             .iter()
             .zip(&self.sess.managed)
             .map(|(info, m)| {
-                let session = info
-                    .session_path
-                    .as_deref()
-                    .and_then(|p| session_at(&groups, p));
                 let desktop = m
                     .controlling()
                     .is_some_and(|v| self.views.get(&v).is_some_and(|v| v.owner.is_none()));
-                live_session(info, device, session, desktop)
+                live_session(info, device, &groups, &self.devices.canon, desktop)
             })
             .collect()
     }
@@ -1022,7 +1099,7 @@ impl Engine {
     fn refresh_feed(&self, device: &str, feed: &Feed, st: &mut FeedState, out: &DeviceOut) {
         let body = match feed {
             Feed::Projects {} => {
-                let list = projects(&self.groups());
+                let list = projects(&self.groups(), &self.devices.canon);
                 fit_feed(feed, &list, |projects, truncated| FeedValue::Projects {
                     projects,
                     truncated,
@@ -1879,7 +1956,7 @@ mod tests {
     #[test]
     fn project_and_session_feeds_are_bounded_and_hold_no_paths() {
         let g = groups();
-        let list = projects(&g);
+        let list = projects(&g, &Canon::default());
         assert_eq!(list.len(), 3);
         assert_eq!(
             list[0].id,
@@ -1933,34 +2010,23 @@ mod tests {
         assert!(!projects.is_empty() && projects.len() < big.len());
     }
 
-    #[test]
-    fn live_projection_shows_only_the_devices_own_requests_and_no_ctl_key() {
-        use crate::controller::{CommandKind, RequestRecord, ServiceEpoch, SessionKey};
-        let target = SessionTarget {
-            epoch: ServiceEpoch([7; 16]),
-            key: SessionKey::tmux("omp-deck-test-1", "omp-x"),
-            generation: 3,
-        };
-        let record = |client: &str, seq| {
-            let mut r: RequestRecord = serde_json::from_value(serde_json::json!({
-                "id": seq,
-                "key": { "client": client, "seq": seq },
-                "target": target,
-                "kind": "Prompt",
-                "label": "Send prompt",
-                "delivery": "Queued",
-                "runtime": "Untracked",
-            }))
-            .expect("record");
-            r.kind = CommandKind::Prompt;
-            r
-        };
-        let info = ControllerInfo {
-            target: target.clone(),
+    fn controller_info(
+        cwd: &Path,
+        session_path: Option<PathBuf>,
+        live_cwd: Option<PathBuf>,
+        requests: Vec<RequestRecord>,
+    ) -> ControllerInfo {
+        use crate::controller::{ServiceEpoch, SessionKey};
+        ControllerInfo {
+            target: SessionTarget {
+                epoch: ServiceEpoch([7; 16]),
+                key: SessionKey::tmux("omp-deck-test-1", "omp-x"),
+                generation: 3,
+            },
             role: SessionRole::Session,
             label: "x".to_owned(),
-            cwd: PathBuf::from("/srv/alpha"),
-            session_path: Some(PathBuf::from("/srv/alpha/.sessions/a1.jsonl")),
+            cwd: cwd.to_path_buf(),
+            session_path,
             backend: crate::gateway::protocol::BackendRef::Direct,
             title: None,
             activity: Activity::Idle,
@@ -1974,12 +2040,40 @@ mod tests {
             live_control: true,
             spawned_unix_ms: 1,
             ctl_key: Some("secret-ctl-key".to_owned()),
-            live_cwd: None,
-            requests: vec![record("d-1", 1), record("gui-other", 2)],
+            live_cwd,
+            requests,
             views: 1,
             controlled: false,
+        }
+    }
+
+    #[test]
+    fn live_projection_shows_only_the_devices_own_requests_and_no_ctl_key() {
+        use crate::controller::CommandKind;
+        let record = |client: &str, seq| {
+            let target = controller_info(Path::new("/"), None, None, Vec::new()).target;
+            let mut r: RequestRecord = serde_json::from_value(serde_json::json!({
+                "id": seq,
+                "key": { "client": client, "seq": seq },
+                "target": target,
+                "kind": "Prompt",
+                "label": "Send prompt",
+                "delivery": "Queued",
+                "runtime": "Untracked",
+            }))
+            .expect("record");
+            r.kind = CommandKind::Prompt;
+            r
         };
-        let s = live_session(&info, "d-1", Some("a1".to_owned()), false);
+        let info = controller_info(
+            Path::new("/srv/alpha"),
+            Some(PathBuf::from("/srv/alpha/.sessions/a1.jsonl")),
+            None,
+            vec![record("d-1", 1), record("gui-other", 2)],
+        );
+        let s = live_session(&info, "d-1", &groups(), &Canon::default(), false);
+        assert_eq!(s.session.as_deref(), Some("a1"));
+        assert_eq!(s.project, Some(project_id(Path::new("/srv/alpha"))));
         assert_eq!(s.requests.len(), 1);
         assert_eq!(s.requests[0].seq, 1);
         assert_eq!(s.status, api::Status::Idle {});
@@ -1987,6 +2081,81 @@ mod tests {
         assert!(!json.contains("secret-ctl-key"), "{json}");
         assert!(!json.contains("gui-other"), "{json}");
         assert!(!json.contains("/srv/alpha/"), "{json}");
+    }
+
+    #[test]
+    fn a_live_session_is_in_its_launch_project_whatever_omp_reports_as_its_folder() {
+        let info = controller_info(
+            Path::new("/srv/beta"),
+            None,
+            Some(PathBuf::from("/elsewhere/beta")),
+            Vec::new(),
+        );
+        let canon = Canon::default();
+        let s = live_session(&info, "d-1", &groups(), &canon, false);
+        assert_eq!(s.project, Some(project_id(Path::new("/srv/beta"))));
+    }
+
+    /// Resolves what the projections asked for, as the engine's worker does.
+    #[cfg(unix)]
+    fn resolve_wanted(canon: &mut Canon) {
+        let wanted = canon.take_wanted().unwrap_or_default();
+        canon.resolved(
+            wanted
+                .into_iter()
+                .map(|p| {
+                    let c = spelling::resolve(&p);
+                    (p, c)
+                })
+                .collect(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_live_session_spelled_through_a_symlink_is_in_its_inventory_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join(".sessions")).expect("dirs");
+        std::fs::write(real.join(".sessions/s1.jsonl"), "{}\n").expect("file");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let group = |cwd: &Path| ProjectGroup {
+            cwd: cwd.to_path_buf(),
+            display: String::new(),
+            sessions: vec![SessionEntry {
+                id: "s1".to_owned(),
+                path: cwd.join(".sessions/s1.jsonl"),
+                cwd: cwd.to_path_buf(),
+                title: None,
+                first_prompt: None,
+                modified: UNIX_EPOCH,
+            }],
+            worktree: None,
+        };
+        // The inventory spells the project through the link; omp reports the target.
+        let groups = vec![group(&link)];
+        let info = controller_info(
+            &real,
+            Some(real.join(".sessions/s1.jsonl")),
+            Some(real.clone()),
+            Vec::new(),
+        );
+        let mut canon = Canon::default();
+        let first = live_session(&info, "d-1", &groups, &canon, false);
+        assert_eq!(first.session, None, "not resolved yet");
+        resolve_wanted(&mut canon);
+        let s = live_session(&info, "d-1", &groups, &canon, false);
+        assert_eq!(s.project, Some(project_id(&link)));
+        assert_eq!(s.session.as_deref(), Some("s1"));
+        // And the other way round: the inventory has the target, omp the link (no file).
+        let groups = vec![group(&real)];
+        let info = controller_info(&link, None, Some(link.clone()), Vec::new());
+        let mut canon = Canon::default();
+        live_session(&info, "d-1", &groups, &canon, false);
+        resolve_wanted(&mut canon);
+        let s = live_session(&info, "d-1", &groups, &canon, false);
+        assert_eq!(s.project, Some(project_id(&real)));
     }
 
     #[test]

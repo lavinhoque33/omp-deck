@@ -15,6 +15,7 @@ mod notify;
 mod remote;
 mod schedules;
 mod sessions;
+mod spelling;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
@@ -181,6 +182,8 @@ pub(crate) enum Fin {
     Activated(Result<(), String>),
     /// The sessions' live folders (session, generation, folder).
     LiveCwds(Vec<(SessionKey, u64, Option<PathBuf>)>),
+    /// Canonical forms of paths the device projections compared ([`spelling::Canon`]).
+    Canonical(Vec<(PathBuf, Option<PathBuf>)>),
     /// Unjournaled work (a view's kill): only a failure is logged.
     Logged {
         what: &'static str,
@@ -705,6 +708,7 @@ impl Engine {
             }
             Fin::Sched(s) => self.on_schedule_fin(s),
             Fin::LiveCwds(found) => self.on_live_cwds(found),
+            Fin::Canonical(found) => self.on_canonical(found),
             Fin::Activated(r) => {
                 if let Err(e) = r {
                     log::warn!("opening OmpDeck for a notification failed: {e}");

@@ -826,7 +826,28 @@ fn devices_drive_a_real_session_through_the_relay() {
         "absolute path in the live feed: {json}"
     );
     let shown = sessions.iter().find(|s| s.live == live).expect("shown");
-    assert_eq!(shown.project.as_deref(), Some(project.as_str()));
+    if shown.project.as_deref() != Some(project.as_str()) {
+        // A folder spelled differently resolves on a worker: a corrected value follows.
+        let (got, display) = (shown.project.clone(), shown.display.clone());
+        let end = Instant::now() + STEP;
+        loop {
+            let fixed = a.records.iter().any(|r| {
+                matches!(event(r), Some(Event::Feed {
+                    value: FeedValue::Live { sessions, .. },
+                    ..
+                }) if sessions.iter().any(|s| s.live == live && s.project.as_deref() == Some(project.as_str())))
+            });
+            if fixed {
+                break;
+            }
+            assert!(
+                Instant::now() < end,
+                "the live session's project {got:?} (display {display:?}) is not the \
+                 project it was started in, {project:?}; the projects feed: {projects:#?}"
+            );
+            a.poll(SLICE);
+        }
+    }
 
     // -- an observe view: snapshot first, then output --
     let view = match a.call(

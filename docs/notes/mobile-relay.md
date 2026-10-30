@@ -431,6 +431,11 @@ As built (R4, `deck_remote::api` behind the `noise` feature; engine side `gatewa
   subscription at once; its `T_END` goes out right after the WELCOME and before replies/events/feeds/output. A device
   holds at most 2 × `max_views` views (open + ended with an unsent `T_END`); attaches beyond that answer
   `too_many_requests` until those ends go out.
+- A live session's `project` is the inventory project holding its session file, else that of its launch folder, else
+  that of omp's current folder; folders match whatever their spelling (`engine/spelling.rs`: same spelling at once,
+  otherwise canonical forms resolved off the engine thread and cached — symlinks; on Windows 8.3 names, case,
+  separators, `\\?\`). Until a different spelling is resolved the fallback `project_id(launch folder)` may show
+  briefly, then a corrected `live` value follows. `display` abbreviates any spelling of the home folder as `~`.
 
 ## Sources (verified 2026-10-27)
 
