@@ -1,9 +1,9 @@
 # Mobile companion: design contract
 
-Status: step 1's in-process shared service is implemented; gateway/OS integration,
-relay/pairing and the PWA remain planned. Decisions agreed on 2026-10-25: relay
-connectivity, background gateway by default with an app-open-only option, installable
-PWA, full control. The implementation boundary and command routes are recorded below.
+Status: steps 1 (shared service) and 2 (gateway and OS integration, released in 0.15.0) are implemented; relay/pairing
+(proposal in `mobile-relay.md`) and the PWA remain planned. Decisions agreed on 2026-10-25: relay connectivity,
+background gateway by default with an app-open-only option, installable PWA, full control; on 2026-10-27: the relay is
+self-hosted only for now and written in Rust. The implementation boundary and command routes are recorded below.
 
 ## Product boundary
 
@@ -275,5 +275,6 @@ modes with systemd-user / Windows logon-task supervision, install/update/uninsta
 outdated owner. Step 1's "Windows runtime still requires Windows CI" is now answered for the transport, host,
 real-omp live control and the GUI-through-gateway path (CI), plus the gateway CLI/e2e and task trigger measured
 on Windows 11 (see `contracts.md`). Not shown by CI: `install.ps1` drain/resume, enabling Always on from the
-Mobile access card on Windows, and gateway-originated toast delivery. Relay, pairing and the PWA (slices 3-4) remain
-unimplemented.
+Mobile access card on Windows, and gateway-originated toast delivery. Slice 3 progress (relay, Noise, pairing) is
+tracked in `mobile-relay.md`. Slice 4 (the PWA, Web Push and the deferred gateway capabilities) has its own contract
+and step table in `mobile-pwa.md`.

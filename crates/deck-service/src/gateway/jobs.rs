@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::engine::worktree as engine_worktree;
 use deck_core::agent_defs::{self, EditError};
 use deck_core::backup::drive::{LOGIN_TIMEOUT, LoginFlow};
 use deck_core::backup::server::{ServerAuth, ServerConfig};
@@ -40,13 +41,14 @@ fn failed(e: impl std::fmt::Display) -> GatewayError {
 }
 
 /// Server-side objects a client refers to by number: OAuth flows and prepared restores never
-/// leave the gateway (they hold tokens, temp files and validated archives).
+/// leave the gateway (they hold tokens, temp files and validated archives). A prepared restore
+/// belongs to the client that prepared it: only that client may apply or discard it.
 #[derive(Default)]
 pub struct Handles {
     next: AtomicU64,
     logins: Mutex<HashMap<u64, Login>>,
-    restores: Mutex<HashMap<u64, PreparedRestore>>,
-    project_restores: Mutex<HashMap<u64, PreparedProjectRestore>>,
+    restores: Mutex<HashMap<u64, (String, PreparedRestore)>>,
+    project_restores: Mutex<HashMap<u64, (String, PreparedProjectRestore)>>,
 }
 
 struct Login {
@@ -76,12 +78,53 @@ impl Handles {
         }
     }
 
-    pub fn discard_restore(&self, handle: u64) -> bool {
-        lock(&self.restores).remove(&handle).is_some()
+    /// Drops a prepared Drive restore of `client`.
+    pub fn discard_restore(&self, handle: u64, client: &str) -> bool {
+        let mut restores = lock(&self.restores);
+        let own = restores.get(&handle).is_some_and(|(o, _)| o == client);
+        own && restores.remove(&handle).is_some()
     }
 
-    pub fn discard_project_restore(&self, handle: u64) -> bool {
-        lock(&self.project_restores).remove(&handle).is_some()
+    pub fn discard_project_restore(&self, handle: u64, client: &str) -> bool {
+        let mut restores = lock(&self.project_restores);
+        let own = restores.get(&handle).is_some_and(|(o, _)| o == client);
+        own && restores.remove(&handle).is_some()
+    }
+
+    /// The client that prepared Drive restore `handle`.
+    pub fn restore_owner(&self, handle: u64) -> Option<String> {
+        lock(&self.restores).get(&handle).map(|(o, _)| o.clone())
+    }
+
+    /// The client that prepared project restore `handle`.
+    pub fn project_restore_owner(&self, handle: u64) -> Option<String> {
+        lock(&self.project_restores)
+            .get(&handle)
+            .map(|(o, _)| o.clone())
+    }
+
+    /// The local copies project restore `handle` overwrites under `conflicts`: `(session id,
+    /// local session file)` of every backed-up session whose choice is
+    /// [`backup::ConflictChoice::Overwrite`] and that is not in `excluded` (left out of the
+    /// restore, so its local copy is untouched).
+    pub fn overwritten_copies(
+        &self,
+        handle: u64,
+        conflicts: &std::collections::BTreeMap<String, backup::ConflictChoice>,
+        excluded: &std::collections::BTreeSet<String>,
+    ) -> Vec<(String, PathBuf)> {
+        let restores = lock(&self.project_restores);
+        let Some((_, prepared)) = restores.get(&handle) else {
+            return Vec::new();
+        };
+        prepared
+            .plan
+            .sessions
+            .iter()
+            .filter(|s| !excluded.contains(&s.id))
+            .filter(|s| conflicts.get(&s.id) == Some(&backup::ConflictChoice::Overwrite))
+            .flat_map(|s| s.local.iter().map(|l| (s.id.clone(), l.path.clone())))
+            .collect()
     }
 
     /// A sign-in is waiting for the browser.
@@ -193,6 +236,11 @@ pub fn query(ctx: &JobCtx, q: &Query) -> Option<Result<Answer, GatewayError>> {
         Query::CheckBranch { repo, name } => worktree::check_branch_name(repo, name)
             .map(|()| Answer::CheckBranch)
             .map_err(failed),
+        Query::WorktreeDestination { repo, branch, dest } => {
+            engine_worktree::destination(ctx.omp.as_ref(), repo, branch, dest.clone())
+                .map(Answer::WorktreeDestination)
+                .map_err(failed)
+        }
         Query::ResolveWorktree(dir) => Ok(Answer::ResolveWorktree(worktree::resolve(dir))),
         Query::WorktreeStatus { worktree: wt, base } => worktree::status(wt, base)
             .map(Answer::WorktreeStatus)
@@ -245,7 +293,10 @@ pub fn query(ctx: &JobCtx, q: &Query) -> Option<Result<Answer, GatewayError>> {
             &ctx.root.path,
         ))),
         Query::AgentDefs { projects } => Ok(Answer::AgentDefs(agent_catalog(ctx, projects))),
-        Query::Topic(_) | Query::Screen(_) | Query::WorktreeSessions(_) => return None,
+        Query::Topic(_)
+        | Query::Screen(_)
+        | Query::WorktreeSessions(_)
+        | Query::WorktreeVerdict(_) => return None,
     };
     Some(r)
 }
@@ -267,6 +318,21 @@ fn running_detail(backends: &Backends, root: &Path) -> RunningDetail {
         }
     }
     detail
+}
+
+/// The live backend sessions whose folder lies inside `dir`, except `keep`. Blocking.
+pub fn sessions_inside(
+    backends: &Backends,
+    root: &Path,
+    dir: &Path,
+    keep: &[String],
+) -> Vec<String> {
+    running_detail(backends, root)
+        .sessions
+        .into_iter()
+        .filter(|s| s.cwd.as_deref().is_some_and(|c| c.starts_with(dir)) && !keep.contains(&s.name))
+        .map(|s| s.name)
+        .collect()
 }
 
 /// Kills exactly `names` (`wait`: until no backend lists them); the failures, with why.
@@ -328,6 +394,73 @@ pub fn delete_untracked(root: &Path, files: &[ChangedFile]) -> Result<Done, Gate
     changes::delete_untracked(root, &refs(files))
         .map(|()| Done::Unit)
         .map_err(failed)
+}
+
+/// The folders a paired device may act in (browse, start a session, sync, restore into): the
+/// browse roots and project folders, compared where symlinks lead. Checked again on the worker
+/// that uses a folder, so a link changed after the request cannot redirect it.
+#[derive(Clone, Debug)]
+pub struct Confine {
+    roots: Vec<PathBuf>,
+}
+
+/// [`Confine`]'s roots with every symlink resolved.
+pub struct ResolvedRoots(Vec<PathBuf>);
+
+/// `p` with every symlink resolved, in the spelling the rest of OmpDeck uses (no Windows
+/// verbatim prefix). A missing tail (a restore may create its target) is kept as written below
+/// its deepest existing entry, which must be a folder; `None` when nothing resolves, that
+/// entry is a file, an entry on the way exists yet does not resolve (a dangling link), or the
+/// tail is not plain names (`..` could climb out again). Blocking.
+fn resolved(p: &Path) -> Option<PathBuf> {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cur = p;
+    loop {
+        match std::fs::canonicalize(cur) {
+            // A missing tail can only be created below a folder, never below a file.
+            Ok(c) if !tail.is_empty() && !c.is_dir() => return None,
+            Ok(c) => {
+                let mut out = deck_core::platform::strip_verbatim(c);
+                out.extend(tail.iter().rev());
+                return Some(out);
+            }
+            Err(_) if std::fs::symlink_metadata(cur).is_ok() => return None,
+            Err(_) => {}
+        }
+        let mut parts = cur.components();
+        let Some(std::path::Component::Normal(name)) = parts.next_back() else {
+            return None;
+        };
+        tail.push(name);
+        cur = parts.as_path();
+    }
+}
+
+impl Confine {
+    pub fn new(roots: Vec<PathBuf>) -> Confine {
+        Confine { roots }
+    }
+
+    /// The roots resolved (one that cannot be is left out). Blocking.
+    pub fn resolve(&self) -> ResolvedRoots {
+        ResolvedRoots(self.roots.iter().filter_map(|r| resolved(r)).collect())
+    }
+
+    /// [`ResolvedRoots::admit`] against freshly resolved roots, refused with a message.
+    /// Blocking.
+    pub fn admit(&self, dir: &Path) -> Result<PathBuf, GatewayError> {
+        self.resolve().admit(dir).ok_or_else(|| {
+            GatewayError::Refused("That folder is outside the folders a device may use".to_owned())
+        })
+    }
+}
+
+impl ResolvedRoots {
+    /// `dir` resolved, if it leads at or below a root (a symlinked folder counts where it
+    /// leads, never where it is listed). Blocking.
+    pub fn admit(&self, dir: &Path) -> Option<PathBuf> {
+        resolved(dir).filter(|d| self.0.iter().any(|r| d.starts_with(r)))
+    }
 }
 
 pub fn worktree_create(
@@ -706,18 +839,20 @@ pub fn backup(ctx: &JobCtx, force: bool) -> Result<Done, GatewayError> {
     ctx.backup().backup(force).map(Done::Backup).map_err(failed)
 }
 
-pub fn prepare_restore(ctx: &JobCtx, file: &backup::BackupFile) -> Result<Done, GatewayError> {
+pub fn prepare_restore(
+    ctx: &JobCtx,
+    client: &str,
+    file: &backup::BackupFile,
+) -> Result<Done, GatewayError> {
     let prepared = ctx.backup().prepare_restore(file).map_err(failed)?;
     let plan = plan_view(&prepared);
     let handle = ctx.handles.next();
-    lock(&ctx.handles.restores).insert(handle, prepared);
+    lock(&ctx.handles.restores).insert(handle, (client.to_owned(), prepared));
     Ok(Done::Prepared { handle, plan })
 }
 
-pub fn apply_restore(ctx: &JobCtx, handle: u64) -> Result<Done, GatewayError> {
-    let prepared = lock(&ctx.handles.restores).remove(&handle).ok_or_else(|| {
-        GatewayError::Refused("that restore is gone; prepare it again".to_owned())
-    })?;
+pub fn apply_restore(ctx: &JobCtx, client: &str, handle: u64) -> Result<Done, GatewayError> {
+    let prepared = take_own(&ctx.handles.restores, handle, client)?;
     ctx.backup()
         .apply_restore(&prepared)
         .map(Done::Restored)
@@ -730,6 +865,75 @@ pub fn delete_backup(ctx: &JobCtx, file: &backup::BackupFile) -> Result<Done, Ga
         .map(|()| Done::Unit)
         .map_err(failed)
 }
+
+/// Deletes config backups in order, stopping at the first failure.
+pub fn delete_backups(ctx: &JobCtx, files: &[backup::BackupFile]) -> Result<Done, GatewayError> {
+    let service = ctx.backup();
+    delete_each(files, |f| f.id.as_str(), |f| service.delete_backup(f))
+}
+
+/// Deletes project backups in order, stopping at the first failure.
+pub fn project_delete_backups(
+    ctx: &JobCtx,
+    backups: &[backup::ProjectBackup],
+) -> Result<Done, GatewayError> {
+    let service = ctx.backup();
+    delete_each(
+        backups,
+        |b| b.file.id.as_str(),
+        |b| service.delete_project_backup(b),
+    )
+}
+
+/// Runs `delete` over `items` in order: `Unit` when every one was deleted, else a failure
+/// naming how many (and which ids) were deleted before the error.
+fn delete_each<T, E: std::fmt::Display>(
+    items: &[T],
+    id: impl Fn(&T) -> &str,
+    mut delete: impl FnMut(&T) -> Result<(), E>,
+) -> Result<Done, GatewayError> {
+    for (n, item) in items.iter().enumerate() {
+        if let Err(e) = delete(item) {
+            let deleted = &items[..n];
+            let message = if deleted.is_empty() {
+                format!("no backup deleted: {e}")
+            } else {
+                let ids: Vec<&str> = deleted.iter().map(&id).collect();
+                format!(
+                    "deleted {n} of {} backups ({}) before an error: {e}",
+                    items.len(),
+                    ids.join(", ")
+                )
+            };
+            return Err(GatewayError::Failed(message));
+        }
+    }
+    Ok(Done::Unit)
+}
+
+/// Takes the prepared restore `handle` out of `restores` when `client` prepared it.
+fn take_own<T>(
+    restores: &Mutex<HashMap<u64, (String, T)>>,
+    handle: u64,
+    client: &str,
+) -> Result<T, GatewayError> {
+    let mut restores = lock(restores);
+    match restores.get(&handle) {
+        None => Err(GatewayError::Refused(
+            "that restore is gone; prepare it again".to_owned(),
+        )),
+        Some((owner, _)) if owner != client => {
+            Err(GatewayError::Refused(NOT_YOUR_RESTORE.to_owned()))
+        }
+        Some(_) => restores
+            .remove(&handle)
+            .map(|(_, p)| p)
+            .ok_or_else(|| GatewayError::Refused("that restore is gone".to_owned())),
+    }
+}
+
+/// The refusal for a restore handle used by another client than the one that prepared it.
+pub const NOT_YOUR_RESTORE: &str = "that restore was prepared by another client";
 
 // ---- Backup server ------------------------------------------------------------------------------
 
@@ -842,6 +1046,7 @@ pub fn project_delete_backup(
 pub fn project_prepare_restore(
     ctx: &JobCtx,
     backup: &backup::ProjectBackup,
+    client: &str,
     target: &Path,
     parts: backup::Parts,
     cancel: &AtomicBool,
@@ -855,34 +1060,62 @@ pub fn project_prepare_restore(
         .map_err(failed)?;
     let plan = prepared.plan.clone();
     let handle = ctx.handles.next();
-    lock(&ctx.handles.project_restores).insert(handle, prepared);
+    lock(&ctx.handles.project_restores).insert(handle, (client.to_owned(), prepared));
     Ok(Done::ProjectPrepared { handle, plan })
 }
 
-/// Kills the backend sessions in `stop` (the local copies the restore overwrites), then applies
-/// the prepared restore with the user's per-session `conflicts` choices, leaving the sessions in
-/// `excluded` out.
+/// A device's prepared restore still targets a folder it may use (checked on the worker that
+/// applies it: the folder could have been swapped for a link since it was prepared).
+pub fn admit_restore_target(
+    ctx: &JobCtx,
+    client: &str,
+    handle: u64,
+    confine: &Confine,
+) -> Result<(), GatewayError> {
+    let target = lock(&ctx.handles.project_restores)
+        .get(&handle)
+        .filter(|(owner, _)| owner == client)
+        .map(|(_, p)| p.plan.target.clone());
+    match target {
+        Some(t) => confine.admit(&t).map(drop),
+        // Missing or foreign: the apply answers that itself.
+        None => Ok(()),
+    }
+}
+
+/// What a project restore's apply decides: the per-session `conflicts` choices, the backed-up
+/// sessions `excluded` from the restore, and the sessions to `stop` (those running the local
+/// copies the restore overwrites).
+pub struct RestoreChoices<'a> {
+    pub conflicts: &'a std::collections::BTreeMap<String, backup::ConflictChoice>,
+    pub excluded: &'a std::collections::BTreeSet<String>,
+    pub stop: &'a [String],
+}
+
+/// Kills the backend sessions in `choices.stop`, then applies `client`'s prepared restore with
+/// `choices`, leaving the excluded sessions out.
 pub fn project_apply_restore(
     ctx: &JobCtx,
+    client: &str,
     handle: u64,
-    conflicts: &std::collections::BTreeMap<String, backup::ConflictChoice>,
-    excluded: &std::collections::BTreeSet<String>,
-    stop: &[String],
+    choices: &RestoreChoices<'_>,
     cancel: &AtomicBool,
     progress: &(dyn Fn(Progress) + Sync),
 ) -> Result<Done, GatewayError> {
     let service = ctx.backup();
-    let mut prepared = lock(&ctx.handles.project_restores)
-        .remove(&handle)
-        .ok_or_else(|| {
-            GatewayError::Refused("that restore is gone; prepare it again".to_owned())
-        })?;
-    prepared.leave_out_sessions(excluded);
-    lifecycle::kill_all(&ctx.backends, stop, "restore");
+    let mut prepared = take_own(&ctx.handles.project_restores, handle, client)?;
+    prepared.leave_out_sessions(choices.excluded);
+    lifecycle::kill_all(&ctx.backends, choices.stop, "restore");
     service
-        .apply_project_restore(prepared, conflicts, ctx.omp.as_ref(), cancel, &|p| {
-            progress(progress_of(p));
-        })
+        .apply_project_restore(
+            prepared,
+            choices.conflicts,
+            ctx.omp.as_ref(),
+            cancel,
+            &|p| {
+                progress(progress_of(p));
+            },
+        )
         .map(Done::ProjectRestored)
         .map_err(failed)
 }
@@ -891,6 +1124,61 @@ pub fn project_apply_restore(
 mod tests {
     use super::*;
     use deck_core::omp::{Setting, SettingKind, SettingsTab};
+
+    #[cfg(unix)]
+    #[test]
+    fn a_device_folder_counts_where_it_leads_and_is_handed_on_resolved() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = resolved(tmp.path()).expect("temp dir resolves");
+        let (home, outside) = (base.join("home"), base.join("outside"));
+        for d in [home.join("proj/src"), outside.join("secret")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        std::fs::write(home.join("notes.txt"), b"x").expect("file");
+        symlink(&outside, home.join("escape")).expect("escape link");
+        symlink(home.join("proj"), home.join("alias")).expect("alias link");
+        symlink(base.join("nowhere"), home.join("dangling")).expect("dangling link");
+        // A root reached through a symlink is compared by where it leads too.
+        symlink(&home, base.join("home-link")).expect("root link");
+        let confine = Confine::new(vec![base.join("home-link"), base.join("missing")]);
+        let roots = confine.resolve();
+        // Admitted folders come back resolved: the use cannot be redirected by the link.
+        assert_eq!(roots.admit(&home), Some(home.clone()));
+        assert_eq!(
+            roots.admit(&home.join("alias/src")),
+            Some(home.join("proj/src"))
+        );
+        assert_eq!(
+            roots.admit(&base.join("home-link/proj")),
+            Some(home.join("proj"))
+        );
+        // A missing tail below a resolved folder (a restore target to create) stays inside.
+        assert_eq!(
+            roots.admit(&home.join("new/deeper")),
+            Some(home.join("new/deeper"))
+        );
+        for out in [
+            home.join("escape"),
+            home.join("escape/secret"),
+            home.join("escape/new"),
+            base.join("home-link/escape"),
+            outside.clone(),
+            home.join("dangling"),
+            home.join("dangling/new"),
+            // Nothing can be created below a file.
+            home.join("notes.txt/new"),
+            home.join("notes.txt/new/deeper"),
+            home.join("new/../../outside"),
+        ] {
+            assert_eq!(roots.admit(&out), None, "{}", out.display());
+        }
+        assert!(matches!(
+            confine.admit(&home.join("escape")),
+            Err(GatewayError::Refused(_))
+        ));
+        assert_eq!(confine.admit(&home).ok(), Some(home));
+    }
 
     #[test]
     fn a_secret_value_never_leaves_the_gateway() {
@@ -923,6 +1211,44 @@ mod tests {
             out.tabs[0].settings[1].value,
             Some(serde_json::Value::String("dark".to_owned()))
         );
+    }
+
+    #[test]
+    fn bulk_deletes_run_in_order_and_stop_at_the_first_failure() {
+        let ids = ["a", "b", "c", "d"];
+        let mut tried = Vec::new();
+        let all = delete_each(
+            &ids,
+            |s| *s,
+            |s| {
+                tried.push(*s);
+                Ok::<(), String>(())
+            },
+        );
+        assert!(matches!(all, Ok(Done::Unit)));
+        assert_eq!(tried, ids);
+
+        let mut tried = Vec::new();
+        let partial = delete_each(
+            &ids,
+            |s| *s,
+            |s| {
+                tried.push(*s);
+                if *s == "c" { Err("HTTP 500") } else { Ok(()) }
+            },
+        );
+        assert_eq!(tried, ["a", "b", "c"], "nothing after the failure is tried");
+        match partial {
+            Err(GatewayError::Failed(m)) => {
+                assert_eq!(m, "deleted 2 of 4 backups (a, b) before an error: HTTP 500");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        match delete_each(&ids, |s| *s, |_| Err("offline")) {
+            Err(GatewayError::Failed(m)) => assert_eq!(m, "no backup deleted: offline"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

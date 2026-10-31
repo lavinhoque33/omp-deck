@@ -34,7 +34,7 @@ use crate::tabs::{self, Tab};
 use crate::theme::{self, Palette};
 use crate::transfer::{self, TransferKind};
 use crate::widgets::{empty_state, icon_text, menu_item, paint_icon};
-use crate::worktree_ui::{self, Family, Finishing, ParkView, Row, RowWorktree};
+use crate::worktree_ui::{self, Family, ParkView, Row, RowWorktree};
 use crate::{card, tips};
 mod running;
 use deck_service::gateway::running::RunningSnapshot;
@@ -244,7 +244,7 @@ pub struct SidebarInput<'a> {
     /// Project backup entries of the context menus.
     pub backup: BackupMenu<'a>,
     /// Worktrees (by folder) that were sent the finish prompt and are being waited for.
-    pub finishing: &'a HashMap<PathBuf, Finishing>,
+    pub finishing: &'a HashMap<PathBuf, bool>,
     /// Worktrees OmpDeck removed: their sessions nest under the primary, marked as removed.
     pub removed: &'a BTreeMap<PathBuf, RemovedWorktree>,
     /// Parked branches: their sessions carry a chip and the continue actions.
@@ -830,10 +830,19 @@ fn show_group(
                 selected: input.active_path == Some(entry.path.as_path()),
                 running: input.running.is_running(&entry.id, &entry.path)
                     || input.open_paths.contains(&entry.path.as_path()),
-                chip: RowWorktree::of(row_group, &entry.id, input.removed, &input.parked).map(|wt| RowChip {
-                    finishing: matches!(wt, RowWorktree::Live(w) if input.finishing.contains_key(&w.path)),
-                    wt,
-                }),
+                chip: RowWorktree::of(row_group, &entry.id, input.removed, &input.parked).map(
+                    |wt| {
+                        let own = match wt {
+                            RowWorktree::Live(w) => input.finishing.get(&w.path).copied(),
+                            _ => None,
+                        };
+                        RowChip {
+                            finishing: own.is_some(),
+                            own_finish: own == Some(true),
+                            wt,
+                        }
+                    },
+                ),
             };
             let age = ages.get(pass.age_key, input.now, entry);
             session_row(ui, entry, age, &row, input, out);
@@ -861,7 +870,7 @@ fn slots(chip: &RowChip<'_>, omp: bool) -> [Option<Slot>; 2] {
             Some(if chip.finishing {
                 Slot {
                     icon: ICON_X,
-                    enabled: true,
+                    enabled: chip.own_finish,
                 }
             } else {
                 Slot {
@@ -923,13 +932,13 @@ impl RowAct {
 /// worktree `w`.
 fn live_acts(env: &MenuEnv<'_>, w: &Worktree) -> Vec<RowAct> {
     let mut acts = Vec::new();
-    if env.finishing.contains_key(&w.path) {
+    if let Some(&own) = env.finishing.get(&w.path) {
         acts.push(RowAct {
             icon: ICON_X,
             label: "Cancel finishing".to_owned(),
             tip: "Stop waiting for the agent; the worktree stays",
-            enabled: true,
-            why: None,
+            enabled: own,
+            why: (!own).then(|| "another device or window started this finish".to_owned()),
             danger: false,
             action: SidebarAction::CancelFinish(w.path.clone()),
         });
@@ -1704,6 +1713,8 @@ struct RowChip<'a> {
     wt: RowWorktree<'a>,
     /// The worktree is being finished: the chip says so instead of naming the branch.
     finishing: bool,
+    /// This window started the finish, so it can cancel it.
+    own_finish: bool,
 }
 
 impl RowChip<'_> {
@@ -1967,7 +1978,9 @@ fn session_row(
     if let Some(hint) = live.and_then(TabStatus::hint) {
         head = head.subtitle(hint);
     } else if let Some(chip) = &row.chip {
-        if chip.finishing {
+        if chip.finishing && !chip.own_finish {
+            head = head.subtitle("Finishing: another device or window started it");
+        } else if chip.finishing {
             head = head.subtitle("Finishing: waiting for the agent to merge");
         } else if matches!(chip.wt, RowWorktree::Removed(..)) {
             head = head.subtitle("Its worktree was removed by OmpDeck");
@@ -2235,7 +2248,7 @@ pub struct MenuEnv<'a> {
     /// Session files open in a live tab (a move to a worktree types into that tab).
     pub live_tabs: &'a [&'a Path],
     /// Worktrees (by folder) that were sent the finish prompt and are being waited for.
-    pub finishing: &'a HashMap<PathBuf, Finishing>,
+    pub finishing: &'a HashMap<PathBuf, bool>,
     pub parked: ParkView<'a>,
 }
 
@@ -2616,6 +2629,7 @@ mod tests {
             let chip = RowChip {
                 wt: RowWorktree::Parked(&rec, at),
                 finishing: false,
+                own_finish: false,
             };
             let acts = parked_acts(&env, &entry, &rec, at);
             let sl = slots(&chip, true);
@@ -2623,6 +2637,48 @@ mod tests {
             for (a, s) in acts.iter().zip(sl.iter().flatten()) {
                 assert_eq!((a.enabled, a.icon.codepoint), (s.enabled, s.icon.codepoint));
             }
+        }
+    }
+
+    #[test]
+    fn cancel_finishing_is_only_enabled_for_own_jobs() {
+        let wt = Worktree {
+            path: PathBuf::from("/wt/a"),
+            primary: PathBuf::from("/p/repo"),
+            branch: Some("a".into()),
+        };
+        let busy = HashSet::new();
+        let parkable = HashSet::new();
+        let (records, states) = ([], []);
+        for own in [true, false] {
+            let finishing = HashMap::from([(wt.path.clone(), own)]);
+            let env = MenuEnv {
+                groups: &[],
+                omp_available: true,
+                can_stop: true,
+                busy: &busy,
+                backup: BackupMenu {
+                    place: "Google Drive",
+                    off: None,
+                },
+                live_tabs: &[],
+                finishing: &finishing,
+                parked: ParkView {
+                    records: &records,
+                    states: &states,
+                    parkable: &parkable,
+                },
+            };
+            let acts = live_acts(&env, &wt);
+            assert_eq!(acts[0].label, "Cancel finishing");
+            assert_eq!(acts[0].enabled, own);
+            assert_eq!(acts[0].why.is_some(), !own);
+            let chip = RowChip {
+                wt: RowWorktree::Live(&wt),
+                finishing: true,
+                own_finish: own,
+            };
+            assert_eq!(slots(&chip, true)[0].map(|s| s.enabled), Some(own));
         }
     }
 

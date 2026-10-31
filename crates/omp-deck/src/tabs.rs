@@ -234,12 +234,6 @@ impl Tab {
             .map_or_else(|| Activity::from_title(self.term.title()), |i| i.activity)
     }
 
-    pub fn is_busy(&self) -> bool {
-        self.info
-            .as_ref()
-            .is_some_and(|i| i.busy || i.requests.iter().any(|r| !r.delivery.is_final()))
-    }
-
     pub fn pending_switch(&self) -> Option<&SwitchInfo> {
         self.info.as_ref().and_then(|i| i.pending_switch.as_ref())
     }

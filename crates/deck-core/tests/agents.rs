@@ -309,6 +309,7 @@ fn transcript_maps_every_render_shape() {
         text,
         from_agent,
         at,
+        ..
     } = &items[1]
     else {
         unreachable!()
@@ -342,6 +343,7 @@ fn transcript_maps_every_render_shape() {
         intent,
         summary,
         args,
+        ..
     } = &items[4]
     else {
         unreachable!()
@@ -358,6 +360,8 @@ fn transcript_maps_every_render_shape() {
             text: "fn main() {}".into(),
             is_error: false,
             truncated: false,
+            details: None,
+            images: Vec::new(),
         }
     );
     assert_eq!(
@@ -456,6 +460,7 @@ fn irc_blocks_become_their_own_items() {
         text: text.into(),
         from_agent: true,
         at: None,
+        images: Vec::new(),
     };
     assert_eq!(
         read_all(&p),

@@ -1,11 +1,12 @@
 //! The "New session in worktree…" and "Move to new worktree…" dialogs: form state, the checks
-//! (the gateway checks the branch name, a native worker the destination folder) and the form itself.
+//! (the gateway checks the branch name and the destination folder) and the form itself.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use deck_core::worktree::{self, RepoInfo};
 use deck_service::controller::SessionTarget;
+use deck_service::gateway::protocol::DestinationView;
 use egui::{Id, RichText, TextEdit, Ui};
 
 use crate::badge::{self, Hue};
@@ -16,7 +17,7 @@ use crate::icons::{
 };
 use crate::theme::Palette;
 use crate::widgets::{DraftButton, icon_text};
-use crate::worktree_ui::{base_to_record, branch_stamp};
+use crate::worktree_ui::branch_stamp;
 
 /// Typing is checked this long after the last key stroke (each check runs git).
 const DEBOUNCE: Duration = Duration::from_millis(250);
@@ -52,21 +53,30 @@ enum Check<T> {
 
 /// Where the worktree folder comes from.
 pub enum Loc {
-    /// The default under omp's managed base (follows the branch name).
-    Auto { base_setting: Option<String> },
+    /// The gateway's default under omp's managed base (follows the branch name).
+    Auto,
     /// What the user typed.
     Typed { text: String, home: Option<PathBuf> },
     /// No folder (moves are placed by omp).
     None,
 }
 
-/// A check for a worker.
+/// A check to run: the gateway judges the branch name and the destination.
 pub struct CheckReq {
     pub generation: u64,
     dir: PathBuf,
-    primary: PathBuf,
     branch: String,
     loc: Loc,
+}
+
+/// What to ask about the destination folder.
+pub enum DestAsk {
+    /// Moves have no folder.
+    Nothing,
+    /// The gateway checks `dest` (`None`: its default location for the branch).
+    Gateway { dest: Option<PathBuf>, auto: bool },
+    /// The typed text is not a usable path at all.
+    Rejected(String),
 }
 
 /// The folder part of a check.
@@ -74,6 +84,41 @@ pub struct LocationRes {
     location: Option<Result<PathBuf, String>>,
     /// The text of the computed default location.
     auto_text: Option<String>,
+}
+
+impl LocationRes {
+    /// The gateway's answer for the folder (`auto`: the default location was asked for).
+    pub fn answered(auto: bool, res: Result<DestinationView, String>) -> Self {
+        match res {
+            Ok(v) => Self {
+                auto_text: auto.then(|| v.dest.to_string_lossy().into_owned()),
+                location: Some(match v.error {
+                    None => Ok(v.dest),
+                    Some(e) => Err(e),
+                }),
+            },
+            Err(e) => Self {
+                location: Some(Err(e)),
+                auto_text: None,
+            },
+        }
+    }
+
+    /// A verdict reached without the gateway.
+    pub fn rejected(msg: String) -> Self {
+        Self {
+            location: Some(Err(msg)),
+            auto_text: None,
+        }
+    }
+
+    /// No folder to judge.
+    pub fn none() -> Self {
+        Self {
+            location: None,
+            auto_text: None,
+        }
+    }
 }
 
 /// One line for a failure the gateway reported (git's own stderr says it best: the command
@@ -97,56 +142,32 @@ impl CheckReq {
         &self.branch
     }
 
-    /// Blocking (filesystem): call from a native worker.
-    pub fn locate(self) -> LocationRes {
-        let (location, auto_text) = match self.loc {
-            Loc::None => (None, None),
-            Loc::Auto { base_setting } => {
-                let leaf = if self.branch.trim().is_empty() {
-                    "worktree"
-                } else {
-                    self.branch.trim()
-                };
-                let dest = worktree::default_location(
-                    &worktree::managed_base(base_setting.as_deref()),
-                    &self.primary,
-                    leaf,
-                );
-                let text = dest.to_string_lossy().into_owned();
-                (Some(check_destination(&dest).map(|()| dest)), Some(text))
-            }
-            Loc::Typed { text, home } => (
-                Some(
-                    crate::transfer::lexical_dest(&text, home.as_deref()).and_then(|p| {
-                        check_destination(&p)?;
-                        Ok(p)
-                    }),
-                ),
-                None,
-            ),
-        };
-        LocationRes {
-            location,
-            auto_text,
+    /// The branch to ask the gateway about for the folder (its default location follows it).
+    pub fn leaf(&self) -> &str {
+        if self.branch.is_empty() {
+            "worktree"
+        } else {
+            &self.branch
         }
     }
-}
 
-/// `omp worktree add` needs a destination that is absent (below a folder) or empty.
-pub fn check_destination(dest: &Path) -> Result<(), String> {
-    match std::fs::metadata(dest) {
-        Ok(m) if !m.is_dir() => Err("A file is in the way".to_owned()),
-        Ok(_) => match std::fs::read_dir(dest).map(|mut it| it.next().is_none()) {
-            Ok(true) => Ok(()),
-            Ok(_) => Err("That folder is not empty".to_owned()),
-            Err(e) => Err(format!("Cannot read that folder: {e}")),
-        },
-        Err(e) => match dest.ancestors().skip(1).find(|a| a.exists()) {
-            Some(a) if !a.is_dir() => Err(format!("{} is not a folder", a.display())),
-            Some(_) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Some(_) => Err(format!("Cannot use that location: {e}")),
-            None => Err("That location does not exist".to_owned()),
-        },
+    /// What to ask the gateway about the destination folder (no I/O).
+    pub fn destination(&self) -> DestAsk {
+        match &self.loc {
+            Loc::None => DestAsk::Nothing,
+            Loc::Auto => DestAsk::Gateway {
+                dest: None,
+                auto: true,
+            },
+            Loc::Typed { text, home } => match crate::transfer::lexical_dest(text, home.as_deref())
+            {
+                Ok(p) => DestAsk::Gateway {
+                    dest: Some(p),
+                    auto: false,
+                },
+                Err(e) => DestAsk::Rejected(e),
+            },
+        }
     }
 }
 
@@ -157,16 +178,13 @@ pub enum Plan {
         repo: PathBuf,
         branch: String,
         base_ref: String,
-        /// The branch to remember as the merge target (`None`: inferred later).
-        record_base: Option<String>,
-        dest: PathBuf,
+        /// The folder the user typed or picked; `None`: the gateway's default location.
+        dest: Option<PathBuf>,
     },
     Move {
         uid: u64,
         target: SessionTarget,
         branch: String,
-        /// The branch the session is on now: the merge target.
-        base: Option<String>,
     },
 }
 
@@ -250,13 +268,9 @@ impl WorktreeDialog {
         }
     }
 
-    /// The check to run on a worker now, if one is due (the repository is known and typing paused).
-    pub fn take_check(
-        &mut self,
-        base_setting: Option<&str>,
-        home: Option<&Path>,
-    ) -> Option<CheckReq> {
-        let Repo::Ready(info) = &self.repo else {
+    /// The check to run now, if one is due (the repository is known and typing paused).
+    pub fn take_check(&mut self, home: Option<&Path>) -> Option<CheckReq> {
+        let Repo::Ready(_) = &self.repo else {
             return None;
         };
         if !self.needs_check || self.edited_at.elapsed() < DEBOUNCE {
@@ -265,9 +279,7 @@ impl WorktreeDialog {
         self.needs_check = false;
         let loc = match (&self.kind, self.loc_auto) {
             (Kind::Move { .. }, _) => Loc::None,
-            (_, true) => Loc::Auto {
-                base_setting: base_setting.map(str::to_owned),
-            },
+            (_, true) => Loc::Auto,
             (_, false) => Loc::Typed {
                 text: self.location.clone(),
                 home: home.map(Path::to_path_buf),
@@ -276,7 +288,6 @@ impl WorktreeDialog {
         Some(CheckReq {
             generation: self.generation,
             dir: self.dir().to_path_buf(),
-            primary: info.primary.clone(),
             branch: self.branch.trim().to_owned(),
             loc,
         })
@@ -369,14 +380,12 @@ impl WorktreeDialog {
                 uid: *uid,
                 target: target.clone(),
                 branch,
-                base: info.current_branch.clone(),
             }),
             (Kind::New { .. }, Check::Ok(dest)) => Some(Plan::New {
                 repo: info.root.clone(),
-                record_base: base_to_record(&self.base_ref, &info.branches),
                 base_ref: self.base_ref.clone(),
                 branch,
-                dest: dest.clone(),
+                dest: (!self.loc_auto).then(|| dest.clone()),
             }),
             _ => None,
         }
@@ -629,18 +638,15 @@ mod tests {
     fn the_branch_is_prefilled_and_checks_wait_for_the_repository_and_the_typing_pause() {
         let mut d = new_dialog();
         assert_eq!(d.branch, "wt/19700101-0000");
-        assert!(
-            d.take_check(None, None).is_none(),
-            "repository not read yet"
-        );
+        assert!(d.take_check(None).is_none(), "repository not read yet");
         d.on_repo(Ok(info(true)));
         assert_eq!(d.base_ref, "main");
-        assert!(d.take_check(None, None).is_none(), "typing pause not over");
+        assert!(d.take_check(None).is_none(), "typing pause not over");
         d.edited_at -= DEBOUNCE;
-        let req = d.take_check(None, None).expect("due");
+        let req = d.take_check(None).expect("due");
         assert_eq!(req.branch, "wt/19700101-0000");
-        assert!(matches!(req.loc, Loc::Auto { .. }));
-        assert!(d.take_check(None, None).is_none(), "one check per edit");
+        assert!(matches!(req.loc, Loc::Auto));
+        assert!(d.take_check(None).is_none(), "one check per edit");
     }
 
     #[test]
@@ -648,7 +654,7 @@ mod tests {
         let mut d = new_dialog();
         d.on_repo(Ok(info(true)));
         d.edited_at -= DEBOUNCE;
-        let first = d.take_check(None, None).expect("check");
+        let first = d.take_check(None).expect("check");
         d.edited(); // the user kept typing
         let answer = |d: &mut WorktreeDialog, generation, location: &str| {
             d.apply_branch(generation, Ok(()));
@@ -677,9 +683,7 @@ mod tests {
         d.loc_auto = false;
         d.edited();
         d.edited_at -= DEBOUNCE;
-        let req = d
-            .take_check(None, Some(Path::new("/home/u")))
-            .expect("check");
+        let req = d.take_check(Some(Path::new("/home/u"))).expect("check");
         assert!(matches!(&req.loc, Loc::Typed { text, .. } if text == "/typed/here"));
         d.apply_branch(req.generation, Ok(()));
         d.apply_location(
@@ -693,20 +697,17 @@ mod tests {
             d.location, "/typed/here",
             "an auto text never overwrites the user's"
         );
-        let Some(Plan::New {
-            dest,
-            base_ref,
-            record_base,
-            ..
-        }) = d.plan()
-        else {
+        let Some(Plan::New { dest, base_ref, .. }) = d.plan() else {
             panic!("plan");
         };
-        assert_eq!(dest, Path::new("/typed/here"));
-        assert_eq!(
-            (base_ref.as_str(), record_base.as_deref()),
-            ("main", Some("main"))
-        );
+        assert_eq!(dest.as_deref(), Some(Path::new("/typed/here")));
+        assert_eq!(base_ref, "main");
+        // Until the user edits it the gateway picks the folder.
+        d.loc_auto = true;
+        let Some(Plan::New { dest, .. }) = d.plan() else {
+            panic!("plan");
+        };
+        assert_eq!(dest, None);
     }
 
     #[test]
@@ -753,7 +754,7 @@ mod tests {
         );
         d.on_repo(Ok(info(true)));
         d.edited_at -= DEBOUNCE;
-        let req = d.take_check(None, None).expect("check");
+        let req = d.take_check(None).expect("check");
         assert!(matches!(req.loc, Loc::None));
         d.apply_branch(req.generation, Ok(()));
         d.apply_location(
@@ -763,35 +764,9 @@ mod tests {
                 auto_text: None,
             },
         );
-        let Some(Plan::Move {
-            uid, branch, base, ..
-        }) = d.plan()
-        else {
+        let Some(Plan::Move { uid, branch, .. }) = d.plan() else {
             panic!("plan");
         };
-        assert_eq!(
-            (uid, branch.as_str(), base.as_deref()),
-            (7, "wt/19700101-0000", Some("main"))
-        );
-    }
-
-    #[test]
-    fn destination_must_be_absent_or_empty() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = tmp.path();
-        assert_eq!(check_destination(&dir.join("new/deep")), Ok(()));
-        assert_eq!(check_destination(dir), Ok(()), "an empty folder is fine");
-        std::fs::write(dir.join("f"), b"x").expect("file");
-        assert!(check_destination(dir).unwrap_err().contains("not empty"));
-        assert!(
-            check_destination(&dir.join("f"))
-                .unwrap_err()
-                .contains("file")
-        );
-        assert!(
-            check_destination(&dir.join("f/sub"))
-                .unwrap_err()
-                .contains("not a folder")
-        );
+        assert_eq!((uid, branch.as_str()), (7, "wt/19700101-0000"));
     }
 }

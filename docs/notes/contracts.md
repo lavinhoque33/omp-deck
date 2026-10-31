@@ -2557,6 +2557,10 @@ to the connection. Keys are never reused for different work.
 Accepted mutation records are journaled privately before execution. Outcome lookup does not
 execute the operation. Duplicate requests recover the accepted record; evicted accepted sequences
 remain expired. After an owner crash, unfinished records are uncertain, never replayed automatically.
+Outcome lookup and `CancelJob` are limited to the caller's own client id (mobile R4): another client's key answers
+`Refused` (`FOREIGN_KEY`), so no client reads another's results (e.g. a pairing invite) or cancels its jobs. Client ids
+starting `d-` are reserved for paired devices: a local hello claiming one is refused (mobile R5). Paired
+devices are not local clients: they speak `deck_remote::api` (`docs/notes/mobile-relay.md` "R4 contract").
 Raw typing/paste is ephemeral: while disconnected or held, it is refused/dropped, never queued for
 a later connection. Reconnection restores subscriptions and desired view state only.
 
@@ -3215,7 +3219,15 @@ deleted).
 - Transports (blocking, on the caller's worker thread; connect 15 s, stall 60 s): FTP/FTPS via `suppaftp` 12.2
   (`rustls-ring`), passive mode with the data connection dialled to the control address, binary type; SFTP via
   `russh` 0.65 (`ring`) + `russh-sftp` 3 on a private current-thread tokio runtime. No OpenSSL / aws-lc.
-- Wired into the gateway and the GUI in 0.20.0 (next section).
+- Accepted advisory (`deny.toml`): RUSTSEC-2023-0071 (Marvin, `rsa` timing side channel; no fixed release). It comes
+  in through russh's `rsa` feature, which RSA user keys and host keys need. The only private-key operation is the
+  client's single user-auth signature per login, sent to a server the user configured whose host key is pinned on first
+  use. Host-key verification uses public-key operations only. Marvin needs an attacker timing many private-key
+  operations, which this one-signature-per-login pattern does not offer. Dropping the feature would break RSA-key
+  logins.
+- Wired into the gateway and the GUI in 0.20.0 (next section). The gateway's `Service` reads `google-drive.json` and
+  `backup-server.json` from the served profile's `app_root()`. That is `config_dir()` for the default profile; an
+  explicit `--settings` profile keeps its own on every platform, since Windows' config dir ignores the environment.
 
 ## Backup destinations in the gateway and the GUI (0.20.0)
 

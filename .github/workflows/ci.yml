@@ -28,6 +28,35 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: PWA typecheck, tests and build
+        working-directory: pwa
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun test
+          bun run build
+          test -f dist/index.html && test -f dist/sw.js && test -f dist/manifest.webmanifest
+
+  # RustSec advisories (policy in deny.toml) and the PWA's npm advisories.
+  audit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check advisories
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: PWA dependency audit
+        working-directory: pwa
+        run: |
+          bun install --frozen-lockfile
+          bun audit
 
   windows:
     runs-on: windows-latest
@@ -85,6 +114,17 @@ jobs:
         run: |
           $env:OMPDECK_TEST_OMP = Join-Path $env:LOCALAPPDATA 'omp\omp.exe'
           cargo test -p deck-core --test ctl_live -- --nocapture
+
+      # The mobile R4 gate: paired devices drive a real omp session through an in-test relay with the
+      # GUI client gone (skipped in the workspace run above, which has no omp yet).
+      - name: Remote device gate through the relay (real omp)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: |
+          cargo test -p deck-service --test remote_device -- --nocapture 2>&1 | Tee-Object -Variable out
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "remote_device failed ($code)" }
+          if (($out | Out-String) -match 'skipped: omp is not installed') { throw "remote_device skipped: omp is not on PATH" }
 
       - name: Host smoke (omp in ConPTY)
         if: ${{ !cancelled() }}

@@ -1,0 +1,75 @@
+// Public surface of the remote transport. Test seams (`startInitiator`, `respondWith`) and the raw
+// Noise state machines stay in their modules.
+
+export { fromBase64Url, toBase64Url } from './bytes.ts';
+export {
+  DEFAULT_MAX_REASSEMBLY,
+  DEFAULT_REKEY_INTERVAL_MS,
+  DEFAULT_REKEY_MESSAGES,
+  DEFAULT_SESSION_CONFIG,
+  type DeviceHello,
+  decodeDeviceHello,
+  decodeWelcome,
+  encodeDeviceHello,
+  encodePairingInvite,
+  encodeWelcome,
+  FLAG_MORE,
+  FLAG_REKEY,
+  fingerprint,
+  INVITE_PREFIX,
+  Initiator,
+  isDisplaySafe,
+  Keypair,
+  MAX_FEATURES,
+  MAX_FRAGMENT_DATA,
+  MAX_HANDSHAKE_PAYLOAD,
+  type Mode,
+  NoiseError,
+  type NoiseErrorCode,
+  nextTimestamp,
+  PAIRING_PATTERN,
+  type PairingInvite,
+  Pending,
+  PROLOGUE,
+  parsePairingInvite,
+  type ReceivedHello,
+  RECONNECT_PATTERN,
+  respond,
+  Session,
+  type SessionConfig,
+  timestampFresh,
+  type Welcome,
+} from './protocol.ts';
+export { isLowOrder } from './noise.ts';
+export {
+  CLOSE,
+  DEVICE_PATH,
+  encodeRelayHello,
+  HEALTH_PATH,
+  HELLO_OK,
+  isHelloOk,
+  MAX_PAYLOAD,
+  VERSION,
+} from './relay.ts';
+export {
+  ACK_EVERY_BYTES,
+  ACK_EVERY_MESSAGES,
+  ACK_EVERY_MS,
+  AckPolicy,
+  type AppRecord,
+  decodeRecords,
+  encodeRecords,
+  INPUT_CTRL_C,
+  KIND,
+  MAX_APP_MESSAGE,
+  MAX_INPUT,
+  MAX_SNAPSHOT_CHUNK,
+  type Origin,
+  RECORD_HEADER,
+  RecordError,
+  type RecordErrorCode,
+  type RecordKindName,
+} from './records.ts';
+// The application protocol's JSON types and codecs; namespaced because `Welcome` and
+// `decodeWelcome` also exist for the Noise handshake payload.
+export * as api from './api.ts';

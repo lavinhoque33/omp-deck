@@ -234,10 +234,102 @@ pub struct LiveSnapshot {
     pub context: Option<ContextBreakdown>,
     /// The main session's in-memory model state; `None` from older extensions or on any failure.
     pub model: Option<LiveModel>,
+    /// Dialogs the session is waiting on, oldest first. Empty from older extensions and when
+    /// [`CtlClient::ui_hook`] is false. Unknown kinds are dropped.
+    pub pending_ui: Vec<PendingUi>,
     /// The OAuth account the main session uses for its current model's provider (omp's
     /// `authStorage.oauth.identity`); `None` from older extensions, for api-key providers, or on
     /// any failure.
     pub account: Option<LiveAccount>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PendingUiKind {
+    Select,
+    Confirm,
+    Input,
+    Editor,
+    Ask,
+    Approve,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, serde::Serialize)]
+pub struct UiOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, serde::Serialize)]
+pub struct UiQuestion {
+    pub id: String,
+    pub question: String,
+    #[serde(default)]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub options: Vec<UiOption>,
+    #[serde(default)]
+    pub multi: bool,
+    /// Index of the recommended option.
+    #[serde(default)]
+    pub recommended: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiGrant {
+    /// `folder` or `target`.
+    pub scope: String,
+    pub label: String,
+    pub always_label: String,
+}
+
+/// omp's tool-approval prompt.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
+pub struct UiApprove {
+    pub full: String,
+    #[serde(default)]
+    pub compact: String,
+    /// Label of the "approve for this session" choice; absent when every call must be approved.
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub grants: Vec<UiGrant>,
+}
+
+/// A dialog the main session is waiting on (the extension's `pendingUi`).
+#[derive(Clone, Debug, PartialEq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingUi {
+    pub id: u64,
+    pub kind: PendingUiKind,
+    #[serde(default)]
+    pub title: String,
+    /// `confirm`: the question body; `input`: the placeholder.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// `select`.
+    #[serde(default)]
+    pub options: Vec<UiOption>,
+    /// `select` with checkboxes.
+    #[serde(default)]
+    pub multi: bool,
+    /// `select`: initially highlighted index.
+    #[serde(default)]
+    pub initial: Option<u32>,
+    /// `editor`: initial text.
+    #[serde(default)]
+    pub prefill: Option<String>,
+    /// `ask`.
+    #[serde(default)]
+    pub questions: Vec<UiQuestion>,
+    /// `approve`.
+    #[serde(default)]
+    pub approve: Option<UiApprove>,
+    /// omp answers by itself (default option) after this long.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// An omp session's OAuth account for one provider, and the provider's stored accounts it can be
@@ -329,6 +421,16 @@ pub enum CtlCommand {
         root: PathBuf,
         entry_id: String,
     },
+    /// Answer the pending UI request `id` ([`PendingUi::id`]) with `value`, the dialog
+    /// function's own result: a label (`select`), `true`/`false` (`confirm`), text
+    /// (`input`/`editor`), omp's `{kind:"submit",results:[…]}` (`ask`), or `"once"` / `"session"`
+    /// / `"deny"` / `{grant,always}` (`approve`). `null` cancels. Replies `no such request` when
+    /// the request is gone (the terminal answered first) or the extension has no UI hook.
+    AnswerUi {
+        id: u64,
+        value: serde_json::Value,
+        root: PathBuf,
+    },
     /// Pin the main session to the stored OAuth account `credential` of `provider`, the provider
     /// of its current model (`None`: unpin, omp picks again). Refused while streaming, and when
     /// `root` (if given) or the model's provider no longer match.
@@ -355,7 +457,11 @@ pub struct CtlReply {
 #[serde(tag = "t")]
 enum WireMsg {
     #[serde(rename = "hello")]
-    Hello { v: u32 },
+    Hello {
+        v: u32,
+        #[serde(default)]
+        ui_hook: bool,
+    },
     #[serde(rename = "agents")]
     Agents(Box<WireSnapshot>),
     #[serde(rename = "reply")]
@@ -387,6 +493,8 @@ struct WireSnapshot {
     context: Option<Lenient<WireContext>>,
     #[serde(default)]
     model: Option<Lenient<WireModel>>,
+    #[serde(default, rename = "pendingUi")]
+    pending_ui: Vec<Lenient<PendingUi>>,
     #[serde(default)]
     account: Option<Lenient<WireAccount>>,
 }
@@ -562,7 +670,19 @@ impl From<WireSnapshot> for LiveSnapshot {
                 }
             })
             .collect();
+        let pending_ui = w
+            .pending_ui
+            .into_iter()
+            .filter_map(|p| match p {
+                Lenient::Ok(p) => Some(p),
+                Lenient::Bad(_) => {
+                    log::debug!("ctl: skipped unknown or malformed pending UI request");
+                    None
+                }
+            })
+            .collect();
         LiveSnapshot {
+            pending_ui,
             pid: w.pid,
             session_file: w.session_file,
             main_idle: w.main_idle,
@@ -647,6 +767,9 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
         CtlCommand::ForkAt { root, entry_id } => {
             serde_json::json!({"rid": rid, "t": "fork_at", "entryId": entry_id, "root": root})
         }
+        CtlCommand::AnswerUi { id, value, root } => {
+            serde_json::json!({"rid": rid, "t": "answer_ui", "id": id, "value": value, "root": root})
+        }
         CtlCommand::Navigate { root, entry_id } => {
             serde_json::json!({"rid": rid, "t": "navigate", "entryId": entry_id, "root": root})
         }
@@ -668,6 +791,7 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
 #[derive(Default)]
 struct Shared {
     connected: AtomicBool,
+    ui_hook: AtomicBool,
     shutdown: AtomicBool,
     next_id: AtomicU64,
     latest: Mutex<Option<Arc<LiveSnapshot>>>,
@@ -725,6 +849,13 @@ impl CtlClient {
     /// True while a socket is open and the server's `hello` (protocol v1) was received.
     pub fn connected(&self) -> bool {
         self.shared.connected.load(Ordering::Acquire)
+    }
+
+    /// The connected extension wrapped omp's dialog functions, so [`LiveSnapshot::pending_ui`] is
+    /// complete and [`CtlCommand::AnswerUi`] can answer. `false` when offline or for an older or
+    /// drifted extension.
+    pub fn ui_hook(&self) -> bool {
+        self.shared.ui_hook.load(Ordering::Acquire)
     }
 
     /// `None` until the first snapshot and after a disconnect.
@@ -822,6 +953,7 @@ impl Worker {
 
     /// Connection ended: drop the snapshot, fail unanswered requests, tell the UI.
     fn reset(&mut self) {
+        self.shared.ui_hook.store(false, Ordering::Release);
         let was_connected = self.shared.connected.swap(false, Ordering::AcqRel);
         let had_snapshot = lock(&self.shared.latest).take().is_some();
         let mut changed = was_connected || had_snapshot;
@@ -937,11 +1069,12 @@ impl Worker {
             }
         };
         match msg {
-            WireMsg::Hello { v } => {
+            WireMsg::Hello { v, ui_hook } => {
                 if v != PROTOCOL_VERSION {
                     log::warn!("ctl: unsupported protocol version {v}");
                     return false;
                 }
+                self.shared.ui_hook.store(ui_hook, Ordering::Release);
                 *hello = true;
                 if !self.shared.connected.swap(true, Ordering::AcqRel) {
                     (self.on_update)();

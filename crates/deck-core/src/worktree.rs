@@ -1156,7 +1156,8 @@ pub fn merge_target(porcelain: &str, base: &str) -> MergeTarget {
 /// Finds where `base` is checked out (blocking: runs git).
 pub fn find_merge_target(primary: &Path, base: &str) -> Result<MergeTarget, String> {
     let mut cmd = std::process::Command::new("git");
-    cmd.args(["worktree", "list", "--porcelain"])
+    cmd.args(crate::git::NO_FSMONITOR)
+        .args(["worktree", "list", "--porcelain"])
         .current_dir(primary)
         .stdin(std::process::Stdio::null());
     crate::platform::no_window(&mut cmd);

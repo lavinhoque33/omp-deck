@@ -1,0 +1,18 @@
+{
+  "id": "/",
+  "scope": "/",
+  "start_url": "/?source=pwa",
+  "name": "OmpDeck",
+  "short_name": "OmpDeck",
+  "description": "Your OmpDeck desktop sessions, on your phone.",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0c19",
+  "theme_color": "#0b0c19",
+  "categories": ["developer", "productivity"],
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

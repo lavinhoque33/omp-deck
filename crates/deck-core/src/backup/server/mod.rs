@@ -184,7 +184,7 @@ impl ServerConfig {
     }
 
     /// Same server, login and folder: what is there is what the saved sync state describes.
-    fn same_place(&self, other: &ServerConfig) -> bool {
+    pub fn same_place(&self, other: &ServerConfig) -> bool {
         self.protocol == other.protocol
             && self.host.eq_ignore_ascii_case(&other.host)
             && self.effective_port() == other.effective_port()

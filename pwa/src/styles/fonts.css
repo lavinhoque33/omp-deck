@@ -1,0 +1,27 @@
+/* The mockups' typefaces (SIL OFL 1.1, see THIRD_PARTY_LICENSES), served from the app origin. */
+@font-face {
+  font-family: 'JetBrains';
+  src: url('../assets/fonts/JetBrainsMono-VariableFont.ttf') format('truetype');
+  font-weight: 100 800;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist';
+  src: url('../assets/fonts/Geist-Regular.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Space';
+  src: url('../assets/fonts/SpaceGrotesk-Regular.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Manrope';
+  src: url('../assets/fonts/Manrope-Regular.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Outfit';
+  src: url('../assets/fonts/Outfit-Regular.ttf') format('truetype');
+  font-display: swap;
+}

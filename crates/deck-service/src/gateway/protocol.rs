@@ -296,6 +296,11 @@ pub enum Topic {
     Live(SessionKey),
     /// omp's version and update check.
     OmpUpdate,
+    /// Mobile access: the relay link, the gateway's key fingerprint, paired devices and the
+    /// open pairing window (never a secret).
+    Mobile,
+    /// The worktree state of the git repository holding this folder ([`WorktreesView`]).
+    Worktrees(PathBuf),
 }
 
 impl Topic {
@@ -309,6 +314,7 @@ impl Topic {
                 | Topic::Fleet
                 | Topic::Agents
                 | Topic::Transcript(_)
+                | Topic::Worktrees(_)
         )
     }
 }
@@ -339,6 +345,14 @@ pub enum Query {
     CheckBranch {
         repo: PathBuf,
         name: String,
+    },
+    /// Where `branch` would get its worktree (`dest`, else the default location below the
+    /// repository's primary checkout) and whether that location can be used now. The check is
+    /// the one [`Mutation::WorktreeNew`] applies.
+    WorktreeDestination {
+        repo: PathBuf,
+        branch: String,
+        dest: Option<PathBuf>,
     },
     ResolveWorktree(PathBuf),
     WorktreeStatus {
@@ -380,6 +394,8 @@ pub enum Query {
     /// Every live backend session with its memory, and the tmux server's own (the session
     /// manager's Running view and RAM column).
     RunningDetail,
+    /// Whether `worktree` can be removed or parked now, and why not ([`WorktreeVerdict`]).
+    WorktreeVerdict(Worktree),
     /// The custom agent definitions omp reads: the user's and those of the projects these
     /// session cwds resolve to, with omp's agent settings.
     AgentDefs {
@@ -402,6 +418,7 @@ pub enum Answer {
     Patch(String),
     RepoInfo(RepoInfo),
     CheckBranch,
+    WorktreeDestination(DestinationView),
     ResolveWorktree(Option<Worktree>),
     WorktreeStatus(WorktreeStatus),
     InferBase(Option<String>),
@@ -424,6 +441,96 @@ pub enum Answer {
     Done,
     RunningDetail(RunningDetail),
     AgentDefs(AgentCatalog),
+    WorktreeVerdict(WorktreeVerdict),
+}
+
+/// [`Query::WorktreeDestination`]'s answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationView {
+    /// The location asked for, or the default one.
+    pub dest: PathBuf,
+    /// Why `dest` cannot be used (`None`: it can).
+    pub error: Option<String>,
+}
+
+/// [`Query::WorktreeVerdict`]: the worktree's merge target, its git state and what
+/// [`Mutation::WorktreeRetire`] would do.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeVerdict {
+    pub base: String,
+    pub status: WorktreeStatus,
+    pub verdict: Retirement,
+}
+
+/// What retiring a worktree can do now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Retirement {
+    /// Clean and merged into its base: remove it (`park: false`).
+    Remove,
+    /// Clean and pushed, not merged yet (an open PR): park it (`park: true`).
+    Park,
+    /// Neither; the explanation.
+    Blocked(String),
+}
+
+/// [`Topic::Worktrees`]: the repository holding `dir`, its linked worktrees with their merge
+/// targets and running flows, and the branches parked from it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreesView {
+    pub dir: PathBuf,
+    /// `None` until the first look finished; `Err`: not a repository, or git failed.
+    pub repo: Option<Result<RepoInfo, String>>,
+    /// `dir`'s own linked worktree (`None`: the main checkout or no repository).
+    pub worktree: Option<Worktree>,
+    /// Every linked worktree of the repository.
+    pub linked: Vec<WorktreeEntry>,
+    /// The branches parked from this repository.
+    pub parked: Vec<ParkedEntry>,
+}
+
+/// One linked worktree of [`WorktreesView`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeEntry {
+    pub worktree: Worktree,
+    /// Its merge target: the recorded one, else inferred; `None`: unknown.
+    pub base: Option<String>,
+    /// `base` was recorded when the worktree was made (not inferred).
+    pub base_recorded: bool,
+    /// The last look found it clean and pushed but not merged (park, not remove).
+    pub parkable: bool,
+    /// A finish or retire flow running on it.
+    pub flow: Option<WorktreeFlow>,
+}
+
+/// A flow the gateway runs on a worktree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorktreeFlow {
+    /// [`Mutation::WorktreeFinish`] `job`; `stage`: its latest progress text.
+    Finishing {
+        job: RequestKey,
+        stage: Option<String>,
+    },
+    /// [`Mutation::WorktreeRetire`] (or a finish that reached the removal).
+    Retiring { job: RequestKey, park: bool },
+}
+
+/// A parked branch and where it stands (`state`: `None` until looked at).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkedEntry {
+    pub record: deck_core::config::ParkedBranch,
+    pub state: Option<BranchState>,
+}
+
+/// Where [`Mutation::WorktreeContinue`] continues a parked branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ContinueIn {
+    /// A new worktree of the branch at the managed default location; the branch's sessions
+    /// move into it.
+    Worktree,
+    /// The main checkout switches to the branch.
+    Main,
+    /// The main checkout switches back to the branch's base; the branch stays parked.
+    SwitchBack,
 }
 
 /// [`Query::RunningDetail`].
@@ -479,6 +586,8 @@ pub enum TopicValue {
         snapshot: Option<Box<LiveSnapshot>>,
     },
     OmpUpdate(OmpUpdateView),
+    Mobile(MobileView),
+    Worktrees(Box<WorktreesView>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -683,6 +792,80 @@ pub struct BackupView {
     pub last_auto_unix_ms: Option<u64>,
 }
 
+/// [`Topic::Mobile`]: everything the desktop shows about mobile access. Never carries a secret
+/// (room secret, admission tokens, PSK or invite).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileView {
+    pub relay: Option<RelayView>,
+    pub link: RelayLink,
+    /// The gateway's static key fingerprint (empty when its key is unavailable).
+    pub fingerprint: String,
+    pub devices: Vec<DeviceView>,
+    pub pairing: Option<PairingView>,
+}
+
+/// The configured relay: its base URL and printable room id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayView {
+    pub url: String,
+    pub room_id: String,
+}
+
+/// State of the gateway's relay connection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelayLink {
+    /// Not running (mode `Off` or no relay configured).
+    Off,
+    /// Connecting (`attempt` counts from 1 since the last time it was up); `error` is why the
+    /// previous attempt ended.
+    Connecting {
+        attempt: u32,
+        error: Option<String>,
+    },
+    Up,
+    /// The relay (or this gateway's own state) refuses the link; retried slowly.
+    Refused {
+        reason: String,
+    },
+}
+
+/// A paired device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceView {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    /// The device's static key fingerprint.
+    pub fingerprint: String,
+    pub permissions: Permissions,
+    pub created_unix_ms: u64,
+    pub last_seen_unix_ms: u64,
+    /// An encrypted session with it is open now.
+    pub online: bool,
+    /// It has a Web Push subscription.
+    #[serde(default)]
+    pub push: bool,
+}
+
+/// What a device may do beyond viewing (view is implied).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Permissions {
+    /// Prompts, runtime commands, terminal input, stop.
+    pub control: bool,
+    /// Copy/move/delete, git discard, worktree remove, restores, omp config.
+    pub manage: bool,
+}
+
+impl Default for Permissions {
+    /// The approval proposal: View + Control, Manage opt-in.
+    fn default() -> Permissions {
+        Permissions {
+            control: true,
+            manage: false,
+        }
+    }
+}
+
 impl BackupView {
     /// The active destination is set up (signed in / a server saved).
     pub fn linked(&self) -> bool {
@@ -701,6 +884,70 @@ impl BackupView {
         }
     }
 }
+
+/// The open pairing window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingView {
+    /// Identifies this window in [`Mutation::PairingApprove`]/[`Mutation::PairingDeny`] (not a
+    /// secret).
+    pub pairing: String,
+    /// When the current stage times out: the window while waiting, the approval wait once a
+    /// device asks.
+    pub expires_unix_ms: u64,
+    pub state: PairingState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairingState {
+    /// Waiting for a device to scan the invite.
+    Waiting,
+    /// A device proved the invite's PSK and waits for the desktop's decision; compare
+    /// `fingerprint` with the one the phone shows.
+    Approval {
+        name: String,
+        platform: String,
+        fingerprint: String,
+    },
+}
+
+/// Text that must never reach a log: serialized as a plain string, but `Debug`/`Display` print
+/// `<redacted>`, and the memory is wiped on drop.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretText(String);
+
+impl SecretText {
+    pub fn new(text: impl Into<String>) -> SecretText {
+        SecretText(text.into())
+    }
+
+    /// The secret itself (for the one place that needs it).
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for SecretText {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::fmt::Display for SecretText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// The most backups one [`Mutation::DeleteBackups`] / [`Mutation::ProjectDeleteBackups`]
+/// deletes.
+pub const MAX_BULK_DELETE: usize = 100;
 
 /// A saved backup server without its password or key passphrase.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -721,6 +968,17 @@ pub struct ServerView {
 }
 
 impl ServerView {
+    /// The same server, login and folder as `other`: what [`ServerConfig::same_place`] decides
+    /// for the saved configurations these views were made from (what is there is what cached
+    /// listings and the saved sync state describe).
+    pub fn same_place(&self, other: &ServerView) -> bool {
+        self.protocol == other.protocol
+            && self.host.eq_ignore_ascii_case(&other.host)
+            && self.port == other.port
+            && self.user == other.user
+            && self.folder == other.folder
+    }
+
     pub fn of(account: &ServerAccount) -> ServerView {
         let c = &account.config;
         ServerView {
@@ -751,7 +1009,6 @@ pub enum ServerConnectOutcome {
     /// removes the server and adds it again if the change is expected.
     Changed { pinned: String, presented: String },
 }
-
 /// A mutation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Mutation {
@@ -920,6 +1177,9 @@ pub enum Mutation {
     DiscardRestore(u64),
     /// Permanently deletes a config backup (only config backups are accepted).
     DeleteBackup(BackupFile),
+    /// Permanently deletes config backups one after another (at most [`MAX_BULK_DELETE`]),
+    /// stopping at the first failure; the failure names how many were deleted before it.
+    DeleteBackups(Vec<BackupFile>),
     /// Check and save the backup server. `keep_secret`: an empty password / missing passphrase
     /// takes the saved server's (same login), so editing never needs the secret again.
     ServerConnect {
@@ -935,18 +1195,22 @@ pub enum Mutation {
         force: bool,
     },
     ProjectDeleteBackup(ProjectBackup),
+    /// Project backups deleted one after another, as [`Mutation::DeleteBackups`].
+    ProjectDeleteBackups(Vec<ProjectBackup>),
     ProjectPrepareRestore {
         backup: ProjectBackup,
         target: PathBuf,
         parts: Parts,
     },
-    /// Apply a prepared restore. `conflicts` decides each backed-up session whose id exists
-    /// locally (missing = keep the local one); `excluded` = backed-up sessions left out of the
-    /// restore; `stop` = backend sessions to kill first (the local copies being overwritten).
+    /// Apply a prepared restore (only by the client that prepared it). `conflicts` decides each
+    /// backed-up session whose id exists locally (missing = keep the local one); `excluded` =
+    /// backed-up sessions left out of the restore. The gateway stops the sessions running the
+    /// local copies it overwrites itself; `stop` is ignored.
     ProjectApplyRestore {
         handle: u64,
         conflicts: BTreeMap<String, ConflictChoice>,
         excluded: BTreeSet<String>,
+        #[serde(default)]
         stop: Vec<String>,
     },
     ProjectDiscardRestore(u64),
@@ -966,6 +1230,148 @@ pub enum Mutation {
     OmpUpdateCheck,
     /// Rescan the sessions and poll the backends now.
     RefreshSessions,
+    /// Configure the relay: its base URL (`wss://`, or `ws://` for a loopback host) and the
+    /// room key printed by `omp-deck-relay enroll`. Stored only in the gateway's state dir.
+    RelaySet {
+        url: String,
+        room_key: SecretText,
+    },
+    /// Forget the relay (stops the link and closes an open pairing window; devices stay).
+    RelayClear,
+    /// Reconnect to the configured relay now: after another gateway took the room over (the
+    /// link then stays down until asked), or to skip a long backoff. Needs a relay and mobile
+    /// access on.
+    RelayReconnect,
+    /// Open the pairing window; answers [`Done::PairingStarted`].
+    PairingBegin,
+    /// Close the open pairing window (and any device connection on it).
+    PairingCancel,
+    /// Let the device waiting in `pairing` in, with these permissions.
+    PairingApprove {
+        pairing: String,
+        permissions: Permissions,
+    },
+    /// Turn the device waiting in `pairing` away and close the window.
+    PairingDeny {
+        pairing: String,
+    },
+    /// Delete a paired device: its relay token is withdrawn and its live session closed.
+    DeviceRevoke {
+        id: String,
+    },
+    DeviceRename {
+        id: String,
+        name: String,
+    },
+    DeviceSetPermissions {
+        id: String,
+        permissions: Permissions,
+    },
+    /// Review comments on `root`'s changes as one prompt, inserted at omp's cursor or sent
+    /// ([`Command::Review`](crate::controller::Command::Review)); answers like `Submit`.
+    Review {
+        target: SessionTarget,
+        root: PathBuf,
+        comments: Vec<ReviewItem>,
+        general: Option<String>,
+        send: bool,
+    },
+    /// Answers the session's pending dialog `request` ([`LiveSnapshot::pending_ui`]):
+    /// [`Done::Answered`] (`false`: it is gone).
+    AnswerUi {
+        target: SessionTarget,
+        request: u64,
+        answer: crate::ui_answer::UiAnswer,
+    },
+    /// Opens (or focuses) the session file's tab in the desktop app, starting it when no window
+    /// is open.
+    OpenOnDesktop {
+        file: PathBuf,
+        split: Split,
+    },
+    /// Closes the session file's tab in the desktop app (nothing to do without a window).
+    CloseOnDesktop {
+        file: PathBuf,
+    },
+    /// Sign in to the active destination on the desktop: the Google sign-in opens in the desktop
+    /// browser and finishes there ([`Done::DriveAccount`]). Refused "needs desktop" without a
+    /// desktop session, and for a backup server (set up in the desktop app's settings).
+    BackupConnectOnDesktop,
+    /// A worktree on the new `branch` made from `base_ref` (`None`: the repository's current
+    /// branch, else `HEAD`) at `dest` (`None`: the managed default location); its merge target
+    /// is recorded. `open`: a session starts in it ([`Done::Session`]), else [`Done::Path`].
+    WorktreeNew {
+        repo: PathBuf,
+        branch: String,
+        base_ref: Option<String>,
+        dest: Option<PathBuf>,
+        open: bool,
+    },
+    /// omp's `/wt <branch>` in the session: it moves into a new worktree; the branch it is on
+    /// now is recorded as the merge target once it arrived. [`Done::Submitted`].
+    WorktreeMoveSession {
+        target: SessionTarget,
+        branch: String,
+    },
+    /// The finish flow: the worktree's session (opened when none runs) is asked to commit and
+    /// merge; after each of its turns the worktree is checked, and once clean and merged it is
+    /// retired like [`Mutation::WorktreeRetire`] (`park: false`): [`Done::Retired`]. Progress
+    /// texts explain the wait; cancellable until the removal starts.
+    WorktreeFinish {
+        worktree: Worktree,
+    },
+    /// Removes a clean, merged worktree (`park: false`) or parks a clean, pushed, unmerged one
+    /// (`park: true`, the branch is kept): running sessions in it move into the main checkout
+    /// (omp's `/move`, up to 30 s), the rest are stopped, every session file moves there, the
+    /// folder goes and the records are kept. [`Done::Retired`].
+    WorktreeRetire {
+        worktree: Worktree,
+        park: bool,
+    },
+    /// Continues the branch parked from `primary`. `session`: the parked session to open
+    /// (`None`: its newest); opened for `Worktree` and `Main` ([`Done::Session`]); `SwitchBack`
+    /// answers [`Done::Unit`].
+    WorktreeContinue {
+        primary: PathBuf,
+        branch: String,
+        session: Option<String>,
+        place: ContinueIn,
+    },
+}
+
+/// Where [`Mutation::OpenOnDesktop`] places a newly opened tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Split {
+    /// A tab of its own.
+    None,
+    Right,
+    Down,
+}
+
+impl Split {
+    /// The value of the desktop app's `--split` flag.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Split::None => "none",
+            Split::Right => "right",
+            Split::Down => "down",
+        }
+    }
+}
+
+/// One comment of [`Mutation::Review`]: lines `start..=end` of `file`'s diff on `side`
+/// (numbered in the file after the change; a range of deleted lines only is quoted from the
+/// file before it).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewItem {
+    pub file: ChangedFile,
+    pub side: DiffSide,
+    pub start: u32,
+    pub end: u32,
+    pub text: String,
+    /// The exact side of the diff to quote; `None` infers it from the diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_side: Option<crate::review::Side>,
 }
 
 impl Mutation {
@@ -1015,10 +1421,12 @@ impl Mutation {
             Mutation::ApplyRestore(_) => "restore",
             Mutation::DiscardRestore(_) => "discard-restore",
             Mutation::DeleteBackup(_) => "delete-backup",
+            Mutation::DeleteBackups(_) => "delete-backups",
             Mutation::ServerConnect { .. } => "server-connect",
             Mutation::ServerForget => "server-forget",
             Mutation::ProjectBackup { .. } => "project-backup",
             Mutation::ProjectDeleteBackup(_) => "project-delete-backup",
+            Mutation::ProjectDeleteBackups(_) => "project-delete-backups",
             Mutation::ProjectPrepareRestore { .. } => "project-prepare-restore",
             Mutation::ProjectApplyRestore { .. } => "project-restore",
             Mutation::ProjectDiscardRestore(_) => "project-discard-restore",
@@ -1033,6 +1441,26 @@ impl Mutation {
             Mutation::UsageRefresh => "usage-refresh",
             Mutation::OmpUpdateCheck => "omp-update-check",
             Mutation::RefreshSessions => "refresh-sessions",
+            Mutation::RelaySet { .. } => "relay-set",
+            Mutation::RelayClear => "relay-clear",
+            Mutation::RelayReconnect => "relay-reconnect",
+            Mutation::PairingBegin => "pairing-begin",
+            Mutation::PairingCancel => "pairing-cancel",
+            Mutation::PairingApprove { .. } => "pairing-approve",
+            Mutation::PairingDeny { .. } => "pairing-deny",
+            Mutation::DeviceRevoke { .. } => "device-revoke",
+            Mutation::DeviceRename { .. } => "device-rename",
+            Mutation::DeviceSetPermissions { .. } => "device-permissions",
+            Mutation::Review { .. } => "review",
+            Mutation::AnswerUi { .. } => "answer-ui",
+            Mutation::OpenOnDesktop { .. } => "open-on-desktop",
+            Mutation::CloseOnDesktop { .. } => "close-on-desktop",
+            Mutation::BackupConnectOnDesktop => "backup-connect-on-desktop",
+            Mutation::WorktreeNew { .. } => "worktree-new",
+            Mutation::WorktreeMoveSession { .. } => "worktree-move-session",
+            Mutation::WorktreeFinish { .. } => "worktree-finish",
+            Mutation::WorktreeRetire { .. } => "worktree-retire",
+            Mutation::WorktreeContinue { .. } => "worktree-continue",
         }
     }
 
@@ -1048,7 +1476,10 @@ impl Mutation {
             | Mutation::SetSessionPath { target: t, .. }
             | Mutation::Ctl { target: t, .. }
             | Mutation::InboxOpen(t)
-            | Mutation::InboxDismiss(t) => Some(t),
+            | Mutation::InboxDismiss(t)
+            | Mutation::Review { target: t, .. }
+            | Mutation::AnswerUi { target: t, .. }
+            | Mutation::WorktreeMoveSession { target: t, .. } => Some(t),
             _ => None,
         }
     }
@@ -1071,6 +1502,12 @@ impl Mutation {
                 | Mutation::DriveLoginCancel(_)
                 | Mutation::DiscardRestore(_)
                 | Mutation::ProjectDiscardRestore(_)
+                | Mutation::PairingCancel
+                | Mutation::PairingDeny { .. }
+                | Mutation::DeviceRevoke { .. }
+                | Mutation::RelayClear
+                | Mutation::AnswerUi { .. }
+                | Mutation::CloseOnDesktop { .. }
         )
     }
 }
@@ -1162,6 +1599,15 @@ pub enum Done {
     },
     /// [`Mutation::RelocateSessions`]: per file, its new path or why it was not moved.
     Relocated(Vec<(PathBuf, Result<PathBuf, String>)>),
+    /// [`Mutation::WorktreeRetire`] / [`Mutation::WorktreeFinish`]: the git result, the ids of
+    /// the session files moved into the main checkout, how many running sessions moved there
+    /// and kept running, and whether it was parked.
+    Retired {
+        removed: Removed,
+        sessions: Vec<String>,
+        moved: u32,
+        parked: bool,
+    },
     Settings(Snapshot),
     Gateway(GatewayStatus),
     DriveLogin {
@@ -1188,6 +1634,15 @@ pub enum Done {
     Ctl(deck_core::ctl::CtlReply),
     /// [`Mutation::KillNames`]: the sessions that failed, with why.
     Killed(Vec<(String, String)>),
+    /// [`Mutation::PairingBegin`]: the window's id, the invite (`v1.…`) and the link the QR code
+    /// shows (`<pwa origin>/#pair=<invite>`). The only place the PSK leaves the gateway, and
+    /// only to the requesting client.
+    PairingStarted {
+        pairing: String,
+        invite: SecretText,
+        link: SecretText,
+        expires_unix_ms: u64,
+    },
     /// [`Mutation::AgentEdit`]: the definition as now on disk.
     AgentFile(Box<AgentFile>),
 }
@@ -1239,6 +1694,12 @@ pub enum GatewayError {
     /// The job was cancelled (its final outcome is [`Outcome::Cancelled`]).
     #[error("cancelled")]
     Cancelled,
+    /// The session runs (in a backend) without a live-control link the request needs, e.g. a
+    /// fork of a session the gateway cannot ask to fork itself.
+    #[error(
+        "Session is running in the background without live control — open it and restart with live control to fork"
+    )]
+    NoLiveControl,
 }
 
 /// One reply (the payload of a `REPLY` message).
@@ -1297,6 +1758,20 @@ pub enum ServerEvent {
     },
     /// Events were dropped (the client lagged): refetch every cached topic.
     Resync,
+    /// Open (or focus) the tab of the session file `file`; a newly opened one goes beside the
+    /// active tab as `split` says. Sent to the focused (else the most recent) GUI.
+    OpenSession {
+        file: PathBuf,
+        split: Split,
+    },
+    /// Close the tab of the session file `file` (every GUI).
+    CloseSession {
+        file: PathBuf,
+    },
+    /// Open `url` in the desktop browser (the focused, else the most recent GUI).
+    OpenUrl {
+        url: String,
+    },
 }
 
 /// Why one frontend write was refused.
@@ -1379,6 +1854,31 @@ pub fn decode_palette(b: &[u8]) -> Option<[[u8; 3]; 19]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_text_is_redacted_in_debug_but_serialized_plainly() {
+        let op = Mutation::RelaySet {
+            url: "wss://relay.example".into(),
+            room_key: SecretText::new("ompdeck-relay-v1:topsecret"),
+        };
+        let debug = format!("{op:?}");
+        assert!(!debug.contains("topsecret"), "{debug}");
+        assert!(debug.contains("<redacted>"));
+        let json = serde_json::to_string(&op).unwrap();
+        assert!(json.contains("\"ompdeck-relay-v1:topsecret\""), "{json}");
+        let back: Mutation = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(back, Mutation::RelaySet { room_key, .. } if room_key.expose() == "ompdeck-relay-v1:topsecret")
+        );
+        let done = Done::PairingStarted {
+            pairing: "p".into(),
+            invite: SecretText::new("v1.invite"),
+            link: SecretText::new("https://h/#pair=v1.invite"),
+            expires_unix_ms: 1,
+        };
+        assert!(!format!("{done:?}").contains("v1.invite"));
+        assert_eq!(format!("{}", SecretText::new("x")), "<redacted>");
+    }
 
     #[test]
     fn binary_frontend_payloads_round_trip() {

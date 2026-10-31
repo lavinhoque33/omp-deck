@@ -164,9 +164,7 @@ impl App {
         }
         match self.app_update.tracker.phase {
             Phase::Downloading { .. } => {
-                if let Some(key) = self.app_update.download.clone() {
-                    self.gw.cancel(key);
-                }
+                self.cancel_app_download();
             }
             Phase::Applying => {
                 if !self.app_update.close_after {
@@ -211,7 +209,11 @@ impl App {
 
     fn cancel_app_download(&mut self) {
         if let Some(key) = self.app_update.download.clone() {
-            self.gw.cancel(key);
+            self.gw.cancel(key, |_, r| {
+                if let Err(e) = r {
+                    log::debug!("the update download was not cancelled: {e}");
+                }
+            });
         }
     }
 

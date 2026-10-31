@@ -36,6 +36,16 @@ static COMPACT: AtomicU8 = AtomicU8::new(1);
 static UI_FONT: AtomicU8 = AtomicU8::new(0);
 /// The "Separated panels" setting (`AppConfig::separated_panels`, default on).
 static SEPARATED: AtomicBool = AtomicBool::new(true);
+/// Bumped by every [`apply`]: layout tests share the process-global style with tests running in
+/// parallel and count a frame only when no other `apply` ran while it was laid out.
+#[cfg(test)]
+static APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times [`apply`] has run in this process.
+#[cfg(test)]
+pub fn applied() -> u64 {
+    APPLIED.load(Ordering::SeqCst)
+}
 
 /// The structure of every style, in [`UiStyle::ALL`] order: as designed, and with separated panels.
 static LOOKS: LazyLock<[Look; 18]> = LazyLock::new(|| UiStyle::ALL.map(look::look_of));
@@ -200,6 +210,8 @@ pub fn apply(ctx: &Context, style: UiStyle, density: Density, ui_font: UiFont, d
     COMPACT.store(u8::from(density == Density::Compact), Ordering::Relaxed);
     let font_idx = UiFont::ALL.iter().position(|f| *f == ui_font).unwrap_or(0);
     UI_FONT.store(font_idx as u8, Ordering::Relaxed);
+    #[cfg(test)]
+    APPLIED.fetch_add(1, Ordering::SeqCst);
     let flat = style != UiStyle::Neon;
     let look = look_of(style);
     let family = family_for(&look, flat, ui_font);

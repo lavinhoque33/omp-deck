@@ -1,6 +1,6 @@
 //! App-side glue for the session tree window: the gateway topic that follows the session file,
-//! the gates for "Go here" / "Fork", and the two operations — through the live-control request
-//! when the active tab has live control, through the gateway's fork otherwise.
+//! the gates for "Go here" / "Fork", and the two operations — "Go here" through the live-control
+//! request of the active tab, fork through the gateway.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -76,14 +76,13 @@ struct ForkFacts {
 
 const RUNNING: &str = "Session is running in the background without live control — open it and restart with live control to fork";
 
-/// How a fork must run: over the live link of its tab, or headless when nothing runs the file
-/// (two omp processes on one file are unsafe).
-fn fork_route(f: &ForkFacts) -> Result<ForkRoute, &'static str> {
+/// The reason the Fork button is disabled, if any.
+fn fork_gate(f: &ForkFacts) -> Result<(), &'static str> {
     if f.busy {
         return Err("Another tree action is still running");
     }
     match f.tab {
-        TabFact::ActiveLive => return Ok(ForkRoute::Live),
+        TabFact::ActiveLive => return Ok(()),
         TabFact::Background => return Err("Switch to this session's tab to fork it"),
         TabFact::NoControl => return Err(RUNNING),
         TabFact::None => {}
@@ -92,19 +91,10 @@ fn fork_route(f: &ForkFacts) -> Result<ForkRoute, &'static str> {
         return Err("omp was not found");
     }
     match f.run {
-        RunFact::Running { control: true } => Ok(ForkRoute::Background),
+        RunFact::Running { control: true } | RunFact::Stopped | RunFact::Blind => Ok(()),
         RunFact::Running { control: false } => Err(RUNNING),
-        RunFact::Stopped | RunFact::Blind => Ok(ForkRoute::Headless),
         RunFact::Unknown => Err("Still checking which sessions are running"),
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ForkRoute {
-    Live,
-    /// Over a short-lived client of the (closed-tab) tmux session's control socket.
-    Background,
-    Headless,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -247,8 +237,21 @@ impl App {
             Err("omp is busy — wait for it to finish")
         }
     }
-    /// How a fork of `session` must run (see [`fork_route`]).
-    fn tree_fork_route(&self, session: &Path) -> Result<ForkRoute, &'static str> {
+
+    /// The session running `session` in a backend while no tab shows it has a live control
+    /// endpoint (the gateway forks over it).
+    fn tree_bg_control(&self, session: &Path) -> bool {
+        let snap = self.running_snapshot();
+        let name = snap.holder(session).map(str::to_owned).or_else(|| {
+            let id = self.tree.as_ref()?.id.as_deref()?;
+            let canonical = session_name_for(id);
+            (snap.is_alive(&canonical) && snap.files_of(&canonical).is_empty()).then_some(canonical)
+        });
+        name.is_some_and(|n| snap.has_ctl(&n))
+    }
+
+    /// Why a fork of `session` is not offered right now (the gateway decides the fork itself).
+    fn tree_fork_gate(&self, session: &Path) -> Result<(), &'static str> {
         let tab = self
             .tabs
             .iter()
@@ -280,28 +283,12 @@ impl App {
             None if self.gw.running_blind() => RunFact::Blind,
             None => RunFact::Unknown,
         };
-        fork_route(&ForkFacts {
+        fork_gate(&ForkFacts {
             busy: self.tree_busy.is_some(),
             tab,
             omp: self.omp_found(),
             run,
         })
-    }
-
-    /// The session running `session` in a backend while no tab shows it has a live control
-    /// endpoint (the gateway forks over it).
-    fn tree_bg_control(&self, session: &Path) -> bool {
-        let snap = self.running_snapshot();
-        let name = snap.holder(session).map(str::to_owned).or_else(|| {
-            let id = self.tree.as_ref()?.id.as_deref()?;
-            let canonical = session_name_for(id);
-            (snap.is_alive(&canonical) && snap.files_of(&canonical).is_empty()).then_some(canonical)
-        });
-        name.is_some_and(|n| snap.has_ctl(&n))
-    }
-
-    fn tree_fork_gate(&self, session: &Path) -> Result<(), &'static str> {
-        self.tree_fork_route(session).map(drop)
     }
 
     /// Takes a newer tree of the open window's session from the gateway's cache.
@@ -379,9 +366,9 @@ impl App {
         if self.tree_busy.is_some() {
             return;
         }
-        let Ok(route) = self.tree_fork_route(session) else {
+        if self.tree_fork_gate(session).is_err() {
             return;
-        };
+        }
         let busy = TreeBusy {
             op: TreeOp::Fork,
             cwd,
@@ -389,19 +376,8 @@ impl App {
             what,
             seq: self.activation_seq,
         };
-        if route == ForkRoute::Live {
-            let command = CtlCommand::ForkAt {
-                root: session.to_path_buf(),
-                entry_id: entry,
-            };
-            if self.ctl_command(command, |app, r| app.on_tree_reply(r)) {
-                self.tree_busy = Some(busy);
-                self.toasts.info(&self.ctx, "Forking…");
-            }
-            return;
-        }
-        // The gateway forks over the running session's control socket when there is one, and
-        // headless otherwise.
+        // The gateway forks over the running session's control socket when there is one, headless
+        // when nothing runs the file, and refuses a session that runs without live control.
         self.tree_busy = Some(busy);
         self.toasts.info(&self.ctx, "Forking…");
         self.gw.mutate(
@@ -458,23 +434,19 @@ impl App {
             self.tree_failed(busy.op, &why);
             return;
         }
-        match busy.op {
-            TreeOp::Fork => match &reply.new_file {
-                Some(file) => self.tree_forked(&busy, file.clone()),
-                None => self.tree_failed(busy.op, "omp returned no file"),
+        // Only "Go here" settles over the live link; a fork goes through the gateway.
+        let TreeOp::Navigate { user } = busy.op else {
+            return;
+        };
+        self.close_tree();
+        self.toasts.success(
+            &self.ctx,
+            if user {
+                "Moved before that prompt — its text is back in the editor"
+            } else {
+                "Moved there — new prompts continue from this point"
             },
-            TreeOp::Navigate { user } => {
-                self.close_tree();
-                self.toasts.success(
-                    &self.ctx,
-                    if user {
-                        "Moved before that prompt — its text is back in the editor"
-                    } else {
-                        "Moved there — new prompts continue from this point"
-                    },
-                );
-            }
-        }
+        );
     }
 
     /// The gateway's fork finished.
@@ -547,46 +519,37 @@ mod tests {
     #[test]
     fn closed_tab_with_a_live_session_needs_its_control_socket_to_fork() {
         assert_eq!(
-            fork_route(&facts(TabFact::None, RunFact::Running { control: false })),
+            fork_gate(&facts(TabFact::None, RunFact::Running { control: false })),
             Err(RUNNING)
         );
         assert_eq!(
-            fork_route(&facts(TabFact::None, RunFact::Running { control: true })),
-            Ok(ForkRoute::Background)
+            fork_gate(&facts(TabFact::None, RunFact::Running { control: true })),
+            Ok(())
         );
     }
 
     #[test]
-    fn idle_closed_session_forks_headless() {
-        assert_eq!(
-            fork_route(&facts(TabFact::None, RunFact::Stopped)),
-            Ok(ForkRoute::Headless)
-        );
-        assert_eq!(
-            fork_route(&facts(TabFact::None, RunFact::Blind)),
-            Ok(ForkRoute::Headless)
-        );
-        assert!(fork_route(&facts(TabFact::None, RunFact::Unknown)).is_err());
+    fn idle_closed_session_may_fork() {
+        assert_eq!(fork_gate(&facts(TabFact::None, RunFact::Stopped)), Ok(()));
+        assert_eq!(fork_gate(&facts(TabFact::None, RunFact::Blind)), Ok(()));
+        assert!(fork_gate(&facts(TabFact::None, RunFact::Unknown)).is_err());
     }
 
     #[test]
-    fn open_tabs_decide_the_route() {
+    fn open_tabs_decide_the_gate() {
         let run = RunFact::Stopped;
-        assert_eq!(
-            fork_route(&facts(TabFact::ActiveLive, run)),
-            Ok(ForkRoute::Live)
-        );
-        assert!(fork_route(&facts(TabFact::Background, run)).is_err());
-        assert_eq!(fork_route(&facts(TabFact::NoControl, run)), Err(RUNNING));
+        assert_eq!(fork_gate(&facts(TabFact::ActiveLive, run)), Ok(()));
+        assert!(fork_gate(&facts(TabFact::Background, run)).is_err());
+        assert_eq!(fork_gate(&facts(TabFact::NoControl, run)), Err(RUNNING));
     }
 
     #[test]
     fn busy_and_missing_omp_refuse() {
         let mut f = facts(TabFact::ActiveLive, RunFact::Stopped);
         f.busy = true;
-        assert!(fork_route(&f).is_err());
+        assert!(fork_gate(&f).is_err());
         let mut f = facts(TabFact::None, RunFact::Stopped);
         f.omp = false;
-        assert!(fork_route(&f).is_err());
+        assert!(fork_gate(&f).is_err());
     }
 }

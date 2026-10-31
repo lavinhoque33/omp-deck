@@ -1,0 +1,697 @@
+{
+  "description": "Accept/reject vectors of the pairing invite (deck_remote::noise::PairingInvite, pwa/src/remote/protocol.ts). `urls`: the relay URL grammar; `invite` is the `v1.` text of that URL with `fields` (null when the URL does not fit a length byte); an accepted URL encodes to exactly `invite` and parses back to it, a rejected one is refused by both encode and parse. `invites`: whole invite texts, rejected unless `accept`. Hand-maintained (see README.md).",
+  "fields": {
+    "room": "6162636465666768696a6b6c6d6e6f70",
+    "token": "a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0",
+    "gateway_public": "64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d48466",
+    "psk": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40"
+  },
+  "urls": [
+    {
+      "case": "wss host",
+      "url": "wss://relay.example.test",
+      "accept": true,
+      "invite": "v1.GHdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "wss host and port",
+      "url": "wss://relay.example.test:8443",
+      "accept": true,
+      "invite": "v1.HXdzczovL3JlbGF5LmV4YW1wbGUudGVzdDo4NDQzYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "wss single label",
+      "url": "wss://relay",
+      "accept": true,
+      "invite": "v1.C3dzczovL3JlbGF5YWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "wss punycode",
+      "url": "wss://xn--bcher-kva.example",
+      "accept": true,
+      "invite": "v1.G3dzczovL3huLS1iY2hlci1rdmEuZXhhbXBsZWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "wss digits and dashes",
+      "url": "wss://a-1.b--2.3",
+      "accept": true,
+      "invite": "v1.EHdzczovL2EtMS5iLS0yLjNhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "wss trailing dot",
+      "url": "wss://relay.example.",
+      "accept": true,
+      "invite": "v1.FHdzczovL3JlbGF5LmV4YW1wbGUuYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "wss port 1",
+      "url": "wss://relay.example:1",
+      "accept": true,
+      "invite": "v1.FXdzczovL3JlbGF5LmV4YW1wbGU6MWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "wss port 65535",
+      "url": "wss://relay.example:65535",
+      "accept": true,
+      "invite": "v1.GXdzczovL3JlbGF5LmV4YW1wbGU6NjU1MzVhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "wss port 80",
+      "url": "wss://relay.example:80",
+      "accept": true,
+      "invite": "v1.FndzczovL3JlbGF5LmV4YW1wbGU6ODBhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "wss ipv4",
+      "url": "wss://203.0.113.7",
+      "accept": true,
+      "invite": "v1.EXdzczovLzIwMy4wLjExMy43YWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "wss ipv4 with leading zeros is a host name",
+      "url": "wss://127.000.0.1",
+      "accept": true,
+      "invite": "v1.EXdzczovLzEyNy4wMDAuMC4xYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "wss ipv6",
+      "url": "wss://[2001:db8::1]",
+      "accept": true,
+      "invite": "v1.E3dzczovL1syMDAxOmRiODo6MV1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "wss ipv6 and port",
+      "url": "wss://[2001:db8::1]:8443",
+      "accept": true,
+      "invite": "v1.GHdzczovL1syMDAxOmRiODo6MV06ODQ0M2FiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "wss ipv6 full",
+      "url": "wss://[2001:db8:0:0:0:0:0:1]",
+      "accept": true,
+      "invite": "v1.HHdzczovL1syMDAxOmRiODowOjA6MDowOjA6MV1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "wss ipv6 embedded ipv4",
+      "url": "wss://[::ffff:192.0.2.1]",
+      "accept": true,
+      "invite": "v1.GHdzczovL1s6OmZmZmY6MTkyLjAuMi4xXWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "wss ipv6 unspecified",
+      "url": "wss://[::]",
+      "accept": true,
+      "invite": "v1.CndzczovL1s6Ol1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ws localhost",
+      "url": "ws://localhost",
+      "accept": true,
+      "invite": "v1.DndzOi8vbG9jYWxob3N0YWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "ws localhost port",
+      "url": "ws://localhost:8080",
+      "accept": true,
+      "invite": "v1.E3dzOi8vbG9jYWxob3N0OjgwODBhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ws localhost port 443",
+      "url": "ws://localhost:443",
+      "accept": true,
+      "invite": "v1.EndzOi8vbG9jYWxob3N0OjQ0M2FiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "ws 127.0.0.1",
+      "url": "ws://127.0.0.1",
+      "accept": true,
+      "invite": "v1.DndzOi8vMTI3LjAuMC4xYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "ws 127.0.0.1 port",
+      "url": "ws://127.0.0.1:9000",
+      "accept": true,
+      "invite": "v1.E3dzOi8vMTI3LjAuMC4xOjkwMDBhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ws 127.255.255.254",
+      "url": "ws://127.255.255.254",
+      "accept": true,
+      "invite": "v1.FHdzOi8vMTI3LjI1NS4yNTUuMjU0YWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "ws ::1",
+      "url": "ws://[::1]",
+      "accept": true,
+      "invite": "v1.CndzOi8vWzo6MV1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ws ::1 port",
+      "url": "ws://[::1]:8080",
+      "accept": true,
+      "invite": "v1.D3dzOi8vWzo6MV06ODA4MGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "ws ::1 spelled out",
+      "url": "ws://[0:0:0:0:0:0:0:1]",
+      "accept": true,
+      "invite": "v1.FndzOi8vWzA6MDowOjA6MDowOjA6MV1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ws ::1 with zero prefixes",
+      "url": "ws://[0000::0001]",
+      "accept": true,
+      "invite": "v1.EXdzOi8vWzAwMDA6OjAwMDFdYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "ws ::1 as embedded ipv4",
+      "url": "ws://[::0.0.0.1]",
+      "accept": true,
+      "invite": "v1.EHdzOi8vWzo6MC4wLjAuMV1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "255 bytes",
+      "url": "wss://hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+      "accept": true,
+      "invite": "v1._3dzczovL2hoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "256 bytes",
+      "url": "wss://hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+      "accept": false,
+      "invite": null
+    },
+    {
+      "case": "empty",
+      "url": "",
+      "accept": false,
+      "invite": "v1.AGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "no scheme",
+      "url": "relay.example.test",
+      "accept": false,
+      "invite": "v1.EnJlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "https",
+      "url": "https://relay.example.test",
+      "accept": false,
+      "invite": "v1.Gmh0dHBzOi8vcmVsYXkuZXhhbXBsZS50ZXN0YWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "http",
+      "url": "http://localhost",
+      "accept": false,
+      "invite": "v1.EGh0dHA6Ly9sb2NhbGhvc3RhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "uppercase scheme",
+      "url": "WSS://relay.example.test",
+      "accept": false,
+      "invite": "v1.GFdTUzovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "mixed-case scheme",
+      "url": "Wss://relay.example.test",
+      "accept": false,
+      "invite": "v1.GFdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "uppercase host",
+      "url": "wss://Relay.example.test",
+      "accept": false,
+      "invite": "v1.GHdzczovL1JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "wss no host",
+      "url": "wss://",
+      "accept": false,
+      "invite": "v1.BndzczovL2FiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "ws no host",
+      "url": "ws://",
+      "accept": false,
+      "invite": "v1.BXdzOi8vYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "only port",
+      "url": "wss://:8443",
+      "accept": false,
+      "invite": "v1.C3dzczovLzo4NDQzYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "trailing slash",
+      "url": "wss://relay.example.test/",
+      "accept": false,
+      "invite": "v1.GXdzczovL3JlbGF5LmV4YW1wbGUudGVzdC9hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "path",
+      "url": "wss://relay.example.test/v1/device",
+      "accept": false,
+      "invite": "v1.IndzczovL3JlbGF5LmV4YW1wbGUudGVzdC92MS9kZXZpY2VhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "port and path",
+      "url": "wss://relay.example.test:8443/base",
+      "accept": false,
+      "invite": "v1.IndzczovL3JlbGF5LmV4YW1wbGUudGVzdDo4NDQzL2Jhc2VhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "query",
+      "url": "wss://relay.example.test?x=1",
+      "accept": false,
+      "invite": "v1.HHdzczovL3JlbGF5LmV4YW1wbGUudGVzdD94PTFhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "fragment",
+      "url": "wss://relay.example.test#pair",
+      "accept": false,
+      "invite": "v1.HXdzczovL3JlbGF5LmV4YW1wbGUudGVzdCNwYWlyYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "userinfo",
+      "url": "wss://user@relay.example.test",
+      "accept": false,
+      "invite": "v1.HXdzczovL3VzZXJAcmVsYXkuZXhhbXBsZS50ZXN0YWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "userinfo with password",
+      "url": "wss://user:pw@relay.example.test",
+      "accept": false,
+      "invite": "v1.IHdzczovL3VzZXI6cHdAcmVsYXkuZXhhbXBsZS50ZXN0YWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "space in host",
+      "url": "wss://relay example",
+      "accept": false,
+      "invite": "v1.E3dzczovL3JlbGF5IGV4YW1wbGVhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "leading space",
+      "url": " wss://relay.example.test",
+      "accept": false,
+      "invite": "v1.GSB3c3M6Ly9yZWxheS5leGFtcGxlLnRlc3RhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "trailing space",
+      "url": "wss://relay.example.test ",
+      "accept": false,
+      "invite": "v1.GXdzczovL3JlbGF5LmV4YW1wbGUudGVzdCBhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "trailing newline",
+      "url": "wss://relay.example.test\n",
+      "accept": false,
+      "invite": "v1.GXdzczovL3JlbGF5LmV4YW1wbGUudGVzdAphYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "tab",
+      "url": "wss://relay.example.test\t",
+      "accept": false,
+      "invite": "v1.GXdzczovL3JlbGF5LmV4YW1wbGUudGVzdAlhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "nul",
+      "url": "wss://relay\u0000.example.test",
+      "accept": false,
+      "invite": "v1.GXdzczovL3JlbGF5AC5leGFtcGxlLnRlc3RhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "del",
+      "url": "wss://relay\u007f.example.test",
+      "accept": false,
+      "invite": "v1.GXdzczovL3JlbGF5fy5leGFtcGxlLnRlc3RhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "underscore",
+      "url": "wss://relay_1.example.test",
+      "accept": false,
+      "invite": "v1.GndzczovL3JlbGF5XzEuZXhhbXBsZS50ZXN0YWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "non-ascii host",
+      "url": "wss://b\u00fccher.example",
+      "accept": false,
+      "invite": "v1.FXdzczovL2LDvGNoZXIuZXhhbXBsZWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "percent",
+      "url": "wss://relay%2eexample",
+      "accept": false,
+      "invite": "v1.FXdzczovL3JlbGF5JTJlZXhhbXBsZWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "backslash",
+      "url": "wss://relay.example.test\\x",
+      "accept": false,
+      "invite": "v1.GndzczovL3JlbGF5LmV4YW1wbGUudGVzdFx4YWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "ws non-loopback host",
+      "url": "ws://relay.example.test",
+      "accept": false,
+      "invite": "v1.F3dzOi8vcmVsYXkuZXhhbXBsZS50ZXN0YWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "ws non-loopback ipv4",
+      "url": "ws://128.0.0.1",
+      "accept": false,
+      "invite": "v1.DndzOi8vMTI4LjAuMC4xYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "ws 127 with leading zero",
+      "url": "ws://127.000.0.1",
+      "accept": false,
+      "invite": "v1.EHdzOi8vMTI3LjAwMC4wLjFhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ws localhost subdomain",
+      "url": "ws://localhost.example",
+      "accept": false,
+      "invite": "v1.FndzOi8vbG9jYWxob3N0LmV4YW1wbGVhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ws uppercase localhost",
+      "url": "ws://LOCALHOST",
+      "accept": false,
+      "invite": "v1.DndzOi8vTE9DQUxIT1NUYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "ws ipv6 non-loopback",
+      "url": "ws://[::2]",
+      "accept": false,
+      "invite": "v1.CndzOi8vWzo6Ml1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ws ipv4-mapped loopback",
+      "url": "ws://[::ffff:127.0.0.1]",
+      "accept": false,
+      "invite": "v1.F3dzOi8vWzo6ZmZmZjoxMjcuMC4wLjFdYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "ws unspecified ipv6",
+      "url": "ws://[::]",
+      "accept": false,
+      "invite": "v1.CXdzOi8vWzo6XWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "ws 0.0.0.0",
+      "url": "ws://0.0.0.0",
+      "accept": false,
+      "invite": "v1.DHdzOi8vMC4wLjAuMGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "port 0",
+      "url": "wss://relay.example.test:0",
+      "accept": false,
+      "invite": "v1.GndzczovL3JlbGF5LmV4YW1wbGUudGVzdDowYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "port leading zero",
+      "url": "wss://relay.example.test:08443",
+      "accept": false,
+      "invite": "v1.HndzczovL3JlbGF5LmV4YW1wbGUudGVzdDowODQ0M2FiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "port 00",
+      "url": "wss://relay.example.test:00",
+      "accept": false,
+      "invite": "v1.G3dzczovL3JlbGF5LmV4YW1wbGUudGVzdDowMGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "port 65536",
+      "url": "wss://relay.example.test:65536",
+      "accept": false,
+      "invite": "v1.HndzczovL3JlbGF5LmV4YW1wbGUudGVzdDo2NTUzNmFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "port 99999999999",
+      "url": "wss://relay.example.test:99999999999",
+      "accept": false,
+      "invite": "v1.JHdzczovL3JlbGF5LmV4YW1wbGUudGVzdDo5OTk5OTk5OTk5OWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "empty port",
+      "url": "wss://relay.example.test:",
+      "accept": false,
+      "invite": "v1.GXdzczovL3JlbGF5LmV4YW1wbGUudGVzdDphYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "negative port",
+      "url": "wss://relay.example.test:-1",
+      "accept": false,
+      "invite": "v1.G3dzczovL3JlbGF5LmV4YW1wbGUudGVzdDotMWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "plus port",
+      "url": "wss://relay.example.test:+80",
+      "accept": false,
+      "invite": "v1.HHdzczovL3JlbGF5LmV4YW1wbGUudGVzdDorODBhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "hex port",
+      "url": "wss://relay.example.test:0x50",
+      "accept": false,
+      "invite": "v1.HXdzczovL3JlbGF5LmV4YW1wbGUudGVzdDoweDUwYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "port with letters",
+      "url": "wss://relay.example.test:80a",
+      "accept": false,
+      "invite": "v1.HHdzczovL3JlbGF5LmV4YW1wbGUudGVzdDo4MGFhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "two ports",
+      "url": "wss://relay.example.test:80:81",
+      "accept": false,
+      "invite": "v1.HndzczovL3JlbGF5LmV4YW1wbGUudGVzdDo4MDo4MWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "wss default port",
+      "url": "wss://relay.example.test:443",
+      "accept": false,
+      "invite": "v1.HHdzczovL3JlbGF5LmV4YW1wbGUudGVzdDo0NDNhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ws default port",
+      "url": "ws://localhost:80",
+      "accept": false,
+      "invite": "v1.EXdzOi8vbG9jYWxob3N0OjgwYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "ipv6 unclosed",
+      "url": "wss://[::1",
+      "accept": false,
+      "invite": "v1.CndzczovL1s6OjFhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ipv6 junk after bracket",
+      "url": "wss://[::1]x",
+      "accept": false,
+      "invite": "v1.DHdzczovL1s6OjFdeGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "ipv6 path",
+      "url": "wss://[::1]/",
+      "accept": false,
+      "invite": "v1.DHdzczovL1s6OjFdL2FiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "ipv6 empty",
+      "url": "wss://[]",
+      "accept": false,
+      "invite": "v1.CHdzczovL1tdYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "ipv6 uppercase",
+      "url": "wss://[2001:DB8::1]",
+      "accept": false,
+      "invite": "v1.E3dzczovL1syMDAxOkRCODo6MV1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ipv6 zone",
+      "url": "wss://[fe80::1%25eth0]",
+      "accept": false,
+      "invite": "v1.FndzczovL1tmZTgwOjoxJTI1ZXRoMF1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ipv6 nine groups",
+      "url": "wss://[1:2:3:4:5:6:7:8:9]",
+      "accept": false,
+      "invite": "v1.GXdzczovL1sxOjI6Mzo0OjU6Njo3Ojg6OV1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ipv6 seven groups",
+      "url": "wss://[1:2:3:4:5:6:7]",
+      "accept": false,
+      "invite": "v1.FXdzczovL1sxOjI6Mzo0OjU6Njo3XWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "ipv6 two double colons",
+      "url": "wss://[1::2::3]",
+      "accept": false,
+      "invite": "v1.D3dzczovL1sxOjoyOjozXWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "ipv6 double colon for no group",
+      "url": "wss://[1:2:3:4:5:6:7:8::]",
+      "accept": false,
+      "invite": "v1.GXdzczovL1sxOjI6Mzo0OjU6Njo3Ojg6Ol1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ipv6 double colon after eight with ipv4",
+      "url": "wss://[1:2:3:4:5:6::1.2.3.4]",
+      "accept": false,
+      "invite": "v1.HHdzczovL1sxOjI6Mzo0OjU6Njo6MS4yLjMuNF1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ipv6 five-digit group",
+      "url": "wss://[00001::1]",
+      "accept": false,
+      "invite": "v1.EHdzczovL1swMDAwMTo6MV1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ipv6 leading single colon",
+      "url": "wss://[:1:2:3:4:5:6:7]",
+      "accept": false,
+      "invite": "v1.FndzczovL1s6MToyOjM6NDo1OjY6N11hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ipv6 trailing single colon",
+      "url": "wss://[1::2:]",
+      "accept": false,
+      "invite": "v1.DXdzczovL1sxOjoyOl1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ipv6 ipv4 not last",
+      "url": "wss://[1.2.3.4::1]",
+      "accept": false,
+      "invite": "v1.EndzczovL1sxLjIuMy40OjoxXWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "ipv6 bad embedded ipv4",
+      "url": "wss://[::1.2.3.256]",
+      "accept": false,
+      "invite": "v1.E3dzczovL1s6OjEuMi4zLjI1Nl1hYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    },
+    {
+      "case": "ipv6 embedded ipv4 leading zero",
+      "url": "wss://[::1.2.3.04]",
+      "accept": false,
+      "invite": "v1.EndzczovL1s6OjEuMi4zLjA0XWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "ipv6 unbracketed",
+      "url": "wss://2001:db8::1",
+      "accept": false,
+      "invite": "v1.EXdzczovLzIwMDE6ZGI4OjoxYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    },
+    {
+      "case": "bracket inside host",
+      "url": "wss://a[::1]",
+      "accept": false,
+      "invite": "v1.DHdzczovL2FbOjoxXWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A"
+    },
+    {
+      "case": "closing bracket host",
+      "url": "wss://a]",
+      "accept": false,
+      "invite": "v1.CHdzczovL2FdYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA"
+    }
+  ],
+  "invites": [
+    {
+      "case": "byte order mark before the url",
+      "text": "v1.G--7v3dzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A",
+      "accept": false
+    },
+    {
+      "case": "invalid utf-8 in the url",
+      "text": "v1.FHdzczovL3JlbGF5_y5leGFtcGxlYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA",
+      "accept": false
+    },
+    {
+      "case": "overlong utf-8 slash",
+      "text": "v1.FXdzczovL3JlbGF5wK8uZXhhbXBsZWFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A",
+      "accept": false
+    },
+    {
+      "case": "utf-8 encoded surrogate",
+      "text": "v1.FndzczovL3JlbGF57aCALmV4YW1wbGVhYmNkZWZnaGlqa2xtbm9woaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8BksQGx0L5ahwS9B4-YlQAfwD6On5Ui8YjdEo2YRtSEZiEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A",
+      "accept": false
+    },
+    {
+      "case": "nul in the url",
+      "text": "v1.FHdzczovL3JlbGF5AC5leGFtcGxlYWJjZGVmZ2hpamtsbW5vcKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGYhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA",
+      "accept": false
+    },
+    {
+      "case": "missing prefix",
+      "text": "GHdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A",
+      "accept": false
+    },
+    {
+      "case": "v2 prefix",
+      "text": "v2.GHdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A",
+      "accept": false
+    },
+    {
+      "case": "uppercase prefix",
+      "text": "V1.GHdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A",
+      "accept": false
+    },
+    {
+      "case": "padding",
+      "text": "v1.GHdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A=",
+      "accept": false
+    },
+    {
+      "case": "standard base64 alphabet",
+      "text": "v1.GHdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wGSxAbHQvlqHBL0Hj5iVAB/APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A",
+      "accept": false
+    },
+    {
+      "case": "whitespace in body",
+      "text": "v1.GHdzczovL3JlbGF5L mV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A",
+      "accept": false
+    },
+    {
+      "case": "empty body",
+      "text": "v1.",
+      "accept": false
+    },
+    {
+      "case": "one byte short",
+      "text": "v1.GHdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-Pw",
+      "accept": false
+    },
+    {
+      "case": "one byte extra",
+      "text": "v1.GHdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0AA",
+      "accept": false
+    },
+    {
+      "case": "url length byte too large",
+      "text": "v1.GXdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A",
+      "accept": false
+    },
+    {
+      "case": "url length byte zero",
+      "text": "v1.AHdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A",
+      "accept": false
+    },
+    {
+      "case": "non-canonical trailing bits",
+      "text": "v1.GHdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0B",
+      "accept": false
+    },
+    {
+      "case": "the reference invite",
+      "text": "v1.GHdzczovL3JlbGF5LmV4YW1wbGUudGVzdGFiY2RlZmdoaWprbG1ub3ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wGSxAbHQvlqHBL0Hj5iVAB_APo6flSLxiN0SjZhG1IRmISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A",
+      "accept": true
+    }
+  ]
+}

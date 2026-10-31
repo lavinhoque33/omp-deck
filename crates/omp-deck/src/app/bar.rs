@@ -16,7 +16,7 @@ use deck_core::status::SessionStats;
 use deck_core::status::SessionStatus;
 use deck_service::controller::{
     ActionFacts, Command, CommandKind, ControllerEvent, Delivery, Refusal, Rejected, RequestId,
-    RequestKey, SessionTarget,
+    SessionTarget,
 };
 use deck_service::gateway::protocol::{
     Answer, Done, GatewayError, ModelFactsView, Mutation, Query, Topic,
@@ -51,9 +51,6 @@ pub(super) struct StatusView {
     revision: u64,
     snapshot: Option<(SessionTarget, Arc<SessionStatus>)>,
 }
-
-/// Runs on the UI thread once the gateway accepted a submitted command.
-type Accepted = Box<dyn FnOnce(&mut App, RequestId)>;
 
 impl App {
     /// The gateway's status of the active session tab (`None` while it is not the session the
@@ -154,6 +151,7 @@ impl App {
             || self.usage_open
             || self.sessions.open
             || self.palette.is_some()
+            || self.mobile_modal_open()
             || egui::Popup::is_any_open(&self.ctx)
         {
             let visible = self.visible_uids();
@@ -201,11 +199,11 @@ impl App {
                 }
             }
             ControllerEvent::Ended {
-                id,
                 kind,
                 label,
                 delivery,
-            } => self.command_ended(uid, id, kind, &label, &delivery),
+                ..
+            } => self.command_ended(uid, kind, &label, &delivery),
         }
     }
 
@@ -213,24 +211,10 @@ impl App {
     /// accepted the bytes, not that omp (or the host's PTY) executed anything; "Unobserved" means
     /// they were queued but no acknowledgement was seen before the view closed. Only the waiting UI
     /// state (review comments, worktree moves) acts on "Delivered".
-    fn command_ended(
-        &mut self,
-        uid: u64,
-        id: RequestId,
-        kind: CommandKind,
-        label: &str,
-        delivery: &Delivery,
-    ) {
+    fn command_ended(&mut self, uid: u64, kind: CommandKind, label: &str, delivery: &Delivery) {
         let finish = kind == CommandKind::WorktreeFinish;
         // Both retry by themselves; only the final failure is announced.
         let quiet = finish || kind == CommandKind::MoveTo;
-        match (kind, delivery) {
-            (CommandKind::Review { send }, Delivery::Delivered) => {
-                self.review_delivered(uid, send, id);
-            }
-            (CommandKind::Review { send }, _) => self.review_dropped(uid, send, id),
-            _ => {}
-        }
         // The finish prompt retries by itself; only its final failure is announced.
         let note = match delivery {
             Delivery::Refused(Refusal::NoBracketedPaste) => Some(format!(
@@ -264,12 +248,9 @@ impl App {
                 | Delivery::Stalled
         ) || (matches!(kind, CommandKind::WorktreeMove | CommandKind::MoveTo)
             && matches!(delivery, Delivery::Cancelled(_)));
-        if lost {
-            self.injection_lost(uid, kind);
-        }
-        // A cancelled or declined finish prompt never goes in on its own: stop the finish.
-        if finish && matches!(delivery, Delivery::Cancelled(_) | Delivery::Declined) {
-            self.finish_cancelled(uid);
+        // A move that never went in is not waited for.
+        if lost && kind == CommandKind::WorktreeMove {
+            self.forget_move(uid);
         }
     }
 
@@ -427,30 +408,9 @@ impl App {
         self.dialog_target = Some(target);
     }
 
-    /// Submits `command` to the session `target` names. Until the gateway accepted it the
-    /// request is only locally pending; `accepted` then runs with the controller's request id.
-    /// A refusal is told to the user (one that only restates a no-op stays silent) and
-    /// `accepted` never runs. The final delivery arrives as a controller event.
-    pub(super) fn submit_command(
-        &mut self,
-        target: &SessionTarget,
-        command: Command,
-        accepted: impl FnOnce(&mut App, RequestId) + 'static,
-    ) -> RequestKey {
-        self.submit_inner(target, command, Some(Box::new(accepted)))
-    }
-
-    /// [`Self::submit_command`] for commands whose request id nobody waits for.
+    /// Submits `command` to the session `target` names. A refusal is told to the user (one that
+    /// only restates a no-op stays silent). The final delivery arrives as a controller event.
     pub(super) fn send_command(&mut self, target: &SessionTarget, command: Command) {
-        self.submit_inner(target, command, None);
-    }
-
-    fn submit_inner(
-        &mut self,
-        target: &SessionTarget,
-        command: Command,
-        accepted: Option<Accepted>,
-    ) -> RequestKey {
         // Actions and model switches that find omp gone stay silent, as the bar always did.
         let quiet_exit = matches!(
             command,
@@ -460,12 +420,7 @@ impl App {
             target.clone(),
             command,
             move |app, _key, result| match result {
-                Ok(done) => {
-                    app.ctx.request_repaint();
-                    if let Some(accepted) = accepted {
-                        accepted(app, done.id);
-                    }
-                }
+                Ok(_) => app.ctx.request_repaint(),
                 Err(GatewayError::Rejected(why)) => app.report_rejected(&why, quiet_exit),
                 Err(e) => app.toasts.error(&app.ctx, format!("Nothing was sent: {e}")),
             },
@@ -481,7 +436,7 @@ impl App {
                     );
                 }
             },
-        )
+        );
     }
 
     fn report_rejected(&mut self, why: &Rejected, quiet_exit: bool) {

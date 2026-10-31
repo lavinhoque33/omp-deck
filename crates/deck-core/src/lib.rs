@@ -8,6 +8,7 @@ pub mod changes;
 pub mod config;
 pub mod ctl;
 pub mod fleet;
+pub mod folders;
 pub(crate) mod git;
 pub mod inventory;
 pub mod mux;

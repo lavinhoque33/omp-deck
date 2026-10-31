@@ -15,6 +15,7 @@ use super::bar::ActionDialog;
 use super::{App, DEFAULT_FONT};
 use crate::backup_view::BackupAction;
 use crate::icons::*;
+use crate::mobile_view::{can_reconnect, pair_block};
 use crate::model_picker;
 use crate::notify_view::NotifyAction;
 use crate::palette::{Item, Mode, Outcome, PaletteState, Target};
@@ -684,9 +685,10 @@ impl App {
             ICON_ARCHIVE_RESTORE,
             project_why.or(project_backup_why),
         );
-        let finishing = worktree
+        let finish_state = worktree
             .as_ref()
-            .is_some_and(|w| self.wt.finishing.contains_key(&w.path));
+            .and_then(|w| self.wt.finishing.get(&w.path).copied());
+        let finishing = finish_state.is_some();
         let wt_why = need(worktree.is_some(), NOT_WORKTREE);
         add(
             "worktree.finish",
@@ -702,7 +704,10 @@ impl App {
             "Worktree: Cancel finishing",
             None,
             ICON_X,
-            wt_why.or(need(finishing, "Not finishing")),
+            wt_why.or(need(finishing, "Not finishing")).or(need(
+                finish_state == Some(true),
+                "Another device or window started it",
+            )),
         );
         add(
             "worktree.remove",
@@ -1091,6 +1096,45 @@ impl App {
             project_backup_why,
         );
 
+        // Mobile access (the same gate as the settings button).
+        let pair_why: Why = pair_block(
+            self.gw.mobile().as_deref(),
+            self.gw
+                .gateway()
+                .is_none_or(|g| g.mode == deck_core::config::GatewayMode::Off),
+            self.gw.is_up(),
+        )
+        .map(|b| b.short());
+        add(
+            "mobile.pair",
+            "Mobile access: Pair a device",
+            None,
+            ICON_GLOBE,
+            pair_why,
+        );
+        add(
+            "mobile.settings",
+            "Mobile access: Open settings",
+            None,
+            ICON_GLOBE,
+            None,
+        );
+        let reconnect_why: Why = (!(self.gw.is_up()
+            && can_reconnect(
+                self.gw.mobile().as_deref(),
+                self.gw
+                    .gateway()
+                    .is_none_or(|g| g.mode == deck_core::config::GatewayMode::Off),
+            )))
+        .then_some("Only while the relay is refused or reconnecting");
+        add(
+            "mobile.reconnect",
+            "Mobile access: Reconnect relay",
+            None,
+            ICON_REFRESH_CW,
+            reconnect_why,
+        );
+
         // Sessions list and app.
         add(
             "app.refresh",
@@ -1270,6 +1314,9 @@ impl App {
             "view.changes" => self.toggle_changes_panel(),
             "view.switcher" => self.open_palette(Mode::Switcher),
             "app.settings" => self.open_settings(),
+            "mobile.pair" => self.start_pairing(),
+            "mobile.reconnect" => self.reconnect_relay(),
+            "mobile.settings" => self.open_settings_page(OmpDeckPage::General),
             "settings.sync" => {
                 self.open_settings();
                 self.settings.show_sync();

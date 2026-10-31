@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/deck-service", "crates/omp-deck"]
+members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/deck-service", "crates/deck-remote", "crates/deck-relay", "crates/omp-deck"]
 
 [workspace.package]
 edition = "2024"
@@ -18,6 +18,8 @@ deck-core = { path = "crates/deck-core" }
 deck-host = { path = "crates/deck-host" }
 deck-term = { path = "crates/deck-term" }
 deck-service = { path = "crates/deck-service" }
+deck-remote = { path = "crates/deck-remote", default-features = false }
+deck-relay = { path = "crates/deck-relay" }
 # Already in Cargo.lock via eframe/arboard/polling; crates add the API features they call.
 windows-sys = "0.61"
 libc = "0.2"
@@ -55,14 +57,31 @@ wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # Sharpshooter memory restore takes omp's consolidation lock: pi-natives names it with xxh64.
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+# Mobile companion slice 3 (docs/notes/mobile-relay.md): Noise device protocol (gateway + test client)
+# and the self-hosted relay (axum/tokio; tungstenite clients matching axum's ws). Crates add features.
+snow = { version = "0.10", default-features = false }
+zeroize = "1"
+axum = { version = "0.8", default-features = false }
+# Shared by the relay (crates add features) and the SFTP backup destination's private current-thread runtime.
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
+tokio-tungstenite = "0.29"
+tungstenite = { version = "0.29", default-features = false }
+# rustls/ring + the webpki roots ureq already uses: R3's gateway relay client and the FTPS backup destination.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+# R3: the QR code painted in the pairing dialog.
+qrcodegen = "1.8"
+# Mobile companion slice 4: Web Push from the gateway (RFC 8291 encryption). No crate features:
+# the subscription is parsed by hand (the serde impl panics on a bad `auth`), and the VAPID
+# ES256 JWT is signed with ring (already in the tree through rustls), never jwt-simple (`rsa`,
+# RUSTSEC-2023-0071) or p256 (crypto-bigint 0.5, RUSTSEC-2026-0387) on the long-lived key.
+web-push-native = { version = "0.5.0", default-features = false }
+ring = "0.17"
 # Server backup destination (deck-core `backup::server`): FTP/explicit FTPS (sync API, rustls + ring like
 # ureq; no OpenSSL/aws-lc) and SFTP (russh on ring, driven from a private current-thread runtime).
 suppaftp = { version = "12.2", default-features = false, features = ["rustls-ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-webpki-roots = "1"
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "3"
-tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 
 [profile.dev.package."*"]
 opt-level = 2

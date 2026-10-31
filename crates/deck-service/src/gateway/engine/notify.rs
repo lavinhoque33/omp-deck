@@ -1,8 +1,10 @@
 //! Canonical notifications: the one notification center and inbox (they run with the GUI
-//! closed), the desktop adapter that shows the pop-ups, bells to the GUIs and notification
-//! clicks (routed to one GUI, or opening the app through a private activation ticket).
+//! closed), the desktop adapter that shows the pop-ups, bells to the GUIs, notification clicks
+//! (routed to one GUI, or opening the app through a private activation ticket) and Web Push to
+//! the paired phones.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -10,11 +12,14 @@ use super::{Engine, Fin};
 use crate::controller::SessionTarget;
 use crate::gateway::desktop::{self, Notifier, Signal};
 use crate::gateway::protocol::{InboxEntry, InboxView, Role, ServerEvent, Topic};
-use crate::notifications::{Effect, NotificationCenter, Observation};
+use crate::gateway::push::{self, Push};
+use crate::notifications::{Effect, MobileKind, NotificationCenter, Observation};
 
 pub(super) struct Notify {
     pub(super) center: NotificationCenter,
     pub(super) notifier: Notifier,
+    /// The VAPID key and the push sender.
+    pub(super) push: Push,
     /// The inbox as last published.
     published: Option<InboxView>,
     /// "Notifications are unavailable" was logged.
@@ -22,10 +27,12 @@ pub(super) struct Notify {
 }
 
 impl Notify {
-    pub(super) fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Notify {
+    /// `secrets`: the gateway's secrets dir, home of `push.key`.
+    pub(super) fn new(wake: Arc<dyn Fn() + Send + Sync>, secrets: &Path) -> Notify {
         Notify {
             center: NotificationCenter::new(wake.clone()),
-            notifier: Notifier::start(wake),
+            notifier: Notifier::start(wake.clone()),
+            push: Push::open(secrets, wake),
             published: None,
             unavailable_logged: false,
         }
@@ -35,11 +42,8 @@ impl Notify {
 impl Engine {
     pub(super) fn step_notifications(&mut self, now: Instant) {
         self.handle_signals();
-        let guis: Vec<_> = self
-            .conns
-            .values()
-            .filter(|c| c.role == Role::Gui)
-            .collect();
+        self.forget_gone_pushes();
+        let guis: Vec<_> = self.conns.values().filter(|c| c.is(Role::Gui)).collect();
         // The window focus of any GUI; what the user looks at: the views of the focused GUIs,
         // else of every GUI (none focused: they still show what they show).
         let focused = guis.iter().any(|c| c.state.focused);
@@ -111,6 +115,64 @@ impl Engine {
                 Effect::Withdraw(t) => self.notify.notifier.close(Some(t)),
                 Effect::WithdrawAll => self.notify.notifier.close_all(),
                 Effect::Bell(t) => self.to_guis(&ServerEvent::Bell(t)),
+                Effect::Mobile {
+                    target,
+                    kind,
+                    title,
+                } => self.push_to_devices(&target, kind, &title),
+            }
+        }
+    }
+
+    /// Fans a canonical event out to the subscribed devices: each device's prefs decide, and a
+    /// device whose app is visible on a live connection is skipped (it sees the event there).
+    fn push_to_devices(&mut self, target: &SessionTarget, kind: MobileKind, title: &str) {
+        let Some(origin) = self.mobile.pwa_origin() else {
+            return;
+        };
+        let Some(registry) = self.mobile.registry() else {
+            return;
+        };
+        if registry.devices().iter().all(|d| d.push.is_none()) {
+            return;
+        }
+        let present: HashSet<String> = registry
+            .devices()
+            .iter()
+            .filter(|d| d.push.is_some() && self.device_visible(&d.id))
+            .map(|d| d.id.clone())
+            .collect();
+        let session = self.push_session_id(target);
+        let fallback = target.key.to_string();
+        let offer = push::Offer {
+            kind,
+            title,
+            session: session.as_deref(),
+            fallback: &fallback,
+            origin: &origin,
+        };
+        let Some(registry) = self.mobile.registry() else {
+            return;
+        };
+        self.notify
+            .push
+            .offer(registry.devices(), |id| present.contains(id), &offer);
+    }
+
+    /// Deletes the subscriptions the push services reported gone (404/410).
+    fn forget_gone_pushes(&mut self) {
+        let gone = self.notify.push.take_gone();
+        let Some(registry) = self.mobile.registry_mut() else {
+            return;
+        };
+        for g in gone {
+            match push::forget(registry, &g) {
+                Ok(true) => self.dirty.mobile = true,
+                Ok(false) => {}
+                Err(e) => log::warn!(
+                    "cannot delete the gone push subscription of {}: {e}",
+                    g.device
+                ),
             }
         }
     }
@@ -143,10 +205,10 @@ impl Engine {
         let gui = self
             .conns
             .values()
-            .filter(|c| c.role == Role::Gui)
+            .filter(|c| c.is(Role::Gui))
             .max_by_key(|c| (c.state.focused, c.seq));
-        if let Some(c) = gui {
-            c.out.event(&ServerEvent::Activate { target, token });
+        if let Some(out) = gui.and_then(|c| c.local()) {
+            out.event(&ServerEvent::Activate { target, token });
             return;
         }
         // Only a session this owner still runs can be shown.
@@ -181,7 +243,7 @@ impl Engine {
 
 /// The opened app outlives this request: its exit is collected off the actor (no zombie on
 /// Unix; Windows holds only a handle).
-fn reap(launcher: deck_host::Launcher) {
+pub(super) fn reap(launcher: deck_host::Launcher) {
     #[cfg(unix)]
     {
         let mut child = launcher;

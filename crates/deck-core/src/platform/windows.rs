@@ -15,9 +15,15 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Foundation::{FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{FILETIME, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    SE_FILE_OBJECT, SetNamedSecurityInfoW,
+};
 use windows_sys::Win32::Security::{
-    GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    ACL, DACL_SECURITY_INFORMATION, GetLengthSid, GetSecurityDescriptorDacl, GetTokenInformation,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
@@ -40,6 +46,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::core::PWSTR;
 
 use super::FileId;
 
@@ -184,6 +191,45 @@ pub fn user_sid_bytes() -> Option<Vec<u8>> {
 }
 
 fn current_sid() -> Option<Vec<u8>> {
+    with_current_sid(|sid| {
+        // SAFETY: `sid` is a valid SID for the duration of the closure.
+        let len = unsafe { GetLengthSid(sid) } as usize;
+        // SAFETY: `sid` is valid for `len` bytes (GetLengthSid).
+        Some(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) }.to_vec())
+    })
+}
+
+/// The current user's SID in string form (`S-1-5-21-…`), as SDDL names it.
+pub(super) fn current_sid_string() -> Option<String> {
+    with_current_sid(|sid| {
+        let mut text: PWSTR = ptr::null_mut();
+        // SAFETY: `sid` is valid; `text` receives a LocalAlloc'ed NUL-terminated string.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return None;
+        }
+        // SAFETY: `text` is NUL-terminated and freed exactly once, right after.
+        let s = unsafe { local_wide_string(text) };
+        Some(s)
+    })
+}
+
+/// Copies the NUL-terminated `text` into a `String` and frees it with `LocalFree`.
+///
+/// # Safety
+/// `text` must be a non-null NUL-terminated UTF-16 string allocated with `LocalAlloc` that is
+/// not used afterwards.
+unsafe fn local_wide_string(text: PWSTR) -> String {
+    // SAFETY: the caller guarantees a NUL terminator; every unit up to it is readable.
+    let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+    // SAFETY: `len` units are readable (see above).
+    let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+    // SAFETY: allocated with LocalAlloc (caller contract); not used again.
+    unsafe { LocalFree(text.cast()) };
+    s
+}
+
+/// Runs `f` with the current user's SID, which is valid only during the call.
+fn with_current_sid<T>(f: impl FnOnce(PSID) -> Option<T>) -> Option<T> {
     let mut token: HANDLE = ptr::null_mut();
     // SAFETY: the pseudo-handle of the current process is always valid; `token` is an out-pointer.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -213,13 +259,10 @@ fn current_sid() -> Option<Vec<u8>> {
     if ok == 0 {
         return None;
     }
-    // SAFETY: on success the buffer starts with a TOKEN_USER whose SID points into the buffer.
-    let (sid, len) = unsafe {
-        let user = &*buf.as_ptr().cast::<TOKEN_USER>();
-        (user.User.Sid, GetLengthSid(user.User.Sid) as usize)
-    };
-    // SAFETY: `sid` is valid for `len` bytes (GetLengthSid) while `buf` lives.
-    Some(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) }.to_vec())
+    // SAFETY: on success the buffer starts with a TOKEN_USER whose SID points into the buffer,
+    // which outlives `f`.
+    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    f(sid)
 }
 
 /// Open-file introspection of other processes is not available: no files are reported.
@@ -261,6 +304,204 @@ pub fn private_dir_builder(recursive: bool) -> DirBuilder {
 
 /// Windows files inherit the ACL of their (user-profile) parent: nothing to set.
 pub fn private_file_options(_o: &mut OpenOptions) {}
+
+/// Creates `path` with its missing ancestors, then gives it a protected access list: full
+/// control for the current user and SYSTEM, inherited by everything created inside, and no
+/// ACE inherited from the parent (`D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;<user>)`). Applied to an
+/// existing directory too, so a looser one is repaired.
+pub fn secret_dir_all(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    let user = current_sid_string()
+        .ok_or_else(|| io::Error::other("the current user's SID cannot be read"))?;
+    let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{user})")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `sddl` is NUL-terminated; `sd` receives a LocalAlloc'ed descriptor freed below.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let result = apply_dacl(path, sd);
+    // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW; not used again.
+    unsafe { LocalFree(sd) };
+    result
+}
+
+/// Sets the DACL of `sd` on `path` as a protected DACL.
+fn apply_dacl(path: &Path, sd: PSECURITY_DESCRIPTOR) -> io::Result<()> {
+    let (mut present, mut defaulted) = (0, 0);
+    let mut dacl: *mut ACL = ptr::null_mut();
+    // SAFETY: `sd` is a valid descriptor; the out-pointers are live.
+    if unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if present == 0 || dacl.is_null() {
+        return Err(io::Error::other(
+            "the secret directory's descriptor has no DACL",
+        ));
+    }
+    let name = wide(path.as_os_str());
+    // SAFETY: `name` is NUL-terminated; `dacl` points into `sd`, alive for the call.
+    let code = unsafe {
+        SetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            dacl,
+            ptr::null(),
+        )
+    };
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(code as i32))
+    }
+}
+
+/// One ACE of a DACL as tests check it. `sid` is the full `S-1-…` form: SDDL text abbreviates
+/// well-known accounts (the built-in Administrator prints as `LA`), so tests compare SIDs.
+#[cfg(test)]
+pub(super) struct Ace {
+    pub allow: bool,
+    pub flags: u8,
+    pub mask: u32,
+    pub sid: String,
+}
+
+/// The DACL of `path` as tests check it; `sddl` only for failure messages.
+#[cfg(test)]
+pub(super) struct Dacl {
+    pub protected: bool,
+    pub aces: Vec<Ace>,
+    pub sddl: String,
+}
+
+#[cfg(test)]
+pub(super) fn dacl_of(path: &Path) -> io::Result<Dacl> {
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation, GetAce,
+        GetAclInformation, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+    };
+    // `ACCESS_ALLOWED_ACE_TYPE` / `ACCESS_DENIED_ACE_TYPE` (winnt.h); both share
+    // `ACCESS_ALLOWED_ACE`'s layout. The constants live in a windows-sys feature we don't enable.
+    const ALLOWED: u8 = 0;
+    const DENIED: u8 = 1;
+    let name = wide(path.as_os_str());
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `name` is NUL-terminated; `sd` receives a LocalAlloc'ed descriptor freed below and
+    // `dacl` points into it.
+    let code = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if code != 0 {
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    let read = || -> io::Result<Dacl> {
+        let (mut control, mut revision) = (0u16, 0u32);
+        // SAFETY: `sd` is valid; the out-pointers are live.
+        if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: plain data; all-zero is a valid value.
+        let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `dacl` is valid while `sd` lives; `size` matches the class and length.
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                ptr::from_mut(&mut size).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut aces = Vec::with_capacity(size.AceCount as usize);
+        for i in 0..size.AceCount {
+            let mut ace: *mut core::ffi::c_void = ptr::null_mut();
+            // SAFETY: `dacl` is valid while `sd` lives and `i` < its ACE count.
+            if unsafe { GetAce(dacl, i, &mut ace) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: every ACE starts with an `ACE_HEADER`.
+            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+            if header.AceType != ALLOWED && header.AceType != DENIED {
+                aces.push(Ace {
+                    allow: false,
+                    flags: header.AceFlags,
+                    mask: 0,
+                    sid: String::new(),
+                });
+                continue;
+            }
+            let body = ace.cast::<ACCESS_ALLOWED_ACE>();
+            // SAFETY: allowed/denied ACEs have this layout; the SID starts at `SidStart`.
+            let (mask, sid) = unsafe { ((*body).Mask, (&raw const (*body).SidStart) as PSID) };
+            let mut text: PWSTR = ptr::null_mut();
+            // SAFETY: `sid` points at a valid SID inside the ACE; `text` receives a LocalAlloc'ed
+            // NUL-terminated string.
+            if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            aces.push(Ace {
+                allow: header.AceType == ALLOWED,
+                flags: header.AceFlags,
+                mask,
+                // SAFETY: NUL-terminated, LocalAlloc'ed and not used again.
+                sid: unsafe { local_wide_string(text) },
+            });
+        }
+        let mut text: PWSTR = ptr::null_mut();
+        // SAFETY: `sd` is valid; `text` receives a LocalAlloc'ed string.
+        if unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: NUL-terminated, LocalAlloc'ed and not used again.
+        let sddl = unsafe { local_wide_string(text) };
+        Ok(Dacl {
+            protected: control & SE_DACL_PROTECTED != 0,
+            aces,
+            sddl,
+        })
+    };
+    let result = read();
+    // SAFETY: allocated by GetNamedSecurityInfoW; not used again.
+    unsafe { LocalFree(sd) };
+    result
+}
 
 /// No POSIX modes: archives record 0o755 for files Windows would run, 0o644 for the rest.
 pub fn file_mode(path: &Path, _meta: &Metadata) -> u32 {

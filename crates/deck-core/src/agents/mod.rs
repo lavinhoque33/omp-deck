@@ -15,7 +15,7 @@ mod transcript;
 mod watcher;
 
 pub use scan::AgentsScanner;
-pub use transcript::{TranscriptReader, TranscriptUpdate, TranscriptWatcher};
+pub use transcript::{TranscriptReader, TranscriptUpdate, TranscriptWatcher, read_blob};
 pub use watcher::AgentsWatcher;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -78,12 +78,25 @@ pub struct AgentsSnapshot {
     pub agents: Vec<AgentSummary>,
 }
 
+/// An image carried by a transcript message. `blob` is the first 16 hex digits of SHA-256 over
+/// the image's base64 `data` string exactly as stored in the transcript (for images omp
+/// externalized, the `blob:sha256:…` reference string); [`read_blob`] resolves it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImageRef {
+    pub blob: String,
+    pub mime: String,
+    /// Decoded size; `0` for an externalized image whose size is not known without reading it.
+    pub bytes: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TranscriptItem {
     User {
         text: String,
         from_agent: bool,
         at: Option<SystemTime>,
+        #[serde(default)]
+        images: Vec<ImageRef>,
     },
     Assistant {
         text: String,
@@ -99,6 +112,10 @@ pub enum TranscriptItem {
         intent: Option<String>,
         summary: String,
         args: String,
+        /// Structured arguments: string leaves cut to 16 KiB (`…` appended); `None` when the
+        /// value is still over 64 KiB serialized.
+        #[serde(default)]
+        args_value: Option<serde_json::Value>,
     },
     ToolResult {
         call_id: String,
@@ -106,6 +123,11 @@ pub enum TranscriptItem {
         text: String,
         is_error: bool,
         truncated: bool,
+        /// omp's tool-result `details`; `None` when absent or over 32 KiB serialized.
+        #[serde(default)]
+        details: Option<serde_json::Value>,
+        #[serde(default)]
+        images: Vec<ImageRef>,
     },
     /// custom_message display:true (async-result, …).
     Notice {

@@ -6,8 +6,10 @@
 use std::path::{Path, PathBuf};
 
 use deck_core::changes::{ChangedFile, Changes, FileDiff};
-use deck_service::controller::{Command, RequestId};
-use deck_service::gateway::protocol::{Answer, Mutation, Query, Topic, TopicValue};
+use deck_service::controller::Delivery;
+use deck_service::gateway::protocol::{
+    Answer, Done, Mutation, Query, ReviewItem, Topic, TopicValue,
+};
 use egui::Margin;
 
 use super::{App, PendingConfirm};
@@ -40,38 +42,6 @@ pub(super) struct PendingWrite {
     files: Vec<ChangedFile>,
 }
 
-/// A review handed to a tab's controller: which comments leave the review once it is delivered.
-struct PendingReview {
-    uid: u64,
-    root: PathBuf,
-    ids: Vec<u64>,
-    send: bool,
-    /// The controller request that carries it: only its own outcome settles this hand-off.
-    request: RequestId,
-}
-
-/// Review hand-offs in flight, at most one per tab (a tab's controller refuses a second review
-/// while one runs). Each completion clears exactly the comments of its own hand-off.
-#[derive(Default)]
-struct PendingReviews(Vec<PendingReview>);
-
-impl PendingReviews {
-    /// Records a hand-off; an older one of the same tab (it was refused or dropped) is replaced.
-    fn start(&mut self, p: PendingReview) {
-        self.0.retain(|q| q.uid != p.uid);
-        self.0.push(p);
-    }
-
-    /// The hand-off of tab `uid` that request `request` just settled.
-    fn take(&mut self, uid: u64, send: bool, request: RequestId) -> Option<PendingReview> {
-        let i = self
-            .0
-            .iter()
-            .position(|p| p.uid == uid && p.send == send && p.request == request)?;
-        Some(self.0.swap_remove(i))
-    }
-}
-
 #[derive(Default)]
 pub(super) struct ChangesUi {
     pub(super) open: bool,
@@ -87,8 +57,6 @@ pub(super) struct ChangesUi {
     diff_generation: u64,
     /// The offline notice is the one shown in the panel.
     offline_shown: bool,
-    /// The review request in flight (cleared when its controller reports it settled).
-    pending_reviews: PendingReviews,
 }
 
 impl ChangesUi {
@@ -499,10 +467,10 @@ impl App {
         }
     }
 
-    /// **Insert into omp** / **Send**: queues the review on the panel's tab (looked up again now).
-    /// The review is cleared only when the controller reports the request delivered
-    /// ([`Self::review_delivered`]); every refusal (omp busy, a dialog open, draft declined, no
-    /// bracketed paste) keeps it.
+    /// **Insert into omp** / **Send**: the gateway builds the prompt from the current diff and
+    /// queues it on the panel's tab. The review is cleared only when the controller reports the
+    /// request delivered; every refusal (omp busy, a dialog open, draft declined, no bracketed
+    /// paste) keeps it.
     fn hand_review(&mut self, send: bool) {
         let (Some(uid), Some(root)) = (self.changes.uid, self.changes.view.root.clone()) else {
             return;
@@ -514,13 +482,6 @@ impl App {
             .of(&root)
             .map(|r| r.comments().to_vec())
             .unwrap_or_default();
-        let text = match review::build_prompt(&comments) {
-            Ok(t) => t,
-            Err(e) => {
-                self.toasts.error(&self.ctx, e.to_string());
-                return;
-            }
-        };
         let Some(target) = self
             .tabs
             .iter()
@@ -531,38 +492,77 @@ impl App {
                 .error(&self.ctx, "The session tab was closed; nothing was sent");
             return;
         };
+        let (items, general) = match self.review_items(&comments) {
+            Ok(v) => v,
+            Err(e) => {
+                self.toasts.error(&self.ctx, e);
+                return;
+            }
+        };
         let ids: Vec<u64> = comments.iter().map(|c| c.id).collect();
-        // The hand-off is only recorded once the gateway accepted the command: until then it is
-        // just a local request, and a refusal leaves the review exactly as it was.
-        self.submit_command(
-            &target,
-            Command::Review { text, send },
-            move |app, request| {
-                app.changes.pending_reviews.start(PendingReview {
-                    uid,
-                    root,
-                    ids,
-                    send,
-                    request,
-                });
+        self.gw.mutate(
+            Mutation::Review {
+                target,
+                root: root.clone(),
+                comments: items,
+                general,
+                send,
+            },
+            move |app, result| match result {
+                Ok(Done::Submitted(r)) if matches!(r.delivery, Delivery::Delivered) => {
+                    app.review_delivered(&root, &ids, send);
+                }
+                // Any other end (refused, declined, cancelled): the controller's own report says
+                // why, and the comments stay in the review.
+                Ok(_) => {}
+                Err(e) => app.toasts.error(&app.ctx, format!("Nothing was sent: {e}")),
             },
         );
     }
 
-    /// A review request ended without reaching omp (refused, declined, cancelled): its comments
-    /// stay in the review.
-    pub(super) fn review_dropped(&mut self, uid: u64, send: bool, request: RequestId) {
-        self.changes.pending_reviews.take(uid, send, request);
+    /// The gateway's view of `comments`: line comments as items on the listed files, general
+    /// comments joined into the one general text.
+    fn review_items(
+        &self,
+        comments: &[review::Comment],
+    ) -> Result<(Vec<ReviewItem>, Option<String>), String> {
+        let mut items = Vec::new();
+        let mut general: Vec<&str> = Vec::new();
+        for c in comments {
+            let Some(loc) = &c.loc else {
+                general.push(&c.body);
+                continue;
+            };
+            let file = self
+                .changes
+                .view
+                .files
+                .iter()
+                .find(|f| f.path == loc.path)
+                .ok_or_else(|| {
+                    format!(
+                        "{} has no changes any more — delete its comment to continue",
+                        loc.path
+                    )
+                })?;
+            items.push(ReviewItem {
+                file: file.clone(),
+                side: loc.section.side(),
+                start: loc.span.start,
+                end: loc.span.end,
+                line_side: Some(loc.span.side),
+                text: c.body.clone(),
+            });
+        }
+        let general = (!general.is_empty()).then(|| general.join("\n\n"));
+        Ok((items, general))
     }
 
-    /// The controller delivered a review request on tab `uid`: those comments are in omp's hands
-    /// now (delivered bytes, not proof that omp acted on them).
-    pub(super) fn review_delivered(&mut self, uid: u64, send: bool, request: RequestId) {
-        let Some(p) = self.changes.pending_reviews.take(uid, send, request) else {
-            return;
-        };
-        let n = p.ids.len();
-        self.changes.view.reviews.of_mut(&p.root).remove_all(&p.ids);
+    /// The controller delivered a review: those comments are in omp's hands now (delivered
+    /// bytes, not proof that omp acted on them).
+    fn review_delivered(&mut self, root: &Path, ids: &[u64], send: bool) {
+        let n = ids.len();
+        self.changes.view.reviews.of_mut(root).remove_all(ids);
         let what = if n == 1 {
             "1 review comment".to_owned()
         } else {
@@ -664,37 +664,6 @@ mod tests {
         assert!(ch.view.selected.is_none());
         assert_eq!(ch.seen_rev, 0, "the new folder's listing is read afresh");
         assert!(ch.diff_generation > diff);
-    }
-
-    #[test]
-    fn each_tabs_review_handoff_completes_on_its_own() {
-        let p = |uid, root: &str, ids: Vec<u64>| PendingReview {
-            uid,
-            root: PathBuf::from(root),
-            ids,
-            send: true,
-            request: RequestId(uid),
-        };
-        let mut pending = PendingReviews::default();
-        pending.start(p(1, "/a", vec![1, 2]));
-        pending.start(p(2, "/b", vec![7]));
-        // Tab 2's hand-off did not overwrite tab 1's.
-        let done = pending.take(1, true, RequestId(1)).unwrap();
-        assert_eq!((done.root, done.ids), (PathBuf::from("/a"), vec![1, 2]));
-        assert!(
-            pending.take(1, true, RequestId(1)).is_none(),
-            "already completed"
-        );
-        assert!(
-            pending.take(2, false, RequestId(2)).is_none(),
-            "other kind of job"
-        );
-        assert_eq!(pending.take(2, true, RequestId(2)).unwrap().ids, vec![7]);
-        // A retry on the same tab replaces its refused predecessor.
-        pending.start(p(3, "/c", vec![1]));
-        pending.start(p(3, "/c", vec![1, 2]));
-        assert_eq!(pending.take(3, true, RequestId(3)).unwrap().ids, vec![1, 2]);
-        assert!(pending.take(3, true, RequestId(3)).is_none());
     }
 
     #[test]

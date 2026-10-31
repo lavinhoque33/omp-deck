@@ -11,9 +11,12 @@
 //! - [`settings`]: the single, cross-process-safe writer of the settings file.
 //! - [`gateway`]: the per-user headless owner of all of the above, its private IPC and client.
 //! - [`status`], [`statusfmt`]: session status and its text formatting.
+//! - [`review`], [`ui_answer`], [`attachments`]: client-independent pieces of the review prompt,
+//!   answers to omp's dialogs and the attachment store of remote clients.
 //!
 //! No GUI toolkit here: the desktop app is one client, headless drivers are others.
 
+pub mod attachments;
 pub mod backend;
 pub mod composer;
 pub mod controller;
@@ -23,7 +26,9 @@ pub mod inject;
 pub mod lifecycle;
 pub mod model_switch;
 pub mod notifications;
+pub mod review;
 pub mod session_actions;
 pub mod settings;
 pub mod status;
 pub mod statusfmt;
+pub mod ui_answer;

@@ -695,3 +695,55 @@ fn untracked_directory_diff_shares_one_byte_budget_across_files() {
     assert!(diff.text.ends_with('\n'));
     assert!(diff.text.contains("+++ b/big/a.txt"));
 }
+
+/// A repository's `core.fsmonitor` names a program git would run on status and diff; OmpDeck
+/// browses arbitrary folders, so none of its read-only git runs may execute it.
+#[cfg(unix)]
+#[test]
+fn repository_fsmonitor_hook_never_runs() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if Command::new("git").arg("--version").output().is_err() {
+        return;
+    }
+    let dir = init();
+    let d = dir.path();
+    write(d, "f.txt", "one\n");
+    commit_all(d);
+    let marker = d.join(".git/fsmonitor-ran");
+    let hook = d.join(".git/fsmonitor-hook");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\necho ran >> '{}'\nexit 1\n", marker.display()),
+    )
+    .expect("write hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");
+    git(d, &["config", "core.fsmonitor", &hook.to_string_lossy()]);
+    write(d, "f.txt", "two\n");
+
+    // Control: plain git does run the hook (else this git cannot show the difference).
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(d)
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("git runs");
+    if !marker.exists() {
+        return;
+    }
+    fs::remove_file(&marker).expect("rm marker");
+
+    let c = listed(d);
+    let f = find(&c, "f.txt");
+    let unstaged = diff(d, f, DiffSide::Unstaged).expect("diff");
+    assert!(unstaged.text.contains("+two"), "{}", unstaged.text);
+    patch(d).expect("patch");
+    let info = crate::status::git_info(d).expect("status");
+    assert_eq!(info.unstaged, 1);
+    crate::worktree::find_merge_target(d, "main").expect("worktree list");
+    assert!(
+        !marker.exists(),
+        "the repository's fsmonitor hook ran: {:?}",
+        fs::read_to_string(&marker)
+    );
+}

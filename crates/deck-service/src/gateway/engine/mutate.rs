@@ -18,6 +18,7 @@ use crate::gateway::protocol::{
     ServerEvent, SessionRole, Tool, UpdatePhase,
 };
 use crate::settings::{Field, SettingsError, Snapshot};
+use deck_core::backup::Destination;
 
 /// Progress events of one job are sent at most this often.
 const PROGRESS_EVERY: Duration = Duration::from_millis(150);
@@ -74,17 +75,22 @@ fn uses_lane(op: &Mutation) -> bool {
             | Mutation::Backup { .. }
             | Mutation::PrepareRestore(_)
             | Mutation::DeleteBackup(_)
+            | Mutation::DeleteBackups(_)
             | Mutation::ApplyRestore(_)
             | Mutation::ServerConnect { .. }
             | Mutation::ServerForget
             | Mutation::ProjectBackup { .. }
             | Mutation::ProjectDeleteBackup(_)
+            | Mutation::ProjectDeleteBackups(_)
             | Mutation::ProjectPrepareRestore { .. }
             | Mutation::ProjectApplyRestore { .. }
+            | Mutation::BackupConnectOnDesktop
     )
 }
 
 impl Engine {
+    /// `work`: the hash deciding "same work" for a repeated key (a device's request in device
+    /// terms); `None` hashes `op`.
     pub(super) fn on_mutate(
         &mut self,
         conn: u64,
@@ -92,11 +98,12 @@ impl Engine {
         key: RequestKey,
         epoch: ServiceEpoch,
         op: Mutation,
+        work: Option<String>,
     ) {
         let Some(c) = self.conns.get(&conn) else {
             return;
         };
-        if c.role == Role::Supervisor {
+        if c.is(Role::Supervisor) {
             self.reply(
                 conn,
                 id,
@@ -110,9 +117,7 @@ impl Engine {
             self.reply(
                 conn,
                 id,
-                Err(GatewayError::Refused(
-                    "this request key belongs to another client".to_owned(),
-                )),
+                Err(GatewayError::Refused(super::FOREIGN_KEY.to_owned())),
             );
             return;
         }
@@ -141,7 +146,7 @@ impl Engine {
                 return;
             }
         }
-        match self.journal.admit(&key, &op, self.epoch) {
+        match self.journal.admit(&key, &op, work, self.epoch) {
             Err(e) => self.reply(
                 conn,
                 id,
@@ -150,10 +155,7 @@ impl Engine {
                 ))),
             ),
             Ok(Admission::Accepted) => self.execute(conn, id, key, op),
-            Ok(Admission::Duplicate(Outcome::Rejected(r))) => {
-                self.reply(conn, id, Err(GatewayError::Rejected(r)));
-            }
-            Ok(Admission::Duplicate(outcome)) => {
+            Ok(other) => {
                 let submitted = match &op {
                     Mutation::Submit { target, .. } => self
                         .sess
@@ -165,6 +167,25 @@ impl Engine {
                         }),
                     _ => None,
                 };
+                self.answer_known(conn, id, key, other, submitted);
+            }
+        }
+    }
+
+    /// Answers a key the journal knew: its record (duplicate), or why it cannot be used.
+    pub(super) fn answer_known(
+        &mut self,
+        conn: u64,
+        id: u64,
+        key: RequestKey,
+        known: Admission,
+        submitted: Option<Submitted>,
+    ) {
+        match known {
+            Admission::Duplicate(Outcome::Rejected(r)) => {
+                self.reply(conn, id, Err(GatewayError::Rejected(r)));
+            }
+            Admission::Duplicate(outcome) => {
                 self.reply(
                     conn,
                     id,
@@ -178,8 +199,10 @@ impl Engine {
                     self.to_client(&key.client.clone(), &ServerEvent::Outcome { key, outcome });
                 }
             }
-            Ok(Admission::KeyReused) => self.reply(conn, id, Err(GatewayError::KeyReused)),
-            Ok(Admission::Expired) => self.reply(conn, id, Err(GatewayError::Expired)),
+            Admission::KeyReused => self.reply(conn, id, Err(GatewayError::KeyReused)),
+            Admission::Expired => self.reply(conn, id, Err(GatewayError::Expired)),
+            // Not a known key: never passed here.
+            Admission::Accepted => {}
         }
     }
 
@@ -201,6 +224,9 @@ impl Engine {
                 "Another backup job is running ({busy}); try again."
             )));
         }
+        if super::remote::is_mobile(op) {
+            return self.mobile_precheck(op);
+        }
         match op {
             Mutation::Launch(spec) if spec.argv.is_empty() => refused("there is nothing to run"),
             Mutation::Close {
@@ -215,16 +241,81 @@ impl Engine {
             Mutation::Answer { target, id, .. } => {
                 match managed(target).and_then(|m| m.ctl.request(*id)) {
                     None => refused("no such request"),
-                    Some(r) if r.key.client != key.client => {
+                    Some(r)
+                        if r.key.client != key.client
+                            && self.worktree.owner(&r.key) != Some(key.client.as_str()) =>
+                    {
                         refused("only the client that sent the command can answer it")
                     }
                     Some(_) => None,
                 }
             }
+            Mutation::WorktreeNew { .. }
+            | Mutation::WorktreeMoveSession { .. }
+            | Mutation::WorktreeFinish { .. }
+            | Mutation::WorktreeRetire { .. }
+            | Mutation::WorktreeContinue { .. } => self.worktree_precheck(op),
             Mutation::Ctl { target, .. } => match managed(target) {
                 Some(m) if m.ctl_key.is_none() => refused("this session runs without live control"),
                 _ => None,
             },
+            Mutation::ForkAt { file, .. } => self
+                .runs_without_ctl(file)
+                .then_some(GatewayError::NoLiveControl),
+            Mutation::ApplyRestore(h) | Mutation::DiscardRestore(h) => self
+                .handles
+                .restore_owner(*h)
+                .filter(|o| *o != key.client)
+                .and_then(|_| refused(jobs::NOT_YOUR_RESTORE)),
+            Mutation::ProjectApplyRestore { handle: h, .. }
+            | Mutation::ProjectDiscardRestore(h) => self
+                .handles
+                .project_restore_owner(*h)
+                .filter(|o| *o != key.client)
+                .and_then(|_| refused(jobs::NOT_YOUR_RESTORE)),
+            Mutation::AnswerUi {
+                target,
+                request,
+                answer,
+            } => match managed(target) {
+                None => None,
+                Some(m) => match self.pending_ui(m, *request) {
+                    Err(e) => Some(e),
+                    Ok(None) => None,
+                    Ok(Some(ui)) => crate::ui_answer::value_for(&ui, answer)
+                        .err()
+                        .map(|e| GatewayError::Refused(e.to_string())),
+                },
+            },
+            Mutation::Review {
+                comments, general, ..
+            } => {
+                if comments
+                    .iter()
+                    .any(|c| c.start == 0 || c.end < c.start || c.text.trim().is_empty())
+                {
+                    refused("each review comment needs text and a line range starting at 1")
+                } else if comments.is_empty()
+                    && general.as_deref().is_none_or(|g| g.trim().is_empty())
+                {
+                    refused("There are no review comments yet")
+                } else {
+                    None
+                }
+            }
+            Mutation::BackupConnectOnDesktop
+                if self.cfg.backup_destination != Destination::Drive =>
+            {
+                refused("set up the backup server in the desktop app (Settings, Backup)")
+            }
+            Mutation::BackupConnectOnDesktop if self.service.creds.is_none() => {
+                refused("Google Drive is not available")
+            }
+            Mutation::BackupConnectOnDesktop | Mutation::OpenOnDesktop { .. }
+                if !self.desktop_reachable() =>
+            {
+                refused("needs desktop")
+            }
             Mutation::Settings(edit)
                 if edit.changes.iter().any(|s| s.field() == Field::GatewayMode) =>
             {
@@ -265,6 +356,10 @@ impl Engine {
             Mutation::UsageRefresh if self.omp.is_none() => refused("omp was not found"),
             Mutation::AppUpdateDownload => self.sched.download_refusal(),
             Mutation::AppUpdateApply => self.sched.apply_refusal(),
+            // Only the client's own jobs; another client's keys are refused before any lookup.
+            Mutation::CancelJob(k) if k.client != key.client => {
+                Some(GatewayError::Refused(super::FOREIGN_KEY.to_owned()))
+            }
             Mutation::CancelJob(k) => match self.jobs.get(k) {
                 None => Some(GatewayError::NoSuchJob),
                 Some(j) if j.cancel.is_none() => refused("this job cannot be cancelled"),
@@ -276,7 +371,7 @@ impl Engine {
 
     // ---- job bookkeeping ----------------------------------------------------------------------
 
-    fn accepted(&self, conn: u64, id: u64, key: &RequestKey) {
+    pub(super) fn accepted(&self, conn: u64, id: u64, key: &RequestKey) {
         self.reply(
             conn,
             id,
@@ -457,12 +552,15 @@ impl Engine {
             Mutation::Launch(spec) => {
                 self.track(&key, "launch", Post::None);
                 self.accepted(conn, id, &key);
+                // A device's folder is checked again where the launch is prepared.
+                let confine = self.confine_for(&key.client);
                 self.sess.queue(LaunchJob {
                     spec,
                     key: Some(key),
                     exact: false,
                     restore: false,
                     tool: None,
+                    confine,
                 });
                 self.pump_launches();
             }
@@ -848,6 +946,7 @@ impl Engine {
                     exact: false,
                     restore: false,
                     tool: Some(tool),
+                    confine: None,
                 });
                 self.pump_launches();
             }
@@ -867,6 +966,23 @@ impl Engine {
                 self.accepted(conn, id, &key);
                 self.mode_queue.push_back((key, mode));
                 self.pump_mode();
+            }
+            op @ (Mutation::RelaySet { .. }
+            | Mutation::RelayClear
+            | Mutation::RelayReconnect
+            | Mutation::PairingBegin
+            | Mutation::PairingCancel
+            | Mutation::PairingApprove { .. }
+            | Mutation::PairingDeny { .. }
+            | Mutation::DeviceRevoke { .. }
+            | Mutation::DeviceRename { .. }
+            | Mutation::DeviceSetPermissions { .. }) => {
+                self.accepted(conn, id, &key);
+                let outcome = match self.mobile_execute(op) {
+                    Ok(done) => Outcome::Done(Box::new(done)),
+                    Err(e) => Outcome::Failed(e.to_string()),
+                };
+                self.finish_journal(&key, outcome);
             }
             Mutation::DriveLoginBegin => {
                 self.accepted(conn, id, &key);
@@ -918,6 +1034,7 @@ impl Engine {
                 );
             }
             Mutation::PrepareRestore(file) => {
+                let client = key.client.clone();
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
@@ -925,10 +1042,11 @@ impl Engine {
                     true,
                     false,
                     Post::None,
-                    move |ctx, _, _| jobs::prepare_restore(ctx, &file),
+                    move |ctx, _, _| jobs::prepare_restore(ctx, &client, &file),
                 );
             }
             Mutation::ApplyRestore(handle) => {
+                let client = key.client.clone();
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
@@ -936,7 +1054,7 @@ impl Engine {
                     true,
                     false,
                     Post::Refresh,
-                    move |ctx, _, _| jobs::apply_restore(ctx, handle),
+                    move |ctx, _, _| jobs::apply_restore(ctx, &client, handle),
                 );
             }
             Mutation::DeleteBackup(file) => {
@@ -950,8 +1068,19 @@ impl Engine {
                     move |ctx, _, _| jobs::delete_backup(ctx, &file),
                 );
             }
+            Mutation::DeleteBackups(files) => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "delete-backups",
+                    true,
+                    false,
+                    Post::Accounts,
+                    move |ctx, _, _| jobs::delete_backups(ctx, &files),
+                );
+            }
             Mutation::DiscardRestore(handle) => {
-                let ok = self.handles.discard_restore(handle);
+                let ok = self.handles.discard_restore(handle, &key.client);
                 self.accepted(conn, id, &key);
                 self.inline_result(key, ok, "that restore is gone");
             }
@@ -1011,11 +1140,25 @@ impl Engine {
                     move |ctx, _, _| jobs::project_delete_backup(ctx, &backup),
                 );
             }
+            Mutation::ProjectDeleteBackups(backups) => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "project-delete-backups",
+                    true,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::project_delete_backups(ctx, &backups),
+                );
+            }
             Mutation::ProjectPrepareRestore {
                 backup,
                 target,
                 parts,
             } => {
+                let client = key.client.clone();
+                // A device's folder is checked again on the worker that reads it.
+                let confine = self.confine_for(&client);
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
@@ -1024,8 +1167,12 @@ impl Engine {
                     true,
                     Post::None,
                     move |ctx, cancel, progress| {
+                        let target = match &confine {
+                            Some(c) => c.admit(&target)?,
+                            None => target,
+                        };
                         jobs::project_prepare_restore(
-                            ctx, &backup, &target, parts, cancel, progress,
+                            ctx, &backup, &client, &target, parts, cancel, progress,
                         )
                     },
                 );
@@ -1034,8 +1181,14 @@ impl Engine {
                 handle,
                 conflicts,
                 excluded,
-                stop,
+                ..
             } => {
+                // The sessions running the local copies the restore overwrites: backend ones
+                // are killed by the job, direct programs end here.
+                let stop = self.restore_stop_list(handle, &conflicts, &excluded);
+                let client = key.client.clone();
+                // A device's target is checked again on the worker that writes it.
+                let confine = self.confine_for(&client);
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
@@ -1044,14 +1197,26 @@ impl Engine {
                     true,
                     Post::Refresh,
                     move |ctx, cancel, progress| {
+                        if let Some(c) = &confine {
+                            jobs::admit_restore_target(ctx, &client, handle, c)?;
+                        }
                         jobs::project_apply_restore(
-                            ctx, handle, &conflicts, &excluded, &stop, cancel, progress,
+                            ctx,
+                            &client,
+                            handle,
+                            &jobs::RestoreChoices {
+                                conflicts: &conflicts,
+                                excluded: &excluded,
+                                stop: &stop,
+                            },
+                            cancel,
+                            progress,
                         )
                     },
                 );
             }
             Mutation::ProjectDiscardRestore(handle) => {
-                let ok = self.handles.discard_project_restore(handle);
+                let ok = self.handles.discard_project_restore(handle, &key.client);
                 self.accepted(conn, id, &key);
                 self.inline_result(key, ok, "that restore is gone");
             }
@@ -1227,12 +1392,126 @@ impl Engine {
                     },
                 );
             }
+            Mutation::Review {
+                target,
+                root,
+                comments,
+                general,
+                send,
+            } => {
+                if index.is_none() {
+                    return self.vanished(conn, id, key);
+                }
+                self.track(&key, "review", Post::None);
+                self.accepted(conn, id, &key);
+                self.spawn_worker("review", move || Fin::ReviewBuilt {
+                    key,
+                    target,
+                    send,
+                    result: build_review(&root, &comments, general.as_deref()),
+                });
+            }
+            Mutation::AnswerUi {
+                request, answer, ..
+            } => {
+                let Some(i) = index else {
+                    return self.vanished(conn, id, key);
+                };
+                let m = &self.sess.managed[i];
+                let pending = self.pending_ui(m, request);
+                let root = m.ctl.session_path().map(std::path::Path::to_path_buf);
+                let value = match (pending, root) {
+                    (Ok(Some(ui)), Some(root)) => crate::ui_answer::value_for(&ui, &answer)
+                        .map(|value| (value, root))
+                        .map_err(|e| GatewayError::Refused(e.to_string())),
+                    (Err(e), _) => Err(e),
+                    // Answered or abandoned meanwhile.
+                    _ => {
+                        self.accepted(conn, id, &key);
+                        self.finish_journal(&key, Outcome::Done(Box::new(Done::Answered(false))));
+                        return;
+                    }
+                };
+                match value {
+                    Err(e) => {
+                        self.journal.finish(&key, Outcome::Failed(e.to_string()));
+                        self.reply(conn, id, Err(e));
+                    }
+                    Ok((value, root)) => {
+                        self.track(&key, "answer-ui", Post::None);
+                        self.accepted(conn, id, &key);
+                        self.queue_ctl(
+                            i,
+                            key,
+                            deck_core::ctl::CtlCommand::AnswerUi {
+                                id: request,
+                                value,
+                                root,
+                            },
+                        );
+                    }
+                }
+            }
+            Mutation::OpenOnDesktop { file, split } => {
+                self.accepted(conn, id, &key);
+                let ev = ServerEvent::OpenSession {
+                    file: file.clone(),
+                    split,
+                };
+                if !self.to_desktop(&ev) {
+                    self.launch_gui(
+                        "opening a session on the desktop",
+                        vec![
+                            "--open".into(),
+                            file.into_os_string(),
+                            "--split".into(),
+                            split.as_str().into(),
+                        ],
+                    );
+                }
+                self.finish_journal(&key, Outcome::Done(Box::new(Done::Unit)));
+            }
+            Mutation::CloseOnDesktop { file } => {
+                self.accepted(conn, id, &key);
+                // Without a window nothing is open: nothing to close.
+                for c in self.conns.values().filter(|c| c.is(Role::Gui)) {
+                    if let Some(out) = c.local() {
+                        out.event(&ServerEvent::CloseSession { file: file.clone() });
+                    }
+                }
+                self.finish_journal(&key, Outcome::Done(Box::new(Done::Unit)));
+            }
+            Mutation::BackupConnectOnDesktop => {
+                self.accepted(conn, id, &key);
+                let tx = self.tx.clone();
+                self.job(
+                    key,
+                    "backup-connect-on-desktop",
+                    true,
+                    false,
+                    Post::Accounts,
+                    move |ctx, _, _| {
+                        let Done::DriveLogin { handle, url } = jobs::drive_login_begin(ctx)? else {
+                            return Err(GatewayError::Failed(
+                                "the sign-in did not start".to_owned(),
+                            ));
+                        };
+                        send(&tx, Fin::OpenUrl(url));
+                        jobs::drive_login_finish(ctx, handle)
+                    },
+                );
+            }
             Mutation::RefreshSessions => {
                 self.sessions_watch.refresh_now();
                 self.running.poke();
                 self.accepted(conn, id, &key);
                 self.finish_journal(&key, Outcome::Done(Box::new(Done::Unit)));
             }
+            op @ (Mutation::WorktreeNew { .. }
+            | Mutation::WorktreeMoveSession { .. }
+            | Mutation::WorktreeFinish { .. }
+            | Mutation::WorktreeRetire { .. }
+            | Mutation::WorktreeContinue { .. }) => self.execute_worktree(conn, id, key, op),
         }
     }
 
@@ -1248,7 +1527,7 @@ impl Engine {
 
     /// The admitted mutation's subject disappeared between validation and execution (cannot
     /// happen on this thread; kept total so no admitted key stays Running).
-    fn vanished(&mut self, conn: u64, id: u64, key: RequestKey) {
+    pub(super) fn vanished(&mut self, conn: u64, id: u64, key: RequestKey) {
         let e = GatewayError::Refused("that session is closed".to_owned());
         self.journal.finish(&key, Outcome::Failed(e.to_string()));
         self.reply(conn, id, Err(e));
@@ -1269,6 +1548,186 @@ impl Engine {
         let holder = snap.holder(file)?;
         snap.has_ctl(holder).then(|| holder.to_owned())
     }
+
+    /// `file` runs, but nothing can ask it to act through live control: a managed session
+    /// without a control socket, or a backend session whose holder has none.
+    fn runs_without_ctl(&self, file: &std::path::Path) -> bool {
+        if self.ctl_holder(file).is_some() {
+            return false;
+        }
+        let managed = self
+            .sess
+            .managed
+            .iter()
+            .any(|m| !m.exited() && m.ctl.session_path() == Some(file));
+        managed
+            || self
+                .running
+                .latest()
+                .is_some_and(|snap| snap.holder(file).is_some())
+    }
+
+    /// The session's pending dialog `request` (`None`: no longer pending), or why the session
+    /// cannot be answered remotely.
+    fn pending_ui(
+        &self,
+        m: &super::sessions::Managed,
+        request: u64,
+    ) -> Result<Option<deck_core::ctl::PendingUi>, GatewayError> {
+        let refused = |s: &str| GatewayError::Refused(s.to_owned());
+        if m.ctl_key.is_none() || m.ctl.session_path().is_none() {
+            return Err(refused("this session runs without live control"));
+        }
+        let Some(link) = &m.live else {
+            return Err(refused("this session's dialogs are not followed"));
+        };
+        if !link.client.ui_hook() {
+            return Err(refused("this omp cannot be answered remotely"));
+        }
+        Ok(link
+            .client
+            .latest()
+            .and_then(|s| s.pending_ui.iter().find(|u| u.id == request).cloned()))
+    }
+
+    /// The backend sessions running the local copies project restore `handle` overwrites
+    /// (killed by its job); a direct program running one ends here. Sessions in `excluded` are
+    /// left out of the restore, so their copies stay.
+    fn restore_stop_list(
+        &mut self,
+        handle: u64,
+        conflicts: &std::collections::BTreeMap<String, deck_core::backup::ConflictChoice>,
+        excluded: &std::collections::BTreeSet<String>,
+    ) -> Vec<String> {
+        let snap = self.running.latest();
+        let mut names: Vec<String> = Vec::new();
+        for (id, path) in self.handles.overwritten_copies(handle, conflicts, excluded) {
+            if let Some(n) = snap.as_ref().and_then(|s| s.holder(&path)) {
+                names.push(n.to_owned());
+            }
+            let derived = deck_core::mux::session_name_for(&id);
+            if snap.as_ref().is_some_and(|s| s.is_alive(&derived)) {
+                names.push(derived);
+            }
+            for m in self
+                .sess
+                .managed
+                .iter_mut()
+                .filter(|m| !m.exited() && m.ctl.session_path() == Some(path.as_path()))
+            {
+                match &m.mux_name {
+                    Some(n) if m.mux.is_some() => names.push(n.clone()),
+                    _ => m.ctl.terminal_mut().kill(),
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// A GUI is connected, or the app can be started.
+    fn desktop_reachable(&self) -> bool {
+        self.context.gui.is_some() || self.conns.values().any(|c| c.is(Role::Gui))
+    }
+
+    /// Sends `ev` to the focused (else the most recent) GUI; `false` without one.
+    fn to_desktop(&self, ev: &ServerEvent) -> bool {
+        let gui = self
+            .conns
+            .values()
+            .filter(|c| c.is(Role::Gui))
+            .max_by_key(|c| (c.state.focused, c.seq))
+            .and_then(|c| c.local());
+        gui.inspect(|out| out.event(ev)).is_some()
+    }
+
+    /// Starts the desktop app with `extra` arguments (no window is open).
+    fn launch_gui(&mut self, what: &'static str, extra: Vec<std::ffi::OsString>) {
+        let Some(program) = self.context.gui.clone() else {
+            log::warn!("{what}: the app was not found");
+            return;
+        };
+        self.spawn_worker("launch-gui", move || {
+            let mut args: Vec<std::ffi::OsString> = program.args.iter().map(Into::into).collect();
+            args.extend(extra);
+            let result = deck_host::launch_detached(&program.program, args)
+                .map(super::notify::reap)
+                .map_err(|e| e.to_string());
+            Fin::Logged { what, result }
+        });
+    }
+
+    pub(super) fn open_url(&mut self, url: String) {
+        let ev = ServerEvent::OpenUrl { url: url.clone() };
+        if !self.to_desktop(&ev) {
+            self.launch_gui(
+                "opening the Google sign-in on the desktop",
+                vec!["--open-url".into(), url.into()],
+            );
+        }
+    }
+
+    /// Submits a built review prompt to its session, as `Submit` would.
+    pub(super) fn on_review_built(
+        &mut self,
+        key: RequestKey,
+        target: crate::controller::SessionTarget,
+        send: bool,
+        result: Result<String, GatewayError>,
+    ) {
+        self.jobs.remove(&key);
+        self.dirty.gateway = true;
+        let text = match result {
+            Ok(t) => t,
+            Err(e) => return self.finish_journal(&key, Outcome::Failed(e.to_string())),
+        };
+        let Some(i) = self.sess.find(&target.key) else {
+            return self.finish_journal(&key, Outcome::Failed("that session is closed".to_owned()));
+        };
+        let session = target.key.clone();
+        let submitted = self.sess.managed[i].ctl.submit(Submission {
+            key: key.clone(),
+            target,
+            command: crate::controller::Command::Review { text, send },
+        });
+        self.dirty.controllers = true;
+        match submitted {
+            Ok(_) => {
+                self.sess.submits.insert(key, session);
+                self.waker.now();
+            }
+            Err(r) => self.finish_journal(&key, Outcome::Rejected(r)),
+        }
+    }
+}
+
+/// Worker: the review prompt of `comments` on `root`'s current diff.
+fn build_review(
+    root: &std::path::Path,
+    comments: &[crate::gateway::protocol::ReviewItem],
+    general: Option<&str>,
+) -> Result<String, GatewayError> {
+    use crate::review::{Comment, Loc};
+    let mut out = Vec::with_capacity(comments.len() + 1);
+    for c in comments {
+        let diff = deck_core::changes::diff(root, &c.file, c.side)
+            .map_err(|e| GatewayError::Failed(format!("{}: {e}", c.file.path)))?;
+        out.push(Comment {
+            loc: Some(Loc {
+                path: c.file.path.clone(),
+                span: crate::review::span_on_side(&diff.text, c.start, c.end, c.line_side),
+            }),
+            body: c.text.clone(),
+        });
+    }
+    if let Some(g) = general {
+        out.push(Comment {
+            loc: None,
+            body: g.to_owned(),
+        });
+    }
+    crate::review::build_prompt(&out).map_err(|e| GatewayError::Refused(e.to_string()))
 }
 
 /// Worker: `omp usage` (through omp's report cache).

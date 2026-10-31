@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use deck_service::gateway::protocol::Split;
+
 pub const HELP: &str = "\
 OmpDeck — desktop wrapper for the omp coding-agent TUI
 
@@ -16,6 +18,10 @@ OPTIONS:
     --sessions-root <dir>   Read omp sessions from <dir> instead of the default store
     --activate <file>       Used by the OmpDeck gateway: open the session of a clicked
                             notification (the file is a private one-use ticket)
+    --open <file>           Used by the OmpDeck gateway: open (or focus) the tab of that
+                            session file
+    --split none|right|down With --open: where the tab goes (default none: a tab of its own)
+    --open-url <url>        Used by the OmpDeck gateway: open a link in the desktop browser
     -h, --help              Print this help
 
 ENVIRONMENT:
@@ -37,6 +43,12 @@ pub struct Cli {
     /// Set by the gateway when a notification was clicked with no window open: the private
     /// activation ticket to consume (see `deck_service::gateway::activation`).
     pub activate: Option<PathBuf>,
+    /// Session file to open (or focus) once the window is up (`--open`).
+    pub open: Option<PathBuf>,
+    /// Where the `--open` tab goes (`--split`; unset: a tab of its own).
+    pub split: Option<Split>,
+    /// Link to open in the desktop browser once the window is up (`--open-url`).
+    pub open_url: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -68,6 +80,17 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--folder" => cli.folder = Some(PathBuf::from(value("--folder")?)),
             "--screenshot" => cli.screenshot = Some(PathBuf::from(value("--screenshot")?)),
             "--activate" => cli.activate = Some(PathBuf::from(value("--activate")?)),
+            "--open" => cli.open = Some(PathBuf::from(value("--open")?)),
+            "--open-url" => cli.open_url = Some(value("--open-url")?),
+            "--split" => {
+                let v = value("--split")?;
+                cli.split = Some(match v.as_str() {
+                    "none" => Split::None,
+                    "right" => Split::Right,
+                    "down" => Split::Down,
+                    _ => return Err(format!("invalid --split value: {v} (none, right or down)")),
+                });
+            }
             "--screenshot-after" => {
                 let v = value("--screenshot-after")?;
                 cli.screenshot_after = v
@@ -135,5 +158,25 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn open_flags() {
+        match p(&[
+            "--open",
+            "/s/a.jsonl",
+            "--split=down",
+            "--open-url",
+            "https://x",
+        ]) {
+            Ok(Parsed::Run(c)) => {
+                assert_eq!(c.open, Some(PathBuf::from("/s/a.jsonl")));
+                assert_eq!(c.split, Some(Split::Down));
+                assert_eq!(c.open_url.as_deref(), Some("https://x"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(p(&["--split", "up"]).is_err());
+        assert!(p(&["--open"]).is_err());
     }
 }

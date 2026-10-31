@@ -1,132 +1,96 @@
-//! App-side glue for git worktree sessions: the new-worktree and move dialogs, creating worktrees
-//! through the gateway (which runs omp and git), finishing (ask the agent, wait, remove once
-//! merged) and removing them, and the tab bookkeeping that follows a session moving into a
-//! worktree. Git, omp and the removal itself run in the gateway; this module decides which tabs
-//! are affected and shows the dialogs.
+//! App-side glue for git worktree sessions: the new-worktree and move dialogs, the confirmations,
+//! and the tab bookkeeping that follows a session moving into (or out of) a worktree. The flows
+//! themselves — creating, moving a session in, finishing, removing or parking, continuing a
+//! parked branch — run in the gateway (`Mutation::Worktree*`, `Topic::Worktrees`), so the phone
+//! drives the same logic; this module only asks, shows what the gateway reports and updates the
+//! tabs of this window.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use deck_core::config::{ParkedBranch, RemovedWorktree};
+use deck_core::config::ParkedBranch;
 use deck_core::sessions::{SessionEntry, abbreviate_home};
-use deck_core::worktree::{
-    self, BranchState, MergeTarget, Removal, Removed, TabCwd, Worktree, WorktreeStatus, blockers,
-    finish_prompt, park_blockers,
+use deck_core::worktree::{Removed, Worktree, WorktreeStatus};
+use deck_service::controller::{RequestKey, SessionTarget};
+use deck_service::gateway::protocol::{
+    Answer, ContinueIn, Done, Mutation, Progress, Query, Retirement, Split, Topic, TopicValue,
+    WorktreesView,
 };
-use deck_service::controller::{Command, CommandKind};
-use deck_service::gateway::protocol::{Answer, Done, Mutation, Query};
-use deck_service::statusfmt::Activity;
 
+use super::desktop::DesktopOpen;
 use super::{App, PendingConfirm};
 use crate::confirm::Confirm;
 use crate::tabs::TabRole;
 use crate::transfer;
-use crate::worktree_dialog::{Kind, Outcome, Plan, WorktreeDialog, brief};
-use crate::worktree_ui::{
-    self, ContinuePlan, FINISH_TAB_TIMEOUT, Finishing, ParkState, Relocating, RemovePlan, Step,
-    Then, Verdict,
-};
-
-/// How often the parked branches are looked at again (merged or deleted ones drop out).
-const PARK_CHECK: Duration = Duration::from_secs(10 * 60);
+use crate::worktree_dialog::{DestAsk, Kind, LocationRes, Outcome, Plan, WorktreeDialog, brief};
+use crate::worktree_ui::{self, ParkState};
 
 /// A move that was typed into a tab: the session reappears in the worktree omp creates.
 const MOVE_EXPIRES: Duration = Duration::from_secs(10 * 60);
 
-/// Why a worktree is being inspected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Purpose {
-    /// "Remove worktree…": refuse unless clean and merged, else ask.
-    Remove,
-    /// "Finish worktree": learn the merge target, then start waiting.
-    Start,
-    /// The agent's turn ended while finishing.
-    Check,
-}
+/// How long a continued session waits for its controller record before it is reported.
+const CONTINUE_WAIT: Duration = Duration::from_secs(10);
 
 struct PendingMove {
     uid: u64,
-    base: Option<String>,
     since: Instant,
 }
 
 pub(super) struct WtUi {
     pub(super) dialog: Option<WorktreeDialog>,
-    /// Worktrees (by folder) being finished.
-    pub(super) finishing: HashMap<PathBuf, Finishing>,
-    /// Removals waiting for their running sessions to move into the primary checkout.
-    relocating: HashMap<PathBuf, Relocating>,
     /// omp's `worktree.base` setting, once the settings catalog was read.
-    pub(super) base_setting: Option<String>,
     moves: Vec<PendingMove>,
-    /// Worktrees whose removal is running.
-    removing: HashSet<PathBuf>,
     /// Each tab's session file as of the last relocation check.
     seen: HashMap<u64, Option<PathBuf>>,
     /// Each tab's live folder as of the last relocation check.
     seen_cwd: HashMap<u64, Option<PathBuf>>,
-    /// Sessions of removed worktrees being moved into their primary (by a leftover pass or an open).
+    /// Sessions being moved into their primary by an open.
     in_flight: HashSet<PathBuf>,
     /// The last unresolved lookup per tab (file, scan generation): not repeated until the scan changes.
     tried: HashMap<u64, (PathBuf, u64)>,
-    /// The removed-worktree map was checked against the disk once.
-    pruned: bool,
-    /// Where each parked branch was last seen checked out.
+    /// What the gateway reports of each repository that has linked worktrees or parked branches
+    /// (by primary), with the topic revision it was read at.
+    views: HashMap<PathBuf, (u64, WorktreesView)>,
+    /// Worktrees (by folder) a finish flow runs on: the sidebar shows "Finishing…". The value is
+    /// whether this window started the job (and so can cancel it).
+    pub(super) finishing: HashMap<PathBuf, bool>,
+    /// Where each parked branch is checked out (as the gateway last looked).
     pub(super) park_states: Vec<ParkState>,
     /// Worktrees last seen clean and pushed but not merged: their remove action parks.
     pub(super) parkable: HashSet<PathBuf>,
-    /// The next parked-branch check (`None`: at startup, once the first scan is in).
-    park_next: Option<Instant>,
+    /// Finish jobs this window started (by worktree folder), for an instant cancel.
+    finish_jobs: HashMap<PathBuf, RequestKey>,
+    /// The last progress text shown per worktree: a repeat is not toasted again.
+    last_stage: HashMap<PathBuf, String>,
+    /// Worktrees whose removal or park this window asked for and has no answer to yet.
+    removing: HashSet<PathBuf>,
     /// Parked branches (primary, branch) with a continue in progress.
     continuing: HashSet<(PathBuf, String)>,
-}
-
-/// What a removed worktree's record leaves in the session list.
-struct Leftover {
-    worktree: PathBuf,
-    primary: PathBuf,
-    /// Sessions that are not running: moved into the primary.
-    files: Vec<PathBuf>,
-    /// Every session with the folder can be moved (none runs).
-    all_movable: bool,
-    /// No session has the folder anymore.
-    none: bool,
-}
-
-/// The folder a tab's omp runs in now (the gateway's record), else the one it was launched in.
-fn tab_dir(t: &crate::tabs::Tab) -> PathBuf {
-    t.info()
-        .and_then(|i| i.live_cwd.clone())
-        .unwrap_or_else(|| t.cwd.clone())
+    /// Continued sessions whose desktop tab waits for the controller record, since when.
+    continued: Vec<(SessionTarget, Instant)>,
 }
 
 impl WtUi {
     pub(super) fn new() -> WtUi {
         WtUi {
             dialog: None,
-            finishing: HashMap::new(),
-            relocating: HashMap::new(),
-            base_setting: None,
             moves: Vec::new(),
-            removing: HashSet::new(),
-            in_flight: HashSet::new(),
             seen: HashMap::new(),
             seen_cwd: HashMap::new(),
+            in_flight: HashSet::new(),
             tried: HashMap::new(),
-            pruned: false,
+            views: HashMap::new(),
+            finishing: HashMap::new(),
+            continued: Vec::new(),
             park_states: Vec::new(),
             parkable: HashSet::new(),
-            park_next: None,
+            finish_jobs: HashMap::new(),
+            last_stage: HashMap::new(),
+            removing: HashSet::new(),
             continuing: HashSet::new(),
         }
     }
-}
-
-fn unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
 }
 
 fn unix_secs() -> u64 {
@@ -135,11 +99,11 @@ fn unix_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The refusal of a switch in a dirty checkout, worded for the toast; `None` for other errors.
-fn dirty_reason(error: &str, dir: &Path) -> Option<String> {
-    error
-        .contains("uncommitted or untracked changes")
-        .then(|| format!("{} has uncommitted or untracked changes", dir.display()))
+/// The folder a tab's omp runs in now (the gateway's record), else the one it was launched in.
+fn tab_dir(t: &crate::tabs::Tab) -> PathBuf {
+    t.info()
+        .and_then(|i| i.live_cwd.clone())
+        .unwrap_or_else(|| t.cwd.clone())
 }
 
 /// The reply a query is expected to carry, or why not.
@@ -202,7 +166,7 @@ impl App {
         });
     }
 
-    /// Starts one dialog check: the gateway judges the branch name, a native worker the folder.
+    /// Starts one dialog check: the gateway judges the branch name and the destination folder.
     fn run_check(&mut self, req: crate::worktree_dialog::CheckReq) {
         let generation = req.generation;
         let branch = req.branch().to_owned();
@@ -224,21 +188,42 @@ impl App {
                     }
                 });
         }
-        self.gw.native(
-            move || req.locate(),
-            move |app, res| {
-                if let Some(d) = &mut app.wt.dialog {
-                    d.apply_location(generation, res);
+        match req.destination() {
+            DestAsk::Nothing => {
+                if let Some(d) = &mut self.wt.dialog {
+                    d.apply_location(generation, LocationRes::none());
                 }
-            },
-        );
+            }
+            DestAsk::Rejected(msg) => {
+                if let Some(d) = &mut self.wt.dialog {
+                    d.apply_location(generation, LocationRes::rejected(msg));
+                }
+            }
+            DestAsk::Gateway { dest, auto } => {
+                let query = Query::WorktreeDestination {
+                    repo: req.dir().to_path_buf(),
+                    branch: req.leaf().to_owned(),
+                    dest,
+                };
+                self.gw.query(query, move |app, r| {
+                    let verdict = unexpected(r, |a| match a {
+                        Answer::WorktreeDestination(v) => Some(v),
+                        _ => None,
+                    })
+                    .map_err(|e| brief(&e));
+                    if let Some(d) = &mut app.wt.dialog {
+                        d.apply_location(generation, LocationRes::answered(auto, verdict));
+                    }
+                });
+            }
+        }
     }
 
     pub(super) fn show_worktree_dialog(&mut self, ctx: &egui::Context) {
         let Some(dlg) = self.wt.dialog.as_mut() else {
             return;
         };
-        let req = dlg.take_check(self.wt.base_setting.as_deref(), self.home.as_deref());
+        let req = dlg.take_check(self.home.as_deref());
         if let Some(due) = dlg.check_due_in() {
             ctx.request_repaint_after(due);
         }
@@ -283,7 +268,6 @@ impl App {
                 repo,
                 branch,
                 base_ref,
-                record_base,
                 dest,
             } => {
                 if !self.omp_found() {
@@ -291,22 +275,31 @@ impl App {
                 }
                 self.toasts
                     .info(&self.ctx, format!("Creating worktree “{branch}”…"));
-                let created = dest.clone();
-                self.gw.mutate(
-                    Mutation::WorktreeCreate {
-                        repo,
-                        branch,
-                        base_ref,
-                        dest,
-                    },
-                    move |app, r| app.on_worktree_created(created, record_base, r.map(drop)),
-                );
+                // The gateway makes the worktree (at its managed default location when `dest` is
+                // `None`) and records the merge target; the tab opens here.
+                let op = Mutation::WorktreeNew {
+                    repo,
+                    branch,
+                    base_ref: Some(base_ref),
+                    dest,
+                    open: false,
+                };
+                self.gw.mutate(op, |app, r| match r {
+                    Ok(Done::Path(dest)) => {
+                        app.refresh_sessions();
+                        app.new_session(dest);
+                    }
+                    Ok(other) => app.toasts.error(
+                        &app.ctx,
+                        format!("Could not create the worktree: unexpected answer {other:?}"),
+                    ),
+                    Err(e) => app.toasts.error(&app.ctx, brief(&e)),
+                });
             }
             Plan::Move {
                 uid,
                 target,
                 branch,
-                base,
             } => {
                 let open = self
                     .tabs
@@ -318,159 +311,266 @@ impl App {
                     return;
                 }
                 // Bound to the session the dialog was opened on: if it moved on to another
-                // conversation meanwhile, the controller refuses and nothing is typed. The move
-                // is only tracked once the gateway accepted the command.
-                self.submit_command(&target, Command::WorktreeMove { branch }, move |app, _| {
-                    app.wt.moves.push(PendingMove {
+                // conversation meanwhile, the gateway refuses and nothing is typed. The move is
+                // only tracked once the gateway accepted the command.
+                let op = Mutation::WorktreeMoveSession { target, branch };
+                self.gw.mutate(op, move |app, r| match r {
+                    Ok(_) => app.wt.moves.push(PendingMove {
                         uid,
-                        base,
                         since: Instant::now(),
-                    });
+                    }),
+                    Err(e) => app.toasts.error(
+                        &app.ctx,
+                        format!("Could not move the session: {}", brief(&e)),
+                    ),
                 });
             }
         }
     }
 
-    fn on_worktree_created(
-        &mut self,
-        dest: PathBuf,
-        record_base: Option<String>,
-        result: Result<(), String>,
-    ) {
-        match result {
-            Ok(()) => {
-                if let Some(base) = record_base {
-                    self.cfg.worktree_bases.insert(dest.clone(), base);
+    // ------------------------------------------------------------ gateway state
+
+    /// Follows `Topic::Worktrees` of every repository that has linked worktrees or parked
+    /// branches in this window's lists, and derives what the sidebar shows from it. Also keeps the
+    /// tab bookkeeping of sessions that moved.
+    pub(super) fn drive_worktrees(&mut self) {
+        self.expire_moves();
+        self.track_relocations();
+        self.follow_worktrees();
+        self.open_queued_continues();
+    }
+
+    fn follow_worktrees(&mut self) {
+        let mut wanted: HashSet<PathBuf> = self
+            .cfg
+            .parked_branches
+            .iter()
+            .map(|r| r.primary.clone())
+            .collect();
+        if let Some(groups) = self.groups() {
+            wanted.extend(
+                groups
+                    .iter()
+                    .filter_map(|g| g.worktree.as_ref())
+                    .map(|w| w.primary.clone()),
+            );
+        }
+        let mut changed = false;
+        let gone: Vec<PathBuf> = self
+            .wt
+            .views
+            .keys()
+            .filter(|p| !wanted.contains(*p))
+            .cloned()
+            .collect();
+        for p in gone {
+            self.gw.unsubscribe(&Topic::Worktrees(p.clone()));
+            self.wt.views.remove(&p);
+            changed = true;
+        }
+        for primary in wanted {
+            let topic = Topic::Worktrees(primary.clone());
+            if !self.wt.views.contains_key(&primary) {
+                self.gw.subscribe(topic.clone());
+            }
+            let revision = self.gw.revision(&topic);
+            let known = self.wt.views.get(&primary).map(|(r, _)| *r);
+            if known == Some(revision) {
+                continue;
+            }
+            let Some(TopicValue::Worktrees(view)) = self.gw.topic(&topic) else {
+                continue;
+            };
+            self.wt.views.insert(primary, (revision, *view));
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        self.wt.finishing.clear();
+        self.wt.parkable.clear();
+        self.wt.park_states.clear();
+        for (_, view) in self.wt.views.values() {
+            for e in &view.linked {
+                if let Some(deck_service::gateway::protocol::WorktreeFlow::Finishing {
+                    job, ..
+                }) = &e.flow
+                {
+                    // Only a job this window sent can be cancelled from here: the gateway
+                    // refuses another client's job.
+                    let own = self.wt.finish_jobs.get(&e.worktree.path) == Some(job);
+                    self.wt.finishing.insert(e.worktree.path.clone(), own);
                 }
-                // A worktree made at the path of a removed one is a live worktree again.
-                self.cfg.removed_worktrees.remove(&dest);
-                self.dirty = true;
-                self.refresh_sessions();
-                self.new_session(dest);
+                if e.parkable {
+                    self.wt.parkable.insert(e.worktree.path.clone());
+                }
             }
-            Err(e) => self.toasts.error(
-                &self.ctx,
-                format!("Could not create the worktree: {}", brief(&e)),
-            ),
-        }
-    }
-
-    // ------------------------------------------------------------ inspection
-
-    /// Reads a worktree's state through the gateway: its merge target (`base`, else the recorded
-    /// or inferred one) and whether it is clean and merged.
-    fn inspect(&mut self, purpose: Purpose, wt: Worktree, base: Option<String>) {
-        let recorded = base.or_else(|| self.cfg.worktree_bases.get(&wt.path).cloned());
-        match recorded {
-            Some(base) => self.inspect_status(purpose, wt, base),
-            None => {
-                let asked = wt.clone();
-                self.gw.query(Query::InferBase(asked), move |app, r| {
-                    let inferred = unexpected(r, |a| match a {
-                        Answer::InferBase(b) => Some(b),
-                        _ => None,
+            for p in &view.parked {
+                if let Some(state) = &p.state {
+                    self.wt.park_states.push(ParkState {
+                        primary: p.record.primary.clone(),
+                        branch: p.record.branch.clone(),
+                        checked_out: state.checked_out.clone(),
                     });
-                    match inferred {
-                        Ok(Some(base)) => app.inspect_status(purpose, wt, base),
-                        Ok(None) => app.on_inspected(
-                            purpose,
-                            wt,
-                            Err(
-                                "OmpDeck does not know which branch it is meant to merge into"
-                                    .to_owned(),
-                            ),
-                        ),
-                        Err(e) => app.on_inspected(purpose, wt, Err(brief(&e))),
-                    }
-                });
+                }
             }
         }
+        self.ctx.request_repaint();
     }
 
-    fn inspect_status(&mut self, purpose: Purpose, wt: Worktree, base: String) {
-        let q = Query::WorktreeStatus {
+    /// The merge target the gateway knows for `wt`.
+    fn base_of(&self, wt: &Worktree) -> Option<String> {
+        self.wt
+            .views
+            .get(&wt.primary)?
+            .1
+            .linked
+            .iter()
+            .find(|e| e.worktree.path == wt.path)?
+            .base
+            .clone()
+    }
+
+    /// The finish job this window started on `path`: only its own jobs can be cancelled from
+    /// here (the gateway refuses another client's).
+    fn finish_job(&self, path: &Path) -> Option<RequestKey> {
+        self.wt.finish_jobs.get(path).cloned()
+    }
+
+    // ------------------------------------------------------------ finishing
+
+    pub(super) fn request_finish(&mut self, wt: Worktree) {
+        if self.wt.finishing.contains_key(&wt.path)
+            || self.wt.finish_jobs.contains_key(&wt.path)
+            || self.wt.removing.contains(&wt.path)
+        {
+            return;
+        }
+        let label = worktree_ui::worktree_label(&wt);
+        let into = self
+            .base_of(&wt)
+            .map(|b| format!(" into {b}"))
+            .unwrap_or_default();
+        self.toasts.info(
+            &self.ctx,
+            format!(
+                "Finishing “{label}”: the session is asked to commit and merge{into}; the worktree is removed once that is done"
+            ),
+        );
+        let path = wt.path.clone();
+        let progress_path = wt.path.clone();
+        let tracked = wt.path.clone();
+        let op = Mutation::WorktreeFinish {
             worktree: wt.clone(),
-            base: base.clone(),
         };
-        self.gw.query(q, move |app, r| {
-            let status = unexpected(r, |a| match a {
-                Answer::WorktreeStatus(s) => Some(s),
-                _ => None,
-            })
-            .map(|s| (base, s))
-            .map_err(|e| brief(&e));
-            app.on_inspected(purpose, wt, status);
+        let key = self.gw.mutate_with_progress(
+            op,
+            move |app, p: &Progress| {
+                if app.wt.last_stage.get(&progress_path) != Some(&p.stage) {
+                    app.wt
+                        .last_stage
+                        .insert(progress_path.clone(), p.stage.clone());
+                    app.toasts.info(&app.ctx, p.stage.clone());
+                }
+            },
+            move |app, r| {
+                app.wt.finish_jobs.remove(&path);
+                app.wt.last_stage.remove(&path);
+                match r {
+                    // Stopped by the user (toasted when asked) or by another client.
+                    Err(e) if e == "cancelled" => {}
+                    // The gateway words its refusals and failures for the user.
+                    Err(e) => app.toasts.error(&app.ctx, e),
+                    Ok(done) => app.on_retired(&wt, Ok(done)),
+                }
+            },
+        );
+        self.wt.finish_jobs.insert(tracked, key);
+    }
+
+    pub(super) fn cancel_finish(&mut self, path: &Path) {
+        let Some(job) = self.finish_job(path) else {
+            if self.wt.finishing.contains_key(path) {
+                self.toasts.info(
+                    &self.ctx,
+                    "Another device or window started this finish; stop it there",
+                );
+            }
+            return;
+        };
+        self.gw.cancel(job, |app, r| match r {
+            Ok(()) => app
+                .toasts
+                .info(&app.ctx, "Stopped waiting — the worktree stays"),
+            Err(e) => app.toasts.error(&app.ctx, e),
         });
     }
 
-    fn on_inspected(
+    // ------------------------------------------------------------ removing
+
+    /// "Remove worktree…": the gateway says whether it can be removed (clean and merged) or
+    /// parked (clean and pushed), else why not; the confirmation names what will happen.
+    pub(super) fn request_remove(&mut self, wt: Worktree) {
+        if self.wt.removing.contains(&wt.path) {
+            return;
+        }
+        let asked = wt.clone();
+        self.gw.query(Query::WorktreeVerdict(asked), move |app, r| {
+            let verdict = unexpected(r, |a| match a {
+                Answer::WorktreeVerdict(v) => Some(v),
+                _ => None,
+            });
+            match verdict {
+                Ok(v) => app.confirm_retire(wt, &v.base, &v.status, v.verdict),
+                Err(e) => {
+                    let label = worktree_ui::worktree_label(&wt);
+                    app.toasts
+                        .error(&app.ctx, format!("Worktree “{label}”: {}", brief(&e)));
+                }
+            }
+        });
+    }
+
+    fn confirm_retire(
         &mut self,
-        purpose: Purpose,
         wt: Worktree,
-        result: Result<(String, WorktreeStatus), String>,
+        base: &str,
+        status: &WorktreeStatus,
+        verdict: Retirement,
     ) {
         let label = worktree_ui::worktree_label(&wt);
-        match (purpose, result) {
-            (Purpose::Remove, Ok((base, st))) => {
-                let merged_blockers = blockers(&st, &base);
-                if merged_blockers.is_empty() {
-                    self.wt.parkable.remove(&wt.path);
-                    self.confirm = Some((
-                        Confirm {
-                            title: "Remove worktree?".to_owned(),
-                            body: format!(
-                                "{} is clean and merged into {base}.\n\nIts sessions move into {}. Tabs running in {} move there too once omp is idle and keep running; a tab still busy after 30 s is stopped. This deletes {}.",
-                                match &wt.branch {
-                                    Some(_) => format!("Branch “{label}”"),
-                                    None => format!("The detached worktree “{label}”"),
-                                },
-                                abbreviate_home(&wt.primary),
-                                wt.path.display(),
-                                if wt.branch.is_some() {
-                                    "the folder and the branch"
-                                } else {
-                                    "the folder"
-                                }
-                            ),
-                            confirm_label: "Remove".to_owned(),
-                            danger: true,
-                        },
-                        PendingConfirm::RemoveWorktree {
-                            wt,
-                            base,
-                            how: Removal::Merged {
-                                delete_branch: true,
+        match verdict {
+            Retirement::Blocked(why) => self.toasts.error(&self.ctx, why),
+            Retirement::Remove => {
+                self.confirm = Some((
+                    Confirm {
+                        title: "Remove worktree?".to_owned(),
+                        body: format!(
+                            "{} is clean and merged into {base}.\n\nIts sessions move into {}. Tabs running in {} move there too once omp is idle and keep running; a tab still busy after 30 s is stopped. This deletes {}.",
+                            match &wt.branch {
+                                Some(_) => format!("Branch “{label}”"),
+                                None => format!("The detached worktree “{label}”"),
                             },
-                        },
-                    ));
-                    return;
-                }
-                if st.merged {
-                    // Merged, but something else stops the removal (uncommitted work).
-                    self.toasts.error(
-                        &self.ctx,
-                        format!("Cannot remove “{label}”: {}", merged_blockers.join("; ")),
-                    );
-                    return;
-                }
-                let park = park_blockers(&st);
-                if !park.is_empty() {
-                    self.wt.parkable.remove(&wt.path);
-                    self.toasts.error(
-                        &self.ctx,
-                        format!(
-                            "Cannot remove “{label}”: {}. Commit and push the work to park it, or merge it first.",
-                            park.join("; ")
+                            abbreviate_home(&wt.primary),
+                            wt.path.display(),
+                            if wt.branch.is_some() {
+                                "the folder and the branch"
+                            } else {
+                                "the folder"
+                            }
                         ),
-                    );
-                    return;
-                }
+                        confirm_label: "Remove".to_owned(),
+                        danger: true,
+                    },
+                    PendingConfirm::RemoveWorktree { wt, park: false },
+                ));
+            }
+            Retirement::Park => {
                 let branch = wt.branch.clone().unwrap_or_default();
-                let upstream = st
+                let upstream = status
                     .upstream
                     .clone()
                     .unwrap_or_else(|| "its upstream".to_owned());
-                self.wt.parkable.insert(wt.path.clone());
                 self.confirm = Some((
                     Confirm {
                         title: "Park worktree?".to_owned(),
@@ -483,620 +583,67 @@ impl App {
                         confirm_label: "Park".to_owned(),
                         danger: false,
                     },
-                    PendingConfirm::RemoveWorktree {
-                        wt,
-                        base,
-                        how: Removal::Park,
-                    },
+                    PendingConfirm::RemoveWorktree { wt, park: true },
                 ));
             }
-            (Purpose::Start, Ok((base, _))) => self.begin_finishing(wt, base),
-            (Purpose::Check, Ok((base, st))) => {
-                let Some(f) = self.wt.finishing.get_mut(&wt.path) else {
-                    return;
-                };
-                match f.on_checked(&blockers(&st, &base)) {
-                    Verdict::Remove => self.execute_remove(
-                        wt,
-                        base,
-                        Removal::Merged {
-                            delete_branch: true,
-                        },
-                    ),
-                    Verdict::Wait { announce } => {
-                        if let Some(text) = announce {
-                            self.toasts.info(&self.ctx, text);
-                        }
-                    }
-                }
-            }
-            (Purpose::Check, Err(e)) => {
-                if let Some(text) = self
-                    .wt
-                    .finishing
-                    .get_mut(&wt.path)
-                    .and_then(|f| f.on_check_failed(&e))
-                {
-                    self.toasts.error(&self.ctx, text);
-                }
-            }
-            (_, Err(e)) => self
-                .toasts
-                .error(&self.ctx, format!("Worktree “{label}”: {e}")),
         }
     }
 
-    // ------------------------------------------------------------ finishing
-
-    pub(super) fn request_finish(&mut self, wt: Worktree) {
-        if self.wt.finishing.contains_key(&wt.path) || self.wt.removing.contains(&wt.path) {
-            return;
-        }
-        self.inspect(Purpose::Start, wt, None);
-    }
-
-    pub(super) fn cancel_finish(&mut self, path: &Path) {
-        if self.wt.finishing.remove(path).is_some() {
-            self.toasts
-                .info(&self.ctx, "Stopped waiting — the worktree stays");
-        }
-    }
-
-    pub(super) fn request_remove(&mut self, wt: Worktree) {
-        if self.wt.removing.contains(&wt.path) {
-            return;
-        }
-        self.inspect(Purpose::Remove, wt, None);
-    }
-
-    fn begin_finishing(&mut self, wt: Worktree, base: String) {
-        let uid = self.tab_in(&wt).map(|t| t.uid);
-        let session = self.newest_session_in(&wt).map(|e| e.path);
-        if uid.is_none() && session.is_none() {
-            self.toasts.error(
-                &self.ctx,
-                "This worktree has no session to ask — open a session in it first",
-            );
-            return;
-        }
-        let label = worktree_ui::worktree_label(&wt);
-        self.toasts.info(
-            &self.ctx,
-            format!(
-                "Finishing “{label}”: the session is asked to commit and merge into {base}; the worktree is removed once that is done"
-            ),
-        );
-        let (path, primary, target_base) = (wt.path.clone(), wt.primary.clone(), base.clone());
-        self.wt.finishing.insert(
-            wt.path.clone(),
-            Finishing::new(wt, base, uid, session, Instant::now()),
-        );
-        self.gw.query(
-            Query::MergeTarget {
-                primary,
-                base: target_base,
-            },
-            move |app, r| {
-                let found = unexpected(r, |a| match a {
-                    Answer::MergeTarget(t) => Some(t),
-                    _ => None,
-                });
-                app.on_merge_target(&path, found);
-            },
-        );
-        self.ctx.request_repaint();
-    }
-
-    fn on_merge_target(&mut self, path: &Path, result: Result<MergeTarget, String>) {
-        let Some(f) = self.wt.finishing.get_mut(path) else {
-            return;
-        };
-        match result {
-            Ok(t) => f.target = Some(t),
-            Err(e) => {
-                let label = worktree_ui::worktree_label(&f.worktree);
-                self.wt.finishing.remove(path);
-                self.toasts
-                    .error(&self.ctx, format!("Cannot finish “{label}”: {e}"));
-            }
-        }
-    }
-
-    /// The running session tab whose folder is inside the worktree.
-    fn tab_in(&self, wt: &Worktree) -> Option<&crate::tabs::Tab> {
-        self.tabs.iter().find(|t| {
-            t.role == TabRole::Session
-                && !t.terminal().is_exited()
-                && worktree_ui::inside(wt, &t.cwd)
-        })
-    }
-
-    fn newest_session_in(&self, wt: &Worktree) -> Option<SessionEntry> {
-        let groups = self.groups()?;
-        groups
-            .iter()
-            .filter(|g| g.worktree.as_ref().is_some_and(|w| w.path == wt.path))
-            .flat_map(|g| &g.sessions)
-            .max_by_key(|e| e.modified)
-            .cloned()
-    }
-
-    /// Advances every finishing worktree: opens its session when no tab runs it, types the finish
-    /// prompt once the composer is idle, checks the worktree after each agent turn.
-    pub(super) fn drive_worktrees(&mut self, ctx: &egui::Context) {
-        self.prune_removed_once();
-        self.expire_moves();
-        self.track_relocations();
-        self.check_parked(ctx);
-        if !self.wt.relocating.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(300));
-            self.drive_relocations();
-        }
-        if self.wt.finishing.is_empty() {
-            return;
-        }
-        ctx.request_repaint_after(Duration::from_millis(400));
-        let paths: Vec<PathBuf> = self.wt.finishing.keys().cloned().collect();
-        for path in paths {
-            self.drive_finish(&path);
-        }
-    }
-
-    fn drive_finish(&mut self, path: &Path) {
-        let Some(f) = self.wt.finishing.get(path) else {
-            return;
-        };
-        let wt = f.worktree.clone();
-        let (known_uid, started, injected) = (f.uid, f.started, f.injected());
-        // The prompt has to go in within the timeout, whatever state the tab is stuck in.
-        if !injected && started.elapsed() > FINISH_TAB_TIMEOUT {
-            self.wt.finishing.remove(path);
-            self.toasts.error(
-                &self.ctx,
-                format!(
-                    "Stopped finishing “{}”: its session was not ready for the prompt in time",
-                    worktree_ui::worktree_label(&wt)
-                ),
-            );
-            return;
-        }
-        // The tab: the remembered one, else any session tab inside the worktree.
-        let uid = known_uid
-            .filter(|u| {
-                self.tabs
-                    .iter()
-                    .any(|t| t.uid == *u && !t.terminal().is_exited())
-            })
-            .or_else(|| self.tab_in(&wt).map(|t| t.uid));
-        let Some(uid) = uid else {
-            if known_uid.is_some() || injected {
-                self.wt.finishing.remove(path);
-                self.toasts.info(
-                    &self.ctx,
-                    format!(
-                        "“{}” has no running session anymore — stopped waiting",
-                        worktree_ui::worktree_label(&wt)
-                    ),
-                );
-            } else {
-                self.resume_for_finish(path, &wt, started);
-            }
-            return;
-        };
-        let Some(f) = self.wt.finishing.get_mut(path) else {
-            return;
-        };
-        f.uid = Some(uid);
-        let Some((activity, busy, session)) = self.tabs.iter().find(|t| t.uid == uid).map(|t| {
-            (
-                t.activity(),
-                t.is_busy(),
-                // The tab was just found through its session file: its current target is the
-                // conversation the worktree belongs to.
-                t.target().clone(),
-            )
-        }) else {
-            return;
-        };
-        match f.observe(activity) {
-            Step::Nothing => {}
-            Step::Inject => {
-                let command = match f.target.clone() {
-                    Some(target) if !busy && f.may_inject(Instant::now()) => {
-                        Some(Command::WorktreeFinish {
-                            prompt: finish_prompt(wt.branch.as_deref(), &f.base, &wt.path, &target),
-                        })
-                    }
-                    _ => None,
-                };
-                if let Some(command) = command {
-                    // Until the gateway accepts the command it is only locally pending: the retry
-                    // pause keeps this frame loop from submitting it again meanwhile.
-                    f.injection_failed(Instant::now());
-                    let key = path.to_path_buf();
-                    self.submit_command(&session, command, move |app, _| {
-                        if let Some(f) = app.wt.finishing.get_mut(&key) {
-                            f.mark_injected();
-                        }
-                    });
-                }
-            }
-            Step::Recheck => {
-                let base = f.base.clone();
-                self.inspect(Purpose::Check, wt, Some(base));
-            }
-        }
-    }
-
-    /// No tab runs the worktree: resume its newest session (once), then wait for the tab.
-    fn resume_for_finish(&mut self, path: &Path, wt: &Worktree, started: Instant) {
-        if started.elapsed() > FINISH_TAB_TIMEOUT {
-            self.wt.finishing.remove(path);
-            self.toasts.error(
-                &self.ctx,
-                format!(
-                    "Could not open a session in “{}” to finish it",
-                    worktree_ui::worktree_label(wt)
-                ),
-            );
-            return;
-        }
-        let session = self
-            .wt
-            .finishing
-            .get_mut(path)
-            .and_then(|f| f.session.take());
-        if let Some(session) = session
-            && let Some(entry) = self.newest_session_in(wt).filter(|e| e.path == session)
-        {
-            // An exited tab still shows this session: opening would only focus it.
-            let exited = self.tabs.iter().position(|t| {
-                t.terminal().is_exited()
-                    && t.session_path()
-                        .is_some_and(|p| worktree_ui::same_session(p, &entry.path))
-            });
-            if let Some(i) = exited {
-                self.close_tab(i, false);
-            }
-            self.open_session(&entry);
-        }
-    }
-
-    /// The finish prompt of tab `uid` was definitively cancelled or declined: it was never (or no
-    /// longer will be) typed, so the wait for omp's turn would never end. The finish stops; the
-    /// prompt is not sent again on its own.
-    pub(super) fn finish_cancelled(&mut self, uid: u64) {
-        let paths: Vec<PathBuf> = self
-            .wt
-            .finishing
-            .iter()
-            .filter(|(_, f)| f.uid == Some(uid))
-            .map(|(p, _)| p.clone())
-            .collect();
-        for path in paths {
-            if let Some(f) = self.wt.finishing.remove(&path) {
-                self.toasts.info(
-                    &self.ctx,
-                    format!(
-                        "Stopped finishing “{}”: the finish prompt was not sent — the worktree stays",
-                        worktree_ui::worktree_label(&f.worktree)
-                    ),
-                );
-            }
-        }
-    }
-
-    /// The injector dropped (or never ran) a job of ours: whatever waited for it gives up.
-    pub(super) fn injection_lost(&mut self, uid: u64, kind: CommandKind) {
-        if kind == CommandKind::WorktreeFinish {
-            // omp was not ready (still starting, a dialog open, working): the prompt is offered
-            // again until the finish times out.
-            let now = Instant::now();
-            for f in self
-                .wt
-                .finishing
-                .values_mut()
-                .filter(|f| f.uid == Some(uid))
-            {
-                f.injection_failed(now);
-            }
-        } else if kind == CommandKind::WorktreeMove {
-            self.wt.moves.retain(|m| m.uid != uid);
-        } else if kind == CommandKind::MoveTo {
-            // The `/move` was not accepted by omp: offered again after a pause until the wait
-            // runs out, then the tab is stopped like before.
-            let now = Instant::now();
-            for r in self.wt.relocating.values_mut() {
-                r.paused(uid, now);
-            }
-        }
-    }
-
-    // ------------------------------------------------------------ removal
-
-    /// The running session tabs as the removal classifier sees them: the folder each was launched
-    /// in and the one its omp runs in now (the gateway's controller record).
-    fn tab_cwds(&self) -> Vec<TabCwd> {
-        self.tabs
-            .iter()
-            .filter(|t| t.role == TabRole::Session && !t.terminal().is_exited())
-            .map(|t| TabCwd {
-                uid: t.uid,
-                label: t.fallback_title.clone(),
-                stored: t.cwd.clone(),
-                live: t.info().and_then(|i| i.live_cwd.clone()),
-            })
-            .collect()
-    }
-
-    /// Moves the running sessions inside the worktree into its primary checkout (omp's `/move`,
-    /// the tabs keep running there), then stops the tabs that did not move and removes it. Git
-    /// itself re-checks that the worktree is clean and merged (or, parking, clean and pushed).
-    pub(super) fn execute_remove(&mut self, wt: Worktree, base: String, how: Removal) {
-        self.wt.finishing.remove(&wt.path);
+    /// The user confirmed: the gateway moves the running sessions into the primary checkout,
+    /// stops the rest, moves every session file and removes (or parks) the worktree.
+    pub(super) fn execute_remove(&mut self, wt: Worktree, park: bool) {
         if !self.wt.removing.insert(wt.path.clone()) {
             return;
         }
-        let moving: Vec<(u64, Option<PathBuf>)> = self
-            .tabs
-            .iter()
-            .filter(|t| {
-                t.role == TabRole::Session
-                    && !t.terminal().is_exited()
-                    && worktree_ui::inside(&wt, &tab_dir(t))
-            })
-            .map(|t| (t.uid, t.session_path_owned()))
-            .collect();
-        // Tabs that move out are recorded by id (their file changes under them); the gateway
-        // adds every session it relocated.
-        let groups = self.groups();
-        let sessions: Vec<String> = moving
-            .iter()
-            .filter_map(|(_, f)| f.as_deref())
-            .filter_map(|f| {
-                groups
-                    .as_deref()?
-                    .iter()
-                    .flat_map(|g| &g.sessions)
-                    .find(|e| worktree_ui::same_session(&e.path, f))
-                    .map(|e| e.id.clone())
-            })
-            .collect();
-        let plan = RemovePlan {
-            worktree: wt,
-            base,
-            how,
-            sessions,
-        };
-        if moving.is_empty() {
-            self.classify_removal(plan, Vec::new());
-            return;
+        let inside = self.tabs.iter().any(|t| {
+            t.role == TabRole::Session
+                && !t.terminal().is_exited()
+                && worktree_ui::inside(&wt, &tab_dir(t))
+        });
+        if inside {
+            self.toasts.info(
+                &self.ctx,
+                format!(
+                    "Moving the open sessions of “{}” into {} once omp is idle (a tab still busy after 30 s is stopped)…",
+                    worktree_ui::worktree_label(&wt),
+                    abbreviate_home(&wt.primary)
+                ),
+            );
         }
-        self.toasts.info(
-            &self.ctx,
-            format!(
-                "Moving the open sessions of “{}” into {} once omp is idle (a tab still busy after 30 s is stopped)…",
-                worktree_ui::worktree_label(&plan.worktree),
-                abbreviate_home(&plan.worktree.primary)
-            ),
-        );
-        let r = Relocating::new(Then::Remove(plan), moving, Instant::now());
-        self.wt.relocating.insert(r.key().to_path_buf(), r);
-        self.ctx.request_repaint();
+        let op = Mutation::WorktreeRetire {
+            worktree: wt.clone(),
+            park,
+        };
+        self.gw.mutate(op, move |app, r| {
+            app.wt.removing.remove(&wt.path);
+            app.on_retired(&wt, r);
+        });
     }
 
-    /// Advances every move that waits for running sessions: types `/move` into idle ones,
-    /// notices tabs that arrived (or went away), and carries on once all did or the wait ran out.
-    fn drive_relocations(&mut self) {
-        let paths: Vec<PathBuf> = self.wt.relocating.keys().cloned().collect();
-        for path in paths {
-            let Some(r) = self.wt.relocating.get(&path) else {
-                continue;
-            };
-            let (dest, pending) = (r.dest().to_path_buf(), r.pending());
-            let groups = self.groups();
-            let mut left: Vec<(u64, Option<PathBuf>)> = Vec::new();
-            let mut gone = Vec::new();
-            let mut send = Vec::new();
-            for uid in pending {
-                match self.tabs.iter().find(|t| t.uid == uid) {
-                    None => gone.push(uid),
-                    Some(t) if t.terminal().is_exited() => gone.push(uid),
-                    Some(t) => {
-                        let file_changed = matches!(
-                            (r.file_of(uid), t.session_path()),
-                            (Some(before), Some(now)) if before != now
-                        );
-                        let scanned = t.session_path().and_then(|p| {
-                            groups.as_deref()?.iter().find_map(|g| {
-                                g.sessions
-                                    .iter()
-                                    .find(|e| worktree_ui::same_session(&e.path, p))
-                            })
-                        });
-                        if file_changed
-                            || r.arrived(
-                                t.info().and_then(|i| i.live_cwd.as_deref()),
-                                &t.cwd,
-                                scanned.map(|e| e.cwd.as_path()),
-                            )
-                        {
-                            left.push((uid, scanned.map(|e| e.path.clone())));
-                        } else if t.activity() == Activity::Idle
-                            && !t.is_busy()
-                            && r.may_send(uid, Instant::now())
-                        {
-                            send.push((uid, t.target().clone()));
-                        }
-                    }
-                }
-            }
-            let Some(r) = self.wt.relocating.get_mut(&path) else {
-                continue;
-            };
-            for uid in gone {
-                r.gone(uid);
-            }
-            for (uid, _) in &left {
-                r.left(*uid);
-            }
-            // The tab's recorded file may still be the one from before the move: point it (and
-            // the gateway) at the file the scan lists now.
-            for (uid, new) in &left {
-                if let Some(new) = new {
-                    self.fix_tab_path(*uid, new);
-                }
-            }
-            // A tab that moved now runs in the destination: that is its folder from here on
-            // (restored tabs relaunch there).
-            for t in self
-                .tabs
-                .iter_mut()
-                .filter(|t| left.iter().any(|(u, _)| *u == t.uid))
-            {
-                if t.cwd != dest {
-                    t.cwd = dest.clone();
-                    self.dirty = true;
-                }
-            }
-            let Some(r) = self.wt.relocating.get_mut(&path) else {
-                continue;
-            };
-            for (uid, _) in &send {
-                r.paused(*uid, Instant::now());
-            }
-            let finished = r.finished(Instant::now());
-            for (uid, target) in send {
-                let key = path.clone();
-                self.submit_command(
-                    &target,
-                    Command::MoveTo { dest: dest.clone() },
-                    move |app, _| {
-                        if let Some(r) = app.wt.relocating.get_mut(&key) {
-                            r.accepted(uid);
-                        }
-                    },
+    /// The gateway removed or parked `wt` (a retire, or a finish that reached the removal).
+    fn on_retired(&mut self, wt: &Worktree, result: Result<Done, String>) {
+        let label = worktree_ui::worktree_label(wt);
+        let (removed, moved, parked): (Removed, u32, bool) = match result {
+            Ok(Done::Retired {
+                removed,
+                moved,
+                parked,
+                ..
+            }) => (removed, moved, parked),
+            Ok(other) => {
+                self.toasts.error(
+                    &self.ctx,
+                    format!("Could not remove “{label}”: unexpected answer {other:?}"),
                 );
-            }
-            if finished && let Some(r) = self.wt.relocating.remove(&path) {
-                let moved = r.moved_uids().to_vec();
-                let stayed = r.pending().len();
-                match r.then {
-                    Then::Remove(plan) => self.classify_removal(plan, moved),
-                    Then::Continue(plan) => self.finish_continue(plan, &moved, stayed),
-                }
-            }
-        }
-    }
-
-    /// Records `new` as tab `uid`'s session file (here and in the gateway) when it differs.
-    fn fix_tab_path(&mut self, uid: u64, new: &Path) {
-        let Some(t) = self.tabs.iter_mut().find(|t| t.uid == uid) else {
-            return;
-        };
-        if t.session_path() == Some(new) {
-            return;
-        }
-        t.hint_session_path(Some(new.to_path_buf()));
-        let target = t.target().clone();
-        self.gw.mutate(
-            Mutation::SetSessionPath {
-                target,
-                path: Some(new.to_path_buf()),
-            },
-            |_, result| {
-                if let Err(e) = result {
-                    log::debug!("setting the session file failed: {e}");
-                }
-            },
-        );
-        self.dirty = true;
-    }
-
-    /// Stops only the tabs still inside the worktree, then removes it. Which tabs those are is
-    /// decided off the UI thread from each tab's live folder (see [`worktree::classify`]); the
-    /// gateway stops them, checks again that no other session still runs in the folder, moves
-    /// every session file of the worktree into the primary and removes the folder. `moved` are
-    /// the tabs that already left through `/move`: never stopped, even while their live folder
-    /// still reads as the worktree.
-    fn classify_removal(&mut self, plan: RemovePlan, moved: Vec<u64>) {
-        let mut tabs = self.tab_cwds();
-        tabs.retain(|t| !moved.contains(&t.uid));
-        let asked = plan.worktree.clone();
-        self.gw.native(
-            move || worktree::classify(&asked, &tabs),
-            move |app, result| app.on_classified(plan, moved, result),
-        );
-    }
-
-    fn on_classified(
-        &mut self,
-        plan: RemovePlan,
-        moved: Vec<u64>,
-        result: Result<Vec<u64>, String>,
-    ) {
-        let stop: Vec<u64> = match result {
-            Ok(stop) => stop.into_iter().filter(|u| !moved.contains(u)).collect(),
-            Err(e) => {
-                self.wt.removing.remove(&plan.worktree.path);
-                let label = worktree_ui::worktree_label(&plan.worktree);
-                self.toasts
-                    .error(&self.ctx, format!("Cannot remove “{label}”: {e}"));
                 return;
             }
-        };
-        let targets_of = |app: &App, uids: &[u64]| -> Vec<_> {
-            app.tabs
-                .iter()
-                .filter(|t| uids.contains(&t.uid))
-                .map(|t| t.target().clone())
-                .collect()
-        };
-        let targets = targets_of(self, &stop);
-        let moved_targets = targets_of(self, &moved);
-        for i in (0..self.tabs.len()).rev() {
-            if matches!(self.tabs.get(i), Some(t) if stop.contains(&t.uid)) {
-                self.close_tab(i, false);
-            }
-        }
-        let count = moved_targets.len();
-        self.gw.mutate(
-            Mutation::WorktreeRemove {
-                worktree: plan.worktree.clone(),
-                base: plan.base.clone(),
-                how: plan.how,
-                stop: targets,
-                moved: moved_targets,
-            },
-            move |app, r| {
-                let result = r.and_then(|d| match d {
-                    Done::Removed { removed, sessions } => Ok((removed, sessions)),
-                    _ => Err("the gateway answered with something else".to_owned()),
-                });
-                app.on_removed(plan, result, count);
-            },
-        );
-    }
-
-    fn on_removed(
-        &mut self,
-        plan: RemovePlan,
-        result: Result<(Removed, Vec<String>), String>,
-        moved: usize,
-    ) {
-        let wt = plan.worktree;
-        self.wt.removing.remove(&wt.path);
-        let label = worktree_ui::worktree_label(&wt);
-        let (removed, relocated) = match result {
-            Ok(r) => r,
+            // The gateway words its failures for the user ("Could not remove “x”: …").
             Err(e) => {
-                self.toasts
-                    .error(&self.ctx, format!("Could not remove “{label}”: {e}"));
+                self.toasts.error(&self.ctx, e);
                 self.refresh_sessions();
                 return;
             }
         };
-        let parked = plan.how == Removal::Park;
         let mut text = if parked {
             format!(
                 "Parked “{label}”: the folder is removed, the branch is kept (OmpDeck never deletes it)"
@@ -1120,34 +667,22 @@ impl App {
         } else {
             self.toasts.success(&self.ctx, text);
         }
-        self.wt.parkable.remove(&wt.path);
-        if parked && let Some(branch) = wt.branch.clone() {
-            self.record_parked(ParkedBranch {
-                primary: wt.primary.clone(),
-                branch,
-                base: plan.base.clone(),
-                sessions: {
-                    let mut ids = relocated;
-                    for id in plan.sessions {
-                        if !ids.contains(&id) {
-                            ids.push(id);
-                        }
-                    }
-                    ids
-                },
-                parked_ms: unix_millis(),
-            });
+        // Tabs of this window: the ones that kept running now live in the primary checkout; the
+        // ones the gateway stopped are closed.
+        for i in (0..self.tabs.len()).rev() {
+            let Some(t) = self.tabs.get(i) else {
+                continue;
+            };
+            if t.role != TabRole::Session || !worktree_ui::inside(wt, &tab_dir(t)) {
+                continue;
+            }
+            if t.terminal().is_exited() {
+                self.close_tab(i, false);
+            } else if let Some(t) = self.tabs.get_mut(i) {
+                t.cwd.clone_from(&wt.primary);
+                self.dirty = true;
+            }
         }
-        self.cfg.removed_worktrees.insert(
-            wt.path.clone(),
-            RemovedWorktree {
-                primary: wt.primary.clone(),
-                branch: wt.branch.clone(),
-            },
-        );
-        self.cfg.worktree_bases.remove(&wt.path);
-        self.cfg.folder_tabs.remove(&wt.path);
-        self.cfg.recent_folders.retain(|p| *p != wt.path);
         if self
             .scope
             .as_deref()
@@ -1155,7 +690,6 @@ impl App {
         {
             self.set_scope(None);
         }
-        self.dirty = true;
         self.refresh_sessions();
         if self.cfg.project_sync.iter().any(|r| r.path == wt.path) && self.confirm.is_none() {
             self.confirm = Some((
@@ -1168,7 +702,9 @@ impl App {
                     confirm_label: "Remove from list".to_owned(),
                     danger: false,
                 },
-                PendingConfirm::DropSyncRow { path: wt.path },
+                PendingConfirm::DropSyncRow {
+                    path: wt.path.clone(),
+                },
             ));
         }
     }
@@ -1183,467 +719,34 @@ impl App {
             .cloned()
     }
 
-    /// Remembers a parked branch (replacing the record of the same branch; its sessions merge).
-    fn record_parked(&mut self, mut rec: ParkedBranch) {
-        if let Some(old) = self
-            .cfg
-            .parked_branches
-            .iter()
-            .position(|r| r.primary == rec.primary && r.branch == rec.branch)
-        {
-            let old = self.cfg.parked_branches.remove(old);
-            for id in old.sessions {
-                if !rec.sessions.contains(&id) {
-                    rec.sessions.push(id);
-                }
-            }
-        }
-        self.set_park_state(&rec.primary, &rec.branch, None);
-        self.cfg.parked_branches.push(rec);
-        self.dirty = true;
-    }
-
-    fn drop_parked(&mut self, primary: &Path, branch: &str) {
-        self.cfg
-            .parked_branches
-            .retain(|r| !(r.primary == primary && r.branch == branch));
-        self.wt
-            .park_states
-            .retain(|s| !(s.primary == primary && s.branch == branch));
-        self.dirty = true;
-    }
-
-    fn set_park_state(&mut self, primary: &Path, branch: &str, checked_out: Option<PathBuf>) {
-        match self
-            .wt
-            .park_states
-            .iter_mut()
-            .find(|s| s.primary == primary && s.branch == branch)
-        {
-            Some(s) => s.checked_out = checked_out,
-            None => self.wt.park_states.push(ParkState {
-                primary: primary.to_path_buf(),
-                branch: branch.to_owned(),
-                checked_out,
-            }),
-        }
-    }
-
-    fn query_branch(
-        &mut self,
-        rec: &ParkedBranch,
-        then: impl FnOnce(&mut App, Result<BranchState, String>) + 'static,
-    ) {
-        let q = Query::BranchState {
-            primary: rec.primary.clone(),
-            branch: rec.branch.clone(),
-            base: rec.base.clone(),
-        };
-        self.gw.query(q, move |app, r| {
-            let state = unexpected(r, |a| match a {
-                Answer::BranchState(s) => Some(s),
-                _ => None,
-            })
-            .map_err(|e| brief(&e));
-            then(app, state);
-        });
-    }
-
-    /// Startup and every ten minutes: looks at each parked branch through the gateway. A record
-    /// goes when its branch no longer exists, or is merged and checked out nowhere. Branches are
-    /// never deleted here.
-    fn check_parked(&mut self, ctx: &egui::Context) {
-        if self.cfg.parked_branches.is_empty() {
-            self.wt.park_next = None;
-            self.wt.park_states.clear();
-            return;
-        }
-        let now = Instant::now();
-        match self.wt.park_next {
-            Some(at) if now < at => {
-                ctx.request_repaint_after(at - now);
-                return;
-            }
-            _ => {}
-        }
-        if self.groups().is_none() {
-            return;
-        }
-        self.wt.park_next = Some(now + PARK_CHECK);
-        ctx.request_repaint_after(PARK_CHECK);
-        for rec in self.cfg.parked_branches.clone() {
-            let asked = rec.clone();
-            self.query_branch(&asked, move |app, state| app.on_park_checked(&rec, state));
-        }
-    }
-
-    fn on_park_checked(&mut self, rec: &ParkedBranch, state: Result<BranchState, String>) {
-        let st = match state {
-            Ok(st) => st,
-            Err(e) => {
-                log::debug!("parked branch {}: {e}", rec.branch);
-                // The gateway may not be up yet: look again soon.
-                self.wt.park_next = Some(Instant::now() + Duration::from_secs(30));
-                return;
-            }
-        };
-        if !st.exists || (st.merged && st.checked_out.is_none()) {
-            self.drop_parked(&rec.primary, &rec.branch);
-        } else {
-            self.set_park_state(&rec.primary, &rec.branch, st.checked_out);
-        }
-    }
-
-    /// "Continue in worktree": a worktree on the parked branch at its default location, the
-    /// branch's sessions move into it, then the clicked one opens.
+    /// "Continue in worktree": the gateway makes a worktree on the parked branch at its default
+    /// location, moves the branch's sessions into it and opens the clicked one.
     pub(super) fn continue_in_worktree(&mut self, entry: SessionEntry) {
-        let Some(rec) = self.parked_of(&entry) else {
-            self.toasts
-                .error(&self.ctx, "This session is not parked anymore");
-            return;
-        };
-        if !self.omp_found()
-            || !self
-                .wt
-                .continuing
-                .insert((rec.primary.clone(), rec.branch.clone()))
-        {
+        if !self.omp_found() {
             return;
         }
-        let asked = rec.clone();
-        self.query_branch(&asked, move |app, state| {
-            let key = (rec.primary.clone(), rec.branch.clone());
-            match app.vet_branch(&rec, state) {
-                Some(()) => app.locate_continue(entry, rec),
-                None => {
-                    app.wt.continuing.remove(&key);
-                }
-            }
-        });
+        self.continue_parked(&entry, ContinueIn::Worktree, true);
     }
 
-    /// The branch must exist and be checked out nowhere to get its own worktree. Notes the
-    /// answer; explains a refusal.
-    fn vet_branch(&mut self, rec: &ParkedBranch, state: Result<BranchState, String>) -> Option<()> {
-        let st = match state {
-            Ok(st) => st,
-            Err(e) => {
-                self.toasts.error(
-                    &self.ctx,
-                    format!("Cannot look at branch {}: {e}", rec.branch),
-                );
-                return None;
-            }
-        };
-        if !st.exists {
-            self.drop_parked(&rec.primary, &rec.branch);
-            self.toasts.error(
-                &self.ctx,
-                format!(
-                    "Branch {} no longer exists — it is not parked anymore",
-                    rec.branch
-                ),
-            );
-            return None;
-        }
-        self.set_park_state(&rec.primary, &rec.branch, st.checked_out.clone());
-        if let Some(at) = st.checked_out {
-            self.toasts.error(
-                &self.ctx,
-                format!(
-                    "Branch {} is checked out in {}",
-                    rec.branch,
-                    if at == rec.primary {
-                        "the main checkout".to_owned()
-                    } else {
-                        abbreviate_home(&at)
-                    }
-                ),
-            );
-            return None;
-        }
-        Some(())
-    }
-
-    fn locate_continue(&mut self, entry: SessionEntry, rec: ParkedBranch) {
-        let (setting, primary, branch) = (
-            self.wt.base_setting.clone(),
-            rec.primary.clone(),
-            rec.branch.clone(),
-        );
-        self.gw.native(
-            move || {
-                let dest = worktree::default_location(
-                    &worktree::managed_base(setting.as_deref()),
-                    &primary,
-                    &branch,
-                );
-                crate::worktree_dialog::check_destination(&dest).map(|()| dest)
-            },
-            move |app, located| match located {
-                Ok(dest) => app.add_existing(entry, rec, dest),
-                Err(e) => {
-                    app.wt
-                        .continuing
-                        .remove(&(rec.primary.clone(), rec.branch.clone()));
-                    app.toasts.error(
-                        &app.ctx,
-                        format!("Cannot create a worktree for {}: {}", rec.branch, brief(&e)),
-                    );
-                }
-            },
-        );
-    }
-
-    fn add_existing(&mut self, entry: SessionEntry, rec: ParkedBranch, dest: PathBuf) {
-        self.toasts.info(
-            &self.ctx,
-            format!("Creating a worktree on “{}”…", rec.branch),
-        );
-        let asked = Mutation::WorktreeAddExisting {
-            repo: rec.primary.clone(),
-            branch: rec.branch.clone(),
-            dest: dest.clone(),
-        };
-        self.gw.mutate(asked, move |app, r| {
-            app.wt
-                .continuing
-                .remove(&(rec.primary.clone(), rec.branch.clone()));
-            match r {
-                Ok(_) => app.on_worktree_added(entry, rec, dest),
-                Err(e) => app.toasts.error(
-                    &app.ctx,
-                    format!("Could not create the worktree: {}", brief(&e)),
-                ),
-            }
-        });
-    }
-
-    /// The worktree exists: the branch is no longer parked, its open sessions move in (`/move`),
-    /// its closed ones are relocated headlessly, and the clicked session is opened or focused.
-    fn on_worktree_added(&mut self, entry: SessionEntry, rec: ParkedBranch, dest: PathBuf) {
-        self.cfg
-            .worktree_bases
-            .insert(dest.clone(), rec.base.clone());
-        self.cfg.removed_worktrees.remove(&dest);
-        self.drop_parked(&rec.primary, &rec.branch);
-        let members: Vec<(String, PathBuf)> = self
-            .groups()
-            .map(|gs| {
-                gs.iter()
-                    .flat_map(|g| &g.sessions)
-                    .filter(|e| rec.sessions.contains(&e.id))
-                    .map(|e| (e.id.clone(), e.path.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // A closed tab still showing a session would keep a path that is about to move.
-        for i in (0..self.tabs.len()).rev() {
-            let stale = self.tabs.get(i).is_some_and(|t| {
-                t.terminal().is_exited()
-                    && t.session_path().is_some_and(|p| {
-                        members.iter().any(|(_, m)| worktree_ui::same_session(m, p))
-                    })
-            });
-            if stale {
-                self.close_tab(i, false);
-            }
-        }
-        let tab_of = |app: &App, path: &Path| {
-            app.tabs
-                .iter()
-                .find(|t| {
-                    !t.terminal().is_exited()
-                        && t.session_path()
-                            .is_some_and(|p| worktree_ui::same_session(p, path))
-                })
-                .map(|t| t.uid)
-        };
-        let moving: Vec<(u64, Option<PathBuf>)> = self
-            .tabs
-            .iter()
-            .filter(|t| {
-                t.role == TabRole::Session
-                    && !t.terminal().is_exited()
-                    && t.session_path().is_some_and(|p| {
-                        members.iter().any(|(_, m)| worktree_ui::same_session(m, p))
-                    })
-            })
-            .map(|t| (t.uid, t.session_path_owned()))
-            .collect();
-        let focus = tab_of(self, &entry.path);
-        let snap = self.running_snapshot();
-        let files: Vec<PathBuf> = members
-            .iter()
-            .filter(|(id, path)| !snap.is_running(id, path) && tab_of(self, path).is_none())
-            .map(|(_, path)| path.clone())
-            .collect();
-        let clicked_closed = files.contains(&entry.path);
-        if !files.is_empty() {
-            self.relocate_closed(files, dest.clone(), clicked_closed.then(|| entry.clone()));
-        } else if focus.is_none() {
-            // Running elsewhere (no tab): attach as it is.
-            self.open_session(&entry);
-        }
-        if moving.is_empty() {
-            self.toasts.success(
-                &self.ctx,
-                format!("Continuing “{}” in {}", rec.branch, abbreviate_home(&dest)),
-            );
-        } else {
-            self.toasts.info(
-                &self.ctx,
-                format!(
-                    "Moving the open sessions of “{}” into {} once omp is idle (a tab still busy after 30 s stays where it is)…",
-                    rec.branch,
-                    abbreviate_home(&dest)
-                ),
-            );
-            let plan = ContinuePlan {
-                record: rec,
-                dest,
-                focus,
-            };
-            let r = Relocating::new(Then::Continue(plan), moving, Instant::now());
-            self.wt.relocating.insert(r.key().to_path_buf(), r);
-        }
-        self.dirty = true;
-        self.refresh_sessions();
-        self.ctx.request_repaint();
-    }
-
-    /// Moves closed sessions into `dest`; `open` (the clicked one, when closed) opens there.
-    fn relocate_closed(&mut self, files: Vec<PathBuf>, dest: PathBuf, open: Option<SessionEntry>) {
-        let batch: Vec<PathBuf> = files
-            .iter()
-            .filter(|f| self.wt.in_flight.insert((*f).clone()))
-            .cloned()
-            .collect();
-        if batch.is_empty() {
-            return;
-        }
-        let done = batch.clone();
-        self.gw.mutate(
-            Mutation::RelocateSessions {
-                files: batch,
-                dest: dest.clone(),
-            },
-            move |app, r| {
-                for f in &done {
-                    app.wt.in_flight.remove(f);
-                }
-                let results = match r {
-                    Ok(Done::Relocated(results)) => results,
-                    Ok(_) => Vec::new(),
-                    Err(e) => {
-                        app.toasts.error(
-                            &app.ctx,
-                            format!("Could not move the parked sessions: {}", brief(&e)),
-                        );
-                        if let Some(entry) = open {
-                            app.open_session(&entry);
-                        }
-                        return;
-                    }
-                };
-                if let Some(why) = results.iter().find_map(|(_, r)| r.as_ref().err()) {
-                    app.toasts.error(
-                        &app.ctx,
-                        format!("Could not move a parked session: {}", brief(why)),
-                    );
-                }
-                app.refresh_sessions();
-                if let Some(entry) = open {
-                    let moved = results
-                        .into_iter()
-                        .find(|(old, _)| *old == entry.path)
-                        .and_then(|(_, r)| r.ok());
-                    match moved {
-                        Some(new_path) => app.open_entry_at(&entry, new_path, dest),
-                        None => app.open_session(&entry),
-                    }
-                }
-            },
-        );
-    }
-
-    /// The tabs of a continued branch moved (or the wait ran out): focus the clicked one.
-    fn finish_continue(&mut self, plan: ContinuePlan, moved: &[u64], stayed: usize) {
-        if stayed > 0 {
-            self.toasts.info(
-                &self.ctx,
-                format!(
-                    "{stayed} tab{} of “{}” did not move: still busy or not accepting /move",
-                    if stayed == 1 { "" } else { "s" },
-                    plan.record.branch
-                ),
-            );
-        } else {
-            self.toasts.success(
-                &self.ctx,
-                format!(
-                    "Continuing “{}” in {}",
-                    plan.record.branch,
-                    abbreviate_home(&plan.dest)
-                ),
-            );
-        }
-        if let Some(uid) = plan.focus.filter(|u| moved.contains(u))
-            && let Some(i) = self.tabs.iter().position(|t| t.uid == uid)
-        {
-            self.activate(i);
-        }
-        self.refresh_sessions();
-    }
-
-    /// "Continue in main checkout": the branch is checked out in the main checkout after a
-    /// confirmation that names the sessions running there.
+    /// "Continue in main checkout": after a confirmation that names the sessions running there
+    /// the gateway checks the branch out in the main checkout and the session opens.
     pub(super) fn continue_in_main(&mut self, entry: SessionEntry) {
         let Some(rec) = self.parked_of(&entry) else {
             self.toasts
                 .error(&self.ctx, "This session is not parked anymore");
             return;
         };
-        let asked = rec.clone();
-        self.query_branch(&asked, move |app, state| {
-            let st = match state {
-                Ok(st) => st,
-                Err(e) => {
-                    app.toasts.error(
-                        &app.ctx,
-                        format!("Cannot look at branch {}: {e}", rec.branch),
-                    );
-                    return;
-                }
-            };
-            if !st.exists {
-                app.drop_parked(&rec.primary, &rec.branch);
-                app.toasts.error(
-                    &app.ctx,
-                    format!(
-                        "Branch {} no longer exists — it is not parked anymore",
-                        rec.branch
-                    ),
-                );
-                return;
-            }
-            app.set_park_state(&rec.primary, &rec.branch, st.checked_out.clone());
-            match st.checked_out {
-                Some(at) if at == rec.primary => app.open_session(&entry),
-                Some(at) => app.toasts.error(
-                    &app.ctx,
-                    format!(
-                        "Branch {} is checked out in {}",
-                        rec.branch,
-                        abbreviate_home(&at)
-                    ),
-                ),
-                None => {
-                    let target = rec.branch.clone();
-                    app.confirm_switch(entry, rec.primary, target, true);
-                }
-            }
-        });
+        let state = self
+            .wt
+            .park_states
+            .iter()
+            .find(|s| s.primary == rec.primary && s.branch == rec.branch)
+            .and_then(|s| s.checked_out.clone());
+        match state {
+            // Already there: nothing to switch, the gateway just opens the session.
+            Some(at) if at == rec.primary => self.continue_parked(&entry, ContinueIn::Main, true),
+            _ => self.confirm_switch(entry, rec.primary, rec.branch, true),
+        }
     }
 
     /// "Switch main checkout back to <base>": the parked branch stays; nothing opens.
@@ -1654,6 +757,112 @@ impl App {
             return;
         };
         self.confirm_switch(entry, rec.primary, rec.base, false);
+    }
+
+    /// Sends the gateway's continue flow for the branch `entry` was parked on.
+    fn continue_parked(&mut self, entry: &SessionEntry, place: ContinueIn, open: bool) {
+        let Some(rec) = self.parked_of(entry) else {
+            self.toasts
+                .error(&self.ctx, "This session is not parked anymore");
+            return;
+        };
+        let key = (rec.primary.clone(), rec.branch.clone());
+        if !self.wt.continuing.insert(key.clone()) {
+            return;
+        }
+        let branch = rec.branch.clone();
+        let op = Mutation::WorktreeContinue {
+            primary: rec.primary,
+            branch: rec.branch,
+            session: Some(entry.id.clone()),
+            place,
+        };
+        self.gw.mutate_with_progress(
+            op,
+            |app, p: &Progress| app.toasts.info(&app.ctx, p.stage.clone()),
+            move |app, r| {
+                app.wt.continuing.remove(&key);
+                app.refresh_sessions();
+                match r {
+                    Ok(Done::Session(target)) if open => {
+                        let text = match place {
+                            ContinueIn::Main => format!("The main checkout is on {branch} now"),
+                            _ => format!("Continuing “{branch}”"),
+                        };
+                        app.toasts.success(&app.ctx, text);
+                        app.show_continued(&target);
+                    }
+                    Ok(Done::Unit) if place == ContinueIn::SwitchBack => app.toasts.success(
+                        &app.ctx,
+                        "The main checkout is back on its base branch".to_owned(),
+                    ),
+                    Ok(Done::Path(dest)) => app.toasts.success(
+                        &app.ctx,
+                        format!("Continuing “{branch}” in {}", abbreviate_home(&dest)),
+                    ),
+                    Ok(_) => app
+                        .toasts
+                        .success(&app.ctx, format!("Continued “{branch}”")),
+                    Err(e) => app.toasts.error(&app.ctx, brief(&e)),
+                }
+            },
+        );
+    }
+
+    /// The session the gateway opened for a continued branch: its tab takes focus, or opens.
+    fn show_continued(&mut self, target: &SessionTarget) {
+        if !self.open_continued(target) {
+            // `Done::Session` can beat the controller cache: wait for its record.
+            self.wt.continued.push((target.clone(), Instant::now()));
+            self.ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    /// Focuses the tab of `target`, or asks for its session file to be opened once the gateway's
+    /// record names it. `false` while the record (or its file) is not there yet.
+    fn open_continued(&mut self, target: &SessionTarget) -> bool {
+        if let Some(i) = self.tabs.iter().position(|t| t.target().key == target.key) {
+            self.activate(i);
+            return true;
+        }
+        let file = self.gw.controllers().and_then(|all| {
+            all.iter()
+                .find(|c| c.target.key == target.key)
+                .and_then(|c| c.session_path.clone())
+        });
+        match file {
+            Some(file) => {
+                self.desktop_opens.push(DesktopOpen::new(file, Split::None));
+                // `run_desktop_opens` runs before this in the frame: an idle window needs a new one.
+                self.ctx.request_repaint();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Opens the continued sessions whose controller record arrived since; one that never shows
+    /// up within [`CONTINUE_WAIT`] is reported.
+    fn open_queued_continues(&mut self) {
+        if self.wt.continued.is_empty() {
+            return;
+        }
+        for (target, since) in std::mem::take(&mut self.wt.continued) {
+            if self.open_continued(&target) {
+                continue;
+            }
+            if since.elapsed() >= CONTINUE_WAIT {
+                self.toasts.error(
+                    &self.ctx,
+                    "The continued session did not show up; open it from the sidebar",
+                );
+            } else {
+                self.wt.continued.push((target, since));
+            }
+        }
+        if !self.wt.continued.is_empty() {
+            self.ctx.request_repaint_after(Duration::from_millis(250));
+        }
     }
 
     /// Asks the gateway which live backend sessions exist, then warns about every session that
@@ -1791,183 +1000,22 @@ impl App {
                 confirm_label: confirm_label.to_owned(),
                 danger: false,
             },
-            PendingConfirm::SwitchMain {
-                entry,
-                primary,
-                target,
-                open,
-            },
+            PendingConfirm::SwitchMain { entry, open },
         ));
     }
 
-    pub(super) fn execute_switch_main(
-        &mut self,
-        entry: SessionEntry,
-        primary: PathBuf,
-        target: String,
-        open: bool,
-    ) {
-        let rec = self.parked_of(&entry);
-        let op = Mutation::SwitchBranch {
-            dir: primary.clone(),
-            branch: target.clone(),
+    /// The switch was confirmed: the gateway checks the parked branch out (opening the session)
+    /// or switches the main checkout back to the branch's base.
+    pub(super) fn execute_switch_main(&mut self, entry: SessionEntry, open: bool) {
+        let place = if open {
+            ContinueIn::Main
+        } else {
+            ContinueIn::SwitchBack
         };
-        self.gw.mutate(op, move |app, r| match r {
-            Ok(_) => {
-                if let Some(rec) = rec {
-                    let at = open.then(|| primary.clone());
-                    app.set_park_state(&rec.primary, &rec.branch, at);
-                }
-                app.toasts
-                    .success(&app.ctx, format!("The main checkout is on {target} now"));
-                if open {
-                    app.open_session(&entry);
-                }
-            }
-            Err(e) => app.toasts.error(
-                &app.ctx,
-                format!(
-                    "Cannot switch the main checkout to {target}: {}",
-                    dirty_reason(&e, &primary).unwrap_or_else(|| brief(&e))
-                ),
-            ),
-        });
+        self.continue_parked(&entry, place, open);
     }
 
     // ------------------------------------------------------------ moves into a worktree
-
-    /// Once per run: forget removed worktrees whose primary repository is gone too.
-    fn prune_removed_once(&mut self) {
-        if self.wt.pruned {
-            return;
-        }
-        if self.cfg.removed_worktrees.is_empty() {
-            self.wt.pruned = true;
-            return;
-        }
-        // The leftovers are looked for in the first scan.
-        let Some(groups) = self.groups() else {
-            return;
-        };
-        self.wt.pruned = true;
-        let snap = self.running_snapshot();
-        let open: Vec<PathBuf> = self
-            .tabs
-            .iter()
-            .filter_map(|t| t.session_path_owned())
-            .collect();
-        let leftovers: Vec<Leftover> = self
-            .cfg
-            .removed_worktrees
-            .iter()
-            .map(|(path, r)| {
-                let all: Vec<&SessionEntry> = groups
-                    .iter()
-                    .flat_map(|g| &g.sessions)
-                    .filter(|e| e.cwd == *path)
-                    .collect();
-                let files: Vec<PathBuf> = all
-                    .iter()
-                    .filter(|e| !snap.is_running(&e.id, &e.path) && !open.contains(&e.path))
-                    .map(|e| e.path.clone())
-                    .collect();
-                Leftover {
-                    worktree: path.clone(),
-                    primary: r.primary.clone(),
-                    all_movable: files.len() == all.len(),
-                    none: all.is_empty(),
-                    files,
-                }
-            })
-            .collect();
-        let removed = self.cfg.removed_worktrees.clone();
-        self.gw.native(
-            move || worktree_ui::orphaned_removed(&removed),
-            move |app, paths| {
-                for p in &paths {
-                    app.cfg.removed_worktrees.remove(p);
-                }
-                app.dirty = true;
-                for l in leftovers
-                    .into_iter()
-                    .filter(|l| !paths.contains(&l.worktree))
-                {
-                    app.relocate_leftover(l);
-                }
-            },
-        );
-    }
-
-    /// Sessions that still carry a removed worktree's folder: move the idle ones into the primary
-    /// checkout; the record goes once nothing of it remains.
-    fn relocate_leftover(&mut self, l: Leftover) {
-        if l.none {
-            self.cfg.removed_worktrees.remove(&l.worktree);
-            self.dirty = true;
-            return;
-        }
-        if l.files.is_empty() {
-            return;
-        }
-        let n = l.files.len();
-        // Files an open is moving right now are left to it.
-        let files: Vec<PathBuf> = l
-            .files
-            .into_iter()
-            .filter(|f| self.wt.in_flight.insert(f.clone()))
-            .collect();
-        if files.is_empty() {
-            return;
-        }
-        let (worktree, all_movable) = (l.worktree, l.all_movable && files.len() == n);
-        let batch = files.clone();
-        self.gw.mutate(
-            Mutation::RelocateSessions {
-                files,
-                dest: l.primary,
-            },
-            move |app, r| {
-                for f in &batch {
-                    app.wt.in_flight.remove(f);
-                }
-                let results = match r {
-                    Ok(Done::Relocated(results)) => results,
-                    Ok(_) => {
-                        log::debug!("relocating leftovers: unexpected answer");
-                        return;
-                    }
-                    Err(e) => {
-                        app.toasts.error(
-                            &app.ctx,
-                            format!(
-                                "Could not move sessions of a removed worktree: {}",
-                                brief(&e)
-                            ),
-                        );
-                        return;
-                    }
-                };
-                let failed: Vec<&String> = results
-                    .iter()
-                    .filter_map(|(_, r)| r.as_ref().err())
-                    .collect();
-                if let Some(why) = failed.first() {
-                    app.toasts.error(
-                        &app.ctx,
-                        format!(
-                            "Could not move {} of {n} sessions of a removed worktree: {}",
-                            failed.len(),
-                            brief(why)
-                        ),
-                    );
-                } else if all_movable {
-                    app.cfg.removed_worktrees.remove(&worktree);
-                    app.dirty = true;
-                }
-                app.refresh_sessions();
-            },
-        );
-    }
 
     /// A session of a removed worktree is opened: omp moves it into the primary checkout first,
     /// then the tab opens on the moved file there. When the move fails the session opens as
@@ -2045,12 +1093,41 @@ impl App {
         }
     }
 
+    /// A move typed into tab `uid` never went in: its "Moved to worktree" note is not waited for.
+    pub(super) fn forget_move(&mut self, uid: u64) {
+        self.wt.moves.retain(|m| m.uid != uid);
+    }
+
     fn expire_moves(&mut self) {
         self.wt.moves.retain(|m| m.since.elapsed() < MOVE_EXPIRES);
     }
 
+    /// Records `new` as tab `uid`'s session file (here and in the gateway) when it differs.
+    fn fix_tab_path(&mut self, uid: u64, new: &Path) {
+        let Some(t) = self.tabs.iter_mut().find(|t| t.uid == uid) else {
+            return;
+        };
+        if t.session_path() == Some(new) {
+            return;
+        }
+        t.hint_session_path(Some(new.to_path_buf()));
+        let target = t.target().clone();
+        self.gw.mutate(
+            Mutation::SetSessionPath {
+                target,
+                path: Some(new.to_path_buf()),
+            },
+            |_, result| {
+                if let Err(e) = result {
+                    log::debug!("setting the session file failed: {e}");
+                }
+            },
+        );
+        self.dirty = true;
+    }
+
     /// A tab whose session file changed (omp relocated it, `/new`, `/resume`, …) takes the folder
-    /// of the new file; a pending move that landed in a worktree records its merge target.
+    /// of the new file; a pending move that landed in a worktree says so.
     fn track_relocations(&mut self) {
         let generation = self.gw.sessions_generation();
         let live: HashSet<u64> = self.tabs.iter().map(|t| t.uid).collect();
@@ -2120,11 +1197,7 @@ impl App {
             if let Some(i) = self.wt.moves.iter().position(|m| m.uid == uid)
                 && let Some(w) = &group.worktree
             {
-                let m = self.wt.moves.remove(i);
-                if let Some(base) = m.base {
-                    self.cfg.worktree_bases.insert(w.path.clone(), base);
-                    self.dirty = true;
-                }
+                self.wt.moves.remove(i);
                 self.toasts.success(
                     &self.ctx,
                     format!("Moved to worktree “{}”", worktree_ui::worktree_label(w)),

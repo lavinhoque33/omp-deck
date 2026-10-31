@@ -39,7 +39,7 @@ use deck_core::mux::{Mux, MuxKind};
 use deck_term::{InputMeta, ScreenText, Terminal, TerminalEvents};
 use serde::{Deserialize, Serialize};
 
-use crate::inject::{End, Env, HOLD_TAIL, Injector, Job, JobId, Requires, Write};
+use crate::inject::{ComposeMode, End, Env, HOLD_TAIL, Injector, Job, JobId, Requires, Write};
 use crate::model_switch::{FRESH_TIMEOUT, Pending, SWITCH_TIMEOUT, plan_switch};
 use crate::session_actions::{self, Action, ActionCtx};
 use crate::status::TabStatus;
@@ -50,12 +50,19 @@ pub const MODEL_SWITCH_LABEL: &str = "Model switch";
 /// Job labels of the two ways to hand a review to omp.
 pub const REVIEW_INSERT_LABEL: &str = "Insert review";
 pub const REVIEW_SEND_LABEL: &str = "Send review";
+/// Job label of a typed prompt submitted for the user (mobile devices).
+pub const PROMPT_LABEL: &str = "Send prompt";
 /// Job label of the `/wt <branch>` move into a worktree.
 pub const WORKTREE_MOVE_LABEL: &str = "Move to worktree";
 /// Job label of the injected worktree finish prompt.
 pub const WORKTREE_FINISH_LABEL: &str = "Finish worktree";
 /// Job label of the `/move <dir>` relocation (a finished worktree's session into its repository).
 pub const MOVE_TO_LABEL: &str = "Move to folder";
+/// Job labels of composer text delivered while omp works.
+pub const STEER_LABEL: &str = "Steer";
+pub const FOLLOW_UP_LABEL: &str = "Follow-up";
+/// Job label of a text (with attachments) inserted at omp's cursor without submitting.
+pub const INSERT_LABEL: &str = "Insert text";
 
 /// Settled requests remembered per session (pending ones are never dropped).
 const HISTORY: usize = 256;
@@ -241,12 +248,25 @@ pub enum Command {
     SetEffort { level: String },
     /// A review prompt: inserted at omp's cursor (`send=false`) or sent (`send=true`).
     Review { text: String, send: bool },
+    /// Composer text submitted with Enter; only while omp is idle.
+    Prompt { text: String },
     /// `/wt <branch>`: omp moves the session into the worktree.
     WorktreeMove { branch: String },
     /// The worktree finish prompt.
     WorktreeFinish { prompt: String },
     /// `/move <dest>`: omp moves the session (file, artifacts, process cwd) into `dest`.
     MoveTo { dest: std::path::PathBuf },
+    /// Text pasted while omp works, then Enter (steer the running turn) or, with `follow_up`,
+    /// Ctrl+Q (omp queues it for after the turn). Busy only; a blank text is refused (an empty
+    /// Enter while busy aborts the turn).
+    Steer { text: String, follow_up: bool },
+    /// Attachments (absolute file paths, pasted first as one file drop so omp attaches the images
+    /// among them), then the text, then the submit of `mode`.
+    Compose {
+        attachments: Vec<std::path::PathBuf>,
+        text: String,
+        mode: ComposeMode,
+    },
 }
 
 /// Which kind of command a request carried (for clients mapping outcomes back to their state).
@@ -255,9 +275,12 @@ pub enum CommandKind {
     Action,
     ModelSwitch,
     Review { send: bool },
+    Prompt,
     WorktreeMove,
     WorktreeFinish,
     MoveTo,
+    Steer { follow_up: bool },
+    Compose { mode: ComposeMode },
 }
 
 impl Command {
@@ -266,9 +289,14 @@ impl Command {
             Command::Action(_) => CommandKind::Action,
             Command::SwitchModel { .. } | Command::SetEffort { .. } => CommandKind::ModelSwitch,
             Command::Review { send, .. } => CommandKind::Review { send: *send },
+            Command::Prompt { .. } => CommandKind::Prompt,
             Command::WorktreeMove { .. } => CommandKind::WorktreeMove,
             Command::WorktreeFinish { .. } => CommandKind::WorktreeFinish,
             Command::MoveTo { .. } => CommandKind::MoveTo,
+            Command::Steer { follow_up, .. } => CommandKind::Steer {
+                follow_up: *follow_up,
+            },
+            Command::Compose { mode, .. } => CommandKind::Compose { mode: *mode },
         }
     }
 
@@ -352,6 +380,9 @@ pub enum Cancel {
     Closing,
     /// Another session file took over this session before the request started.
     SessionChanged,
+    /// The client lost the right to send it (a paired device revoked, or its `control`
+    /// lowered) before its first byte.
+    NotAllowed,
 }
 
 /// How far a request got toward the terminal.
@@ -924,6 +955,18 @@ impl SessionController {
                 };
                 Ok((Job::text(label, text, *send), None))
             }
+            Command::Prompt { text } => {
+                if text.trim().is_empty() {
+                    return Err(Rejected::Empty);
+                }
+                if self.terminal.paste_bytes("x").is_none() {
+                    return Err(Rejected::NoBracketedPaste);
+                }
+                if self.is_busy() || self.activity().is_busy() {
+                    return Err(Rejected::Busy);
+                }
+                Ok((Job::text(PROMPT_LABEL, text, true), None))
+            }
             Command::WorktreeMove { branch } => Ok((
                 Job::slash(
                     WORKTREE_MOVE_LABEL,
@@ -954,7 +997,57 @@ impl SessionController {
                     None,
                 ))
             }
+            Command::Steer { text, follow_up } => {
+                let mode = if *follow_up {
+                    ComposeMode::FollowUp
+                } else {
+                    ComposeMode::Steer
+                };
+                self.compose_job(&[], text, mode)
+            }
+            Command::Compose {
+                attachments,
+                text,
+                mode,
+            } => self.compose_job(attachments, text, *mode),
         }
+    }
+
+    /// The job of [`Command::Steer`] / [`Command::Compose`].
+    fn compose_job(
+        &self,
+        attachments: &[std::path::PathBuf],
+        text: &str,
+        mode: ComposeMode,
+    ) -> Result<(Job, Option<Pending>), Rejected> {
+        let blank = text.trim().is_empty();
+        let steering = matches!(mode, ComposeMode::Steer | ComposeMode::FollowUp);
+        if (steering && blank) || (blank && attachments.is_empty()) {
+            return Err(Rejected::Empty);
+        }
+        if attachments
+            .iter()
+            .any(|p| !p.is_absolute() || p.to_str().is_none_or(|s| s.chars().any(char::is_control)))
+        {
+            return Err(Rejected::BadPath);
+        }
+        if self.terminal.paste_bytes("x").is_none() {
+            return Err(Rejected::NoBracketedPaste);
+        }
+        if self.is_busy() || (mode == ComposeMode::Send && self.activity().is_busy()) {
+            return Err(Rejected::Busy);
+        }
+        let attach = (!attachments.is_empty()).then(|| {
+            deck_term::input::encode_dropped_paths(attachments.iter().map(|p| p.as_path()))
+        });
+        let label = match mode {
+            ComposeMode::Send => PROMPT_LABEL,
+            ComposeMode::Steer => STEER_LABEL,
+            ComposeMode::FollowUp => FOLLOW_UP_LABEL,
+            ComposeMode::Insert => INSERT_LABEL,
+        };
+        let text = if blank { "" } else { text };
+        Ok((Job::compose(label, attach.as_deref(), text, mode), None))
     }
 
     /// Drops the oldest settled requests beyond [`HISTORY`]; pending ones always stay. Dropped
@@ -1039,6 +1132,26 @@ impl SessionController {
         self.sweep(why);
         self.pending_switch = None;
         self.settle_switch(Runtime::Abandoned);
+    }
+
+    /// Client `client` may no longer send commands: its requests that have not written a byte
+    /// yet (queued, or waiting for a draft confirmation) are cancelled. One already writing
+    /// finishes. True when any was cancelled.
+    pub fn cancel_client(&mut self, client: &str) -> bool {
+        let ids: Vec<JobId> = self
+            .history
+            .iter()
+            .filter(|r| r.key.client == client && !r.delivery.is_final())
+            .map(|r| JobId(r.id.0))
+            .collect();
+        if ids.is_empty() || !self.injector.drop_unwritten(&ids) {
+            return false;
+        }
+        if self.awaiting.is_some_and(|a| ids.contains(&a)) {
+            self.awaiting = None;
+        }
+        self.sweep(Cancel::NotAllowed);
+        true
     }
 
     fn settle_switch(&mut self, verdict: Runtime) {
@@ -1327,6 +1440,8 @@ mod tests {
     struct Omp {
         draft: String,
         submitted: Vec<String>,
+        /// Drafts queued with Ctrl+Q (0x11).
+        followed_up: Vec<String>,
         input: Vec<u8>,
         /// The transport fails to take a lone Enter.
         fail_enter: bool,
@@ -1393,6 +1508,9 @@ mod tests {
                 omp.submitted.push(line);
             } else if bytes == b"\x03" {
                 omp.draft.clear();
+            } else if bytes == b"\x11" {
+                let line = std::mem::take(&mut omp.draft);
+                omp.followed_up.push(line);
             } else {
                 return Ok(());
             }
@@ -1518,6 +1636,213 @@ mod tests {
             ctl.submit(reused),
             Err(Rejected::KeyReused { id: first.id })
         );
+    }
+
+    /// The fake omp enables bracketed paste (?2004) and shows an idle title, like omp at rest.
+    fn idle_composer(ctl: &mut SessionController, fake: &Fake) {
+        let _ = fake.out.send(RemoteEvent::Output(
+            "\x1b[?2004h\x1b]0;π > app\x07".as_bytes().to_vec(),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ctl.terminal().paste_bytes("x").is_none() || ctl.activity() != Activity::Idle {
+            assert!(
+                Instant::now() < deadline,
+                "?2004 and the idle title never applied"
+            );
+            ctl.terminal_mut().poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_prompt_is_submitted_with_enter_when_omp_is_idle() {
+        let (mut ctl, fake) = controller("", None);
+        idle_composer(&mut ctl, &fake);
+        let s = submission(
+            &ctl,
+            1,
+            Command::Prompt {
+                text: "explain main".into(),
+            },
+        );
+        let first = ctl.submit(s).expect("accepted");
+        let record = ctl.request(first.id).expect("recorded");
+        assert_eq!(
+            (record.kind, record.label.as_str()),
+            (CommandKind::Prompt, PROMPT_LABEL)
+        );
+        run(&mut ctl, |c, _| {
+            c.request(first.id)
+                .is_some_and(|r| r.delivery == Delivery::Delivered)
+        });
+        assert_eq!(fake.omp().submitted, vec!["explain main".to_owned()]);
+    }
+
+    #[test]
+    fn a_prompt_is_refused_while_omp_works_or_a_command_runs() {
+        let (mut ctl, fake) = controller("", None);
+        idle_composer(&mut ctl, &fake);
+        assert_eq!(
+            ctl.submit(submission(&ctl, 1, Command::Prompt { text: " \n".into() })),
+            Err(Rejected::Empty)
+        );
+        // A queued command holds the injector.
+        ctl.submit(submission(&ctl, 2, Command::Action(Action::AutoName)))
+            .expect("accepted");
+        assert_eq!(
+            ctl.submit(submission(&ctl, 3, Command::Prompt { text: "a".into() })),
+            Err(Rejected::Busy)
+        );
+        run(&mut ctl, |c, _| !c.is_busy());
+        // omp streams a turn (its title shows a spinner).
+        let _ = fake.out.send(RemoteEvent::Output(
+            "\x1b]0;π ⠋ work\x07".as_bytes().to_vec(),
+        ));
+        run(&mut ctl, |c, _| c.activity().is_busy());
+        assert_eq!(
+            ctl.submit(submission(&ctl, 4, Command::Prompt { text: "a".into() })),
+            Err(Rejected::Busy)
+        );
+        assert_eq!(fake.omp().submitted, vec!["/rename".to_owned()]);
+    }
+
+    /// omp streams a turn (its title shows a spinner).
+    fn busy_composer(ctl: &mut SessionController, fake: &Fake) {
+        idle_composer(ctl, fake);
+        let _ = fake.out.send(RemoteEvent::Output(
+            "\x1b]0;π ⠋ work\x07".as_bytes().to_vec(),
+        ));
+        run(ctl, |c, _| c.activity().is_busy());
+    }
+
+    #[test]
+    fn steer_pastes_and_enters_while_omp_works() {
+        let (mut ctl, fake) = controller("", None);
+        busy_composer(&mut ctl, &fake);
+        let s = submission(
+            &ctl,
+            1,
+            Command::Steer {
+                text: "go left".into(),
+                follow_up: false,
+            },
+        );
+        let first = ctl.submit(s).expect("accepted");
+        let record = ctl.request(first.id).expect("recorded");
+        assert_eq!(
+            (record.kind, record.label.as_str()),
+            (CommandKind::Steer { follow_up: false }, STEER_LABEL)
+        );
+        run(&mut ctl, |c, _| {
+            c.request(first.id)
+                .is_some_and(|r| r.delivery == Delivery::Delivered)
+        });
+        let omp = fake.omp();
+        assert_eq!(omp.submitted, vec!["go left".to_owned()]);
+        // No Esc (it would interrupt the turn): exactly the paste and one Enter.
+        assert_eq!(omp.input, b"\x1b[200~go left\x1b[201~\r".to_vec());
+    }
+
+    #[test]
+    fn follow_up_pastes_and_sends_ctrl_q_never_a_bare_enter() {
+        let (mut ctl, fake) = controller("", None);
+        busy_composer(&mut ctl, &fake);
+        let s = submission(
+            &ctl,
+            1,
+            Command::Steer {
+                text: "then add tests".into(),
+                follow_up: true,
+            },
+        );
+        let first = ctl.submit(s).expect("accepted");
+        run(&mut ctl, |c, _| {
+            c.request(first.id)
+                .is_some_and(|r| r.delivery == Delivery::Delivered)
+        });
+        let omp = fake.omp();
+        assert_eq!(omp.followed_up, vec!["then add tests".to_owned()]);
+        assert!(omp.submitted.is_empty());
+        assert_eq!(omp.input, b"\x1b[200~then add tests\x1b[201~\x11".to_vec());
+    }
+
+    #[test]
+    fn steering_refuses_blank_text_and_waits_for_a_turn() {
+        let (mut ctl, fake) = controller("", None);
+        idle_composer(&mut ctl, &fake);
+        for follow_up in [false, true] {
+            let blank = Command::Steer {
+                text: " \n".into(),
+                follow_up,
+            };
+            assert_eq!(ctl.submit(submission(&ctl, 1, blank)), Err(Rejected::Empty));
+        }
+        // Idle: accepted, then refused by the injector without a byte.
+        let s = submission(
+            &ctl,
+            2,
+            Command::Steer {
+                text: "x".into(),
+                follow_up: false,
+            },
+        );
+        let id = ctl.submit(s).expect("accepted").id;
+        run(&mut ctl, |c, _| {
+            c.request(id).is_some_and(|r| {
+                r.delivery == Delivery::Refused(Refusal::Precondition(Requires::Busy))
+            })
+        });
+        assert!(fake.omp().input.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_pastes_the_quoted_attachments_then_the_text_then_enter() {
+        let (mut ctl, fake) = controller("", None);
+        idle_composer(&mut ctl, &fake);
+        let s = submission(
+            &ctl,
+            1,
+            Command::Compose {
+                attachments: vec!["/tmp/my shot.png".into()],
+                text: "what is this?".into(),
+                mode: ComposeMode::Send,
+            },
+        );
+        let id = ctl.submit(s).expect("accepted").id;
+        run(&mut ctl, |c, _| {
+            c.request(id)
+                .is_some_and(|r| r.delivery == Delivery::Delivered)
+        });
+        let omp = fake.omp();
+        assert_eq!(
+            omp.input,
+            b"\x1b[200~/tmp/my\\ shot.png\x1b[201~\x1b[200~what is this?\x1b[201~\r".to_vec()
+        );
+        assert_eq!(
+            omp.submitted,
+            vec!["/tmp/my\\ shot.pngwhat is this?".to_owned()]
+        );
+    }
+
+    #[test]
+    fn compose_refuses_relative_attachments_and_nothing_to_send() {
+        let (mut ctl, fake) = controller("", None);
+        idle_composer(&mut ctl, &fake);
+        let compose = |attachments: Vec<std::path::PathBuf>, text: &str| Command::Compose {
+            attachments,
+            text: text.into(),
+            mode: ComposeMode::Send,
+        };
+        assert_eq!(
+            ctl.submit(submission(&ctl, 1, compose(vec![], "  "))),
+            Err(Rejected::Empty)
+        );
+        assert_eq!(
+            ctl.submit(submission(&ctl, 2, compose(vec!["rel.png".into()], "x"))),
+            Err(Rejected::BadPath)
+        );
+        assert!(fake.omp().input.is_empty());
     }
 
     #[test]
@@ -1870,6 +2195,70 @@ mod tests {
         let omp = fake.omp();
         assert_eq!(omp.draft, "half typed", "the new draft was not cleared");
         assert!(omp.input.is_empty(), "nothing was typed");
+    }
+
+    #[test]
+    fn a_client_losing_its_rights_has_its_unwritten_requests_cancelled_and_no_one_elses() {
+        let (mut ctl, fake) = controller("half typed", None);
+        let phone = |ctl: &SessionController, seq: u64, command: Command| Submission {
+            key: RequestKey {
+                client: "d-phone".to_owned(),
+                seq,
+            },
+            ..submission(ctl, seq, command)
+        };
+        // The phone's command waits for a decision on the desktop draft; another of its
+        // commands and one of the desktop's queue behind it.
+        let waiting = ctl
+            .submit(phone(&ctl, 1, Command::Action(Action::AutoName)))
+            .expect("accepted")
+            .id;
+        let queued = ctl
+            .submit(phone(&ctl, 2, Command::Action(Action::AutoName)))
+            .expect("accepted")
+            .id;
+        let desktop = ctl
+            .submit(submission(&ctl, 3, Command::Action(Action::AutoName)))
+            .expect("accepted")
+            .id;
+        run(&mut ctl, |_, ev| {
+            ev.iter()
+                .any(|e| matches!(e, ControllerEvent::Confirm { id, .. } if *id == waiting))
+        });
+        assert!(!ctl.cancel_client("someone-else"));
+        assert!(ctl.cancel_client("d-phone"));
+        for id in [waiting, queued] {
+            assert_eq!(
+                ctl.request(id).map(|r| r.delivery.clone()),
+                Some(Delivery::Cancelled(Cancel::NotAllowed))
+            );
+        }
+        let events = ctl.drive(Instant::now()).events;
+        let ended: Vec<RequestId> = events
+            .iter()
+            .filter_map(|e| match e {
+                ControllerEvent::Ended {
+                    id,
+                    delivery: Delivery::Cancelled(Cancel::NotAllowed),
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ended, [waiting, queued]);
+        // The phone's draft question is gone and nothing of its was typed; the desktop's own
+        // command now asks about the draft itself.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ControllerEvent::Confirm { id, .. } if *id == desktop)),
+            "{events:?}"
+        );
+        assert!(!ctl.answer(&ctl.target().clone(), waiting, true));
+        let omp = fake.omp();
+        assert_eq!(omp.draft, "half typed");
+        assert!(omp.input.is_empty(), "nothing was typed");
+        assert!(!ctl.cancel_client("d-phone"), "nothing of it is left");
     }
 
     #[test]

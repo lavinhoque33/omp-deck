@@ -164,14 +164,24 @@ struct SideQ {
 }
 
 /// Shared between the engine (which attaches the output subscription and queues refusals) and
-/// the view's writer thread.
+/// the view's writer: a local view's writer thread, or a device view's relay link thread, which
+/// polls it ([`ViewSide::take`]) when `waker` runs.
 #[derive(Default)]
 pub(crate) struct ViewSide {
     q: Mutex<SideQ>,
     cv: Condvar,
+    waker: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ViewSide {
+    /// A view whose reader polls instead of blocking.
+    pub(crate) fn polled(waker: Arc<dyn Fn() + Send + Sync>) -> ViewSide {
+        ViewSide {
+            waker: Some(waker),
+            ..ViewSide::default()
+        }
+    }
+
     pub(crate) fn set_subscription(&self, sub: Arc<OutputSubscription>) {
         lock(&self.q).sub = Some(sub);
         self.signal();
@@ -193,6 +203,9 @@ impl ViewSide {
     pub(crate) fn signal(&self) {
         lock(&self.q).signaled = true;
         self.cv.notify_one();
+        if let Some(w) = &self.waker {
+            w();
+        }
     }
 
     /// Blocks until something is ready.
@@ -204,6 +217,20 @@ impl ViewSide {
         q.signaled = false;
         (q.items.drain(..).collect(), q.sub.clone())
     }
+
+    /// What is ready now, without waiting.
+    pub(crate) fn take(&self) -> (Vec<SideItem>, Option<Arc<OutputSubscription>>) {
+        let mut q = lock(&self.q);
+        q.signaled = false;
+        (q.items.drain(..).collect(), q.sub.clone())
+    }
+}
+
+/// A process-wide unique id for links and views (local connections and device sessions share
+/// the engine's maps).
+pub(crate) fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 // ---- serve ------------------------------------------------------------------------------------
@@ -290,7 +317,6 @@ pub fn serve(opts: ServeOptions) -> i32 {
 }
 
 fn accept_loop(listener: &Listener, tx: &Sender<Msg>) {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
     loop {
         let stream = match listener.accept() {
             Ok(s) => s,
@@ -299,7 +325,7 @@ fn accept_loop(listener: &Listener, tx: &Sender<Msg>) {
                 return;
             }
         };
-        let conn = NEXT.fetch_add(1, Ordering::Relaxed);
+        let conn = next_id();
         let tx = tx.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("gateway-conn-{conn}"))

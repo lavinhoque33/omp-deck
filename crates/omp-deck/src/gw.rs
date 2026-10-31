@@ -30,8 +30,8 @@ use deck_service::gateway::client::{
 };
 use deck_service::gateway::protocol::{
     Accepted, Answer, AppUpdateView, BackupView, ClientState, ControllerInfo, Done, GatewayError,
-    GatewayStatus, InboxView, ModelFactsView, Mutation, OmpUpdateView, Outcome, Progress, Query,
-    Topic, TopicValue, UsageView, ViewRole,
+    GatewayStatus, InboxView, MobileView, ModelFactsView, Mutation, OmpUpdateView, Outcome,
+    Permissions, Progress, Query, SecretText, Topic, TopicValue, UsageView, ViewRole,
 };
 use deck_service::gateway::running::RunningSnapshot;
 
@@ -45,6 +45,14 @@ type Poll = Box<dyn FnMut() -> Option<Option<Job>>>;
 type DoneFn = Box<dyn FnOnce(&mut App, Result<Done, String>)>;
 type ProgressFn = Rc<RefCell<dyn FnMut(&mut App, &Progress)>>;
 type AcceptedFn = Box<dyn FnOnce(&mut App, RequestKey, Result<Submitted, GatewayError>)>;
+
+/// What the gateway answered to opening a pairing window. The invite itself is dropped (and
+/// wiped) on arrival: only the link the QR code carries is kept.
+pub struct PairingStarted {
+    pub pairing: String,
+    pub link: SecretText,
+    pub expires_unix_ms: u64,
+}
 
 /// A final outcome as the closure's result. Outcomes that kept no result say so.
 fn outcome_result(o: Outcome) -> Result<Done, String> {
@@ -208,6 +216,119 @@ impl Gw {
         )
     }
 
+    // ------------------------------------------------------------------ mobile access
+
+    /// The gateway's mobile-access record: relay, link state, devices, open pairing.
+    pub fn mobile(&self) -> Option<Arc<MobileView>> {
+        self.client.state().mobile.get()
+    }
+
+    /// A mutation whose answer carries nothing: `done` gets the error text, if any.
+    fn mutate_unit(
+        &mut self,
+        op: Mutation,
+        done: impl FnOnce(&mut App, Result<(), String>) + 'static,
+    ) {
+        self.mutate(op, move |app, r| done(app, r.map(|_| ())));
+    }
+
+    /// Configures the relay (the gateway validates the URL and the room key).
+    pub fn relay_set(
+        &mut self,
+        url: String,
+        room_key: SecretText,
+        done: impl FnOnce(&mut App, Result<(), String>) + 'static,
+    ) {
+        self.mutate_unit(Mutation::RelaySet { url, room_key }, done);
+    }
+
+    pub fn relay_clear(&mut self, done: impl FnOnce(&mut App, Result<(), String>) + 'static) {
+        self.mutate_unit(Mutation::RelayClear, done);
+    }
+
+    /// Restarts the relay link now (also takes the room back after another gateway replaced it).
+    pub fn relay_reconnect(&mut self, done: impl FnOnce(&mut App, Result<(), String>) + 'static) {
+        self.mutate_unit(Mutation::RelayReconnect, done);
+    }
+
+    /// Opens the pairing window. The invite never leaves this call: only the link (the QR code's
+    /// payload) is handed on, as [`SecretText`] so it is wiped when dropped.
+    pub fn pairing_begin(
+        &mut self,
+        done: impl FnOnce(&mut App, Result<PairingStarted, String>) + 'static,
+    ) {
+        self.mutate(Mutation::PairingBegin, move |app, r| {
+            let r = match r {
+                Ok(Done::PairingStarted {
+                    pairing,
+                    invite: _,
+                    link,
+                    expires_unix_ms,
+                }) => Ok(PairingStarted {
+                    pairing,
+                    link,
+                    expires_unix_ms,
+                }),
+                Ok(_) => Err("unexpected reply from the gateway".to_owned()),
+                Err(e) => Err(e),
+            };
+            done(app, r);
+        });
+    }
+
+    pub fn pairing_cancel(&mut self, done: impl FnOnce(&mut App, Result<(), String>) + 'static) {
+        self.mutate_unit(Mutation::PairingCancel, done);
+    }
+
+    pub fn pairing_approve(
+        &mut self,
+        pairing: String,
+        permissions: Permissions,
+        done: impl FnOnce(&mut App, Result<(), String>) + 'static,
+    ) {
+        self.mutate_unit(
+            Mutation::PairingApprove {
+                pairing,
+                permissions,
+            },
+            done,
+        );
+    }
+
+    pub fn pairing_deny(
+        &mut self,
+        pairing: String,
+        done: impl FnOnce(&mut App, Result<(), String>) + 'static,
+    ) {
+        self.mutate_unit(Mutation::PairingDeny { pairing }, done);
+    }
+
+    pub fn device_revoke(
+        &mut self,
+        id: String,
+        done: impl FnOnce(&mut App, Result<(), String>) + 'static,
+    ) {
+        self.mutate_unit(Mutation::DeviceRevoke { id }, done);
+    }
+
+    pub fn device_rename(
+        &mut self,
+        id: String,
+        name: String,
+        done: impl FnOnce(&mut App, Result<(), String>) + 'static,
+    ) {
+        self.mutate_unit(Mutation::DeviceRename { id, name }, done);
+    }
+
+    pub fn device_set_permissions(
+        &mut self,
+        id: String,
+        permissions: Permissions,
+        done: impl FnOnce(&mut App, Result<(), String>) + 'static,
+    ) {
+        self.mutate_unit(Mutation::DeviceSetPermissions { id, permissions }, done);
+    }
+
     /// Sends a command to a session's controller. `accepted` runs when the gateway accepted it
     /// (with the controller's request id) or refused it; `done` when it reached its final result.
     /// Between the call and `accepted` the request is only locally pending.
@@ -253,9 +374,14 @@ impl Gw {
         key
     }
 
-    /// Asks the gateway to cancel an accepted job.
-    pub fn cancel(&mut self, key: RequestKey) {
-        let _ = self.client.mutate(Mutation::CancelJob(key));
+    /// Asks the gateway to cancel an accepted job; `done` runs once the gateway answered
+    /// (an error when it refused, e.g. a job of another client, or the job already ended).
+    pub fn cancel(
+        &mut self,
+        key: RequestKey,
+        done: impl FnOnce(&mut App, Result<(), String>) + 'static,
+    ) {
+        self.mutate_unit(Mutation::CancelJob(key), done);
     }
 
     // ------------------------------------------------------------------ per frame

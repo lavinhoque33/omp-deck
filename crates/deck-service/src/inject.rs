@@ -20,10 +20,15 @@
 //! [`ESC_TIMEOUT`]) abandons the job without Enter ([`End::Stalled`]): the command stays in the
 //! composer rather than risk the merge.
 //!
-//! Text jobs (review comments): the paste bytes come from [`Env::paste`] (the terminal's own mode-aware
-//! encoding, evaluated at write time so the pure state machine never guesses the modes); `None` →
-//! the job is refused ([`End::NoPaste`]). Insert (`submit=false`) pastes at omp's cursor and
-//! ends there; Send (`submit=true`) follows the slash sequence with the text as the paste.
+//! Text jobs (review comments, prompts, steering): the paste bytes come from [`Env::paste`] (the
+//! terminal's own mode-aware encoding, evaluated at write time so the pure state machine never
+//! guesses the modes); `None` → the job is refused ([`End::NoPaste`]). [`ComposeMode::Insert`]
+//! pastes at omp's cursor and ends there; the submitting modes follow the slash sequence with the
+//! text as the paste and end with Enter ([`ComposeMode::Send`] idle, [`ComposeMode::Steer`] busy)
+//! or Ctrl+Q ([`ComposeMode::FollowUp`], busy). Steering never sends `Esc` (it would interrupt the
+//! turn) and never a submit key once omp stopped working (an Enter would start a new prompt, an
+//! empty one would abort). Attachments are pasted first as their own paste, like a file drop;
+//! the text follows once omp shows them.
 //! [`Poll::ended`] reports every job that left the queue, by [`JobId`]; [`End::Completed`] means
 //! every byte of it was handed out — not that omp ran it successfully.
 //!
@@ -83,6 +88,34 @@ pub enum Requires {
     Busy,
 }
 
+/// How a [`Payload::Text`] ends once its text is in omp's composer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ComposeMode {
+    /// Submit with Enter (idle only; the draft is confirmed and cleared first).
+    Send,
+    /// Enter while omp works: omp steers the running turn with the text.
+    Steer,
+    /// Ctrl+Q (0x11) while omp works: omp queues the text as a follow-up.
+    FollowUp,
+    /// Pasted at omp's cursor, never submitted (any activity; a draft stays).
+    Insert,
+}
+
+impl ComposeMode {
+    /// What omp must be doing for the job to start.
+    pub fn requires(self) -> Requires {
+        match self {
+            ComposeMode::Send => Requires::Idle,
+            ComposeMode::Steer | ComposeMode::FollowUp => Requires::Busy,
+            ComposeMode::Insert => Requires::Any,
+        }
+    }
+
+    fn submits(self) -> bool {
+        self != ComposeMode::Insert
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Payload {
     /// A slash command typed through the composer (single line, no control characters).
@@ -91,8 +124,15 @@ pub enum Payload {
     Key(Key, Mods),
     /// `Esc`, and a second `Esc` after [`STOP_RETRY`] if the turn still runs.
     Stop,
-    /// Review comments and other multi-line text, written with `Terminal::paste_bytes`.
-    Text { text: String, submit: bool },
+    /// Review comments, typed prompts and other multi-line text, written with
+    /// `Terminal::paste_bytes`. `attach`: quoted file paths (`deck_term::input::encode_dropped_paths`)
+    /// pasted on their own first, as a file drop, so omp attaches the images among them; the text
+    /// follows once omp shows them. Empty `text`: only the attachments.
+    Text {
+        attach: Option<String>,
+        text: String,
+        mode: ComposeMode,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,17 +182,30 @@ impl Job {
     /// keeps a draft, never sends; `submit=true`: **Send**, idle only, the draft is confirmed and
     /// cleared first, then Esc + Enter). The text is sanitized with [`sanitize_text`].
     pub fn text(label: impl Into<String>, text: &str, submit: bool) -> Job {
+        let mode = if submit {
+            ComposeMode::Send
+        } else {
+            ComposeMode::Insert
+        };
+        Job::compose(label, None, text, mode)
+    }
+
+    /// Attachments (already quoted paths, pasted first as their own paste), then `text`, then
+    /// the submit of `mode`. The text and the paths are sanitized with [`sanitize_text`].
+    pub fn compose(
+        label: impl Into<String>,
+        attach: Option<&str>,
+        text: &str,
+        mode: ComposeMode,
+    ) -> Job {
         Job {
             label: label.into(),
             payload: Payload::Text {
+                attach: attach.map(sanitize_text).filter(|a| !a.is_empty()),
                 text: sanitize_text(text),
-                submit,
+                mode,
             },
-            requires: if submit {
-                Requires::Idle
-            } else {
-                Requires::Any
-            },
+            requires: mode.requires(),
         }
     }
 
@@ -200,6 +253,8 @@ pub enum Write {
 const ESC_KEY: Write = Write::Key(Key::Escape, Mods::NONE);
 const ENTER_KEY: Write = Write::Key(Key::Enter, Mods::NONE);
 const CTRL_C_KEY: Write = Write::Key(Key::Char('c'), Mods::CTRL);
+/// omp's follow-up hotkey (`app.message.followUp`, Ctrl+Q: 0x11 in legacy encoding).
+const FOLLOW_UP_KEY: Write = Write::Key(Key::Char('q'), Mods::CTRL);
 
 /// Identity of one pushed job, unique per [`Injector`] (see [`Injector::push`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -298,6 +353,13 @@ enum Stage {
     ClearPending,
     /// The composer must read empty from this instant on (Ctrl+C sent, or nothing to clear).
     Cleared(Instant),
+    /// The attachment paste was written at `at` onto a composer that read `before`; the text
+    /// follows once omp shows a change. `baseline`: the rows below the composer before it.
+    Attached {
+        at: Instant,
+        before: String,
+        baseline: Vec<String>,
+    },
     /// Paste written at `at`; `baseline` = the rows below the empty composer before it.
     /// `settle` = the rows below the composer since it shows the text, and since when.
     Pasted {
@@ -403,6 +465,24 @@ impl Injector {
             self.active = None;
         }
         self.active.is_none()
+    }
+
+    /// Drops the jobs `ids` that have not put a byte into the PTY yet (queued, or running and
+    /// unwritten, such as one waiting for a draft confirmation). True when any was dropped; a
+    /// running job that already wrote is left to finish.
+    pub fn drop_unwritten(&mut self, ids: &[JobId]) -> bool {
+        let before = self.queue.len();
+        self.queue.retain(|(id, _)| !ids.contains(id));
+        let mut dropped = self.queue.len() != before;
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|a| !a.wrote && ids.contains(&a.id))
+        {
+            self.active = None;
+            dropped = true;
+        }
+        dropped
     }
 
     /// Tab closing: true once nothing is left to send, no job is mid-way and the last written byte
@@ -564,9 +644,41 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             Step::Done
         }
         (Payload::Stop, _) => Step::Done,
-        (Payload::Slash(_) | Payload::Text { submit: true, .. }, Stage::Start) => {
-            if let Payload::Text { text, .. } = &a.job.payload
-                && (env.paste)(text).is_none()
+        (
+            Payload::Text {
+                attach,
+                text,
+                mode: ComposeMode::Insert,
+            },
+            Stage::Start,
+        ) => {
+            // Insert: pasted at omp's cursor; a draft stays, nothing is cleared, nothing submitted.
+            let first = attach.as_deref().unwrap_or(text);
+            let Some(bytes) = (env.paste)(first) else {
+                return Step::Dropped(End::NoPaste);
+            };
+            let screen = (env.screen)();
+            let before = match composer::inspect(&screen) {
+                Composer::Missing => return Step::Dropped(End::DialogOpen),
+                Composer::Empty => String::new(),
+                Composer::Draft(draft) => draft,
+            };
+            let single = attach.is_none() || text.is_empty();
+            let baseline = composer::rows_below(&screen).unwrap_or_default();
+            write(a, out, Write::Bytes(bytes));
+            if single {
+                return Step::Done;
+            }
+            a.stage = Stage::Attached {
+                at: now,
+                before,
+                baseline,
+            };
+            Step::Wait(SCREEN_POLL)
+        }
+        (Payload::Slash(_) | Payload::Text { .. }, Stage::Start) => {
+            if let Payload::Text { attach, text, .. } = &a.job.payload
+                && (env.paste)(attach.as_deref().unwrap_or(text)).is_none()
             {
                 return Step::Dropped(End::NoPaste);
             }
@@ -589,22 +701,18 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
         }
         (
             Payload::Text {
-                submit: false,
-                text,
+                mode: ComposeMode::Insert,
+                ..
             },
-            Stage::Start,
-        ) => {
-            // Insert: pasted at omp's cursor; a draft stays, nothing is cleared, nothing submitted.
-            let Some(bytes) = (env.paste)(text) else {
-                return Step::Dropped(End::NoPaste);
-            };
-            if matches!(composer::inspect(&(env.screen)()), Composer::Missing) {
-                return Step::Dropped(End::DialogOpen);
-            }
-            write(a, out, Write::Bytes(bytes));
-            Step::Done
-        }
-        (Payload::Text { submit: false, .. }, _) => Step::Done,
+            Stage::Attached { .. },
+        ) => after_attach(a, env, out),
+        (
+            Payload::Text {
+                mode: ComposeMode::Insert,
+                ..
+            },
+            _,
+        ) => Step::Done,
         (Payload::Slash(_) | Payload::Text { .. }, Stage::AwaitConfirm) => Step::Blocked,
         (Payload::Slash(_) | Payload::Text { .. }, Stage::ClearPending) => {
             let last = [*ctrl_c, env.last_ctrl_c].into_iter().flatten().max();
@@ -632,23 +740,37 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
                     Step::Wait(SCREEN_POLL)
                 };
             }
-            let bytes = match &a.job.payload {
-                Payload::Slash(text) => [PASTE_START, text.as_bytes(), PASTE_END].concat(),
-                Payload::Text { text, .. } => match (env.paste)(text) {
-                    Some(bytes) => bytes,
-                    // The terminal's modes changed since the start: nothing was sent for this paste.
-                    None => return Step::Aborted,
-                },
+            let baseline = composer::rows_below(&screen).unwrap_or_default();
+            let (bytes, attaching) = match &a.job.payload {
+                Payload::Slash(text) => ([PASTE_START, text.as_bytes(), PASTE_END].concat(), false),
+                Payload::Text { attach, text, .. } => {
+                    match (env.paste)(attach.as_deref().unwrap_or(text)) {
+                        Some(bytes) => (bytes, attach.is_some()),
+                        // The terminal's modes changed since the start: nothing was sent for this
+                        // paste.
+                        None => return Step::Aborted,
+                    }
+                }
                 Payload::Key(..) | Payload::Stop => return Step::Done,
             };
-            let baseline = composer::rows_below(&screen).unwrap_or_default();
             write(a, out, Write::Bytes(bytes));
-            a.stage = Stage::Pasted {
-                at: now,
-                baseline,
-                settle: None,
+            a.stage = if attaching {
+                Stage::Attached {
+                    at: now,
+                    before: String::new(),
+                    baseline,
+                }
+            } else {
+                Stage::Pasted {
+                    at: now,
+                    baseline,
+                    settle: None,
+                }
             };
             Step::Wait(SCREEN_POLL)
+        }
+        (Payload::Slash(_) | Payload::Text { .. }, Stage::Attached { .. }) => {
+            after_attach(a, env, out)
         }
         (Payload::Slash(_) | Payload::Text { .. }, Stage::Pasted { .. }) => {
             after_paste(a, env, out)
@@ -679,10 +801,60 @@ fn shows_paste(payload: &Payload, screen: &ScreenText) -> bool {
     }
 }
 
-/// Paste written: once omp shows it, Enter right away (no popup, or omp busy: an `Esc` would
-/// interrupt the turn), else `Esc` to close the popup first.
+/// Attachment paste written: once omp shows it (the composer changed), the text is pasted (an
+/// Insert ends there); without a text the submit check follows at once.
+fn after_attach(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
+    let now = env.now;
+    let Stage::Attached {
+        at,
+        before,
+        baseline,
+    } = &mut a.stage
+    else {
+        return Step::Done;
+    };
+    let shown = match composer::inspect(&(env.screen)()) {
+        Composer::Draft(draft) => draft != *before,
+        Composer::Empty | Composer::Missing => false,
+    };
+    if !shown {
+        return if now >= *at + SHOW_TIMEOUT {
+            Step::Stalled
+        } else {
+            Step::Wait(SCREEN_POLL)
+        };
+    }
+    let baseline = std::mem::take(baseline);
+    let Payload::Text { text, mode, .. } = &a.job.payload else {
+        return Step::Done;
+    };
+    let mode = *mode;
+    if !text.is_empty() {
+        let Some(bytes) = (env.paste)(text) else {
+            return Step::Aborted;
+        };
+        write(a, out, Write::Bytes(bytes));
+    }
+    if !mode.submits() {
+        return Step::Done;
+    }
+    a.stage = Stage::Pasted {
+        at: now,
+        baseline,
+        settle: None,
+    };
+    Step::Wait(SCREEN_POLL)
+}
+
+/// Paste written: once omp shows it, the submit key right away (no popup, or omp busy: an `Esc`
+/// would interrupt the turn), else `Esc` to close the popup first. Steer and follow-up need omp
+/// still working at that moment: an Enter on an idle omp would send the text as a new prompt.
 fn after_paste(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
     let now = env.now;
+    let mode = match &a.job.payload {
+        Payload::Text { mode, .. } => *mode,
+        Payload::Slash(_) | Payload::Key(..) | Payload::Stop => ComposeMode::Send,
+    };
     let Stage::Pasted {
         at,
         baseline,
@@ -699,6 +871,13 @@ fn after_paste(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
             Step::Wait(SCREEN_POLL)
         };
     }
+    let submit = match mode {
+        ComposeMode::Steer | ComposeMode::FollowUp if !env.activity.is_busy() => {
+            return Step::Aborted;
+        }
+        ComposeMode::FollowUp => FOLLOW_UP_KEY,
+        ComposeMode::Send | ComposeMode::Steer | ComposeMode::Insert => ENTER_KEY,
+    };
     let popup = if env.activity == Activity::Idle {
         let below = composer::rows_below(&screen).unwrap_or_default();
         match settle {
@@ -724,7 +903,7 @@ fn after_paste(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
             Step::Wait(AFTER_ESC)
         }
         None => {
-            write(a, out, ENTER_KEY);
+            write(a, out, submit);
             Step::Done
         }
     }
@@ -880,8 +1059,9 @@ mod tests {
                     self.draft.clear();
                     self.popup = false;
                 }
-                // Like omp: Ctrl+C empties the composer but leaves a stale popup on screen.
-                Write::Key(Key::Char('c'), m) if m.ctrl => self.draft.clear(),
+                // Like omp: Ctrl+C empties the composer but leaves a stale popup on screen;
+                // Ctrl+Q queues the draft as a follow-up.
+                Write::Key(Key::Char('c' | 'q'), m) if m.ctrl => self.draft.clear(),
                 Write::Key(..) => {}
             }
         }
@@ -1401,8 +1581,9 @@ mod tests {
         assert_eq!(
             job.payload,
             Payload::Text {
+                attach: None,
                 text: "a\nb\tc[201~\nde".to_owned(),
-                submit: true
+                mode: ComposeMode::Send,
             }
         );
         assert_eq!(job.requires, Requires::Idle);
@@ -1522,5 +1703,181 @@ mod tests {
         let p = fx.poll(&mut inj, 200);
         assert_eq!(p.aborted(), vec!["Send review".to_owned()]);
         assert!(p.writes.is_empty() && p.completed().is_empty());
+    }
+
+    // ---- Payload::Text with ComposeMode (steer, follow-up, attachments)
+
+    const ATTACH: &str = "/data/attachments/dev/0123456789abcdef-shot.png";
+
+    fn drain_ended(fx: &mut Fixture, inj: &mut Injector) -> (Vec<Write>, Vec<(String, End)>) {
+        let mut writes = Vec::new();
+        let mut ended = Vec::new();
+        for t in (0..5_000).step_by(10) {
+            let p = fx.poll(inj, t);
+            writes.extend(p.writes);
+            ended.extend(p.ended.into_iter().map(|e| (e.label, e.end)));
+        }
+        (writes, ended)
+    }
+
+    #[test]
+    fn compose_modes_require_the_right_activity() {
+        assert_eq!(
+            Job::compose("s", None, "x", ComposeMode::Steer).requires,
+            Requires::Busy
+        );
+        assert_eq!(
+            Job::compose("f", None, "x", ComposeMode::FollowUp).requires,
+            Requires::Busy
+        );
+        assert_eq!(
+            Job::compose("p", None, "x", ComposeMode::Send).requires,
+            Requires::Idle
+        );
+        assert_eq!(
+            Job::compose("i", None, "x", ComposeMode::Insert).requires,
+            Requires::Any
+        );
+        // Control characters in the paths cannot end the paste early either.
+        let job = Job::compose("s", Some("/a\u{1b}[201~b"), "x", ComposeMode::Send);
+        assert!(matches!(job.payload, Payload::Text { attach: Some(a), .. } if a == "/a[201~b"));
+    }
+
+    #[test]
+    fn steer_pastes_then_enters_while_omp_works_and_never_escapes() {
+        let mut fx = Fixture::new();
+        fx.activity = Activity::Busy;
+        let mut inj = Injector::default();
+        inj.push(Job::compose("Steer", None, "go left", ComposeMode::Steer));
+        let (writes, ended) = drain_ended(&mut fx, &mut inj);
+        assert_eq!(writes, vec![paste("go left"), ENTER_KEY]);
+        assert_eq!(ended, vec![("Steer".to_owned(), End::Completed)]);
+    }
+
+    #[test]
+    fn follow_up_pastes_then_sends_ctrl_q() {
+        let mut fx = Fixture::new();
+        fx.activity = Activity::Busy;
+        let mut inj = Injector::default();
+        inj.push(Job::compose(
+            "Follow-up",
+            None,
+            "then tests",
+            ComposeMode::FollowUp,
+        ));
+        let (writes, _) = drain_ended(&mut fx, &mut inj);
+        assert_eq!(writes, vec![paste("then tests"), FOLLOW_UP_KEY]);
+        assert!(!writes.contains(&ENTER_KEY) && !writes.contains(&ESC_KEY));
+    }
+
+    #[test]
+    fn steer_is_refused_while_idle() {
+        let mut fx = Fixture::new();
+        let mut inj = Injector::default();
+        inj.push(Job::compose("Steer", None, "x", ComposeMode::Steer));
+        let p = fx.poll(&mut inj, 0);
+        assert_eq!(p.refused(), vec![("Steer".to_owned(), Requires::Busy)]);
+        assert!(p.writes.is_empty());
+    }
+
+    /// The turn ended between the paste and the submit: an Enter now would send the text as a
+    /// new prompt instead of steering, so nothing follows the paste.
+    #[test]
+    fn steer_is_abandoned_when_the_turn_ends_before_the_submit() {
+        let mut fx = Fixture::new();
+        fx.activity = Activity::Busy;
+        let mut inj = Injector::default();
+        inj.push(Job::compose("Steer", None, "go left", ComposeMode::Steer));
+        let p = fx.poll(&mut inj, 0);
+        assert_eq!(p.writes, vec![paste("go left")]);
+        fx.activity = Activity::Idle;
+        let p = fx.poll(&mut inj, 100);
+        assert_eq!(p.aborted(), vec!["Steer".to_owned()]);
+        assert!(p.writes.is_empty());
+    }
+
+    /// A draft is confirmed and cleared with Ctrl+C (safe mid-turn), never with Esc.
+    #[test]
+    fn steer_clears_a_confirmed_draft_with_ctrl_c_only() {
+        let mut fx = Fixture::new();
+        fx.activity = Activity::Busy;
+        fx.draft = "unsent".into();
+        let mut inj = Injector::default();
+        inj.push(Job::compose("Steer", None, "go left", ComposeMode::Steer));
+        let p = fx.poll(&mut inj, 0);
+        assert_eq!(p.confirm.map(|c| c.draft), Some("unsent".to_owned()));
+        inj.answer(true);
+        let (writes, _) = drain_ended(&mut fx, &mut inj);
+        assert_eq!(writes, vec![CTRL_C_KEY, paste("go left"), ENTER_KEY]);
+    }
+
+    #[test]
+    fn attachments_are_their_own_paste_before_the_text() {
+        let mut fx = Fixture::new();
+        fx.paste_opens_popup = false;
+        let mut inj = Injector::default();
+        inj.push(Job::compose(
+            "Send prompt",
+            Some(ATTACH),
+            "what is this?",
+            ComposeMode::Send,
+        ));
+        let (writes, ended) = drain_ended(&mut fx, &mut inj);
+        assert_eq!(
+            writes,
+            vec![paste(ATTACH), paste("what is this?"), ENTER_KEY]
+        );
+        assert_eq!(ended, vec![("Send prompt".to_owned(), End::Completed)]);
+    }
+
+    #[test]
+    fn attachments_alone_are_submitted_too() {
+        let mut fx = Fixture::new();
+        fx.paste_opens_popup = false;
+        let mut inj = Injector::default();
+        inj.push(Job::compose(
+            "Send prompt",
+            Some(ATTACH),
+            "",
+            ComposeMode::Send,
+        ));
+        let (writes, _) = drain_ended(&mut fx, &mut inj);
+        assert_eq!(writes, vec![paste(ATTACH), ENTER_KEY]);
+    }
+
+    #[test]
+    fn insert_with_attachments_keeps_the_draft_and_never_submits() {
+        let mut fx = Fixture::new();
+        fx.paste_opens_popup = false;
+        fx.activity = Activity::Busy;
+        fx.draft = "draft ".into();
+        let mut inj = Injector::default();
+        inj.push(Job::compose(
+            "Insert",
+            Some(ATTACH),
+            "look",
+            ComposeMode::Insert,
+        ));
+        let (writes, ended) = drain_ended(&mut fx, &mut inj);
+        assert_eq!(writes, vec![paste(ATTACH), paste("look")]);
+        assert_eq!(ended, vec![("Insert".to_owned(), End::Completed)]);
+        assert_eq!(fx.draft, format!("draft {ATTACH}look"));
+    }
+
+    #[test]
+    fn an_attachment_omp_never_shows_stalls_before_the_text() {
+        let mut fx = Fixture::new();
+        fx.paste_opens_popup = false;
+        fx.react = false;
+        let mut inj = Injector::default();
+        inj.push(Job::compose(
+            "Send prompt",
+            Some(ATTACH),
+            "x",
+            ComposeMode::Send,
+        ));
+        let (writes, ended) = drain_ended(&mut fx, &mut inj);
+        assert_eq!(writes, vec![paste(ATTACH)]);
+        assert_eq!(ended, vec![("Send prompt".to_owned(), End::Stalled)]);
     }
 }

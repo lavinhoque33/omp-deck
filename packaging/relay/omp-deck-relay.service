@@ -1,0 +1,88 @@
+# omp-deck-relay: self-hosted relay for the OmpDeck mobile companion (docs/relay.md).
+#
+# Install: copy the binary to /usr/local/bin/omp-deck-relay, this file to
+# /etc/systemd/system/omp-deck-relay.service, then `systemctl enable --now omp-deck-relay`.
+# The phone app: copy the release archive's web/ to /usr/share/omp-deck-relay/web (a web/ next to
+# the binary is found too); anywhere else, pass it with --web-dir (drop-in below). The
+# directory must be readable by the dynamic user (world-readable files) and is read at startup:
+# restart after updating it. Without one the relay serves no app (logged once at startup).
+# It listens on 127.0.0.1:8080 behind a TLS reverse proxy (Caddyfile.example, nginx.conf.example).
+# --trust-forwarded-for honours X-Forwarded-For from loopback peers only (the proxy on this host);
+# any local user can connect from loopback too and forge it, so on a shared host its per-IP limits
+# are only as good as the local users. A proxy elsewhere needs --trusted-proxy <ip or cidr>; the
+# in-process TLS example below must not use --trust-forwarded-for (refused).
+#
+# Enroll rooms as the same dynamic user, so rooms.json stays readable by the service:
+#   sudo systemd-run --pipe --wait --quiet -p DynamicUser=yes -p User=omp-deck-relay \
+#     -p StateDirectory=omp-deck-relay \
+#     /usr/local/bin/omp-deck-relay enroll --state-dir /var/lib/omp-deck-relay --label phone
+#
+# Local changes go into a drop-in (`systemctl edit omp-deck-relay`), e.g. in-process TLS on :443:
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/local/bin/omp-deck-relay serve --listen [::]:443 \
+#     --state-dir /var/lib/omp-deck-relay --tls-cert /etc/omp-deck-relay/cert.pem \
+#     --tls-key /etc/omp-deck-relay/key.pem
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# (the key must be readable by the dynamic user: use LoadCredential= or a group-readable file).
+# Serving the phone app from a custom directory, e.g. /opt/omp-deck-relay/web:
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/local/bin/omp-deck-relay serve --listen 127.0.0.1:8080 --trust-forwarded-for \
+#     --state-dir /var/lib/omp-deck-relay --web-dir /opt/omp-deck-relay/web
+
+[Unit]
+Description=OmpDeck relay (omp-deck-relay)
+Documentation=https://github.com/lavinhoque33/omp-deck/blob/main/docs/relay.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/omp-deck-relay serve --listen 127.0.0.1:8080 --trust-forwarded-for --state-dir /var/lib/omp-deck-relay
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2s
+# Graceful stop closes every socket (GOING_AWAY) and exits within 5 s.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+# 1024 WebSocket connections by default, plus proxy/health connections.
+LimitNOFILE=4096
+
+DynamicUser=yes
+User=omp-deck-relay
+StateDirectory=omp-deck-relay
+StateDirectoryMode=0700
+UMask=0077
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -1089,6 +1089,7 @@ mod tests {
             intent: None,
             summary: "ls".to_owned(),
             args: String::new(),
+            args_value: None,
         }
     }
 
@@ -1099,6 +1100,8 @@ mod tests {
             text: "out".to_owned(),
             is_error,
             truncated: false,
+            details: None,
+            images: Vec::new(),
         }
     }
 

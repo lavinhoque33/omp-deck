@@ -48,7 +48,23 @@ jobs:
         env:
           OMP_DECK_GOOGLE_CLIENT_ID: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_ID }}
           OMP_DECK_GOOGLE_CLIENT_SECRET: ${{ secrets.OMP_DECK_GOOGLE_CLIENT_SECRET }}
-        run: cargo build --release -p omp-deck -p deck-host -p deck-service --locked
+        run: cargo build --release -p omp-deck -p deck-host -p deck-service -p deck-relay --locked
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Relay archive (relay binary + phone app)
+        run: |
+          (cd pwa && bun install --frozen-lockfile && bun run build)
+          stage="omp-deck-relay-${VERSION}-x86_64-linux"
+          mkdir -p "dist/$stage"
+          install -m 0755 target/release/omp-deck-relay "dist/$stage/"
+          cp -r pwa/dist "dist/$stage/web"
+          cp packaging/relay/omp-deck-relay.service docs/relay.md LICENSE-MIT LICENSE-APACHE \
+            pwa/THIRD_PARTY_LICENSES "dist/$stage/"
+          tar -C dist --owner=0 --group=0 --sort=name -czf "dist/$stage.tar.gz" "$stage"
+          rm -rf "dist/$stage"
 
       - name: Validate desktop file
         run: desktop-file-validate packaging/omp-deck.desktop

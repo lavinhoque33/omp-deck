@@ -10,6 +10,8 @@
 //! - [`lifetime`]: modes, OS supervision (`omp-deck-gateway supervise`) and the maintenance barrier.
 //! - [`running`]: which backend sessions are alive and what they hold.
 //! - [`desktop`]: the OS notification adapter (delivery and activation, never classification).
+//! - [`remote`]: mobile access: the gateway key, relay settings, paired devices, the pairing
+//!   window and the relay link thread.
 //!
 //! Identity: one owner per user and base host namespace ([`GatewayId`]). The profile (settings
 //! file, sessions root) is part of the handshake, not of the identity: a client with another
@@ -25,6 +27,8 @@ pub mod jobs;
 pub mod journal;
 pub mod lifetime;
 pub mod protocol;
+pub mod push;
+pub mod remote;
 pub mod running;
 pub mod server;
 mod wire;
@@ -115,6 +119,19 @@ impl Profile {
         gateway_root(&self.app_root()).join(self.id().as_str())
     }
 
+    /// Where the mobile secrets live (`remote.key`, `relay.json`, `devices.json`,
+    /// `relay-epoch`): device-local, never in a roaming profile. Unix: [`Profile::state_dir`].
+    /// Windows: the state dir moved from Roaming to Local AppData when the app root lies under
+    /// `%APPDATA%` (the default profile: `%LOCALAPPDATA%\omp-deck\gateway\<id>`); a profile
+    /// rooted elsewhere (tests, a custom settings path) keeps them in its own state dir.
+    pub fn secrets_dir(&self) -> PathBuf {
+        #[cfg(windows)]
+        let (roaming, local) = (dirs::config_dir(), dirs::data_local_dir());
+        #[cfg(not(windows))]
+        let (roaming, local) = (None, None);
+        gateway_root(&local_root(&self.app_root(), roaming, local)).join(self.id().as_str())
+    }
+
     /// `true` when both name the same files (paths compared as given and canonicalized; a file
     /// that does not exist yet, like a fresh `state.json`, is compared through its directory).
     pub fn same_as(&self, other: &Profile) -> bool {
@@ -140,9 +157,26 @@ pub fn gateway_root(app_root: &Path) -> PathBuf {
     app_root.join("gateway")
 }
 
+/// `app_root` moved from the `roaming` base to the `local` base when it lies under `roaming`;
+/// otherwise (or without both bases) `app_root` itself.
+fn local_root(app_root: &Path, roaming: Option<PathBuf>, local: Option<PathBuf>) -> PathBuf {
+    match (roaming, local) {
+        (Some(roaming), Some(local)) => app_root
+            .strip_prefix(&roaming)
+            .map_or_else(|_| app_root.to_path_buf(), |rest| local.join(rest)),
+        _ => app_root.to_path_buf(),
+    }
+}
+
 /// Creates `dir` (and parents) owner-only.
 pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     deck_core::platform::create_private_dir_all(dir)
+}
+
+/// Creates the secrets dir (and parents) with [`deck_core::platform::create_secret_dir_all`]:
+/// owner-only on Unix, a protected user + SYSTEM access list on Windows.
+pub(crate) fn secret_dir(dir: &Path) -> io::Result<()> {
+    deck_core::platform::create_secret_dir_all(dir)
 }
 
 /// Writes `bytes` to `path` owner-only and atomically.
@@ -576,6 +610,42 @@ mod tests {
             p("/a/state.json").state_dir(),
             PathBuf::from("/a/gateway").join(a.as_str())
         );
+    }
+
+    #[test]
+    fn secrets_leave_the_roaming_profile_but_injected_roots_keep_them() {
+        let roaming = PathBuf::from("/u/AppData/Roaming");
+        let local = PathBuf::from("/u/AppData/Local");
+        let bases = || (Some(roaming.clone()), Some(local.clone()));
+        // The default profile: `%APPDATA%\omp-deck` → `%LOCALAPPDATA%\omp-deck`.
+        let (r, l) = bases();
+        assert_eq!(
+            local_root(&roaming.join("omp-deck"), r, l),
+            local.join("omp-deck")
+        );
+        // A profile rooted elsewhere (a test sandbox) never reaches the real Local AppData.
+        let (r, l) = bases();
+        assert_eq!(
+            local_root(Path::new("/tmp/sandbox/config/omp-deck"), r, l),
+            PathBuf::from("/tmp/sandbox/config/omp-deck")
+        );
+        // A sibling that merely shares the textual prefix is not under Roaming.
+        let (r, l) = bases();
+        assert_eq!(
+            local_root(Path::new("/u/AppData/RoamingX/omp-deck"), r, l),
+            PathBuf::from("/u/AppData/RoamingX/omp-deck")
+        );
+        assert_eq!(
+            local_root(&roaming.join("omp-deck"), None, Some(local.clone())),
+            roaming.join("omp-deck")
+        );
+        // Tests' profiles find the secrets in the state dir on every platform.
+        let p = Profile {
+            host_namespace: "omp-deck".into(),
+            settings: PathBuf::from("/tmp/sandbox/config/omp-deck/state.json"),
+            sessions_root: PathBuf::from("/r"),
+        };
+        assert_eq!(p.secrets_dir(), p.state_dir());
     }
 
     #[test]

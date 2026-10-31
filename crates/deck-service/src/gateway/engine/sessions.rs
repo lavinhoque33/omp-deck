@@ -57,6 +57,8 @@ pub(super) struct LaunchJob {
     /// Startup re-attach: only if the backend session still exists.
     pub(super) restore: bool,
     pub(super) tool: Option<Tool>,
+    /// A paired device's launch: its folder must still lead inside these when prepared.
+    pub(super) confine: Option<crate::gateway::jobs::Confine>,
 }
 
 /// A launch prepared on a worker.
@@ -81,7 +83,7 @@ pub(super) struct CopyWatch {
 
 /// The live-control client of a session (while followed, or while a command waits on it).
 pub(super) struct LiveLink {
-    client: CtlClient,
+    pub(super) client: CtlClient,
     queued: Vec<(RequestKey, CtlCommand, Instant)>,
     pending: HashMap<u64, RequestKey>,
     seen: (bool, Option<Arc<LiveSnapshot>>),
@@ -124,6 +126,16 @@ impl Managed {
     /// The folder omp runs in now (its breadcrumb), else the one it was launched in.
     pub(super) fn current_cwd(&self) -> &Path {
         self.live_cwd.as_deref().unwrap_or(&self.cwd)
+    }
+
+    /// The folder omp last reported, if any.
+    pub(super) fn live_cwd(&self) -> Option<&Path> {
+        self.live_cwd.as_deref()
+    }
+
+    /// The view owning focus and geometry.
+    pub(super) fn controlling(&self) -> Option<u64> {
+        self.controlling
     }
 
     pub(super) fn display_label(&self) -> String {
@@ -197,6 +209,11 @@ impl Sessions {
         self.launching.is_some() || !self.launches.is_empty()
     }
 
+    /// The manifest is written again (a session's re-launch folder changed).
+    pub(super) fn touch_manifest(&mut self) {
+        self.manifest_dirty = true;
+    }
+
     pub(super) fn busy_controllers(&self) -> usize {
         self.managed.iter().filter(|m| m.ctl.is_busy()).count()
     }
@@ -226,6 +243,20 @@ impl Sessions {
 
     pub(super) fn queue(&mut self, job: LaunchJob) {
         self.launches.push_back(job);
+    }
+
+    /// Removes the queued launches `client` asked for (not one already being prepared) and
+    /// returns their keys; the others keep their order.
+    pub(super) fn take_launches_of(&mut self, client: &str) -> Vec<RequestKey> {
+        let mut taken = Vec::new();
+        self.launches.retain_mut(|j| match &j.key {
+            Some(k) if k.client == client => {
+                taken.extend(j.key.take());
+                false
+            }
+            _ => true,
+        });
+        taken
     }
 }
 
@@ -441,13 +472,28 @@ impl Engine {
         let Some(Attach { target, view: role }) = hello.attach else {
             return Err(Refusal::NotAllowed("not a view".to_owned()));
         };
+        self.attach_view(view, target, role, side, None)
+            .map_err(|current| Refusal::Stale { current })?;
+        Ok(self.welcome())
+    }
+
+    /// Registers view `view` of `target` (`owner`: the device link it belongs to). `Err` holds
+    /// the session's current target when `target` is not current.
+    pub(super) fn attach_view(
+        &mut self,
+        view: u64,
+        target: SessionTarget,
+        role: ViewRole,
+        side: Arc<ViewSide>,
+        owner: Option<u64>,
+    ) -> Result<(), Option<SessionTarget>> {
         let found = self.sess.find(&target.key);
         let current = found.map(|i| self.sess.managed[i].ctl.target().clone());
         let Some(i) = found.filter(|_| target.epoch == self.epoch) else {
-            return Err(Refusal::Stale { current });
+            return Err(current);
         };
         if current.as_ref() != Some(&target) {
-            return Err(Refusal::Stale { current });
+            return Err(current);
         }
         let notify: deck_term::OutputNotify = {
             let weak: Weak<ViewSide> = Arc::downgrade(&side);
@@ -461,14 +507,16 @@ impl Engine {
         let sub = Arc::new(m.ctl.terminal().subscribe_output(notify));
         if role == ViewRole::Controlling {
             // The previous controlling view keeps typing; focus, geometry and the clipboard
-            // move to the new one.
+            // move to the new one (a device has no clipboard: it gets focus and geometry).
             if let Some(prev) = m.controlling.replace(view)
                 && let Some(pv) = self.views.get_mut(&prev)
             {
                 pv.role = ViewRole::Input;
                 pv.sub.set_clipboard_owner(false);
             }
-            sub.set_clipboard_owner(true);
+            if owner.is_none() {
+                sub.set_clipboard_owner(true);
+            }
         }
         m.ctl.terminal().set_visible(true);
         side.set_subscription(sub.clone());
@@ -479,10 +527,11 @@ impl Engine {
                 target,
                 role,
                 sub,
+                owner,
             },
         );
         self.dirty.controllers = true;
-        Ok(self.welcome())
+        Ok(())
     }
 
     pub(super) fn on_view_op(&mut self, view: u64, op: ViewOp) {
@@ -573,13 +622,16 @@ impl Engine {
 
     /// A client that left will never answer: its draft confirmations are declined.
     pub(super) fn decline_confirmations(&mut self, client: &str) {
+        // Commands a worktree flow typed for this client are its to confirm too.
+        let flows = self.worktree_owned(client);
         for m in &mut self.sess.managed {
             let target = m.ctl.target().clone();
             let ids: Vec<_> = m
                 .ctl
                 .requests()
                 .filter(|r| {
-                    r.key.client == client && matches!(r.delivery, Delivery::AwaitingConfirm { .. })
+                    (r.key.client == client || flows.contains(&r.key))
+                        && matches!(r.delivery, Delivery::AwaitingConfirm { .. })
                 })
                 .map(|r| r.id)
                 .collect();
@@ -588,6 +640,30 @@ impl Engine {
             }
         }
         self.dirty.controllers = true;
+    }
+
+    /// Client `client` lost the right to run commands (a paired device revoked, or its
+    /// `control` lowered): its controller requests that have not written a byte yet (draft
+    /// confirmations included) and its queued launches are cancelled and journaled so. Work
+    /// already writing, or a launch already starting, finishes.
+    pub(super) fn cancel_client_work(&mut self, client: &str) {
+        let mut cancelled = false;
+        for m in &mut self.sess.managed {
+            cancelled |= m.ctl.cancel_client(client);
+        }
+        let gone = self.sess.take_launches_of(client);
+        if !gone.is_empty() {
+            self.sync_ctl_keep();
+        }
+        for key in gone {
+            self.job_finished(key, Err::<Box<Done>, _>(GatewayError::Cancelled));
+        }
+        self.cancel_worktree_work(client);
+        if cancelled {
+            // Their ends reach the journal and the clients on the next tick.
+            self.dirty.controllers = true;
+            self.waker.now();
+        }
     }
 
     // ---- model observations -------------------------------------------------------------------
@@ -709,16 +785,24 @@ impl Engine {
             let Some(record) = d.record else {
                 continue;
             };
+            // A worktree flow's typed command reports to the client that started the flow.
+            let client = self
+                .worktree
+                .owner(&record.key)
+                .unwrap_or(&record.key.client)
+                .to_owned();
             self.to_client(
-                &record.key.client,
+                &client,
                 &ServerEvent::Controller {
                     target: d.target.clone(),
                     event: d.event.clone(),
                 },
             );
-            if matches!(d.event, crate::controller::ControllerEvent::Ended { .. })
-                && self.sess.submits.remove(&record.key).is_some()
-            {
+            if !matches!(d.event, crate::controller::ControllerEvent::Ended { .. }) {
+                continue;
+            }
+            self.worktree_request_ended(&record);
+            if self.sess.submits.remove(&record.key).is_some() {
                 let key = record.key.clone();
                 self.finish_journal(&key, Outcome::Done(Box::new(Done::Submitted(record))));
             }
@@ -976,6 +1060,7 @@ impl Engine {
             exact: true,
             restore: false,
             tool: m.tool.clone(),
+            confine: None,
         };
         self.remove_session(i, ViewEnd::Stale, Instant::now());
         self.sess.queue(job);
@@ -1092,6 +1177,12 @@ impl Engine {
             }
         }
         for (key, result) in finished {
+            let answer_ui = self.jobs.get(&key).is_some_and(|j| j.label == "answer-ui");
+            let result = if answer_ui {
+                answer_ui_result(result)
+            } else {
+                result
+            };
             self.job_finished(key, result);
         }
         for key in changed {
@@ -1210,7 +1301,7 @@ impl Engine {
         let gui = self
             .conns
             .values()
-            .filter(|c| c.role == Role::Gui && c.state.active.is_some())
+            .filter(|c| c.is(Role::Gui) && c.state.active.is_some())
             .max_by_key(|c| (c.state.focused, c.seq));
         let found = gui
             .and_then(|c| c.state.active.as_ref())
@@ -1303,6 +1394,28 @@ impl Engine {
     fn mux_for(&self, snap: &crate::gateway::running::RunningSnapshot, name: &str) -> Option<Mux> {
         let owner = snap.owner_of(name).and_then(|k| self.backends.of_kind(k));
         owner.or_else(|| self.backends.primary()).cloned()
+    }
+
+    /// Removes the exited controllers of session file `path` (or backend session `name`), so a
+    /// launch for it starts a process instead of resolving to the dead one in `existing_for`.
+    pub(super) fn drop_exited_for(&mut self, path: &Path, name: Option<&str>) {
+        let now = Instant::now();
+        let dead: Vec<usize> = self
+            .sess
+            .managed
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.exited()
+                    && (m.ctl.session_path() == Some(path)
+                        || (name.is_some() && m.mux_name.as_deref() == name))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for i in dead.into_iter().rev() {
+            let session = self.remove_session(i, ViewEnd::Closed, now);
+            log::debug!("replacing the exited {session}");
+        }
     }
 
     fn existing_for(&self, spec: &LaunchSpec, name: Option<&str>) -> Option<SessionTarget> {
@@ -1543,6 +1656,7 @@ impl Engine {
                 exact: true,
                 restore: true,
                 tool: None,
+                confine: None,
             });
         }
         self.sess.manifest_dirty = true;
@@ -1605,6 +1719,23 @@ struct CwdProbe {
     session_path: Option<PathBuf>,
 }
 
+/// The result of an `AnswerUi` from the extension's reply: answered, already gone (the dialog
+/// closed meanwhile), or refused with its reason.
+fn answer_ui_result(result: Result<Done, GatewayError>) -> Result<Done, GatewayError> {
+    match result {
+        Ok(Done::Ctl(reply)) if reply.ok => Ok(Done::Answered(true)),
+        Ok(Done::Ctl(reply)) if reply.error.as_deref() == Some("no such request") => {
+            Ok(Done::Answered(false))
+        }
+        Ok(Done::Ctl(reply)) => {
+            Err(GatewayError::Failed(reply.error.unwrap_or_else(|| {
+                "the session refused the answer".to_owned()
+            })))
+        }
+        other => other,
+    }
+}
+
 /// The folder omp wrote to the session's terminal breadcrumb, when the breadcrumb belongs to
 /// the pane's current process (written since it started) or names the session's own file (not
 /// a previous owner of the pty). Blocking.
@@ -1623,7 +1754,7 @@ fn read_live_cwd(p: &CwdProbe, agent_dir: &Path) -> Option<PathBuf> {
 
 /// Worker: control dir and environment, the resolved argv and the backend launch.
 fn prepare(
-    job: LaunchJob,
+    mut job: LaunchJob,
     name: Option<String>,
     ctl_key: Option<String>,
     mux: Option<Mux>,
@@ -1645,6 +1776,23 @@ fn prepare(
             launch: Err("the session ended".to_owned()),
             gone: true,
         };
+    }
+    // A device's folder must still lead inside its roots here, where it is used.
+    if let Some(c) = &job.confine {
+        match c.admit(&job.spec.cwd) {
+            Ok(cwd) => job.spec.cwd = cwd,
+            Err(e) => {
+                return Prepared {
+                    job,
+                    name,
+                    ctl_key: None,
+                    created,
+                    mux,
+                    launch: Err(e.to_string()),
+                    gone: false,
+                };
+            }
+        }
     }
     let ctl_key = ctl_key.and_then(|key| match prepare_ctl_dir(&ctl_dir(&ns, &key)) {
         Ok(()) => Some(key),
@@ -1697,6 +1845,81 @@ fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ui_answer_reply_becomes_answered_gone_or_refused() {
+        let reply = |ok: bool, error: Option<&str>| {
+            Ok(Done::Ctl(deck_core::ctl::CtlReply {
+                ok,
+                error: error.map(str::to_owned),
+                new_file: None,
+                leaf: None,
+            }))
+        };
+        assert!(matches!(
+            answer_ui_result(reply(true, None)),
+            Ok(Done::Answered(true))
+        ));
+        assert!(matches!(
+            answer_ui_result(reply(false, Some("no such request"))),
+            Ok(Done::Answered(false))
+        ));
+        assert!(matches!(
+            answer_ui_result(reply(false, Some("bad value"))),
+            Err(GatewayError::Failed(m)) if m == "bad value"
+        ));
+        assert!(matches!(
+            answer_ui_result(reply(false, None)),
+            Err(GatewayError::Failed(m)) if m == "the session refused the answer"
+        ));
+        assert!(matches!(
+            answer_ui_result(Err(GatewayError::Cancelled)),
+            Err(GatewayError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn a_client_losing_its_rights_loses_only_its_own_queued_launches() {
+        let job = |label: &str, key: Option<(&str, u64)>| LaunchJob {
+            spec: LaunchSpec {
+                mux_name: None,
+                cwd: PathBuf::from("/p"),
+                session_path: None,
+                label: label.into(),
+                argv: omp_argv(None),
+                role: SessionRole::Session,
+                copy_of: None,
+            },
+            key: key.map(|(client, seq)| RequestKey {
+                client: client.into(),
+                seq,
+            }),
+            exact: false,
+            restore: false,
+            tool: None,
+            confine: None,
+        };
+        let mut sess = Sessions::new(PathBuf::from("/nowhere/sessions.json"));
+        sess.queue(job("phone 1", Some(("d-phone", 1))));
+        sess.queue(job("desk", Some(("gui", 1))));
+        sess.queue(job("re-attach", None));
+        sess.queue(job("phone 2", Some(("d-phone", 2))));
+        let taken = sess.take_launches_of("d-phone");
+        assert_eq!(
+            taken
+                .iter()
+                .map(|k| (k.client.as_str(), k.seq))
+                .collect::<Vec<_>>(),
+            [("d-phone", 1), ("d-phone", 2)]
+        );
+        let left: Vec<&str> = sess
+            .launches
+            .iter()
+            .map(|j| j.spec.label.as_str())
+            .collect();
+        assert_eq!(left, ["desk", "re-attach"]);
+        assert!(sess.take_launches_of("d-phone").is_empty());
+    }
 
     #[test]
     fn a_session_follows_its_only_open_file_and_adopts_the_first_when_unknown() {

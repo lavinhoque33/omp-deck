@@ -15,8 +15,8 @@ use deck_service::controller::{Command as ControlCommand, Delivery, Runtime};
 use deck_service::gateway::Profile;
 use deck_service::gateway::client::{GatewayClient, GatewayOptions, Link};
 use deck_service::gateway::protocol::{
-    Answer, ControllerInfo, Done, LaunchSpec, Mutation, Outcome, Query, Role, SessionRole, Topic,
-    TopicValue,
+    Answer, ControllerInfo, Done, GatewayError, LaunchSpec, Mutation, Outcome, Query, Role,
+    SessionRole, Topic, TopicValue,
 };
 use deck_service::session_actions::Action;
 
@@ -377,6 +377,38 @@ fn headless_gateway_controls_real_omp_without_a_gui() {
             .find(|c| c.target == target && c.title.as_deref().is_some_and(|t| t.contains(title)))
             .map(|_| ())
     });
+
+    // Journal lookups and job cancels are limited to the client's own request keys.
+    let other = sb.client();
+    up(&other);
+    assert_ne!(other.client_id(), client.client_id());
+    let refused = |r: Option<Result<_, GatewayError>>, what: &str| match r {
+        Some(Err(GatewayError::Refused(_))) => {}
+        other => panic!("{what} of a foreign key: {other:?}"),
+    };
+    refused(
+        other
+            .outcome(rename.key.clone())
+            .wait(Duration::from_secs(10))
+            .map(|r| r.map(|_| ())),
+        "outcome",
+    );
+    refused(
+        other
+            .mutate(Mutation::CancelJob(rename.key.clone()))
+            .accepted
+            .wait(Duration::from_secs(10))
+            .map(|r| r.map(|_| ())),
+        "cancel",
+    );
+    match client
+        .outcome(rename.key.clone())
+        .wait(Duration::from_secs(10))
+    {
+        Some(Ok(Outcome::Done(_))) => {}
+        r => panic!("own outcome lookup: {r:?}"),
+    }
+    drop(other);
 
     // The owner is lost (SIGKILL): the backend session survives and a new owner adopts it.
     drop(client);
