@@ -24,8 +24,8 @@ use crate::icons::{
 use crate::theme::{self, Palette};
 use crate::usage_fmt::{long_date, money, requests};
 use crate::usage_state::{
-    AccountGroup, AccountRow, ActivityView, CARD_ROWS, CardView, DetailBlock, DraftRow, Load,
-    ModelRow, NoDataWarning, QuotaRow, Summary, Tile, account_policies, merged_draft,
+    AccountGroup, AccountRow, ActivityView, CARD_ROWS, CardView, DetailBlock, DraftRow, KeyGroup,
+    Load, ModelRow, NoDataWarning, QuotaRow, Summary, Tile, account_policies, merged_draft,
 };
 use crate::widgets::{DraftButton, DraftKind, Spin, empty_state, icon_text, paint_icon, stepper};
 
@@ -1037,6 +1037,10 @@ among the rest, the higher one here goes first. A session keeps its account unti
 its reserve, or a higher account has more than its reclaim level left. A pinned tab stays on its \
 account until that is rate-limited.";
 
+const KEYS_NOTE: &str = "omp chooses among API keys by itself on every request: used-up or \
+rate-limited keys are skipped and, where omp measures quotas, the key with more room left goes \
+first. Account order and pinning only work for OAuth logins.";
+
 fn accounts(ui: &mut Ui, st: &mut ViewState, input: &ViewInput<'_>, out: &mut Vec<UsageAction>) {
     let pal = Palette::of_ui(ui);
     match input.load {
@@ -1058,8 +1062,11 @@ fn accounts(ui: &mut Ui, st: &mut ViewState, input: &ViewInput<'_>, out: &mut Ve
     if let Some(e) = input.error {
         error_strip(ui, e, out);
     }
-    ui.add(egui::Label::new(RichText::new(ROUTING_NOTE).small().color(pal.weak)).wrap());
-    if summary.accounts.is_empty() {
+    // The routing note is about OAuth accounts; API-key groups carry their own.
+    if !summary.accounts.is_empty() || summary.keys.is_empty() {
+        ui.add(egui::Label::new(RichText::new(ROUTING_NOTE).small().color(pal.weak)).wrap());
+    }
+    if summary.accounts.is_empty() && summary.keys.is_empty() {
         empty_state(
             ui,
             ICON_KEY_ROUND,
@@ -1072,6 +1079,56 @@ fn accounts(ui: &mut Ui, st: &mut ViewState, input: &ViewInput<'_>, out: &mut Ve
     for g in &summary.accounts {
         account_group(ui, st, input, g, out);
     }
+    for g in &summary.keys {
+        key_group(ui, g);
+    }
+}
+
+/// One provider's API keys: listed with their quotas, without order or pin (omp offers neither
+/// for API keys).
+fn key_group(ui: &mut Ui, g: &KeyGroup) {
+    let pal = Palette::of_ui(ui);
+    card_frame(pal).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 6.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(theme::strong(&g.name).size(14.5).color(pal.text_strong));
+            ui.label(
+                RichText::new(format!("{} API keys · omp picks", g.rows.len()))
+                    .small()
+                    .color(pal.weak),
+            );
+        });
+        ui.add(egui::Label::new(RichText::new(KEYS_NOTE).small().color(pal.weak)).wrap());
+        for (i, row) in g.rows.iter().enumerate() {
+            ui.push_id(("key-row", &row.label, i), |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(icon_text(ICON_KEY_ROUND, 12.0, pal.weak));
+                    ui.add(
+                        egui::Label::new(RichText::new(&row.label).color(pal.text_strong))
+                            .truncate(),
+                    );
+                    if let Some(n) = &row.note {
+                        ui.add(
+                            egui::Label::new(RichText::new(n).small().color(pal.weak)).truncate(),
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        for p in row.pills.iter().rev() {
+                            ui.label(
+                                RichText::new(format!("{} {}", p.tag, p.text))
+                                    .small()
+                                    .color(status_color(pal, p.status)),
+                            );
+                        }
+                    });
+                });
+            });
+        }
+    });
 }
 
 /// One provider: its accounts top first, each movable, with its reserve and reclaim levels and,

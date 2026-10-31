@@ -1014,10 +1014,13 @@ shape, stats.db schema, extension imports, timings).
     { Ok, Warning, Exhausted, Unknown }, notes }`, `ResetCredits { available_count, redeemable_count,
     cooldown_until, credits: Vec<ResetCredit { title, remaining_count, usable, expires_at }> }`,
     `UnavailableAccount { provider, label: Option<String>, reason: Option<String> }`.
-  - `fetch_usage(omp: &OmpCli-or-program, invalidate: bool, timeout: Duration) -> Result<UsageSnapshot, UsageError>`:
-    runs `omp usage --json --no-extensions` (preceded by `omp usage invalidate` when `invalidate`), kills
-    on timeout (default 30 s), typed errors (spawn / timeout / exit status + stderr tail / parse).
-    Never runs `usage reset`.
+  - `fetch_usage(omp: &Omp, timeout: Duration) -> Result<UsageSnapshot, UsageError>`: runs
+    `omp usage --json --no-extensions` through omp's 5-minute report cache (like omp's own `/usage`), kills on
+    timeout (default 30 s), typed errors (spawn / timeout / exit status + stderr tail / parse). Never runs
+    `usage reset` or `usage invalidate` (0.21.1): after an invalidation omp drops a failing provider's last good
+    report (`retainLastGood = !invalidated`), and Anthropic's IP-limited `/usage` endpoint then left the account
+    "unavailable" after most manual refreshes. omp computes `policy` from the current config on every run, so a
+    plain re-read after saving rules shows them.
   - `provider_cards(&UsageSnapshot, now_ms) -> Vec<ProviderCard>` — pure port of omp's
     `buildProviderCards`: group windows by `label|window.id`, mean fraction across accounts,
     `resets_in_ms` from the fullest window, window tag (`5h`/`7d`/`mo`…) only when labels collide,
@@ -1066,7 +1069,7 @@ shape, stats.db schema, extension imports, timings).
 ### omp-deck
 
 - Usage state owned by the app: background worker runs `fetch_usage` ~3 s after startup, every 5 min,
-  when the Usage view opens and data is > 60 s old, and on manual refresh (`invalidate = true`); and
+  when the Usage view opens and data is > 60 s old, and on manual refresh (`Mutation::UsageRefresh`, no fields); and
   `activity` when the view opens (≥ 10 min apart). UI thread never blocks.
 - Status bar **usage chip** (gauge icon + tightest `NN% left`, coloured by status; dropped first when
   narrow; hidden when there are no reports). Hover: compact per-provider cards (bars = remaining,
@@ -1135,17 +1138,23 @@ reservePct, reserveSource: "global"|"override", reclaimAbovePct?, state: "eligib
   keeps a draft's order/values across refreshes (accounts gone drop out, new ones append; same-identity accounts by
   count); `account_policies(group, rows, global_reserve)`: priority `n − i` over the rows that have a key (rows
   without one get no entry: omp ranks them below every rule), reserve/reclaim only when `usage_capable`, a reclaim at
-  or under the effective reserve dropped.
+  or under the effective reserve dropped. `usage_state::KeyGroup { provider, name, rows: Vec<KeyRow { label, pills,
+  note }> }` in `Summary.keys`: providers with ≥ 2 API keys (reports naming no OAuth account + `api_key` entries
+  without usage), labelled as the Overview pager labels them. omp's `auth.accountPolicies` and `/session pin` cover
+  OAuth credentials only (API keys: per-request pick, used-up/blocked skipped, usage-ranked where measured), so these
+  are listed read-only.
 - Accounts tab (`usage_view::accounts`): routing note; one card per group: "your order" / "omp's automatic order",
   "Reset to automatic" (only with policies), the focused tab's account and whether it is pinned; per row ↑/↓,
   rank, label (weak with a tooltip when it has no key), `inside reserve`/`used up` badge, no-usage reason, quota
   pills, and Reserve (stepper, "default" = `retry.usageReservePct`, ✕ back to default) / Reclaim above (off, or a
   stepper kept above the reserve, ✕ off) where omp measures quotas. For the focused tab's provider: `this tab`
   (+ lock when pinned), Pin (the matching `LiveCredential`) / Unpin. A dirty draft (`ViewState.drafts`) shows
-  Discard / Save order; Save → `UsageAction::SaveAccounts` → `Mutation::AccountPolicies`, toast, forced
-  `UsageRefresh`; the draft stays until a newer summary arrives. Pin/Unpin → `UsageAction::Pin` →
+  Discard / Save order; Save → `UsageAction::SaveAccounts` → `Mutation::AccountPolicies`, toast, `UsageRefresh`;
+  the draft stays until a newer summary arrives. Pin/Unpin → `UsageAction::Pin` →
   `ctl_command(PinAccount)`, toast with omp's refusal reason. `retry.usageReservePct` is shown, never written
   (it also drives omp's model fallback); read from the settings catalog (`usage_reserve_from_catalog`, 10 until read).
+- Key groups follow the OAuth groups as read-only cards ("N API keys · omp picks", how omp picks, per key label,
+  no-usage reason, quota pills); the "One account per provider" empty state shows only when neither kind exists.
 
 ## Tab activity indicators, "Open tabs" sidebar section
 

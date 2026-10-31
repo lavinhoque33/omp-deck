@@ -960,10 +960,8 @@ pub enum Mutation {
     InboxTest,
     /// Cancel a running job.
     CancelJob(RequestKey),
-    /// Fetch usage now (`force`: even if fresh).
-    UsageRefresh {
-        force: bool,
-    },
+    /// Fetch usage now (through omp's report cache, like omp's own `/usage`).
+    UsageRefresh,
     /// Check omp for an update now.
     OmpUpdateCheck,
     /// Rescan the sessions and poll the backends now.
@@ -1032,7 +1030,7 @@ impl Mutation {
             Mutation::InboxClear => "inbox-clear",
             Mutation::InboxTest => "inbox-test",
             Mutation::CancelJob(_) => "cancel-job",
-            Mutation::UsageRefresh { .. } => "usage-refresh",
+            Mutation::UsageRefresh => "usage-refresh",
             Mutation::OmpUpdateCheck => "omp-update-check",
             Mutation::RefreshSessions => "refresh-sessions",
         }

@@ -695,16 +695,11 @@ fn run_omp(omp: &Omp, args: &[&str], timeout: Duration) -> Result<String, UsageE
     }
 }
 
-/// `omp usage --json --no-extensions`, preceded by `omp usage invalidate` when `invalidate` (drops
-/// omp's 5-minute report cache). Never runs `usage reset`. The same `timeout` bounds each command.
-pub fn fetch_usage(
-    omp: &Omp,
-    invalidate: bool,
-    timeout: Duration,
-) -> Result<UsageSnapshot, UsageError> {
-    if invalidate {
-        run_omp(omp, &["usage", "invalidate"], timeout)?;
-    }
+/// `omp usage --json --no-extensions`, through omp's 5-minute report cache like omp's own `/usage`.
+/// Never runs `usage invalidate`: after it omp drops a failing provider's last good report instead
+/// of keeping it, and Anthropic's IP-limited usage endpoint then leaves the account "unavailable".
+/// Never runs `usage reset`.
+pub fn fetch_usage(omp: &Omp, timeout: Duration) -> Result<UsageSnapshot, UsageError> {
     let stdout = run_omp(omp, &["usage", "--json", "--no-extensions"], timeout)?;
     UsageSnapshot::parse(&stdout)
 }
@@ -2782,20 +2777,21 @@ mod tests {
         let ok = fake_omp(
             dir.path(),
             &format!(
-                "echo \"$@\" >> {}\ncase \"$1 $2\" in \"usage invalidate\") exit 0;; esac\ncat <<'EOF'\n{}\nEOF",
+                "echo \"$@\" >> {}\ncat <<'EOF'\n{}\nEOF",
                 log.display(),
                 SAMPLE
             ),
         );
-        let s = fetch_usage(&ok, true, Duration::from_secs(10)).unwrap();
+        let s = fetch_usage(&ok, Duration::from_secs(10)).unwrap();
         assert_eq!(s.reports.len(), 1);
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            "usage invalidate\nusage --json --no-extensions\n"
+            "usage --json --no-extensions\n",
+            "never `usage invalidate`: it makes omp drop a failing provider's last good report"
         );
 
         let bad = fake_omp(dir.path(), "echo 'boom: no login' >&2; exit 3");
-        match fetch_usage(&bad, false, Duration::from_secs(10)) {
+        match fetch_usage(&bad, Duration::from_secs(10)) {
             Err(UsageError::Exit {
                 code: Some(3),
                 stderr_tail,
@@ -2804,13 +2800,13 @@ mod tests {
         }
         let junk = fake_omp(dir.path(), "echo 'hello'");
         assert!(matches!(
-            fetch_usage(&junk, false, Duration::from_secs(10)),
+            fetch_usage(&junk, Duration::from_secs(10)),
             Err(UsageError::Parse(_))
         ));
         let slow = fake_omp(dir.path(), "sleep 30");
         let t0 = Instant::now();
         assert!(matches!(
-            fetch_usage(&slow, false, Duration::from_millis(200)),
+            fetch_usage(&slow, Duration::from_millis(200)),
             Err(UsageError::Timeout(_))
         ));
         assert!(
@@ -2819,7 +2815,7 @@ mod tests {
         );
         let gone = Omp::at(dir.path().join("nope"));
         assert!(matches!(
-            fetch_usage(&gone, false, Duration::from_secs(1)),
+            fetch_usage(&gone, Duration::from_secs(1)),
             Err(UsageError::Spawn(_))
         ));
     }
@@ -2842,7 +2838,7 @@ mod tests {
         let marker_a = format!("31{}", std::process::id());
         let bg = fake_omp(dir.path(), &format!("sleep {marker_a} &\nexit 0"));
         let t0 = Instant::now();
-        let r = fetch_usage(&bg, false, Duration::from_secs(2));
+        let r = fetch_usage(&bg, Duration::from_secs(2));
         assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
         assert!(matches!(r, Err(UsageError::Parse(_))), "{r:?}");
         std::thread::sleep(Duration::from_millis(200));
@@ -2852,7 +2848,7 @@ mod tests {
         let marker_b = format!("32{}", std::process::id());
         let hang = fake_omp(dir.path(), &format!("sleep {marker_b} &\nsleep {marker_b}"));
         let t0 = Instant::now();
-        let r = fetch_usage(&hang, false, Duration::from_millis(300));
+        let r = fetch_usage(&hang, Duration::from_millis(300));
         assert!(matches!(r, Err(UsageError::Timeout(_))), "{r:?}");
         assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
         std::thread::sleep(Duration::from_millis(200));

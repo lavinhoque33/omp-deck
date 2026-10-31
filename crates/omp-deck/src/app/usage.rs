@@ -61,15 +61,15 @@ impl App {
         self.focus_pending = true;
     }
 
-    /// The gateway re-fetches the quotas now (`omp usage --json` with omp's report cache dropped).
+    /// The gateway re-reads the quotas now (`omp usage --json`, through omp's report cache like
+    /// omp's own `/usage`).
     fn start_usage_fetch(&mut self) {
-        self.gw
-            .mutate(Mutation::UsageRefresh { force: true }, |app, r| {
-                if let Err(e) = r {
-                    app.toasts
-                        .error(&app.ctx, format!("Usage refresh failed: {e}"));
-                }
-            });
+        self.gw.mutate(Mutation::UsageRefresh, |app, r| {
+            if let Err(e) = r {
+                app.toasts
+                    .error(&app.ctx, format!("Usage refresh failed: {e}"));
+            }
+        });
     }
 
     /// `stats.db` (read by the gateway, read-only).

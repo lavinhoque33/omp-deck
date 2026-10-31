@@ -262,7 +262,7 @@ impl Engine {
             Mutation::RunTool(Tool::Update(_)) | Mutation::OmpUpdateCheck if self.omp.is_none() => {
                 refused("omp was not found")
             }
-            Mutation::UsageRefresh { .. } if self.omp.is_none() => refused("omp was not found"),
+            Mutation::UsageRefresh if self.omp.is_none() => refused("omp was not found"),
             Mutation::AppUpdateDownload => self.sched.download_refusal(),
             Mutation::AppUpdateApply => self.sched.apply_refusal(),
             Mutation::CancelJob(k) => match self.jobs.get(k) {
@@ -1175,7 +1175,7 @@ impl Engine {
                 self.accepted(conn, id, &key);
                 self.inline_result(key, applied, "that job already ended");
             }
-            Mutation::UsageRefresh { force } => {
+            Mutation::UsageRefresh => {
                 self.accepted(conn, id, &key);
                 if self.sched.usage_fetching() {
                     // The running fetch is the refresh.
@@ -1192,7 +1192,7 @@ impl Engine {
                     false,
                     Post::None,
                     move |ctx, _, _| {
-                        let r = fetch_usage(ctx, force);
+                        let r = fetch_usage(ctx);
                         let out = r
                             .as_ref()
                             .map(|_| Done::Unit)
@@ -1271,16 +1271,13 @@ impl Engine {
     }
 }
 
-/// Worker: `omp usage` (after invalidating its cache when forced).
-pub(super) fn fetch_usage(
-    ctx: &JobCtx,
-    force: bool,
-) -> Result<deck_core::usage::UsageSnapshot, String> {
+/// Worker: `omp usage` (through omp's report cache).
+pub(super) fn fetch_usage(ctx: &JobCtx) -> Result<deck_core::usage::UsageSnapshot, String> {
     let omp = ctx
         .omp
         .as_ref()
         .ok_or_else(|| "omp was not found".to_owned())?;
-    deck_core::usage::fetch_usage(omp, force, deck_core::usage::DEFAULT_FETCH_TIMEOUT)
+    deck_core::usage::fetch_usage(omp, deck_core::usage::DEFAULT_FETCH_TIMEOUT)
         .map_err(|e| e.to_string())
 }
 

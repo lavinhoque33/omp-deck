@@ -331,6 +331,8 @@ pub struct Summary {
     pub warning: Option<NoDataWarning>,
     /// The Accounts page: providers with several OAuth accounts, or with routing rules.
     pub accounts: Vec<AccountGroup>,
+    /// The Accounts page: providers signed in with several API keys (no order or pin).
+    pub keys: Vec<KeyGroup>,
 }
 
 /// One provider's OAuth accounts in the order omp prefers them (`auth.accountPolicies`).
@@ -400,6 +402,97 @@ impl AccountGroup {
                 name: p.name,
                 usage_capable: p.usage_capable,
                 has_policies: p.has_policies,
+            })
+            .collect()
+    }
+}
+
+/// A provider signed in with several API keys. omp picks among them by itself on every request
+/// (used-up or rate-limited keys skipped; where it measures quotas, the key with more room left
+/// preferred). `auth.accountPolicies` and `/session pin` name OAuth logins only, so the Accounts
+/// page lists these keys without order or pin.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyGroup {
+    pub provider: String,
+    pub name: String,
+    pub rows: Vec<KeyRow>,
+}
+
+/// One API key of a [`KeyGroup`], named as the Overview card's pager names it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyRow {
+    pub label: String,
+    pub pills: Vec<QuotaPill>,
+    /// Why it has no usage report.
+    pub note: Option<String>,
+}
+
+impl KeyGroup {
+    /// API keys are the reports that name no OAuth account and the `api_key` entries without
+    /// usage; providers in snapshot order, like [`AccountGroup::build`].
+    fn build(snap: &UsageSnapshot, cards: &[ProviderCard]) -> Vec<KeyGroup> {
+        let mut providers: Vec<&str> = Vec::new();
+        let named = snap.reports.iter().map(|r| r.provider.as_str());
+        for p in named.chain(
+            snap.accounts_without_usage
+                .iter()
+                .map(|u| u.provider.as_str()),
+        ) {
+            if !p.is_empty() && !providers.contains(&p) {
+                providers.push(p);
+            }
+        }
+        providers
+            .into_iter()
+            .filter_map(|provider| {
+                let card = cards.iter().find(|c| c.provider == provider)?;
+                let mut rows: Vec<KeyRow> = snap
+                    .reports
+                    .iter()
+                    .filter(|r| r.provider == provider)
+                    .enumerate()
+                    .filter(|(_, r)| r.account().is_none())
+                    // `per_account` holds one page per report, in report order, when there
+                    // are several; a lone report is the card itself.
+                    .map(|(i, r)| match card.per_account.get(i) {
+                        Some(a) => KeyRow {
+                            label: a.label.clone(),
+                            pills: chip_pills(&a.card),
+                            note: None,
+                        },
+                        None => KeyRow {
+                            label: r
+                                .metadata
+                                .identity()
+                                .map_or_else(|| format!("account {}", i + 1), str::to_owned),
+                            pills: chip_pills(card),
+                            note: None,
+                        },
+                    })
+                    .collect();
+                rows.extend(
+                    snap.accounts_without_usage
+                        .iter()
+                        .filter(|u| u.provider == provider && u.kind.as_deref() == Some("api_key"))
+                        .map(|u| KeyRow {
+                            label: who_of(u).to_owned(),
+                            pills: Vec::new(),
+                            note: Some(reason_of(u).to_owned()),
+                        }),
+                );
+                for i in 1..rows.len() {
+                    let base = rows[i].label.clone();
+                    let mut n = 1;
+                    while rows[..i].iter().any(|r| r.label == rows[i].label) {
+                        n += 1;
+                        rows[i].label = format!("{base} ({n})");
+                    }
+                }
+                (rows.len() > 1).then(|| KeyGroup {
+                    provider: provider.to_owned(),
+                    name: card.name.clone(),
+                    rows,
+                })
             })
             .collect()
     }
@@ -579,6 +672,7 @@ impl Summary {
             orphans,
             warning: no_data_warning(snap),
             accounts: AccountGroup::build(snap, now_ms),
+            keys: KeyGroup::build(snap, &provider_cards),
         }
     }
 
@@ -1099,6 +1193,50 @@ mod tests {
          {"provider":"anthropic","type":"oauth","email":"twin@x.test","reason":"backoff"},
          {"provider":"anthropic","type":"oauth","email":"twin@x.test","reason":"backoff"},
          {"provider":"cursor","type":"oauth","email":"solo@x.test"}]}"#;
+
+    /// Two API keys (reports naming no account, as omp prints opencode-go's), one more without
+    /// usage, and a provider with one key: only the first is a key group, named like the
+    /// Overview pager, and none of it becomes an orderable OAuth group.
+    #[test]
+    fn api_keys_are_listed_as_keys_not_as_one_account() {
+        let s = Summary::build(
+            &snap(
+                r#"{"generatedAt":1,"reports":[
+                {"provider":"opencode-go","metadata":{"planType":"OpenCode Go"},"limits":[{"id":"weekly","label":"Weekly",
+                 "scope":{"provider":"opencode-go","windowId":"7d"},"window":{"id":"7d","durationMs":604800000},
+                 "amount":{"usedFraction":0.92}}]},
+                {"provider":"opencode-go","metadata":{"planType":"OpenCode Go"},"limits":[{"id":"weekly","label":"Weekly",
+                 "scope":{"provider":"opencode-go","windowId":"7d"},"window":{"id":"7d","durationMs":604800000},
+                 "amount":{"usedFraction":0.0}}]}],
+                "accountsWithoutUsage":[
+                 {"provider":"opencode-go","type":"api_key","reason":"backoff"},
+                 {"provider":"commandcode","type":"api_key"}]}"#,
+            ),
+            0,
+        );
+        assert!(
+            s.accounts.is_empty(),
+            "API keys cannot be ordered or pinned"
+        );
+        assert_eq!(s.keys.len(), 1, "one key is nothing to list");
+        let g = &s.keys[0];
+        assert_eq!(g.provider, "opencode-go");
+        let labels: Vec<&str> = g.rows.iter().map(|r| r.label.as_str()).collect();
+        let pager: Vec<&str> = s.cards[0]
+            .pages
+            .iter()
+            .map(|p| p.account.as_str())
+            .collect();
+        assert_eq!(labels[..2], pager[..], "named as the Overview pages them");
+        assert_eq!(labels[2], "account");
+        assert_eq!(g.rows[2].note.as_deref(), Some("backoff"));
+        let left: Vec<Vec<&str>> = g
+            .rows
+            .iter()
+            .map(|r| r.pills.iter().map(|p| p.text.as_str()).collect())
+            .collect();
+        assert_eq!(left, [vec!["8% left"], vec!["100% left"], vec![]]);
+    }
 
     #[test]
     fn account_rules_follow_the_shown_order_and_omps_limits() {

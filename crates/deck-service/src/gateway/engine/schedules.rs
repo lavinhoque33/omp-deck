@@ -378,7 +378,7 @@ impl Engine {
                 self.dirty.usage = true;
                 let ctx = self.job_ctx();
                 self.spawn_worker("usage", move || {
-                    Sched::Usage(super::mutate::fetch_usage(&ctx, false)).into()
+                    Sched::Usage(super::mutate::fetch_usage(&ctx)).into()
                 });
             } else {
                 next.push(at);
