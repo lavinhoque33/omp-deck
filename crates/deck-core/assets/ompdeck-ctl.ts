@@ -79,6 +79,36 @@ export default async function ompdeckCtl(api: any) {
           };
         } catch (e) { log("model state failed: " + e); return null; }
       };
+      // The OAuth account the main session uses for its model's provider: the session's sticky credential, else omp's
+      // default pick (`authStorage.oauth.identity`, what omp's own status line shows). Undefined for api-key providers.
+      // `pinned`: the sticky record is explicit (`/session pin`); `credentials`: the stored accounts it can be pinned to.
+      type Identity = { email: string | null; accountId: string | null; projectId: string | null; orgId: string | null };
+      type Account = Identity & { provider: string; pinned: boolean; credentials: (Identity & { credentialId: string })[] };
+      const idStr = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+      const identityOf = (v: any): Identity => ({ email: idStr(v?.email), accountId: idStr(v?.accountId), projectId: idStr(v?.projectId), orgId: idStr(v?.orgId) });
+      const providerAccounts = (auth: any, provider: string, sessionId: string): any[] => {
+        const list = typeof auth?.oauth?.accounts === "function" ? auth.oauth.accounts(provider, sessionId) : [];
+        return (Array.isArray(list) ? list : []).filter((a: any) => (typeof a?.credentialId === "string" && a.credentialId) || typeof a?.credentialId === "number");
+      };
+      const mainAccount = (): Account | null => {
+        try {
+          const sess = mainSession();
+          const provider = sess?.model?.provider;
+          const auth = sess?.modelRegistry?.authStorage;
+          if (typeof provider !== "string" || !provider || typeof auth?.oauth?.identity !== "function") return null;
+          const id = auth.oauth.identity(provider, sess.sessionId);
+          if (!id) return null;
+          let pinned = false;
+          try { const sticky = auth.sessions?.get?.(provider, sess.sessionId); pinned = sticky?.type === "oauth" && sticky.explicit === true; } catch {}
+          let credentials: Account["credentials"] = [];
+          try {
+            // credentialId is omp's numeric row id: sent as a string, mapped back by pin_account.
+            credentials = providerAccounts(auth, provider, sess.sessionId)
+              .map((a: any) => ({ credentialId: String(a.credentialId), ...identityOf(a) }));
+          } catch (e) { log("account list failed: " + e); }
+          return { provider, ...identityOf(id), pinned, credentials };
+        } catch (e) { log("account state failed: " + e); return null; }
+      };
       const perToolTokens = (sess: any): [string, number][] => {
         const tokenizer = sess.agent?.tokenizer;
         const tools: any[] = sess.agent?.state?.tools ?? [];
@@ -141,7 +171,7 @@ export default async function ompdeckCtl(api: any) {
               model: r.history?.resolvedModel ?? null,
             }));
         } catch (e) { log("snapshot failed: " + e); }
-        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache, model: mainModel(), pendingUi: [...pendingUi.values()].map(p => p.summary) };
+        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache, model: mainModel(), account: mainAccount(), pendingUi: [...pendingUi.values()].map(p => p.summary) };
       };
       const write = (c: any, l: string) => { try { c.write(l); } catch {} };
       const push = (m: unknown) => {
@@ -284,6 +314,27 @@ export default async function ompdeckCtl(api: any) {
           const p = pendingUi.get(Number(cmd.id));
           if (!p) return { ok: false, error: "no such request" };
           p.resolve(cmd.value ?? undefined); // null = cancel, as a local Esc
+          return { ok: true };
+        }
+        if (cmd.t === "pin_account") {
+          // == `/session pin` (AgentSession.pinCurrentProviderOAuthAccount); null credentialId clears the session's sticky
+          // account (authStorage.sessions.clear), so omp ranks the accounts again on the next request.
+          const want = rootFile();
+          if (typeof cmd.root === "string" && want && cmd.root !== want) return { ok: false, error: "session changed" };
+          const sess = mainSession();
+          const provider = sess?.model?.provider;
+          if (!sess || typeof provider !== "string" || provider !== cmd.provider) return { ok: false, error: "the session's model changed provider" };
+          if (sess.isStreaming) return { ok: false, error: "busy: wait for the reply to finish" };
+          if (cmd.credentialId === null || cmd.credentialId === undefined) {
+            const sessions = sess.modelRegistry?.authStorage?.sessions;
+            if (typeof sessions?.clear !== "function") return { ok: false, error: "unpinning unavailable" };
+            sessions.clear(provider, sess.sessionId);
+          } else {
+            if (typeof sess.pinCurrentProviderOAuthAccount !== "function") return { ok: false, error: "pinning unavailable" };
+            const target = providerAccounts(sess.modelRegistry?.authStorage, provider, sess.sessionId).find((a: any) => String(a.credentialId) === String(cmd.credentialId));
+            if (!target || !sess.pinCurrentProviderOAuthAccount(target.credentialId)) return { ok: false, error: "that account is no longer available" };
+          }
+          schedule();
           return { ok: true };
         }
         if (cmd.t !== "kill" && cmd.t !== "revive" && cmd.t !== "chat") return { ok: false, error: "unknown cmd" };

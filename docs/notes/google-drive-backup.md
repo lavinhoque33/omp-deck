@@ -1,12 +1,12 @@
-These are the facts behind the Google Drive backup (`deck_core::gdrive`, `crates/omp-deck/src/app/drive.rs`,
-`drive_view.rs`). The synced file set comes from oh-my-pi's own docs (`docs/*.md` on `main`, read
+These are the facts behind the Google Drive backup (`deck_core::backup`, `crates/omp-deck/src/app/backup.rs`,
+`backup_view.rs`). The synced file set comes from oh-my-pi's own docs (`docs/*.md` on `main`, read
 2026-10-22). The Google behaviour comes from Google's OAuth and Drive v3 documentation. Maintainer
 setup is covered in [`../google-drive-setup.md`](../google-drive-setup.md).
 
 ## What omp reads from its agent directory
 
 The agent dir is `SessionsRoot::agent_dir()`: `$PI_CODING_AGENT_DIR`, default `~/.omp/agent`. Only
-names omp documents as user config are synced (`SYNCED_FILES` / `SYNCED_DIRS` in `gdrive/archive.rs`):
+names omp documents as user config are synced (`SYNCED_FILES` / `SYNCED_DIRS` in `backup/archive.rs`):
 
 | Name | Source doc |
 |---|---|

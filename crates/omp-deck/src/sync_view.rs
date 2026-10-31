@@ -1,29 +1,41 @@
 //! Project sync UI (pure: state in, actions out; the logic lives in `app/project_sync.rs` and
-//! `deck_core::gdrive`): the Settings "Sync" page, the restore dialog, the sidebar's backup dialog
+//! `deck_core::backup`): the Settings "Sync" page, the restore dialog, the sidebar's backup dialog
 //! and the typed-path prompt.
 
+use deck_core::backup::ConflictChoice;
 use deck_core::config::SyncInterval;
-use deck_core::gdrive::ConflictChoice;
 use egui::{Button, Context, Frame, Id, Margin, RichText, ScrollArea, Stroke, Ui, vec2};
 
+use crate::backup_view::{BackupAction, BackupCard, DriveAccount};
 use crate::badge::{self, Hue};
 use crate::card as deck_card;
 use crate::confirm::{Dialog, show_dialog, show_dialog_labeled};
-use crate::drive_view::{DriveAction, DriveCard};
 use crate::icons::{
     ICON_ARCHIVE_RESTORE, ICON_CIRCLE_CHECK, ICON_CLOUD, ICON_CLOUD_UPLOAD, ICON_FOLDER,
     ICON_FOLDER_OPEN, ICON_FOLDER_PLUS, ICON_LIST_CHECKS, ICON_LOG_IN, ICON_PENCIL,
-    ICON_REFRESH_CW, ICON_TRASH_2, ICON_TRIANGLE_ALERT, ICON_X,
+    ICON_REFRESH_CW, ICON_SETTINGS, ICON_TRASH_2, ICON_TRIANGLE_ALERT, ICON_X,
 };
 use crate::theme::{self, Palette};
 use crate::widgets::{DraftButton, DraftKind, Spin, card, icon_text, setting_row, toggle};
+use deck_core::backup::Destination;
 
 const PLAN_LIST_MAX: usize = 8;
 
-/// Wording shared by the page, the sidebar menus and the dialogs.
-pub const NOTE: &str = "Stored in OmpDeck's private Google Drive app folder and counted toward your \
-     Drive storage. A project's .omp folder may contain secrets (API tokens in config.yml, \
-     mcp.json, secrets.yml).";
+/// Where project backups are stored and what to mind (the page and the backup dialog).
+pub fn note(destination: Destination) -> &'static str {
+    match destination {
+        Destination::Drive => {
+            "Stored in OmpDeck's private Google Drive app folder and counted toward your Drive \
+             storage. A project's .omp folder may contain secrets (API tokens in config.yml, \
+             mcp.json, secrets.yml)."
+        }
+        Destination::Server => {
+            "Stored in the folder you chose on your server, readable by whoever can read that \
+             folder. A project's .omp folder may contain secrets (API tokens in config.yml, \
+             mcp.json, secrets.yml)."
+        }
+    }
+}
 
 // ------------------------------------------------------------------ shared cells
 
@@ -232,7 +244,7 @@ pub struct RowView {
 }
 
 pub struct SyncPage<'a> {
-    pub account: &'a DriveCard,
+    pub account: &'a BackupCard,
     pub rows: &'a [RowView],
     pub interval: SyncInterval,
     /// A project job (any row, a restore) is running: starting another is disabled.
@@ -245,7 +257,8 @@ pub struct SyncPage<'a> {
 pub enum SyncAction {
     /// The page was drawn this frame (the app measures sizes when it newly appears).
     Visible,
-    Drive(DriveAction),
+    /// The destination strip (sign-in, or opening Settings → Backup).
+    Backup(BackupAction),
     Add,
     Change(usize),
     Remove(usize),
@@ -259,16 +272,47 @@ pub enum SyncAction {
     OpenManager,
 }
 
-fn account_strip(ui: &mut Ui, account: &DriveCard, actions: &mut Vec<SyncAction>) {
+/// The active destination: the Google account (with sign-in) or the saved server.
+fn account_strip(ui: &mut Ui, account: &BackupCard, actions: &mut Vec<SyncAction>) {
     let pal = Palette::of_ui(ui);
-    match account {
-        DriveCard::Unavailable => setting_row(
+    let settings = |ui: &mut Ui, actions: &mut Vec<SyncAction>, primary: bool| {
+        let kind = if primary {
+            DraftKind::Primary
+        } else {
+            DraftKind::Secondary
+        };
+        if button(ui, true, kind, ICON_SETTINGS, "Backup settings…").clicked() {
+            actions.push(SyncAction::Backup(BackupAction::OpenBackupSettings));
+        }
+    };
+    if account.destination == Destination::Server {
+        match &account.server {
+            Some(s) => setting_row(
+                ui,
+                &s.label,
+                &format!(
+                    "Project backups go to the folder {} on this server",
+                    s.folder
+                ),
+                |ui| settings(ui, actions, false),
+            ),
+            None => setting_row(
+                ui,
+                "No backup server yet",
+                "Set up your FTP, FTPS or SFTP server in Settings → Backup",
+                |ui| settings(ui, actions, true),
+            ),
+        }
+        return;
+    }
+    match &account.drive {
+        DriveAccount::Unavailable => setting_row(
             ui,
-            "Not available in this build",
-            "This OmpDeck was built without a Google OAuth client",
-            |_| {},
+            "Google Drive is not available in this build",
+            "Back up to your own FTP or SFTP server instead (Settings → Backup)",
+            |ui| settings(ui, actions, true),
         ),
-        DriveCard::SignedOut => setting_row(
+        DriveAccount::SignedOut => setting_row(
             ui,
             "Sign in to back up projects",
             "Uses the same Google account as the config backup",
@@ -282,22 +326,22 @@ fn account_strip(ui: &mut Ui, account: &DriveCard, actions: &mut Vec<SyncAction>
                 )
                 .clicked()
                 {
-                    actions.push(SyncAction::Drive(DriveAction::SignIn));
+                    actions.push(SyncAction::Backup(BackupAction::SignIn));
                 }
             },
         ),
-        DriveCard::Waiting => setting_row(
+        DriveAccount::Waiting => setting_row(
             ui,
             "Waiting for the browser…",
             "Finish signing in on the Google page that just opened.",
             |ui| {
                 if button(ui, true, DraftKind::Secondary, ICON_X, "Cancel").clicked() {
-                    actions.push(SyncAction::Drive(DriveAction::CancelSignIn));
+                    actions.push(SyncAction::Backup(BackupAction::CancelSignIn));
                 }
                 ui.add(Spin::new(18.0, pal.accent_b));
             },
         ),
-        DriveCard::SignedIn { email, .. } => {
+        DriveAccount::SignedIn { email } => {
             let who = email
                 .as_deref()
                 .map_or_else(|| "Signed in".to_owned(), |e| format!("Signed in as {e}"));
@@ -315,25 +359,30 @@ fn account_strip(ui: &mut Ui, account: &DriveCard, actions: &mut Vec<SyncAction>
 pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
     let pal = Palette::of_ui(ui);
     let mut actions = vec![SyncAction::Visible];
+    let place = page.account.place.as_str();
     ui.label(theme::strong("Sync").size(22.0).color(pal.text_strong));
     ui.label(
-        RichText::new(
-            "Back up a project's .omp folder, its omp sessions and omp's project memory to Google Drive",
-        )
-            .color(pal.weak),
+        RichText::new(format!(
+            "Back up a project's .omp folder, its omp sessions and omp's project memory to {place}"
+        ))
+        .color(pal.weak),
     );
     ui.add_space(16.0);
 
-    let signed_in = matches!(page.account, DriveCard::SignedIn { .. });
-    card(ui, "Google account", |ui| {
+    let linked = page.account.linked();
+    let title = match page.account.destination {
+        Destination::Drive => "Google account",
+        Destination::Server => "Backup server",
+    };
+    card(ui, title, |ui| {
         account_strip(ui, page.account, &mut actions);
     });
 
-    let idle = signed_in && !page.lane_busy;
-    let why_not = if !signed_in {
-        "Sign in with Google first"
+    let idle = linked && !page.lane_busy;
+    let why_not = if linked {
+        "Another backup or restore is running"
     } else {
-        "Another project backup or restore is running"
+        page.account.unlinked_reason()
     };
     card(ui, "Projects", |ui| {
         if page.rows.is_empty() {
@@ -391,7 +440,7 @@ pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
     card(ui, "Restore", |ui| {
         setting_row(
             ui,
-            "Restore a project from Google Drive",
+            &format!("Restore a project from {place}"),
             "Pick a backup, a folder on this computer and what to bring back",
             |ui| {
                 let resp = button(
@@ -410,7 +459,7 @@ pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
                     idle,
                     DraftKind::Secondary,
                     ICON_LIST_CHECKS,
-                    "Manage cloud backups…",
+                    "Manage project backups…",
                 );
                 if resp.clicked() {
                     actions.push(SyncAction::OpenManager);
@@ -418,7 +467,7 @@ pub fn page(ui: &mut Ui, page: &SyncPage<'_>) -> Vec<SyncAction> {
                 resp.on_disabled_hover_text(why_not);
             },
         );
-        weak_note(ui, NOTE);
+        weak_note(ui, note(page.account.destination));
     });
     actions
 }
@@ -459,7 +508,7 @@ fn project_row(
                             .min_size(vec2(0.0, theme::dens(28.0, 30.0))),
                     );
                     if rm
-                        .on_hover_text("Remove from Sync (Drive backups stay)")
+                        .on_hover_text("Remove from Sync (its backups stay)")
                         .clicked()
                     {
                         actions.push(SyncAction::Remove(i));
@@ -827,12 +876,13 @@ pub enum BackupAnswer {
     ChooseSessions,
 }
 
-/// "Back up to Google Drive": both parts with their sizes, "Keep this folder in Sync", Back up now.
+/// "Back up to {place}": the parts with their sizes, "Keep this folder in Sync", Back up now.
 pub fn backup_dialog(
     ctx: &Context,
     d: &mut BackupDialog,
     cells: &Cells,
     busy: bool,
+    account: &BackupCard,
 ) -> BackupAnswer {
     let pal = Palette::of_ctx(ctx);
     let mut choose = false;
@@ -843,14 +893,17 @@ pub fn backup_dialog(
         ctx,
         &Dialog {
             id: "sync-backup",
-            title: "Back up to Google Drive",
+            title: &format!("Back up to {}", account.place),
             width: 480.0,
             confirm_label: "Back up now",
             confirm_enabled: any && !busy,
             danger: false,
             enter_confirms: false,
             icon: Some(ICON_CLOUD_UPLOAD),
-            subtitle: Some("Project folder to OmpDeck's private Drive folder"),
+            subtitle: Some(match account.destination {
+                Destination::Drive => "Project folder to OmpDeck's private Drive folder",
+                Destination::Server => "Project folder to the backup folder on your server",
+            }),
             ..Default::default()
         },
         |ui| {
@@ -938,7 +991,7 @@ pub fn backup_dialog(
             ui.checkbox(&mut d.keep, "Keep this folder in Sync")
                 .on_hover_text("Adds the folder to the Sync page so it is backed up automatically");
             ui.add_space(6.0);
-            weak_note(ui, NOTE);
+            weak_note(ui, note(account.destination));
             if busy {
                 ui.add_space(6.0);
                 weak_note(
@@ -974,7 +1027,7 @@ pub struct VersionRow {
     pub has_memory: bool,
 }
 
-/// A project on Drive: every version of one (host, path).
+/// A project at the backup destination: every version of one (host, path).
 pub struct CloudProject {
     pub name: String,
     pub path: String,
@@ -1015,10 +1068,12 @@ pub struct PlanView {
     pub memory_added: usize,
     /// Memory files that will NOT be written ("<name>: <reason>").
     pub memory_skipped: Vec<String>,
-    /// Sessions that cannot be restored ("<title>: <reason>").
-    pub session_problems: Vec<String>,
+    /// Sessions that cannot be restored: (id, "<title>: <reason>").
+    pub session_problems: Vec<(String, String)>,
     /// How many sessions the backup holds (`None` = the backup has none).
     pub sessions: Option<usize>,
+    /// Backed-up sessions the user left out of this restore (ids of the plan's sessions).
+    pub excluded: std::collections::BTreeSet<String>,
     /// Backed-up sessions whose id already exists in the sessions root, with the user's choice.
     pub conflicts: Vec<ConflictRow>,
     pub safety: String,
@@ -1044,9 +1099,31 @@ impl PlanView {
         self.omp_danger() || self.memory_danger() || self.sessions_overwritten() > 0
     }
 
-    fn sessions_overwritten(&self) -> usize {
+    /// Something would be written: Restore is offered.
+    pub fn any_work(&self) -> bool {
+        self.sessions.is_none()
+            || self.included() > 0
+            || self.omp_overwritten_total + self.omp_added > 0
+            || !self.memory_overwritten.is_empty()
+            || self.memory_added > 0
+    }
+
+    /// Sessions of the backup that are restored (not left out).
+    pub fn included(&self) -> usize {
+        self.sessions
+            .unwrap_or(0)
+            .saturating_sub(self.excluded.len())
+    }
+
+    /// The conflicts of the sessions that are restored.
+    pub fn included_conflicts(&self) -> impl Iterator<Item = &ConflictRow> {
         self.conflicts
             .iter()
+            .filter(|c| !self.excluded.contains(&c.id))
+    }
+
+    fn sessions_overwritten(&self) -> usize {
+        self.included_conflicts()
             .filter(|c| c.choice == ConflictChoice::Overwrite)
             .count()
     }
@@ -1153,9 +1230,11 @@ pub enum RestoreAction {
     /// The target text was edited.
     TargetEdited,
     Select(usize, usize),
-    /// Delete the version (project, version) from Drive (asks first).
+    /// Delete the version (project, version) from the destination (asks first).
     Delete(usize, usize),
     Continue,
+    /// Open the chooser of the sessions this restore brings back (confirm step).
+    ChooseSessions,
     Confirm,
     Close,
 }
@@ -1166,13 +1245,14 @@ pub fn restore_dialog(
     d: &mut RestoreDialog,
     progress: Option<&ProgView>,
     lane_busy: bool,
+    place: &str,
 ) -> Option<RestoreAction> {
     let pal = Palette::of_ctx(ctx);
     let mut act = None;
     let (label, enabled, danger) = match &d.step {
         Step::Pick => ("Continue", d.can_continue(lane_busy), false),
         Step::Preparing => ("Continue", false, false),
-        Step::Confirm(p) => ("Restore", true, p.danger()),
+        Step::Confirm(p) => ("Restore", p.any_work(), p.danger()),
         Step::Applying => ("Restore", false, false),
         Step::Report(_) => ("Close", true, false),
     };
@@ -1180,7 +1260,7 @@ pub fn restore_dialog(
         ctx,
         &Dialog {
             id: "sync-restore",
-            title: "Restore a project from Google Drive",
+            title: &format!("Restore a project from {place}"),
             width: 560.0,
             confirm_label: label,
             confirm_enabled: enabled,
@@ -1209,11 +1289,11 @@ pub fn restore_dialog(
         },
         |ui| {
             if let Step::Confirm(plan) = &mut d.step {
-                confirm_body(ui, plan);
+                confirm_body(ui, plan, &mut act);
                 return;
             }
             match &d.step {
-                Step::Pick => pick_body(ui, d, lane_busy, &mut act),
+                Step::Pick => pick_body(ui, d, lane_busy, place, &mut act),
                 Step::Preparing => {
                     progress_or_wait(ui, progress, "Downloading and checking the backup…");
                 }
@@ -1331,7 +1411,13 @@ fn progress_or_wait(ui: &mut Ui, p: Option<&ProgView>, fallback: &str) {
     }
 }
 
-fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Option<RestoreAction>) {
+fn pick_body(
+    ui: &mut Ui,
+    d: &mut RestoreDialog,
+    lane_busy: bool,
+    place: &str,
+    act: &mut Option<RestoreAction>,
+) {
     let pal = Palette::of_ui(ui);
     if let Some(e) = &d.error {
         ui.horizontal(|ui| {
@@ -1364,9 +1450,9 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
         }
         ListState::Ready(p) if p.is_empty() => {
             let msg = if d.target_fixed {
-                "No backups of this folder on Google Drive yet."
+                format!("No backups of this folder on {place} yet.")
             } else {
-                "No project backups on Google Drive yet."
+                format!("No project backups on {place} yet.")
             };
             ui.label(RichText::new(msg).color(pal.weak));
             return;
@@ -1416,7 +1502,7 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
                                     Button::new(icon_text(ICON_TRASH_2, 14.0, pal.danger))
                                         .min_size(vec2(26.0, 24.0)),
                                 )
-                                .on_hover_text("Delete this backup from Google Drive")
+                                .on_hover_text(format!("Delete this backup from {place}"))
                                 .on_disabled_hover_text("Another project job is running");
                             if del.clicked() {
                                 *act = Some(RestoreAction::Delete(pi, vi));
@@ -1520,7 +1606,7 @@ fn pick_body(ui: &mut Ui, d: &mut RestoreDialog, lane_busy: bool, act: &mut Opti
     }
 }
 
-fn confirm_body(ui: &mut Ui, plan: &mut PlanView) {
+fn confirm_body(ui: &mut Ui, plan: &mut PlanView, act: &mut Option<RestoreAction>) {
     let pal = Palette::of_ui(ui);
     let wrap = |ui: &mut Ui, text: RichText| {
         ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Wrap));
@@ -1612,14 +1698,35 @@ fn confirm_body(ui: &mut Ui, plan: &mut PlanView) {
         });
     }
     if let Some(n) = plan.sessions {
-        let fresh = n.saturating_sub(plan.conflicts.len());
-        if fresh > 0 || plan.conflicts.is_empty() {
+        let included = plan.included();
+        let s = |n: usize| if n == 1 { "" } else { "s" };
+        ui.add_space(6.0);
+        deck_card::kv(ui, 84.0, "Sessions", |ui| {
+            let (text, hue) = if included == 0 {
+                ("none selected".to_owned(), Hue::Amber)
+            } else if included < n {
+                (format!("{included} of {n} sessions"), Hue::Teal)
+            } else {
+                (format!("{n} session{}", s(n)), Hue::Teal)
+            };
+            badge::show(ui, None, &text, hue, 11.0);
             ui.add_space(6.0);
-            deck_card::kv(ui, 84.0, "Sessions", |ui| {
+            if DraftButton::new("Choose…")
+                .min_width(CHOOSE_W)
+                .show(ui)
+                .on_hover_text("Pick which sessions are restored")
+                .clicked()
+            {
+                *act = Some(RestoreAction::ChooseSessions);
+            }
+        });
+        let fresh = included.saturating_sub(plan.included_conflicts().count());
+        if fresh > 0 {
+            deck_card::kv(ui, 84.0, "Added", |ui| {
                 badge::show(
                     ui,
                     None,
-                    &format!("{fresh} session{} added", if fresh == 1 { "" } else { "s" }),
+                    &format!("{fresh} session{}", s(fresh)),
                     Hue::Teal,
                     11.0,
                 );
@@ -1643,11 +1750,13 @@ fn confirm_body(ui: &mut Ui, plan: &mut PlanView) {
         "Memory files that will NOT be written:",
         &plan.memory_skipped,
     );
-    warn_list(
-        ui,
-        "Sessions that cannot be restored:",
-        &plan.session_problems,
-    );
+    let problems: Vec<String> = plan
+        .session_problems
+        .iter()
+        .filter(|(id, _)| !plan.excluded.contains(id))
+        .map(|(_, text)| text.clone())
+        .collect();
+    warn_list(ui, "Sessions that cannot be restored:", &problems);
 }
 
 const CONFLICT_CHOICES: [(ConflictChoice, &str, &str); 3] = [
@@ -1690,11 +1799,21 @@ fn unix_time(secs: i64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(secs).unwrap_or(0))
 }
 
-/// "Sessions already here": an All selector and one row per session whose id exists locally.
+/// "Sessions already here": an All selector and one row per restored session whose id exists
+/// locally (left-out sessions are not listed).
 fn conflicts_section(ui: &mut Ui, plan: &mut PlanView) {
-    if plan.conflicts.is_empty() {
+    let PlanView {
+        conflicts,
+        excluded,
+        ..
+    } = plan;
+    let mut rows: Vec<&mut ConflictRow> = conflicts
+        .iter_mut()
+        .filter(|c| !excluded.contains(&c.id))
+        .collect();
+    let Some(all) = rows.first().map(|c| c.choice) else {
         return;
-    }
+    };
     let pal = Palette::of_ui(ui);
     let now = std::time::SystemTime::now();
     ui.add_space(8.0);
@@ -1707,13 +1826,7 @@ fn conflicts_section(ui: &mut Ui, plan: &mut PlanView) {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(theme::strong("Sessions already here").color(pal.text_strong));
-                badge::show(
-                    ui,
-                    None,
-                    &plan.conflicts.len().to_string(),
-                    Hue::Amber,
-                    10.5,
-                );
+                badge::show(ui, None, &rows.len().to_string(), Hue::Amber, 10.5);
             });
             ui.label(
                 RichText::new("These backed-up sessions have the same id as a local one.")
@@ -1721,12 +1834,11 @@ fn conflicts_section(ui: &mut Ui, plan: &mut PlanView) {
                     .color(pal.weak),
             );
             ui.add_space(4.0);
-            let all = plan.conflicts[0].choice;
-            let uniform = plan.conflicts.iter().all(|c| c.choice == all);
+            let uniform = rows.iter().all(|c| c.choice == all);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("All:").small().color(pal.weak));
                 if let Some(c) = choice_pills(ui, uniform.then_some(all)) {
-                    for row in &mut plan.conflicts {
+                    for row in &mut rows {
                         row.choice = c;
                     }
                 }
@@ -1736,16 +1848,12 @@ fn conflicts_section(ui: &mut Ui, plan: &mut PlanView) {
                 .id_salt("restore-conflicts")
                 .max_height(220.0)
                 .show(ui, |ui| {
-                    for row in &mut plan.conflicts {
+                    for row in &mut rows {
                         conflict_row(ui, pal, now, row);
                     }
                 });
         });
-    let n = plan
-        .conflicts
-        .iter()
-        .filter(|c| c.choice == ConflictChoice::Overwrite)
-        .count();
+    let n = plan.sessions_overwritten();
     if n > 0 {
         overwrite_warning(
             ui,
@@ -1868,7 +1976,7 @@ fn warn_list(ui: &mut Ui, title: &str, items: &[String]) {
 
 // ------------------------------------------------------------------ sessions to back up
 
-/// One session in the "Sessions to back up" list.
+/// One session in the "Sessions to back up" / "Sessions to restore" list.
 pub struct SessionItem {
     pub id: String,
     pub title: String,
@@ -1888,6 +1996,28 @@ pub enum SessionsTarget {
     Row,
     /// The open sidebar backup dialog (this one backup only).
     Backup,
+    /// The confirm step of the open restore dialog (checked = restored).
+    Restore,
+}
+
+impl SessionsTarget {
+    /// (title, subtitle, folder label, closing note).
+    fn wording(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            SessionsTarget::Row | SessionsTarget::Backup => (
+                "Sessions to back up",
+                "New sessions are included automatically",
+                "Folder",
+                "New sessions are backed up automatically.",
+            ),
+            SessionsTarget::Restore => (
+                "Sessions to restore",
+                "Only the checked sessions are restored",
+                "Into",
+                "Sessions left out stay in the backup; nothing local is touched for them.",
+            ),
+        }
+    }
 }
 
 pub struct SessionsDialog {
@@ -1950,25 +2080,26 @@ impl SessionsDialog {
     }
 }
 
-/// "Sessions to back up": checkbox list, checked = backed up.
+/// "Sessions to back up" / "Sessions to restore": checkbox list, checked = included.
 pub fn sessions_dialog(ctx: &Context, d: &mut SessionsDialog) -> SessionsAnswer {
     let pal = Palette::of_ctx(ctx);
+    let (title, subtitle, folder, note) = d.target.wording();
     let answer = show_dialog(
         ctx,
         &Dialog {
             id: "sync-sessions",
-            title: "Sessions to back up",
+            title,
             width: 560.0,
             confirm_label: "Save",
             confirm_enabled: true,
             danger: false,
             enter_confirms: false,
             icon: Some(ICON_LIST_CHECKS),
-            subtitle: Some("New sessions are included automatically"),
+            subtitle: Some(subtitle),
             ..Default::default()
         },
         |ui| {
-            deck_card::kv(ui, 84.0, "Folder", |ui| {
+            deck_card::kv(ui, 84.0, folder, |ui| {
                 ui.add(
                     egui::Label::new(RichText::new(&d.display).color(pal.text_strong)).truncate(),
                 );
@@ -2035,7 +2166,7 @@ pub fn sessions_dialog(ctx: &Context, d: &mut SessionsDialog) -> SessionsAnswer 
                 );
                 badge::show(ui, None, &crate::app::human_size(bytes), Hue::Amber, 11.0);
             });
-            weak_note(ui, "New sessions are backed up automatically.");
+            weak_note(ui, note);
         },
     );
     match answer {
@@ -2144,6 +2275,7 @@ pub fn manager_dialog(
     d: &mut ManagerDialog,
     progress: Option<&ProgView>,
     lane_busy: bool,
+    place: &str,
 ) -> Option<ManagerAction> {
     let pal = Palette::of_ctx(ctx);
     let mut act = None;
@@ -2177,23 +2309,27 @@ pub fn manager_dialog(
             } else {
                 ICON_LIST_CHECKS
             }),
-            subtitle: Some(match d.step {
-                ManagerStep::Browse => "Delete old versions or another PC's project backups",
-                ManagerStep::Confirm => "Permanent — cannot be undone",
-                ManagerStep::Deleting => "Deleting from Google Drive…",
+            subtitle: Some(&match d.step {
+                ManagerStep::Browse => {
+                    "Delete old versions or another PC's project backups".to_owned()
+                }
+                ManagerStep::Confirm => "Permanent — cannot be undone".to_owned(),
+                ManagerStep::Deleting => format!("Deleting from {place}…"),
             }),
             ..Default::default()
         },
         cancel_label,
         |ui| match d.step {
-            ManagerStep::Browse => manager_body(ui, d, selected, bytes, lane_busy, &mut act),
+            ManagerStep::Browse => {
+                manager_body(ui, d, selected, bytes, lane_busy, place, &mut act);
+            }
             ManagerStep::Confirm => {
                 let wrap = |ui: &mut Ui, t: RichText| {
                     ui.add(egui::Label::new(t).wrap_mode(egui::TextWrapMode::Wrap));
                 };
                 wrap(
                     ui,
-                    RichText::new("Permanently delete these backups from Google Drive?")
+                    RichText::new(format!("Permanently delete these backups from {place}?"))
                         .color(pal.text_strong),
                 );
                 ui.add_space(6.0);
@@ -2204,7 +2340,7 @@ pub fn manager_dialog(
                     badge::show(ui, None, &crate::app::human_size(bytes), Hue::Teal, 11.0);
                 });
                 deck_card::kv(ui, 84.0, "Target", |ui| {
-                    badge::show(ui, Some(ICON_CLOUD), "Google Drive", Hue::Blue, 11.0);
+                    badge::show(ui, Some(ICON_CLOUD), place, Hue::Blue, 11.0);
                 });
                 ui.add_space(4.0);
                 wrap(
@@ -2270,6 +2406,7 @@ fn manager_body(
     selected: usize,
     bytes: u64,
     lane_busy: bool,
+    place: &str,
     act: &mut Option<ManagerAction>,
 ) {
     let pal = Palette::of_ui(ui);
@@ -2295,7 +2432,7 @@ fn manager_body(
         ListState::Ready(g) => g,
     };
     if groups.is_empty() {
-        ui.label(RichText::new("No project backups on Google Drive.").color(pal.weak));
+        ui.label(RichText::new(format!("No project backups on {place}.")).color(pal.weak));
         ui.add_space(8.0);
         if button(
             ui,
@@ -2420,6 +2557,7 @@ mod tests {
             memory_skipped: Vec::new(),
             session_problems: Vec::new(),
             sessions: None,
+            excluded: Default::default(),
             conflicts: Vec::new(),
             safety: String::new(),
         }
@@ -2447,6 +2585,22 @@ mod tests {
         assert!(!p.danger());
         p.conflicts[0].choice = ConflictChoice::Overwrite;
         assert!(p.danger());
+    }
+
+    #[test]
+    fn left_out_sessions_neither_count_nor_endanger_and_leaving_out_all_disables_restore() {
+        let mut p = plan(false, 0);
+        p.sessions = Some(2);
+        p.conflicts = vec![conflict_row("a", ConflictChoice::Overwrite)];
+        assert!(p.danger() && p.any_work());
+        p.excluded = ["a".to_owned()].into();
+        assert!(!p.danger(), "the overwritten session is not restored");
+        assert_eq!((p.included(), p.included_conflicts().count()), (1, 0));
+        assert!(p.any_work());
+        p.excluded.insert("b".into());
+        assert!(!p.any_work(), "nothing left to write");
+        p.omp_added = 1;
+        assert!(p.any_work(), ".omp files are still restored");
     }
 
     #[test]
@@ -2630,11 +2784,17 @@ mod render_tests {
                 fraction: Some(0.4),
             }),
         }];
-        let account = DriveCard::SignedIn {
-            email: Some("a@b.c".into()),
+        let account = BackupCard {
+            destination: Destination::Drive,
+            drive: DriveAccount::SignedIn {
+                email: Some("a@b.c".into()),
+            },
+            server: None,
+            place: "Google Drive".into(),
             last: None,
             interval: SyncInterval::Every10Minutes,
             busy: None,
+            picker: false,
         };
         let page_state = SyncPage {
             account: &account,
@@ -2682,7 +2842,12 @@ mod render_tests {
                 memory_exists: true,
                 memory_overwritten: vec!["product.md".into()],
                 memory_skipped: vec!["style.md: symlink".into()],
-                sessions: Some(2),
+                sessions: Some(3),
+                excluded: ["c".to_owned()].into(),
+                session_problems: vec![
+                    ("b".into(), "b: too big".into()),
+                    ("c".into(), "c: too big".into()),
+                ],
                 conflicts: vec![
                     super::tests::conflict_row("a", ConflictChoice::KeepLocal),
                     super::tests::conflict_row("b", ConflictChoice::Overwrite),
@@ -2701,13 +2866,13 @@ mod render_tests {
         for step in steps {
             d.step = step;
             frames(|_, ctx| {
-                restore_dialog(ctx, &mut d, Some(&progress), false);
+                restore_dialog(ctx, &mut d, Some(&progress), false, "Google Drive");
             });
         }
         d.list = ListState::Failed("offline".into());
         d.step = Step::Pick;
         frames(|_, ctx| {
-            restore_dialog(ctx, &mut d, None, false);
+            restore_dialog(ctx, &mut d, None, false, "sftp://nas");
         });
     }
 
@@ -2724,9 +2889,19 @@ mod render_tests {
             excluded: 2,
         };
         let mut p = PathPrompt::new(PathPurpose::Add);
+        let account = BackupCard {
+            destination: Destination::Server,
+            drive: DriveAccount::Unavailable,
+            server: None,
+            place: "sftp://nas".into(),
+            last: None,
+            interval: SyncInterval::Daily,
+            busy: None,
+            picker: false,
+        };
         frames(|_, ctx| {
             assert!(matches!(
-                backup_dialog(ctx, &mut b, &cells(), false),
+                backup_dialog(ctx, &mut b, &cells(), false, &account),
                 BackupAnswer::Open
             ));
             assert!(matches!(path_dialog(ctx, &mut p), PathAnswer::Open));

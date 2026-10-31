@@ -8,7 +8,7 @@ import { age } from '../ui/format.ts';
 import { useClient, useClientState, useFeed, useNow } from '../ui/hooks.ts';
 import { Card, ConnectionPill, InstallHint, KeyValues, UpdateBanner, useS4 } from '../ui/kit.tsx';
 import '../../styles/settings.css';
-import { MODE_LABEL, percent, remainingTone } from './settings/logic.ts';
+import { MODE_LABEL, percent, remainingTone, backupDestinationLabel } from './settings/logic.ts';
 
 export function SettingsScreen({
   theme,
@@ -28,7 +28,7 @@ export function SettingsScreen({
   const conn = useClientState((state) => state.conn);
   const device = useFeed({ feed: 'device' }, 'device');
   const updates = useFeed({ feed: 'updates' }, 'updates');
-  const drive = useFeed({ feed: 'drive' }, 'drive');
+  const backup = useFeed({ feed: 'backup' }, 'backup');
   const sync = useFeed({ feed: 'sync' }, 'sync');
   const usage = useFeed({ feed: 'usage' }, 'usage');
   const manage = (device?.permissions ?? welcome?.permissions)?.manage ?? false;
@@ -121,17 +121,17 @@ export function SettingsScreen({
         <Card title="Backup">
           <div className="hub-list">
             {row(
-              'drive',
+              'backup',
               '☁',
-              'Google Drive',
-              drive === undefined ? (
+              backupDestinationLabel(backup?.destination),
+              backup === undefined ? (
                 <span className="chip">—</span>
-              ) : !drive.available ? (
+              ) : !backup.available ? (
                 <span className="chip">unavailable</span>
-              ) : drive.signed_in ? (
-                <span className="chip ok">{drive.last_backup_unix_ms === null ? 'signed in' : `${age(drive.last_backup_unix_ms, now)} ago`}</span>
+              ) : backup.connected ? (
+                <span className="chip ok">{backup.last_backup_unix_ms === null ? 'connected' : `${age(backup.last_backup_unix_ms, now)} ago`}</span>
               ) : (
-                <span className="chip warn">signed out</span>
+                <span className="chip warn">not configured</span>
               ),
             )}
             {row(

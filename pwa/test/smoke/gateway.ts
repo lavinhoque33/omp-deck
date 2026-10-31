@@ -68,7 +68,10 @@ export class SmokeGateway {
   push: api.PushStateView = { subscribed: false, prefs: fx.DEFAULT_PREFS, since_unix_ms: null };
   appPhase: api.UpdatePhase = { state: 'idle' };
   ompChecking = false;
-  driveBusy: string | null = null;
+  backupBusy: string | null = null;
+  backupDestination: api.BackupDestinationView = { kind: 'drive', label: 'Google Drive' };
+  /** Controlled listing replies let browser tests hold an old destination response in flight. */
+  backupListing: ((op: Extract<api.Op, { op: 'backup_list' | 'sync_backups' }>) => api.Resp | Promise<api.Resp>) | null = null;
   syncBusy: string | null = null;
   syncRows: api.SyncRowView[];
   usageFetching = false;
@@ -187,8 +190,8 @@ export class SmokeGateway {
         return { feed: 'agents', session: feed.session, agents: fx.agents(now, feed.session), truncated: false };
       case 'worktrees':
         return fx.worktrees(now, feed.project);
-      case 'drive':
-        return fx.driveFeed(now, this.driveBusy);
+      case 'backup':
+        return { ...fx.backupFeed(now, this.backupBusy), destination: this.backupDestination };
       case 'sync':
         return { feed: 'sync', rows: this.syncRows, interval: 'hourly', busy: this.syncBusy, truncated: false };
       case 'updates':
@@ -390,10 +393,14 @@ export class SmokeConnection {
         return unit;
       case 'omp_settings':
         return { ok: { type: 'omp_settings', groups: fx.ompSettings(), truncated: false } };
-      case 'drive_backups':
-        return { ok: { type: 'drive_backups', hosts: fx.driveBackups(gw.t0), truncated: false } };
+      case 'backup_list':
+        return gw.backupListing === null
+          ? { ok: { type: 'backup_list', hosts: fx.backupList(gw.t0), truncated: false } }
+          : Promise.resolve(gw.backupListing(op)).then((ok) => ({ ok }));
       case 'sync_backups':
-        return { ok: { type: 'sync_backups', backups: fx.syncBackups(gw.t0, op.project ?? null), truncated: false } };
+        return gw.backupListing === null
+          ? { ok: { type: 'sync_backups', backups: fx.syncBackups(gw.t0, op.project ?? null), truncated: false } }
+          : Promise.resolve(gw.backupListing(op)).then((ok) => ({ ok }));
       case 'presence':
         return unit;
       case 'push_subscribe':
@@ -575,8 +582,8 @@ export class SmokeConnection {
         gw.changed('changes');
         return unit;
       }
-      case 'drive_restore_prepare':
-        return ok({ type: 'restore_plan', handle: 7, plan: fx.drivePlan(), truncated: false });
+      case 'backup_restore_prepare':
+        return ok({ type: 'restore_plan', handle: 7, plan: fx.backupPlan(), truncated: false });
       case 'sync_restore_prepare':
         return ok({ type: 'restore_plan', handle: 8, plan: fx.syncPlan(gw.t0), truncated: false });
       case 'sync_set':
@@ -617,11 +624,11 @@ export class SmokeConnection {
 
 /** Long-running ops report progress: stage and total. */
 const PROGRESS: Partial<Record<api.OpName, readonly [string, number]>> = {
-  drive_backup: ['uploading', 4_812_331],
+  backup_run: ['uploading', 4_812_331],
   sync_backup: ['packing', 38_400_000],
   update_run: ['installing', 4],
   app_update: ['downloading', 84 * MIB],
-  drive_restore_apply: ['restoring', 12],
+  backup_restore_apply: ['restoring', 12],
   sync_restore_apply: ['restoring', 5],
   worktree_finish: ['merging', 3],
 };

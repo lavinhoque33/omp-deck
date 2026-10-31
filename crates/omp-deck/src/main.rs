@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod activate;
+mod agent_config;
 mod agent_ctl;
 mod agent_hub;
 mod agent_model;
@@ -9,6 +10,7 @@ mod agent_output;
 mod agent_popup;
 mod app;
 mod app_update;
+mod backup_view;
 mod badge;
 mod card;
 mod changes_view;
@@ -21,7 +23,6 @@ mod ctx_tip;
 mod dashboard;
 mod dashboard_model;
 mod deco;
-mod drive_view;
 mod file_drop;
 mod folder_scope;
 mod gw;

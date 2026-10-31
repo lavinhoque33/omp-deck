@@ -417,6 +417,8 @@ pub struct PickerInput<'a> {
     pub favorites: &'a [String],
     /// Persisted provider filter (`None` = all providers).
     pub provider: Option<&'a str>,
+    /// What the Thinking row says while there is no current model.
+    pub unset: &'a str,
 }
 
 /// `(provider, models)` alphabetical (case-insensitive).
@@ -744,7 +746,7 @@ fn body(
     ui.label(theme::section_caption("Thinking", pal.weak));
     if options.is_empty() {
         let text = match (input.current, current_model) {
-            (None, _) => "Current model unknown yet",
+            (None, _) => input.unset,
             (Some(_), None) => "Current model is not in the catalog",
             (Some(_), Some(_)) => "This model has no adjustable thinking",
         };

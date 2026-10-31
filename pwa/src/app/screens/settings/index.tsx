@@ -4,7 +4,7 @@ import type { ReactNode } from 'react';
 import type { SettingsSection } from '../../nav.ts';
 import '../../../styles/settings.css';
 import { DeviceSection } from './Device.tsx';
-import { DriveSection } from './Drive.tsx';
+import { BackupSection } from './Backup.tsx';
 import { NotificationsSection } from './Notifications.tsx';
 import { OmpSettingsSection } from './OmpSettings.tsx';
 import { SyncSection } from './Sync.tsx';
@@ -23,8 +23,8 @@ export function SettingsSectionScreen({ section }: { section: SettingsSection })
       return <OmpSettingsSection />;
     case 'updates':
       return <UpdatesSection />;
-    case 'drive':
-      return <DriveSection />;
+    case 'backup':
+      return <BackupSection />;
     case 'sync':
       return <SyncSection />;
   }

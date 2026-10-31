@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type { api } from '../src/remote/index.ts';
 import {
   buildHeatmap,
+  backupDestinationLabel,
   bytes,
   conflictList,
   defaultChoices,
@@ -15,7 +16,7 @@ import {
   prettyJson,
   remainingTone,
   settingLabel,
-  sortDriveHosts,
+  sortBackupHosts,
   summarizeProjectPlan,
   toggleExcluded,
   totalSize,
@@ -81,7 +82,7 @@ describe('heatmap', () => {
     expect(map.weeks[0]![0]?.day).toBe('2025-10-20');
   });
 
-  test('requests drive the levels without any cost', () => {
+  test('requests backup the levels without any cost', () => {
     const map = buildHeatmap([day('2026-10-22', null, 4), day('2026-10-21', 0, 1)], '2026-10-22', 53);
     expect(map.byCost).toBe(false);
     expect(map.weeks[52]![3]?.level).toBe(4);
@@ -191,8 +192,8 @@ describe('backups and restores', () => {
     expect(totalSize([backup('1', '~/a', 'x', 1, 5), backup('2', '~/a', 'x', 1, 7)], new Set(['2']))).toBe(7);
   });
 
-  test('drive hosts sorted with newest versions first', () => {
-    const hosts = sortDriveHosts([
+  test('backup hosts sorted with newest versions first', () => {
+    const hosts = sortBackupHosts([
       { host: 'z', backups: [{ id: 'a', name: 'a', size: 1, created_unix_ms: 1 }] },
       { host: 'm', backups: [{ id: 'b', name: 'b', size: 1, created_unix_ms: 1 }, { id: 'c', name: 'c', size: 1, created_unix_ms: 7 }] },
     ]);
@@ -233,7 +234,21 @@ describe('backups and restores', () => {
     const changed = { ...choices, s2: 'overwrite' as const };
     const summary = summarizeProjectPlan(plan, changed);
     expect(summary).toMatchObject({ conflicts: 2, overwrite: 1, keep: 1, both: 0, sessionsAdded: 1, added: 1, destructive: true });
+    const excluded = ['s2', 's3'];
+    expect(conflictList(plan, changed, excluded)).toEqual([{ session: 's1', choice: 'keep' }]);
+    expect(summarizeProjectPlan(plan, changed, excluded)).toMatchObject({ overwrite: 0, sessionsAdded: 0, writable: true });
+    const sessionsOnly = { ...plan, omp_added: [] };
+    expect(summarizeProjectPlan(sessionsOnly, changed, excluded).writable).toBe(false);
+    expect(summarizeProjectPlan(sessionsOnly, changed).writable).toBe(true);
+    expect(summarizeProjectPlan({ ...sessionsOnly, sessions: [{ ...session('broken', false), problem: 'unreadable' }] }, {}).writable).toBe(false);
     expect(summarizeProjectPlan({ ...plan, omp_exists: true }, choices).destructive).toBe(true);
+  });
+
+  test('backup labels follow the active destination', () => {
+    expect(backupDestinationLabel({ kind: 'drive', label: 'Google Drive' })).toBe('Google Drive');
+    expect(backupDestinationLabel({ kind: 'ftp', label: 'ftp://backup.local' })).toBe('FTP server ftp://backup.local');
+    expect(backupDestinationLabel({ kind: 'ftps', label: 'ftps://secure.local' })).toBe('FTPS server ftps://secure.local');
+    expect(backupDestinationLabel({ kind: 'sftp', label: 'sftp://host:22' })).toBe('SFTP server sftp://host:22');
   });
 
   test('session opt-out toggles', () => {

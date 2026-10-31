@@ -36,6 +36,9 @@ host), so closing a tab or the whole app leaves omp running.
 - **Usage**: omp's `/usage` as a native view (Ctrl+Shift+U or the status-bar usage chip): remaining quota
   per provider and window with reset times, a year of activity as a heatmap, and top models by cost.
   The chip itself shows the selected model's provider: its 5-hour and weekly quota as two colored pills.
+  The **Accounts** tab sets the order omp uses a provider's OAuth logins in (omp's `auth.accountPolicies`: priority,
+  reserve and reclaim levels) and pins the focused tab's session to one of them, like omp's `/session pin`. A provider
+  with several API keys is listed with each key's quota; omp picks among API keys by itself (no order or pin).
 - **Session manager** (Ctrl+Shift+S, the ⋯ menu, the sidebar button or a project's "Manage sessions…"): every
   omp session on the machine, including empty ones the sidebar hides, in a sortable table with its disk size
   (session file plus attachments and subagent transcripts, i.e. what deleting it frees), prompts and turns, tokens,
@@ -56,14 +59,30 @@ host), so closing a tab or the whole app leaves omp running.
   Missing or unreadable earlier usage is marked with `≥`; hover for a higher-precision subtotal
   and scope details. Unrecorded live subagent spend is not included.
 - **omp updates and settings**: update check badge, update actions, and a searchable editor for every `omp config` key.
+  Settings (the title-bar gear, or "Settings" in the palette) opens as a large window over the app, like the session
+  tree; Esc, ✕ or a click outside closes it and you are back on the tab you were on.
+- **Task agents** (Settings → Agents, or "Settings: Agents" in the palette): omp's built-in agents (task,
+  scout, reviewer, …) and every custom one omp finds, yours (`~/.omp/agent/agents`) and each project's
+  (`.omp/agents`). Enable or disable any agent (`task.disabledAgents`). Built-ins are read-only: pick a model
+  for one (written to `task.agentModelOverrides`; role aliases such as `@smol` show the model the role is set
+  to) or **Customize** it, which copies it into your agents or a project's, where the copy replaces it. **New
+  agent** creates a custom agent for you or for any project with sessions. For custom agents, pick the model
+  from the same dropdown as the status bar (written to the file's `model` field, with the chosen thinking
+  level), edit the system prompt (Ctrl+S saves) or delete the file (deleting a copy brings the built-in back).
+  Files omp skips, agents that replace others and model overrides in omp's config are marked. Changes apply
+  to the next task an agent runs, in running sessions too.
 - **Google Drive backup**: sign in with Google and back up your omp config (settings, models,
   custom agents, skills, …) and prompt history to a private Drive app folder, automatically when it
-  changes or on demand, and restore it on any machine (Settings → OmpDeck). See
+  changes or on demand, and restore it on any machine (Settings → Backup). See
   [below](#google-drive-backup).
+- **Server backup**: the same backups to your own FTP, FTPS or SFTP server instead of Google Drive
+  (anonymous or password login, SFTP key files, trust-on-first-use fingerprints). One destination is
+  active at a time. See [below](#server-backup-ftp-ftps-sftp).
 - **Project sync**: back up chosen project folders' `.omp` folder, omp sessions and omp's project memory
-  to the same private Drive app folder (Settings → Sync, or right-click a project in the sidebar), and
-  restore them into any folder on any machine; restored sessions keep their original age, and sessions that
-  already exist locally are kept, overwritten or added as a copy, as you choose.
+  to the active backup destination (Google Drive's private app folder or your server; Settings → Sync, or
+  right-click a project in the sidebar), and
+  restore them into any folder on any machine, picking which sessions come back; restored sessions keep their
+  original age, and sessions that already exist locally are kept, overwritten or added as a copy, as you choose.
   See [below](#project-sync).
 - **Worktree sessions**: run several agents on one repository in parallel, each in its own git worktree
   and branch: start a session in a new worktree, move a running session into one, finish it (the agent
@@ -232,8 +251,8 @@ Ctrl+C, Ctrl+X and Ctrl+V go straight to omp (omp uses Ctrl+V for image paste).
 
 | Path | Contents |
 | --- | --- |
-| `$XDG_CONFIG_HOME/omp-deck/` (default `~/.config/omp-deck/`; Windows `%APPDATA%\omp-deck\`) | `state.json` (window, tabs, settings, Sync folders), generated `tmux.conf`, `google-drive.json` (Google sign-in, mode 0600), `project-sync.json` (last project backups, mode 0600), `ctl.key` (Windows: secret for the live-control pipes) |
-| `$XDG_DATA_HOME/omp-deck/` (default `~/.local/share/omp-deck/`; Windows `%APPDATA%\omp-deck\`) | live-control extension loaded into omp tabs, `restore-safety/` (copies kept before a Drive restore; `project-*` for project restores) |
+| `$XDG_CONFIG_HOME/omp-deck/` (default `~/.config/omp-deck/`; Windows `%APPDATA%\omp-deck\`) | `state.json` (window, tabs, settings, Sync folders), generated `tmux.conf`, `google-drive.json` (Google sign-in, mode 0600), `project-sync.json` (last project backups on Google Drive, mode 0600), `backup-server.json` (the FTP/FTPS/SFTP server with its password or key passphrase, pinned fingerprint and sync state, mode 0600), `project-sync-server.json` (last project backups on the server, mode 0600), `ctl.key` (Windows: secret for the live-control pipes) |
+| `$XDG_DATA_HOME/omp-deck/` (default `~/.local/share/omp-deck/`; Windows `%APPDATA%\omp-deck\`) | live-control extension loaded into omp tabs, `restore-safety/` (copies kept before a restore, from either destination; `project-*` for project restores) |
 | `$XDG_CACHE_HOME/omp-deck/` (default `~/.cache/omp-deck/`; Windows `%LOCALAPPDATA%\omp-deck\`) | `project-sync/` temporary archives while a project backup or restore runs (removed afterwards), `host/` session-host logs |
 
 Environment: `OMP_DECK_TMUX_SOCKET` / `OMP_DECK_HOST_NS` select a different tmux socket / host namespace
@@ -244,7 +263,7 @@ client for Drive backup; `RUST_LOG` enables logging.
 
 ## Google Drive backup
 
-Settings → OmpDeck → **Google Drive backup**. **Sign in with Google** opens Google's consent page
+Settings → **Backup** → **Back up to** → **Google Drive**. **Sign in with Google** opens Google's consent page
 in your browser, and OmpDeck receives the answer on a local `127.0.0.1` port. OmpDeck only asks
 for access to its own hidden app folder on your Drive (`drive.appdata`) and your email address. It
 cannot see your other Drive files. See the [privacy policy](PRIVACY.md).
@@ -262,8 +281,8 @@ caches, the model catalog (`models.db`) and other runtime state.
 
 **Backups**: each backup is one `omp-backup-<UTC time>-<host>.tar.gz` with a manifest. **Back up
 automatically** sets how often OmpDeck checks (Off, every 10 minutes (default), 30 minutes, hour, 6 hours,
-day); it uploads only when the backed-up content changed. **Back up now** uploads at once. Drive keeps the
-newest 30 backups.
+day); it uploads only when the backed-up content changed. **Back up now** uploads at once. The newest 30
+backups are kept (on Drive, and on a [server](#server-backup-ftp-ftps-sftp)).
 
 **Restore…** lists the backups, newest first, with date, machine and size. After you pick one,
 OmpDeck downloads and verifies it, then shows exactly which files will be replaced, added or
@@ -275,19 +294,74 @@ into the live database, so running omp processes keep working. Restart running o
 up the restored config.
 
 **Sign out** revokes OmpDeck's access at Google and deletes the local sign-in. Builds made without
-Google OAuth credentials show the card as "not available in this build". Maintainers: see
+Google OAuth credentials show the Google Drive option as unavailable and the card as "not available in this build". Maintainers: see
 [docs/google-drive-setup.md](docs/google-drive-setup.md).
+
+## Server backup (FTP, FTPS, SFTP)
+
+Instead of Google Drive, config backups and project sync can go to your own FTP, FTPS or SFTP server
+(a NAS, a VPS, a router with a USB disk, …). One destination is active at a time: Settings → **Backup**
+→ **Back up to** picks Google Drive or **FTP · SFTP server**, and everything else (the schedules,
+**Back up now**, **Restore…**, the Sync page, the sidebar and palette entries) then works on that
+destination and names it, for example **Back up to sftp://host…**. Google Drive is greyed out in builds
+without a Google OAuth client; the server option is available in every build. Each destination keeps
+its own sign-in or server and its own "already backed up" state, so you can switch back and forth;
+the first backup after switching uploads. What is backed up, the schedules, restore and its safety
+copies work as described in [Google Drive backup](#google-drive-backup) and [Project sync](#project-sync).
+
+**Set up**: choose **FTP · SFTP server** and fill in the form:
+
+- **Protocol**: **SFTP** (over SSH, default port 22), **FTPS** (FTP over TLS, explicit `AUTH TLS`,
+  default port 21) or plain **FTP** (default port 21). The port follows the protocol until you change it.
+- **Server**: host name or address, and port.
+- **Anonymous login** (FTP and FTPS only): logs in as `anonymous`, for public servers that allow writing.
+- **User name** and **Password**, or for SFTP **Key file** (**Browse…**; an OpenSSH or PEM private key:
+  ed25519, ECDSA or RSA) with an optional **Key passphrase**. OmpDeck keeps the path to the key file, not a copy.
+- **Remote folder**: where the backups go (default `omp-deck-backups`). It is created if missing and is
+  relative to your login folder unless it starts with `/`.
+
+**Connect** logs in, creates the folder if needed, writes and deletes a small probe file to prove write
+access, and only then saves the server. A failure shows the reason and saves nothing. **Edit** changes
+the saved server; leave the password or passphrase empty to keep the saved one.
+
+**Plain FTP is unencrypted**: the form warns that your login and your backups (which can hold project
+secrets) travel in the clear and can be read by anyone on the network path. Prefer SFTP or FTPS.
+
+**Trust on first use**: the first time you connect to an SFTP server, OmpDeck shows **Trust this server?**
+with the host key's `SHA256:` fingerprint (the format of `ssh-keygen -l`); compare it with your server's
+and click **Trust**. For FTPS, OmpDeck first checks the certificate against public root certificates and
+asks only when that fails (a self-signed or private-CA certificate); the prompt then shows the
+certificate's SHA-256 fingerprint (the format of `openssl x509 -fingerprint -sha256`). Once trusted, the
+key or certificate is pinned: a pinned FTPS certificate must match exactly (its name and expiry are not
+checked, so a renewed certificate must be trusted again), and a server whose key or certificate has changed is
+refused as a possible man-in-the-middle. If the change is legitimate, **Remove server** and add it again.
+
+**Layout on the server**: every backup is a `<name>.tar.gz` (the same
+`omp-backup-…`/`omp-project-…` names as on Drive) plus a small `<name>.tar.gz.json` sidecar with its
+date, size and details. Files are uploaded as `.part` and renamed, the sidecar last, so an interrupted
+upload never shows up as a backup. Only app-named backups that have a sidecar are listed, pruned or deleted;
+other files in the folder are left alone. The retention is the same as on Drive: the newest 30 config
+backups, and the newest 3 per project and machine. **Manage backups…** and **Manage cloud backups…**
+delete older or other machines' backups.
+
+**Remove server** forgets the server on this computer: it deletes `backup-server.json` and
+`project-sync-server.json` (see [Configuration and data](#configuration-and-data)). Nothing is deleted on
+the server, so the backups stay there until you remove them (or add the server again).
+
+The server password and key passphrase are stored in `backup-server.json` in the config folder (mode
+0600; on Windows the per-user `%APPDATA%` folder), never anywhere else. See the [privacy policy](PRIVACY.md).
 
 ## Project sync
 
-Settings → **Sync** is a separate workflow from the config backup above and uses the same Google
-sign-in. Each row of the **Projects** table is a folder (**Add folder…**, **Change…**) with three
+Settings → **Sync** is a separate workflow from the config backup above and uses the same backup
+destination (Google Drive or your server; see [Server backup](#server-backup-ftp-ftps-sftp)). Each row
+of the **Projects** table is a folder (**Add folder…**, **Change…**) with three
 switches, each showing how much it would upload. A newly added folder starts with all switches off and
 nothing is uploaded until you pick what to keep and click **Back up now**:
 
 - **.omp folder**: the project's `<folder>/.omp` (project `AGENTS.md`, rules, skills, commands, agents,
   `config.yml`, `mcp.json`, plans, …). `node_modules/`, `.git/`, symlinks and special files are skipped
-  (and listed). A project `.omp` can hold secrets; it is stored only in your private Drive app folder.
+  (and listed). A project `.omp` can hold secrets; it is stored only at your backup destination (your private Drive app folder or your server).
   Not offered for your home folder, whose `.omp` is omp's global directory.
 - **Sessions**: every omp session whose project is this folder, with its attachments, subagent
   transcripts and referenced images. Sessions that are being written are saved up to their last complete
@@ -300,11 +374,13 @@ nothing is uploaded until you pick what to keep and click **Back up now**:
 **Back up now** uploads one row at once. **Back up listed projects automatically** (Off, every 10 or 30
 minutes, every hour, every 6 hours (default), every day) uploads only rows whose files or session choices
 changed since their last backup. Each backup is one
-`omp-project-<UTC time>-<host>-<folder>.tar.gz`; Drive keeps the newest 3 per project and machine.
-Backups count toward your Drive storage. Right-click a project (or a session, under **Google Drive**) in the
-sidebar → **Back up to Google Drive…** for a one-off backup, optionally adding the folder to the table.
+`omp-project-<UTC time>-<host>-<folder>.tar.gz`; the newest 3 per project and machine are kept, on Google
+Drive and on a server alike. Backups count toward your Drive storage or your server's disk space. Right-click
+a project (or a session, under **Backup**) in the sidebar → **Back up to <destination>…** (for example
+**Back up to Google Drive…** or **Back up to sftp://host…**) for a one-off backup, optionally adding the
+folder to the table.
 
-**Restore…** (on the Sync page, or **Restore from Google Drive…** in the sidebar menu, which restores
+**Restore…** (on the Sync page, or **Restore from <destination>…** in the sidebar menu, which restores
 into that project's folder) lists project backups by project and machine, newest first, with older
 versions selectable. Pick the folder to restore into (it is created if missing) and **.omp folder**,
 **Sessions** and/or **Memory**. OmpDeck downloads and verifies the backup, then shows what will change before writing:
@@ -320,7 +396,9 @@ versions selectable. Pick the folder to restore into (it is created if missing) 
   OmpDeck waits for omp to finish merging memory for that folder; if omp is still busy after 10 s the
   memory is left untouched and the summary says so.
 - **Sessions**: each session is added through `omp session unpack --cwd <folder>`, so omp moves it to the
-  new folder and tells the agent where it now lives. Restored sessions keep the last-activity time they had
+  new folder and tells the agent where it now lives. **Choose…** next to the session count opens the backup's
+  session list: untick the sessions to leave out (they are neither written nor listed as conflicts).
+  Restored sessions keep the last-activity time they had
   when backed up, so the sidebar's newest/oldest order survives. When a session already exists on this machine,
   the dialog lists it with both ages and lets you pick, per session or for all: **Keep current** (the default;
   the backup's copy is skipped), **Overwrite** (the local copy is stopped if running, saved as an
@@ -330,8 +408,8 @@ versions selectable. Pick the folder to restore into (it is created if missing) 
 
 **Delete backups**: **Manage cloud backups…** lists every project backup by project, machine and version;
 tick the ones to remove and **Delete permanently…**. The restore dialog also has a delete button per
-version. Deleted backups are removed from Drive at once (they do not go to the Drive trash) and cannot be
-recovered.
+version. Deleted backups are removed from the destination at once (Google Drive: they do not go to the
+Drive trash; server: the files are deleted) and cannot be recovered.
 
 ## Worktree sessions
 

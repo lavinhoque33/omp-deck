@@ -108,7 +108,7 @@ pub fn requests() -> Vec<(&'static str, Request)> {
         ("usage_activity", view(112, Op::UsageActivity { days: 30 })),
         ("usage_refresh", view(113, Op::UsageRefresh {})),
         ("omp_settings", view(114, Op::OmpSettings {})),
-        ("drive_backups", view(115, Op::DriveBackups {})),
+        ("backup_list", view(115, Op::BackupList {})),
         ("sync_backups", view(116, Op::SyncBackups { project: None })),
         (
             "sync_backups of a project",
@@ -459,7 +459,7 @@ pub fn requests() -> Vec<(&'static str, Request)> {
     }
     out.extend([
         ("update_check", view(157, Op::UpdateCheck {})),
-        ("drive_backup", journaled(158, Op::DriveBackup {})),
+        ("backup_run", journaled(158, Op::BackupRun {})),
         (
             "sync_backup",
             journaled(
@@ -568,27 +568,27 @@ pub fn requests() -> Vec<(&'static str, Request)> {
                 },
             ),
         ),
-        ("drive_sign_in", journaled(174, Op::DriveSignIn {})),
+        ("backup_connect", journaled(174, Op::BackupConnect {})),
         (
-            "drive_delete",
+            "backup_delete",
             journaled(
                 175,
-                Op::DriveDelete {
+                Op::BackupDelete {
                     ids: vec![s("1AbC"), s("1DeF")],
                 },
             ),
         ),
         (
-            "drive_restore_prepare",
-            journaled(176, Op::DriveRestorePrepare { id: s("1AbC") }),
+            "backup_restore_prepare",
+            journaled(176, Op::BackupRestorePrepare { id: s("1AbC") }),
         ),
         (
-            "drive_restore_apply",
-            journaled(177, Op::DriveRestoreApply { handle: 3 }),
+            "backup_restore_apply",
+            journaled(177, Op::BackupRestoreApply { handle: 3 }),
         ),
         (
-            "drive_restore_discard",
-            journaled(178, Op::DriveRestoreDiscard { handle: 3 }),
+            "backup_restore_discard",
+            journaled(178, Op::BackupRestoreDiscard { handle: 3 }),
         ),
         ("sync_add", journaled(179, Op::SyncAdd { dir: s(DIR) })),
         (
@@ -664,6 +664,18 @@ pub fn requests() -> Vec<(&'static str, Request)> {
                             choice: ConflictResolution::Both,
                         },
                     ],
+                    excluded: vec![s("01D")],
+                },
+            ),
+        ),
+        (
+            "sync_restore_apply without excluded sessions",
+            journaled(
+                197,
+                Op::SyncRestoreApply {
+                    handle: 5,
+                    conflicts: vec![],
+                    excluded: vec![],
                 },
             ),
         ),
@@ -714,7 +726,7 @@ pub fn requests() -> Vec<(&'static str, Request)> {
                 },
             ),
         ),
-        ("subscribe drive", subscribe(193, Feed::Drive {})),
+        ("subscribe backup", subscribe(193, Feed::Backup {})),
         ("subscribe sync", subscribe(194, Feed::Sync {})),
         ("subscribe updates", subscribe(195, Feed::Updates {})),
         (
@@ -730,8 +742,8 @@ pub fn requests() -> Vec<(&'static str, Request)> {
     out
 }
 
-pub fn drive_plan() -> RestorePlanView {
-    RestorePlanView::Drive {
+pub fn backup_plan() -> RestorePlanView {
+    RestorePlanView::Backup {
         name: s("omp-config-2026-10-30.zip"),
         created_unix_ms: Some(AT),
         host: s("workstation"),
@@ -1017,13 +1029,13 @@ fn replies() -> Vec<(&'static str, Reply)> {
             ),
         ),
         (
-            "drive_backups",
+            "backup_list",
             ok(
                 115,
-                Resp::DriveBackups {
-                    hosts: vec![DriveHost {
+                Resp::BackupList {
+                    hosts: vec![BackupHost {
                         host: s("workstation"),
-                        backups: vec![DriveBackupView {
+                        backups: vec![BackupFileView {
                             id: s("1AbC"),
                             name: s("omp-config-2026-10-30.zip"),
                             size: 52_000,
@@ -1098,12 +1110,12 @@ fn replies() -> Vec<(&'static str, Reply)> {
             ),
         ),
         (
-            "done drive restore plan",
+            "done backup restore plan",
             done(
                 176,
                 DoneView::RestorePlan {
                     handle: 3,
-                    plan: drive_plan(),
+                    plan: backup_plan(),
                     truncated: false,
                 },
             ),
@@ -1296,9 +1308,13 @@ fn feeds() -> Vec<(&'static str, Event)> {
         has_output: false,
         live: false,
     };
-    let drive = |interval: SyncInterval| FeedValue::Drive {
+    let backup = |interval: SyncInterval| FeedValue::Backup {
+        destination: BackupDestinationView {
+            kind: BackupKind::Drive,
+            label: s("Google Drive"),
+        },
         available: true,
-        signed_in: false,
+        connected: false,
         account: None,
         last_backup_unix_ms: None,
         interval,
@@ -1740,12 +1756,16 @@ fn feeds() -> Vec<(&'static str, Event)> {
             ),
         ),
         (
-            "feed drive",
+            "feed backup",
             feed(
-                Feed::Drive {},
-                FeedValue::Drive {
+                Feed::Backup {},
+                FeedValue::Backup {
+                    destination: BackupDestinationView {
+                        kind: BackupKind::Drive,
+                        label: s("Google Drive"),
+                    },
                     available: true,
-                    signed_in: true,
+                    connected: true,
                     account: Some(s("me@example.com")),
                     last_backup_unix_ms: Some(AT),
                     interval: SyncInterval::Daily,
@@ -1778,13 +1798,50 @@ fn feeds() -> Vec<(&'static str, Event)> {
         ),
     ];
     for (case, interval) in [
-        ("feed drive every ten minutes", SyncInterval::TenMinutes),
+        ("feed backup every ten minutes", SyncInterval::TenMinutes),
         (
-            "feed drive every thirty minutes",
+            "feed backup every thirty minutes",
             SyncInterval::ThirtyMinutes,
         ),
     ] {
-        out.push((case, feed(Feed::Drive {}, drive(interval))));
+        out.push((case, feed(Feed::Backup {}, backup(interval))));
+    }
+    for (case, kind, label) in [
+        (
+            "feed backup to an ftp server",
+            BackupKind::Ftp,
+            "ftp://nas.local",
+        ),
+        (
+            "feed backup to an ftps server",
+            BackupKind::Ftps,
+            "ftps://nas.local",
+        ),
+        (
+            "feed backup to an sftp server",
+            BackupKind::Sftp,
+            "sftp://nas.local:2222",
+        ),
+    ] {
+        out.push((
+            case,
+            feed(
+                Feed::Backup {},
+                FeedValue::Backup {
+                    destination: BackupDestinationView {
+                        kind,
+                        label: s(label),
+                    },
+                    available: true,
+                    connected: true,
+                    account: None,
+                    last_backup_unix_ms: Some(AT),
+                    interval: SyncInterval::Hourly,
+                    busy: None,
+                    error: None,
+                },
+            ),
+        ));
     }
     for (case, interval) in [
         ("feed sync hourly", SyncInterval::Hourly),
@@ -1860,7 +1917,7 @@ fn events() -> Vec<(&'static str, Event)> {
             outcome: OutcomeView::Done {
                 result: DoneView::RestorePlan {
                     handle: 3,
-                    plan: drive_plan(),
+                    plan: backup_plan(),
                     truncated: false,
                 },
             },

@@ -8,6 +8,8 @@ import { join } from 'node:path';
 import type { BrowserContext, Page } from 'playwright-core';
 import { launch, phone } from '../test/smoke/browser.ts';
 import { startSmoke } from '../test/smoke/server.ts';
+import type { api } from '../src/remote/index.ts';
+import * as fixtures from '../test/smoke/fixtures.ts';
 
 const OUT = process.env['E2E_OUT'] ?? '/tmp/pwa-smoke/e2e';
 const TIMEOUT = 15_000;
@@ -104,6 +106,56 @@ try {
     await page.locator('.composer button.send').click();
     await page.getByText('I can see notes.txt').first().waitFor();
   });
+
+  for (const section of ['backup', 'sync'] as const) {
+    await scenario(`${section}: destination switches reset selection and fence old replies`, `route=settings&section=${section}`, async (page) => {
+      const gw = smoke.gateway;
+      const reply = (marker: string): api.Resp => section === 'backup'
+        ? { type: 'backup_list', hosts: [{ host: marker, backups: [{ id: marker, name: marker, size: 1, created_unix_ms: gw.t0 }] }], truncated: false }
+        : { type: 'sync_backups', backups: [{ ...fixtures.syncBackups(gw.t0, null)[0]!, id: marker, name: marker, host: marker }], truncated: false };
+      const reload = page.getByRole('button', { name: section === 'backup' ? 'Reload versions' : 'Reload backups', exact: true });
+      await page.locator('.version .check').first().click();
+      await page.locator('.select-bar').waitFor();
+      const held = Promise.withResolvers<api.Resp>();
+      const pending = Promise.withResolvers<void>();
+      gw.backupListing = () => {
+        pending.resolve();
+        return held.promise;
+      };
+      await reload.click();
+      const timer = setTimeout(() => pending.reject(new Error('old listing was not requested')), TIMEOUT);
+      try {
+        await pending.promise;
+      } finally {
+        clearTimeout(timer);
+      }
+      try {
+        for (const [index, destination] of [
+          { kind: 'sftp', label: 'sftp://first.example' },
+          { kind: 'sftp', label: 'sftp://second.example' },
+        ].entries()) {
+          const marker = `destination-version-${index}`;
+          gw.backupListing = () => reply(marker);
+          gw.backupDestination = destination as api.BackupDestinationView;
+          // Do not change timestamps: kind/label alone must cause a fresh listing.
+          gw.changed('backup');
+          await page.getByRole('button', { name: `Select ${marker}`, exact: true }).waitFor();
+          if (await page.locator('.select-bar').count() !== 0) throw new Error('selection survived a destination switch');
+          if (index === 0) {
+            held.resolve(reply('stale-version'));
+            await page.waitForTimeout(250);
+            if (await page.getByRole('button', { name: 'Select stale-version', exact: true }).count() !== 0) throw new Error('old response replaced destination listing');
+          }
+          await page.getByRole('button', { name: `Select ${marker}`, exact: true }).click();
+          await page.locator('.select-bar').waitFor();
+        }
+      } finally {
+        gw.backupListing = null;
+        gw.backupDestination = { kind: 'drive', label: 'Google Drive' };
+        gw.changed('backup');
+      }
+    });
+  }
 
   await scenario('terminal input reaches the desktop and echoes', 'route=terminal&live=tmux%3A8%3Aomp-deck%3Aomp-3c4d&title=Refactor%20tmux%20launcher', async (page) => {
     await page.getByRole('button', { name: /Observe/ }).click();

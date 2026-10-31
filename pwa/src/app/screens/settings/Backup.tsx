@@ -1,59 +1,68 @@
-// Google Drive config backup: sign-in state (signing in happens in the desktop's browser), back
+// Active-destination config backup: desktop setup, back
 // up now, the stored versions by host with multi-select delete, and restore: prepare → plan
 // preview → apply (with the overwrite warning) or discard.
 
-import { type ReactNode, useCallback, useEffect, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 import type { api } from '../../../remote/index.ts';
 import { age, perform, succeeded } from '../../ui/format.ts';
 import { useClient, useFeed, useNow, useOnline } from '../../ui/hooks.ts';
 import { Card, ConfirmSheet, Empty, KeyValues, NeedsS4, Sheet } from '../../ui/kit.tsx';
 import { ReadOnlyNote, SectionScreen, ask, useControl, useManage } from './common.tsx';
-import { INTERVAL_LABEL, type HostVersions, bytes, sortDriveHosts, totalSize, when } from './logic.ts';
+import { INTERVAL_LABEL, type HostVersions, bytes, sortBackupHosts, totalSize, when, backupDestinationLabel } from './logic.ts';
 
-type DrivePlan = Extract<api.RestorePlanView, { type: 'drive' }>;
+type BackupPlan = Extract<api.RestorePlanView, { type: 'backup' }>;
 
-export function DriveSection(): ReactNode {
+export function BackupSection(): ReactNode {
+  const backup = useFeed({ feed: 'backup' }, 'backup');
+  // A destination switch is a new listing scope, including selection and restore handles.
+  const destinationKey = JSON.stringify([backup?.destination.kind, backup?.destination.label]);
   return (
-    <SectionScreen eyebrow="Backup" title="Google Drive">
-      <NeedsS4 what="Google Drive backup">
-        <DriveBody />
+    <SectionScreen eyebrow="Backup" title="Settings backup">
+      <NeedsS4 what="Settings backup">
+        <BackupBody key={destinationKey} backup={backup} />
       </NeedsS4>
     </SectionScreen>
   );
 }
 
-function DriveBody(): ReactNode {
+function BackupBody({ backup }: { backup: Extract<api.FeedValue, { feed: 'backup' }> | undefined }): ReactNode {
   const client = useClient();
   const now = useNow();
   const online = useOnline();
   const control = useControl();
   const manage = useManage();
-  const drive = useFeed({ feed: 'drive' }, 'drive');
-  const [hosts, setHosts] = useState<HostVersions<api.DriveBackupView>[] | null>(null);
+  const active = useRef(true);
+  useEffect(() => {
+    active.current = true;
+    return () => { active.current = false; };
+  }, []);
+  const [hosts, setHosts] = useState<HostVersions<api.BackupFileView>[] | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
-  const [plan, setPlan] = useState<{ handle: number; plan: DrivePlan; truncated: boolean } | null>(null);
+  const [plan, setPlan] = useState<{ handle: number; plan: BackupPlan; truncated: boolean } | null>(null);
 
-  const signedIn = drive?.signed_in === true;
+  const connected = backup?.connected === true;
+  const destination = backupDestinationLabel(backup?.destination);
   const load = useCallback(async () => {
     setLoading(true);
-    const reply = await ask(client, { op: 'drive_backups' }, 'Drive versions');
+    const reply = await ask(client, { op: 'backup_list' }, 'Backup versions');
+    if (!active.current) return;
     setLoading(false);
-    if (reply?.type === 'drive_backups') {
-      setHosts(sortDriveHosts(reply.hosts));
+    if (reply?.type === 'backup_list') {
+      setHosts(sortBackupHosts(reply.hosts));
       setTruncated(reply.truncated);
     }
   }, [client]);
   useEffect(() => {
-    if (online && signedIn && hosts === null) void load();
-  }, [online, signedIn, hosts, load]);
+    if (online && connected && hosts === null) void load();
+  }, [online, connected, hosts, load]);
   // A finished backup adds a version.
-  const lastBackup = drive?.last_backup_unix_ms ?? null;
+  const lastBackup = backup?.last_backup_unix_ms ?? null;
   useEffect(() => {
-    if (online && signedIn && lastBackup !== null) void load();
+    if (online && connected && lastBackup !== null) void load();
   }, [lastBackup]);
 
   const all = hosts?.flatMap((host) => host.versions) ?? [];
@@ -72,61 +81,66 @@ function DriveBody(): ReactNode {
     return view;
   };
   const remove = async () => {
-    const view = await step('delete', { op: 'drive_delete', ids: chosen.map((v) => v.id) }, `Delete ${chosen.length} Drive backup${chosen.length === 1 ? '' : 's'}`, 'Deleted.');
+    const view = await step('delete', { op: 'backup_delete', ids: chosen.map((v) => v.id) }, `Delete ${chosen.length} backup${chosen.length === 1 ? '' : 's'}`, 'Deleted.');
     setConfirmDelete(false);
     if (succeeded(view)) setSelected(new Set());
     await load();
   };
-  const prepare = async (version: api.DriveBackupView) => {
-    const view = await step(`restore:${version.id}`, { op: 'drive_restore_prepare', id: version.id }, `Prepare restore of ${version.name}`);
+  const prepare = async (version: api.BackupFileView) => {
+    const view = await step(`restore:${version.id}`, { op: 'backup_restore_prepare', id: version.id }, `Prepare restore of ${version.name}`);
     const result = view?.outcome?.state === 'done' ? view.outcome.result : null;
-    if (result?.type === 'restore_plan' && result.plan.type === 'drive') setPlan({ handle: result.handle, plan: result.plan, truncated: result.truncated });
+    if (result?.type === 'restore_plan' && result.plan.type === 'backup') setPlan({ handle: result.handle, plan: result.plan, truncated: result.truncated });
   };
 
-  if (drive !== undefined && !drive.available) {
-    return <Empty title="Google Drive backup is not available">This desktop build of OmpDeck has no Google Drive support.</Empty>;
+  if (backup !== undefined && !backup.available) {
+    return <Empty title="Backup destination is not available">Set up a supported backup destination in the desktop app’s Settings → Backup.</Empty>;
   }
 
   return (
     <>
       {online && !manage && <ReadOnlyNote need="manage" />}
-      <Card title="Account" aside={<span className={`chip ${signedIn ? 'ok' : 'warn'}`}>{signedIn ? 'signed in' : 'signed out'}</span>}>
+      <Card title="Destination" aside={<span className={`chip ${connected ? 'ok' : 'warn'}`}>{connected ? 'connected' : 'not configured'}</span>}>
         <KeyValues
           rows={[
-            ['Account', drive?.account ?? '—'],
-            ['Last backup', drive?.last_backup_unix_ms != null ? `${age(drive.last_backup_unix_ms, now)} ago` : 'never'],
-            ['Schedule', <span className="chip">{drive === undefined ? '—' : INTERVAL_LABEL[drive.interval]}</span>],
-            drive?.busy != null ? ['Working', <span className="chip accent"><span className="busy" /> {drive.busy}</span>] : null,
+            ['Destination', destination],
+            backup?.account != null ? ['Account', backup.account] : null,
+            ['Last backup', backup?.last_backup_unix_ms != null ? `${age(backup.last_backup_unix_ms, now)} ago` : 'never'],
+            ['Schedule', <span className="chip">{backup === undefined ? '—' : INTERVAL_LABEL[backup.interval]}</span>],
+            backup?.busy != null ? ['Working', <span className="chip accent"><span className="busy" /> {backup.busy}</span>] : null,
           ]}
         />
-        {drive?.error != null && <p className="field-error">{drive.error}</p>}
-        {signedIn ? (
+        {backup?.error != null && <p className="field-error">{backup.error}</p>}
+        {connected ? (
           <button
             type="button"
             className="button primary block spaced"
-            disabled={!control || busy !== null || drive?.busy != null}
-            onClick={() => void step('backup', { op: 'drive_backup' }, 'Back up to Google Drive', 'Backed up to Google Drive.')}
+            disabled={!control || busy !== null || backup?.busy != null}
+            onClick={() => void step('backup', { op: 'backup_run' }, `Back up to ${destination}`, `Backed up to ${destination}.`)}
           >
-            {busy === 'backup' || drive?.busy != null ? 'Backing up…' : '⤒ Back up now'}
+            {busy === 'backup' || backup?.busy != null ? 'Backing up…' : `⤒ Back up to ${destination}`}
           </button>
         ) : (
           <>
             <p className="muted small note">
-              Google’s sign-in cannot finish on a phone. It opens in the desktop’s browser; this page updates once you are signed in.
+              {backup?.destination.kind === 'drive'
+                ? 'Sign in to Google Drive from the desktop app; the sign-in opens in the desktop’s browser.'
+                : `Set up the server in the desktop app’s Settings → Backup (${destination}).`}
             </p>
-            <button
-              type="button"
-              className="button primary block spaced"
-              disabled={!manage || busy !== null}
-              onClick={() => void step('signin', { op: 'drive_sign_in' }, 'Sign in on desktop', 'Continue in the desktop’s browser.')}
-            >
-              {busy === 'signin' ? 'Opening…' : '🖥 Sign in on desktop'}
-            </button>
+            {backup?.destination.kind === 'drive' && (
+              <button
+                type="button"
+                className="button primary block spaced"
+                disabled={!manage || busy !== null || backup.available === false}
+                onClick={() => void step('signin', { op: 'backup_connect' }, 'Sign in on the desktop', 'Continue in the desktop’s browser.')}
+              >
+                {busy === 'signin' ? 'Opening…' : '🖥 Sign in on the desktop'}
+              </button>
+            )}
           </>
         )}
       </Card>
 
-      {signedIn && (
+      {connected && (
         <Card
           title="Versions"
           aside={
@@ -136,7 +150,7 @@ function DriveBody(): ReactNode {
           }
         >
           {hosts === null && <Empty title={loading ? 'Loading versions…' : 'Not loaded'} />}
-          {hosts !== null && all.length === 0 && <Empty title="No backups on Drive yet">Back up now to store the first version.</Empty>}
+          {hosts !== null && all.length === 0 && <Empty title="No backups at this destination yet">Back up now to store the first version.</Empty>}
           {truncated && <p className="muted small note">Only the newest versions are listed.</p>}
           {hosts?.map((host) => (
             <div key={host.host} className="host-group">
@@ -186,7 +200,7 @@ function DriveBody(): ReactNode {
       {confirmDelete && (
         <ConfirmSheet
           title={`Delete ${chosen.length} backup${chosen.length === 1 ? '' : 's'} permanently?`}
-          message="They are removed from Google Drive for good; they cannot be restored afterwards."
+          message="They are removed from the active destination for good; they cannot be restored afterwards."
           facts={[
             ['Versions', `${chosen.length}`],
             ['Size', bytes(totalSize(all, selected))],
@@ -199,13 +213,13 @@ function DriveBody(): ReactNode {
           onCancel={() => setConfirmDelete(false)}
         />
       )}
-      {plan !== null && <DrivePlanSheet prepared={plan} onDone={() => setPlan(null)} />}
+      {plan !== null && <BackupPlanSheet prepared={plan} onDone={() => setPlan(null)} />}
     </>
   );
 }
 
 /** The prepared restore: what is replaced, added, made to match, removed, and where the safety copy goes. */
-function DrivePlanSheet({ prepared, onDone }: { prepared: { handle: number; plan: DrivePlan; truncated: boolean }; onDone: () => void }): ReactNode {
+function BackupPlanSheet({ prepared, onDone }: { prepared: { handle: number; plan: BackupPlan; truncated: boolean }; onDone: () => void }): ReactNode {
   const client = useClient();
   const manage = useManage();
   const [confirm, setConfirm] = useState(false);
@@ -214,13 +228,13 @@ function DrivePlanSheet({ prepared, onDone }: { prepared: { handle: number; plan
 
   const discard = async () => {
     setBusy(true);
-    await perform(client, { op: 'drive_restore_discard', handle }, 'Discard restore');
+    await perform(client, { op: 'backup_restore_discard', handle }, 'Discard restore');
     setBusy(false);
     onDone();
   };
   const apply = async () => {
     setBusy(true);
-    const view = await perform(client, { op: 'drive_restore_apply', handle }, 'Restore from Google Drive', 'Restored. Restart omp sessions to pick up the settings.');
+    const view = await perform(client, { op: 'backup_restore_apply', handle }, 'Restore settings backup', 'Restored. Restart omp sessions to pick up the settings.');
     setBusy(false);
     setConfirm(false);
     if (succeeded(view)) onDone();

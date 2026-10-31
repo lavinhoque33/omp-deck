@@ -344,8 +344,16 @@ export function groupSyncBackups(backups: readonly api.SyncBackupView[]): Projec
     });
 }
 
-/** Drive hosts with their versions newest first. */
-export function sortDriveHosts(hosts: readonly api.DriveHost[]): HostVersions<api.DriveBackupView>[] {
+/** A destination label safe to show on phones (the gateway never exposes credentials). */
+export function backupDestinationLabel(destination: api.BackupDestinationView | undefined): string {
+  if (destination === undefined) return 'backup destination';
+  if (destination.kind === 'drive') return 'Google Drive';
+  const kind = destination.kind === 'sftp' ? 'SFTP' : destination.kind === 'ftps' ? 'FTPS' : 'FTP';
+  return `${kind} server ${destination.label}`;
+}
+
+/** Backup hosts with their versions newest first. */
+export function sortBackupHosts(hosts: readonly api.BackupHost[]): HostVersions<api.BackupFileView>[] {
   return [...hosts]
     .sort((a, b) => a.host.localeCompare(b.host))
     .map((host) => ({ host: host.host, versions: [...host.backups].sort(newestFirst) }));
@@ -387,8 +395,9 @@ export function defaultChoices(plan: Extract<api.RestorePlanView, { type: 'proje
 export function conflictList(
   plan: Extract<api.RestorePlanView, { type: 'project' }>,
   choices: Readonly<Record<string, api.ConflictResolution>>,
+  excluded: readonly string[] = [],
 ): api.ConflictChoice[] {
-  return plan.sessions.filter(isConflict).map((session) => ({ session: session.id, choice: choices[session.id] ?? 'keep' }));
+  return plan.sessions.filter((session) => !excluded.includes(session.id) && isConflict(session)).map((session) => ({ session: session.id, choice: choices[session.id] ?? 'keep' }));
 }
 
 export interface ProjectPlanSummary {
@@ -402,23 +411,26 @@ export interface ProjectPlanSummary {
   both: number;
   /** Whether applying overwrites anything (shows the overwrite warning). */
   destructive: boolean;
+  writable: boolean;
 }
 
 export function summarizeProjectPlan(
   plan: Extract<api.RestorePlanView, { type: 'project' }>,
   choices: Readonly<Record<string, api.ConflictResolution>>,
+  excluded: readonly string[] = [],
 ): ProjectPlanSummary {
-  const list = conflictList(plan, choices);
+  const list = conflictList(plan, choices, excluded);
   const overwrite = list.filter((c) => c.choice === 'overwrite').length;
   const overwritten = plan.omp_overwritten.length + plan.memory_overwritten.length;
   return {
     overwritten,
     added: plan.omp_added.length + plan.memory_added.length,
-    sessionsAdded: plan.sessions.filter((s) => !isConflict(s) && s.problem === null).length,
+    sessionsAdded: plan.sessions.filter((s) => !excluded.includes(s.id) && !isConflict(s) && s.problem === null).length,
     conflicts: list.length,
     overwrite,
     keep: list.filter((c) => c.choice === 'keep').length,
     both: list.filter((c) => c.choice === 'both').length,
+    writable: overwritten + plan.omp_added.length + plan.memory_added.length + plan.sessions.filter((s) => !excluded.includes(s.id) && s.problem === null && (!isConflict(s) || choices[s.id] === 'overwrite' || choices[s.id] === 'both')).length > 0,
     destructive: overwritten > 0 || overwrite > 0 || plan.omp_exists || plan.memory_exists,
   };
 }

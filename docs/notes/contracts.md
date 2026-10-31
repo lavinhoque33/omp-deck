@@ -412,8 +412,8 @@ pub fn parse_settings(list_text: &str, list_json: &str, defaults_json: &str) -> 
 - Client-side title bar unless `native_decorations`: logo, inline tab strip, update badge, settings
   button, app menu, minimize/maximize/close; drag → `ViewportCommand::StartDrag`, double-click toggles
   maximize, 6 px edge/corner zones → `BeginResize` with matching cursors (not when maximized).
-- Settings page = a special non-terminal tab (at most one; not persisted) with omp's tabs as a nav
-  rail plus an "OmpDeck" section (font size, theme, title bar style, update checks).
+- Settings = an overlay window (see "Settings is a window" below; it was a special non-terminal tab) with omp's
+  tabs as a nav rail plus an "OmpDeck" section (font size, theme, title bar style, update checks).
 - Sidebar context menus (session row, project header); copy = new tab running `fork_argv` in a fresh
   `omp-new-<ms>` tmux session; move = confirm modal → stop the session if alive (tmux kill, close its tab)
   → `move_session` (retry ≤ 10 × 300 ms on the live-writer error) → rescan → reopen in a tab if it had one.
@@ -986,7 +986,8 @@ tuned for contrast on white (zinc/tailwind-600 family). OSC 10/11/4 replies foll
 - Icons: lucide icon font (ISC; license shipped) replaces Material Symbols everywhere (both styles);
   `egui_material_icons` dependency removed.
 - Density Compact: tighter sidebar rows/headers, tab row, title row, menus, tree/picker rows, paddings.
-  The status bar keeps its user-tuned size (41 px bar, model chip 1.3 × max(path, 213 px)).
+  The status bar keeps its user-tuned size (41 px bar, model chip 1.3 × 213 px in every session, at most 52 % of
+  the bar; it does not follow the path chip, so a long worktree path cannot push usage out).
 - Settings → Appearance: Theme (Dark/Light), Style (Neutral/Midnight neon), Density (Compact/Comfortable);
   live switch, persisted.
 - Sidebar expansion: open(group) = filtering || override(group) ?? (group == active tab's project group).
@@ -1013,17 +1014,29 @@ shape, stats.db schema, extension imports, timings).
     { Ok, Warning, Exhausted, Unknown }, notes }`, `ResetCredits { available_count, redeemable_count,
     cooldown_until, credits: Vec<ResetCredit { title, remaining_count, usable, expires_at }> }`,
     `UnavailableAccount { provider, label: Option<String>, reason: Option<String> }`.
-  - `fetch_usage(omp: &OmpCli-or-program, invalidate: bool, timeout: Duration) -> Result<UsageSnapshot, UsageError>`:
-    runs `omp usage --json --no-extensions` (preceded by `omp usage invalidate` when `invalidate`), kills
-    on timeout (default 30 s), typed errors (spawn / timeout / exit status + stderr tail / parse).
-    Never runs `usage reset`.
+  - `fetch_usage(omp: &Omp, timeout: Duration) -> Result<UsageSnapshot, UsageError>`: runs
+    `omp usage --json --no-extensions` through omp's 5-minute report cache (like omp's own `/usage`), kills on
+    timeout (default 30 s), typed errors (spawn / timeout / exit status + stderr tail / parse). Never runs
+    `usage reset` or `usage invalidate` (0.21.1): after an invalidation omp drops a failing provider's last good
+    report (`retainLastGood = !invalidated`), and Anthropic's IP-limited `/usage` endpoint then left the account
+    "unavailable" after most manual refreshes. omp computes `policy` from the current config on every run, so a
+    plain re-read after saving rules shows them.
   - `provider_cards(&UsageSnapshot, now_ms) -> Vec<ProviderCard>` — pure port of omp's
     `buildProviderCards`: group windows by `label|window.id`, mean fraction across accounts,
     `resets_in_ms` from the fullest window, window tag (`5h`/`7d`/`mo`…) only when labels collide,
     effective status (explicit, else used ≥1 exhausted / ≥0.9 warning / ok), `idle` when every window
     < 0.5 % used and no credits/notes, sort active by max fraction desc then name, display names
     (`anthropic` → `Anthropic`, `openai-codex` → `Codex`, …), accounts count + unavailable account labels,
-    reset-credit summary text. `tightest(&[ProviderCard]) -> Option<(provider name, window label, used_fraction, status)>`.
+    reset-credit summary text. A provider with several reports also carries `per_account:
+    Vec<AccountCard { label, card: ProviderCard, identity: ReportIdentity }>` — the same card built from each
+    report alone (label = `email` / `orgName` / `accountId`, else `account N`, made unique); the Usage view pages
+    through these instead of showing the mean. `tightest(&[ProviderCard]) -> Option<Tightest { provider, account,
+    window, used, status }>` reads windows per account for such providers (`account` = the page label, else `None`).
+  - `ReportIdentity::of(&UsageReport)` (lowercased `metadata.email`/`orgId`, account/project ids from metadata and
+    every limit's `scope`) `.matches(&OAuthIdentity { email, account_id, project_id, org_id })`: port of omp's
+    `limitMatchesActiveAccount` — org ids must agree (an org-only identity then matches), two emails decide alone,
+    else an account id, else a project id, must appear; a report without limits matches nobody.
+    `UsageMetadata.org_id` and `UsageScope.project_id` parsed for it.
   - `stats_db_path() -> PathBuf` (`~/$PI_CONFIG_DIR/stats.db`, `PI_CONFIG_DIR` default `.omp`).
   - `activity(db, days) -> Result<Activity, UsageError>`: read-only open (`SQLITE_OPEN_READ_ONLY`, WAL
     tolerated, busy timeout); per local day `cost, requests, tokens` (omp's query) and per model
@@ -1040,21 +1053,38 @@ shape, stats.db schema, extension imports, timings).
   {snapcompactSavings:true})` (+ per-tool schema tokens) on `session_start`, `session_switch`,
   `agent_end`, `turn_end`, model change, and caches it; snapshots carry the cached value (no model blob).
   Any failure → field omitted.
+- `deck_core::ctl`: `LiveSnapshot.account: Option<LiveAccount { provider, identity: OAuthIdentity, pinned: bool,
+  credentials: Vec<LiveCredential { id, identity }> }>` — the OAuth account the main session uses for its current
+  model's provider. Extension: `mainAccount()` =
+  `session.modelRegistry.authStorage.oauth.identity(model.provider, session.sessionId)` (what omp's own status line
+  shows: the session's sticky credential once a request went out, before that omp's default pick); `pinned` =
+  `authStorage.sessions.get(provider, sessionId)` is an explicit oauth record (`/session pin`); `credentials` =
+  `authStorage.oauth.accounts(provider, sessionId)` (omp's numeric `credentialId` sent as a string). Wire
+  `account: {provider, email, accountId, projectId, orgId, pinned, credentials: [{credentialId, email, accountId,
+  projectId, orgId}]} | null`. Null for api-key providers; an identity naming nobody, a missing provider or a
+  malformed value → `None`; credentials without an id or identity are skipped. Additive, no protocol bump. The
+  extension pushes a snapshot every second while a client is connected, so a `/session pin` typed in the terminal
+  shows within ~1 s.
 
 ### omp-deck
 
 - Usage state owned by the app: background worker runs `fetch_usage` ~3 s after startup, every 5 min,
-  when the Usage view opens and data is > 60 s old, and on manual refresh (`invalidate = true`); and
+  when the Usage view opens and data is > 60 s old, and on manual refresh (`Mutation::UsageRefresh`, no fields); and
   `activity` when the view opens (≥ 10 min apart). UI thread never blocks.
 - Status bar **usage chip** (gauge icon + tightest `NN% left`, coloured by status; dropped first when
   narrow; hidden when there are no reports). Hover: compact per-provider cards (bars = remaining,
-  `resets in …`). Click, ⋯ menu "Usage…", app menu, Ctrl+Shift+U → **Usage view**.
+  `resets in …`). Click, ⋯ menu "Usage…", app menu, Ctrl+Shift+U → **Usage view**. A multi-account provider shows
+  one account in the chip and in the hover, both from `usage_view::shown_page`: the page whose report matches the
+  focused tab's `LiveSnapshot.account` (`CardView::in_use`, same provider only; labelled `email · in use`, or
+  `email · pinned` when the session is pinned), else the page last picked in the Usage view's pager (labelled
+  `email · i / N`), else the first.
+  `BarView::set_account` bumps `rev`; the segment-width cache also keys on the shown page.
 - **Usage view** (modal like the session tree): header "Usage" + "Updated Xs ago" + refresh;
   tabs **Overview** (stats strip: Tightest quota, Past year, Last 30 days + sparkline, Busiest day;
   provider cards with remaining bars, `NN% left`, `resets in`, resets banked, unavailable accounts,
   "untouched: …" footnote; activity heatmap 53×7 with month labels + "N active days · longest streak M
-  days") and **Details** (per provider table Limit | Account | Left | Resets; top models last 30 days).
-  Empty states: no accounts (hint `omp /login`), fetch error inline with Retry, omp missing.
+  days"), **Details** (per provider table Limit | Account | Left | Resets; top models last 30 days) and
+  **Accounts** (see below). Empty states: no accounts (hint `omp /login`), fetch error inline with Retry, omp missing.
 - **Context tooltip**: rich hover on the status-bar context chip: model + window header,
   `used / window (pct)` (+ "estimated" when not anchored), stacked category meter with the
   auto-compact threshold mark, legend rows (swatch, label, tokens, % of window) for categories, free
@@ -1062,6 +1092,69 @@ shape, stats.db schema, extension imports, timings).
   savings, top tool schemas (≤ 8 + "N more"), skills count. Without a breakdown (no live control /
   old extension): current numbers + note that the full breakdown needs live control.
 - Both styles (Neutral default, Neon) and Compact/Comfortable density; lucide icons; no per-frame allocation.
+
+### Accounts tab: omp's account order (`auth.accountPolicies`) and the session pin
+
+Facts (omp 18.14.0): a policy entry is `{provider, account: {email?, accountId?, projectId?, orgId?}, priority?,
+reservePct?, reclaimAbovePct?}`; `account` needs one of email/accountId/projectId and matches by exact equality of
+every field it gives; two entries matching one account, or reserve/reclaim on a provider without usage reports,
+make omp throw when it resolves that provider's credentials; an entry matching nobody is ignored;
+`reclaimAbovePct` must be above the account's reserve (own, else `retry.usageReservePct`). omp's ranking puts
+blocked, spent, inside-reserve and ≥ 85 %-of-5h accounts last before `priority` decides; a session keeps its
+account until it is spent or in reserve, or a higher-priority account is above its reclaim level. `omp config set`
+does not validate the shape; running sessions pick up the change. `omp usage --json` adds `policy: {priority,
+reservePct, reserveSource: "global"|"override", reclaimAbovePct?, state: "eligible"|"inside-reserve"|"exhausted"|
+"unknown", remainingPct?}` to reports and `accountsWithoutUsage` entries of providers with policies.
+
+- `deck_core::usage`:
+  - `OAuthIdentity` (camelCase serde, `None` fields skipped) `::new(email, account_id, project_id, org_id)` (empty
+    strings dropped, `None` when nothing is left), `.same_account(&other)` (case-insensitive: two emails decide, org
+    ids too when both have one; else account ids, else project ids).
+  - `policy_key(target, accounts) -> Option<OAuthIdentity>`: the fewest fields of `target` that select it alone among
+    `accounts` by omp's matcher — {email}, {email, org}, {accountId}, {email, accountId}, {projectId},
+    {email, projectId}, all; `None` when even all fields match another account.
+  - `AccountPolicy { provider, account, priority, reserve_pct, reclaim_above_pct }` (omp's entry, `None` skipped);
+    `replace_account_policies(current: &Value, provider, &[AccountPolicy]) -> Value`: other entries (other providers,
+    non-objects, unknown fields) kept verbatim in place, `provider`'s dropped, the new ones appended.
+  - `UsagePolicy` (`policy` above; `own_reserve()` = `reservePct` when `override`), `PolicyState` (unknown →
+    `Unknown`); `UsageReport.policy`, `UnavailableAccount.{project_id, org_id, org_name, kind ("type"), policy}`,
+    `UsageReport::account()` / `UnavailableAccount::account()` (api keys → `None`).
+  - `policy_providers(snap, now_ms) -> Vec<PolicyProvider { provider, name, accounts: Vec<PolicyAccount { label,
+    identity, key, card: Option<ProviderCard>, reason, policy }>, usage_capable, has_policies }>`: OAuth accounts from
+    reports and `accountsWithoutUsage` (disabled credentials take no part in routing), `priority` descending then
+    snapshot order; a label shared by two accounts gets ` · orgName` (else orgId).
+- `Omp::set_account_policies(provider, &[AccountPolicy]) -> Value`: `omp config get auth.accountPolicies`, then
+  `replace_account_policies`, then `omp config set auth.accountPolicies --json -- <array>` (the same private
+  `set_encoded` path as `set_setting`); returns the saved array.
+- Gateway: `Mutation::AccountPolicies { provider, policies }` (label `account-policies`, not allowed in maintenance)
+  → job `jobs::account_policies` → `Done::Setting(saved array)`. Empty `policies` = back to omp's automatic order.
+- ctl: `CtlCommand::PinAccount { root: Option<PathBuf>, provider, credential: Option<String> }`, wire
+  `{t:"pin_account", root, provider, credentialId}`. Extension: root checked only when both sides have one; refused
+  when `provider` is not the main session's model provider, while streaming, or for an unknown credential;
+  `credentialId` mapped back to omp's own id, then `session.pinCurrentProviderOAuthAccount(id)`; `null` →
+  `authStorage.sessions.clear(provider, sessionId)`. Reply `{ok}`; a snapshot follows at once.
+- omp-deck: `usage_state::AccountGroup` (providers with ≥ 2 OAuth accounts or with policies; rows = label, identity,
+  key, quota pills, reason, policy state, own reserve, reclaim) in `Summary.accounts`; `merged_draft(group, draft)`
+  keeps a draft's order/values across refreshes (accounts gone drop out, new ones append; same-identity accounts by
+  count); `account_policies(group, rows, global_reserve)`: priority `n − i` over the rows that have a key (rows
+  without one get no entry: omp ranks them below every rule), reserve/reclaim only when `usage_capable`, a reclaim at
+  or under the effective reserve dropped. `usage_state::KeyGroup { provider, name, rows: Vec<KeyRow { label, pills,
+  note }> }` in `Summary.keys`: providers with ≥ 2 API keys (reports naming no OAuth account + `api_key` entries
+  without usage), labelled as the Overview pager labels them. omp's `auth.accountPolicies` and `/session pin` cover
+  OAuth credentials only (API keys: per-request pick, used-up/blocked skipped, usage-ranked where measured), so these
+  are listed read-only.
+- Accounts tab (`usage_view::accounts`): routing note; one card per group: "your order" / "omp's automatic order",
+  "Reset to automatic" (only with policies), the focused tab's account and whether it is pinned; per row ↑/↓,
+  rank, label (weak with a tooltip when it has no key), `inside reserve`/`used up` badge, no-usage reason, quota
+  pills, and Reserve (stepper, "default" = `retry.usageReservePct`, ✕ back to default) / Reclaim above (off, or a
+  stepper kept above the reserve, ✕ off) where omp measures quotas. For the focused tab's provider: `this tab`
+  (+ lock when pinned), Pin (the matching `LiveCredential`) / Unpin. A dirty draft (`ViewState.drafts`) shows
+  Discard / Save order; Save → `UsageAction::SaveAccounts` → `Mutation::AccountPolicies`, toast, `UsageRefresh`;
+  the draft stays until a newer summary arrives. Pin/Unpin → `UsageAction::Pin` →
+  `ctl_command(PinAccount)`, toast with omp's refusal reason. `retry.usageReservePct` is shown, never written
+  (it also drives omp's model fallback); read from the settings catalog (`usage_reserve_from_catalog`, 10 until read).
+- Key groups follow the OAuth groups as read-only cards ("N API keys · omp picks", how omp picks, per key label,
+  no-usage reason, quota pills); the "One account per provider" empty state shows only when neither kind exists.
 
 ## Tab activity indicators, "Open tabs" sidebar section
 
@@ -1097,7 +1190,7 @@ impl SyncInterval { pub fn period(self) -> Option<Duration>; pub const ALL: [Syn
 // AppConfig gains: pub project_sync: Vec<SyncRow> (default empty), pub project_sync_interval: SyncInterval.
 ```
 
-### deck_core::gdrive::project (new; re-exported from `gdrive`)
+### deck_core::backup::project (new; re-exported from `backup`)
 
 ```rust
 pub const PROJECT_PREFIX: &str = "omp-project-";
@@ -1252,7 +1345,7 @@ impl Service {
   `drive_backup_interval` key → `Off`; `true`/absent → `Every10Minutes`. The old key is never written again.
 - `config::SyncRow` gains `#[serde(default)] excluded_sessions: BTreeSet<String>` (session ids opted out; every
   other session, including ones created later, is backed up).
-- `gdrive::ProjectSizes` (now `Clone`, not `Copy`) gains `session_list: Vec<SessionSize>`, newest first, for every
+- `backup::ProjectSizes` (now `Clone`, not `Copy`) gains `session_list: Vec<SessionSize>`, newest first, for every
   session of the project (exclusions not applied; `sessions`/`session_bytes` stay totals over all of them).
   `SessionSize { id: String, title: String /* title, else first-prompt snippet, else "(untitled)" */,
   modified: SystemTime, bytes: u64 /* jsonl + artifacts */ }`.
@@ -1389,7 +1482,7 @@ payloads raw (`Input`, `Output`, `Snapshot` chunks), control payloads JSON (unkn
 - omp on Windows: `Omp::detect` searches PATH (PATHEXT), `%LOCALAPPDATA%\omp\omp.exe`,
   `%USERPROFILE%\.bun\bin\omp.exe`; `.cmd` runs through `cmd.exe /d /c`; install argv = PowerShell
   `& ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary` (`-NoProfile -ExecutionPolicy Bypass`).
-- gdrive on Windows: no POSIX modes (stored as 0o644/0o755 by origin), `path_id` over `as_encoded_bytes()`,
+- backup on Windows: no POSIX modes (stored as 0o644/0o755 by origin), `path_id` over `as_encoded_bytes()`,
   restore skips (and lists in `omp_skipped`) names invalid on Windows (`<>:"|?*`, control chars, reserved
   CON/PRN/AUX/NUL/COM1-9/LPT1-9, trailing dot/space) and never writes through reparse points.
 - `status.rs` breadcrumb trust uses `Mux::pane`; a bare `omp` title is noise on Windows.
@@ -1916,7 +2009,7 @@ pub struct BankLock { /* platform handle */ }
 ### deck_core::config
 - `SyncRow` gains `#[serde(default)] pub memory: bool` (new rows: off, per Wave 11).
 
-### deck_core::gdrive::project
+### deck_core::backup::project
 - `Parts` gains `#[serde(default)] pub memory: bool`; `any()` includes it.
 - `pub enum MemoryBank { Missing, Present { files: u64, bytes: u64 } }` (Missing = bank dir absent or all three
   files missing/empty/non-regular). `ProjectSizes` gains `pub memory: MemoryBank` and `pub memory_dir: PathBuf`
@@ -2284,7 +2377,7 @@ omp-deck (hub):
 ### Wave 20 as built
 - Settings: selection is `Entry { OmpDeck(OmpDeckPage), Sync, Omp(i) }`; `OmpDeckPage` = General, Appearance, Notifications,
   Updates, Backup (label, subtitle, icon, palette slug). `SettingsState::show_ompdeck_page(page)` replaces `show_ompdeck()`;
-  `App::open_settings_page(page)` focuses the Settings tab on a page. `view_key` = `Option<(Option<Entry>, String)>`
+  `App::open_settings_page(page)` opens the Settings window on a page. `view_key` = `Option<(Option<Entry>, String)>`
   (`None` while searching). Palette: `settings.ompdeck.<slug>` ("Settings: OmpDeck — <page>") and `notify.while_viewing`.
   No update/Drive entry point opened Settings before (badges are popovers, Drive commands act directly), so only the bell
   gear and the palette navigate to a subpage.
@@ -2680,12 +2773,13 @@ total badge, one section per source (assistant replies / side-model calls) with 
 notes for gaps; the data rules of the earlier text version are unchanged.
 
 Status-bar usage chip (not hovered) shows the **selected model's provider**, not the tightest quota overall:
-`Summary::quota_of(provider)` (provider id = the selector's `provider/` prefix) → `ProviderQuota.pills`, the fullest
+`Summary::card_of(provider)` (provider id = the selector's `provider/` prefix) → the shown page's
+`CardPage.pills` (the account the session uses, see the usage chip above), the fullest
 window of ~5 h length (`5h`, blue tag) and of ~a week (`wk`, violet tag), lengths from `CardWindow.window_ms`
 (`durationMs`, else the id: `5h`/`7d`/`1w`). A warning/exhausted window turns its pill amber/red. A provider with
 neither window shows its two shortest measured windows (`1d`, `mo`, …, teal); a provider with no measurable window
 (or no model selected) falls back to the old tightest-overall chip, prefixed with that provider's name. The hover
-card is unchanged (all providers).
+card lists all providers.
 
 ## Settings-backup manager, dialog padding, UI font
 
@@ -2703,8 +2797,8 @@ chosen by the user from 10 rendered mockups.
   = 10×8 Compact / 12×10 Comfortable; `theme::menu_style` keeps 6/8 for context menus, dropdowns, notification and
   scope popovers.
 - **Settings-backup manager**:
-  - `deck_core::gdrive::Service::delete_backup(&self, &BackupFile) -> Result<()>`: permanent `files.delete`;
-    re-reads the file's metadata and refuses anything that is not a config backup (`drive::is_config_backup`,
+  - `deck_core::backup::Service::delete_backup(&self, &BackupFile) -> Result<()>`: permanent `files.delete`;
+    re-reads the file's metadata and refuses anything that is not a config backup (`remote::is_config_backup`,
     the same rule as `list()`: `omp-backup-` name, no `kind` property) or whose name changed; 404 = deleted.
     Deleting the recorded `last_backup` clears it and `synced_fingerprint`; deleting a file with the synced
     fingerprint clears that; the next automatic pass then uploads again.
@@ -2792,7 +2886,7 @@ earlier "always alongside, never replace" rule for that case only; the default s
   session failure). Both OmpDeck's sidebar and omp's own picker order/age sessions by file mtime
   (`session-listing.ts` `modified: mtime`, newest-mtime-first). User-approved exception to "OmpDeck never writes
   `~/.omp/**`". A rolled-back local copy (below) gets its own previous mtime back the same way.
-- `deck_core::gdrive` (re-exported like the other project types):
+- `deck_core::backup` (re-exported like the other project types):
   ```rust
   #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
   pub enum ConflictChoice { #[default] KeepLocal, Overwrite, KeepBoth }
@@ -2820,9 +2914,16 @@ earlier "always alongside, never replace" rule for that case only; the default s
   unpacked back from its safety tar with `--cwd` = its header cwd when that folder exists, else the restore target,
   and its mtime restored; the failure text says the local copy was put back (or names the safety tar if that failed).
   A live omp holding a copy makes the delete fail (`Live`) → session failed, local copy untouched.
-- `deck-service`: `Mutation::ProjectApplyRestore { handle: u64, conflicts: BTreeMap<String, ConflictChoice>, stop:
-  Vec<String> }`; the job runs `lifecycle::kill_all(&ctx.backends, &stop, "restore")` and then the apply.
-- `omp-deck` confirm step: a **"Sessions already here"** section when any plan session has `local`: an "All:" choice
+- `deck-service`: `Mutation::ProjectApplyRestore { handle: u64, conflicts: BTreeMap<String, ConflictChoice>, excluded:
+  BTreeSet<String>, stop: Vec<String> }`; the job calls `PreparedProjectRestore::leave_out_sessions(&excluded)`
+  (drops those ids from `plan.sessions` and the manifest's items together, they stay index-aligned; unknown ids
+  ignored), runs `lifecycle::kill_all(&ctx.backends, &stop, "restore")` and then the apply.
+- `omp-deck` confirm step: a **Sessions** row ("N sessions" / "K of N sessions" / "none selected") with
+  **Choose…**, which opens the shared session chooser as `SessionsTarget::Restore` ("Sessions to restore", rows
+  from the plan's `SessionPlan`s with the backed-up age; Save sets `PlanView.excluded`). Left-out sessions are
+  dropped from the conflicts, the problems list, the danger check and the apply's `conflicts`/`stop`; Restore is
+  disabled when nothing would be written. A **"Sessions already here"** section when any restored plan session has
+  `local`: an "All:" choice
   (Keep current / Overwrite / Keep both) and one row per conflict (title, backup age vs local age with a Newer
   badge on the newer side, the local copy's folder `~`-abbreviated when it differs from the target, Running badge)
   with its own three-way choice; default Keep current. Any Overwrite → danger box "N local session(s) will be
@@ -2972,3 +3073,194 @@ deleted).
   "Check for updates"; the omp submenu's check is labelled "Check for updates" ("Checking for updates…" while running).
 - `confirm::Dialog.ctrl_enter_confirms`: Ctrl+Enter (consumed before the body, so the multiline editor never sees it)
   confirms; footer hint "Ctrl+Enter confirms". Used by the Handoff dialog.
+
+## Custom agent configuration (Settings → Agents)
+
+- `deck_core::agent_defs` reads and edits the task agents omp discovers (`task/discovery.ts`): the user dir
+  `<agent dir>/agents/*.md` (`agent dir` = the sessions root's parent), per project the nearest
+  `<ancestor>/.omp/agents/*.md` walking up from its cwd, and omp's built-ins. Precedence (omp's): project > user >
+  plugins > bundled, so a file of a built-in's name replaces it. Extension/plugin agents are not listed.
+  `discover(agent_dir, cwds)` → `Catalog{dirs, bare_roots, settings}`: the user `AgentDir` first (even when
+  missing), then project dirs deduped and sorted; `bare_roots` = project cwds with no `.omp/agents` above them
+  (where a new project agent would go: `<cwd>/.omp/agents`).
+- Built-ins: `Omp::bundled_agent_sources()` runs `omp agents unpack --dir <temp dir> --json` and reads back only
+  the `written` files directly in that temp dir (removed afterwards); `bundled(&[(file, content)])` parses them
+  like files into an `AgentDir{scope: Scope::Bundled}` under pseudo paths `omp:bundled/<file>` (`BUNDLED_PREFIX`,
+  `is_bundled`), sorted. They are never written: every writer refuses those paths.
+- Reading mirrors omp's `parseAgent`: CRLF normalized, leading HTML comments skipped, frontmatter up to the first
+  `\n---`, trimmed body. `AgentFile.issue` says why omp skips a file (unreadable, no frontmatter, missing name or
+  description, reserved `main`/`sub`, name already declared by an earlier file of the same dir). `revision` = first
+  16 bytes of the content's SHA-256, hex.
+- Edits are textual (`Edit::Model(Option<String>)`, `Edit::Body(String)`): a model change rewrites only the `model`
+  entry (inserted after `description`, written JSON-quoted; `None` removes it), a body change replaces only the
+  trimmed body. Every other byte, comments, key order and line endings included, is kept. `save(path, agent_dir,
+  revision, edit)` refuses anything but an existing `*.md` directly in an agents dir (`is_agents_dir`: the user
+  dir or any absolute `…/.omp/agents`; `NotAgentFile`), re-reads and refuses a moved revision (`Changed`, text
+  `CHANGED_ON_DISK`, tested with `is_changed_error` by clients that only see the message), then replaces the file
+  atomically (through a symlink to its target, keeping its permissions).
+- `create(dir, agent_dir, name, content)` writes `<dir>/<name>.md` with `create_new`: `dir` must be an agents dir
+  (`NotAgentsDir`) whose project root exists (the user dir is created if missing), `name` passes `check_name`
+  (`[a-z0-9]` words joined by single hyphens, ≤ `NAME_MAX` = 64, not `main`/`sub`; `BadName`), and no file in
+  `dir` may already declare it (`Exists`). `NewAgent{name, description, model, body}.content()` is omp's own
+  `saveAgent` layout: JSON-quoted `name`/`description`/`model` frontmatter, a blank line, the trimmed body
+  (frontmatter only when empty; empty description → `NoDescription`). `delete(path, agent_dir, revision)`: same
+  path and revision checks as `save`.
+- `Omp::agent_settings()` reads `task.agentModelOverrides`, `task.disabledAgents` and `modelRoles` (`omp config get
+  --json`, side by side) into `AgentSettings`; override entries are kept whole, malformed ones included, so a write
+  changes only the agent it names: `overrides_with(name, Option<&str>)` / `disabled_with(name, bool)` return the
+  full new value for `OVERRIDES_KEY` / `DISABLED_KEY` (written with `Mutation::OmpSet`, as omp's `/agents` hub
+  does). `role_model(alias)` resolves `@role`, `pi/role` and `@role:level` through `modelRoles` (`ROLES_KEY`).
+  omp's model precedence: explicit request > config override > the agent's `model` > the spawning session's
+  model, so an override hides the file's model; an explicit `:level` suffix beats `thinkingLevel`, which beats the
+  role's level.
+- Gateway (`PROTOCOL` unchanged): `Query::AgentDefs{projects}` → `Answer::AgentDefs(Catalog)` (discovery, the three
+  config reads and the unpack in parallel; a failed unpack is the built-in dir's `error`). Mutations, serialized
+  by one lock: `AgentEdit{path, revision, edit}` ("agent-edit") and `AgentCreate{dir, agent: NewAgent}`
+  ("agent-create") → `Done::AgentFile(Box<AgentFile>)`; `AgentCustomize{dir, name}` ("agent-customize") unpacks
+  the built-ins, copies the one omp loads as `name` verbatim through `create` → `Done::AgentFile` (no such
+  built-in: `Refused`); `AgentDelete{path, revision}` ("agent-delete") → `Done::Unit`. `NotAgentFile` and
+  `NotAgentsDir` are `Refused`, every other agent error `Failed`.
+- UI (`agent_config.rs`, app glue `app/agent_config.rs`): Settings nav entry "Agents" at the top of the omp section
+  (badge = files with unsaved prompt edits) and the palette command `settings.agents`. Rendered full height outside
+  the settings scroll area (max 1600 px), without the omp search field. Projects = the sidebar groups' cwds. The
+  page rereads the files whenever it is opened (the page or the Settings window on it) and on its refresh button.
+  - Header: "New agent" opens the create dialog. List: filter box (name, description, model, file name,
+    "built-in"); a "User" group, one per project folder (with their path) and "Built-in" last; a "+" on the user
+    and project groups opens the dialog for that location. Rows show the model (or the overriding one; roles as
+    `@smol · <model>`) and glyphs for issue, disabled, override, replaced built-in and unsaved edits. A selection
+    made by the page (a new file, what a delete gives way to, "Show it") is scrolled into view.
+  - Enabled switch (every agent): writes `task.disabledAgents` with or without its name.
+  - Model: a chip opening `model_picker::show` (the status bar's dropdown; `PickerInput.unset` is its "no current
+    model" text). Custom agents: a pick writes `selector[:level]` to the file, keeping the agent's level when the
+    new model supports it; effort pills re-level the current model; × removes `model`. Built-ins: a pick writes
+    `task.agentModelOverrides[name]`, ↶ removes it (omp's default applies). Fallback lists show as written and
+    mark no model current. Reload, stars and provider filter are the app's shared ones.
+  - Override notice on custom agents: "Remove override" writes `task.agentModelOverrides` without this agent.
+    Settings writes update the omp settings row, toast, and reread.
+  - Built-in pane: read-only prompt, "replaced by" banner with "Show it" when a user (everywhere) or project file
+    (there) of its name exists, and "Customize ▾": one entry per location (user, each project), disabled where a
+    file already declares the name; the copy is selected once listed.
+  - Create dialog (`agent_config/create.rs`): name (live `check_name`, clash with the location's files, note when
+    it replaces a user agent or a built-in), location (user, every project folder, those without `.omp/agents`
+    included), description (required), optional prompt; Ctrl+Enter creates. A refusal stays in the dialog; the
+    new file is selected once listed and its model is picked in the editor.
+  - Delete (custom agents): asks first, saying what applies afterwards (the user agent of that name in the
+    project, else the built-in, else nothing) and selects it after the reread.
+  - System prompt: monospace editor per file, Save / Revert, Ctrl+S. Drafts live per file for the app's lifetime;
+    a reread keeps dirty drafts and, when the file moved on under one, shows "The file changed on disk…" with
+    "Keep my edits" (rebase onto the disk revision; saving then replaces only the prompt) / "Use the file". A save
+    that loses the race rereads and shows that choice (info toast); a lost model pick is an error notice.
+  - Changes apply to the next task an agent runs, in running sessions too (omp rediscovers agents per spawn and
+    watches its config).
+- `omp_settings::split_level` is the shared `provider/id:level` splitter (`auto` and omp's levels);
+  `widgets::card_frame` is `card`'s surface without a caption.
+
+## Settings is a window (user, 2026-10-27)
+
+- `Tab::Settings` is gone: Settings opens as an overlay window like the session tree, Usage and Sessions windows
+  (scrim + `egui::Window`, title bar off, `card::chrome`, resizable/movable, default 94 % × 92 % of the screen
+  clamped to 860–1800 × 520–1300, min 760 × 440). It covers the sidebar and the tab strip; the tabs and the active
+  tab are untouched, so closing it returns to the tab that was active.
+- `settings_page::window(ctx, state, input, blocked) -> Vec<SettingsAction>` (replaces `show(ui, …)`): header row
+  (gear tile, "Settings", ✕ → `SettingsAction::Close`) over the nav rail and the content, both rounded panes.
+  `SettingsState::opened()` releases keyboard focus held outside the window (the terminal) on its next frame and
+  rereads the agents when the Agents page is selected. Agents page width cap 1200 → 1600 px.
+- Close: ✕, a click on the scrim, or Esc when, at the start of the frame, no widget had focus (a text field being
+  edited lets go first), no menu/popup and no egui modal was open, and the key is still unconsumed after the page and
+  its dialogs were drawn. `blocked` (app dialogs, palette, Sessions/Usage/tree windows, agent popup) disables Esc and
+  the scrim click.
+- App: `settings_open: bool`; `open_settings()` (no-op while open) / `close_settings()` (returns focus to the
+  terminal). `modal_open()` includes it (no palette, tab switching or split shortcuts behind it); the terminal does not
+  take focus back and its input is held while it is open (`hold_input_during_modals`). Drawn right after the central
+  panel, so the other windows and dialogs stack above it. `SettingsAction::InstallOmp` closes it before opening the
+  installer tab. The title-bar gear shows active while it is open; the quick switcher no longer lists a Settings tab.
+
+## Backup destinations: Google Drive or an FTP/FTPS/SFTP server (deck-core)
+
+- Module `deck_core::gdrive` is now `deck_core::backup`: `archive`, `project` and the shared `Service` logic at the
+  root; `backup::drive` (`Account`, `AccountStore`, `Credentials`, `Endpoints`, `LoginFlow`, `LOGIN_TIMEOUT`,
+  `SCOPES`; private `client` = Drive v3, `oauth`); `backup::server` (FTP/FTPS/SFTP); private `remote` (the
+  `Remote` trait every operation goes through, `BackupFile`, `is_config_backup`/`is_project_backup`, `to_delete`).
+- `pub enum Destination { #[default] Drive, Server }` (serde: `"Drive"`, `"Server"`);
+  `AppConfig.backup_destination: Destination` (default Drive). One destination is active at a time.
+- `Service { creds: Option<Credentials> /* None = Drive unavailable */, endpoints, store: AccountStore,
+  server_store: ServerStore, destination, agent_dir, safety_root, cache_root }`; `Service::new(Option<Credentials>,
+  agent_dir)` (Drive active); `with_destination(Destination) -> Service` (clone). `backup`, `list`,
+  `prepare_restore`, `apply_restore`, `delete_backup`, `backup_project`, `list_projects`, `prepare_project_restore`,
+  `apply_project_restore`, `delete_project_backup`, `project_state` act on `destination`. Without a linked
+  destination: Drive → `NotSignedIn` (`DriveUnavailable` when `creds` is `None`), Server → `NoServer`.
+- State per destination, all under `config_dir()`, mode 0600: Drive `google-drive.json` + `project-sync.json`
+  (unchanged); Server `backup-server.json` (`ServerAccount { config, last_backup, synced_fingerprint }`, holds the
+  password) + `project-sync-server.json`. Switching destinations never reads the other's sync state, so the first
+  pass after a switch uploads. `server_connect` keeps `last_backup`/`synced_fingerprint` and the project state only
+  when protocol, host, port, user and folder are unchanged; otherwise both reset. `server_forget` deletes both server
+  files and nothing on the server.
+- `server::{Protocol { Ftp, Ftps /* explicit AUTH TLS */, Sftp }, ServerAuth { Anonymous /* FTP/FTPS */,
+  Password { user, password }, Key { user, key_path, passphrase } /* SFTP */ } /* serde tag "kind" */,
+  ServerConfig { protocol, host, port /* 0 = 21/22 */, auth, folder /* "" = DEFAULT_FOLDER "omp-deck-backups",
+  relative to the login dir unless it starts with "/" */, pinned: Option<String> }, ServerAccount, ServerStore}`.
+  `ServerConfig::normalized()` → `InvalidServer` for impossible combinations; `label()` = `scheme://host[:port]`.
+  `Debug` of `ServerAuth` redacts secrets.
+- `Service::server_connect(ServerConfig) -> Result<ServerAccount>`: normalize, connect, log in, create the folder,
+  write + rename + delete a probe file, then save. Nothing is saved on failure. `server_account()` reads the file.
+- Trust on first use: `Error::UntrustedServer { fingerprint }` when nothing is pinned (SFTP: any host key; FTPS: a
+  certificate the WebPKI roots reject) — the UI shows the fingerprint and retries with `pinned = Some(fingerprint)`.
+  `Error::ServerChanged { pinned, presented }` when the server shows another key/certificate than the pinned one.
+  SFTP fingerprint = OpenSSH `SHA256:<base64>` (`ssh-keygen -l`); FTPS = `SHA256:` + uppercase colon hex of the leaf
+  DER (`openssl x509 -fingerprint -sha256`). A pinned FTPS certificate is accepted on an exact match only (no
+  WebPKI, name or expiry check). Other server failures are `Error::Server(String)`, worded for the user.
+- Server folder layout: each backup = `<name>.tar.gz` + sidecar `<name>.tar.gz.json`
+  (`{"created": RFC 3339, "size", "props"}` = Drive's `createdTime`/`size`/`appProperties`). Both are uploaded as
+  `.part` and renamed, archive first; a failed or cancelled upload removes its parts. `BackupFile.id` = the archive
+  name. Listing needs the sidecar; only `omp-backup-*`/`omp-project-*` `.tar.gz` names with no `/`, `\`, `..` or
+  control characters are valid ids; other files in the folder are never listed, pruned or deleted. Delete removes
+  the sidecar, then the archive; a missing file counts as deleted. Retention (30 config, 3 per host+project) and
+  the delete safety checks are the Drive rules.
+- Transports (blocking, on the caller's worker thread; connect 15 s, stall 60 s): FTP/FTPS via `suppaftp` 12.2
+  (`rustls-ring`), passive mode with the data connection dialled to the control address, binary type; SFTP via
+  `russh` 0.65 (`ring`) + `russh-sftp` 3 on a private current-thread tokio runtime. No OpenSSL / aws-lc.
+- Accepted advisory (`deny.toml`): RUSTSEC-2023-0071 (Marvin, `rsa` timing side channel; no fixed release). It comes
+  in through russh's `rsa` feature, which RSA user keys and host keys need. The only private-key operation is the
+  client's single user-auth signature per login, sent to a server the user configured whose host key is pinned on first
+  use. Host-key verification uses public-key operations only. Marvin needs an attacker timing many private-key
+  operations, which this one-signature-per-login pattern does not offer. Dropping the feature would break RSA-key
+  logins.
+- Wired into the gateway and the GUI in 0.20.0 (next section).
+
+## Backup destinations in the gateway and the GUI (0.20.0)
+
+- Protocol (`PROTOCOL` stays 1; the 0.20.0 gateway version makes a newer GUI replace an older gateway):
+  - `Topic::Drive`/`TopicValue::Drive(DriveView)` → `Topic::Backup`/`TopicValue::Backup(BackupView)`;
+    `StateCache.backup` (always on). `BackupView { destination, drive_available, drive_signed_in, drive_email,
+    server: Option<ServerView>, last_backup /* active destination */, busy /* lane label */, last_error
+    /* automatic backup at the active destination */, last_auto_unix_ms }`, `linked()`, `place()`.
+  - `ServerView { protocol, host, port /* effective */, user /* None = anonymous */, key_path, folder, pinned:
+    bool, label }` = `ServerView::of(&ServerAccount)`: never the password or passphrase.
+  - Renamed (they act on the active destination): queries `BackupList`, `ProjectBackups`, `ProjectSyncState`,
+    `ProjectMeasure { project }` (same `Answer` names); mutations `Backup { force }`, `PrepareRestore(BackupFile)`,
+    `ApplyRestore(u64)`, `DiscardRestore(u64)`, `DeleteBackup(BackupFile)` (journal keys `backup`,
+    `prepare-restore`, `restore`, `discard-restore`, `delete-backup`); `Done::{Backup, Prepared { handle, plan },
+    Restored}`. Google-only ops keep their names: `DriveLoginBegin/Finish/Cancel`, `DriveSignOut`,
+    `Done::{DriveLogin, DriveAccount}`.
+  - `Mutation::ServerConnect { config: ServerConfig, keep_secret: bool }` (`server-connect`) →
+    `Done::ServerConnect(ServerConnectOutcome::{Connected(ServerView), Untrusted { fingerprint }, Changed { pinned,
+    presented }})`: trust answers are results, not errors. Before connecting, `jobs::inherit` fills from the saved
+    server when protocol, host (case-insensitive) and effective port match: a missing `pinned`, and with
+    `keep_secret` an empty password / missing passphrase for the same trimmed user. Remove + add again drops both.
+  - `Mutation::ServerForget` (`server-forget`): deletes the local server files only.
+- Engine: one backup lane for every destination (`backup_lane`; login finish, sign-out, backup, restores, deletes,
+  project jobs, `ServerConnect`, `ServerForget`); refusal "Another backup job is running (…); try again.".
+  `Service` is always built (`Credentials::detect()` may be `None`); jobs use `service.with_destination(
+  cfg.backup_destination)`. Schedules arm per `(destination, linked)` and re-arm on a change; a destination switch
+  clears the shown error; an automatic failure is recorded only while its destination is still active.
+- Settings: `BackupDestination(backup_destination: Destination)`, `Shared`; the GUI switches it through the
+  settings path like any other shared field.
+- GUI: `backup_view.rs` (was `drive_view.rs`) — `BackupCard { destination, drive: DriveAccount, server, place,
+  last, interval, busy, picker }`, `BackupAction`, `ServerForm` (kept in `SettingsState.server_form`); the card
+  shows a "Back up to" picker (Drive disabled with a reason when unavailable), the Drive rows or the server
+  summary/form (protocol FTP/FTPS/SFTP, plain-FTP warning, host, port, anonymous, user, password or key file with
+  Browse… = `transfer::pick_file`, passphrase, folder), the trust dialog with the fingerprint, then the shared
+  schedule/backup/restore/manage rows. `app/backup.rs` (was `app/drive.rs`, `BackupUi`). Dialogs, toasts, the
+  sidebar `BackupMenu { place, off }` and the palette (`project.backup`, `project.restore`, `backup.now`,
+  `backup.restore`, `backup.manage`; `sync.*` unchanged) name the active destination; the Sync page's strip shows
+  the server or a "Backup settings…" button.

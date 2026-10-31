@@ -9,10 +9,12 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use deck_core::ctl::LiveAccount;
 use deck_core::usage::{
-    Activity, CardWindow, Heatmap, LimitStatus, ProviderCard, UnavailableAccount, UsageLimit,
-    UsageReport, UsageSnapshot, format_remaining, limit_fraction, provider_cards,
-    provider_display_name, tightest,
+    AccountPolicy, Activity, CardWindow, Heatmap, LimitStatus, OAuthIdentity, PolicyState,
+    ProviderCard, ReportIdentity, UnavailableAccount, UsageLimit, UsageReport, UsageSnapshot,
+    format_remaining, limit_fraction, policy_providers, provider_cards, provider_display_name,
+    tightest,
 };
 use deck_service::gateway::protocol::UsageView;
 
@@ -37,7 +39,8 @@ pub struct Chip {
     /// `63% left`, or `Usage` when no window has a measurable fraction.
     pub text: String,
     pub status: LimitStatus,
-    /// `Anthropic · Claude 7 Day` for the hover header; empty without a tightest window.
+    /// `Anthropic · Claude 7 Day` (`Anthropic · me@example.test · Claude 7 Day` when the provider
+    /// has several accounts) for the hover header; empty without a tightest window.
     pub tight: String,
 }
 
@@ -61,56 +64,42 @@ pub struct QuotaPill {
     pub status: LimitStatus,
 }
 
-/// The windows of one provider the chip shows: its 5-hour and its weekly quota (the fullest of
-/// each when a provider has several, such as per-model weekly limits).
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProviderQuota {
-    /// omp's provider id (`anthropic`), as in a model selector's `provider/model`.
-    pub provider: String,
-    pub pills: Vec<QuotaPill>,
-}
-
 const HOUR_MS: i64 = 3_600_000;
 /// Window lengths counted as "5 hours" and "a week" (omp reports `durationMs` or ids like `5h`).
 const FIVE_HOUR_MS: std::ops::RangeInclusive<i64> = 9 * HOUR_MS / 2..=11 * HOUR_MS / 2;
 const WEEK_MS: std::ops::RangeInclusive<i64> = 6 * 24 * HOUR_MS..=8 * 24 * HOUR_MS;
 
-impl ProviderQuota {
-    fn build(c: &ProviderCard) -> ProviderQuota {
-        let measured: Vec<&CardWindow> =
-            c.windows.iter().filter(|w| w.fraction.is_some()).collect();
-        let fullest = |span: std::ops::RangeInclusive<i64>| {
-            measured
-                .iter()
-                .copied()
-                .filter(|w| w.window_ms.is_some_and(|m| span.contains(&m)))
-                .max_by(|a, b| {
-                    a.fraction
-                        .partial_cmp(&b.fraction)
-                        .unwrap_or(Ordering::Equal)
-                })
-        };
-        let mut pills: Vec<QuotaPill> = [
-            (fullest(FIVE_HOUR_MS), PillKind::FiveHour, "5h"),
-            (fullest(WEEK_MS), PillKind::Weekly, "wk"),
-        ]
-        .into_iter()
-        .filter_map(|(w, kind, tag)| w.map(|w| QuotaPill::of(w, kind, tag.to_owned())))
-        .collect();
-        if pills.is_empty() {
-            let mut rest = measured;
-            rest.sort_by_key(|w| w.window_ms.unwrap_or(i64::MAX));
-            pills = rest
-                .into_iter()
-                .take(2)
-                .map(|w| QuotaPill::of(w, PillKind::Other, other_tag(w)))
-                .collect();
-        }
-        ProviderQuota {
-            provider: c.provider.clone(),
-            pills,
-        }
+/// The windows of one card the chip shows: its 5-hour and its weekly quota (the fullest of each
+/// when there are several, such as per-model weekly limits), else its two shortest measured ones.
+fn chip_pills(c: &ProviderCard) -> Vec<QuotaPill> {
+    let measured: Vec<&CardWindow> = c.windows.iter().filter(|w| w.fraction.is_some()).collect();
+    let fullest = |span: std::ops::RangeInclusive<i64>| {
+        measured
+            .iter()
+            .copied()
+            .filter(|w| w.window_ms.is_some_and(|m| span.contains(&m)))
+            .max_by(|a, b| {
+                a.fraction
+                    .partial_cmp(&b.fraction)
+                    .unwrap_or(Ordering::Equal)
+            })
+    };
+    let pills: Vec<QuotaPill> = [
+        (fullest(FIVE_HOUR_MS), PillKind::FiveHour, "5h"),
+        (fullest(WEEK_MS), PillKind::Weekly, "wk"),
+    ]
+    .into_iter()
+    .filter_map(|(w, kind, tag)| w.map(|w| QuotaPill::of(w, kind, tag.to_owned())))
+    .collect();
+    if !pills.is_empty() {
+        return pills;
     }
+    let mut rest = measured;
+    rest.sort_by_key(|w| w.window_ms.unwrap_or(i64::MAX));
+    rest.into_iter()
+        .take(2)
+        .map(|w| QuotaPill::of(w, PillKind::Other, other_tag(w)))
+        .collect()
 }
 
 impl QuotaPill {
@@ -171,13 +160,12 @@ pub struct QuotaRow {
     pub reset: Option<String>,
 }
 
-/// One provider card as painted: the quota rows plus the extras, all pre-formatted.
+/// What a provider card shows for one account (or for the provider when it has one report).
 #[derive(Clone, Debug, PartialEq)]
-pub struct CardView {
-    pub name: String,
+pub struct CardPage {
+    /// The account (`me@example.test`); empty on a single-page card.
+    pub account: String,
     pub status: LimitStatus,
-    /// `2 accounts`.
-    pub accounts: Option<String>,
     pub unlimited: bool,
     pub rows: Vec<QuotaRow>,
     /// `3 more in Details` / `+3 more`, when rows exceed [`CARD_ROWS`].
@@ -185,16 +173,15 @@ pub struct CardView {
     pub more_compact: Option<String>,
     pub reset_credits: Option<String>,
     pub daybreak: Vec<String>,
-    /// `work@example.test — no usage endpoint`: the one place an unavailable account shows.
-    pub unavailable: Vec<String>,
     pub notes: Vec<String>,
-    pub idle: bool,
-    /// Rough height, to balance the two columns.
-    pub weight: f32,
+    /// Whose report the page shows; `None` on a single-page card.
+    pub identity: Option<ReportIdentity>,
+    /// The status-bar chip's pills for this account (empty: no measurable window).
+    pub pills: Vec<QuotaPill>,
 }
 
-impl CardView {
-    fn build(c: &ProviderCard, snap: &UsageSnapshot) -> CardView {
+impl CardPage {
+    fn build(c: &ProviderCard, account: String, identity: Option<ReportIdentity>) -> CardPage {
         let rows: Vec<QuotaRow> = c
             .windows
             .iter()
@@ -215,22 +202,9 @@ impl CardView {
             })
             .collect();
         let more = rows.len().saturating_sub(CARD_ROWS);
-        let unavailable: Vec<String> = unavailable_accounts(snap)
-            .filter(|a| a.provider == c.provider)
-            .map(|a| {
-                let who = who_of(a);
-                format!("{who} — {}", reason_of(a))
-            })
-            .collect();
-        let notes: Vec<String> = c.notes.iter().take(2).cloned().collect();
-        let extras = usize::from(c.reset_credits.is_some())
-            + unavailable.len()
-            + c.daybreak_accounts.len()
-            + notes.len();
-        CardView {
-            name: c.name.clone(),
+        CardPage {
+            account,
             status: c.status(),
-            accounts: (c.accounts > 1).then(|| format!("{} accounts", c.accounts)),
             unlimited: c.unlimited && c.windows.is_empty(),
             more_full: (more > 0).then(|| format!("{more} more in Details")),
             more_compact: (more > 0).then(|| format!("+{more} more")),
@@ -241,11 +215,86 @@ impl CardView {
                 .iter()
                 .map(|a| format!("daybreak · {a}"))
                 .collect(),
-            unavailable,
-            notes,
-            idle: c.idle,
-            weight: c.windows.len().min(CARD_ROWS) as f32 * 2.0 + extras as f32 + 2.0,
+            notes: c.notes.iter().take(2).cloned().collect(),
+            identity,
+            pills: chip_pills(c),
         }
+    }
+
+    /// Rough height in rows.
+    fn weight(&self) -> f32 {
+        let extras =
+            usize::from(self.reset_credits.is_some()) + self.daybreak.len() + self.notes.len();
+        self.rows.len().min(CARD_ROWS) as f32 * 2.0 + extras as f32
+    }
+}
+
+/// One provider card as painted: a page per account plus the provider-wide extras, all
+/// pre-formatted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardView {
+    /// omp's provider id: what the shown page is remembered under.
+    pub provider: String,
+    pub name: String,
+    /// `2 accounts` on a single-page card whose provider also has accounts without usage.
+    pub accounts: Option<String>,
+    /// One page per account that reported usage, each with that account's own numbers; a
+    /// single page (unnamed) when the provider has at most one report. Never empty.
+    pub pages: Vec<CardPage>,
+    /// `work@example.test — no usage endpoint`: the one place an unavailable account shows.
+    pub unavailable: Vec<String>,
+    pub idle: bool,
+    /// Rough height, to balance the two columns.
+    pub weight: f32,
+}
+
+impl CardView {
+    fn build(c: &ProviderCard, snap: &UsageSnapshot) -> CardView {
+        let pages: Vec<CardPage> = if c.per_account.is_empty() {
+            vec![CardPage::build(c, String::new(), None)]
+        } else {
+            c.per_account
+                .iter()
+                .map(|a| CardPage::build(&a.card, a.label.clone(), Some(a.identity.clone())))
+                .collect()
+        };
+        let unavailable: Vec<String> = unavailable_accounts(snap)
+            .filter(|a| a.provider == c.provider)
+            .map(|a| {
+                let who = who_of(a);
+                format!("{who} — {}", reason_of(a))
+            })
+            .collect();
+        let pager = if pages.len() > 1 { 1.0 } else { 0.0 };
+        let tallest = pages.iter().map(CardPage::weight).fold(0.0, f32::max);
+        CardView {
+            provider: c.provider.clone(),
+            name: c.name.clone(),
+            accounts: (pages.len() == 1 && c.accounts > 1)
+                .then(|| format!("{} accounts", c.accounts)),
+            weight: tallest + pager + unavailable.len() as f32 + 2.0,
+            pages,
+            unavailable,
+            idle: c.idle,
+        }
+    }
+
+    /// Index of the page named `account`, else the first.
+    pub fn page_index(&self, account: Option<&str>) -> usize {
+        account
+            .and_then(|a| self.pages.iter().position(|p| p.account == a))
+            .unwrap_or(0)
+    }
+
+    /// The page of the account an omp session uses, when `account` is this provider's and one
+    /// page's report matches it (omp's `limitMatchesActiveAccount`); single-page cards: `None`.
+    pub fn in_use(&self, account: Option<&LiveAccount>) -> Option<usize> {
+        let account = account.filter(|a| a.provider == self.provider)?;
+        self.pages.iter().position(|p| {
+            p.identity
+                .as_ref()
+                .is_some_and(|id| id.matches(&account.identity))
+        })
     }
 }
 
@@ -271,8 +320,6 @@ pub fn chip_visible(snap: &UsageSnapshot) -> bool {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Summary {
     pub cards: Vec<CardView>,
-    /// Per provider, the quota windows the status-bar chip shows.
-    pub quotas: Vec<ProviderQuota>,
     pub chip: Option<Chip>,
     pub details: Vec<DetailBlock>,
     /// `Untouched: A · B` footnote for providers with nothing used; empty when none.
@@ -282,6 +329,252 @@ pub struct Summary {
     /// Set when no report has limits yet accounts exist that produced nothing (all fetches
     /// failed, backoff, disabled): Overview and Details both show it instead of their content.
     pub warning: Option<NoDataWarning>,
+    /// The Accounts page: providers with several OAuth accounts, or with routing rules.
+    pub accounts: Vec<AccountGroup>,
+    /// The Accounts page: providers signed in with several API keys (no order or pin).
+    pub keys: Vec<KeyGroup>,
+}
+
+/// One provider's OAuth accounts in the order omp prefers them (`auth.accountPolicies`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountGroup {
+    pub provider: String,
+    pub name: String,
+    /// omp measures this provider's quotas: reserve and reclaim apply.
+    pub usage_capable: bool,
+    /// omp has routing rules for this provider (else it uses its automatic order).
+    pub has_policies: bool,
+    /// Highest priority first.
+    pub rows: Vec<AccountRow>,
+}
+
+/// One account of an [`AccountGroup`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountRow {
+    pub label: String,
+    pub identity: OAuthIdentity,
+    /// What its rule names it by; `None`: no rule can single it out (omp keeps it automatic).
+    pub key: Option<OAuthIdentity>,
+    pub pills: Vec<QuotaPill>,
+    /// Why it has no usage report.
+    pub note: Option<String>,
+    /// omp's verdict under the current rules (`None` without rules).
+    pub state: Option<PolicyState>,
+    /// Its own `reservePct` (`None`: `retry.usageReservePct`).
+    pub reserve: Option<u32>,
+    pub reclaim: Option<u32>,
+}
+
+/// Rounded whole percent, as omp's rules take it.
+fn whole_pct(v: f64) -> u32 {
+    v.round().clamp(0.0, 100.0) as u32
+}
+
+impl AccountGroup {
+    fn build(snap: &UsageSnapshot, now_ms: i64) -> Vec<AccountGroup> {
+        policy_providers(snap, now_ms)
+            .into_iter()
+            .filter(|p| p.accounts.len() > 1 || p.has_policies)
+            .map(|p| AccountGroup {
+                rows: p
+                    .accounts
+                    .into_iter()
+                    .map(|a| AccountRow {
+                        pills: a.card.as_ref().map(chip_pills).unwrap_or_default(),
+                        note: a.reason,
+                        state: a.policy.as_ref().map(|p| p.state),
+                        reserve: a
+                            .policy
+                            .as_ref()
+                            .and_then(|p| p.own_reserve())
+                            .map(whole_pct),
+                        reclaim: a
+                            .policy
+                            .as_ref()
+                            .and_then(|p| p.reclaim_above_pct)
+                            .map(whole_pct),
+                        label: a.label,
+                        identity: a.identity,
+                        key: a.key,
+                    })
+                    .collect(),
+                provider: p.provider,
+                name: p.name,
+                usage_capable: p.usage_capable,
+                has_policies: p.has_policies,
+            })
+            .collect()
+    }
+}
+
+/// A provider signed in with several API keys. omp picks among them by itself on every request
+/// (used-up or rate-limited keys skipped; where it measures quotas, the key with more room left
+/// preferred). `auth.accountPolicies` and `/session pin` name OAuth logins only, so the Accounts
+/// page lists these keys without order or pin.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyGroup {
+    pub provider: String,
+    pub name: String,
+    pub rows: Vec<KeyRow>,
+}
+
+/// One API key of a [`KeyGroup`], named as the Overview card's pager names it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyRow {
+    pub label: String,
+    pub pills: Vec<QuotaPill>,
+    /// Why it has no usage report.
+    pub note: Option<String>,
+}
+
+impl KeyGroup {
+    /// API keys are the reports that name no OAuth account and the `api_key` entries without
+    /// usage; providers in snapshot order, like [`AccountGroup::build`].
+    fn build(snap: &UsageSnapshot, cards: &[ProviderCard]) -> Vec<KeyGroup> {
+        let mut providers: Vec<&str> = Vec::new();
+        let named = snap.reports.iter().map(|r| r.provider.as_str());
+        for p in named.chain(
+            snap.accounts_without_usage
+                .iter()
+                .map(|u| u.provider.as_str()),
+        ) {
+            if !p.is_empty() && !providers.contains(&p) {
+                providers.push(p);
+            }
+        }
+        providers
+            .into_iter()
+            .filter_map(|provider| {
+                let card = cards.iter().find(|c| c.provider == provider)?;
+                let mut rows: Vec<KeyRow> = snap
+                    .reports
+                    .iter()
+                    .filter(|r| r.provider == provider)
+                    .enumerate()
+                    .filter(|(_, r)| r.account().is_none())
+                    // `per_account` holds one page per report, in report order, when there
+                    // are several; a lone report is the card itself.
+                    .map(|(i, r)| match card.per_account.get(i) {
+                        Some(a) => KeyRow {
+                            label: a.label.clone(),
+                            pills: chip_pills(&a.card),
+                            note: None,
+                        },
+                        None => KeyRow {
+                            label: r
+                                .metadata
+                                .identity()
+                                .map_or_else(|| format!("account {}", i + 1), str::to_owned),
+                            pills: chip_pills(card),
+                            note: None,
+                        },
+                    })
+                    .collect();
+                rows.extend(
+                    snap.accounts_without_usage
+                        .iter()
+                        .filter(|u| u.provider == provider && u.kind.as_deref() == Some("api_key"))
+                        .map(|u| KeyRow {
+                            label: who_of(u).to_owned(),
+                            pills: Vec::new(),
+                            note: Some(reason_of(u).to_owned()),
+                        }),
+                );
+                for i in 1..rows.len() {
+                    let base = rows[i].label.clone();
+                    let mut n = 1;
+                    while rows[..i].iter().any(|r| r.label == rows[i].label) {
+                        n += 1;
+                        rows[i].label = format!("{base} ({n})");
+                    }
+                }
+                (rows.len() > 1).then(|| KeyGroup {
+                    provider: provider.to_owned(),
+                    name: card.name.clone(),
+                    rows,
+                })
+            })
+            .collect()
+    }
+}
+
+/// One account as the Accounts page edits it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DraftRow {
+    pub identity: OAuthIdentity,
+    pub reserve: Option<u32>,
+    pub reclaim: Option<u32>,
+}
+
+impl DraftRow {
+    pub fn of(r: &AccountRow) -> DraftRow {
+        DraftRow {
+            identity: r.identity.clone(),
+            reserve: r.reserve,
+            reclaim: r.reclaim,
+        }
+    }
+}
+
+/// The rows the Accounts page shows for `group`: the draft's order and values for the accounts
+/// still there, then the accounts it does not know; without a draft, the group as omp has it.
+/// Accounts with the same identity are told apart by count only.
+pub fn merged_draft(group: &AccountGroup, draft: Option<&[DraftRow]>) -> Vec<DraftRow> {
+    let in_group = |id: &OAuthIdentity| group.rows.iter().filter(|r| r.identity == *id).count();
+    let mut rows: Vec<DraftRow> = Vec::with_capacity(group.rows.len());
+    for d in draft.into_iter().flatten() {
+        if rows.iter().filter(|r| r.identity == d.identity).count() < in_group(&d.identity) {
+            rows.push(d.clone());
+        }
+    }
+    for (i, r) in group.rows.iter().enumerate() {
+        let upto = group.rows[..=i]
+            .iter()
+            .filter(|o| o.identity == r.identity)
+            .count();
+        if rows.iter().filter(|d| d.identity == r.identity).count() < upto {
+            rows.push(DraftRow::of(r));
+        }
+    }
+    rows
+}
+
+/// The rules that put `rows` (top first) in that order: falling priorities, each account named by
+/// its [`AccountRow::key`]; accounts without one are left out (omp ranks them below every rule,
+/// priority 0). Reserve and reclaim only where omp measures quotas; a reclaim at or under the
+/// account's reserve (`global_reserve` when it has none) is dropped, as omp refuses it.
+pub fn account_policies(
+    group: &AccountGroup,
+    rows: &[DraftRow],
+    global_reserve: u32,
+) -> Vec<AccountPolicy> {
+    let keyed: Vec<(&DraftRow, OAuthIdentity)> = rows
+        .iter()
+        .filter_map(|d| {
+            let row = group.rows.iter().find(|r| r.identity == d.identity)?;
+            Some((d, row.key.clone()?))
+        })
+        .collect();
+    let n = keyed.len() as i64;
+    keyed
+        .into_iter()
+        .enumerate()
+        .map(|(i, (d, key))| {
+            let (reserve, reclaim) = if group.usage_capable {
+                let floor = d.reserve.unwrap_or(global_reserve);
+                (d.reserve, d.reclaim.filter(|r| *r > floor && *r <= 100))
+            } else {
+                (None, None)
+            };
+            AccountPolicy {
+                provider: group.provider.clone(),
+                account: key,
+                priority: Some(n - i as i64),
+                reserve_pct: reserve,
+                reclaim_above_pct: reclaim,
+            }
+        })
+        .collect()
 }
 
 /// "No provider returned usage" with the per-account reasons.
@@ -329,10 +622,13 @@ impl Summary {
         let provider_cards = provider_cards(snap, now_ms);
         let chip = if chip_visible(snap) {
             Some(match tightest(&provider_cards) {
-                Some((provider, label, used, status)) => Chip {
-                    text: left_text(used),
-                    status,
-                    tight: format!("{provider} · {label}"),
+                Some(t) => Chip {
+                    text: left_text(t.used),
+                    status: t.status,
+                    tight: match t.account {
+                        Some(a) => format!("{} · {a} · {}", t.provider, t.window),
+                        None => format!("{} · {}", t.provider, t.window),
+                    },
                 },
                 None => Chip {
                     text: "Usage".to_owned(),
@@ -367,7 +663,6 @@ impl Summary {
             .collect();
         Summary {
             details: detail_blocks(&snap.reports, now_ms),
-            quotas: provider_cards.iter().map(ProviderQuota::build).collect(),
             cards: provider_cards
                 .iter()
                 .map(|c| CardView::build(c, snap))
@@ -376,15 +671,14 @@ impl Summary {
             untouched,
             orphans,
             warning: no_data_warning(snap),
+            accounts: AccountGroup::build(snap, now_ms),
+            keys: KeyGroup::build(snap, &provider_cards),
         }
     }
 
-    /// The 5 h / weekly pills of `provider` (omp's provider id); `None` when it reports no
-    /// measurable window, so the chip falls back to the tightest quota overall.
-    pub fn quota_of(&self, provider: &str) -> Option<&ProviderQuota> {
-        self.quotas
-            .iter()
-            .find(|q| q.provider == provider && !q.pills.is_empty())
+    /// The card of `provider` (omp's provider id).
+    pub fn card_of(&self, provider: &str) -> Option<&CardView> {
+        self.cards.iter().find(|c| c.provider == provider)
     }
 }
 
@@ -430,13 +724,7 @@ fn amount_text(l: &UsageLimit) -> String {
 }
 
 fn account_of(r: &UsageReport) -> String {
-    let m = &r.metadata;
-    [&m.email, &m.org_name, &m.account_id]
-        .into_iter()
-        .flatten()
-        .find(|s| !s.is_empty())
-        .cloned()
-        .unwrap_or_else(|| "—".to_owned())
+    r.metadata.identity().unwrap_or("—").to_owned()
 }
 
 fn detail_blocks(reports: &[UsageReport], now_ms: i64) -> Vec<DetailBlock> {
@@ -799,9 +1087,11 @@ mod tests {
         assert_eq!(chip.status, LimitStatus::Ok);
     }
 
-    fn pills(q: &ProviderQuota) -> Vec<(PillKind, &str, &str)> {
-        q.pills
-            .iter()
+    /// The chip pills of `provider`'s first page; empty without a card or a measured window.
+    fn pills<'a>(s: &'a Summary, provider: &str) -> Vec<(PillKind, &'a str, &'a str)> {
+        s.card_of(provider)
+            .into_iter()
+            .flat_map(|c| &c.pages[0].pills)
             .map(|p| (p.kind, p.tag.as_str(), p.text.as_str()))
             .collect()
     }
@@ -809,9 +1099,8 @@ mod tests {
     #[test]
     fn provider_quota_is_its_five_hour_then_weekly_window() {
         let s = Summary::build(&snap(ONE), 0);
-        let q = s.quota_of("anthropic").expect("anthropic quota");
         assert_eq!(
-            pills(q),
+            pills(&s, "anthropic"),
             [
                 (PillKind::FiveHour, "5h", "63% left"),
                 (PillKind::Weekly, "wk", "19% left"),
@@ -819,10 +1108,10 @@ mod tests {
             "the usd-only extra window has no fraction and is not a pill"
         );
         assert!(
-            s.quota_of("openai-codex").is_none(),
+            pills(&s, "openai-codex").is_empty(),
             "an account without usage has no windows"
         );
-        assert!(s.quota_of("nobody").is_none());
+        assert!(pills(&s, "nobody").is_empty());
     }
 
     #[test]
@@ -841,12 +1130,12 @@ mod tests {
             0,
         );
         assert_eq!(
-            pills(s.quota_of("anthropic").expect("anthropic")),
+            pills(&s, "anthropic"),
             [(PillKind::Weekly, "wk", "30% left")],
             "no 5 h window: only the weekly pill, from the fullest weekly limit"
         );
         assert_eq!(
-            pills(s.quota_of("google-gemini-cli").expect("gemini")),
+            pills(&s, "google-gemini-cli"),
             [
                 (PillKind::Other, "1d", "50% left"),
                 (PillKind::Other, "mo", "90% left"),
@@ -891,6 +1180,124 @@ mod tests {
         assert_eq!(rows, ["work@example.test — no usage endpoint"]);
         let codex = s.cards.iter().find(|c| c.name == "Codex").expect("card");
         assert_eq!(codex.unavailable.len(), 1);
+    }
+
+    const ACCOUNTS: &str = r#"{"generatedAt":1,"reports":[
+        {"provider":"anthropic","metadata":{"email":"a@x.test"},"limits":[{"id":"anthropic:5h","label":"5h",
+         "scope":{"provider":"anthropic","windowId":"5h"},"window":{"id":"5h","durationMs":18000000},
+         "amount":{"usedFraction":0.25}}],
+         "policy":{"priority":1,"reservePct":20,"reserveSource":"override","reclaimAbovePct":60,"state":"eligible"}},
+        {"provider":"anthropic","metadata":{"email":"b@x.test"},"limits":[],
+         "policy":{"priority":2,"reservePct":10,"reserveSource":"global","state":"inside-reserve"}}],
+        "accountsWithoutUsage":[
+         {"provider":"anthropic","type":"oauth","email":"twin@x.test","reason":"backoff"},
+         {"provider":"anthropic","type":"oauth","email":"twin@x.test","reason":"backoff"},
+         {"provider":"cursor","type":"oauth","email":"solo@x.test"}]}"#;
+
+    /// Two API keys (reports naming no account, as omp prints opencode-go's), one more without
+    /// usage, and a provider with one key: only the first is a key group, named like the
+    /// Overview pager, and none of it becomes an orderable OAuth group.
+    #[test]
+    fn api_keys_are_listed_as_keys_not_as_one_account() {
+        let s = Summary::build(
+            &snap(
+                r#"{"generatedAt":1,"reports":[
+                {"provider":"opencode-go","metadata":{"planType":"OpenCode Go"},"limits":[{"id":"weekly","label":"Weekly",
+                 "scope":{"provider":"opencode-go","windowId":"7d"},"window":{"id":"7d","durationMs":604800000},
+                 "amount":{"usedFraction":0.92}}]},
+                {"provider":"opencode-go","metadata":{"planType":"OpenCode Go"},"limits":[{"id":"weekly","label":"Weekly",
+                 "scope":{"provider":"opencode-go","windowId":"7d"},"window":{"id":"7d","durationMs":604800000},
+                 "amount":{"usedFraction":0.0}}]}],
+                "accountsWithoutUsage":[
+                 {"provider":"opencode-go","type":"api_key","reason":"backoff"},
+                 {"provider":"commandcode","type":"api_key"}]}"#,
+            ),
+            0,
+        );
+        assert!(
+            s.accounts.is_empty(),
+            "API keys cannot be ordered or pinned"
+        );
+        assert_eq!(s.keys.len(), 1, "one key is nothing to list");
+        let g = &s.keys[0];
+        assert_eq!(g.provider, "opencode-go");
+        let labels: Vec<&str> = g.rows.iter().map(|r| r.label.as_str()).collect();
+        let pager: Vec<&str> = s.cards[0]
+            .pages
+            .iter()
+            .map(|p| p.account.as_str())
+            .collect();
+        assert_eq!(labels[..2], pager[..], "named as the Overview pages them");
+        assert_eq!(labels[2], "account");
+        assert_eq!(g.rows[2].note.as_deref(), Some("backoff"));
+        let left: Vec<Vec<&str>> = g
+            .rows
+            .iter()
+            .map(|r| r.pills.iter().map(|p| p.text.as_str()).collect())
+            .collect();
+        assert_eq!(left, [vec!["8% left"], vec!["100% left"], vec![]]);
+    }
+
+    #[test]
+    fn account_rules_follow_the_shown_order_and_omps_limits() {
+        let s = Summary::build(&snap(ACCOUNTS), 0);
+        assert_eq!(
+            s.accounts.len(),
+            1,
+            "a provider with one account has nothing to order"
+        );
+        let g = &s.accounts[0];
+        let labels: Vec<&str> = g.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["b@x.test", "a@x.test", "twin@x.test", "twin@x.test"]
+        );
+        let a = &g.rows[1];
+        assert_eq!((a.reserve, a.reclaim), (Some(20), Some(60)));
+        assert_eq!(a.pills.len(), 1);
+        assert_eq!(g.rows[0].state, Some(PolicyState::InsideReserve));
+
+        // a moves to the top with its reserve cleared; its reclaim (60) stays above the global 10,
+        // b gets a reclaim at the global reserve, which omp would refuse.
+        let mut rows = merged_draft(g, None);
+        rows.swap(0, 1);
+        rows[0].reserve = None;
+        rows[1].reclaim = Some(10);
+        let rules = account_policies(g, &rows, 10);
+        assert_eq!(
+            serde_json::to_value(&rules).unwrap(),
+            serde_json::json!([
+                {"provider": "anthropic", "account": {"email": "a@x.test"}, "priority": 2, "reclaimAbovePct": 60},
+                {"provider": "anthropic", "account": {"email": "b@x.test"}, "priority": 1},
+            ]),
+            "the twins cannot be singled out and get no rule"
+        );
+    }
+
+    #[test]
+    fn a_draft_keeps_its_order_across_refreshes() {
+        let s = Summary::build(&snap(ACCOUNTS), 0);
+        let g = &s.accounts[0];
+        let mut draft = merged_draft(g, None);
+        draft.reverse();
+        // An account that left (logged out) drops out; the rest keep the drafted order.
+        draft.insert(
+            0,
+            DraftRow {
+                identity: OAuthIdentity::new(Some("gone@x.test"), None, None, None).unwrap(),
+                reserve: None,
+                reclaim: None,
+            },
+        );
+        let rows = merged_draft(g, Some(&draft));
+        let emails: Vec<&str> = rows
+            .iter()
+            .map(|r| r.identity.email.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            emails,
+            ["twin@x.test", "twin@x.test", "a@x.test", "b@x.test"]
+        );
     }
 
     #[test]
@@ -975,13 +1382,109 @@ mod tests {
             .iter()
             .find(|c| c.name == "Anthropic")
             .expect("card");
-        let five = a
+        let five = a.pages[0]
             .rows
             .iter()
             .find(|r| r.label == "Claude 5 Hour")
             .expect("row");
         assert_eq!(five.value.as_deref(), Some("63% left"));
         assert_eq!(five.reset.as_deref(), Some("resets in 2h14m"));
+        assert_eq!(
+            (a.pages.len(), a.pages[0].account.as_str()),
+            (1, ""),
+            "one report, one unnamed page"
+        );
+    }
+
+    #[test]
+    fn multi_account_card_has_one_page_per_account_with_its_own_numbers() {
+        let s = Summary::build(
+            &snap(
+                r#"{"generatedAt":1,"reports":[
+                {"provider":"anthropic","limits":[{"label":"Claude 7 Day","window":{"id":"7d"},
+                  "amount":{"usedFraction":0.9,"unit":"percent"},"status":"warning"}],
+                 "metadata":{"email":"a@x.test"}},
+                {"provider":"anthropic","limits":[{"label":"Claude 7 Day","window":{"id":"7d"},
+                  "amount":{"usedFraction":0.1,"unit":"percent"},"status":"ok"}],
+                 "metadata":{"accountId":"acc-b"}}],
+                "accountsWithoutUsage":[{"provider":"anthropic","email":"c@x.test","reason":"HTTP 500"}]}"#,
+            ),
+            0,
+        );
+        let c = &s.cards[0];
+        let pages: Vec<(&str, &str, LimitStatus)> = c
+            .pages
+            .iter()
+            .map(|p| {
+                (
+                    p.account.as_str(),
+                    p.rows[0].value.as_deref().unwrap_or(""),
+                    p.status,
+                )
+            })
+            .collect();
+        assert_eq!(
+            pages,
+            [
+                ("a@x.test", "10% left", LimitStatus::Warning),
+                ("acc-b", "90% left", LimitStatus::Ok),
+            ]
+        );
+        assert_eq!(c.accounts, None, "the pager names the accounts");
+        assert_eq!(c.unavailable, ["c@x.test — HTTP 500"]);
+        assert_eq!(c.page_index(Some("acc-b")), 1);
+        assert_eq!(
+            c.page_index(Some("gone@x.test")),
+            0,
+            "a vanished account falls back"
+        );
+        let chip = s.chip.as_ref().expect("chip");
+        assert_eq!(
+            (chip.text.as_str(), chip.tight.as_str()),
+            ("10% left", "Anthropic · a@x.test · Claude 7 Day"),
+            "the fullest account, not the mean"
+        );
+
+        let session = |provider: &str, email: Option<&str>, account_id: Option<&str>| LiveAccount {
+            provider: provider.into(),
+            identity: deck_core::usage::OAuthIdentity {
+                email: email.map(Into::into),
+                account_id: account_id.map(Into::into),
+                ..Default::default()
+            },
+            pinned: false,
+            credentials: Vec::new(),
+        };
+        assert_eq!(
+            c.in_use(Some(&session("anthropic", None, Some("ACC-B")))),
+            Some(1)
+        );
+        assert_eq!(
+            c.in_use(Some(&session("anthropic", Some("a@x.test"), None))),
+            Some(0)
+        );
+        assert_eq!(
+            c.in_use(Some(&session("openai-codex", Some("a@x.test"), None))),
+            None,
+            "another provider's account"
+        );
+        assert_eq!(
+            c.in_use(Some(&session("anthropic", Some("c@x.test"), None))),
+            None
+        );
+        assert_eq!(c.in_use(None), None);
+        let wk = |i: usize| {
+            c.pages[i]
+                .pills
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            (wk(0), wk(1)),
+            (vec!["10% left"], vec!["90% left"]),
+            "chip pills per account"
+        );
     }
 
     #[test]

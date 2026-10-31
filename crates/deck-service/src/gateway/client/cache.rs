@@ -12,7 +12,7 @@ use deck_core::status::SessionStatus;
 
 use crate::controller::SessionTarget;
 use crate::gateway::protocol::{
-    AppUpdateView, ControllerInfo, DriveView, GatewayStatus, InboxView, MobileView, OmpUpdateView,
+    AppUpdateView, BackupView, ControllerInfo, GatewayStatus, InboxView, MobileView, OmpUpdateView,
     SessionsView, Topic, TopicValue, UsageView,
 };
 use crate::gateway::running::RunningSnapshot;
@@ -33,7 +33,7 @@ pub const ALWAYS_ON: &[Topic] = &[
     Topic::Status,
     Topic::Usage,
     Topic::AppUpdate,
-    Topic::Drive,
+    Topic::Backup,
     Topic::OmpUpdate,
     Topic::Mobile,
 ];
@@ -81,7 +81,7 @@ pub struct StateCache {
     pub status: Slot<Option<(SessionTarget, SessionStatus)>>,
     pub usage: Slot<UsageView>,
     pub app_update: Slot<AppUpdateView>,
-    pub drive: Slot<DriveView>,
+    pub backup: Slot<BackupView>,
     pub omp_update: Slot<OmpUpdateView>,
     /// [`Topic::Mobile`]: relay link, devices, pairing window.
     pub mobile: Slot<MobileView>,
@@ -111,7 +111,7 @@ impl StateCache {
             Topic::Status => arc(&self.status).map(|v| TopicValue::Status(Box::new(v))),
             Topic::Usage => arc(&self.usage).map(TopicValue::Usage),
             Topic::AppUpdate => arc(&self.app_update).map(TopicValue::AppUpdate),
-            Topic::Drive => arc(&self.drive).map(TopicValue::Drive),
+            Topic::Backup => arc(&self.backup).map(TopicValue::Backup),
             Topic::OmpUpdate => arc(&self.omp_update).map(TopicValue::OmpUpdate),
             Topic::Mobile => arc(&self.mobile).map(TopicValue::Mobile),
             Topic::Fleet => arc(&self.fleet).map(TopicValue::Fleet),
@@ -132,7 +132,7 @@ impl StateCache {
             Topic::Status => self.status.revision(),
             Topic::Usage => self.usage.revision(),
             Topic::AppUpdate => self.app_update.revision(),
-            Topic::Drive => self.drive.revision(),
+            Topic::Backup => self.backup.revision(),
             Topic::OmpUpdate => self.omp_update.revision(),
             Topic::Mobile => self.mobile.revision(),
             Topic::Fleet => self.fleet.revision(),
@@ -158,7 +158,7 @@ impl StateCache {
             TopicValue::Status(v) => self.status.set(rev, *v),
             TopicValue::Usage(v) => self.usage.set(rev, v),
             TopicValue::AppUpdate(v) => self.app_update.set(rev, v),
-            TopicValue::Drive(v) => self.drive.set(rev, v),
+            TopicValue::Backup(v) => self.backup.set(rev, v),
             TopicValue::OmpUpdate(v) => self.omp_update.set(rev, v),
             TopicValue::Mobile(v) => self.mobile.set(rev, v),
             TopicValue::Fleet(v) => self.fleet.set(rev, v),

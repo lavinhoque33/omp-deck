@@ -120,8 +120,8 @@ describe('slice-4 classes, journaling and bounds', () => {
       expect(opJournaled(op)).toBe(false);
     }
     expect(opJournaled({ op: 'compose', live, text: 'x', attachments: [], mode: 'steer' })).toBe(true);
-    expect(opClass({ op: 'drive_sign_in' })).toBe('manage');
-    expect(opJournaled({ op: 'drive_sign_in' })).toBe(true);
+    expect(opClass({ op: 'backup_connect' })).toBe('manage');
+    expect(opJournaled({ op: 'backup_connect' })).toBe(true);
     const control = { control: true, manage: false };
     expect(opAllowed({ op: 'answer_ui', live, request: 'u-1', value: { type: 'cancel' } }, control)).toBe(true);
     expect(opAllowed({ op: 'omp_reset', key: 'k' }, control)).toBe(false);
@@ -158,7 +158,7 @@ describe('slice-4 classes, journaling and bounds', () => {
   test('the builder gives seqs to journaled slice-4 ops only', () => {
     const builder = new RequestBuilder({ next_seq: 40 });
     expect(builder.build({ op: 'upload_cancel', upload: 'x' }).seq).toBeNull();
-    expect(builder.build({ op: 'drive_backup' }).seq).toBe(40);
+    expect(builder.build({ op: 'backup_run' }).seq).toBe(40);
     expect(builder.build({ op: 'presence', visible: false }).seq).toBeNull();
     expect(builder.nextSeq).toBe(41);
   });

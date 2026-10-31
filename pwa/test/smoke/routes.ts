@@ -31,7 +31,7 @@ export const ROUTES: Readonly<Record<string, string>> = {
   'settings-usage': 'route=settings&section=usage',
   'settings-omp': 'route=settings&section=omp',
   'settings-updates': 'route=settings&section=updates',
-  'settings-drive': 'route=settings&section=drive',
+  'settings-backup': 'route=settings&section=backup',
   'settings-sync': 'route=settings&section=sync',
   'deep-link': 's=s-convo',
   'old-desktop': 'route=settings&section=usage&gw=v1',

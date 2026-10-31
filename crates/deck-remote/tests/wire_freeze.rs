@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 const PINNED: &[(&str, &str)] = &[
     (
         "api-s4.json",
-        "28c91bb4d415c3af1243a7f9f2fdc5726cc661705d54017a91b39e1fb82130b3",
+        "c2f61bf6eb1c7113b250fd891f81ff86f992e54df551c097d8ebeae47ebe1047",
     ),
     (
         "api-v1.json",

@@ -1,5 +1,5 @@
 // Vendored from oh-my-pi packages/collab-web/src/tool-render/tools/browser.tsx @ 1ff12a7873c8d2eda8bb4447dd9df4dbd10377ce (MIT, see pwa/THIRD_PARTY_LICENSES).
-/** `browser` — drive a Chromium tab: open/close named tabs, run puppeteer scripts. */
+/** `browser` — backup a Chromium tab: open/close named tabs, run puppeteer scripts. */
 import type { ReactNode } from "react";
 import { Badge, CodeBlock, ResultImages, ResultText, type Tone } from "../parts";
 import type { ToolRenderer, ToolRenderProps } from "../types";

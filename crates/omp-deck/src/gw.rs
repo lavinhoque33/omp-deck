@@ -29,7 +29,7 @@ use deck_service::gateway::client::{
     ClientEvent, GatewayClient, GatewayOptions, Link, Pending, RemoteSettings,
 };
 use deck_service::gateway::protocol::{
-    Accepted, Answer, AppUpdateView, ClientState, ControllerInfo, Done, DriveView, GatewayError,
+    Accepted, Answer, AppUpdateView, BackupView, ClientState, ControllerInfo, Done, GatewayError,
     GatewayStatus, InboxView, MobileView, ModelFactsView, Mutation, OmpUpdateView, Outcome,
     Permissions, Progress, Query, SecretText, Topic, TopicValue, UsageView, ViewRole,
 };
@@ -622,8 +622,8 @@ impl Gw {
         self.client.state().omp_update.get()
     }
 
-    pub fn drive(&self) -> Option<Arc<DriveView>> {
-        self.client.state().drive.get()
+    pub fn backup(&self) -> Option<Arc<BackupView>> {
+        self.client.state().backup.get()
     }
 
     /// The dashboard's fleet snapshot (unwrapped once per gateway revision, not per frame).

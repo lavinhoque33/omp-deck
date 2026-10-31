@@ -177,14 +177,14 @@ impl DeviceConn {
                 // The rows embed the running state; the scanned entries are reused.
                 (Feed::Inventory { .. }, Topic::Inventory | Topic::Running)
                 | (Feed::Usage {}, Topic::Usage)
-                | (Feed::Drive {}, Topic::Drive)
+                | (Feed::Backup {}, Topic::Backup | Topic::Settings)
                 | (Feed::Updates {}, Topic::AppUpdate | Topic::OmpUpdate)
                 | (
                     Feed::Agents { .. } | Feed::Context { .. },
                     Topic::Fleet | Topic::Controllers | Topic::Live(_),
                 )
                 | (Feed::Running {}, Topic::Running | Topic::Sessions | Topic::Controllers)
-                | (Feed::Sync {}, Topic::Settings | Topic::Sessions | Topic::Drive)
+                | (Feed::Sync {}, Topic::Settings | Topic::Sessions | Topic::Backup)
                 | (Feed::Device {}, Topic::Settings | Topic::Mobile) => true,
                 (Feed::Worktrees { .. }, Topic::Worktrees(p)) => st.path.as_ref() == Some(p),
                 // The followed folders and files (repository, fleet target) follow the sessions.
@@ -1966,7 +1966,10 @@ impl Engine {
                 result: self.done_view(d, key, s4),
             },
             Outcome::Failed(m) => O::Failed {
-                message: self.devices.canon.scrub(m),
+                message: match key {
+                    Some(k) if self.is_server_request(k) => views::server_failure(m),
+                    _ => self.devices.canon.scrub(m),
+                },
             },
             Outcome::Rejected(r) => O::Rejected {
                 reason: rejected(r),

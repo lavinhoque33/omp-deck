@@ -28,6 +28,7 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
+use deck_core::backup::Destination;
 use deck_core::config::{
     AppConfig, Density, FolderTabs, GatewayMode, NotifyConfig, ParkedBranch, RemovedWorktree,
     SplitState, SyncInterval, SyncRow, TabState, Theme, UiFont, UiStyle, WindowGeometry,
@@ -287,6 +288,7 @@ settings! {
     FolderScope(folder_scope: Option<PathBuf>) = Device,
     RecentFolders(recent_folders: Vec<PathBuf>) = Device,
     DriveBackupInterval(drive_backup_interval: SyncInterval) = Shared,
+    BackupDestination(backup_destination: Destination) = Shared,
     ProjectSync(project_sync: Vec<SyncRow>) = Device,
     ProjectSyncInterval(project_sync_interval: SyncInterval) = Shared,
     SessionBackend(session_backend: BackendChoice) = Device,

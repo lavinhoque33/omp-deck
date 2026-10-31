@@ -107,7 +107,7 @@ pub const FIRST_PROMPT_CHARS: usize = 200;
 ///   [`MAX_ITEM_TEXT`] bytes (at a character boundary) and end with [`CUT_MARK`].
 /// - `diff` replies: the text is cut to [`MAX_DIFF_TEXT`] bytes with `truncated: true`.
 /// - Slice 4: the `running`, `agents`, `worktrees`, `sync`, `usage` values and the `tree`,
-///   `dir`, `omp_settings`, `drive_backups`, `sync_backups` replies and `restore_plan` results
+///   `dir`, `omp_settings`, `backup_list`, `sync_backups` replies and `restore_plan` results
 ///   drop whole entries from the end with `truncated: true` (`worktrees`: parked entries,
 ///   then branches; `usage`: limits of the last report, then reports; `omp_settings`: entries
 ///   of the last group, then groups; `restore_plan`: list entries); `inventory` is at most
@@ -1201,8 +1201,8 @@ pub enum Op {
     UsageRefresh {},
     /// [`Resp::OmpSettings`].
     OmpSettings {},
-    /// [`Resp::DriveBackups`].
-    DriveBackups {},
+    /// [`Resp::BackupList`]: the active destination's config backups.
+    BackupList {},
     /// [`Resp::SyncBackups`] of `project` (`None`: all).
     SyncBackups {
         #[serde(default)]
@@ -1320,7 +1320,8 @@ pub enum Op {
     },
     /// Not journaled.
     UpdateCheck {},
-    DriveBackup {},
+    /// Backs up the omp config to the active destination now.
+    BackupRun {},
     SyncBackup {
         project: String,
     },
@@ -1351,19 +1352,22 @@ pub enum Op {
     AppUpdate {
         step: AppUpdateStep,
     },
-    /// Opens the Drive sign-in in the desktop browser.
-    DriveSignIn {},
-    DriveDelete {
+    /// Sets up or signs in to the active destination on the desktop (Google sign-in in the
+    /// desktop browser); refused `needs desktop` without a desktop session and for a backup
+    /// server, which is set up in the desktop app.
+    BackupConnect {},
+    /// Deletes config backups of the active destination.
+    BackupDelete {
         ids: Vec<String>,
     },
     /// [`DoneView::RestorePlan`].
-    DriveRestorePrepare {
+    BackupRestorePrepare {
         id: String,
     },
-    DriveRestoreApply {
+    BackupRestoreApply {
         handle: u64,
     },
-    DriveRestoreDiscard {
+    BackupRestoreDiscard {
         handle: u64,
     },
     /// Adds the folder of a dir token to the sync rows.
@@ -1388,9 +1392,12 @@ pub enum Op {
         target: RestoreTarget,
         parts: SyncParts,
     },
+    /// `excluded`: backed-up session ids ([`SessionPlanView::id`]) left out of the restore.
     SyncRestoreApply {
         handle: u64,
         conflicts: Vec<ConflictChoice>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        excluded: Vec<String>,
     },
 }
 
@@ -1436,7 +1443,7 @@ impl Op {
         "usage_activity",
         "usage_refresh",
         "omp_settings",
-        "drive_backups",
+        "backup_list",
         "sync_backups",
         "presence",
         "push_subscribe",
@@ -1462,7 +1469,7 @@ impl Op {
         "worktree_finish",
         "worktree_continue",
         "update_check",
-        "drive_backup",
+        "backup_run",
         "sync_backup",
         "open_on_desktop",
         "close_on_desktop",
@@ -1471,11 +1478,11 @@ impl Op {
         "omp_reset",
         "update_run",
         "app_update",
-        "drive_sign_in",
-        "drive_delete",
-        "drive_restore_prepare",
-        "drive_restore_apply",
-        "drive_restore_discard",
+        "backup_connect",
+        "backup_delete",
+        "backup_restore_prepare",
+        "backup_restore_apply",
+        "backup_restore_discard",
         "sync_add",
         "sync_set",
         "sync_remove",
@@ -1525,7 +1532,7 @@ impl Op {
             Op::UsageActivity { .. } => "usage_activity",
             Op::UsageRefresh {} => "usage_refresh",
             Op::OmpSettings {} => "omp_settings",
-            Op::DriveBackups {} => "drive_backups",
+            Op::BackupList {} => "backup_list",
             Op::SyncBackups { .. } => "sync_backups",
             Op::Presence { .. } => "presence",
             Op::PushSubscribe { .. } => "push_subscribe",
@@ -1551,7 +1558,7 @@ impl Op {
             Op::WorktreeFinish { .. } => "worktree_finish",
             Op::WorktreeContinue { .. } => "worktree_continue",
             Op::UpdateCheck {} => "update_check",
-            Op::DriveBackup {} => "drive_backup",
+            Op::BackupRun {} => "backup_run",
             Op::SyncBackup { .. } => "sync_backup",
             Op::OpenOnDesktop { .. } => "open_on_desktop",
             Op::CloseOnDesktop { .. } => "close_on_desktop",
@@ -1560,11 +1567,11 @@ impl Op {
             Op::OmpReset { .. } => "omp_reset",
             Op::UpdateRun { .. } => "update_run",
             Op::AppUpdate { .. } => "app_update",
-            Op::DriveSignIn {} => "drive_sign_in",
-            Op::DriveDelete { .. } => "drive_delete",
-            Op::DriveRestorePrepare { .. } => "drive_restore_prepare",
-            Op::DriveRestoreApply { .. } => "drive_restore_apply",
-            Op::DriveRestoreDiscard { .. } => "drive_restore_discard",
+            Op::BackupConnect {} => "backup_connect",
+            Op::BackupDelete { .. } => "backup_delete",
+            Op::BackupRestorePrepare { .. } => "backup_restore_prepare",
+            Op::BackupRestoreApply { .. } => "backup_restore_apply",
+            Op::BackupRestoreDiscard { .. } => "backup_restore_discard",
             Op::SyncAdd { .. } => "sync_add",
             Op::SyncSet { .. } => "sync_set",
             Op::SyncRemove { .. } => "sync_remove",
@@ -1613,7 +1620,7 @@ impl Op {
             | Op::UsageActivity { .. }
             | Op::UsageRefresh {}
             | Op::OmpSettings {}
-            | Op::DriveBackups {}
+            | Op::BackupList {}
             | Op::SyncBackups { .. }
             | Op::Presence { .. }
             | Op::PushSubscribe { .. }
@@ -1639,7 +1646,7 @@ impl Op {
             | Op::WorktreeFinish { .. }
             | Op::WorktreeContinue { .. }
             | Op::UpdateCheck {}
-            | Op::DriveBackup {}
+            | Op::BackupRun {}
             | Op::SyncBackup { .. }
             | Op::OpenOnDesktop { .. }
             | Op::CloseOnDesktop { .. } => Class::Control,
@@ -1653,11 +1660,11 @@ impl Op {
             | Op::OmpReset { .. }
             | Op::UpdateRun { .. }
             | Op::AppUpdate { .. }
-            | Op::DriveSignIn {}
-            | Op::DriveDelete { .. }
-            | Op::DriveRestorePrepare { .. }
-            | Op::DriveRestoreApply { .. }
-            | Op::DriveRestoreDiscard { .. }
+            | Op::BackupConnect {}
+            | Op::BackupDelete { .. }
+            | Op::BackupRestorePrepare { .. }
+            | Op::BackupRestoreApply { .. }
+            | Op::BackupRestoreDiscard { .. }
             | Op::SyncAdd { .. }
             | Op::SyncSet { .. }
             | Op::SyncRemove { .. }
@@ -1766,7 +1773,7 @@ pub enum Feed {
     Worktrees {
         project: String,
     },
-    Drive {},
+    Backup {},
     Sync {},
     Updates {},
     Device {},
@@ -1788,7 +1795,7 @@ impl Feed {
         "usage",
         "agents",
         "worktrees",
-        "drive",
+        "backup",
         "sync",
         "updates",
         "device",
@@ -1809,7 +1816,7 @@ impl Feed {
             Feed::Usage {} => "usage",
             Feed::Agents { .. } => "agents",
             Feed::Worktrees { .. } => "worktrees",
-            Feed::Drive {} => "drive",
+            Feed::Backup {} => "backup",
             Feed::Sync {} => "sync",
             Feed::Updates {} => "updates",
             Feed::Device {} => "device",
@@ -1918,14 +1925,18 @@ pub enum FeedValue {
         parked: Vec<ParkedView>,
         truncated: bool,
     },
-    /// Google Drive config backup; `available`: credentials are configured in this build.
-    Drive {
+    /// Config backup to the active destination; `available`: the destination can be used in
+    /// this build (Google credentials are configured; always true for a server), `connected`:
+    /// it is set up (signed in / a server saved).
+    Backup {
+        destination: BackupDestinationView,
         available: bool,
-        signed_in: bool,
+        connected: bool,
+        /// The Google account's email; absent for a backup server.
         account: Option<String>,
         last_backup_unix_ms: Option<u64>,
         interval: SyncInterval,
-        /// The running Drive job's label.
+        /// The running backup job's label.
         busy: Option<String>,
         error: Option<String>,
     },
@@ -2324,8 +2335,8 @@ pub enum Resp {
         groups: Vec<SettingsGroup>,
         truncated: bool,
     },
-    DriveBackups {
-        hosts: Vec<DriveHost>,
+    BackupList {
+        hosts: Vec<BackupHost>,
         truncated: bool,
     },
     SyncBackups {
@@ -2399,7 +2410,7 @@ pub enum DoneView {
     Killed {
         results: Vec<KillResult>,
     },
-    /// `drive_restore_prepare`/`sync_restore_prepare`: apply or discard `handle` (bound to
+    /// `backup_restore_prepare`/`sync_restore_prepare`: apply or discard `handle` (bound to
     /// this device).
     RestorePlan {
         handle: u64,
@@ -2919,23 +2930,41 @@ pub struct SettingsGroup {
     pub entries: Vec<SettingView>,
 }
 
-/// One Drive config backup.
+/// Where config backups go (the active destination); never a secret, password or path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DriveBackupView {
+pub struct BackupDestinationView {
+    pub kind: BackupKind,
+    /// `Google Drive`, or the server's `sftp://host[:port]`.
+    pub label: String,
+}
+
+/// The kind of backup destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupKind {
+    Drive,
+    Ftp,
+    Ftps,
+    Sftp,
+}
+
+/// One config backup at the active destination.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupFileView {
     pub id: String,
     pub name: String,
     pub size: u64,
     pub created_unix_ms: Option<u64>,
 }
 
-/// The Drive config backups of one machine, newest first.
+/// The config backups of one machine, newest first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DriveHost {
+pub struct BackupHost {
     pub host: String,
-    pub backups: Vec<DriveBackupView>,
+    pub backups: Vec<BackupFileView>,
 }
 
-/// One project backup on Drive.
+/// One project backup at the active destination.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncBackupView {
     pub id: String,
@@ -2977,8 +3006,8 @@ pub struct SessionPlanView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RestorePlanView {
-    /// A Drive config backup.
-    Drive {
+    /// A config backup.
+    Backup {
         name: String,
         created_unix_ms: Option<u64>,
         host: String,
@@ -3436,8 +3465,8 @@ mod tests {
         assert!(!chunk(0).journaled());
         assert!(!Op::UpdateCheck {}.journaled());
         assert!(!Op::Unpair {}.journaled());
-        assert!(Op::DriveBackup {}.journaled());
-        assert_eq!(Op::DriveSignIn {}.class(), Class::Manage);
+        assert!(Op::BackupRun {}.journaled());
+        assert_eq!(Op::BackupConnect {}.class(), Class::Manage);
         assert_eq!(
             Op::AnswerUi {
                 live,

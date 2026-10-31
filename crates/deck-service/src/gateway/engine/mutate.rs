@@ -1,6 +1,6 @@
 //! Journaled mutations: validation before the journal, admission (dedup, reused and expired
 //! keys), execution over the real executors (inline, on the controllers, or on worker jobs with
-//! progress, cancellation and the one-at-a-time Drive lane) and the final outcome.
+//! progress, cancellation and the one-at-a-time backup lane) and the final outcome.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +18,7 @@ use crate::gateway::protocol::{
     ServerEvent, SessionRole, Tool, UpdatePhase,
 };
 use crate::settings::{Field, SettingsError, Snapshot};
+use deck_core::backup::Destination;
 
 /// Progress events of one job are sent at most this often.
 const PROGRESS_EVERY: Duration = Duration::from_millis(150);
@@ -29,8 +30,8 @@ pub(super) enum Post {
     Refresh,
     /// Recompute the changes of this repository (when followed).
     Changes(PathBuf),
-    /// Reload the Google account (sign-in, sign-out, backups).
-    DriveAccount,
+    /// Reload the destinations' records (sign-in, server, backups).
+    Accounts,
     /// The result is the app-update state after the job.
     AppView,
 }
@@ -65,23 +66,25 @@ fn send(tx: &std::sync::mpsc::Sender<Msg>, fin: Fin) {
     let _ = tx.send(Msg::Fin(Box::new(fin)));
 }
 
-/// Mutations that hold the Google Drive lane.
+/// Mutations that hold the backup lane.
 fn uses_lane(op: &Mutation) -> bool {
     matches!(
         op,
         Mutation::DriveLoginFinish(_)
             | Mutation::DriveSignOut
-            | Mutation::DriveBackup { .. }
-            | Mutation::DrivePrepareRestore(_)
-            | Mutation::DriveDeleteBackup(_)
-            | Mutation::DriveDeleteBackups(_)
-            | Mutation::DriveApplyRestore(_)
+            | Mutation::Backup { .. }
+            | Mutation::PrepareRestore(_)
+            | Mutation::DeleteBackup(_)
+            | Mutation::DeleteBackups(_)
+            | Mutation::ApplyRestore(_)
+            | Mutation::ServerConnect { .. }
+            | Mutation::ServerForget
             | Mutation::ProjectBackup { .. }
             | Mutation::ProjectDeleteBackup(_)
             | Mutation::ProjectDeleteBackups(_)
             | Mutation::ProjectPrepareRestore { .. }
             | Mutation::ProjectApplyRestore { .. }
-            | Mutation::DriveSignInOnDesktop
+            | Mutation::BackupConnectOnDesktop
     )
 }
 
@@ -215,10 +218,10 @@ impl Engine {
             self.sess.find(&t.key).map(|i| &self.sess.managed[i])
         };
         if uses_lane(op)
-            && let Some(busy) = &self.drive_lane
+            && let Some(busy) = &self.backup_lane
         {
             return Some(GatewayError::Refused(format!(
-                "Another Google Drive job is running ({busy}); try again."
+                "Another backup job is running ({busy}); try again."
             )));
         }
         if super::remote::is_mobile(op) {
@@ -259,7 +262,7 @@ impl Engine {
             Mutation::ForkAt { file, .. } => self
                 .runs_without_ctl(file)
                 .then_some(GatewayError::NoLiveControl),
-            Mutation::DriveApplyRestore(h) | Mutation::DriveDiscardRestore(h) => self
+            Mutation::ApplyRestore(h) | Mutation::DiscardRestore(h) => self
                 .handles
                 .restore_owner(*h)
                 .filter(|o| *o != key.client)
@@ -300,10 +303,15 @@ impl Engine {
                     None
                 }
             }
-            Mutation::DriveSignInOnDesktop if self.drive.is_none() => {
+            Mutation::BackupConnectOnDesktop
+                if self.cfg.backup_destination != Destination::Drive =>
+            {
+                refused("set up the backup server in the desktop app (Settings, Backup)")
+            }
+            Mutation::BackupConnectOnDesktop if self.service.creds.is_none() => {
                 refused("Google Drive is not available")
             }
-            Mutation::DriveSignInOnDesktop | Mutation::OpenOnDesktop { .. }
+            Mutation::BackupConnectOnDesktop | Mutation::OpenOnDesktop { .. }
                 if !self.desktop_reachable() =>
             {
                 refused("needs desktop")
@@ -345,7 +353,7 @@ impl Engine {
             Mutation::RunTool(Tool::Update(_)) | Mutation::OmpUpdateCheck if self.omp.is_none() => {
                 refused("omp was not found")
             }
-            Mutation::UsageRefresh { .. } if self.omp.is_none() => refused("omp was not found"),
+            Mutation::UsageRefresh if self.omp.is_none() => refused("omp was not found"),
             Mutation::AppUpdateDownload => self.sched.download_refusal(),
             Mutation::AppUpdateApply => self.sched.apply_refusal(),
             // Only the client's own jobs; another client's keys are refused before any lookup.
@@ -406,8 +414,8 @@ impl Engine {
     {
         let cancel = Arc::new(AtomicBool::new(false));
         if lane {
-            self.drive_lane = Some(label.to_owned());
-            self.dirty.drive = true;
+            self.backup_lane = Some(label.to_owned());
+            self.dirty.backup = true;
         }
         self.jobs.insert(
             key.clone(),
@@ -463,8 +471,8 @@ impl Engine {
         let mut cancelled = false;
         if let Some(s) = state {
             if s.lane {
-                self.drive_lane = None;
-                self.dirty.drive = true;
+                self.backup_lane = None;
+                self.dirty.backup = true;
             }
             cancelled = s.cancel.is_some_and(|c| c.load(Ordering::Relaxed));
             match s.post {
@@ -474,7 +482,7 @@ impl Engine {
                     self.running.poke();
                 }
                 Post::Changes(root) => self.refresh_changes(&root),
-                Post::DriveAccount => self.load_drive_account(),
+                Post::Accounts => self.load_accounts(),
                 Post::AppView => {
                     if let Ok(done) = &mut result {
                         **done = Done::AppUpdate(self.sched.app_view());
@@ -858,6 +866,65 @@ impl Engine {
                     move |ctx, _, _| jobs::omp_reset(ctx, &setting),
                 );
             }
+            Mutation::AccountPolicies { provider, policies } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "account-policies",
+                    false,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::account_policies(ctx, &provider, &policies),
+                );
+            }
+            Mutation::AgentEdit {
+                path,
+                revision,
+                edit,
+            } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "agent-edit",
+                    false,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::agent_edit(ctx, &path, &revision, &edit),
+                );
+            }
+            Mutation::AgentCreate { dir, agent } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "agent-create",
+                    false,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::agent_create(ctx, &dir, &agent),
+                );
+            }
+            Mutation::AgentCustomize { dir, name } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "agent-customize",
+                    false,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::agent_customize(ctx, &dir, &name),
+                );
+            }
+            Mutation::AgentDelete { path, revision } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "agent-delete",
+                    false,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::agent_delete(ctx, &path, &revision),
+                );
+            }
             Mutation::RunTool(tool) => {
                 let (argv, label) = match &tool {
                     Tool::Update(kind) => (deck_core::omp::update_argv(*kind), "omp update"),
@@ -935,7 +1002,7 @@ impl Engine {
                     "drive-login-finish",
                     true,
                     false,
-                    Post::DriveAccount,
+                    Post::Accounts,
                     move |ctx, _, _| jobs::drive_login_finish(ctx, handle),
                 );
             }
@@ -951,71 +1018,96 @@ impl Engine {
                     "drive-sign-out",
                     true,
                     false,
-                    Post::DriveAccount,
+                    Post::Accounts,
                     move |ctx, _, _| jobs::drive_sign_out(ctx),
                 );
             }
-            Mutation::DriveBackup { force } => {
+            Mutation::Backup { force } => {
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
-                    "drive-backup",
+                    "backup",
                     true,
                     false,
-                    Post::DriveAccount,
-                    move |ctx, _, _| jobs::drive_backup(ctx, force),
+                    Post::Accounts,
+                    move |ctx, _, _| jobs::backup(ctx, force),
                 );
             }
-            Mutation::DrivePrepareRestore(file) => {
+            Mutation::PrepareRestore(file) => {
                 let client = key.client.clone();
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
-                    "drive-prepare-restore",
+                    "prepare-restore",
                     true,
                     false,
                     Post::None,
-                    move |ctx, _, _| jobs::drive_prepare_restore(ctx, &client, &file),
+                    move |ctx, _, _| jobs::prepare_restore(ctx, &client, &file),
                 );
             }
-            Mutation::DriveApplyRestore(handle) => {
+            Mutation::ApplyRestore(handle) => {
                 let client = key.client.clone();
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
-                    "drive-restore",
+                    "restore",
                     true,
                     false,
                     Post::Refresh,
-                    move |ctx, _, _| jobs::drive_apply_restore(ctx, &client, handle),
+                    move |ctx, _, _| jobs::apply_restore(ctx, &client, handle),
                 );
             }
-            Mutation::DriveDeleteBackup(file) => {
+            Mutation::DeleteBackup(file) => {
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
-                    "drive-delete-backup",
+                    "delete-backup",
                     true,
                     false,
-                    Post::DriveAccount,
-                    move |ctx, _, _| jobs::drive_delete_backup(ctx, &file),
+                    Post::Accounts,
+                    move |ctx, _, _| jobs::delete_backup(ctx, &file),
                 );
             }
-            Mutation::DriveDeleteBackups(files) => {
+            Mutation::DeleteBackups(files) => {
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
-                    "drive-delete-backups",
+                    "delete-backups",
                     true,
                     false,
-                    Post::DriveAccount,
-                    move |ctx, _, _| jobs::drive_delete_backups(ctx, &files),
+                    Post::Accounts,
+                    move |ctx, _, _| jobs::delete_backups(ctx, &files),
                 );
             }
-            Mutation::DriveDiscardRestore(handle) => {
+            Mutation::DiscardRestore(handle) => {
                 let ok = self.handles.discard_restore(handle, &key.client);
                 self.accepted(conn, id, &key);
                 self.inline_result(key, ok, "that restore is gone");
+            }
+            Mutation::ServerConnect {
+                config,
+                keep_secret,
+            } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "server-connect",
+                    true,
+                    false,
+                    Post::Accounts,
+                    move |ctx, _, _| jobs::server_connect(ctx, config, keep_secret),
+                );
+            }
+            Mutation::ServerForget => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "server-forget",
+                    true,
+                    false,
+                    Post::Accounts,
+                    move |ctx, _, _| jobs::server_forget(ctx),
+                );
             }
             Mutation::ProjectBackup {
                 project,
@@ -1086,11 +1178,14 @@ impl Engine {
                 );
             }
             Mutation::ProjectApplyRestore {
-                handle, conflicts, ..
+                handle,
+                conflicts,
+                excluded,
+                ..
             } => {
                 // The sessions running the local copies the restore overwrites: backend ones
                 // are killed by the job, direct programs end here.
-                let stop = self.restore_stop_list(handle, &conflicts);
+                let stop = self.restore_stop_list(handle, &conflicts, &excluded);
                 let client = key.client.clone();
                 // A device's target is checked again on the worker that writes it.
                 let confine = self.confine_for(&client);
@@ -1106,7 +1201,16 @@ impl Engine {
                             jobs::admit_restore_target(ctx, &client, handle, c)?;
                         }
                         jobs::project_apply_restore(
-                            ctx, &client, handle, &conflicts, &stop, cancel, progress,
+                            ctx,
+                            &client,
+                            handle,
+                            &jobs::RestoreChoices {
+                                conflicts: &conflicts,
+                                excluded: &excluded,
+                                stop: &stop,
+                            },
+                            cancel,
+                            progress,
                         )
                     },
                 );
@@ -1236,7 +1340,7 @@ impl Engine {
                 self.accepted(conn, id, &key);
                 self.inline_result(key, applied, "that job already ended");
             }
-            Mutation::UsageRefresh { force } => {
+            Mutation::UsageRefresh => {
                 self.accepted(conn, id, &key);
                 if self.sched.usage_fetching() {
                     // The running fetch is the refresh.
@@ -1253,7 +1357,7 @@ impl Engine {
                     false,
                     Post::None,
                     move |ctx, _, _| {
-                        let r = fetch_usage(ctx, force);
+                        let r = fetch_usage(ctx);
                         let out = r
                             .as_ref()
                             .map(|_| Done::Unit)
@@ -1377,15 +1481,15 @@ impl Engine {
                 }
                 self.finish_journal(&key, Outcome::Done(Box::new(Done::Unit)));
             }
-            Mutation::DriveSignInOnDesktop => {
+            Mutation::BackupConnectOnDesktop => {
                 self.accepted(conn, id, &key);
                 let tx = self.tx.clone();
                 self.job(
                     key,
-                    "drive-sign-in-on-desktop",
+                    "backup-connect-on-desktop",
                     true,
                     false,
-                    Post::DriveAccount,
+                    Post::Accounts,
                     move |ctx, _, _| {
                         let Done::DriveLogin { handle, url } = jobs::drive_login_begin(ctx)? else {
                             return Err(GatewayError::Failed(
@@ -1487,15 +1591,17 @@ impl Engine {
     }
 
     /// The backend sessions running the local copies project restore `handle` overwrites
-    /// (killed by its job); a direct program running one ends here.
+    /// (killed by its job); a direct program running one ends here. Sessions in `excluded` are
+    /// left out of the restore, so their copies stay.
     fn restore_stop_list(
         &mut self,
         handle: u64,
-        conflicts: &std::collections::BTreeMap<String, deck_core::gdrive::ConflictChoice>,
+        conflicts: &std::collections::BTreeMap<String, deck_core::backup::ConflictChoice>,
+        excluded: &std::collections::BTreeSet<String>,
     ) -> Vec<String> {
         let snap = self.running.latest();
         let mut names: Vec<String> = Vec::new();
-        for (id, path) in self.handles.overwritten_copies(handle, conflicts) {
+        for (id, path) in self.handles.overwritten_copies(handle, conflicts, excluded) {
             if let Some(n) = snap.as_ref().and_then(|s| s.holder(&path)) {
                 names.push(n.to_owned());
             }
@@ -1624,16 +1730,13 @@ fn build_review(
     crate::review::build_prompt(&out).map_err(|e| GatewayError::Refused(e.to_string()))
 }
 
-/// Worker: `omp usage` (after invalidating its cache when forced).
-pub(super) fn fetch_usage(
-    ctx: &JobCtx,
-    force: bool,
-) -> Result<deck_core::usage::UsageSnapshot, String> {
+/// Worker: `omp usage` (through omp's report cache).
+pub(super) fn fetch_usage(ctx: &JobCtx) -> Result<deck_core::usage::UsageSnapshot, String> {
     let omp = ctx
         .omp
         .as_ref()
         .ok_or_else(|| "omp was not found".to_owned())?;
-    deck_core::usage::fetch_usage(omp, force, deck_core::usage::DEFAULT_FETCH_TIMEOUT)
+    deck_core::usage::fetch_usage(omp, deck_core::usage::DEFAULT_FETCH_TIMEOUT)
         .map_err(|e| e.to_string())
 }
 

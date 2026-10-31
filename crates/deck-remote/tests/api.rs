@@ -1965,6 +1965,7 @@ plain!(UiKind: Select, Confirm, Input, Editor, Ask, Approve);
 plain!(MuxBackend: Tmux, Host);
 plain!(AgentStatus: Running, Done, Failed, Aborted, Interrupted, Parked);
 plain!(SyncInterval: Off, TenMinutes, ThirtyMinutes, Hourly, SixHours, Daily);
+plain!(BackupKind: Drive, Ftp, Ftps, Sftp);
 plain!(InstallKind: UserDir, AppImage, Deb, Rpm, WindowsDir, Dev, Unsupported);
 plain!(GatewayMode: Off, WhileOpen, Background);
 plain!(TreeNodeKind:
@@ -2017,7 +2018,7 @@ variants!(SettingKind, Some("type"), {
 });
 
 variants!(RestorePlanView, Some("type"), {
-    RestorePlanView::Drive { .. } => RestorePlanView::Drive {
+    RestorePlanView::Backup { .. } => RestorePlanView::Backup {
         name: String::new(),
         created_unix_ms: None,
         host: String::new(),
@@ -2148,7 +2149,7 @@ variants!(Op, Some("op"), {
     Op::UsageActivity { .. } => Op::UsageActivity { days: 1 },
     Op::UsageRefresh {} => Op::UsageRefresh {},
     Op::OmpSettings {} => Op::OmpSettings {},
-    Op::DriveBackups {} => Op::DriveBackups {},
+    Op::BackupList {} => Op::BackupList {},
     Op::SyncBackups { .. } => Op::SyncBackups { project: None },
     Op::Presence { .. } => Op::Presence { visible: true },
     Op::PushSubscribe { .. } => Op::PushSubscribe {
@@ -2229,7 +2230,7 @@ variants!(Op, Some("op"), {
         r#where: ContinueWhere::Main,
     },
     Op::UpdateCheck {} => Op::UpdateCheck {},
-    Op::DriveBackup {} => Op::DriveBackup {},
+    Op::BackupRun {} => Op::BackupRun {},
     Op::SyncBackup { .. } => Op::SyncBackup { project: e() },
     Op::OpenOnDesktop { .. } => Op::OpenOnDesktop {
         session: e(),
@@ -2251,11 +2252,11 @@ variants!(Op, Some("op"), {
     Op::AppUpdate { .. } => Op::AppUpdate {
         step: AppUpdateStep::Download,
     },
-    Op::DriveSignIn {} => Op::DriveSignIn {},
-    Op::DriveDelete { .. } => Op::DriveDelete { ids: vec![] },
-    Op::DriveRestorePrepare { .. } => Op::DriveRestorePrepare { id: e() },
-    Op::DriveRestoreApply { .. } => Op::DriveRestoreApply { handle: 0 },
-    Op::DriveRestoreDiscard { .. } => Op::DriveRestoreDiscard { handle: 0 },
+    Op::BackupConnect {} => Op::BackupConnect {},
+    Op::BackupDelete { .. } => Op::BackupDelete { ids: vec![] },
+    Op::BackupRestorePrepare { .. } => Op::BackupRestorePrepare { id: e() },
+    Op::BackupRestoreApply { .. } => Op::BackupRestoreApply { handle: 0 },
+    Op::BackupRestoreDiscard { .. } => Op::BackupRestoreDiscard { handle: 0 },
     Op::SyncAdd { .. } => Op::SyncAdd { dir: e() },
     Op::SyncSet { .. } => Op::SyncSet {
         project: e(),
@@ -2272,6 +2273,7 @@ variants!(Op, Some("op"), {
     Op::SyncRestoreApply { .. } => Op::SyncRestoreApply {
         handle: 0,
         conflicts: vec![],
+        excluded: vec![],
     },
 });
 
@@ -2303,7 +2305,7 @@ variants!(Feed, Some("feed"), {
     Feed::Usage {} => Feed::Usage {},
     Feed::Agents { .. } => Feed::Agents { session: e() },
     Feed::Worktrees { .. } => Feed::Worktrees { project: e() },
-    Feed::Drive {} => Feed::Drive {},
+    Feed::Backup {} => Feed::Backup {},
     Feed::Sync {} => Feed::Sync {},
     Feed::Updates {} => Feed::Updates {},
     Feed::Device {} => Feed::Device {},
@@ -2379,9 +2381,13 @@ variants!(FeedValue, Some("feed"), {
         parked: vec![],
         truncated: false,
     },
-    FeedValue::Drive { .. } => FeedValue::Drive {
+    FeedValue::Backup { .. } => FeedValue::Backup {
+        destination: BackupDestinationView {
+            kind: BackupKind::Drive,
+            label: String::new(),
+        },
         available: false,
-        signed_in: false,
+        connected: false,
         account: None,
         last_backup_unix_ms: None,
         interval: SyncInterval::Off,
@@ -2526,7 +2532,7 @@ variants!(Resp, Some("type"), {
         groups: vec![],
         truncated: false,
     },
-    Resp::DriveBackups { .. } => Resp::DriveBackups {
+    Resp::BackupList { .. } => Resp::BackupList {
         hosts: vec![],
         truncated: false,
     },
@@ -2568,7 +2574,7 @@ variants!(DoneView, Some("type"), {
     DoneView::Killed { .. } => DoneView::Killed { results: vec![] },
     DoneView::RestorePlan { .. } => DoneView::RestorePlan {
         handle: 1,
-        plan: s4::drive_plan(),
+        plan: s4::backup_plan(),
         truncated: false,
     },
 });
@@ -2866,9 +2872,15 @@ impl Seen {
                     self.add(&a.status);
                 }
             }
-            FeedValue::Drive { interval, .. } | FeedValue::Sync { interval, .. } => {
+            FeedValue::Backup {
+                destination,
+                interval,
+                ..
+            } => {
+                self.add(&destination.kind);
                 self.add(interval)
             }
+            FeedValue::Sync { interval, .. } => self.add(interval),
             FeedValue::Updates { app, .. } => {
                 self.add(&app.install);
                 self.add(&app.phase);
@@ -2950,6 +2962,7 @@ fn the_vectors_cover_every_variant() {
     seen.covered::<UpdatePhase>();
     seen.covered::<SettingKind>();
     seen.covered::<RestorePlanView>();
+    seen.covered::<BackupKind>();
     for (_, r) in requests().into_iter().chain(s4::requests()) {
         assert_eq!(serde_json::to_value(&r.op).unwrap()["op"], r.op.name());
     }

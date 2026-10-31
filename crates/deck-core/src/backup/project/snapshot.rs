@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use super::{MemoryBank, OmpDir, Parts, ProjectSizes, SessionSize, same_path};
-use crate::gdrive::archive::hex;
+use crate::backup::archive::hex;
 use crate::platform;
 use crate::sessions::{self, SessionsRoot};
 use crate::sharpshooter::{self, MEMORY_FILES};

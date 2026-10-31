@@ -33,14 +33,14 @@ pub struct LoginFlow {
 }
 
 #[derive(Deserialize)]
-pub(super) struct Tokens {
+pub(in crate::backup) struct Tokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub id_token: Option<String>,
 }
 
 impl LoginFlow {
-    pub(super) fn start(creds: &Credentials, ep: &Endpoints) -> Result<LoginFlow> {
+    pub(in crate::backup) fn start(creds: &Credentials, ep: &Endpoints) -> Result<LoginFlow> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(|e| Error::Login(format!("cannot listen on 127.0.0.1: {e}")))?;
         let port = listener
@@ -84,14 +84,18 @@ impl LoginFlow {
 
     /// The loopback port the redirect must reach.
     #[cfg(test)]
-    pub(super) fn port(&self) -> u16 {
+    pub(in crate::backup) fn port(&self) -> u16 {
         self.listener.local_addr().map_or(0, |a| a.port())
     }
 
     /// Serves the loopback until the redirect arrives; returns its authorization code. Requests
     /// for other paths (favicon, …) are answered 404 and ignored; a redirect with a wrong
     /// `state` or an error ends the sign-in.
-    pub(super) fn wait_code(&self, cancel: &AtomicBool, timeout: Duration) -> Result<String> {
+    pub(in crate::backup) fn wait_code(
+        &self,
+        cancel: &AtomicBool,
+        timeout: Duration,
+    ) -> Result<String> {
         let deadline = Instant::now() + timeout;
         self.listener
             .set_nonblocking(true)
@@ -158,7 +162,7 @@ impl LoginFlow {
     }
 
     /// Trades the authorization code (plus the PKCE verifier) for tokens.
-    pub(super) fn exchange(
+    pub(in crate::backup) fn exchange(
         &self,
         http: &ureq::Agent,
         creds: &Credentials,
@@ -180,7 +184,7 @@ impl LoginFlow {
 }
 
 /// A fresh access token for `refresh_token`. A revoked/expired grant is [`Error::SignedOut`].
-pub(super) fn refresh(
+pub(in crate::backup) fn refresh(
     http: &ureq::Agent,
     creds: &Credentials,
     ep: &Endpoints,
@@ -228,7 +232,7 @@ fn token_request(
 }
 
 /// Revokes a token at Google (sign-out).
-pub(super) fn revoke(http: &ureq::Agent, ep: &Endpoints, token: &str) -> Result<()> {
+pub(in crate::backup) fn revoke(http: &ureq::Agent, ep: &Endpoints, token: &str) -> Result<()> {
     let mut resp = http
         .post(&ep.revoke)
         .send_form([("token", token)])
@@ -247,7 +251,7 @@ pub(super) fn revoke(http: &ureq::Agent, ep: &Endpoints, token: &str) -> Result<
 
 /// The `email` claim of an id_token (its payload is trusted: it came straight from the token
 /// endpoint over TLS).
-pub(super) fn email_from_id_token(id_token: &str) -> Option<String> {
+pub(in crate::backup) fn email_from_id_token(id_token: &str) -> Option<String> {
     let payload = id_token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD
         .decode(payload.trim_end_matches('='))
@@ -320,7 +324,7 @@ fn encode(s: &str) -> String {
 }
 
 /// Decodes `%XX` and `+` (form encoding); invalid escapes are kept literally.
-pub(super) fn decode(s: &str) -> String {
+pub(in crate::backup) fn decode(s: &str) -> String {
     let b = s.as_bytes();
     let hex = |c: u8| char::from(c).to_digit(16).map(|d| d as u8);
     let mut out = Vec::with_capacity(b.len());

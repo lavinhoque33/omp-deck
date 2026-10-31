@@ -21,7 +21,7 @@ use deck_service::gateway::protocol::{
 use super::desktop::DesktopOpen;
 use super::{App, PendingConfirm};
 use crate::confirm::Confirm;
-use crate::tabs::{Tab, TabRole};
+use crate::tabs::TabRole;
 use crate::transfer;
 use crate::worktree_dialog::{DestAsk, Kind, LocationRes, Outcome, Plan, WorktreeDialog, brief};
 use crate::worktree_ui::{self, ParkState};
@@ -100,7 +100,7 @@ fn unix_secs() -> u64 {
 }
 
 /// The folder a tab's omp runs in now (the gateway's record), else the one it was launched in.
-fn tab_dir(t: &crate::tabs::TermTab) -> PathBuf {
+fn tab_dir(t: &crate::tabs::Tab) -> PathBuf {
     t.info()
         .and_then(|i| i.live_cwd.clone())
         .unwrap_or_else(|| t.cwd.clone())
@@ -133,7 +133,7 @@ impl App {
         if !self.omp_found() || self.wt.dialog.is_some() {
             return;
         }
-        let tab = self.tabs.iter().filter_map(Tab::term).find(|t| {
+        let tab = self.tabs.iter().find(|t| {
             t.session_path()
                 .is_some_and(|p| worktree_ui::same_session(p, &entry.path))
         });
@@ -304,7 +304,6 @@ impl App {
                 let open = self
                     .tabs
                     .iter()
-                    .filter_map(Tab::term)
                     .any(|t| t.uid == uid && !t.terminal().is_exited());
                 if !open {
                     self.toasts
@@ -596,7 +595,7 @@ impl App {
         if !self.wt.removing.insert(wt.path.clone()) {
             return;
         }
-        let inside = self.tabs.iter().filter_map(Tab::term).any(|t| {
+        let inside = self.tabs.iter().any(|t| {
             t.role == TabRole::Session
                 && !t.terminal().is_exited()
                 && worktree_ui::inside(&wt, &tab_dir(t))
@@ -671,7 +670,7 @@ impl App {
         // Tabs of this window: the ones that kept running now live in the primary checkout; the
         // ones the gateway stopped are closed.
         for i in (0..self.tabs.len()).rev() {
-            let Some(t) = self.tabs.get(i).and_then(Tab::term) else {
+            let Some(t) = self.tabs.get(i) else {
                 continue;
             };
             if t.role != TabRole::Session || !worktree_ui::inside(wt, &tab_dir(t)) {
@@ -679,7 +678,7 @@ impl App {
             }
             if t.terminal().is_exited() {
                 self.close_tab(i, false);
-            } else if let Some(t) = self.tabs[i].term_mut() {
+            } else if let Some(t) = self.tabs.get_mut(i) {
                 t.cwd.clone_from(&wt.primary);
                 self.dirty = true;
             }
@@ -697,7 +696,7 @@ impl App {
                 Confirm {
                     title: "Stop backing up the removed worktree?".to_owned(),
                     body: format!(
-                        "{} is in the project backups list but no longer exists. Backups already in Google Drive stay.",
+                        "{} is in the project backups list but no longer exists. Its existing backups stay.",
                         wt.path.display()
                     ),
                     confirm_label: "Remove from list".to_owned(),
@@ -822,11 +821,7 @@ impl App {
     /// Focuses the tab of `target`, or asks for its session file to be opened once the gateway's
     /// record names it. `false` while the record (or its file) is not there yet.
     fn open_continued(&mut self, target: &SessionTarget) -> bool {
-        if let Some(i) = self
-            .tabs
-            .iter()
-            .position(|t| t.term().is_some_and(|t| t.target().key == target.key))
-        {
+        if let Some(i) = self.tabs.iter().position(|t| t.target().key == target.key) {
             self.activate(i);
             return true;
         }
@@ -906,7 +901,6 @@ impl App {
         let tab_label = |path: &Path| -> Option<String> {
             self.tabs
                 .iter()
-                .filter_map(Tab::term)
                 .find(|t| {
                     t.session_path()
                         .is_some_and(|p| worktree_ui::same_session(p, path))
@@ -1110,12 +1104,7 @@ impl App {
 
     /// Records `new` as tab `uid`'s session file (here and in the gateway) when it differs.
     fn fix_tab_path(&mut self, uid: u64, new: &Path) {
-        let Some(t) = self
-            .tabs
-            .iter_mut()
-            .filter_map(Tab::term_mut)
-            .find(|t| t.uid == uid)
-        else {
+        let Some(t) = self.tabs.iter_mut().find(|t| t.uid == uid) else {
             return;
         };
         if t.session_path() == Some(new) {
@@ -1141,17 +1130,12 @@ impl App {
     /// of the new file; a pending move that landed in a worktree says so.
     fn track_relocations(&mut self) {
         let generation = self.gw.sessions_generation();
-        let live: HashSet<u64> = self
-            .tabs
-            .iter()
-            .filter_map(Tab::term)
-            .map(|t| t.uid)
-            .collect();
+        let live: HashSet<u64> = self.tabs.iter().map(|t| t.uid).collect();
         self.wt.seen.retain(|u, _| live.contains(u));
         self.wt.seen_cwd.retain(|u, _| live.contains(u));
         self.wt.tried.retain(|u, _| live.contains(u));
         let mut changed = Vec::new();
-        for tab in self.tabs.iter().filter_map(Tab::term) {
+        for tab in self.tabs.iter() {
             let live_cwd = tab.info().and_then(|i| i.live_cwd.clone());
             let path = tab.session_path_owned();
             let (Some(prev_path), Some(prev_cwd)) = (
@@ -1204,11 +1188,7 @@ impl App {
             }
             self.wt.seen.insert(uid, Some(entry.path.clone()));
             let folder = live_cwd.unwrap_or_else(|| entry.cwd.clone());
-            if let Some(t) = self
-                .tabs
-                .iter_mut()
-                .filter_map(Tab::term_mut)
-                .find(|t| t.uid == uid)
+            if let Some(t) = self.tabs.iter_mut().find(|t| t.uid == uid)
                 && t.cwd != folder
             {
                 t.cwd = folder;

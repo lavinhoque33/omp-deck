@@ -1,6 +1,6 @@
 //! The gateway actor: the single authority over the managed sessions (controllers, terminal
 //! fanout to frontend views), typed queries and journaled mutations, worker jobs and their
-//! lanes, interest-driven watchers, the schedules that run without a GUI (usage, updates, Drive,
+//! lanes, interest-driven watchers, the schedules that run without a GUI (usage, updates, backups,
 //! project sync), the canonical notifications and inbox, the maintenance barrier and the owner's
 //! lifetime.
 //!
@@ -27,10 +27,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use deck_core::agents::AgentsTarget;
+use deck_core::backup::Service;
 use deck_core::changes::Changes;
 use deck_core::config::{AppConfig, GatewayMode};
 use deck_core::fleet::FleetTarget;
-use deck_core::gdrive::{LastBackup, Service};
 use deck_core::inventory::{InventoryEntry, StatsCache};
 use deck_core::omp::{Omp, UpdateStatus};
 use deck_core::selfupdate::{Applied, InstallKind, Release};
@@ -205,9 +205,6 @@ pub(crate) enum Fin {
     Worktree(Box<worktree::WtFin>),
 }
 
-/// A signed-in Google account: its email and last backup from this machine.
-pub(crate) type AccountInfo = (Option<String>, Option<LastBackup>);
-
 /// Results the schedules own ([`Engine::on_schedule_fin`]).
 pub(crate) enum Sched {
     Usage(Result<UsageSnapshot, String>),
@@ -219,8 +216,11 @@ pub(crate) enum Sched {
     OmpFound(Option<Omp>),
     OmpVersion(Result<String, String>),
     OmpChecked(Result<UpdateStatus, String>),
-    DriveAccount(Result<Option<AccountInfo>, String>),
-    DriveAuto(Result<(), String>),
+    Accounts(Result<schedules::Accounts, String>),
+    BackupAuto {
+        destination: deck_core::backup::Destination,
+        result: Result<(), String>,
+    },
     ProjectAuto {
         path: PathBuf,
         result: Result<(), String>,
@@ -355,7 +355,7 @@ struct JobState {
     label: &'static str,
     progress: Option<Progress>,
     cancel: Option<Arc<AtomicBool>>,
-    /// Holds the one-at-a-time Google Drive lane.
+    /// Holds the one-at-a-time backup lane.
     lane: bool,
     post: mutate::Post,
 }
@@ -379,7 +379,7 @@ struct Dirty {
     controllers: bool,
     usage: bool,
     app: bool,
-    drive: bool,
+    backup: bool,
     omp: bool,
     gateway: bool,
     mobile: bool,
@@ -400,7 +400,8 @@ pub(crate) struct Engine {
     ctl_ns: String,
     ctl_ext: Option<PathBuf>,
     omp: Option<Omp>,
-    drive: Option<Arc<Service>>,
+    /// Backups to every destination (the Drive side is unavailable without OAuth credentials).
+    service: Arc<Service>,
     handles: Arc<Handles>,
     stats: Arc<Mutex<StatsCache>>,
     inventory_shared: Arc<Mutex<Arc<Vec<InventoryEntry>>>>,
@@ -417,7 +418,7 @@ pub(crate) struct Engine {
 
     sess: sessions::Sessions,
     jobs: HashMap<RequestKey, JobState>,
-    drive_lane: Option<String>,
+    backup_lane: Option<String>,
     mode_queue: VecDeque<(RequestKey, GatewayMode)>,
     mode_busy: bool,
     mode_failed: Option<String>,
@@ -482,8 +483,10 @@ impl Engine {
             log::warn!("live control extension unavailable: no per-user data directory");
         }
         let omp = super::resolve_omp(context.omp.as_deref());
-        let drive = deck_core::gdrive::Credentials::detect()
-            .map(|c| Arc::new(Service::new(c, root.agent_dir())));
+        let service = Arc::new(Service::new(
+            deck_core::backup::drive::Credentials::detect(),
+            root.agent_dir(),
+        ));
         let waker = Waker::new(tx.clone());
         let wake = waker.callback();
         let sessions_watch = {
@@ -529,7 +532,7 @@ impl Engine {
             ctl_ns,
             ctl_ext,
             omp,
-            drive,
+            service,
             handles: Arc::new(Handles::default()),
             stats: Arc::new(Mutex::new(StatsCache::default())),
             inventory_shared: Arc::new(Mutex::new(Arc::new(Vec::new()))),
@@ -543,7 +546,7 @@ impl Engine {
             next_seq: 0,
             sess: sessions::Sessions::new(manifest),
             jobs: HashMap::new(),
-            drive_lane: None,
+            backup_lane: None,
             mode_queue: VecDeque::new(),
             mode_busy: false,
             mode_failed: None,
@@ -682,7 +685,8 @@ impl Engine {
             root: self.root.clone(),
             backends: self.backends.clone(),
             ctl_ns: self.ctl_ns.clone(),
-            drive: self.drive.clone(),
+            service: self.service.clone(),
+            destination: self.cfg.backup_destination,
             handles: self.handles.clone(),
             stats: self.stats.clone(),
             inventory: self.inventory_shared.clone(),
@@ -1044,7 +1048,7 @@ impl Engine {
             && !self.sess.closing()
             && self.sess.busy_controllers() == 0
             && self.sess.direct_programs() == 0
-            && self.drive_lane.is_none()
+            && self.backup_lane.is_none()
             && !self.mode_busy
             && self.mode_queue.is_empty()
     }
@@ -1313,8 +1317,8 @@ impl Engine {
         if std::mem::take(&mut self.dirty.app) {
             self.changed(Topic::AppUpdate);
         }
-        if std::mem::take(&mut self.dirty.drive) {
-            self.changed(Topic::Drive);
+        if std::mem::take(&mut self.dirty.backup) {
+            self.changed(Topic::Backup);
         }
         if std::mem::take(&mut self.dirty.omp) {
             self.changed(Topic::OmpUpdate);
@@ -1361,7 +1365,7 @@ impl Engine {
             )),
             Topic::Usage => TopicValue::Usage(self.sched.usage_view()),
             Topic::AppUpdate => TopicValue::AppUpdate(self.sched.app_view()),
-            Topic::Drive => TopicValue::Drive(self.drive_view()),
+            Topic::Backup => TopicValue::Backup(self.backup_view()),
             Topic::OmpUpdate => TopicValue::OmpUpdate(self.sched.omp_view()),
             Topic::Mobile => TopicValue::Mobile(self.mobile_view()),
             Topic::Live(key) => self.live_value(key),
@@ -1394,7 +1398,7 @@ fn always_on(t: &Topic) -> bool {
             | Topic::Status
             | Topic::Usage
             | Topic::AppUpdate
-            | Topic::Drive
+            | Topic::Backup
             | Topic::OmpUpdate
             | Topic::Mobile
     )

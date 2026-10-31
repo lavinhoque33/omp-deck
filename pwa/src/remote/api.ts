@@ -237,7 +237,7 @@ export type Feed =
   | { feed: 'usage' }
   | { feed: 'agents'; session: string }
   | { feed: 'worktrees'; project: string }
-  | { feed: 'drive' }
+  | { feed: 'backup' }
   | { feed: 'sync' }
   | { feed: 'updates' }
   | { feed: 'device' };
@@ -284,7 +284,7 @@ export type Op =
   | { op: 'usage_activity'; days: number }
   | { op: 'usage_refresh' }
   | { op: 'omp_settings' }
-  | { op: 'drive_backups' }
+  | { op: 'backup_list' }
   | { op: 'sync_backups'; project?: string | null }
   | { op: 'presence'; visible: boolean }
   | { op: 'push_subscribe'; endpoint: string; p256dh: string; auth: string }
@@ -311,7 +311,7 @@ export type Op =
   | { op: 'worktree_finish'; project: string }
   | { op: 'worktree_continue'; parked: string; where: ContinueWhere }
   | { op: 'update_check' }
-  | { op: 'drive_backup' }
+  | { op: 'backup_run' }
   | { op: 'sync_backup'; project: string }
   | { op: 'open_on_desktop'; session: string; split: Split }
   | { op: 'close_on_desktop'; session: string }
@@ -321,17 +321,17 @@ export type Op =
   | { op: 'omp_reset'; key: string }
   | { op: 'update_run'; kind: UpdateKind }
   | { op: 'app_update'; step: AppUpdateStep }
-  | { op: 'drive_sign_in' }
-  | { op: 'drive_delete'; ids: string[] }
-  | { op: 'drive_restore_prepare'; id: string }
-  | { op: 'drive_restore_apply'; handle: number }
-  | { op: 'drive_restore_discard'; handle: number }
+  | { op: 'backup_connect' }
+  | { op: 'backup_delete'; ids: string[] }
+  | { op: 'backup_restore_prepare'; id: string }
+  | { op: 'backup_restore_apply'; handle: number }
+  | { op: 'backup_restore_discard'; handle: number }
   | { op: 'sync_add'; dir: string }
   | { op: 'sync_set'; project: string; parts: SyncParts; excluded: string[] }
   | { op: 'sync_remove'; project: string }
   | { op: 'sync_delete'; ids: string[] }
   | { op: 'sync_restore_prepare'; backup: string; target: RestoreTarget; parts: SyncParts }
-  | { op: 'sync_restore_apply'; handle: number; conflicts: ConflictChoice[] };
+  | { op: 'sync_restore_apply'; handle: number; conflicts: ConflictChoice[]; excluded?: string[] };
 
 export type OpName = Op['op'];
 
@@ -383,7 +383,7 @@ const OP_CLASS: { readonly [K in OpName]: Class } = {
   usage_activity: 'view',
   usage_refresh: 'view',
   omp_settings: 'view',
-  drive_backups: 'view',
+  backup_list: 'view',
   sync_backups: 'view',
   presence: 'view',
   push_subscribe: 'view',
@@ -409,7 +409,7 @@ const OP_CLASS: { readonly [K in OpName]: Class } = {
   worktree_finish: 'control',
   worktree_continue: 'control',
   update_check: 'control',
-  drive_backup: 'control',
+  backup_run: 'control',
   sync_backup: 'control',
   open_on_desktop: 'control',
   close_on_desktop: 'control',
@@ -418,11 +418,11 @@ const OP_CLASS: { readonly [K in OpName]: Class } = {
   omp_reset: 'manage',
   update_run: 'manage',
   app_update: 'manage',
-  drive_sign_in: 'manage',
-  drive_delete: 'manage',
-  drive_restore_prepare: 'manage',
-  drive_restore_apply: 'manage',
-  drive_restore_discard: 'manage',
+  backup_connect: 'manage',
+  backup_delete: 'manage',
+  backup_restore_prepare: 'manage',
+  backup_restore_apply: 'manage',
+  backup_restore_discard: 'manage',
   sync_add: 'manage',
   sync_set: 'manage',
   sync_remove: 'manage',
@@ -840,6 +840,11 @@ export interface Changes {
   files: ChangedFile[];
 }
 
+export interface BackupDestinationView {
+  kind: 'drive' | 'ftp' | 'ftps' | 'sftp';
+  label: string;
+}
+
 /** A feed's value (tag `feed`). */
 export type FeedValue =
   | { feed: 'projects'; projects: Project[]; truncated: boolean }
@@ -866,9 +871,10 @@ export type FeedValue =
   | { feed: 'agents'; session: string; agents: AgentView[]; truncated: boolean }
   | { feed: 'worktrees'; project: string; worktree: WorktreeView | null; parked: ParkedView[]; truncated: boolean }
   | {
-      feed: 'drive';
+      feed: 'backup';
+      destination: BackupDestinationView;
       available: boolean;
-      signed_in: boolean;
+      connected: boolean;
       account: string | null;
       last_backup_unix_ms: number | null;
       interval: SyncInterval;
@@ -1160,7 +1166,7 @@ export interface SessionPlanView {
 /** What a prepared restore would change (tag `type`); paths are `~` displays. */
 export type RestorePlanView =
   | {
-      type: 'drive';
+      type: 'backup';
       name: string;
       created_unix_ms: number | null;
       host: string;
@@ -1263,16 +1269,16 @@ export interface SettingsGroup {
   entries: SettingView[];
 }
 
-export interface DriveBackupView {
+export interface BackupFileView {
   id: string;
   name: string;
   size: number;
   created_unix_ms: number | null;
 }
 
-export interface DriveHost {
+export interface BackupHost {
   host: string;
-  backups: DriveBackupView[];
+  backups: BackupFileView[];
 }
 
 export interface SyncBackupView {
@@ -1334,7 +1340,7 @@ export type Resp =
   | { type: 'dir'; dir: string | null; display: string; parent: string | null; entries: DirEntry[]; truncated: boolean }
   | { type: 'activity'; days: DayCount[] }
   | { type: 'omp_settings'; groups: SettingsGroup[]; truncated: boolean }
-  | { type: 'drive_backups'; hosts: DriveHost[]; truncated: boolean }
+  | { type: 'backup_list'; hosts: BackupHost[]; truncated: boolean }
   | { type: 'sync_backups'; backups: SyncBackupView[]; truncated: boolean }
   | { type: 'upload'; upload: string };
 
@@ -1595,7 +1601,7 @@ const feed = tagged<Feed, 'feed'>('feed', {
   usage: {},
   agents: { session: str },
   worktrees: { project: str },
-  drive: {},
+  backup: {},
   sync: {},
   updates: {},
   device: {},
@@ -1855,9 +1861,9 @@ const settingsGroup = struct<SettingsGroup>({
     }),
   ),
 });
-const driveHost = struct<DriveHost>({
+const backupHost = struct<BackupHost>({
   host: str,
-  backups: list(struct<DriveBackupView>({ id: str, name: str, size: u64, created_unix_ms: nullable(u64) })),
+  backups: list(struct<BackupFileView>({ id: str, name: str, size: u64, created_unix_ms: nullable(u64) })),
 });
 const syncBackupView = struct<SyncBackupView>({
   id: str,
@@ -1872,7 +1878,7 @@ const syncBackupView = struct<SyncBackupView>({
   session_bytes: nullable(u64),
 });
 const restorePlanView = tagged<RestorePlanView, 'type'>('type', {
-  drive: {
+  backup: {
     name: str,
     created_unix_ms: nullable(u64),
     host: str,
@@ -2063,9 +2069,10 @@ const feedValue = tagged<FeedValue, 'feed'>('feed', {
   },
   agents: { session: str, agents: list(agentView), truncated: bool },
   worktrees: { project: str, worktree: nullable(worktreeView), parked: list(parkedView), truncated: bool },
-  drive: {
+  backup: {
+    destination: struct<BackupDestinationView>({ kind: oneOf(['drive', 'ftp', 'ftps', 'sftp']), label: str }),
     available: bool,
-    signed_in: bool,
+    connected: bool,
     account: nullable(str),
     last_backup_unix_ms: nullable(u64),
     interval: syncInterval,
@@ -2145,7 +2152,7 @@ const resp = tagged<Resp, 'type'>('type', {
   dir: { dir: nullable(str), display: str, parent: nullable(str), entries: list(dirEntry), truncated: bool },
   activity: { days: list(dayCount) },
   omp_settings: { groups: list(settingsGroup), truncated: bool },
-  drive_backups: { hosts: list(driveHost), truncated: bool },
+  backup_list: { hosts: list(backupHost), truncated: bool },
   sync_backups: { backups: list(syncBackupView), truncated: bool },
   upload: { upload: str },
 });
@@ -2279,7 +2286,7 @@ const opV = tagged<Op, 'op'>('op', {
   usage_activity: { days: u32 },
   usage_refresh: {},
   omp_settings: {},
-  drive_backups: {},
+  backup_list: {},
   sync_backups: { project: nullable(str) },
   presence: { visible: bool },
   push_subscribe: { endpoint: str, p256dh: str, auth: str },
@@ -2305,7 +2312,7 @@ const opV = tagged<Op, 'op'>('op', {
   worktree_finish: { project: str },
   worktree_continue: { parked: str, where: oneOf<ContinueWhere>(['worktree', 'main', 'switch_back']) },
   update_check: {},
-  drive_backup: {},
+  backup_run: {},
   sync_backup: { project: str },
   open_on_desktop: { session: str, split: oneOf<Split>(['none', 'right', 'down']) },
   close_on_desktop: { session: str },
@@ -2314,17 +2321,17 @@ const opV = tagged<Op, 'op'>('op', {
   omp_reset: { key: str },
   update_run: { kind: oneOf<UpdateKind>(['omp', 'plugins', 'stable', 'canary']) },
   app_update: { step: oneOf<AppUpdateStep>(['download', 'apply']) },
-  drive_sign_in: {},
-  drive_delete: { ids: files },
-  drive_restore_prepare: { id: str },
-  drive_restore_apply: { handle: u64 },
-  drive_restore_discard: { handle: u64 },
+  backup_connect: {},
+  backup_delete: { ids: files },
+  backup_restore_prepare: { id: str },
+  backup_restore_apply: { handle: u64 },
+  backup_restore_discard: { handle: u64 },
   sync_add: { dir: str },
   sync_set: { project: str, parts: syncParts, excluded: files },
   sync_remove: { project: str },
   sync_delete: { ids: files },
   sync_restore_prepare: { backup: str, target: restoreTarget, parts: syncParts },
-  sync_restore_apply: { handle: u64, conflicts: list(conflictChoice) },
+  sync_restore_apply: { handle: u64, conflicts: list(conflictChoice), excluded: optional(files) },
 });
 const requestV = struct<Request>({ id: u64, seq: nullable(u64), op: opV });
 

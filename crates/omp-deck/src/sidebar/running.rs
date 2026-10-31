@@ -21,7 +21,7 @@ use super::{
 use crate::badge::{self, Hue};
 use crate::folder_scope;
 use crate::icons::{ICON_APP_WINDOW, ICON_CIRCLE_STOP, ICON_PLAY, ICON_TERMINAL};
-use crate::tabs::{self, Tab};
+use crate::tabs;
 use crate::theme::{self, Palette};
 use crate::widgets::{menu_item, paint_icon};
 use crate::{card, tips};
@@ -100,7 +100,7 @@ fn fingerprint(input: &SidebarInput<'_>) -> u64 {
     (live, snap.blind, input.tabs.len()).hash(&mut h);
     for t in input.tabs {
         t.mux_name().hash(&mut h);
-        t.term().map(|t| t.cwd.as_path()).hash(&mut h);
+        t.cwd.as_path().hash(&mut h);
     }
     h.finish()
 }
@@ -169,7 +169,6 @@ fn build(input: &SidebarInput<'_>) -> Vec<Row> {
                 _ => r
                     .tab
                     .and_then(|i| input.tabs.get(i))
-                    .and_then(Tab::term)
                     .map(|t| t.cwd.as_path()),
             };
             cwd.is_some_and(|c| folder_scope::contains(scope, c))
@@ -249,7 +248,7 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
     };
     let cwd = entry
         .map(|e| e.cwd.as_path())
-        .or_else(|| tab.and_then(Tab::term).map(|t| t.cwd.as_path()));
+        .or_else(|| tab.map(|t| t.cwd.as_path()));
     let folder = cwd.and_then(Path::file_name).and_then(|n| n.to_str());
     let active = row.tab == Some(input.active_tab);
     let neutral = theme::flat();

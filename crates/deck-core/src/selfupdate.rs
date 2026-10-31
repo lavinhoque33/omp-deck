@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::gdrive::transfer_http;
+use crate::backup::transfer_http;
 use crate::usage::run_bounded;
 
 /// Where releases live; `OMP_DECK_UPDATE_BASE` replaces it (tests, sandboxes).

@@ -79,7 +79,7 @@ Console errors from the page are printed next to each file.
 | browse | `route=browse` (folder tokens are `dir:<path>`) |
 | worktrees / worktrees-linked | `route=worktrees&project=p-ompdeck` / `p-ompdeck-wt` (parked branches) |
 | running | `route=running` (RAM per session, one orphan mux session) |
-| settings-notifications, -device, -usage, -omp, -updates, -drive, -sync | `route=settings&section=<section>` |
+| settings-notifications, -device, -usage, -omp, -updates, -backup, -sync | `route=settings&section=<section>` |
 | deep-link | `s=s-convo` |
 | old-desktop | `route=settings&section=usage&gw=v1` |
 
@@ -107,10 +107,16 @@ Everything is in `fixtures.ts`, keyed to `now` at server start.
 - **Settings data.**
   - omp settings covering every kind, including set and unset secrets.
   - Updates: omp has a newer version, and the app is a deb with apply refused.
-  - Drive: two hosts with three backups each, plus a drive restore plan.
+  - Backup: the active destination (Google Drive in the fixture), two hosts with three backups each, and a settings restore plan.
+    The phone also supports FTP, FTPS and SFTP destination labels and desktop setup.
   - Sync: three rows and backups for two projects on two hosts, plus a project restore plan with conflicts and a
-    problem.
+    problem. Restore review offers **Choose sessions**; left-out ids are sent as `excluded`, independently of conflict
+    choices. Restore is disabled when the plan has no writable files or included, writable sessions.
   - Device state, including push.
 
 To change what a screen shows, edit `fixtures.ts`. `test/smoke.test.ts` validates every fixture answer against the wire
 decoders.
+
+`bun run e2e` also switches backup destination kind and label with timestamps unchanged on both
+backup screens, verifies selections reset, and releases a delayed old-destination reply to check
+that it cannot replace the new listing.

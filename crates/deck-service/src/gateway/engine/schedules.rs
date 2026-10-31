@@ -1,12 +1,13 @@
-//! Work that keeps running without a GUI: usage fetches, app and omp update checks, the Google
-//! account and the automatic Drive and project backups (on the one-at-a-time Drive lane).
+//! Work that keeps running without a GUI: usage fetches, app and omp update checks, the backup
+//! accounts and the automatic config and project backups to the active destination (on the
+//! one-at-a-time backup lane).
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use deck_core::gdrive::{self, MemoryBank, OmpDir, Parts, ProjectSizes};
+use deck_core::backup::{self, Destination, LastBackup, MemoryBank, OmpDir, Parts, ProjectSizes};
 use deck_core::omp::UpdateStatus;
 use deck_core::selfupdate::{self, InstallKind, Release};
 use deck_core::usage::UsageSnapshot;
@@ -14,7 +15,8 @@ use deck_core::usage::UsageSnapshot;
 use super::{Engine, Sched};
 use crate::gateway::GATEWAY_VERSION;
 use crate::gateway::protocol::{
-    AppUpdateView, DriveView, GatewayError, OmpUpdateView, Progress, UpdatePhase, UsageView,
+    AppUpdateView, BackupView, GatewayError, OmpUpdateView, Progress, ServerView, UpdatePhase,
+    UsageView,
 };
 
 /// First usage fetch after start (or after omp turned up).
@@ -23,12 +25,20 @@ const USAGE_EVERY: Duration = Duration::from_secs(300);
 /// First app/omp update check after start.
 const CHECK_FIRST: Duration = Duration::from_secs(10);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
-/// First automatic Drive backup after signing in (or turning it on).
-const DRIVE_FIRST: Duration = Duration::from_secs(45);
-/// First automatic project pass after signing in (or turning it on).
+/// First automatic config backup after the destination was set up (or turning it on).
+const BACKUP_FIRST: Duration = Duration::from_secs(45);
+/// First automatic project pass after the destination was set up (or turning it on).
 const PROJECT_FIRST: Duration = Duration::from_secs(2 * 60);
-/// The Drive lane label of automatic work.
+/// The backup lane label of automatic work.
 const AUTO_LANE: &str = "automatic backup";
+
+/// What the destinations' local records say (read on a worker).
+pub(crate) struct Accounts {
+    /// Signed in to Google: the email and the last backup from this machine.
+    drive: Option<(Option<String>, Option<LastBackup>)>,
+    /// The saved server and the last backup from this machine.
+    server: Option<(ServerView, Option<LastBackup>)>,
+}
 
 pub(super) struct Schedules {
     // usage
@@ -54,15 +64,16 @@ pub(super) struct Schedules {
     omp_checked: Option<u64>,
     omp_checking: bool,
     next_omp: Instant,
-    // Google Drive
-    signed_in: bool,
-    email: Option<String>,
-    last_backup: Option<gdrive::LastBackup>,
-    drive_error: Option<String>,
+    // backup destinations
+    accounts: Accounts,
+    backup_error: Option<String>,
     last_auto: Option<u64>,
     account_busy: bool,
-    next_drive: Option<Instant>,
-    drive_period: Option<Duration>,
+    account_again: bool,
+    /// The destination the timers are armed for, and whether it was set up then.
+    armed: (Destination, bool),
+    next_backup: Option<Instant>,
+    backup_period: Option<Duration>,
     // project sync
     next_project: Option<Instant>,
     project_period: Option<Duration>,
@@ -91,14 +102,17 @@ impl Schedules {
             omp_checked: None,
             omp_checking: false,
             next_omp: now + CHECK_FIRST,
-            signed_in: false,
-            email: None,
-            last_backup: None,
-            drive_error: None,
+            accounts: Accounts {
+                drive: None,
+                server: None,
+            },
+            backup_error: None,
             last_auto: None,
             account_busy: false,
-            next_drive: None,
-            drive_period: None,
+            account_again: false,
+            armed: (Destination::Drive, false),
+            next_backup: None,
+            backup_period: None,
             next_project: None,
             project_period: None,
             pass: VecDeque::new(),
@@ -264,16 +278,34 @@ fn parts_of(row: &deck_core::config::SyncRow) -> Parts {
 }
 
 impl Engine {
-    pub(super) fn drive_view(&self) -> DriveView {
+    pub(super) fn backup_view(&self) -> BackupView {
         let s = &self.sched;
-        DriveView {
-            available: self.drive.is_some(),
-            signed_in: s.signed_in,
-            email: s.email.clone(),
-            last_backup: s.last_backup.clone(),
-            busy: self.drive_lane.clone(),
-            last_error: s.drive_error.clone(),
+        let destination = self.cfg.backup_destination;
+        let drive = s.accounts.drive.as_ref();
+        let server = s.accounts.server.as_ref();
+        BackupView {
+            destination,
+            drive_available: self.service.creds.is_some(),
+            drive_signed_in: drive.is_some(),
+            drive_email: drive.and_then(|(e, _)| e.clone()),
+            server: server.map(|(v, _)| v.clone()),
+            last_backup: match destination {
+                Destination::Drive => drive.and_then(|(_, l)| l.clone()),
+                Destination::Server => server.and_then(|(_, l)| l.clone()),
+            },
+            busy: self.backup_lane.clone(),
+            last_error: s.backup_error.clone(),
             last_auto_unix_ms: s.last_auto,
+        }
+    }
+
+    /// The active destination is set up (signed in to Google / a server saved).
+    fn backup_linked(&self) -> bool {
+        match self.cfg.backup_destination {
+            Destination::Drive => {
+                self.service.creds.is_some() && self.sched.accounts.drive.is_some()
+            }
+            Destination::Server => self.sched.accounts.server.is_some(),
         }
     }
 
@@ -283,7 +315,7 @@ impl Engine {
             Sched::AppDetected(selfupdate::detect()).into()
         });
         self.refresh_omp_version();
-        self.load_drive_account();
+        self.load_accounts();
     }
 
     fn refresh_omp_version(&mut self) {
@@ -297,24 +329,27 @@ impl Engine {
         });
     }
 
-    /// Re-reads the Google account (sign-in state, last backup).
-    pub(super) fn load_drive_account(&mut self) {
-        let Some(service) = self.drive.clone() else {
-            return;
-        };
+    /// Re-reads both destinations' local records (sign-in, saved server, last backups). A request
+    /// while a read runs is served by one more read after it.
+    pub(super) fn load_accounts(&mut self) {
         if self.sched.account_busy {
+            self.sched.account_again = true;
             return;
         }
         self.sched.account_busy = true;
-        self.spawn_worker("drive-account", move || {
-            Sched::DriveAccount(
-                service
-                    .store
-                    .load()
-                    .map(|a| a.map(|a| (a.email, a.last_backup)))
-                    .map_err(|e| e.to_string()),
-            )
-            .into()
+        let service = self.service.clone();
+        self.spawn_worker("backup-accounts", move || {
+            let read = || -> backup::Result<Accounts> {
+                let drive = match service.creds {
+                    Some(_) => service.store.load()?.map(|a| (a.email, a.last_backup)),
+                    None => None,
+                };
+                let server = service
+                    .server_account()?
+                    .map(|a| (ServerView::of(&a), a.last_backup));
+                Ok(Accounts { drive, server })
+            };
+            Sched::Accounts(read().map_err(|e| e.to_string())).into()
         });
     }
 
@@ -343,7 +378,7 @@ impl Engine {
                 self.dirty.usage = true;
                 let ctx = self.job_ctx();
                 self.spawn_worker("usage", move || {
-                    Sched::Usage(super::mutate::fetch_usage(&ctx, false)).into()
+                    Sched::Usage(super::mutate::fetch_usage(&ctx)).into()
                 });
             } else {
                 next.push(at);
@@ -383,25 +418,33 @@ impl Engine {
                 next.push(self.sched.next_omp);
             }
         }
-        // Automatic Drive backup, then project passes (one lane job at a time).
-        if let (Some(service), Some(period)) = (self.drive.clone(), self.sched.drive_period)
-            && self.sched.signed_in
-            && let Some(at) = self.sched.next_drive
+        // Automatic config backup, then project passes, to the active destination (one lane
+        // job at a time).
+        let linked = self.sched.armed.1;
+        if let Some(period) = self.sched.backup_period
+            && linked
+            && let Some(at) = self.sched.next_backup
         {
             if now < at {
                 next.push(at);
-            } else if self.drive_lane.is_none() {
-                self.sched.next_drive = Some(now + period);
-                self.drive_lane = Some(AUTO_LANE.to_owned());
-                self.dirty.drive = true;
-                self.spawn_worker("drive-auto", move || {
-                    Sched::DriveAuto(service.backup(false).map(drop).map_err(|e| e.to_string()))
-                        .into()
+            } else if self.backup_lane.is_none() {
+                self.sched.next_backup = Some(now + period);
+                self.backup_lane = Some(AUTO_LANE.to_owned());
+                self.dirty.backup = true;
+                let destination = self.cfg.backup_destination;
+                let service = self.service.with_destination(destination);
+                self.spawn_worker("backup-auto", move || {
+                    let result = service.backup(false).map(drop).map_err(|e| e.to_string());
+                    Sched::BackupAuto {
+                        destination,
+                        result,
+                    }
+                    .into()
                 });
             }
         }
-        if let (Some(_), Some(period)) = (&self.drive, self.sched.project_period)
-            && self.sched.signed_in
+        if let Some(period) = self.sched.project_period
+            && linked
             && let Some(at) = self.sched.next_project
         {
             if now >= at {
@@ -419,7 +462,7 @@ impl Engine {
                 next.push(at);
             }
         }
-        if self.drive_lane.is_none() {
+        if self.backup_lane.is_none() {
             self.next_project_backup();
         }
         if let Some(at) = next.into_iter().min() {
@@ -427,14 +470,36 @@ impl Engine {
         }
     }
 
-    /// Applies interval and sign-in changes to the Drive and project timers.
+    /// Applies interval, destination and sign-in changes to the backup and project timers: a
+    /// destination that just became active and set up gets its first passes soon (its own sync
+    /// state decides what is uploaded).
     fn track_intervals(&mut self, now: Instant) {
-        let drive = self.cfg.drive_backup_interval.period();
-        if drive != self.sched.drive_period {
-            let was = std::mem::replace(&mut self.sched.drive_period, drive);
-            self.sched.next_drive = match (was, drive) {
+        let armed = (self.cfg.backup_destination, self.backup_linked());
+        if armed != self.sched.armed {
+            let s = &mut self.sched;
+            if armed.0 != s.armed.0 {
+                s.backup_error = None;
+            }
+            s.armed = armed;
+            let (backup, project) = if armed.1 {
+                (
+                    s.backup_period.map(|_| now + BACKUP_FIRST),
+                    s.project_period.map(|_| now + PROJECT_FIRST),
+                )
+            } else {
+                (None, None)
+            };
+            s.next_backup = backup;
+            s.next_project = project;
+            s.pass.clear();
+            self.dirty.backup = true;
+        }
+        let backup = self.cfg.drive_backup_interval.period();
+        if backup != self.sched.backup_period {
+            let was = std::mem::replace(&mut self.sched.backup_period, backup);
+            self.sched.next_backup = match (was, backup) {
                 (_, None) => None,
-                (None, Some(_)) => Some(now + DRIVE_FIRST),
+                (None, Some(_)) => Some(now + BACKUP_FIRST),
                 (Some(_), Some(p)) => Some(now + p),
             };
         }
@@ -454,9 +519,14 @@ impl Engine {
 
     /// Starts the next folder of the running automatic pass.
     fn next_project_backup(&mut self) {
-        let Some(service) = self.drive.clone() else {
+        if !self.sched.armed.1 {
+            self.sched.pass.clear();
             return;
-        };
+        }
+        if self.sched.pass.is_empty() {
+            return;
+        }
+        let service = self.service.with_destination(self.cfg.backup_destination);
         while let Some(path) = self.sched.pass.pop_front() {
             // The row may have been removed or turned off since the pass started.
             let Some(row) = self
@@ -470,10 +540,10 @@ impl Engine {
             let want = parts_of(row);
             let excluded = row.excluded_sessions.clone();
             let root = self.root.clone();
-            self.drive_lane = Some(AUTO_LANE.to_owned());
-            self.dirty.drive = true;
+            self.backup_lane = Some(AUTO_LANE.to_owned());
+            self.dirty.backup = true;
             self.spawn_worker("project-auto", move || {
-                let result = gdrive::measure(&root, &path)
+                let result = backup::measure(&root, &path)
                     .map_err(|e| e.to_string())
                     .and_then(|sizes| {
                         let parts = usable_parts(want, &sizes, &excluded);
@@ -612,43 +682,41 @@ impl Engine {
                 self.sched.omp_status = Some(r);
                 self.dirty.omp = true;
             }
-            Sched::DriveAccount(r) => {
+            Sched::Accounts(r) => {
                 let s = &mut self.sched;
                 s.account_busy = false;
                 match r {
-                    Ok(Some((email, last))) => {
-                        if !s.signed_in {
-                            s.next_drive = s.drive_period.map(|_| now + DRIVE_FIRST);
-                            s.next_project = s.project_period.map(|_| now + PROJECT_FIRST);
-                            s.pass.clear();
-                        }
-                        s.signed_in = true;
-                        s.email = email;
-                        s.last_backup = last;
-                    }
-                    Ok(None) => {
-                        s.signed_in = false;
-                        s.email = None;
-                        s.last_backup = None;
-                        s.next_drive = None;
-                        s.next_project = None;
-                        s.pass.clear();
-                    }
-                    Err(e) => s.drive_error = Some(e),
+                    Ok(accounts) => s.accounts = accounts,
+                    Err(e) => s.backup_error = Some(e),
                 }
-                self.dirty.drive = true;
+                self.dirty.backup = true;
+                if std::mem::take(&mut self.sched.account_again) {
+                    self.load_accounts();
+                }
+                // Re-arm the timers for what is set up now.
+                self.waker.now();
             }
-            Sched::DriveAuto(r) => {
+            Sched::BackupAuto {
+                destination,
+                result,
+            } => {
                 self.release_auto_lane();
                 self.sched.last_auto = Some(crate::gateway::unix_ms());
-                match r {
-                    Ok(()) => self.sched.drive_error = None,
+                match result {
                     Err(e) => {
-                        log::warn!("automatic Google Drive backup failed: {e}");
-                        self.sched.drive_error = Some(e);
+                        log::warn!("automatic backup to {destination:?} failed: {e}");
+                        // A destination switched away from meanwhile is not the one shown.
+                        if destination == self.cfg.backup_destination {
+                            self.sched.backup_error = Some(e);
+                        }
+                    }
+                    Ok(()) => {
+                        if destination == self.cfg.backup_destination {
+                            self.sched.backup_error = None;
+                        }
                     }
                 }
-                self.load_drive_account();
+                self.load_accounts();
             }
             Sched::ProjectAuto { path, result } => {
                 self.release_auto_lane();
@@ -661,9 +729,9 @@ impl Engine {
     }
 
     fn release_auto_lane(&mut self) {
-        if self.drive_lane.as_deref() == Some(AUTO_LANE) {
-            self.drive_lane = None;
+        if self.backup_lane.as_deref() == Some(AUTO_LANE) {
+            self.backup_lane = None;
         }
-        self.dirty.drive = true;
+        self.dirty.backup = true;
     }
 }

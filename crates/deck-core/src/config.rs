@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::backup::Destination;
 use crate::mux::BackendChoice;
 
 #[derive(Debug, thiserror::Error)]
@@ -98,9 +99,11 @@ pub struct AppConfig {
     pub recent_folders: Vec<PathBuf>,
     /// Per-folder open tabs (folder mode launch/restore).
     pub folder_tabs: BTreeMap<PathBuf, FolderTabs>,
-    /// Back up the omp config to Google Drive automatically when it changed (while signed in).
+    /// Back up the omp config automatically when it changed (while the destination is set up).
     pub drive_backup_interval: SyncInterval,
-    /// Project folders backed up to Google Drive (Settings → Sync), in table order.
+    /// Where config backups and project sync go (one destination at a time).
+    pub backup_destination: Destination,
+    /// Project folders backed up to the active destination (Settings → Sync), in table order.
     pub project_sync: Vec<SyncRow>,
     /// How often the rows are backed up automatically.
     pub project_sync_interval: SyncInterval,
@@ -251,6 +254,7 @@ impl Default for AppConfig {
             recent_folders: Vec::new(),
             folder_tabs: BTreeMap::new(),
             drive_backup_interval: SyncInterval::Every10Minutes,
+            backup_destination: Destination::default(),
             project_sync: Vec::new(),
             project_sync_interval: SyncInterval::default(),
             session_backend: BackendChoice::default(),
@@ -1126,6 +1130,22 @@ mod tests {
         assert_eq!(
             AppConfig::load_from(&p).drive_backup_interval,
             SyncInterval::Off
+        );
+    }
+
+    #[test]
+    fn backup_destination_defaults_to_drive_and_round_trips() {
+        assert_eq!(load_str("{}").backup_destination, Destination::Drive);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        let cfg = AppConfig {
+            backup_destination: Destination::Server,
+            ..AppConfig::default()
+        };
+        cfg.save_to(&p).unwrap();
+        assert_eq!(
+            AppConfig::load_from(&p).backup_destination,
+            Destination::Server
         );
     }
 

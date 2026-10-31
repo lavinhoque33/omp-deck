@@ -10,7 +10,7 @@ use deck_service::controller::SessionTarget;
 use deck_service::gateway::protocol::{Done, LaunchSpec, Mutation, SessionRole, Tool, ViewRole};
 use deck_term::{TermOptions, Terminal};
 
-use super::{App, CopyPending, Tab, TabRole, TermTab};
+use super::{App, CopyPending, Tab, TabRole};
 use crate::panes::Split;
 use crate::tabs::{Anchor, TabLaunch};
 
@@ -306,10 +306,7 @@ impl App {
         } = req;
         // The gateway returns the controller that already runs a session as is: a tab that shows
         // it just takes focus.
-        let shown = self
-            .tabs
-            .iter()
-            .position(|t| t.term().is_some_and(|t| t.target().key == target.key));
+        let shown = self.tabs.iter().position(|t| t.target().key == target.key);
         if let Some(i) = shown {
             if focus.grants(claim, self.activation_seq) {
                 self.activate(i);
@@ -319,7 +316,7 @@ impl App {
         let term = self.open_view(&target);
         self.next_tab_uid += 1;
         let uid = self.next_tab_uid;
-        let mut tab = TermTab::new(
+        let mut tab = Tab::new(
             term,
             target.clone(),
             uid,
@@ -334,7 +331,7 @@ impl App {
         if let Some(info) = self.gw.controller(&target) {
             tab.set_info(&info);
         }
-        self.tabs.push(Tab::Terminal(Box::new(tab)));
+        self.tabs.push(tab);
         let mut at = self.tabs.len() - 1;
         if let Post::Anchor(anchor) = &post {
             // The tab was appended; put it next to the neighbour it sat beside.
@@ -384,9 +381,7 @@ impl App {
                 }
             }
             Post::Copy { label, dest } => {
-                if let Some(t) = self.tabs[at].term_mut() {
-                    t.copy = Some(CopyPending { dest: dest.clone() });
-                }
+                self.tabs[at].copy = Some(CopyPending { dest: dest.clone() });
                 self.toasts.info(
                     &self.ctx,
                     format!(
@@ -407,7 +402,6 @@ impl App {
         let Some(tab) = self
             .tabs
             .iter_mut()
-            .filter_map(Tab::term_mut)
             .find(|t| t.target().key == target.key && t.copy.is_some())
         else {
             return; // the tab is gone

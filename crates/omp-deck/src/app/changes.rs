@@ -18,7 +18,7 @@ use crate::changes_view::{
 };
 use crate::confirm::Confirm;
 use crate::review;
-use crate::tabs::{Tab, TabRole};
+use crate::tabs::TabRole;
 use crate::theme::{self, Palette};
 
 /// Panel width until the user resizes it.
@@ -86,9 +86,7 @@ impl ChangesUi {
 /// The folder the panel follows: the live cwd of the active session tab (what the status bar
 /// shows), else the tab's stored cwd.
 fn target_of(app: &App) -> Option<(u64, PathBuf)> {
-    let Some(Tab::Terminal(t)) = app.tabs.get(app.active) else {
-        return None;
-    };
+    let t = app.tabs.get(app.active)?;
     let live = (t.role == TabRole::Session)
         .then(|| app.gw.status_of(t.target()))
         .flatten()
@@ -156,7 +154,7 @@ impl App {
 
     /// The panel can follow the active tab.
     pub(super) fn changes_available(&self) -> bool {
-        matches!(self.tabs.get(self.active), Some(Tab::Terminal(_)))
+        self.tabs.get(self.active).is_some()
     }
 
     /// Stops following the folder's gateway topic (the gateway then stops watching it).
@@ -487,7 +485,6 @@ impl App {
         let Some(target) = self
             .tabs
             .iter()
-            .filter_map(Tab::term)
             .find(|t| t.uid == uid)
             .map(|t| t.target().clone())
         else {

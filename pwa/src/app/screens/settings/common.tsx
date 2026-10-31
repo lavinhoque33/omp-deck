@@ -71,7 +71,7 @@ export function useManage(): boolean {
 /** Whether this phone may send Control ops now. */
 export function useControl(): boolean {
   const can = useCan();
-  return can({ op: 'drive_backup' });
+  return can({ op: 'backup_run' });
 }
 
 /** A labelled switch row: title and hint on the left, the switch on the right. */

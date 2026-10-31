@@ -25,7 +25,7 @@ use crate::confirm::Confirm;
 use crate::running_model::{HubMode, RunModel, RunPoll};
 use crate::sessions_model::{Live, Model, plural};
 use crate::sessions_view::{self, OpProgress, SessionsAction, ViewInput, ViewState};
-use crate::tabs::{Anchor, ClosedTab, MovedTab, Tab};
+use crate::tabs::{Anchor, ClosedTab, MovedTab};
 use crate::transfer::{FolderDialog, Subject, TransferKind};
 use crate::worktree_ui;
 
@@ -310,7 +310,7 @@ impl App {
                 live.entry(r.entry.path.clone()).or_default().running = true;
             }
         }
-        for t in self.tabs.iter().filter_map(Tab::term) {
+        for t in self.tabs.iter() {
             if t.terminal().is_exited() {
                 continue;
             }
@@ -324,7 +324,6 @@ impl App {
         let tabs = &self.tabs;
         self.sessions.run.set_tabs(|r| {
             tabs.iter()
-                .filter_map(Tab::term)
                 .find(|t| {
                     !t.terminal().is_exited()
                         && (t.mux_name.as_deref() == Some(r.name())

@@ -262,7 +262,7 @@ export function feedKey(feed: api.Feed): string {
     case 'inbox':
     case 'running':
     case 'usage':
-    case 'drive':
+    case 'backup':
     case 'sync':
     case 'updates':
     case 'device':

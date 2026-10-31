@@ -187,13 +187,14 @@ pub enum SidebarAction {
     },
 }
 
-/// The "Google Drive" menu entries: hidden without credentials, disabled with a reason while
-/// signed out or a project job runs.
+/// The project backup entries of the context menus: named after the active destination,
+/// disabled with a reason while it is not set up or a project job runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DriveMenu {
-    Hidden,
-    Off(&'static str),
-    On,
+pub struct BackupMenu<'a> {
+    /// "Google Drive", `sftp://host`, …
+    pub place: &'a str,
+    /// `Some` = disabled, with the reason.
+    pub off: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -240,8 +241,8 @@ pub struct SidebarInput<'a> {
     pub active_tab: usize,
     /// Live omp state (`Busy` / `Attention` only) of sessions open in a tab, by session file.
     pub tab_activity: &'a HashMap<&'a Path, TabStatus>,
-    /// Google Drive project sync entries of the context menus.
-    pub drive: DriveMenu,
+    /// Project backup entries of the context menus.
+    pub backup: BackupMenu<'a>,
     /// Worktrees (by folder) that were sent the finish prompt and are being waited for.
     pub finishing: &'a HashMap<PathBuf, bool>,
     /// Worktrees OmpDeck removed: their sessions nest under the primary, marked as removed.
@@ -252,7 +253,7 @@ pub struct SidebarInput<'a> {
 
 /// Which project groups are open. A group is open while filtering, else by its user override,
 /// else when it is the active group. The active group is the group of the most recent tab that
-/// has one (a Settings tab keeps the previous group). Becoming the active group drops a
+/// has one (a tab without one, e.g. an update tab, keeps the previous group). Becoming the active group drops a
 /// collapsed (`false`) override so it opens; an open (`true`) override survives. Re-activating
 /// the same group changes nothing. Never persisted.
 #[derive(Default)]
@@ -792,7 +793,7 @@ fn show_group(
             });
             ui.close();
         }
-        drive_items(ui, input.drive, &group.cwd, true, out);
+        backup_items(ui, input.backup, &group.cwd, true, out);
         ui.separator();
         if menu_item(ui, ICON_CHEVRONS_DOWN_UP, "Collapse all", None, true, false).clicked() {
             menu_collapse = Some(true);
@@ -1612,10 +1613,7 @@ fn open_tab_row(
     let active = i == input.active_tab;
     let status = tab.status(active);
     let label = tab.label(input.labels);
-    let folder = tab
-        .term()
-        .and_then(|t| t.cwd.file_name())
-        .and_then(|n| n.to_str());
+    let folder = tab.cwd.file_name().and_then(|n| n.to_str());
     let neutral = theme::flat();
 
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h()), Sense::click());
@@ -2246,7 +2244,7 @@ pub struct MenuEnv<'a> {
     pub can_stop: bool,
     /// Session files with a move/copy/delete in flight.
     pub busy: &'a HashSet<PathBuf>,
-    pub drive: DriveMenu,
+    pub backup: BackupMenu<'a>,
     /// Session files open in a live tab (a move to a worktree types into that tab).
     pub live_tabs: &'a [&'a Path],
     /// Worktrees (by folder) that were sent the finish prompt and are being waited for.
@@ -2278,7 +2276,7 @@ impl SidebarInput<'_> {
             omp_available: self.omp_available,
             can_stop: self.can_stop,
             busy: self.busy,
-            drive: self.drive,
+            backup: self.backup,
             live_tabs: self.open_paths,
             finishing: self.finishing,
             parked: self.parked,
@@ -2296,11 +2294,8 @@ pub fn tab_menu(ui: &mut Ui, i: usize, tab: &Tab, env: &MenuEnv<'_>, out: &mut S
     if tab.pane_uid().is_some() {
         split_items(ui, out, |side| SidebarAction::SplitTab { index: i, side });
     }
-    let Some(t) = tab.term() else {
-        return;
-    };
-    let running = !t.terminal().is_exited();
-    let entry = t.session_path().and_then(|p| env.entry(p));
+    let running = !tab.terminal().is_exited();
+    let entry = tab.session_path().and_then(|p| env.entry(p));
     // The session menu's "Stop session process" covers this whenever it is offered.
     if (entry.is_none() || !env.can_stop)
         && menu_item(ui, ICON_POWER, "Kill session process", None, running, false).clicked()
@@ -2402,14 +2397,14 @@ fn session_menu(
         out.actions.push(SidebarAction::OpenFolder(dir));
         ui.close();
     }
-    if env.drive != DriveMenu::Hidden {
+    {
         let pal = Palette::of_ui(ui);
         ui.menu_button(
             (
                 icon_text(ICON_CLOUD, 17.0, pal.glyph),
-                RichText::new("Google Drive").color(pal.text),
+                RichText::new("Backup").color(pal.text),
             ),
-            |ui| drive_items(ui, env.drive, &entry.cwd, false, out),
+            |ui| backup_items(ui, env.backup, &entry.cwd, false, out),
         );
     }
     let worktree = env.worktree_of(&entry.cwd);
@@ -2487,28 +2482,31 @@ fn session_menu(
     }
 }
 
-/// "Back up to Google Drive…" and "Restore from Google Drive…" for `cwd`.
-fn drive_items(
+/// "Back up to {place}…" and "Restore from {place}…" for `cwd`.
+fn backup_items(
     ui: &mut Ui,
-    drive: DriveMenu,
+    menu: BackupMenu<'_>,
     cwd: &Path,
     separator: bool,
     out: &mut SidebarOutput,
 ) {
-    let (enabled, why) = match drive {
-        DriveMenu::Hidden => return,
-        DriveMenu::Off(why) => (false, Some(why)),
-        DriveMenu::On => (true, None),
-    };
     if separator {
         ui.separator();
     }
     for (icon, label, restore) in [
-        (ICON_CLOUD_UPLOAD, "Back up to Google Drive…", false),
-        (ICON_ARCHIVE_RESTORE, "Restore from Google Drive…", true),
+        (
+            ICON_CLOUD_UPLOAD,
+            format!("Back up to {}…", menu.place),
+            false,
+        ),
+        (
+            ICON_ARCHIVE_RESTORE,
+            format!("Restore from {}…", menu.place),
+            true,
+        ),
     ] {
-        let mut resp = menu_item(ui, icon, label, None, enabled, false);
-        if let Some(why) = why {
+        let mut resp = menu_item(ui, icon, &label, None, menu.off.is_none(), false);
+        if let Some(why) = menu.off {
             resp = resp.on_disabled_hover_text(why);
         }
         if resp.clicked() {
@@ -2596,7 +2594,10 @@ mod tests {
             omp_available: true,
             can_stop: true,
             busy: &busy,
-            drive: DriveMenu::Hidden,
+            backup: BackupMenu {
+                place: "Google Drive",
+                off: None,
+            },
             live_tabs: &[],
             finishing: &finishing,
             parked: ParkView {
@@ -2656,7 +2657,10 @@ mod tests {
                 omp_available: true,
                 can_stop: true,
                 busy: &busy,
-                drive: DriveMenu::Hidden,
+                backup: BackupMenu {
+                    place: "Google Drive",
+                    off: None,
+                },
                 live_tabs: &[],
                 finishing: &finishing,
                 parked: ParkView {
@@ -2898,7 +2902,7 @@ mod tests {
         let groups = [proj("/a", &["a1"]), proj("/b", &["b1"])];
         let mut ex = Expansion::default();
         ex.on_activation(group_at(&groups, "/b/b1.jsonl"), None);
-        ex.on_activation(None, None); // Settings tab
+        ex.on_activation(None, None); // a tab without a group
         assert_eq!(open_set(&ex, &groups), [false, true]);
     }
 

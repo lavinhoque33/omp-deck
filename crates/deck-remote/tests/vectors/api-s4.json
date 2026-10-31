@@ -75,8 +75,8 @@
       "type": "request"
     },
     {
-      "case": "drive_backups",
-      "json": "{\"id\":115,\"seq\":null,\"op\":{\"op\":\"drive_backups\"}}",
+      "case": "backup_list",
+      "json": "{\"id\":115,\"seq\":null,\"op\":{\"op\":\"backup_list\"}}",
       "type": "request"
     },
     {
@@ -290,8 +290,8 @@
       "type": "request"
     },
     {
-      "case": "drive_backup",
-      "json": "{\"id\":158,\"seq\":158,\"op\":{\"op\":\"drive_backup\"}}",
+      "case": "backup_run",
+      "json": "{\"id\":158,\"seq\":158,\"op\":{\"op\":\"backup_run\"}}",
       "type": "request"
     },
     {
@@ -370,28 +370,28 @@
       "type": "request"
     },
     {
-      "case": "drive_sign_in",
-      "json": "{\"id\":174,\"seq\":174,\"op\":{\"op\":\"drive_sign_in\"}}",
+      "case": "backup_connect",
+      "json": "{\"id\":174,\"seq\":174,\"op\":{\"op\":\"backup_connect\"}}",
       "type": "request"
     },
     {
-      "case": "drive_delete",
-      "json": "{\"id\":175,\"seq\":175,\"op\":{\"op\":\"drive_delete\",\"ids\":[\"1AbC\",\"1DeF\"]}}",
+      "case": "backup_delete",
+      "json": "{\"id\":175,\"seq\":175,\"op\":{\"op\":\"backup_delete\",\"ids\":[\"1AbC\",\"1DeF\"]}}",
       "type": "request"
     },
     {
-      "case": "drive_restore_prepare",
-      "json": "{\"id\":176,\"seq\":176,\"op\":{\"op\":\"drive_restore_prepare\",\"id\":\"1AbC\"}}",
+      "case": "backup_restore_prepare",
+      "json": "{\"id\":176,\"seq\":176,\"op\":{\"op\":\"backup_restore_prepare\",\"id\":\"1AbC\"}}",
       "type": "request"
     },
     {
-      "case": "drive_restore_apply",
-      "json": "{\"id\":177,\"seq\":177,\"op\":{\"op\":\"drive_restore_apply\",\"handle\":3}}",
+      "case": "backup_restore_apply",
+      "json": "{\"id\":177,\"seq\":177,\"op\":{\"op\":\"backup_restore_apply\",\"handle\":3}}",
       "type": "request"
     },
     {
-      "case": "drive_restore_discard",
-      "json": "{\"id\":178,\"seq\":178,\"op\":{\"op\":\"drive_restore_discard\",\"handle\":3}}",
+      "case": "backup_restore_discard",
+      "json": "{\"id\":178,\"seq\":178,\"op\":{\"op\":\"backup_restore_discard\",\"handle\":3}}",
       "type": "request"
     },
     {
@@ -426,7 +426,12 @@
     },
     {
       "case": "sync_restore_apply",
-      "json": "{\"id\":185,\"seq\":185,\"op\":{\"op\":\"sync_restore_apply\",\"handle\":4,\"conflicts\":[{\"session\":\"01A\",\"choice\":\"keep\"},{\"session\":\"01B\",\"choice\":\"overwrite\"},{\"session\":\"01C\",\"choice\":\"both\"}]}}",
+      "json": "{\"id\":185,\"seq\":185,\"op\":{\"op\":\"sync_restore_apply\",\"handle\":4,\"conflicts\":[{\"session\":\"01A\",\"choice\":\"keep\"},{\"session\":\"01B\",\"choice\":\"overwrite\"},{\"session\":\"01C\",\"choice\":\"both\"}],\"excluded\":[\"01D\"]}}",
+      "type": "request"
+    },
+    {
+      "case": "sync_restore_apply without excluded sessions",
+      "json": "{\"id\":197,\"seq\":197,\"op\":{\"op\":\"sync_restore_apply\",\"handle\":5,\"conflicts\":[]}}",
       "type": "request"
     },
     {
@@ -465,8 +470,8 @@
       "type": "request"
     },
     {
-      "case": "subscribe drive",
-      "json": "{\"id\":193,\"seq\":null,\"op\":{\"op\":\"subscribe\",\"feed\":{\"feed\":\"drive\"}}}",
+      "case": "subscribe backup",
+      "json": "{\"id\":193,\"seq\":null,\"op\":{\"op\":\"subscribe\",\"feed\":{\"feed\":\"backup\"}}}",
       "type": "request"
     },
     {
@@ -530,8 +535,8 @@
       "type": "reply"
     },
     {
-      "case": "drive_backups",
-      "json": "{\"id\":115,\"ok\":{\"type\":\"drive_backups\",\"hosts\":[{\"host\":\"workstation\",\"backups\":[{\"id\":\"1AbC\",\"name\":\"omp-config-2026-10-30.zip\",\"size\":52000,\"created_unix_ms\":1761000000000}]}],\"truncated\":false}}",
+      "case": "backup_list",
+      "json": "{\"id\":115,\"ok\":{\"type\":\"backup_list\",\"hosts\":[{\"host\":\"workstation\",\"backups\":[{\"id\":\"1AbC\",\"name\":\"omp-config-2026-10-30.zip\",\"size\":52000,\"created_unix_ms\":1761000000000}]}],\"truncated\":false}}",
       "type": "reply"
     },
     {
@@ -555,8 +560,8 @@
       "type": "reply"
     },
     {
-      "case": "done drive restore plan",
-      "json": "{\"id\":176,\"ok\":{\"type\":\"outcome\",\"outcome\":{\"state\":\"done\",\"result\":{\"type\":\"restore_plan\",\"handle\":3,\"plan\":{\"type\":\"drive\",\"name\":\"omp-config-2026-10-30.zip\",\"created_unix_ms\":1761000000000,\"host\":\"workstation\",\"replaced\":[\"~/.omp/agent/config.yml\"],\"added\":[\"~/.omp/agent/skills/x/SKILL.md\"],\"dirs\":[\"~/.omp/agent/skills/x\"],\"removed\":[],\"safety_display\":\"~/.omp/agent/.restore-safety/2026-10-30\"},\"truncated\":false}}}}",
+      "case": "done backup restore plan",
+      "json": "{\"id\":176,\"ok\":{\"type\":\"outcome\",\"outcome\":{\"state\":\"done\",\"result\":{\"type\":\"restore_plan\",\"handle\":3,\"plan\":{\"type\":\"backup\",\"name\":\"omp-config-2026-10-30.zip\",\"created_unix_ms\":1761000000000,\"host\":\"workstation\",\"replaced\":[\"~/.omp/agent/config.yml\"],\"added\":[\"~/.omp/agent/skills/x/SKILL.md\"],\"dirs\":[\"~/.omp/agent/skills/x\"],\"removed\":[],\"safety_display\":\"~/.omp/agent/.restore-safety/2026-10-30\"},\"truncated\":false}}}}",
       "type": "reply"
     },
     {
@@ -625,8 +630,8 @@
       "type": "event"
     },
     {
-      "case": "feed drive",
-      "json": "{\"type\":\"feed\",\"feed\":{\"feed\":\"drive\"},\"value\":{\"feed\":\"drive\",\"available\":true,\"signed_in\":true,\"account\":\"me@example.com\",\"last_backup_unix_ms\":1761000000000,\"interval\":\"daily\",\"busy\":\"Backing up\",\"error\":\"quota\"}}",
+      "case": "feed backup",
+      "json": "{\"type\":\"feed\",\"feed\":{\"feed\":\"backup\"},\"value\":{\"feed\":\"backup\",\"destination\":{\"kind\":\"drive\",\"label\":\"Google Drive\"},\"available\":true,\"connected\":true,\"account\":\"me@example.com\",\"last_backup_unix_ms\":1761000000000,\"interval\":\"daily\",\"busy\":\"Backing up\",\"error\":\"quota\"}}",
       "type": "event"
     },
     {
@@ -635,13 +640,28 @@
       "type": "event"
     },
     {
-      "case": "feed drive every ten minutes",
-      "json": "{\"type\":\"feed\",\"feed\":{\"feed\":\"drive\"},\"value\":{\"feed\":\"drive\",\"available\":true,\"signed_in\":false,\"account\":null,\"last_backup_unix_ms\":null,\"interval\":\"ten_minutes\",\"busy\":null,\"error\":null}}",
+      "case": "feed backup every ten minutes",
+      "json": "{\"type\":\"feed\",\"feed\":{\"feed\":\"backup\"},\"value\":{\"feed\":\"backup\",\"destination\":{\"kind\":\"drive\",\"label\":\"Google Drive\"},\"available\":true,\"connected\":false,\"account\":null,\"last_backup_unix_ms\":null,\"interval\":\"ten_minutes\",\"busy\":null,\"error\":null}}",
       "type": "event"
     },
     {
-      "case": "feed drive every thirty minutes",
-      "json": "{\"type\":\"feed\",\"feed\":{\"feed\":\"drive\"},\"value\":{\"feed\":\"drive\",\"available\":true,\"signed_in\":false,\"account\":null,\"last_backup_unix_ms\":null,\"interval\":\"thirty_minutes\",\"busy\":null,\"error\":null}}",
+      "case": "feed backup every thirty minutes",
+      "json": "{\"type\":\"feed\",\"feed\":{\"feed\":\"backup\"},\"value\":{\"feed\":\"backup\",\"destination\":{\"kind\":\"drive\",\"label\":\"Google Drive\"},\"available\":true,\"connected\":false,\"account\":null,\"last_backup_unix_ms\":null,\"interval\":\"thirty_minutes\",\"busy\":null,\"error\":null}}",
+      "type": "event"
+    },
+    {
+      "case": "feed backup to an ftp server",
+      "json": "{\"type\":\"feed\",\"feed\":{\"feed\":\"backup\"},\"value\":{\"feed\":\"backup\",\"destination\":{\"kind\":\"ftp\",\"label\":\"ftp://nas.local\"},\"available\":true,\"connected\":true,\"account\":null,\"last_backup_unix_ms\":1761000000000,\"interval\":\"hourly\",\"busy\":null,\"error\":null}}",
+      "type": "event"
+    },
+    {
+      "case": "feed backup to an ftps server",
+      "json": "{\"type\":\"feed\",\"feed\":{\"feed\":\"backup\"},\"value\":{\"feed\":\"backup\",\"destination\":{\"kind\":\"ftps\",\"label\":\"ftps://nas.local\"},\"available\":true,\"connected\":true,\"account\":null,\"last_backup_unix_ms\":1761000000000,\"interval\":\"hourly\",\"busy\":null,\"error\":null}}",
+      "type": "event"
+    },
+    {
+      "case": "feed backup to an sftp server",
+      "json": "{\"type\":\"feed\",\"feed\":{\"feed\":\"backup\"},\"value\":{\"feed\":\"backup\",\"destination\":{\"kind\":\"sftp\",\"label\":\"sftp://nas.local:2222\"},\"available\":true,\"connected\":true,\"account\":null,\"last_backup_unix_ms\":1761000000000,\"interval\":\"hourly\",\"busy\":null,\"error\":null}}",
       "type": "event"
     },
     {
@@ -706,7 +726,7 @@
     },
     {
       "case": "outcome restore plan",
-      "json": "{\"type\":\"outcome\",\"seq\":176,\"outcome\":{\"state\":\"done\",\"result\":{\"type\":\"restore_plan\",\"handle\":3,\"plan\":{\"type\":\"drive\",\"name\":\"omp-config-2026-10-30.zip\",\"created_unix_ms\":1761000000000,\"host\":\"workstation\",\"replaced\":[\"~/.omp/agent/config.yml\"],\"added\":[\"~/.omp/agent/skills/x/SKILL.md\"],\"dirs\":[\"~/.omp/agent/skills/x\"],\"removed\":[],\"safety_display\":\"~/.omp/agent/.restore-safety/2026-10-30\"},\"truncated\":false}}}",
+      "json": "{\"type\":\"outcome\",\"seq\":176,\"outcome\":{\"state\":\"done\",\"result\":{\"type\":\"restore_plan\",\"handle\":3,\"plan\":{\"type\":\"backup\",\"name\":\"omp-config-2026-10-30.zip\",\"created_unix_ms\":1761000000000,\"host\":\"workstation\",\"replaced\":[\"~/.omp/agent/config.yml\"],\"added\":[\"~/.omp/agent/skills/x/SKILL.md\"],\"dirs\":[\"~/.omp/agent/skills/x\"],\"removed\":[],\"safety_display\":\"~/.omp/agent/.restore-safety/2026-10-30\"},\"truncated\":false}}}",
       "type": "event"
     },
     {

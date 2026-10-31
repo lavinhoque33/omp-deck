@@ -3,13 +3,13 @@
 // with delete, and the restore wizard (target, parts, plan preview with the overwrite warning,
 // a keep/overwrite/both choice per conflicting session) → apply.
 
-import { type ReactNode, useCallback, useEffect, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 import type { api } from '../../../remote/index.ts';
 import { FolderPicker } from '../fleet/FolderBrowser.tsx';
 import { age, perform, succeeded } from '../../ui/format.ts';
 import { useClient, useFeed, useNow, useOnline } from '../../ui/hooks.ts';
 import { Card, ConfirmSheet, Empty, KeyValues, NeedsS4, Sheet } from '../../ui/kit.tsx';
-import { PlanList } from './Drive.tsx';
+import { PlanList } from './Backup.tsx';
 import { ReadOnlyNote, SectionScreen, ToggleRow, ask, useControl, useManage } from './common.tsx';
 import {
   INTERVAL_LABEL,
@@ -30,10 +30,12 @@ import {
 type ProjectPlan = Extract<api.RestorePlanView, { type: 'project' }>;
 
 export function SyncSection(): ReactNode {
+  const backup = useFeed({ feed: 'backup' }, 'backup');
+  const destinationKey = JSON.stringify([backup?.destination.kind, backup?.destination.label]);
   return (
     <SectionScreen eyebrow="Backup" title="Project sync">
       <NeedsS4 what="Project sync">
-        <SyncBody />
+        <SyncBody key={destinationKey} />
       </NeedsS4>
     </SectionScreen>
   );
@@ -44,6 +46,11 @@ function SyncBody(): ReactNode {
   const online = useOnline();
   const manage = useManage();
   const sync = useFeed({ feed: 'sync' }, 'sync');
+  const active = useRef(true);
+  useEffect(() => {
+    active.current = true;
+    return () => { active.current = false; };
+  }, []);
   const [backups, setBackups] = useState<api.SyncBackupView[] | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -53,6 +60,7 @@ function SyncBody(): ReactNode {
   const load = useCallback(async () => {
     setLoading(true);
     const reply = await ask(client, { op: 'sync_backups' }, 'Project backups');
+    if (!active.current) return;
     setLoading(false);
     if (reply?.type === 'sync_backups') {
       setBackups(reply.backups);
@@ -544,15 +552,17 @@ function ProjectPlanSheet({
   const [choices, setChoices] = useState(() => defaultChoices(plan));
   const [confirm, setConfirm] = useState(false);
   const [busy, setBusy] = useState(false);
-  const summary = summarizeProjectPlan(plan, choices);
-  const conflicts = plan.sessions.filter(isConflict);
-  const added = plan.sessions.filter((s) => !isConflict(s));
+  const [excluded, setExcluded] = useState<string[]>([]);
+  const [choosing, setChoosing] = useState(false);
+  const summary = summarizeProjectPlan(plan, choices, excluded);
+  const conflicts = plan.sessions.filter((session) => !excluded.includes(session.id) && isConflict(session));
+  const added = plan.sessions.filter((s) => !excluded.includes(s.id) && !isConflict(s));
 
   const apply = async () => {
     setBusy(true);
     const view = await perform(
       client,
-      { op: 'sync_restore_apply', handle, conflicts: conflictList(plan, choices) },
+      { op: 'sync_restore_apply', handle, conflicts: conflictList(plan, choices, excluded), ...(excluded.length > 0 ? { excluded } : {}) },
       `Restore into ${plan.target_display}`,
       'Restored.',
     );
@@ -560,6 +570,24 @@ function ProjectPlanSheet({
     setConfirm(false);
     if (succeeded(view)) onDone();
   };
+
+  if (choosing) {
+    return (
+      <Sheet title="Choose sessions" icon="☰" onClose={() => setChoosing(false)}>
+        <p>All sessions are included by default. Left-out sessions are not written or changed.</p>
+        <div className="exclude-list">
+          {plan.sessions.map((session) => (
+            <ToggleRow key={session.id} title={session.title || session.id}
+              hint={`${age(session.modified_unix_ms, now)} ago · ${bytes(session.bytes)}${session.problem !== null ? ` · ${session.problem}` : ''}`}
+              on={!excluded.includes(session.id)} disabled={busy}
+              onChange={() => setExcluded(toggleExcluded(excluded, session.id))} />
+          ))}
+        </div>
+        {prepared.truncated && <p className="muted small note">Only listed sessions can be left out here. Other sessions remain included.</p>}
+        <button type="button" className="button primary block spaced" onClick={() => setChoosing(false)}>Done · {plan.sessions.length - excluded.length} included</button>
+      </Sheet>
+    );
+  }
 
   if (confirm) {
     return (
@@ -578,6 +606,7 @@ function ProjectPlanSheet({
           ['Sessions overwritten', `${summary.overwrite}`],
           ['Kept as copies', `${summary.both}`],
           ['Local kept', `${summary.keep}`],
+          ['Sessions left out', `${excluded.length}`],
         ]}
         confirm="Restore"
         busy={busy}
@@ -620,6 +649,11 @@ function ProjectPlanSheet({
           </>
         )}
       </div>
+      {plan.sessions.length > 0 && (
+        <button type="button" className="button block nav-link spaced" disabled={busy} onClick={() => setChoosing(true)}>
+          <span className="grow">Choose sessions</span><span className="chip accent">{excluded.length === 0 ? 'all included' : `${excluded.length} left out`}</span><span aria-hidden="true">›</span>
+        </button>
+      )}
       {conflicts.length > 0 && (
         <div className="conflicts">
           <div className="step-head">
@@ -670,7 +704,7 @@ function ProjectPlanSheet({
         <button type="button" className="button" disabled={busy} onClick={onBack}>
           ‹ Back
         </button>
-        <button type="button" className={`button ${summary.destructive ? 'danger' : 'primary'}`} disabled={!manage || busy} onClick={() => setConfirm(true)}>
+        <button type="button" className={`button ${summary.destructive ? 'danger' : 'primary'}`} disabled={!manage || busy || !summary.writable} onClick={() => setConfirm(true)}>
           Restore…
         </button>
       </div>

@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use deck_core::agents::AgentSummary;
+use deck_core::backup::server::Protocol;
+use deck_core::backup::{BackupFile, Destination, ProjectBackup, ProjectRestorePlan};
 use deck_core::ctl::{ContextBreakdown, LiveAgent, LiveStatus, PendingUi, PendingUiKind};
-use deck_core::gdrive::{BackupFile, ProjectBackup, ProjectRestorePlan};
 use deck_core::inventory::{InventoryEntry, SessionStats};
 use deck_core::omp::SettingsCatalog;
 use deck_core::usage::{LimitStatus, UsageSnapshot, parse_iso_ms};
@@ -493,7 +494,7 @@ pub(super) fn settings_groups(c: &SettingsCatalog) -> Vec<api::SettingsGroup> {
         .collect()
 }
 
-// ---- Google Drive -------------------------------------------------------------------------------
+// ---- Config backups -----------------------------------------------------------------------------
 
 fn created_ms(created: &str) -> Option<u64> {
     parse_iso_ms(created).and_then(ms)
@@ -506,12 +507,70 @@ pub(super) fn newest_backups(files: &[BackupFile]) -> Vec<BackupFile> {
     list
 }
 
+/// The active destination in device terms: its kind and display label, never a secret. A
+/// server destination without a saved server has no protocol yet: it reads as `sftp`.
+pub(super) fn backup_destination(
+    v: &protocol::BackupView,
+    canon: &Canon,
+) -> api::BackupDestinationView {
+    let kind = match (v.destination, &v.server) {
+        (Destination::Drive, _) => api::BackupKind::Drive,
+        (Destination::Server, Some(s)) => match s.protocol {
+            Protocol::Ftp => api::BackupKind::Ftp,
+            Protocol::Ftps => api::BackupKind::Ftps,
+            Protocol::Sftp => api::BackupKind::Sftp,
+        },
+        (Destination::Server, None) => api::BackupKind::Sftp,
+    };
+    api::BackupDestinationView {
+        kind,
+        label: canon.scrub(&v.place()),
+    }
+}
+
+/// What a backup server's failure `message` comes to for a device: one of a few fixed
+/// sentences. The message itself can name the key file, the login or the folder (and any
+/// server text), so none of it is passed on; the desktop keeps the detail.
+pub(super) fn server_failure(message: &str) -> String {
+    const HINT: &str = "check Settings \u{2192} Backup on the desktop";
+    let m = message.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| m.contains(n));
+    let text = if has(&["identity changed", "not trusted yet"]) {
+        "The server's identity could not be verified"
+    } else if m.contains("cannot use the key") {
+        "Could not log in to the server (key file unreadable)"
+    } else if has(&[
+        "refused the login",
+        "log in",
+        "login",
+        "authentic",
+        "password",
+    ]) {
+        "Could not log in to the server"
+    } else if has(&[
+        "cannot connect",
+        "cannot find the server",
+        "timed out",
+        "did not greet",
+        "tls",
+    ]) {
+        "Could not reach the server"
+    } else if m.contains("no backup server is set up") {
+        "No backup server is set up"
+    } else if m.contains("no longer exists on the server") {
+        "That backup no longer exists on the server"
+    } else {
+        "The backup server reported a problem"
+    };
+    format!("{text} \u{2014} {HINT}")
+}
+
 /// Config backups grouped by machine, keeping `files`' order.
-pub(super) fn drive_hosts(files: &[BackupFile]) -> Vec<api::DriveHost> {
-    let mut hosts: Vec<api::DriveHost> = Vec::new();
+pub(super) fn backup_hosts(files: &[BackupFile]) -> Vec<api::BackupHost> {
+    let mut hosts: Vec<api::BackupHost> = Vec::new();
     for f in files {
         let host = f.host().unwrap_or_default();
-        let view = api::DriveBackupView {
+        let view = api::BackupFileView {
             id: f.id.clone(),
             name: f.name.clone(),
             size: f.size,
@@ -519,7 +578,7 @@ pub(super) fn drive_hosts(files: &[BackupFile]) -> Vec<api::DriveHost> {
         };
         match hosts.iter_mut().find(|h| h.host == host) {
             Some(h) => h.backups.push(view),
-            None => hosts.push(api::DriveHost {
+            None => hosts.push(api::BackupHost {
                 host: host.to_owned(),
                 backups: vec![view],
             }),
@@ -551,13 +610,13 @@ fn capped(list: &[String], canon: &Canon, cut_any: &mut bool) -> Vec<String> {
         .collect()
 }
 
-/// A Drive restore plan and whether a list was cut.
-pub(super) fn drive_plan(
+/// A config restore plan and whether a list was cut.
+pub(super) fn backup_plan(
     p: &protocol::RestorePlanView,
     canon: &Canon,
 ) -> (api::RestorePlanView, bool) {
     let mut truncated = false;
-    let view = api::RestorePlanView::Drive {
+    let view = api::RestorePlanView::Backup {
         name: p.name.clone(),
         created_unix_ms: created_ms(&p.created),
         host: p.host.clone(),
@@ -838,18 +897,103 @@ mod tests {
     #[test]
     fn replies_are_fit_to_one_record() {
         let items: Vec<String> = (0..64).map(|_| "x".repeat(64 * 1024)).collect();
-        match fit_reply(&items, |text, truncated| Resp::DriveBackups {
-            hosts: vec![api::DriveHost {
+        match fit_reply(&items, |text, truncated| Resp::BackupList {
+            hosts: vec![api::BackupHost {
                 host: text.concat(),
                 backups: Vec::new(),
             }],
             truncated,
         }) {
-            ReplyResult::Ok(Resp::DriveBackups { hosts, truncated }) => {
+            ReplyResult::Ok(Resp::BackupList { hosts, truncated }) => {
                 assert!(truncated);
                 assert!(hosts[0].host.len() < api::MAX_REPLY);
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_destination_names_the_kind_and_label_but_no_secret() {
+        let canon = Canon::default();
+        let view = |destination, server| protocol::BackupView {
+            destination,
+            drive_available: true,
+            drive_signed_in: true,
+            drive_email: Some("me@example.com".to_owned()),
+            server,
+            last_backup: None,
+            busy: None,
+            last_error: None,
+            last_auto_unix_ms: None,
+        };
+        let server = |protocol| protocol::ServerView {
+            protocol,
+            host: "nas.lan".to_owned(),
+            port: 21,
+            user: Some("me".to_owned()),
+            key_path: None,
+            folder: "/backups".to_owned(),
+            pinned: false,
+            label: "ftp://nas.lan".to_owned(),
+        };
+        let d = backup_destination(
+            &view(Destination::Drive, Some(server(Protocol::Ftp))),
+            &canon,
+        );
+        assert_eq!(d.kind, api::BackupKind::Drive);
+        assert_eq!(d.label, "Google Drive");
+        for (protocol, kind) in [
+            (Protocol::Ftp, api::BackupKind::Ftp),
+            (Protocol::Ftps, api::BackupKind::Ftps),
+            (Protocol::Sftp, api::BackupKind::Sftp),
+        ] {
+            let d = backup_destination(&view(Destination::Server, Some(server(protocol))), &canon);
+            assert_eq!(d.kind, kind);
+            assert_eq!(d.label, "ftp://nas.lan");
+        }
+        let d = backup_destination(&view(Destination::Server, None), &canon);
+        assert_eq!(d.kind, api::BackupKind::Sftp);
+        assert_eq!(d.label, "server");
+    }
+
+    #[test]
+    fn server_failures_reach_a_device_in_fixed_words_only() {
+        let secret = [
+            "/home/me/.ssh/id_marker",
+            "alice_marker",
+            "folder_marker",
+            "hunter2",
+        ];
+        let cases = [
+            (
+                "cannot use the key /home/me/.ssh/id_marker: No such file or directory",
+                "Could not log in to the server (key file unreadable)",
+            ),
+            (
+                "the server refused the login (wrong user name alice_marker, password hunter2)",
+                "Could not log in to the server",
+            ),
+            (
+                "cannot connect to nas.lan:22: Connection refused (os error 111)",
+                "Could not reach the server",
+            ),
+            (
+                "Opening the folder /srv/folder_marker failed: permission denied",
+                "The backup server reported a problem",
+            ),
+            (
+                "the server's identity changed (expected SHA256:a, got SHA256:b); this could be an attack",
+                "The server's identity could not be verified",
+            ),
+            ("no backup server is set up", "No backup server is set up"),
+        ];
+        for (raw, head) in cases {
+            let shown = server_failure(raw);
+            assert!(shown.starts_with(head), "{raw} -> {shown}");
+            assert!(shown.ends_with("check Settings \u{2192} Backup on the desktop"));
+            for s in secret {
+                assert!(!shown.contains(s), "{s} leaked: {shown}");
+            }
         }
     }
 }

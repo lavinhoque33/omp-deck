@@ -14,7 +14,7 @@ use crate::icons::{
     ICON_GIT_BRANCH, ICON_GIT_FORK, ICON_GIT_MERGE, ICON_HANDSHAKE, ICON_HISTORY, ICON_LIST_TREE,
     ICON_MAP, ICON_NETWORK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE,
 };
-use deck_core::ctl::{ContextBreakdown, LiveModel};
+use deck_core::ctl::{ContextBreakdown, LiveAccount, LiveModel};
 use deck_core::omp::ModelInfo;
 use deck_core::status::{GitInfo, SessionStats, SessionStatus};
 use egui::{
@@ -26,7 +26,7 @@ use crate::agent_model::Counts;
 use crate::badge::{self, Badge, Hue};
 use crate::cost_tip::{self, CostTip};
 use crate::ctx_tip::{self, CtxTip};
-use crate::usage_state::{Chip, PillKind, QuotaPill, Summary};
+use crate::usage_state::{CardView, Chip, PillKind, QuotaPill, Summary};
 use crate::usage_view;
 use crate::{card, tips};
 use deck_core::usage::LimitStatus;
@@ -48,9 +48,9 @@ const CHIP_PAD: f32 = 7.0;
 /// Horizontal space a chip adds around its content: both pads plus the one item gap measured
 /// on screen (so a chip asked to be N px wide really is N px wide).
 const CHIP_CHROME_W: f32 = 2.0 * CHIP_PAD + 6.0;
-/// The model chip is 1.3x the wider of the measured path chip and this baseline width.
-const MODEL_CHIP_BASE_W: f32 = 213.0;
-const MODEL_CHIP_SCALE: f32 = 1.3;
+/// The model chip's width in every session (a 213 px baseline widened by 30 %); it does not follow
+/// the path chip, so a long path (a worktree) cannot push the other segments out.
+const MODEL_CHIP_W: f32 = 213.0 * 1.3;
 const PIE_BOX: f32 = 18.0;
 const CARET_W: f32 = 16.8;
 
@@ -110,6 +110,9 @@ pub struct BarView {
     defaults: Defaults,
     /// omp's in-memory model state (live control), used while the file records no model.
     live_model: Option<LiveModel>,
+    /// The OAuth account the session uses for its model's provider (live control): the usage
+    /// chip and its hover show that account's quota.
+    account: Option<LiveAccount>,
     snap: Option<Arc<SessionStatus>>,
     catalog_gen: u64,
     built: bool,
@@ -201,6 +204,14 @@ impl BarView {
         if self.live_model.as_ref() != live {
             self.live_model = live.cloned();
             self.built = false;
+        }
+    }
+
+    /// A changed session account changes the usage chip's pills (and width): bumps `rev`.
+    pub fn set_account(&mut self, account: Option<&LiveAccount>) {
+        if self.account.as_ref() != account {
+            self.account = account.cloned();
+            self.rev += 1;
         }
     }
 
@@ -559,10 +570,10 @@ const SEGS: [Seg; 6] = [
 ];
 
 /// Real widths (divider + chip, without the spacing before them) of every segment for one view
-/// revision and pixel density.
+/// revision, usage chip page and pixel density.
 #[derive(Clone, Copy)]
 struct SegWidths {
-    key: (u64, u32, deck_core::config::UiFont),
+    key: (u64, Option<usize>, u32, deck_core::config::UiFont),
     w: [f32; 6],
 }
 
@@ -583,6 +594,8 @@ fn measure(ui: &mut Ui, f: impl FnOnce(&mut Ui)) -> f32 {
 fn seg_widths(ui: &mut Ui, v: &BarView) -> [f32; 6] {
     let key = (
         v.rev,
+        // The pager's pick lives in egui memory, outside `rev`.
+        usage_chip_card(ui.ctx(), v).map(|(_, i)| i),
         ui.ctx().pixels_per_point().to_bits(),
         theme::ui_font(),
     );
@@ -612,10 +625,10 @@ fn info_row(
 
     activity_dot(ui, input.activity);
     ui.add_space(3.0);
-    // The model chip is as wide as the (measured) path chip, but never takes over the bar.
+    // The model chip has one width in every session, but never takes over the bar.
     let widths = seg_widths(ui, v);
     let gap = ui.spacing().item_spacing.x;
-    let (chip_w, cap) = model_chip_width(widths[2] - gap - 1.0, ui.available_width());
+    let (chip_w, cap) = model_chip_width(ui.available_width());
     model_chip(ui, v, picker, input, (chip_w, cap), out);
 
     // Priority-based fit on measured widths: drop the least important segments first.
@@ -642,12 +655,11 @@ fn info_row(
     }
 }
 
-/// Model chip `(width, cap)`: 1.3x the wider of the path chip and the baseline, capped at 52% of
-/// the bar so it never takes over a narrow bar.
-fn model_chip_width(path_chip_w: f32, bar_w: f32) -> (f32, f32) {
+/// Model chip `(width, cap)`: [`MODEL_CHIP_W`], capped at 52% of the bar so it never takes over a
+/// narrow bar.
+fn model_chip_width(bar_w: f32) -> (f32, f32) {
     let cap = (bar_w * 0.52).max(195.0);
-    let want = path_chip_w.max(MODEL_CHIP_BASE_W) * MODEL_CHIP_SCALE;
-    (want.min(cap), cap)
+    (MODEL_CHIP_W.min(cap), cap)
 }
 
 /// Which segments fit `budget`, in priority order: the first present one that does not fit ends
@@ -723,10 +735,10 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
             {
                 divider(ui);
                 let r = chip(ui, "usage", Sense::click(), |ui| {
-                    usage_chip_content(ui, pal, v, u, c);
+                    usage_chip_content(ui, pal, v, c);
                 });
                 let r = r.on_hover_cursor(CursorIcon::PointingHand);
-                usage_view::hover(&r, u);
+                usage_view::hover(&r, u, v.account.as_ref());
                 if r.clicked() {
                     out.push(BarAction::OpenUsage);
                 }
@@ -735,18 +747,29 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
     }
 }
 
-/// The usage chip's content: the selected model's provider quota as one pill per window (5 h,
-/// weekly), each in its own colour; a provider without a measurable window falls back to the
-/// tightest quota overall, named so it is not mistaken for the selected provider's.
-fn usage_chip_content(ui: &mut Ui, pal: &Palette, v: &BarView, u: &Summary, c: &Chip) {
+/// The selected model's provider card and the page the usage chip shows
+/// ([`usage_view::shown_page`]: the session's account, else the Usage view's pick).
+fn usage_chip_card<'a>(ctx: &egui::Context, v: &'a BarView) -> Option<(&'a CardView, usize)> {
+    let (provider, _) = v.model_selector.as_deref()?.split_once('/')?;
+    let card = v.usage.as_deref()?.card_of(provider)?;
+    Some((
+        card,
+        usage_view::shown_page(ctx, card, v.account.as_ref()).0,
+    ))
+}
+
+/// The usage chip's content: the selected model's provider quota (for a provider with several
+/// accounts, the one the session uses, as the hover) as one pill per window (5 h, weekly), each
+/// in its own colour; a provider without a measurable window falls back to the tightest quota
+/// overall, named so it is not mistaken for the selected provider's.
+fn usage_chip_content(ui: &mut Ui, pal: &Palette, v: &BarView, c: &Chip) {
     ui.label(icon_text(ICON_GAUGE, 15.6, pal.weak));
-    let quota = v
-        .model_selector
-        .as_deref()
-        .and_then(|s| s.split_once('/'))
-        .and_then(|(provider, _)| u.quota_of(provider));
-    if let Some(q) = quota {
-        for p in &q.pills {
+    let pills = usage_chip_card(ui.ctx(), v)
+        .and_then(|(card, i)| card.pages.get(i))
+        .map(|p| p.pills.as_slice())
+        .filter(|p| !p.is_empty());
+    if let Some(pills) = pills {
+        for p in pills {
             quota_pill(ui, pal, p);
         }
         return;
@@ -1213,6 +1236,7 @@ fn model_chip(
             level: assumed_level.or(v.current_level()),
             favorites: input.favorites,
             provider: input.provider,
+            unset: "Current model unknown yet",
         },
     );
     out.extend(acts.into_iter().map(BarAction::Picker));
@@ -1963,16 +1987,19 @@ mod tests {
     }
 
     #[test]
-    fn model_chip_is_wide_but_capped_and_segments_still_fit_monotonically() {
-        assert!((model_chip_width(100.0, 1400.0).0 - 276.9).abs() < 0.1);
-        assert!((model_chip_width(300.0, 1400.0).0 - 390.0).abs() < 0.1);
-        assert_eq!(model_chip_width(300.0, 400.0).0, 208.0);
-        let widths = [60.0, 90.0, 300.0, 70.0, 80.0];
+    fn model_chip_is_as_wide_in_every_session_and_segments_still_fit_monotonically() {
+        assert!((model_chip_width(1400.0).0 - 276.9).abs() < 0.1);
+        assert_eq!(model_chip_width(400.0).0, 208.0);
+        // A worktree's long path chip leaves the model chip alone, so every segment still fits
+        // a 1100 px bar (sized from the path, the chip took 546 px and usage was dropped).
+        let widths = [60.0, 90.0, 420.0, 70.0, 80.0];
         let all = [true; 5];
+        let (chip, _) = model_chip_width(1100.0);
+        assert_eq!(fit_segments(&widths, &all, 1100.0 - chip - 6.0, 6.0), all);
         let mut prev = [true; 5];
         let mut bar = 1400.0;
         while bar >= 0.0 {
-            let (chip, _) = model_chip_width(widths[2], bar);
+            let (chip, _) = model_chip_width(bar);
             let now = fit_segments(&widths, &all, bar - chip - 6.0, 6.0);
             for i in 0..5 {
                 assert!(prev[i] || !now[i], "segment {i} came back at {bar}px");

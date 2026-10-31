@@ -8,7 +8,7 @@ export type Tab = 'sessions' | 'agents' | 'inbox' | 'settings';
 export const TABS: readonly Tab[] = ['sessions', 'agents', 'inbox', 'settings'];
 
 /** The settings sub-screens (slice 4). */
-export type SettingsSection = 'notifications' | 'device' | 'usage' | 'omp' | 'updates' | 'drive' | 'sync';
+export type SettingsSection = 'notifications' | 'device' | 'usage' | 'omp' | 'updates' | 'backup' | 'sync';
 
 export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   'notifications',
@@ -16,7 +16,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   'usage',
   'omp',
   'updates',
-  'drive',
+  'backup',
   'sync',
 ];
 

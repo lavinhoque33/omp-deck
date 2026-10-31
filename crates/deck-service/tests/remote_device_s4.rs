@@ -136,7 +136,7 @@ fn slice4_device_ops_through_the_relay() {
     let mut seq = a.welcome.next_seq;
 
     // -- Manage refused without the permission --
-    let r = a.call(&mut [], Some(seq), Op::DriveSignIn {});
+    let r = a.call(&mut [], Some(seq), Op::BackupConnect {});
     seq += 1;
     assert!(
         matches!(
@@ -363,6 +363,37 @@ fn slice4_device_ops_through_the_relay() {
         let list = git(&sb.proj(), &["worktree", "list", "--porcelain"]);
         assert!(list.contains("refs/heads/device-wt"), "{list}");
     }
+
+    // -- the backup feed: the active destination, described without a secret --
+    let r = a.call(
+        &mut [],
+        None,
+        Op::Subscribe {
+            feed: Feed::Backup {},
+        },
+    );
+    assert!(matches!(r, ReplyResult::Ok(Resp::Unit {})), "{r:?}");
+    let (destination, connected) = a.take(
+        &mut [],
+        "the backup feed",
+        Duration::from_secs(60),
+        |r| match event(r)? {
+            Event::Feed {
+                value:
+                    FeedValue::Backup {
+                        destination,
+                        connected,
+                        ..
+                    },
+                ..
+            } => Some((destination, connected)),
+            _ => None,
+        },
+    );
+    assert_eq!(destination.kind, api::BackupKind::Drive);
+    assert_eq!(destination.label, "Google Drive");
+    assert!(!connected, "nobody signed in to Google in the sandbox");
+    no_path_in(&destination, &root);
 
     // -- the running feed and running_kill --
     let r = a.call(

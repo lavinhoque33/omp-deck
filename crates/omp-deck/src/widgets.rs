@@ -276,8 +276,8 @@ pub fn segmented(ui: &mut Ui, selected: &mut usize, options: &[(Icon, &str)]) ->
     changed
 }
 
-/// Titled card (rounded surface with caption).
-pub fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+/// The rounded surface of a [`card`], for panels that lay out their own content.
+pub fn card_frame(ui: &Ui) -> Frame {
     let pal = Palette::of_ui(ui);
     let neutral = theme::flat();
     Frame::NONE
@@ -293,13 +293,18 @@ pub fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
         } else {
             Margin::symmetric(20, 16)
         })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(theme::section_caption(title, pal.weak));
-            ui.add_space(6.0);
-            add(ui);
-        });
-    ui.add_space(if neutral { 12.0 } else { 14.0 });
+}
+
+/// Titled card (rounded surface with caption).
+pub fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+    let pal = Palette::of_ui(ui);
+    card_frame(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(theme::section_caption(title, pal.weak));
+        ui.add_space(6.0);
+        add(ui);
+    });
+    ui.add_space(if theme::flat() { 12.0 } else { 14.0 });
 }
 
 /// Title + description on the left, control on the right.

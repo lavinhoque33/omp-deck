@@ -19,7 +19,7 @@ cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc --ke
 ## Runtime Unix assumptions to replace (compile fine, break on Windows)
 `sh -c` installer (`omp.rs:315`), `xdg-open` (`app.rs:2659`), kdialog/zenity picker (`transfer.rs`),
 `fc-match` (`deck-term/fonts.rs`, `omp-deck/ui_fonts.rs`), `/proc` (`tmux.rs`, `ctl.rs`, `ompdeck-ctl.ts`,
-hostname in `gdrive/mod.rs:394`, `tabs.rs:278`), exec-bit checks (`omp.rs`, `status.rs on_path`),
+hostname in `backup/mod.rs`, `tabs.rs:278`), exec-bit checks (`omp.rs`, `status.rs on_path`),
 `PathBuf::from("/")` fallbacks, `~/.config`/`~/.local/share`/`~/.cache` fallbacks, process groups +
 `kill(-pgid)` (`usage.rs`, `omp.rs`), 0600/0700 modes, dev/ino file identity (`tail.rs`, `status.rs`, `tree.rs`),
 `OsStrExt::as_bytes` (`path_id`, `sqlite_uri`), FIFO O_NONBLOCK (`agents/tail.rs`).

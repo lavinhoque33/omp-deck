@@ -55,7 +55,7 @@ use crate::sidebar::{self, MenuEnv, SidebarAction, SidebarCache, SidebarInput};
 use crate::statusbar;
 use crate::tabs::{
     self, Anchor, ClosedTab, CopyPending, MovedTab, ReopenStack, Tab, TabAction, TabBarInput,
-    TabRole, TermTab,
+    TabRole,
 };
 use crate::theme::{self, Palette};
 use crate::titlebar::{self, BarAction, BarInput, OmpBar};
@@ -67,13 +67,14 @@ use crate::usage_state::Usage;
 use crate::usage_view;
 use crate::widgets::{empty_state, icon_text, menu_item};
 
+mod agent_config;
 mod agents;
 mod app_update;
+mod backup;
 mod bar;
 mod changes;
 mod ctl;
 mod desktop;
-mod drive;
 mod mobile;
 mod notifications;
 mod palette;
@@ -182,8 +183,10 @@ enum PendingConfirm {
     StopSessions(Vec<PathBuf>),
     /// Kill the live sessions (by backend name) checked in the session manager's Running view.
     KillRunning(Vec<String>),
-    /// Restore a downloaded Google Drive backup over the local omp config.
-    RestoreBackup(drive::PendingRestore),
+    /// Restore a downloaded config backup over the local omp config.
+    RestoreBackup(backup::PendingRestore),
+    /// Forget the saved backup server.
+    RemoveServer,
     /// Remove a clean, merged worktree (with its branch) or park a clean, pushed one (the
     /// branch stays); the gateway moves the sessions inside it into the primary checkout.
     RemoveWorktree {
@@ -386,6 +389,8 @@ pub struct App {
     events_rx: Receiver<AppEvent>,
     confirm: Option<(Confirm, PendingConfirm)>,
     settings: SettingsState,
+    /// The Settings window is open.
+    settings_open: bool,
     update: UpdateTracker,
     /// Revision of the omp update topic last adopted.
     omp_update_rev: u64,
@@ -416,6 +421,8 @@ pub struct App {
     bar_view: statusbar::BarView,
     /// omp's default model/thinking from its settings (refreshed with the catalog).
     omp_defaults: statusbar::Defaults,
+    /// omp's `retry.usageReservePct` (refreshed with the catalog); `None` until it is read.
+    omp_usage_reserve: Option<u32>,
     picker: PickerState,
     models: ModelsCache,
     dialog: Option<bar::ActionDialog>,
@@ -469,8 +476,8 @@ pub struct App {
 
     started: Instant,
     shot: Option<ShotPlan>,
-    /// Google Drive backup of the omp config.
-    drive: drive::DriveUi,
+    /// Backups of the omp config (Google Drive or the user's server).
+    backup: backup::BackupUi,
     /// Project sync (per-folder `.omp` + sessions backups).
     sync: project_sync::SyncUi,
     mobile: mobile::MobileUi,
@@ -606,6 +613,7 @@ impl App {
             events_rx,
             confirm: None,
             settings: SettingsState::default(),
+            settings_open: false,
             update: UpdateTracker::default(),
             omp_update_rev: 0,
             omp_ready: false,
@@ -622,6 +630,7 @@ impl App {
             model_sent: None,
             bar_view: statusbar::BarView::default(),
             omp_defaults: statusbar::Defaults::default(),
+            omp_usage_reserve: None,
             picker: PickerState::default(),
             models: ModelsCache::default(),
             dialog: None,
@@ -660,7 +669,7 @@ impl App {
                 .unwrap_or_else(Instant::now),
             started: Instant::now(),
             shot,
-            drive: drive::DriveUi::new(),
+            backup: backup::BackupUi::new(),
             sync: project_sync::SyncUi::new(),
             mobile: mobile::MobileUi::new(),
             changes: changes::ChangesUi::default(),
@@ -767,10 +776,7 @@ impl App {
             return;
         };
         let mut reattach = Vec::new();
-        for (i, tab) in self.tabs.iter_mut().enumerate() {
-            let Some(t) = tab.term_mut() else {
-                continue;
-            };
+        for (i, t) in self.tabs.iter_mut().enumerate() {
             let Some(info) = infos.iter().find(|c| c.target.key == t.target().key) else {
                 continue;
             };
@@ -781,9 +787,7 @@ impl App {
         }
         for (i, target) in reattach {
             let term = self.open_view(&target);
-            if let Some(t) = self.tabs[i].term_mut() {
-                t.reattach(target, term);
-            }
+            self.tabs[i].reattach(target, term);
             self.dirty = true;
         }
         if !infos.is_empty() {
@@ -877,9 +881,9 @@ impl App {
         }
     }
 
-    /// Per strip position: the terminal tab's uid (`None` for other tab kinds).
-    fn tab_uids(&self) -> Vec<Option<u64>> {
-        self.tabs.iter().map(Tab::uid).collect()
+    /// Per strip position: the tab's uid.
+    fn tab_uids(&self) -> Vec<u64> {
+        self.tabs.iter().map(|t| t.uid).collect()
     }
 
     /// Focus tab `i`; the agents dashboard (if shown) gives way to it.
@@ -894,15 +898,13 @@ impl App {
     fn activate_keeping_dashboard(&mut self, i: usize) {
         if i < self.tabs.len() {
             if i != self.active
-                && let Some(prev) = self.tabs.get_mut(self.active).and_then(Tab::term_mut)
+                && let Some(prev) = self.tabs.get_mut(self.active)
             {
                 prev.terminal_mut().set_focused(false);
             }
             // Only a tab that is drawn has been seen; the dashboard hides every terminal.
-            if !self.dash.open
-                && let Some(t) = self.tabs[i].term_mut()
-            {
-                t.bell = false;
+            if !self.dash.open {
+                self.tabs[i].bell = false;
             }
             self.active = i;
             if let Some(uid) = self.tabs[i].pane_uid() {
@@ -968,8 +970,8 @@ impl App {
                 .position(|t| t.session_path() == Some(p) || t.mux_name().is_some_and(holds))
         });
         if let Some(i) = existing {
-            if let Some(t) = self.tabs[i].term_mut()
-                && t.session_path().is_none()
+            let t = &mut self.tabs[i];
+            if t.session_path().is_none()
                 && let Some(p) = &req.session_path
             {
                 // The tab runs this session but did not know its file yet: tell the gateway too.
@@ -1048,9 +1050,10 @@ impl App {
 
     /// Run omp's official installer in a tool tab; one at a time (re-focus a running one).
     fn open_install_tab(&mut self) {
-        let running = self.tabs.iter().position(|t| {
-            matches!(t, Tab::Terminal(t) if t.role == TabRole::InstallOmp && !t.terminal().is_exited())
-        });
+        let running = self
+            .tabs
+            .iter()
+            .position(|t| t.role == TabRole::InstallOmp && !t.terminal().is_exited());
         if let Some(i) = running {
             self.activate(i);
             return;
@@ -1085,15 +1088,17 @@ impl App {
             .then(|| new_session_name(SystemTime::now()))
     }
 
-    /// Focus the settings page, creating its tab if needed (at most one).
+    /// Open the Settings window (it covers the app; the tabs stay as they are).
     fn open_settings(&mut self) {
-        match self.tabs.iter().position(Tab::is_settings) {
-            Some(i) => self.activate(i),
-            None => {
-                self.tabs.push(Tab::Settings);
-                self.activate(self.tabs.len() - 1);
-            }
+        if !self.settings_open {
+            self.settings_open = true;
+            self.settings.opened();
         }
+    }
+
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.focus_pending = true;
     }
 
     /// Focus the settings page on one OmpDeck subpage.
@@ -1110,10 +1115,8 @@ impl App {
         let tab = self.tabs.remove(i); // dropping the Terminal detaches; tmux keeps running
         let focused_pane = self.split.focused_uid();
         let pane_uid = tab.pane_uid().filter(|u| self.split.slot_of(*u).is_some());
-        if remember
-            && let Tab::Terminal(t) = &tab
-            && t.role == TabRole::Session
-        {
+        if remember && tab.role == TabRole::Session {
+            let t = &tab;
             self.closed.push(ClosedTab {
                 mux_name: t.mux_name.clone(),
                 cwd: t.cwd.clone(),
@@ -1121,25 +1124,21 @@ impl App {
                 title: t.title(&self.labels).to_owned(),
             });
         }
-        let launch = match &tab {
-            Tab::Terminal(t) => (t.session_path_owned(), t.mux_name.clone()),
-            _ => (None, None),
-        };
-        if let Tab::Terminal(t) = &tab {
-            // Detach this window's view; the gateway keeps backend sessions (and accepted work)
-            // running, and ends a direct program only because nothing else can reach it.
-            self.gw.mutate(
-                Mutation::Close {
-                    target: t.target().clone(),
-                    kill_direct: t.mux_name.is_none(),
-                },
-                |_, result| {
-                    if let Err(e) = result {
-                        log::debug!("closing the view failed: {e}");
-                    }
-                },
-            );
-        }
+        let launch = (tab.session_path_owned(), tab.mux_name.clone());
+        let t = &tab;
+        // Detach this window's view; the gateway keeps backend sessions (and accepted work)
+        // running, and ends a direct program only because nothing else can reach it.
+        self.gw.mutate(
+            Mutation::Close {
+                target: t.target().clone(),
+                kill_direct: t.mux_name.is_none(),
+            },
+            |_, result| {
+                if let Err(e) = result {
+                    log::debug!("closing the view failed: {e}");
+                }
+            },
+        );
         drop(tab);
         self.active = tabs::active_after_close(self.active, i, len_before);
         if let Some(uid) = pane_uid {
@@ -1165,7 +1164,7 @@ impl App {
             }
         }
         self.activation_seq += 1;
-        if let Some(t) = self.tabs.get_mut(self.active).and_then(Tab::term_mut) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
             t.bell = false;
         }
         self.focus_pending = true;
@@ -1207,7 +1206,7 @@ impl App {
 
     /// Kill the process of tab `i` — only that tab's session.
     fn kill_tab(&mut self, i: usize) {
-        let Some(Tab::Terminal(tab)) = self.tabs.get(i) else {
+        let Some(tab) = self.tabs.get(i) else {
             return;
         };
         let target = tab.target().clone();
@@ -1329,7 +1328,7 @@ impl App {
             self.cfg.dark(),
         );
         let tt = deck_service::gateway::terminal_theme(self.cfg.theme, self.cfg.style);
-        for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
+        for tab in self.tabs.iter_mut() {
             tab.terminal_mut().set_theme(tt);
         }
         self.dirty = true;
@@ -1532,7 +1531,6 @@ impl App {
             .and_then(|s| s.holder(&entry.path).map(str::to_owned));
         let tab = || {
             self.tabs.iter().find_map(|t| {
-                let t = t.term()?;
                 (t.session_path() == Some(entry.path.as_path()) && !t.terminal().is_exited())
                     .then(|| t.mux_name.clone())
                     .flatten()
@@ -1672,10 +1670,10 @@ impl App {
         let live_tabs: Vec<&Path> = self
             .tabs
             .iter()
-            .filter_map(Tab::term)
             .filter(|t| !t.terminal().is_exited())
             .filter_map(|t| t.session_path())
             .collect();
+        let place = self.backup_place();
         let input = BarInput {
             tabs: TabBarInput {
                 tabs: &self.tabs,
@@ -1694,7 +1692,10 @@ impl App {
                     omp_available: omp_found,
                     can_stop: self.backends_available(),
                     busy: &self.moving,
-                    drive: self.drive_menu(),
+                    backup: crate::sidebar::BackupMenu {
+                        place: &place,
+                        off: self.backup_menu_off(),
+                    },
                     live_tabs: &live_tabs,
                     finishing: &self.wt.finishing,
                     parked: crate::worktree_ui::ParkView {
@@ -1706,7 +1707,7 @@ impl App {
             },
             csd: !self.cfg.native_decorations,
             maximized,
-            settings_active: self.tabs.get(self.active).is_some_and(Tab::is_settings),
+            settings_active: self.settings_open,
             can_reopen: !self.closed.is_empty(),
             font_size: self.cfg.font_size,
             theme: if self.cfg.dark() {
@@ -1720,7 +1721,7 @@ impl App {
                 title: active
                     .map(|t| titlebar::strip_omp_prefix(t.title(&self.labels)))
                     .unwrap_or_default(),
-                cwd: active.and_then(Tab::term).map(|t| t.cwd.as_path()),
+                cwd: active.map(|t| t.cwd.as_path()),
                 session: active.and_then(Tab::session_path),
             },
             omp: omp_found.then(|| OmpBar {
@@ -1816,7 +1817,7 @@ impl App {
         let open_paths: Vec<&Path> = self
             .tabs
             .iter()
-            .filter(|t| t.term().is_some_and(|t| !t.terminal().is_exited()))
+            .filter(|t| !t.terminal().is_exited())
             .filter_map(Tab::session_path)
             .collect();
         // Their rows show the tab's live omp state instead of the running LED.
@@ -1827,17 +1828,14 @@ impl App {
             .filter(|(_, s)| matches!(s, TabStatus::Busy | TabStatus::Attention))
             .collect();
         let generation = self.gw.sessions_generation();
+        let place = self.backup_place();
         let input = SidebarInput {
             groups: groups_ref,
             running: snap,
             root: &self.root,
             root_exists: self.root_exists,
             active_path,
-            active_cwd: self
-                .tabs
-                .get(self.active)
-                .and_then(Tab::term)
-                .map(|t| t.cwd.as_path()),
+            active_cwd: self.tabs.get(self.active).map(|t| t.cwd.as_path()),
             now: SystemTime::now(),
             refreshing,
             can_stop: self.backends_available(),
@@ -1853,7 +1851,10 @@ impl App {
             labels: &self.labels,
             active_tab: self.active,
             tab_activity: &tab_activity,
-            drive: self.drive_menu(),
+            backup: crate::sidebar::BackupMenu {
+                place: &place,
+                off: self.backup_menu_off(),
+            },
             finishing: &self.wt.finishing,
             removed: &self.cfg.removed_worktrees,
             parked: crate::worktree_ui::ParkView {
@@ -1978,93 +1979,115 @@ impl App {
                     self.open_install_tab();
                 }
             }
-            Some(Tab::Settings) => {
-                self.terminal_focused = false;
-                let gateway = self.gw.gateway();
-                let mobile = self.gw.mobile();
-                let backends = gateway
-                    .as_deref()
-                    .map_or(&[][..], |g| g.backends.as_slice());
-                let account = self
-                    .drive
-                    .card(self.gw.drive().as_deref(), self.cfg.drive_backup_interval);
-                let rows = self.sync_rows();
-                let input = SettingsInput {
-                    font_size: self.cfg.font_size,
-                    font_range: (MIN_FONT, MAX_FONT),
-                    font_default: DEFAULT_FONT,
-                    ui_scale: self.cfg.ui_scale,
-                    theme: self.cfg.theme,
-                    style: self.cfg.style,
-                    density: self.cfg.density,
-                    separated_panels: self.cfg.separated_panels,
-                    ui_font: self.cfg.ui_font,
-                    native_decorations: self.cfg.native_decorations,
-                    omp_found: self.omp_found(),
-                    omp_version: self.update.version.as_deref(),
-                    check_updates: self.cfg.check_updates,
-                    update: &self.update.state,
-                    backend: settings_page::BackendCard {
-                        choice: self.cfg.session_backend,
-                        tmux: backends.contains(&MuxKind::Tmux),
-                        host: backends.contains(&MuxKind::Host),
-                    },
-                    drive: account.clone(),
-                    sync: self.sync_page(&account, &rows),
-                    app_update: self.app_update.card(self.cfg.check_app_updates),
-                    notify: NotifyInput {
-                        cfg: &self.cfg.notify,
-                    },
-                    mobile: settings_page::MobileCard {
-                        status: gateway.as_deref(),
-                        link_up: self.gw.is_up(),
-                        pending: self.mode_change.is_some(),
-                        view: mobile.as_deref(),
-                        now_ms: mobile::now_ms(),
-                        error: self.mode_error.as_deref(),
-                    },
-                };
-                let actions = theme::skin::central(ui, pal, false, |ui| {
-                    settings_page::show(ui, &mut self.settings, &input)
-                })
-                .inner;
-                for a in actions {
-                    match a {
-                        SettingsAction::FontSize(s) => self.set_font_size(s),
-                        SettingsAction::UiScale(s) => self.set_ui_scale(s),
-                        SettingsAction::Theme(t) => self.set_theme(t),
-                        SettingsAction::Style(v) => self.set_style(v),
-                        SettingsAction::Density(v) => self.set_density(v),
-                        SettingsAction::SeparatedPanels(v) => self.set_separated_panels(v),
-                        SettingsAction::UiFont(v) => self.set_ui_font(v),
-                        SettingsAction::SessionBackend(v) => self.set_session_backend(v),
-                        SettingsAction::NativeDecorations(v) => self.set_native_decorations(v),
-                        SettingsAction::SetCheckUpdates(v) => {
-                            self.cfg.check_updates = v;
-                            self.dirty = true;
-                        }
-                        SettingsAction::CheckUpdates => self.check_updates_manually(),
-                        SettingsAction::LoadCatalog => self.load_catalog(),
-                        SettingsAction::WriteSetting { setting, value } => {
-                            self.write_setting(*setting, value);
-                        }
-                        SettingsAction::ResetSetting { key } => self.reset_setting(key),
-                        SettingsAction::CopyKey(key) => self.copy_text(&key, "setting key"),
-                        SettingsAction::CopyDetails(text) => {
-                            self.copy_text(&text, "error details");
-                        }
-                        SettingsAction::InstallOmp => self.open_install_tab(),
-                        SettingsAction::Drive(a) => self.apply_drive_action(a),
-                        SettingsAction::Sync(a) => self.apply_sync_action(a),
-                        SettingsAction::Notify(a) => self.apply_notify_action(a),
-                        SettingsAction::AppUpdate(a) => self.apply_app_update_setting(a),
-                        SettingsAction::GatewayMode(mode) => self.set_gateway_mode(mode),
-                        SettingsAction::Mobile(a) => self.apply_mobile_action(a),
-                    }
+            Some(_) if self.split_shown() => self.show_split(ui),
+            Some(_) => self.show_terminal(ui),
+        }
+    }
+
+    /// Per frame: draw the Settings window while it is open and run what it asks for.
+    fn show_settings(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let gateway = self.gw.gateway();
+        let mobile = self.gw.mobile();
+        let backends = gateway
+            .as_deref()
+            .map_or(&[][..], |g| g.backends.as_slice());
+        let account = self.backup_card();
+        let rows = self.sync_rows();
+        let input = SettingsInput {
+            font_size: self.cfg.font_size,
+            font_range: (MIN_FONT, MAX_FONT),
+            font_default: DEFAULT_FONT,
+            ui_scale: self.cfg.ui_scale,
+            theme: self.cfg.theme,
+            style: self.cfg.style,
+            density: self.cfg.density,
+            separated_panels: self.cfg.separated_panels,
+            ui_font: self.cfg.ui_font,
+            native_decorations: self.cfg.native_decorations,
+            omp_found: self.omp_found(),
+            omp_version: self.update.version.as_deref(),
+            check_updates: self.cfg.check_updates,
+            update: &self.update.state,
+            backend: settings_page::BackendCard {
+                choice: self.cfg.session_backend,
+                tmux: backends.contains(&MuxKind::Tmux),
+                host: backends.contains(&MuxKind::Host),
+            },
+            backup: account.clone(),
+            sync: self.sync_page(&account, &rows),
+            app_update: self.app_update.card(self.cfg.check_app_updates),
+            notify: NotifyInput {
+                cfg: &self.cfg.notify,
+            },
+            mobile: settings_page::MobileCard {
+                status: gateway.as_deref(),
+                link_up: self.gw.is_up(),
+                pending: self.mode_change.is_some(),
+                view: mobile.as_deref(),
+                now_ms: mobile::now_ms(),
+                error: self.mode_error.as_deref(),
+            },
+            agents: crate::agent_config::AgentsInput {
+                models: &self.models,
+                favorites: &self.cfg.favorite_models,
+                provider: self.cfg.model_provider_filter.as_deref(),
+            },
+        };
+        // Dialogs of the app (and the other windows) in front of it own the keys and clicks.
+        let blocked = self.confirm.is_some()
+            || self.dialog.is_some()
+            || self.folder_dialog.is_some()
+            || self.wt.dialog.is_some()
+            || self.backup.modal_open()
+            || self.sync.modal_open()
+            || self.sessions.open
+            || self.palette.is_some()
+            || self.popup.is_some()
+            || self.tree.is_some()
+            || self.usage_open;
+        let actions = settings_page::window(ctx, &mut self.settings, &input, blocked);
+        for a in actions {
+            match a {
+                SettingsAction::Close => self.close_settings(),
+                SettingsAction::FontSize(s) => self.set_font_size(s),
+                SettingsAction::UiScale(s) => self.set_ui_scale(s),
+                SettingsAction::Theme(t) => self.set_theme(t),
+                SettingsAction::Style(v) => self.set_style(v),
+                SettingsAction::Density(v) => self.set_density(v),
+                SettingsAction::SeparatedPanels(v) => self.set_separated_panels(v),
+                SettingsAction::UiFont(v) => self.set_ui_font(v),
+                SettingsAction::SessionBackend(v) => self.set_session_backend(v),
+                SettingsAction::NativeDecorations(v) => self.set_native_decorations(v),
+                SettingsAction::SetCheckUpdates(v) => {
+                    self.cfg.check_updates = v;
+                    self.dirty = true;
                 }
+                SettingsAction::CheckUpdates => self.check_updates_manually(),
+                SettingsAction::LoadCatalog => self.load_catalog(),
+                SettingsAction::WriteSetting { setting, value } => {
+                    self.write_setting(*setting, value);
+                }
+                SettingsAction::ResetSetting { key } => self.reset_setting(key),
+                SettingsAction::CopyKey(key) => self.copy_text(&key, "setting key"),
+                SettingsAction::CopyDetails(text) => {
+                    self.copy_text(&text, "error details");
+                }
+                SettingsAction::InstallOmp => {
+                    // The installer runs in a tab: show it.
+                    self.close_settings();
+                    self.open_install_tab();
+                }
+                SettingsAction::Backup(a) => self.apply_backup_action(a),
+                SettingsAction::Sync(a) => self.apply_sync_action(a),
+                SettingsAction::Notify(a) => self.apply_notify_action(a),
+                SettingsAction::AppUpdate(a) => self.apply_app_update_setting(a),
+                SettingsAction::GatewayMode(mode) => self.set_gateway_mode(mode),
+                SettingsAction::Agents(a) => self.apply_agents_action(a),
+                SettingsAction::Mobile(a) => self.apply_mobile_action(a),
             }
-            Some(Tab::Terminal(_)) if self.split_shown() => self.show_split(ui),
-            Some(Tab::Terminal(_)) => self.show_terminal(ui),
         }
     }
 
@@ -2074,7 +2097,7 @@ impl App {
         let pal = Palette::of_ui(ui);
         let font_size = self.terminal_font_size();
         theme::skin::central(ui, pal, true, |ui| {
-            let Some(Tab::Terminal(tab)) = self.tabs.get_mut(self.active) else {
+            let Some(tab) = self.tabs.get_mut(self.active) else {
                 return;
             };
             // Clicking app chrome (status bar, tabs, menus, dialogs) must not toggle the terminal's
@@ -2117,17 +2140,18 @@ impl App {
         }
     }
 
-    /// A confirmation or form dialog is open.
+    /// A confirmation or form dialog (or the Settings window) is open.
     fn modal_open(&self) -> bool {
         self.confirm.is_some()
             || self.dialog.is_some()
             || self.folder_dialog.is_some()
             || self.wt.dialog.is_some()
-            || self.drive.modal_open()
+            || self.backup.modal_open()
             || self.sync.modal_open()
             || self.mobile_modal_open()
             || self.sessions.open
             || self.palette.is_some()
+            || self.settings_open
     }
 
     fn show_confirm(&mut self, ctx: &egui::Context) {
@@ -2168,6 +2192,7 @@ impl App {
                 self.execute_restart_live(uid, &session);
             }
             PendingConfirm::RestartSession(target) => self.execute_restart_session(target),
+            PendingConfirm::RemoveServer => self.remove_server(),
             PendingConfirm::DeleteSession(entry) => self.execute_delete(entry),
             PendingConfirm::DeleteSessions(paths) => self.execute_delete_sessions(paths),
             PendingConfirm::MoveSessions { paths, dest } => {
@@ -2219,14 +2244,11 @@ impl App {
         let mut cfg = self.cfg.clone();
         // Before restore ran (or without a backend) the stored tab list is left untouched.
         if self.backends_available() && self.pending_restore.is_none() {
-            // The settings page is never persisted; `active_tab` indexes the persisted list.
+            // Update and installer tabs are never persisted; `active_tab` indexes the persisted list.
             let mut active_tab = None;
             let mut open_tabs = Vec::new();
             let mut persisted: Vec<u64> = Vec::new();
-            for (i, tab) in self.tabs.iter().enumerate() {
-                let Tab::Terminal(t) = tab else {
-                    continue;
-                };
+            for (i, t) in self.tabs.iter().enumerate() {
                 // Update/installer tabs are one-off processes, never restored.
                 if t.role != TabRole::Session {
                     continue;
@@ -2548,7 +2570,7 @@ impl App {
     /// When an update or install tab's process has exited: re-check, and report the outcome.
     fn check_update_tabs(&mut self) {
         let mut finished = Vec::new();
-        for tab in self.tabs.iter_mut().filter_map(Tab::term_mut) {
+        for tab in self.tabs.iter_mut() {
             if matches!(tab.role, TabRole::Update(_) | TabRole::InstallOmp)
                 && !tab.exit_handled
                 && tab.terminal().is_exited()
@@ -2636,6 +2658,7 @@ impl App {
             });
             if let Ok(catalog) = &catalog {
                 app.omp_defaults = defaults_from_catalog(catalog);
+                app.omp_usage_reserve = crate::omp_settings::usage_reserve_from_catalog(catalog);
             }
             let env = std::env::var("PI_CODING_AGENT_DIR").ok();
             let dir = config_dir_display(env.as_deref(), app.home.as_deref());
@@ -2726,9 +2749,7 @@ impl App {
     fn request_move(&mut self, entry: SessionEntry, dest: PathBuf) {
         let running = self.running_session_name(&entry).is_some()
             || self.tabs.iter().any(|t| {
-                t.term().is_some_and(|t| {
-                    t.session_path() == Some(entry.path.as_path()) && !t.terminal().is_exited()
-                })
+                t.session_path() == Some(entry.path.as_path()) && !t.terminal().is_exited()
             });
         let mut body = format!(
             "Move “{}” to {}? omp moves the session file and its artifacts; the original is removed from {}.",
@@ -2788,33 +2809,33 @@ impl App {
         let mut tab_state: Option<ClosedTab> = None;
         let (mut slot, mut was_active) = (0, false);
         for i in (0..self.tabs.len()).rev() {
-            let hit = self.tabs[i].term().is_some_and(|t| {
+            let hit = {
+                let t = &self.tabs[i];
                 t.session_path() == Some(entry.path.as_path())
                     || (holder.is_some() && t.mux_name == holder)
-            });
+            };
             if !hit {
                 continue;
             }
-            if let Some(t) = self.tabs[i].term_mut() {
-                match &t.mux_name {
-                    Some(name) => {
-                        if !kill_names.contains(name) {
-                            kill_names.push(name.clone());
-                        }
+            let t = &mut self.tabs[i];
+            match &t.mux_name {
+                Some(name) => {
+                    if !kill_names.contains(name) {
+                        kill_names.push(name.clone());
                     }
-                    None => t.terminal_mut().kill(),
                 }
-                if tab_state.is_none() {
-                    slot = i;
-                    tab_state = Some(ClosedTab {
-                        mux_name: t.mux_name.clone(),
-                        cwd: t.cwd.clone(),
-                        session_path: Some(entry.path.clone()),
-                        title: entry.label().to_owned(),
-                    });
-                } else if i < slot {
-                    slot -= 1; // a tab in front of the first one is closed too
-                }
+                None => t.terminal_mut().kill(),
+            }
+            if tab_state.is_none() {
+                slot = i;
+                tab_state = Some(ClosedTab {
+                    mux_name: t.mux_name.clone(),
+                    cwd: t.cwd.clone(),
+                    session_path: Some(entry.path.clone()),
+                    title: entry.label().to_owned(),
+                });
+            } else if i < slot {
+                slot -= 1; // a tab in front of the first one is closed too
             }
             was_active |= i == self.active;
             self.close_tab(i, false);
@@ -2838,13 +2859,10 @@ impl App {
         }
         let label = entry.label().to_owned();
         let running = self.running_session_name(&entry).is_some();
-        let busy = self.tabs.iter().any(|t| match t {
-            Tab::Terminal(t) => {
-                !t.terminal().is_exited()
-                    && t.session_path() == Some(entry.path.as_path())
-                    && Activity::from_title(t.terminal().title()) != Activity::Idle
-            }
-            _ => false,
+        let busy = self.tabs.iter().any(|t| {
+            !t.terminal().is_exited()
+                && t.session_path() == Some(entry.path.as_path())
+                && Activity::from_title(t.terminal().title()) != Activity::Idle
         });
         let live = if running {
             " Its running omp process is stopped first."
@@ -2918,22 +2936,22 @@ impl App {
         let holder = self.running_session_name(entry);
         let mut kill_names: Vec<String> = holder.iter().cloned().collect();
         for i in (0..self.tabs.len()).rev() {
-            let hit = self.tabs[i].term().is_some_and(|t| {
+            let hit = {
+                let t = &self.tabs[i];
                 t.session_path() == Some(entry.path.as_path())
                     || (holder.is_some() && t.mux_name == holder)
-            });
+            };
             if !hit {
                 continue;
             }
-            if let Some(t) = self.tabs[i].term_mut() {
-                match &t.mux_name {
-                    Some(name) => {
-                        if !kill_names.contains(name) {
-                            kill_names.push(name.clone());
-                        }
+            let t = &mut self.tabs[i];
+            match &t.mux_name {
+                Some(name) => {
+                    if !kill_names.contains(name) {
+                        kill_names.push(name.clone());
                     }
-                    None => t.terminal_mut().kill(),
                 }
+                None => t.terminal_mut().kill(),
             }
             if close_tabs {
                 self.close_tab(i, false);
@@ -3083,17 +3101,15 @@ impl App {
         let split_on = self.split_shown();
         let dash_open = self.dash.open;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
-            if let Tab::Terminal(t) = tab {
-                let shown = !dash_open
-                    && if split_on {
-                        self.split.slot_of(t.uid).is_some()
-                    } else {
-                        i == self.active
-                    };
-                // A shown tab's bell is moot; the others show the marker.
-                if t.terminal_mut().poll().bell && !shown {
-                    t.bell = true;
-                }
+            let shown = !dash_open
+                && if split_on {
+                    self.split.slot_of(tab.uid).is_some()
+                } else {
+                    i == self.active
+                };
+            // A shown tab's bell is moot; the others show the marker.
+            if tab.terminal_mut().poll().bell && !shown {
+                tab.bell = true;
             }
         }
     }
@@ -3171,7 +3187,7 @@ impl eframe::App for App {
         self.refresh_sessions_cache();
         self.tick_omp();
         self.tick_omp_update();
-        self.drive_tick(&ctx);
+        self.backup_tick(&ctx);
 
         // Panes follow the tab list; then only the tabs on screen repaint promptly on output
         // (the others coalesce). Polling for title/bell/exit happens in `logic`.
@@ -3180,15 +3196,13 @@ impl eframe::App for App {
         // The dashboard covers the terminal area: no tab is on screen (still polled below).
         let dash_open = self.dash.open;
         for (i, tab) in self.tabs.iter().enumerate() {
-            if let Tab::Terminal(t) = tab {
-                let shown = !dash_open
-                    && if split_on {
-                        self.split.slot_of(t.uid).is_some()
-                    } else {
-                        i == self.active
-                    };
-                t.terminal().set_visible(shown);
-            }
+            let shown = !dash_open
+                && if split_on {
+                    self.split.slot_of(tab.uid).is_some()
+                } else {
+                    i == self.active
+                };
+            tab.terminal().set_visible(shown);
         }
 
         // The terminal keeps keyboard focus: take it back whenever nothing else (a text field,
@@ -3202,6 +3216,7 @@ impl eframe::App for App {
             && self.popup.is_none()
             && !self.dash.open
             && self.tree.is_none()
+            && !self.settings_open
             && !self.usage_open
             && !self.sessions.open
             && self.palette.is_none()
@@ -3225,11 +3240,12 @@ impl eframe::App for App {
         self.show_sidebar(ui, &snap);
         self.show_changes_panel(ui);
         self.show_central(ui);
+        self.show_settings(&ctx);
         self.show_agent_popup(&ctx);
         self.show_tree(&ctx);
         self.show_usage(&ctx);
         self.show_sessions(&ctx);
-        self.show_drive_picker(&ctx);
+        self.show_backup_dialogs(&ctx);
         self.show_sync_dialogs(&ctx);
         self.show_mobile_dialogs(&ctx);
         self.show_confirm(&ctx);

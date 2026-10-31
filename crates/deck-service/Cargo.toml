@@ -56,6 +56,9 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Shel
 [dev-dependencies]
 deck-service = { path = ".", features = ["test-push-loopback"] }
 tempfile.workspace = true
+# tests/remote_device_backup_server.rs: an in-test SSH server (host key only) the backup server
+# destination dials.
+russh.workspace = true
 # tests/remote_pairing.rs: an in-test relay on its own tokio runtime.
 deck-relay.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "macros", "sync", "time"] }

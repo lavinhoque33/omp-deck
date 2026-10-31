@@ -15,7 +15,7 @@ use egui::{Key, Modifiers};
 use super::App;
 use super::spawn::Focus;
 use crate::agent_ctl::Link;
-use crate::tabs::{ClosedTab, Tab, TabRole};
+use crate::tabs::{ClosedTab, TabRole};
 use crate::titlebar;
 use crate::toast::ToastKind;
 use crate::tree_view::{self, TreeAction, TreeInput, TreeState};
@@ -151,7 +151,7 @@ impl App {
 
     /// The tree of the active session tab.
     pub(super) fn open_tree_active(&mut self) {
-        let Some(Tab::Terminal(t)) = self.tabs.get(self.active) else {
+        let Some(t) = self.tabs.get(self.active) else {
             return;
         };
         if t.role != TabRole::Session {
@@ -194,18 +194,13 @@ impl App {
     fn tree_has_tab(&self, session: &Path) -> bool {
         self.tabs
             .iter()
-            .filter_map(Tab::term)
             .any(|t| t.session_path() == Some(session) && !t.terminal().is_exited())
     }
 
     /// The active tab shows `session` and has a live control link.
     fn tree_link(&self, session: &Path) -> Result<(), &'static str> {
         let active = match self.tabs.get(self.active) {
-            Some(Tab::Terminal(t))
-                if t.role == TabRole::Session && t.session_path() == Some(session) =>
-            {
-                t
-            }
+            Some(t) if t.role == TabRole::Session && t.session_path() == Some(session) => t,
             _ if self.tree_has_tab(session) => {
                 return Err("Switch to this session's tab to use Go here");
             }
@@ -233,7 +228,6 @@ impl App {
             .or_else(|| {
                 self.tabs
                     .get(self.active)
-                    .and_then(Tab::term)
                     .map(|t| Activity::from_title(t.terminal().title()) == Activity::Idle)
             })
             .unwrap_or(false);
@@ -262,7 +256,6 @@ impl App {
             .tabs
             .iter()
             .enumerate()
-            .filter_map(|(i, t)| t.term().map(|t| (i, t)))
             .find(|(_, t)| t.session_path() == Some(session) && !t.terminal().is_exited());
         let tab = match tab {
             None => TabFact::None,

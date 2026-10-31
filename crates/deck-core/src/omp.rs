@@ -1,6 +1,7 @@
 //! Thin wrapper around the `omp` CLI: settings catalog + editing, update checks, session
 //! move/copy argv. omp performs every write to its own store/config; OmpDeck never edits
-//! `~/.omp/**` itself. Every call here blocks: run them on a worker thread.
+//! `~/.omp/**` itself, except the user-authored agent definitions ([`crate::agent_defs`]), which
+//! omp only reads. Every call here blocks: run them on a worker thread.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -1102,25 +1103,42 @@ impl Omp {
     /// Returns the saved value (secrets: `Value::Null`; their stdout is never returned or logged).
     pub fn set_setting(&self, setting: &Setting, value: &Value) -> Result<Value, OmpError> {
         let encoded = encode_value(&setting.kind, value)?;
-        if setting.key.is_empty() || setting.key.starts_with('-') {
-            return Err(failed(format!("Invalid setting key: {}", setting.key)));
+        self.set_encoded(&setting.key, &encoded, setting.secret)
+    }
+
+    fn set_encoded(&self, key: &str, encoded: &str, secret: bool) -> Result<Value, OmpError> {
+        if key.is_empty() || key.starts_with('-') {
+            return Err(failed(format!("Invalid setting key: {key}")));
         }
-        if setting.secret {
-            log::debug!("omp config set {} (secret, value not logged)", setting.key);
+        if secret {
+            log::debug!("omp config set {key} (secret, value not logged)");
         } else {
-            log::debug!("omp config set {} = {encoded}", setting.key);
+            log::debug!("omp config set {key} = {encoded}");
         }
         let out = self.run(
-            &["config", "set", &setting.key, "--json", "--", &encoded],
-            setting.secret.then_some(encoded.as_str()),
+            &["config", "set", key, "--json", "--", encoded],
+            secret.then_some(encoded),
         )?;
-        if setting.secret {
+        if secret {
             return Ok(Value::Null);
         }
         match serde_json::from_str::<Value>(out.stdout.trim()) {
             Ok(Value::Object(m)) => Ok(m.get("value").cloned().unwrap_or(Value::Null)),
             _ => Err(OmpError::Parse(out.stdout.trim().to_string())),
         }
+    }
+
+    /// Replaces `provider`'s entries of `auth.accountPolicies` with `policies`, keeping every
+    /// other entry as omp has it (read, merged and written back). Returns the saved array.
+    pub fn set_account_policies(
+        &self,
+        provider: &str,
+        policies: &[crate::usage::AccountPolicy],
+    ) -> Result<Value, OmpError> {
+        const KEY: &str = "auth.accountPolicies";
+        let current = self.get_setting(KEY)?;
+        let next = crate::usage::replace_account_policies(&current, provider, policies);
+        self.set_encoded(KEY, &next.to_string(), false)
     }
 
     /// `omp config reset <key> --json`.
@@ -1130,6 +1148,69 @@ impl Omp {
         }
         self.run(&["config", "reset", key, "--json"], None)?;
         Ok(())
+    }
+
+    /// `omp config get <key> --json` → its `value` (`Null` when unset). Not for secrets: the
+    /// value is returned as omp prints it.
+    fn get_setting(&self, key: &str) -> Result<Value, OmpError> {
+        if key.is_empty() || key.starts_with('-') {
+            return Err(failed(format!("Invalid setting key: {key}")));
+        }
+        let out = self.run(&["config", "get", key, "--json"], None)?;
+        match serde_json::from_str::<Value>(out.stdout.trim()) {
+            Ok(Value::Object(m)) => Ok(m.get("value").cloned().unwrap_or(Value::Null)),
+            _ => Err(OmpError::Parse(out.stdout.trim().to_string())),
+        }
+    }
+
+    /// What omp's config says about task agents: `task.agentModelOverrides`,
+    /// `task.disabledAgents` and `modelRoles` (read concurrently).
+    pub fn agent_settings(&self) -> Result<crate::agent_defs::AgentSettings, OmpError> {
+        use crate::agent_defs::{AgentSettings, DISABLED_KEY, OVERRIDES_KEY, ROLES_KEY};
+        let (overrides, disabled, roles) = std::thread::scope(|s| {
+            let disabled = s.spawn(|| self.get_setting(DISABLED_KEY));
+            let roles = s.spawn(|| self.get_setting(ROLES_KEY));
+            let overrides = self.get_setting(OVERRIDES_KEY);
+            let join = |h: std::thread::ScopedJoinHandle<'_, Result<Value, OmpError>>| {
+                h.join()
+                    .unwrap_or_else(|_| Err(failed("settings worker panicked")))
+            };
+            (overrides, join(disabled), join(roles))
+        });
+        Ok(AgentSettings::from_values(&overrides?, &disabled?, &roles?))
+    }
+
+    /// omp's built-in agent definitions as `(file name, content)`: `omp agents unpack --dir
+    /// <temp dir> --json` into a private temp dir, read back, the dir removed.
+    pub fn bundled_agent_sources(&self) -> Result<Vec<(String, String)>, OmpError> {
+        let tmp = tempfile::Builder::new()
+            .prefix("omp-deck-agents-")
+            .tempdir()?;
+        let dir = tmp.path().as_os_str();
+        let args = [
+            std::ffi::OsStr::new("agents"),
+            "unpack".as_ref(),
+            "--dir".as_ref(),
+            dir,
+            "--json".as_ref(),
+        ];
+        let out = self.finish(self.command(&args), None)?;
+        let report: Value = serde_json::from_str(out.stdout.trim())
+            .map_err(|_| OmpError::Parse(out.stdout.trim().to_string()))?;
+        let written = report
+            .get("written")
+            .and_then(Value::as_array)
+            .ok_or_else(|| OmpError::Parse(out.stdout.trim().to_string()))?;
+        let mut sources = Vec::with_capacity(written.len());
+        for path in written.iter().filter_map(Value::as_str).map(Path::new) {
+            // Only what omp wrote into the temp dir is read.
+            let (Some(name), true) = (path.file_name(), path.parent() == Some(tmp.path())) else {
+                continue;
+            };
+            let content = std::fs::read_to_string(path)?;
+            sources.push((name.to_string_lossy().into_owned(), content));
+        }
+        Ok(sources)
     }
 
     /// Forks the session file at `entry_id` into a new file via a headless

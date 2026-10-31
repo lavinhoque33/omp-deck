@@ -14,8 +14,7 @@ use deck_term::Terminal;
 
 use crate::badge::{self, Hue};
 use crate::icons::{
-    ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_SETTINGS, ICON_SPARKLES, ICON_TERMINAL,
-    ICON_X, Icon,
+    ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_SPARKLES, ICON_TERMINAL, ICON_X, Icon,
 };
 use crate::titlebar::strip_omp_prefix;
 use crate::{card, tips};
@@ -40,11 +39,11 @@ pub enum TabRole {
 }
 
 /// A terminal tab: a view of one session the gateway controls, rendered by deck-term.
-pub struct TermTab {
+pub struct Tab {
     /// This window's own view; dropping it only detaches (the session lives on in the gateway).
     term: Terminal,
     /// The session this window's view is attached to. A new generation (omp moved to another
-    /// file, a restart) ends the view: [`TermTab::needs_reattach`] tells the app to attach anew.
+    /// file, a restart) ends the view: [`Tab::needs_reattach`] tells the app to attach anew.
     target: SessionTarget,
     info: Option<ControllerInfo>,
     /// A session file this window resolved and sent to the gateway, until the record shows it.
@@ -77,10 +76,10 @@ pub struct CopyPending {
     pub dest: PathBuf,
 }
 
-impl TermTab {
+impl Tab {
     /// A tab on the gateway's session `target`, shown through `term`.
-    pub fn new(term: Terminal, target: SessionTarget, uid: u64, launch: TabLaunch) -> TermTab {
-        TermTab {
+    pub fn new(term: Terminal, target: SessionTarget, uid: u64, launch: TabLaunch) -> Tab {
+        Tab {
             term,
             target,
             info: None,
@@ -109,92 +108,7 @@ pub struct TabLaunch {
     pub role: TabRole,
 }
 
-pub enum Tab {
-    Terminal(Box<TermTab>),
-    /// The preferences page (at most one; never persisted).
-    Settings,
-}
-
 impl Tab {
-    pub fn term(&self) -> Option<&TermTab> {
-        match self {
-            Tab::Terminal(t) => Some(t),
-            Tab::Settings => None,
-        }
-    }
-
-    pub fn term_mut(&mut self) -> Option<&mut TermTab> {
-        match self {
-            Tab::Terminal(t) => Some(t),
-            Tab::Settings => None,
-        }
-    }
-
-    /// The terminal tab's uid.
-    pub fn uid(&self) -> Option<u64> {
-        self.term().map(|t| t.uid)
-    }
-
-    /// The uid of a terminal tab that may sit in a pane: only session tabs do (update and
-    /// installer tabs and the settings page always take the full width).
-    pub fn pane_uid(&self) -> Option<u64> {
-        self.term()
-            .filter(|t| t.role == TabRole::Session)
-            .map(|t| t.uid)
-    }
-
-    pub fn is_settings(&self) -> bool {
-        matches!(self, Tab::Settings)
-    }
-
-    pub fn session_path(&self) -> Option<&Path> {
-        self.term().and_then(TermTab::session_path)
-    }
-
-    pub fn mux_name(&self) -> Option<&str> {
-        self.term().and_then(|t| t.mux_name.as_deref())
-    }
-
-    pub fn title<'a>(&'a self, labels: &'a HashMap<PathBuf, String>) -> &'a str {
-        match self {
-            Tab::Terminal(t) => t.title(labels),
-            Tab::Settings => "Settings",
-        }
-    }
-
-    /// The title without omp's `π <glyph>` prefix: the status indicator shows that state.
-    pub fn label<'a>(&'a self, labels: &'a HashMap<PathBuf, String>) -> &'a str {
-        match self {
-            // Restored tabs fall back to the stored (raw) title until omp sets one.
-            Tab::Terminal(t) => {
-                strip_omp_prefix(t.pick_title(labels, t.terminal().title().map(strip_omp_prefix)))
-            }
-            Tab::Settings => "Settings",
-        }
-    }
-
-    /// The leading indicator; the bell only counts on a background tab.
-    pub fn status(&self, active: bool) -> TabStatus {
-        match self.term() {
-            Some(t) => t.status(t.bell && !active),
-            None => TabStatus::Idle,
-        }
-    }
-
-    /// The idle icon and its accent (`sel` = selection 0..=1, mixing from `weak`).
-    pub fn kind_icon(&self, pal: &Palette, sel: f32) -> (Icon, Color32) {
-        match self {
-            Tab::Settings => (ICON_SETTINGS, theme::mix(pal.weak, pal.accent, sel)),
-            Tab::Terminal(t) if matches!(t.role, TabRole::Update(_) | TabRole::InstallOmp) => (
-                ICON_DOWNLOAD,
-                theme::mix(pal.weak, pal.accent_a, sel.max(0.6)),
-            ),
-            Tab::Terminal(_) => (ICON_TERMINAL, theme::mix(pal.weak, pal.accent_b, sel)),
-        }
-    }
-}
-
-impl TermTab {
     /// The terminal, for rendering, user input and read-only queries.
     pub fn terminal(&self) -> &Terminal {
         &self.term
@@ -279,9 +193,39 @@ impl TermTab {
         }
     }
 
-    /// The indicator without the bell: the gateway's record, else the terminal's own state.
-    pub fn status(&self, bell: bool) -> TabStatus {
-        TabStatus::of(self.term.exit_code(), self.activity(), bell)
+    /// The backend session name, if any.
+    pub fn mux_name(&self) -> Option<&str> {
+        self.mux_name.as_deref()
+    }
+
+    /// The leading indicator: the gateway's record, else the terminal's own state; the bell only
+    /// counts on a background tab.
+    pub fn status(&self, active: bool) -> TabStatus {
+        TabStatus::of(self.term.exit_code(), self.activity(), self.bell && !active)
+    }
+
+    /// The uid of a tab that may sit in a pane: only session tabs do (update and installer
+    /// tabs always take the full width).
+    pub fn pane_uid(&self) -> Option<u64> {
+        (self.role == TabRole::Session).then_some(self.uid)
+    }
+
+    /// The title without omp's `π <glyph>` prefix: the status indicator shows that state.
+    pub fn label<'a>(&'a self, labels: &'a HashMap<PathBuf, String>) -> &'a str {
+        // Restored tabs fall back to the stored (raw) title until omp sets one.
+        strip_omp_prefix(self.pick_title(labels, self.terminal().title().map(strip_omp_prefix)))
+    }
+
+    /// The idle icon and its accent (`sel` = selection 0..=1, mixing from `weak`).
+    pub fn kind_icon(&self, pal: &Palette, sel: f32) -> (Icon, Color32) {
+        if matches!(self.role, TabRole::Update(_) | TabRole::InstallOmp) {
+            (
+                ICON_DOWNLOAD,
+                theme::mix(pal.weak, pal.accent_a, sel.max(0.6)),
+            )
+        } else {
+            (ICON_TERMINAL, theme::mix(pal.weak, pal.accent_b, sel))
+        }
     }
 
     pub fn activity(&self) -> Activity {
@@ -429,19 +373,19 @@ pub struct Anchor {
 }
 
 impl Anchor {
-    /// The anchor of strip position `slot`; `uids` lists the strip (`None` = not a terminal tab).
-    pub fn at(uids: &[Option<u64>], slot: usize) -> Anchor {
+    /// The anchor of strip position `slot`; `uids` lists the strip.
+    pub fn at(uids: &[u64], slot: usize) -> Anchor {
         let slot = slot.min(uids.len());
         Anchor {
-            after: uids[..slot].iter().rev().find_map(|u| *u),
-            before: uids[slot..].iter().find_map(|u| *u),
+            after: uids[..slot].last().copied(),
+            before: uids[slot..].first().copied(),
         }
     }
 
     /// The strip position to insert at: after the left neighbour, else before the right one,
     /// else at the end.
-    pub fn index(&self, uids: &[Option<u64>]) -> usize {
-        let find = |want: Option<u64>| want.and_then(|w| uids.iter().position(|u| *u == Some(w)));
+    pub fn index(&self, uids: &[u64]) -> usize {
+        let find = |want: Option<u64>| want.and_then(|w| uids.iter().position(|u| *u == w));
         match (find(self.after), find(self.before)) {
             (Some(i), _) => i + 1,
             (None, Some(j)) => j,
@@ -608,7 +552,7 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     let pal = Palette::of_ui(ui);
     let title = tab.label(input.labels);
     let active = i == input.active;
-    let shown = tab.uid().is_some_and(|u| input.shown.contains(&Some(u)));
+    let shown = input.shown.contains(&Some(tab.uid));
     let status = tab.status((active || shown) && !input.dashboard);
 
     let text_color = if active { pal.text_strong } else { pal.text };
@@ -720,8 +664,7 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
 /// in the header, folder / session file / model / backend session in the body.
 pub fn hover_card(resp: &egui::Response, pal: &Palette, tab: &Tab, title: &str, status: TabStatus) {
     const KEY_W: f32 = 76.0;
-    let term = tab.term();
-    let exit = term.and_then(|t| t.terminal().exit_code());
+    let exit = tab.terminal().exit_code();
     let mut head =
         card::Header::new(tab.kind_icon(pal, 1.0).0, title).tone(tips::status_tone(pal, status));
     if let Some(hint) = status.hint() {
@@ -733,25 +676,21 @@ pub fn hover_card(resp: &egui::Response, pal: &Palette, tab: &Tab, title: &str, 
         false,
         &head,
         |ui| {
-            if term.is_some() {
-                tips::status_badge(ui, status, exit);
-            }
+            tips::status_badge(ui, status, exit);
         },
         |ui| {
-            if let Some(t) = term {
-                card::kv(ui, KEY_W, "Folder", |ui| tips::path(ui, &t.cwd));
-                if let Some(p) = t.session_path() {
-                    card::kv(ui, KEY_W, "Session", |ui| tips::path(ui, p));
-                }
-                if let Some(m) = t.info().and_then(|i| i.current_model.as_deref()) {
-                    card::kv(ui, KEY_W, "Model", |ui| {
-                        let name = m.rsplit('/').next().unwrap_or(m);
-                        badge::show(ui, Some(ICON_SPARKLES), name, Hue::Violet, tips::VALUE);
-                    });
-                }
-                if let Some(n) = &t.mux_name {
-                    card::kv(ui, KEY_W, "tmux", |ui| tips::mono(ui, n));
-                }
+            card::kv(ui, KEY_W, "Folder", |ui| tips::path(ui, &tab.cwd));
+            if let Some(p) = tab.session_path() {
+                card::kv(ui, KEY_W, "Session", |ui| tips::path(ui, p));
+            }
+            if let Some(m) = tab.info().and_then(|i| i.current_model.as_deref()) {
+                card::kv(ui, KEY_W, "Model", |ui| {
+                    let name = m.rsplit('/').next().unwrap_or(m);
+                    badge::show(ui, Some(ICON_SPARKLES), name, Hue::Violet, tips::VALUE);
+                });
+            }
+            if let Some(n) = &tab.mux_name {
+                card::kv(ui, KEY_W, "tmux", |ui| tips::mono(ui, n));
             }
             card::footer_hints(
                 ui,
@@ -772,7 +711,7 @@ mod tests {
     #[test]
     fn an_anchor_survives_a_tab_closing_in_front_of_it() {
         // Strip A B [slot] C D; the tab at the slot is being relaunched.
-        let strip = [Some(1), Some(2), Some(3), Some(4)];
+        let strip = [1, 2, 3, 4];
         let anchor = Anchor::at(&strip, 2);
         assert_eq!(
             anchor,
@@ -783,16 +722,16 @@ mod tests {
         );
         assert_eq!(anchor.index(&strip), 2);
         // A closes meanwhile: an absolute index 2 would now land after C.
-        let closed_front = [Some(2), Some(3), Some(4)];
+        let closed_front = [2, 3, 4];
         assert_eq!(anchor.index(&closed_front), 1);
         // The left neighbour closes: fall back to the right one.
-        assert_eq!(anchor.index(&[Some(1), Some(3), Some(4)]), 1);
+        assert_eq!(anchor.index(&[1, 3, 4]), 1);
         // Both neighbours gone: the end.
-        assert_eq!(anchor.index(&[Some(1), Some(4)]), 2);
-        // Edges and non-terminal tabs.
-        assert_eq!(Anchor::at(&[None, Some(7)], 1).after, None);
+        assert_eq!(anchor.index(&[1, 4]), 2);
+        // Edges.
+        assert_eq!(Anchor::at(&[7], 1).after, Some(7));
         assert_eq!(
-            Anchor::at(&[Some(7)], 0),
+            Anchor::at(&[7], 0),
             Anchor {
                 after: None,
                 before: Some(7)

@@ -835,21 +835,21 @@ export function updates(now: number, phase: api.UpdatePhase, ompChecking: boolea
 
 export const DEFAULT_PREFS: api.PushPrefs = { turn_finished: true, attention: true, ended: false, show_titles: false };
 
-export function driveFeed(now: number, busy: string | null): Extract<api.FeedValue, { feed: 'drive' }> {
-  return { feed: 'drive', available: true, signed_in: true, account: 'axel@example.com', last_backup_unix_ms: now - 5 * HOUR, interval: 'daily', busy, error: null };
+export function backupFeed(now: number, busy: string | null): Extract<api.FeedValue, { feed: 'backup' }> {
+  return { feed: 'backup', destination: { kind: 'drive', label: 'Google Drive' }, available: true, connected: true, account: 'axel@example.com', last_backup_unix_ms: now - 5 * HOUR, interval: 'daily', busy, error: null };
 }
 
-export function driveBackups(now: number): api.DriveHost[] {
-  const backup = (host: string, n: number, age: number, size: number): api.DriveBackupView => ({ id: `drv-${host}-${n}`, name: `ompdeck-settings-${host}-${n}.tar.zst`, size, created_unix_ms: now - age });
+export function backupList(now: number): api.BackupHost[] {
+  const backup = (host: string, n: number, age: number, size: number): api.BackupFileView => ({ id: `drv-${host}-${n}`, name: `ompdeck-settings-${host}-${n}.tar.zst`, size, created_unix_ms: now - age });
   return [
     { host: 'workstation', backups: [backup('workstation', 3, 5 * HOUR, 4_812_331), backup('workstation', 2, 29 * HOUR, 4_790_002), backup('workstation', 1, 8 * DAY, 4_102_118)] },
     { host: 'laptop', backups: [backup('laptop', 3, 2 * DAY, 3_201_774), backup('laptop', 2, 9 * DAY, 3_188_090), backup('laptop', 1, 31 * DAY, 2_904_655)] },
   ];
 }
 
-export function drivePlan(): api.RestorePlanView {
+export function backupPlan(): api.RestorePlanView {
   return {
-    type: 'drive',
+    type: 'backup',
     name: 'ompdeck-settings-laptop-3.tar.zst',
     created_unix_ms: Date.now() - 2 * DAY,
     host: 'laptop',

@@ -86,9 +86,12 @@ Recon facts used here (2026-10-30):
 - **"Open on desktop"** is explicit and named so. It targets the desktop GUI through a new `ServerEvent` (open/focus a
   session's tab, optionally in a split; close a tab). With no GUI connected, the gateway starts the app with
   `--activate` as it already does for notifications. Phone navigation never moves desktop focus by itself.
-- **Drive sign-in** cannot finish on a phone (loopback OAuth). The phone offers **"Sign in on desktop"**: the gateway
-  opens the URL in the desktop browser (through the GUI if connected, otherwise `--activate`), and the phone watches
-  the `drive` feed. With no desktop session it is refused with `rejected { reason: "needs desktop" }`.
+- **Backups follow the active destination** (main 0.20.0: Google Drive, FTP, FTPS or SFTP). Drive sign-in cannot
+  finish on a phone (loopback OAuth), so for Drive the phone offers **"Sign in on the desktop"** (`backup_connect`):
+  the gateway opens the URL in the desktop browser (through the GUI if connected, otherwise `--activate`), and the
+  phone watches the `backup` feed. With no desktop session it is refused with `rejected { reason: "needs desktop" }`.
+  `backup_connect` is refused for server destinations: the phone tells the user to set the server up in the desktop's
+  Settings → Backup.
 - **OmpDeck self-update from the phone:** check and download are allowed. Apply is allowed only for in-place kinds
   (tarball/install.sh, AppImage, Windows dir). The pkexec kinds (deb/rpm) answer `rejected { reason: "at desktop" }`
   because the polkit prompt appears on the desktop. After apply, the gateway is replaced and the phone reconnects
@@ -116,7 +119,7 @@ Types not defined here are v1 types. `Id`s are strings. The class determines the
 | `usage_activity` | `days: u32` (1..=371) | View | | `activity { days: Vec<DayCount> }` |
 | `usage_refresh` | — | View | | `unit` |
 | `omp_settings` | — | View | | `omp_settings { groups, truncated }` (secrets: `set: bool` only, never a value) |
-| `drive_backups` | — | View | | `drive_backups { hosts, truncated }` |
+| `backup_list` | — | View | | `backup_list { hosts, truncated }` (versions on the active destination) |
 | `sync_backups` | `project?` | View | | `sync_backups { backups, truncated }` |
 | `presence` | `visible: bool` | View | | `unit` (push is skipped while the device reports visible and connected) |
 | `push_subscribe` | `endpoint`, `p256dh`, `auth` (base64url) | View | | `unit` |
@@ -141,7 +144,7 @@ Types not defined here are v1 types. `Id`s are strings. The class determines the
 | `worktree_finish` | `project` (the worktree's project) | Control | J | `unit` (progress events; the flow runs on the gateway) |
 | `worktree_continue` | `parked: String`, `where: ContinueWhere` | Control | J | `session { live }` |
 | `update_check` | — | Control | | `unit` |
-| `drive_backup` | — | Control | J | `unit` |
+| `backup_run` | — | Control | J | `unit` |
 | `sync_backup` | `project` | Control | J | `unit` |
 | `open_on_desktop` | `session`, `split: Split` | Control | J | `unit` |
 | `close_on_desktop` | `session` | Control | J | `unit` |
@@ -150,16 +153,16 @@ Types not defined here are v1 types. `Id`s are strings. The class determines the
 | `omp_reset` | `key` | Manage | J | `unit` |
 | `update_run` | `kind: UpdateKind` | Manage | J | `session { live }` (runs in a session the phone can attach to) |
 | `app_update` | `step: AppUpdateStep` | Manage | J | `unit` |
-| `drive_sign_in` | — | Manage | J | `unit` |
-| `drive_delete` | `ids: Vec<String>` | Manage | J | `unit` |
-| `drive_restore_prepare` | `id` | Manage | J | `restore_plan { handle, plan }` |
-| `drive_restore_apply` / `drive_restore_discard` | `handle: u64` | Manage | J | `unit` |
+| `backup_connect` | — | Manage | J | `unit` (Drive only) |
+| `backup_delete` | `ids: Vec<String>` | Manage | J | `unit` |
+| `backup_restore_prepare` | `id` | Manage | J | `restore_plan { handle, plan }` |
+| `backup_restore_apply` / `backup_restore_discard` | `handle: u64` | Manage | J | `unit` |
 | `sync_add` | `dir: DirToken` | Manage | J | `unit` |
 | `sync_set` | `project`, `parts: SyncParts`, `excluded: Vec<String>` (session ids) | Manage | J | `unit` |
 | `sync_remove` | `project` | Manage | J | `unit` |
 | `sync_delete` | `ids: Vec<String>` | Manage | J | `unit` |
 | `sync_restore_prepare` | `backup`, `target: RestoreTarget`, `parts: SyncParts` | Manage | J | `restore_plan { handle, plan }` |
-| `sync_restore_apply` | `handle`, `conflicts: Vec<ConflictChoice>` | Manage | J | `unit` |
+| `sync_restore_apply` | `handle`, `conflicts: Vec<ConflictChoice>`, `excluded?: Vec<String>` (session ids left out, main 0.19.1) | Manage | J | `unit` |
 
 ### New feeds (gate `s4`; latest value only, bounded with `truncated`)
 
@@ -171,7 +174,7 @@ Types not defined here are v1 types. `Id`s are strings. The class determines the
 | `usage` | — | `{ usage?: UsageView, fetched_unix_ms?, error? }` (provider quota cards, tightest remaining) |
 | `agents` | `session` | `{ session, agents: Vec<AgentView>, truncated }` (subagent list: id, label, status incl. parked, model, tokens, cost, parent) |
 | `worktrees` | `project` | `{ project, worktree?: WorktreeView, parked: Vec<ParkedView> }` |
-| `drive` | — | `{ signed_in, account?, last_backup_unix_ms?, interval, busy?, error? }` |
+| `backup` | — | `{ destination: { kind: drive\|ftp\|ftps\|sftp, label }, available, connected, account?, last_backup_unix_ms?, interval, busy?, error? }` (never secrets; `account` = Google email, null for servers) |
 | `sync` | — | `{ rows: Vec<SyncRowView>, interval, busy?, truncated }` |
 | `updates` | — | `{ omp: OmpUpdateView, app: AppUpdateView }` |
 | `device` | — | `{ name, permissions, push: PushStateView, gateway_version, mode }` |
@@ -204,16 +207,19 @@ Types not defined here are v1 types. `Id`s are strings. The class determines the
 - `PushPrefs { turn_finished, attention, ended, show_titles }` (defaults true, true, true, false).
 - `DoneView` gains `text { text }`, `killed { results }` and `restore_plan { handle, plan: RestorePlanView }`; these are
   sent only to `s4` devices. `Resp` gains `text`, `download`, `chunk`, `tree`, `dir`, `activity`, `omp_settings`,
-  `drive_backups`, `sync_backups`, `upload`.
+  `backup_list`, `sync_backups`, `upload`.
 
 ### As built (P1)
 
-`crates/deck-remote/src/api.rs` is authoritative for every field set. Vectors: `tests/vectors/api-s4.json` (142
+`crates/deck-remote/src/api.rs` is authoritative for every field set. Vectors: `tests/vectors/api-s4.json` (146
 messages, 12 refused requests; `"features":["s4"]`), pinned in `wire_freeze.rs`. `api-v1.json` regenerates
 byte-identically (test). Deltas from the sketch above:
-- `usage` and `worktrees` values carry `truncated`, `usage` also carries `fetching`, `drive` carries `available`, and
+- `usage` and `worktrees` values carry `truncated`, `usage` also carries `fetching`, `backup` carries `available`, and
   `DoneView::RestorePlan` carries `truncated`.
-- `RestorePlanView` is tagged: `drive{…, safety_display}` | `project{target_display, …, sessions}`.
+- `RestorePlanView` is tagged: `backup{…, safety_display}` | `project{target_display, …, sessions}`.
+- Merge with main 0.20.0: the s4 Drive surface was renamed destination-neutral before release (no aliases). Backup and
+  project listings remember the destination they came from; their ids resolve only while it is still active
+  (`not_found("backup")` after a switch), and the phone's sync state resets on a switch.
 - `UiRequestView` is one flat struct keyed by `kind: UiKind`; `initial`/`recommended` are option indices; a grant's
   `scope` is a free string.
 - `AppUpdateView.apply_allowed` (false for pkexec kinds); `needs_manual` carries no install command (it would hold
@@ -465,7 +471,8 @@ Gateway (`crates/deck-service`):
   - `push/{mod,vapid,ssrf,sender}.rs`.
 - **Local protocol additions:**
   - Mutations:
-    - `Review`, `AnswerUi`, `OpenOnDesktop`, `CloseOnDesktop`, `DriveSignInOnDesktop`;
+    - `Review`, `AnswerUi`, `OpenOnDesktop`, `CloseOnDesktop`, `BackupConnectOnDesktop` (Drive only: active destination
+      Drive, Google credentials present, desktop reachable);
     - `WorktreeNew{repo, branch, base_ref, dest, open}`, `WorktreeMoveSession{target, branch}`, `WorktreeFinish{worktree}`,
       `WorktreeRetire{worktree, park}`, `WorktreeContinue{primary, branch, session, place}`;
     - `Command::{Steer, Compose}`.
@@ -485,8 +492,8 @@ Gateway (`crates/deck-service`):
   - Finished uploads are kept up to 16 per device; the oldest is dropped first.
   - `unpair` revokes once the reply is flushed, at the latest after 5 s.
   - `DoneView::Text` is reserved: no gateway result maps to it yet.
-- `drive_delete` / `sync_delete` take 1–100 distinct ids and delete them in order in one journaled job (local
-  `Mutation::DriveDeleteBackups` / `ProjectDeleteBackups`). The job stops at the first failure, naming the ids already
+- `backup_delete` / `sync_delete` take 1–100 distinct ids and delete them in order in one journaled job (local
+  `Mutation::DeleteBackups` / `ProjectDeleteBackups`). The job stops at the first failure, naming the ids already
   deleted.
 - Security fixes (S4-1…S4-9):
   - Export/blob reserve a download slot before any worker runs: 1 export and 2 blob workers per device. Export files
