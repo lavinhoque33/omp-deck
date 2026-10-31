@@ -239,27 +239,43 @@ pub struct Relay {
     pub key: RoomKey,
     pub stop: Option<tokio::sync::oneshot::Sender<()>>,
     pub thread: Option<std::thread::JoinHandle<()>>,
+    config: deck_relay::Config,
 }
 
 impl Relay {
     pub fn start(dir: PathBuf) -> Relay {
-        Relay::start_with(deck_relay::Config::new(dir))
+        Relay::start_with(deck_relay::Config::new(dir), 0)
     }
 
-    /// The relay also serving the phone app from `web_dir` (`--web-dir`).
-    pub fn start_serving(dir: PathBuf, web_dir: PathBuf) -> Relay {
+    /// The relay also serving the phone app from `web_dir` (`--web-dir`), on `port` (0: any).
+    pub fn start_serving(dir: PathBuf, web_dir: PathBuf, port: u16) -> Relay {
         let mut config = deck_relay::Config::new(dir);
         config.web_dir = Some(web_dir);
-        Relay::start_with(config)
+        Relay::start_with(config, port)
     }
 
-    fn start_with(config: deck_relay::Config) -> Relay {
+    fn start_with(config: deck_relay::Config, port: u16) -> Relay {
         let (key, _) = deck_relay::rooms::enroll(&config.state_dir, "test").expect("enroll a room");
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the relay");
-        let port = listener.local_addr().expect("relay address").port();
+        let mut relay = Relay {
+            port,
+            key,
+            stop: None,
+            thread: None,
+            config,
+        };
+        relay.serve();
+        relay
+    }
+
+    /// Serves on `self.port` (0: any, then remembered); the enrolled room stays in the state dir.
+    fn serve(&mut self) {
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", self.port)).expect("bind the relay");
+        self.port = listener.local_addr().expect("relay address").port();
         listener.set_nonblocking(true).expect("nonblocking");
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let thread = std::thread::spawn(move || {
+        let config = self.config.clone();
+        self.thread = Some(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -272,12 +288,23 @@ impl Relay {
                 .await
                 .expect("relay serve");
             });
-        });
-        Relay {
-            port,
-            key,
-            stop: Some(stop),
-            thread: Some(thread),
+        }));
+        self.stop = Some(stop);
+    }
+
+    /// Stops the relay (every connection closes) and serves again on the same port and room,
+    /// like a relay restart or upgrade.
+    pub fn restart(&mut self) {
+        self.shut();
+        self.serve();
+    }
+
+    fn shut(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
         }
     }
 
@@ -288,12 +315,7 @@ impl Relay {
 
 impl Drop for Relay {
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        self.shut();
     }
 }
 

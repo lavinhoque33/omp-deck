@@ -132,7 +132,11 @@ export class LiveRun {
   }
 
   async open(context: BrowserContext): Promise<void> {
-    const page = await context.newPage();
+    await this.attach(await context.newPage());
+  }
+
+  /** Watches `page` (console and page errors, WebSockets, CSP violations) and makes it current. */
+  async attach(page: Page): Promise<void> {
     this.#page = page;
     page.on('pageerror', (error) => this.errors.push(`pageerror: ${error.message}`));
     page.on('console', (message) => {
@@ -210,7 +214,7 @@ export class LiveRun {
   }
 }
 
-function assert(condition: boolean, message: string): asserts condition {
+export function assert(condition: boolean, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 

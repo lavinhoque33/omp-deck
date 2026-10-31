@@ -629,3 +629,53 @@ PWA (`pwa/`):
 
 Real-phone delivery (Android Chrome, iOS 16.4+ Home Screen, real push services) is slice 5's release proof. Slice 4
 proves everything that can run on this machine and in CI.
+
+## Slice 5: real-phone proof (Android)
+
+Proven on a Motorola Edge+ 2023 (Android 14, Chrome 156) over USB, by hand first and then as the re-runnable gate
+`bun run phone` (`pwa/e2e/phone/`). iPhone (iOS 16.4+ Home Screen web app) is **not** proven: no device available.
+
+- **Setup:** the same launcher as `bun run live` (`pwa/e2e/live/stack.ts`): real relay serving `dist/`, real
+  sandboxed gateway, real omp on the scripted model. The relay listens on a fixed port (`OMPDECK_LIVE_RELAY_PORT`,
+  default `PHONE_RELAY_PORT` = 47319), `adb reverse` maps it, so the phone's Chrome loads `http://127.0.0.1:47319`.
+  That is a secure context, so the service worker and Web Push work. Push goes through **the real push service**
+  (`fcm.googleapis.com`), not the loopback receiver. TLS termination (Caddy/nginx, `docs/relay.md`) is not part of
+  this proof.
+- **Driving:** input is physical. The gate finds web elements in `uiautomator` dumps (Chrome exposes the page's
+  accessibility tree with screen bounds) and sends `input tap` / `input text` / `keyevent`, so taps, the soft
+  keyboard, Chrome's permission prompts, the Android file chooser and the notification shade are the real OS
+  paths. DevTools (`adb forward … localabstract:chrome_devtools_remote` + Playwright `connectOverCDP`) only
+  observes: the transcript, WebSockets, CSP reports and console errors.
+- **Steps (all passing):**
+  1. pairing link opened by an Android `VIEW` intent (what a scanned QR does); fingerprint matches the desktop; approved;
+  2. still paired after a reload; device WebSocket open;
+  3. Settings → Notifications → push switch → Chrome's "Allow" prompt (first run on the origin) → subscribed at
+     `fcm.googleapis.com`; the desktop's Mobile access shows push on;
+  4. new session; a prompt typed with the phone's keyboard; the composer stays above the keyboard (`visualViewport`);
+  5. omp's question answered with taps;
+  6. image attached through Android's chooser ("Photos & videos"), reaching the model byte-identical;
+  7. a 20 s turn (`PUSH-LONG-MARK`); back to the session list; Home while the turn still runs → exactly one
+     "OmpDeck — A session finished" notification in Android's list (~13 s after leaving); tapping it in the shade
+     brings Chrome back **on that session**, and the notification closes;
+  8. relay restarted (`POST /relay-restart`; same port, room and enrolment): the phone reconnects on its own (~3 s)
+     and the next prompt goes through;
+  9. 0 CSP violations, 0 console errors.
+- **Hygiene:** before and after a run the gate clears the origin's site data (pairing, service worker, push
+  subscription) with `Storage.clearDataForOrigin` on a **tab's** CDP session (Android Chrome answers the
+  browser session with "Internal error"), closes the origin's tabs, removes the pushed image, collapses the shade
+  and removes its port mappings. Chrome's notification permission for the origin stays granted, so later runs
+  skip the prompt (the gate reports which case ran). Phone settings are never changed.
+- **Findings:**
+  - **Fixed:** the notification badge was the full-colour `icon-192.png`; Android draws badges from the alpha
+    channel only, so it showed a blank disc. Now `public/badge-96.png` (white stacked cards with `>_` cut out,
+    transparent), precached.
+  - **Harness:** while DevTools is attached Chrome keeps the page `visible` after Home, so the app keeps reporting
+    `presence` visible and the gateway (correctly) skips the push. The gate detaches before Home. Chrome's DevTools
+    socket also refuses connections while Chrome is in the background, so cleanup brings Chrome to the front first.
+  - **Harness:** `adb reverse --remove` does not drop established connections, so it cannot simulate a network loss;
+    the gate restarts the relay instead.
+  - **Accessibility:** uiautomator lists the composer's textarea with `NAF="true"` and no name even though it has
+    `aria-label="Message"`; the gate finds it as Chrome's only `EditText` without a resource id. Not changed.
+
+Run: phone unlocked, USB debugging on, `cd pwa && bun run phone` (`ANDROID_SERIAL` picks one of several devices).
+Screenshots go to `/tmp/pwa-smoke/phone/`.

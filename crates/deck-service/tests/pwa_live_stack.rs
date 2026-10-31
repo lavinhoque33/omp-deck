@@ -13,9 +13,14 @@
 //! - `GET /requests?after=N`: what the model received (`N` = requests already seen);
 //! - `GET /png`: a 200×200 PNG fixture;
 //! - `GET /push-subscription`: a subscription (loopback endpoint and keys) for the browser's
-//!   stubbed `PushManager`, and `GET /pushes`: every push its receiver got, decrypted.
+//!   stubbed `PushManager`, and `GET /pushes`: every push its receiver got, decrypted;
+//! - `POST /relay-restart`: stops the relay (every connection closes) and serves again on the
+//!   same port and room, answered once it serves.
 //!
-//! `#[ignore]`d: run by the gate with `--ignored`; skipped when omp is not installed.
+//! `$OMPDECK_LIVE_RELAY_PORT` fixes the relay's port (the app origin); default any free port.
+//!
+//! `#[ignore]`d: run by `bun run live` and `bun run phone` with `--ignored`; skipped when omp is
+//! not installed.
 
 mod support;
 
@@ -39,6 +44,8 @@ use web_push_native::{Auth, p256};
 
 /// Longer than the turn-finished threshold (`notifications::tracker::MIN_BUSY`, 3 s).
 const SLOW_TURN: Duration = Duration::from_millis(4500);
+/// Long enough for the phone gate to leave the conversation and background the app by taps.
+const LONG_TURN: Duration = Duration::from_secs(20);
 /// How long the steered turn's tool call streams (time to steer while busy).
 const STEER_STREAM: Duration = Duration::from_secs(8);
 /// The stack never outlives a runner that died without writing the stop file.
@@ -89,6 +96,9 @@ fn script(notes: PathBuf) -> impl FnMut(&Value) -> Reply + Send + 'static {
         }
         if user.contains("PUSH-MARK") {
             return Reply::slow_text("PUSH-REPLY finished after a while", SLOW_TURN);
+        }
+        if user.contains("PUSH-LONG-MARK") {
+            return Reply::slow_text("PUSH-REPLY finished after a long while", LONG_TURN);
         }
         if user.contains("IMG-MARK") {
             let n = fm::last_user(req).map_or(0, |m| fm::images(m).len());
@@ -298,9 +308,13 @@ struct Published {
 /// An approval asked for with the phone's fingerprint, answered by the main thread.
 type ApproveAsk = (String, mpsc::Sender<Result<(), String>>);
 
+/// A relay restart asked for; answered once the relay serves again.
+type RestartAsk = mpsc::Sender<()>;
+
 struct Control {
     published: Arc<Mutex<Published>>,
     approve: mpsc::Sender<ApproveAsk>,
+    restart: mpsc::Sender<RestartAsk>,
     model: Arc<FakeModel>,
     png: Vec<u8>,
     ua: Ua,
@@ -343,6 +357,20 @@ impl Control {
                 match rx.recv_timeout(STEP * 2) {
                     Ok(Ok(())) => json(json!({ "approved": true })),
                     Ok(Err(e)) => ("409 Conflict", "text/plain", e.into_bytes()),
+                    Err(_) => ("504 Gateway Timeout", "text/plain", b"no answer".to_vec()),
+                }
+            }
+            ("POST", "/relay-restart") => {
+                let (tx, rx) = mpsc::channel();
+                if self.restart.send(tx).is_err() {
+                    return (
+                        "503 Service Unavailable",
+                        "text/plain",
+                        b"stopping".to_vec(),
+                    );
+                }
+                match rx.recv_timeout(STEP) {
+                    Ok(()) => json(json!({ "restarted": true })),
                     Err(_) => ("504 Gateway Timeout", "text/plain", b"no answer".to_vec()),
                 }
             }
@@ -420,7 +448,7 @@ fn mobile_summary(m: &deck_service::gateway::protocol::MobileView) -> Value {
 }
 
 #[test]
-#[ignore = "the phone app's live gate: run by `bun run live` in pwa/"]
+#[ignore = "the phone app's live gates: run by `bun run live` / `bun run phone` in pwa/"]
 fn pwa_live_stack() {
     if which(if cfg!(windows) { "omp.exe" } else { "omp" }).is_none() {
         eprintln!("skipped: omp is not installed");
@@ -454,7 +482,12 @@ fn pwa_live_stack() {
     std::fs::write(sb.agent().join("models.yml"), model.models_yml()).expect("models.yml");
     let pushes = Arc::new(Mutex::new(Vec::new()));
     let push_port = push_receiver(pushes.clone());
-    let relay = Relay::start_serving(sb.root.join("relay"), web_dir);
+    // A fixed port keeps one app origin across runs (`bun run phone`: the phone's Chrome keeps
+    // its site data and permission per origin).
+    let port = std::env::var("OMPDECK_LIVE_RELAY_PORT")
+        .ok()
+        .map_or(0, |p| p.parse().expect("OMPDECK_LIVE_RELAY_PORT is a port"));
+    let mut relay = Relay::start_serving(sb.root.join("relay"), web_dir, port);
 
     let client = sb.client();
     wait_for("the gateway link", Duration::from_secs(30), || {
@@ -476,9 +509,11 @@ fn pwa_live_stack() {
 
     let published = Arc::new(Mutex::new(Published::default()));
     let (approve, asks) = mpsc::channel::<ApproveAsk>();
+    let (restart, restarts) = mpsc::channel::<RestartAsk>();
     let control = Control {
         published: published.clone(),
         approve,
+        restart,
         model: model.clone(),
         png: gradient_png(PNG_SIDE),
         ua: Ua::new(),
@@ -558,6 +593,11 @@ fn pwa_live_stack() {
             };
             eprintln!("pwa live stack: approval {result:?}");
             let _ = answer.send(result);
+        }
+        while let Ok(answer) = restarts.try_recv() {
+            relay.restart();
+            eprintln!("pwa live stack: relay restarted on port {}", relay.port);
+            let _ = answer.send(());
         }
         std::thread::sleep(Duration::from_millis(50));
     }

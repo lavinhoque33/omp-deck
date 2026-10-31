@@ -118,10 +118,10 @@ host), so closing a tab or the whole app leaves omp running.
   light. The terminal colors follow the style, and a Comfortable density option is available (Settings → OmpDeck).
   "Separated panels" (on by default) shows the sidebar and main area as separate rounded, bordered panels, like VS Code.
   Integrated title bar (or native decorations), persisted window geometry and open tabs.
-- **Mobile companion (preview)**: control your omp sessions from your phone through a relay you host yourself:
+- **Mobile companion**: control your omp sessions from your phone through a relay you host yourself:
   conversations with send / steer / follow-up, image attachments, answers to omp's questions, a terminal view,
   agents, changes and review comments, worktrees, session manager, usage, omp settings, backups and push
-  notifications. See [Mobile companion](#mobile-companion-preview).
+  notifications. See [Mobile companion](#mobile-companion).
 
 OmpDeck never writes to the omp session store directly; changes go through omp's own CLI.
 
@@ -451,10 +451,10 @@ that branch, the sessions move back into it) and **Continue in main checkout** (
 the branch after showing which other running sessions there will see it; refused while the main checkout has
 uncommitted changes), plus **Switch main checkout back to …**. Unpushed work is never parked.
 
-## Mobile companion (preview)
+## Mobile companion
 
-**Preview:** the protocol and app are complete and tested end to end, but notifications on a real phone have
-not been verified yet. Feedback is welcome.
+Verified end to end on a real Android phone (Chrome): pairing, prompts, attachments, push notifications through
+Google's push service, and reconnects.
 
 The phone app is a web app (PWA) that talks to OmpDeck on your desktop through a **relay you host yourself**.
 The relay only forwards end-to-end encrypted frames (Noise); it never sees your sessions, keys or content. There

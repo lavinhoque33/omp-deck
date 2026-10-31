@@ -102,6 +102,7 @@ export async function build({ outdir = join(ROOT, 'dist'), minify = true }: { ou
     '/index.html',
     ...files(join(outdir, 'assets')).map((path) => `/${relative(outdir, path).split('\\').join('/')}`),
     '/manifest.webmanifest',
+    '/badge-96.png',
     '/icon-192.png',
     '/icon-512.png',
     '/apple-touch-icon.png',

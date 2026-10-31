@@ -75,7 +75,8 @@ self.addEventListener('push', (event) => {
   const options: NotificationOptions = {
     body: shown.body,
     icon: '/icon-192.png',
-    badge: '/icon-192.png',
+    // Android draws the status-bar badge from the alpha channel only: a white silhouette.
+    badge: '/badge-96.png',
     data: { navigate: shown.navigate },
     silent: shown.silent,
   };

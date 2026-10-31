@@ -7,6 +7,7 @@
     "dev": "bun run build.ts --dev",
     "e2e": "bun e2e/run.ts",
     "live": "bun e2e/live/run.ts",
+    "phone": "bun e2e/phone/run.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit -p . && tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.sw.json"
   },
