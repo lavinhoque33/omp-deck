@@ -315,20 +315,24 @@ The terminal path (attach `input`/`control`) keeps working for every kind.
 - **Payload:**
   - Declarative Web Push JSON (WebKit, iOS 18.4+; the service worker handles the same JSON elsewhere):
     `{"web_push":8030,"notification":{"title":"OmpDeck","body":…,"navigate":"<pwa origin>/#s=<session id>","tag":…,"silent":false}}`.
+  - A live session whose file is not in the gateway's latest scan yet (a session started seconds ago) has no session
+    id: `navigate` is `<pwa origin>/#route=conversation&live=<percent-encoded live key>`, and the conversation screen
+    follows that live session to its id. Never the Running view's opaque `r-…` id, which `#s=` would look up as an omp
+    session and answer "Not found: session." (found on a real phone, 0.22.1).
   - Privacy-preserving body by default: "A session finished", "A session needs your attention", "A session ended". With
     `show_titles`, the title is included, cut to 80 characters.
   - The payload is capped at 1024 bytes (the hard limit is 3993).
 - **Headers and timing:**
   - `TTL` 3600.
   - `Urgency`: `high` for attention, `normal` otherwise.
-  - `Topic` = 22 characters of base64url of SHA-256(session id), so pending pushes coalesce per session.
+  - `Topic` = 22 characters of base64url of SHA-256(session id, else live key), so pending pushes coalesce per session.
 - **Delivery:**
   - One worker thread with a bounded queue (256 entries); overflow drops the oldest.
   - 429 honours `Retry-After` (≤ 10 min); 5xx retries with backoff, up to 3 attempts; 400/401/403/413 are logged and
     not retried.
   - The VAPID JWT is cached per push-service origin for 12 h (Apple: at most one refresh per hour).
-  - `sub` = `OMP_DECK_PUSH_CONTACT` (an e-mail, `mailto:` or `https:` URL), default the PWA origin. An event with no
-    session id navigates to `<origin>/` and takes its topic from the session key.
+  - `sub` = `OMP_DECK_PUSH_CONTACT` (an e-mail, `mailto:` or `https:` URL), default the PWA origin. An event without a
+    managed live session navigates to `<origin>/` and takes its topic from the session key.
 - **Tests:**
   - the RFC 8291 appendix A vector through `decrypt`;
   - a loopback receiver round trip (encrypt → POST → decrypt);

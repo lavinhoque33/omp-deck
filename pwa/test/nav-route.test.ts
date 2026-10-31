@@ -35,6 +35,13 @@ describe('routeFromHash', () => {
     expect(routeFromHash('#route=terminal&live=k&title=Spoofed')?.stack).toEqual([{ kind: 'terminal', liveKey: 'k', title: 'Terminal' }]);
   });
 
+  test("a notification for a session without an id yet opens its conversation by live key (the gateway's encoding)", () => {
+    expect(routeFromHash('#route=conversation&live=tmux%3A24%3Aomp-deck%3Aomp-new-17%26x%23y')).toEqual({
+      tab: 'sessions',
+      stack: [{ kind: 'conversation', session: null, liveKey: 'tmux:24:omp-deck:omp-new-17&x#y', title: 'Session' }],
+    });
+  });
+
   test('missing parameters, unknown routes and no route are null', () => {
     expect(routeFromHash('#route=tree')).toBeNull();
     expect(routeFromHash('#route=changes')).toBeNull();

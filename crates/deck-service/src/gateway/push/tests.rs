@@ -181,11 +181,11 @@ fn push() -> Push {
     Push::with_key(Some(new_key()), LOOPBACK, None, Arc::new(|| {}))
 }
 
-fn offer<'a>(kind: MobileKind, session: Option<&'a str>) -> Offer<'a> {
+fn offer<'a>(kind: MobileKind, opens: &'a Opens) -> Offer<'a> {
     Offer {
         kind,
         title: "fix the parser",
-        session,
+        opens: Some(opens),
         fallback: "tmux:x",
         origin: ORIGIN,
     }
@@ -252,13 +252,22 @@ fn subscriptions_are_parsed_by_hand_and_bad_ones_refused_without_panicking() {
 }
 
 #[test]
-fn navigate_is_exactly_the_pwa_origin_and_session_hash() {
+fn navigate_is_exactly_the_pwa_origin_and_the_session_or_live_link() {
     let tag = topic("s");
+    let session = Opens::Session("sess-1".to_owned());
+    // A session the gateway has no id for yet (just started) opens by live key, never by an id
+    // the app would look up as an omp session.
+    let live = Opens::Live("tmux:24:omp-deck:omp-new-17&x#y".to_owned());
     for origin in ["https://relay.example", "https://relay.example/"] {
-        let p = json(&payload(MobileKind::Ended, None, origin, Some("sess-1"), &tag).unwrap());
+        let p = json(&payload(MobileKind::Ended, None, origin, Some(&session), &tag).unwrap());
         assert_eq!(
             p["notification"]["navigate"],
             "https://relay.example/#s=sess-1"
+        );
+        let p = json(&payload(MobileKind::TurnFinished, None, origin, Some(&live), &tag).unwrap());
+        assert_eq!(
+            p["notification"]["navigate"],
+            "https://relay.example/#route=conversation&live=tmux%3A24%3Aomp-deck%3Aomp-new-17%26x%23y"
         );
         let p = json(&payload(MobileKind::Ended, None, origin, None, &tag).unwrap());
         assert_eq!(p["notification"]["navigate"], "https://relay.example/");
@@ -311,7 +320,7 @@ fn a_private_endpoint_is_skipped_at_send_time() {
     strict.offer(
         reg.devices(),
         |_| false,
-        &offer(MobileKind::TurnFinished, Some("s")),
+        &offer(MobileKind::TurnFinished, &Opens::Session("s".to_owned())),
     );
     rx.quiet(Duration::from_millis(500));
 }
@@ -385,7 +394,8 @@ fn payloads_are_declarative_generic_by_default_and_bounded() {
     assert_eq!(tag.len(), 22);
     assert_eq!(tag, topic("sess-1"));
     assert_ne!(tag, topic("sess-2"));
-    let p = json(&payload(MobileKind::Attention, None, ORIGIN, Some("sess-1"), &tag).unwrap());
+    let sess = Opens::Session("sess-1".to_owned());
+    let p = json(&payload(MobileKind::Attention, None, ORIGIN, Some(&sess), &tag).unwrap());
     assert_eq!(
         p,
         serde_json::json!({
@@ -434,6 +444,7 @@ fn one_finished_turn(c: &mut NotificationCenter, key: &SessionTarget) -> Vec<Eff
         title: "fix the parser",
         project: "proj",
         visible: false,
+        omp_title: true,
     };
     let t0 = Instant::now();
     c.tick(t0, &[obs(TabStatus::Busy)], false, &cfg);
@@ -472,7 +483,7 @@ fn apply(push: &mut Push, reg: &Registry, present: &[&str], effects: Vec<Effect>
                 &Offer {
                     kind,
                     title: &title,
-                    session: Some(session),
+                    opens: Some(&Opens::Session(session.to_owned())),
                     fallback: &fallback,
                     origin: ORIGIN,
                 },
@@ -569,7 +580,7 @@ fn prefs_and_presence_decide_per_device() {
     push.offer(
         reg.devices(),
         |id| id == "d-here",
-        &offer(MobileKind::Attention, Some("sess-9")),
+        &offer(MobileKind::Attention, &Opens::Session("sess-9".to_owned())),
     );
     let mut got: Vec<Received> = vec![rx.next(), rx.next()];
     rx.quiet(Duration::from_millis(500));
@@ -593,7 +604,7 @@ fn prefs_and_presence_decide_per_device() {
     push.offer(
         reg.devices(),
         |_| false,
-        &offer(MobileKind::Ended, Some("sess-9")),
+        &offer(MobileKind::Ended, &Opens::Session("sess-9".to_owned())),
     );
     let mut paths: Vec<String> = (0..4).map(|_| rx.next().path).collect();
     paths.sort();
@@ -620,7 +631,7 @@ fn a_gone_subscription_is_deleted() {
     push.offer(
         reg.devices(),
         |_| false,
-        &offer(MobileKind::TurnFinished, Some("s")),
+        &offer(MobileKind::TurnFinished, &Opens::Session("s".to_owned())),
     );
     rx.next();
     let gone = (0..250)

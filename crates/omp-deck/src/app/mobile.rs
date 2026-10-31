@@ -18,7 +18,7 @@ use zeroize::Zeroize;
 use super::App;
 use crate::badge::{self, Hue};
 use crate::card;
-use crate::confirm::{self, Confirm, Dialog, show_dialog, show_dialog_labeled};
+use crate::confirm::{self, Confirm, Dialog, Reply, show_dialog, show_dialog_reply};
 use crate::gw::PairingStarted;
 use crate::icons::{ICON_GLOBE, ICON_KEY_ROUND, ICON_LOCK, ICON_PENCIL};
 use crate::mobile_view::{
@@ -48,6 +48,11 @@ fn trim_in_place(mut s: String) -> String {
     let lead = s.len() - s.trim_start().len();
     s.drain(..lead);
     s
+}
+
+/// The phone has asked to pair: the fingerprint comparison is due.
+fn in_approval(p: &PairingView) -> bool {
+    matches!(p.state, PairingState::Approval { .. })
 }
 
 pub(super) fn now_ms() -> u64 {
@@ -114,8 +119,8 @@ pub(super) struct MobileUi {
     /// The pairing the dialog last showed, to tell how it ended.
     seen: Option<PairingSeen>,
     local_end: Option<LocalEnd>,
-    /// A waiting pairing from another window the user chose to hide.
-    hidden: Option<String>,
+    /// The pairing the user put away (id, and whether it was in the approval state then).
+    hidden: Option<(String, bool)>,
     /// Approve / deny / cancel is in flight.
     deciding: bool,
 }
@@ -148,11 +153,57 @@ impl MobileUi {
 
     /// Whether the pairing dialog shows `p` in this window.
     fn shows(&self, p: &PairingView) -> bool {
-        !(matches!(p.state, PairingState::Waiting) && self.hidden.as_deref() == Some(&p.pairing))
+        !self.is_hidden(p)
+    }
+
+    /// `p` is put away behind the title-bar pill. A pairing hidden while waiting comes back once
+    /// when the phone's request arrives (the fingerprint must be compared before it expires).
+    fn is_hidden(&self, p: &PairingView) -> bool {
+        self.hidden
+            .as_ref()
+            .is_some_and(|(id, approval)| *id == p.pairing && *approval == in_approval(p))
+    }
+
+    /// Puts `p` away in its current state.
+    pub(super) fn hide(&mut self, p: &PairingView) {
+        self.hidden = Some((p.pairing.clone(), in_approval(p)));
+    }
+
+    /// Brings a hidden pairing back (title-bar pill, palette).
+    pub(super) fn restore(&mut self) {
+        self.hidden = None;
     }
 }
 
 impl App {
+    /// A pairing is open in the gateway but put away: the title bar shows its pill instead.
+    pub(super) fn pairing_hidden(&self) -> bool {
+        self.gw
+            .mobile()
+            .and_then(|v| v.pairing.clone())
+            .is_some_and(|p| self.mobile.is_hidden(&p))
+    }
+
+    /// The title-bar pill of a backgrounded pairing; keeps the countdown repainting.
+    pub(super) fn pairing_pill(&self) -> Option<crate::titlebar::PairingPill> {
+        let view = self.gw.mobile()?;
+        let p = view.pairing.as_ref().filter(|p| self.mobile.is_hidden(p))?;
+        self.ctx.request_repaint_after(Duration::from_millis(250));
+        let left = countdown(p.expires_unix_ms, now_ms());
+        let (label, device) = match &p.state {
+            PairingState::Waiting => (format!("Pairing · {left}"), None),
+            PairingState::Approval { name, platform, .. } => (
+                "Approve device".to_owned(),
+                Some((name.clone(), platform.clone())),
+            ),
+        };
+        Some(crate::titlebar::PairingPill {
+            label,
+            device,
+            expires: left,
+        })
+    }
+
     /// A mobile-access dialog is open (or a pairing is on screen).
     pub(super) fn mobile_modal_open(&self) -> bool {
         self.mobile.forms_open()
@@ -404,7 +455,7 @@ impl App {
                     .as_ref()
                     .filter(|s| s.pairing == p.pairing);
                 if mine.is_none() && !self.mobile.beginning {
-                    let answer = show_dialog_labeled(
+                    let answer = show_dialog_reply(
                         ctx,
                         &Dialog {
                             id: "mobile-pairing-other",
@@ -414,6 +465,7 @@ impl App {
                             confirm_enabled: !self.mobile.deciding,
                             icon: Some(ICON_GLOBE),
                             subtitle: Some("Started in another window"),
+                            esc_hint: Some("hides"),
                             ..Dialog::default()
                         },
                         "Close",
@@ -435,8 +487,8 @@ impl App {
                         },
                     );
                     match answer {
-                        Some(true) => self.cancel_pairing(),
-                        Some(false) => self.mobile.hidden = Some(p.pairing.clone()),
+                        Some(Reply::Confirmed) => self.cancel_pairing(),
+                        Some(Reply::Cancelled | Reply::Dismissed) => self.mobile.hide(p),
                         None => {}
                     }
                     return;
@@ -444,7 +496,7 @@ impl App {
                 let side = mine
                     .and_then(|s| s.qr.as_ref().ok())
                     .map_or(240.0, |g| qr_side(g, ctx.pixels_per_point()));
-                let answer = show_dialog_labeled(
+                let answer = show_dialog_reply(
                     ctx,
                     &Dialog {
                         id: "mobile-pairing",
@@ -454,6 +506,7 @@ impl App {
                         confirm_enabled: mine.is_some(),
                         icon: Some(ICON_GLOBE),
                         subtitle: Some("Scan with OmpDeck on your phone"),
+                        esc_hint: Some("hides"),
                         ..Dialog::default()
                     },
                     "Cancel",
@@ -494,13 +547,14 @@ impl App {
                     },
                 );
                 match answer {
-                    Some(true) => {
+                    Some(Reply::Confirmed) => {
                         if let Some(s) = &self.mobile.started {
                             self.clipboard.set_text(s.link.expose());
                             self.toasts.success(&self.ctx, "Copied pairing link");
                         }
                     }
-                    Some(false) => self.cancel_pairing(),
+                    Some(Reply::Cancelled) => self.cancel_pairing(),
+                    Some(Reply::Dismissed) => self.mobile.hide(p),
                     None => {}
                 }
             }
@@ -511,7 +565,7 @@ impl App {
             } => {
                 let deciding = self.mobile.deciding;
                 let approve = &mut self.mobile.approve;
-                let answer = show_dialog_labeled(
+                let answer = show_dialog_reply(
                     ctx,
                     &Dialog {
                         id: "mobile-approval",
@@ -521,6 +575,7 @@ impl App {
                         confirm_enabled: !deciding,
                         icon: Some(ICON_KEY_ROUND),
                         subtitle: Some("Compare the fingerprint with your phone"),
+                        esc_hint: Some("hides"),
                         ..Dialog::default()
                     },
                     "Deny",
@@ -585,8 +640,9 @@ impl App {
                     },
                 );
                 match answer {
-                    Some(true) if !deciding => self.decide_pairing(&p.pairing, true),
-                    Some(false) if !deciding => self.decide_pairing(&p.pairing, false),
+                    Some(Reply::Confirmed) if !deciding => self.decide_pairing(&p.pairing, true),
+                    Some(Reply::Cancelled) if !deciding => self.decide_pairing(&p.pairing, false),
+                    Some(Reply::Dismissed) => self.mobile.hide(p),
                     _ => {}
                 }
             }
@@ -903,5 +959,57 @@ impl App {
             Some(false) => self.mobile.clear = None,
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairing(id: &str, approval: bool) -> PairingView {
+        PairingView {
+            pairing: id.to_owned(),
+            expires_unix_ms: 120_000,
+            state: if approval {
+                PairingState::Approval {
+                    name: "Pixel".to_owned(),
+                    platform: "android".to_owned(),
+                    fingerprint: "AB CD".to_owned(),
+                }
+            } else {
+                PairingState::Waiting
+            },
+        }
+    }
+
+    #[test]
+    fn a_hidden_waiting_pairing_stays_hidden_until_restored() {
+        let mut ui = MobileUi::new();
+        let p = pairing("p1", false);
+        assert!(ui.shows(&p));
+        ui.hide(&p);
+        assert!(!ui.shows(&p));
+        ui.restore();
+        assert!(ui.shows(&p));
+    }
+
+    #[test]
+    fn the_phone_asking_to_pair_shows_a_hidden_pairing_once() {
+        let mut ui = MobileUi::new();
+        ui.hide(&pairing("p1", false));
+        let asked = pairing("p1", true);
+        assert!(ui.shows(&asked));
+        // Dismissing the approval card puts it away again.
+        ui.hide(&asked);
+        assert!(!ui.shows(&asked));
+    }
+
+    #[test]
+    fn a_hidden_approval_is_hidden_and_another_pairing_is_not() {
+        let mut ui = MobileUi::new();
+        ui.hide(&pairing("p1", true));
+        assert!(!ui.shows(&pairing("p1", true)));
+        assert!(ui.shows(&pairing("p2", true)));
+        assert!(ui.shows(&pairing("p2", false)));
     }
 }

@@ -514,6 +514,7 @@ pub fn show_secret_modal(ctx: &egui::Context, m: &mut SecretModal) -> ModalOutco
             icon: Some(ICON_KEY_ROUND),
             subtitle: Some("Writes via omp config set"),
             tone: Some(pal.warn),
+            esc_hint: None,
         },
         |ui| {
             card::kv(ui, 84.0, "Setting", |ui| {

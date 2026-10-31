@@ -1729,7 +1729,10 @@ Facts + user decisions: `docs/notes/wave14.md`. New workspace deps (root `Cargo.
   `io.github.lavinhoque33.OmpDeck` + `SetCurrentProcessExplicitAppUserModelID` at startup, PowerShell AUMID
   fallback when the Start-menu shortcut lacks it). Triggers from `tabs::TabStatus` transitions of a tab that is not
   (active and window focused) — or only when the window is unfocused, per `notify.only_when_unfocused`: Busy→Idle
-  (turn finished; only after ≥ 3 s busy), →Attention, →Exited (`[code]`), each gated by its toggle. Title = tab
+  (turn finished; only after ≥ 3 s busy), →Attention, →Exited (`[code]`), each gated by its toggle. Only omp's own
+  `π …` title moves a live session's state (`Sighting::omp_title`): tmux restores the pre-omp title (`CSI 23 t`) one
+  tick before a pane's exit is seen, so a busy session that ends is Busy→Exited ("Session ended"), never a finished
+  turn (fixed after 0.22.1: it notified with "Session ended" off). Title = tab
   title; body = event + project. Activating the tab closes its notification. Click → activate that tab and raise
   the window (Wayland: xdg-activation with the received token; else/fallback `Focus` + `RequestUserAttention`;
   Windows `Minimized(false)` + `Focus`). No D-Bus/notification server → silently disabled (log once). Settings →

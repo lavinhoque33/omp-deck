@@ -1286,6 +1286,7 @@ pub fn restore_dialog(
                 Step::Report(r) if report_has_problems(r) => Some(pal.warn),
                 _ => None,
             },
+            esc_hint: None,
         },
         |ui| {
             if let Step::Confirm(plan) = &mut d.step {

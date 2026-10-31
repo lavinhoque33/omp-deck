@@ -16,6 +16,7 @@ pub mod sender;
 pub mod ssrf;
 pub mod vapid;
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -332,18 +333,56 @@ fn body(kind: MobileKind, title: Option<&str>) -> String {
     }
 }
 
+/// What a push opens in the PWA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Opens {
+    /// The conversation of the omp session with this id (`#s=`).
+    Session(String),
+    /// The conversation of a live session the gateway has no session id for yet (its file is not
+    /// in the latest scan, e.g. started seconds ago), by its live key (`#route=conversation&live=`).
+    Live(String),
+}
+
+impl Opens {
+    fn seed(&self) -> &str {
+        match self {
+            Opens::Session(id) | Opens::Live(id) => id,
+        }
+    }
+}
+
+/// Percent-encodes everything but RFC 3986 unreserved characters (a URL query value).
+fn encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            // Writing into a String cannot fail.
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
 /// The declarative Web Push JSON (at most [`MAX_PAYLOAD`] bytes; a titled body that does not
-/// fit falls back to the generic one). `navigate` opens the session in the PWA.
+/// fit falls back to the generic one). `navigate` opens `opens` in the PWA (`None`: its start page).
 pub fn payload(
     kind: MobileKind,
     title: Option<&str>,
     origin: &str,
-    session: Option<&str>,
+    opens: Option<&Opens>,
     tag: &str,
 ) -> Option<Vec<u8>> {
     let origin = origin.trim_end_matches('/');
-    let navigate = match session {
-        Some(id) => format!("{origin}/#s={id}"),
+    let navigate = match opens {
+        Some(Opens::Session(id)) => format!("{origin}/#s={}", encode_component(id)),
+        Some(Opens::Live(key)) => {
+            format!(
+                "{origin}/#route=conversation&live={}",
+                encode_component(key)
+            )
+        }
         None => format!("{origin}/"),
     };
     let encode = |body: String| {
@@ -369,9 +408,9 @@ pub struct Offer<'a> {
     pub kind: MobileKind,
     /// The session's label.
     pub title: &'a str,
-    /// The id the PWA routes by (`None`: the app opens at its start page).
-    pub session: Option<&'a str>,
-    /// Coalescing seed when there is no session id (the live session's key).
+    /// What the notification opens (`None`: the app opens at its start page).
+    pub opens: Option<&'a Opens>,
+    /// Coalescing seed when nothing is opened (the live session's key).
     pub fallback: &'a str,
     /// The PWA's origin (the relay's).
     pub origin: &'a str,
@@ -451,7 +490,7 @@ impl Push {
         let Some(key) = &self.key else {
             return;
         };
-        let topic = topic(offer.session.unwrap_or(offer.fallback));
+        let topic = topic(offer.opens.map_or(offer.fallback, Opens::seed));
         let contact = self
             .contact
             .clone()
@@ -464,7 +503,7 @@ impl Push {
                 continue;
             }
             let title = sub.prefs.show_titles.then_some(offer.title);
-            let Some(payload) = payload(offer.kind, title, offer.origin, offer.session, &topic)
+            let Some(payload) = payload(offer.kind, title, offer.origin, offer.opens, &topic)
             else {
                 log::warn!("push to {}: the payload does not fit", d.id);
                 continue;

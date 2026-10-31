@@ -79,6 +79,7 @@ impl Engine {
                     title,
                     project,
                     visible: visible.contains(target),
+                    omp_title: m.ctl.activity() != crate::statusfmt::Activity::Unknown,
                 }
             })
             .collect();
@@ -142,12 +143,12 @@ impl Engine {
             .filter(|d| d.push.is_some() && self.device_visible(&d.id))
             .map(|d| d.id.clone())
             .collect();
-        let session = self.push_session_id(target);
+        let opens = self.push_opens(target);
         let fallback = target.key.to_string();
         let offer = push::Offer {
             kind,
             title,
-            session: session.as_deref(),
+            opens: opens.as_ref(),
             fallback: &fallback,
             origin: &origin,
         };

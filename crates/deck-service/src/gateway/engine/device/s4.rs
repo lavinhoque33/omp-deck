@@ -385,26 +385,28 @@ impl Engine {
             .any(|c| c.client_id == device_id && matches!(&c.sink, Sink::Device(d) if d.visible))
     }
 
-    /// The id a push for `target` opens: its session's id, else its running id.
-    pub(in crate::gateway::engine) fn push_session_id(
+    /// What a push for `target` opens: its session's conversation by id, else (its file is not in
+    /// the latest scan yet) by live key. `None`: no such live session.
+    pub(in crate::gateway::engine) fn push_opens(
         &self,
         target: &SessionTarget,
-    ) -> Option<String> {
+    ) -> Option<crate::gateway::push::Opens> {
+        use crate::gateway::push::Opens;
         let m = self
             .sess
             .managed
             .iter()
             .find(|m| m.ctl.target().key == target.key)?;
         let groups = self.groups();
-        m.ctl
-            .session_path()
-            .and_then(|p| session_in(&groups, &self.devices.canon, p))
-            .map(|(_, s)| s.id.clone())
-            .or_else(|| {
-                m.mux_name
-                    .as_deref()
-                    .map(|n| views::running_id(n, &self.epoch.to_hex()))
-            })
+        Some(
+            m.ctl
+                .session_path()
+                .and_then(|p| session_in(&groups, &self.devices.canon, p))
+                .map_or_else(
+                    || Opens::Live(target.key.to_string()),
+                    |(_, s)| Opens::Session(s.id.clone()),
+                ),
+        )
     }
 
     // ---- requests -----------------------------------------------------------------------------

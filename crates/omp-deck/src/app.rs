@@ -1731,6 +1731,7 @@ impl App {
                 channel: self.update.channel(),
             }),
             app_update: self.app_update_bar(),
+            pairing: self.pairing_pill(),
             notifications: crate::notify_panel::PanelInput {
                 entries: inbox.as_deref().map_or(&[][..], |v| v.entries.as_slice()),
                 badge: inbox.as_deref().and_then(|v| v.badge.as_deref()),
@@ -1762,6 +1763,7 @@ impl App {
             BarAction::CheckUpdates => self.check_updates_manually(),
             BarAction::AppUpdate(a) => self.apply_app_update_action(a),
             BarAction::Inbox(a) => self.apply_inbox_action(a),
+            BarAction::ShowPairing => self.mobile.restore(),
         }
     }
 

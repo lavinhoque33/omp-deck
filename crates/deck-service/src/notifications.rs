@@ -51,6 +51,8 @@ pub struct Observation<'a> {
     pub project: &'a str,
     /// A view shows the session (the active tab, or any pane of a split).
     pub visible: bool,
+    /// The terminal title is omp's ([`tracker::Sighting::omp_title`]).
+    pub omp_title: bool,
 }
 
 /// Which sound a desktop pop-up asks for: a name of the freedesktop sound theme, so the user's
@@ -206,6 +208,7 @@ impl NotificationCenter {
                 status: o.status,
                 exit_code: o.exit_code,
                 visible: o.visible,
+                omp_title: o.omp_title,
             };
             let was_busy = self.tracker.is_busy(o.target);
             if let Some(event) =
@@ -461,6 +464,7 @@ mod tests {
             title: "fix bug",
             project: "proj",
             visible,
+            omp_title: true,
         }
     }
 

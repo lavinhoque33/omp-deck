@@ -1112,6 +1112,15 @@ impl App {
             ICON_GLOBE,
             pair_why,
         );
+        if self.pairing_hidden() {
+            add(
+                "mobile.show-pairing",
+                "Mobile access: Show pairing",
+                None,
+                ICON_GLOBE,
+                None,
+            );
+        }
         add(
             "mobile.settings",
             "Mobile access: Open settings",
@@ -1315,6 +1324,7 @@ impl App {
             "view.switcher" => self.open_palette(Mode::Switcher),
             "app.settings" => self.open_settings(),
             "mobile.pair" => self.start_pairing(),
+            "mobile.show-pairing" => self.mobile.restore(),
             "mobile.reconnect" => self.reconnect_relay(),
             "mobile.settings" => self.open_settings_page(OmpDeckPage::General),
             "settings.sync" => {

@@ -38,6 +38,9 @@ pub struct Dialog<'a> {
     /// Header tone (icon tile, wash, rule), e.g. `pal.warn`; `None` = `pal.danger` when
     /// `danger`, else the accent pair.
     pub tone: Option<Color32>,
+    /// What the footer's Esc hint says Esc does; `None` = "cancels" (a dialog that hides
+    /// itself on Esc says "hides").
+    pub esc_hint: Option<&'a str>,
 }
 
 impl Dialog<'_> {
@@ -70,20 +73,46 @@ pub fn show_dialog_labeled(
     cancel_label: &str,
     body: impl FnOnce(&mut Ui),
 ) -> Option<bool> {
+    match show_dialog_reply(ctx, d, cancel_label, body)? {
+        Reply::Confirmed => Some(true),
+        Reply::Cancelled | Reply::Dismissed => Some(false),
+    }
+}
+
+/// How a dialog was answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reply {
+    /// The confirm button, Enter or Ctrl+Enter.
+    Confirmed,
+    /// The cancel button.
+    Cancelled,
+    /// Esc or a click outside the card: for dialogs whose cancel button has a real effect, the
+    /// caller can put the dialog away instead of acting.
+    Dismissed,
+}
+
+/// [`show_dialog_labeled`] telling the cancel button apart from a dismissal.
+pub fn show_dialog_reply(
+    ctx: &Context,
+    d: &Dialog<'_>,
+    cancel_label: &str,
+    body: impl FnOnce(&mut Ui),
+) -> Option<Reply> {
     let pal = Palette::of_ctx(ctx);
     let icon = d.icon();
     let mut head = card::Header::new(icon, d.title).tone(d.tone(pal));
     if let Some(s) = d.subtitle {
         head = head.subtitle(s);
     }
+    let esc = d.esc_hint.unwrap_or("cancels");
     let hints: &[(&str, &str)] = if !d.confirm_enabled {
-        &[("Esc", "cancels")]
+        &[("Esc", esc)]
     } else if d.enter_confirms {
         &[("Enter", "confirms")]
     } else if d.ctrl_enter_confirms {
         &[("Ctrl+Enter", "confirms")]
     } else {
-        &[("Esc", "cancels")]
+        &[("Esc", esc)]
     };
     // Taken before the body runs, so the dialog's text editor never sees the chord.
     let ctrl_enter = d.ctrl_enter_confirms
@@ -112,14 +141,14 @@ pub fn show_dialog_labeled(
                 }
                 let confirm = confirm.show(ui);
                 if confirm.clicked() {
-                    result = Some(true);
+                    result = Some(Reply::Confirmed);
                 }
                 if DraftButton::new(cancel_label)
                     .min_width(84.0)
                     .show(ui)
                     .clicked()
                 {
-                    result = Some(false);
+                    result = Some(Reply::Cancelled);
                 }
             });
         },
@@ -129,13 +158,13 @@ pub fn show_dialog_labeled(
         && d.confirm_enabled
         && ctx.input(|i| i.key_pressed(Key::Enter))
     {
-        result = Some(true);
+        result = Some(Reply::Confirmed);
     }
     if result.is_none() && ctrl_enter {
-        result = Some(true);
+        result = Some(Reply::Confirmed);
     }
     if result.is_none() && dismissed {
-        result = Some(false);
+        result = Some(Reply::Dismissed);
     }
     result
 }
@@ -244,5 +273,37 @@ mod tests {
             ..handoff_like(true)
         };
         assert_eq!(press(&plain, enter(Modifiers::COMMAND)).0, None);
+    }
+
+    #[test]
+    fn escape_is_a_dismissal_not_the_cancel_button() {
+        let ctx = Context::default();
+        crate::theme::apply(
+            &ctx,
+            deck_core::config::UiStyle::Neutral,
+            deck_core::config::Density::Compact,
+            deck_core::config::UiFont::Auto,
+            true,
+        );
+        let d = handoff_like(true);
+        let mut reply = None;
+        for frame in 0..4 {
+            let mut input = RawInput::default();
+            if frame == 3 {
+                input.events.push(Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                });
+            }
+            let mut out = ctx.run_ui(input, |ui| {
+                let c = ui.ctx().clone();
+                reply = show_dialog_reply(&c, &d, "Cancel", |_| {});
+            });
+            out.textures_delta.clear();
+        }
+        assert_eq!(reply, Some(Reply::Dismissed));
     }
 }

@@ -84,6 +84,11 @@ impl Sandbox {
             std::env::set_var("OMP_DECK_HOST_NS", &ns);
             std::env::set_var("OMP_DECK_TMUX_SOCKET", &ns);
             std::env::set_var("PI_NOTIFICATIONS", "off");
+            // Never the desktop's session bus: the owner's notifier must not pop up for test sessions.
+            std::env::set_var(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", root.join("run/no-bus").display()),
+            );
             let host = PathBuf::from(GATEWAY).with_file_name(if cfg!(windows) {
                 "omp-deck-host.exe"
             } else {

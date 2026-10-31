@@ -315,7 +315,11 @@ key field, link state, Clear), the gateway fingerprint, the device list (name, p
 seen, permission badges; hover row buttons Rename, Permissions, Revoke with confirm) and **Pair a device** (QR painted
 from `qrcodegen`, countdown, copy link, Cancel). An open pairing in `Topic::Mobile` shows the approval dialog in every
 GUI (name, platform, fingerprint to compare with the phone, Control on / Manage off by default, Approve / Deny).
-Dialogs hold terminal input like the other modals.
+Dialogs hold terminal input like the other modals. Esc or a click outside a pairing dialog only **hides** it
+(`confirm::Reply::Dismissed`; never cancel or deny, only the explicit Cancel / Deny buttons do): the title bar then shows
+a pill left of the bell (`Pairing · m:ss`, amber `Approve device` once the phone asks, hover card with state / device /
+expiry) that brings it back, as does the palette command "Mobile access: Show pairing". A hidden pairing holds no input
+and comes back once by itself when the phone's request arrives (the fingerprint must be compared before it expires).
 
 ## R4 contract: device application protocol and capability layer
 

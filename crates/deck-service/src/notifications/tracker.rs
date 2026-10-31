@@ -54,6 +54,10 @@ pub struct Sighting {
     pub exit_code: Option<i32>,
     /// The tab is shown in a pane (the active tab, or any pane of a split).
     pub visible: bool,
+    /// The terminal title is omp's (`π …`). Without it a live status says nothing about turns:
+    /// omp has not set one yet, or tmux restored the title from before it because the process
+    /// is ending (`CSI 23 t`, one tick before the exit is seen). That must not read as "idle".
+    pub omp_title: bool,
 }
 
 /// What an asynchronous turn classification was asked about; see [`Tracker::is_current`].
@@ -136,7 +140,8 @@ impl<K: Clone + Eq + Hash> Tracker<K> {
             return None;
         };
         let prev = mem.kind;
-        if prev == kind {
+        // Only the exit (or omp's own title) changes what is known about a live session.
+        if prev == kind || (!seen.omp_title && kind != Kind::Exited) {
             return None;
         }
         let busy_for = mem
@@ -280,6 +285,7 @@ mod tests {
                 _ => None,
             },
             visible: active,
+            omp_title: true,
         }
     }
 
@@ -437,6 +443,44 @@ mod tests {
             run(TabStatus::Exited { clean: false }, 0, false, false, &cfg),
             None
         );
+    }
+
+    /// tmux restores the pre-omp title when the process ends, a tick before the exit is seen:
+    /// a busy session that ends is "Session ended" (its own toggle), never a finished turn.
+    #[test]
+    fn a_busy_session_that_ends_is_an_exit_not_a_finished_turn() {
+        let ending = |cfg: &NotifyConfig| {
+            let mut t = Tracker::default();
+            let t0 = Instant::now();
+            t.observe(1, t0, seen(IDLE, false), false, cfg);
+            t.observe(1, t0, seen(BUSY, false), false, cfg);
+            let later = t0 + Duration::from_secs(30);
+            let popped = Sighting {
+                omp_title: false,
+                ..seen(IDLE, false)
+            };
+            let at_pop = t.observe(1, later, popped, false, cfg);
+            let at_exit = t.observe(
+                1,
+                later,
+                Sighting {
+                    omp_title: false,
+                    ..seen(TabStatus::Exited { clean: true }, false)
+                },
+                false,
+                cfg,
+            );
+            (at_pop, at_exit)
+        };
+        let on = NotifyConfig::default();
+        assert_eq!(ending(&on), (None, Some(Event::Exited { code: Some(0) })));
+        let off = NotifyConfig {
+            exited: false,
+            ..NotifyConfig::default()
+        };
+        assert_eq!(ending(&off), (None, None));
+        // omp's own idle title after the busy stretch still is a finished turn.
+        assert_eq!(run(IDLE, 30, false, false, &off), Some(Event::TurnFinished));
     }
 
     #[test]

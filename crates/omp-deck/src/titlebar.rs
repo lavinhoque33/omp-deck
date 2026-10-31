@@ -3,9 +3,10 @@
 //! Also the edge/corner resize zones and outline for the undecorated window.
 
 use crate::icons::{
-    ICON_APP_WINDOW, ICON_ARROW_LEFT_RIGHT, ICON_COPY, ICON_DOWNLOAD, ICON_HISTORY, ICON_LOG_OUT,
-    ICON_MENU, ICON_MINUS, ICON_MOON, ICON_PLUS, ICON_PUZZLE, ICON_REFRESH_CW, ICON_ROCKET,
-    ICON_ROTATE_CCW, ICON_SETTINGS, ICON_SQUARE, ICON_SUN, ICON_TERMINAL, ICON_X,
+    ICON_APP_WINDOW, ICON_ARROW_LEFT_RIGHT, ICON_COPY, ICON_DOWNLOAD, ICON_GLOBE, ICON_HISTORY,
+    ICON_KEY_ROUND, ICON_LOG_OUT, ICON_MENU, ICON_MINUS, ICON_MOON, ICON_PLUS, ICON_PUZZLE,
+    ICON_REFRESH_CW, ICON_ROCKET, ICON_ROTATE_CCW, ICON_SETTINGS, ICON_SQUARE, ICON_SUN,
+    ICON_TERMINAL, ICON_X,
 };
 use deck_core::config::Theme;
 use deck_core::omp::UpdateKind;
@@ -49,6 +50,8 @@ pub struct BarInput<'a> {
     pub omp: Option<OmpBar<'a>>,
     /// A newer OmpDeck release to announce (pill + popover).
     pub app_update: Option<crate::app_update::PillView<'a>>,
+    /// A pairing put away behind a pill (click brings the dialog back).
+    pub pairing: Option<PairingPill>,
     /// The notification bell (badge + popover).
     pub notifications: crate::notify_panel::PanelInput<'a>,
 }
@@ -83,6 +86,8 @@ pub enum BarAction {
     SwitchChannel(UpdateKind),
     CheckUpdates,
     AppUpdate(crate::app_update::UpdateAction),
+    /// The backgrounded pairing's pill was clicked: show its dialog again.
+    ShowPairing,
     /// The notification popover asked for something.
     Inbox(crate::notify_panel::PanelAction),
     Quit,
@@ -338,7 +343,15 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                 + pill_label
                     .as_ref()
                     .map_or(0.0, |l| 4.0 + badge_width(&badge_galley(ui, l)));
-            let right_w = 68.0 + notify_panel::bell_width() + 2.0 + badge_w + 12.0;
+            let right_w = 68.0
+                + notify_panel::bell_width()
+                + 2.0
+                + badge_w
+                + input
+                    .pairing
+                    .as_ref()
+                    .map_or(0.0, |p| 4.0 + badge_width(&badge_galley(ui, &p.label)))
+                + 12.0;
             let right_rect = egui::Rect::from_min_max(
                 pos2(rect.right() - right_w, rect.top()),
                 pos2(rect.right(), rect.bottom()),
@@ -372,6 +385,12 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                         );
                         if let Some(a) = update_popover(&badge, o) {
                             action = Some(a);
+                        }
+                    }
+                    if let Some(pill) = &input.pairing {
+                        ui.add_space(4.0);
+                        if pairing_pill(ui, pill).clicked() {
+                            action = Some(BarAction::ShowPairing);
                         }
                     }
                     if let (Some(p), Some(label)) = (&input.app_update, &pill_label) {
@@ -634,60 +653,7 @@ fn update_badge(
     title: &str,
     (current, latest): (&str, &str),
 ) -> egui::Response {
-    let pal = Palette::of_ui(ui);
-    let galley = badge_galley(ui, label);
-    let (rect, resp) = ui.allocate_exact_size(
-        vec2(badge_width(&galley), theme::dens(24.0, 28.0)),
-        Sense::click(),
-    );
-    let hov = ui
-        .ctx()
-        .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-    let p = ui.painter();
-    let (fg, label_fg) = if theme::flat() {
-        // Flat accent-outlined chip: the one deliberate accent in the bar.
-        p.rect(
-            rect,
-            8,
-            theme::mix(pal.bar, pal.accent, 0.10 + 0.10 * hov),
-            Stroke::new(1.0, pal.accent.gamma_multiply(0.55 + 0.35 * hov)),
-            StrokeKind::Inside,
-        );
-        (pal.accent, pal.accent)
-    } else {
-        let glow = egui::Shadow {
-            offset: [0, 2],
-            blur: 12,
-            spread: 0,
-            color: pal.accent_a.gamma_multiply(0.30 + 0.25 * hov),
-        };
-        p.add(glow.as_shape(rect, egui::CornerRadius::same(14)));
-        theme::gradient_rounded(p, rect, 14.0, pal.accent_a, pal.accent_b);
-        p.rect_stroke(
-            rect,
-            14,
-            Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.18 + 0.25 * hov)),
-            StrokeKind::Inside,
-        );
-        (egui::Color32::WHITE, egui::Color32::WHITE)
-    };
-    paint_icon(
-        p,
-        pos2(rect.left() + 10.0 + 8.0, rect.center().y),
-        egui::Align2::CENTER_CENTER,
-        ICON_DOWNLOAD,
-        16.0,
-        fg,
-    );
-    p.galley(
-        pos2(
-            rect.left() + 10.0 + 16.0 + 6.0,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        label_fg,
-    );
-    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    let resp = pill(ui, label, ICON_DOWNLOAD, None);
     card::hover(
         &resp,
         260.0,
@@ -705,6 +671,138 @@ fn update_badge(
         },
     );
     resp
+}
+
+/// A pairing the user put away (Esc / click outside the dialog) while it stays open in the
+/// gateway: the dialog comes back when the pill is clicked.
+pub struct PairingPill {
+    /// `Pairing · 1:42`, or `Approve device` once the phone asked to pair.
+    pub label: String,
+    /// `(name, platform)` of the device asking to pair.
+    pub device: Option<(String, String)>,
+    /// Time left, `m:ss`.
+    pub expires: String,
+}
+
+/// The pill of a backgrounded pairing: amber while a device waits for approval.
+fn pairing_pill(ui: &mut egui::Ui, p: &PairingPill) -> egui::Response {
+    let pal = Palette::of_ui(ui);
+    let approval = p.device.is_some();
+    let resp = pill(
+        ui,
+        &p.label,
+        if approval { ICON_KEY_ROUND } else { ICON_GLOBE },
+        approval.then_some(pal.warn),
+    );
+    card::hover(
+        &resp,
+        260.0,
+        false,
+        &card::Header::new(
+            if approval { ICON_KEY_ROUND } else { ICON_GLOBE },
+            "Pairing in progress",
+        )
+        .tone(if approval {
+            pal.warn
+        } else {
+            egui::Color32::TRANSPARENT
+        }),
+        |_| {},
+        |ui| {
+            card::kv(ui, 84.0, "State", |ui| {
+                let (text, hue) = if approval {
+                    ("Needs your approval", Hue::Amber)
+                } else {
+                    ("Waiting for the phone", Hue::Blue)
+                };
+                badge::show(ui, None, text, hue, tips::VALUE);
+            });
+            if let Some((name, platform)) = &p.device {
+                card::kv(ui, 84.0, "Device", |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(name).strong().color(pal.text_strong))
+                            .truncate(),
+                    );
+                });
+                card::kv(ui, 84.0, "Platform", |ui| {
+                    badge::show(ui, None, platform, Hue::Teal, tips::VALUE);
+                });
+            }
+            card::kv(ui, 84.0, "Expires in", |ui| {
+                badge::show(ui, None, &p.expires, Hue::Amber, tips::VALUE);
+            });
+            card::footer_hints(ui, &[("click", "show pairing")]);
+        },
+    );
+    resp
+}
+
+/// Pill-shaped badge with a glyph and a label: accent gradient (flat themes: accent outline),
+/// or `tone` instead of the accent.
+fn pill(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: crate::icons::Icon,
+    tone: Option<egui::Color32>,
+) -> egui::Response {
+    let pal = Palette::of_ui(ui);
+    let galley = badge_galley(ui, label);
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(badge_width(&galley), theme::dens(24.0, 28.0)),
+        Sense::click(),
+    );
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+    let p = ui.painter();
+    let (fg, label_fg) = if theme::flat() {
+        // Flat chip: the one deliberate accent in the bar.
+        let accent = tone.unwrap_or(pal.accent);
+        p.rect(
+            rect,
+            8,
+            theme::mix(pal.bar, accent, 0.10 + 0.10 * hov),
+            Stroke::new(1.0, accent.gamma_multiply(0.55 + 0.35 * hov)),
+            StrokeKind::Inside,
+        );
+        (accent, accent)
+    } else {
+        let (a, b) = tone.map_or((pal.accent_a, pal.accent_b), |t| {
+            (t, theme::mix(t, egui::Color32::BLACK, 0.25))
+        });
+        let glow = egui::Shadow {
+            offset: [0, 2],
+            blur: 12,
+            spread: 0,
+            color: a.gamma_multiply(0.30 + 0.25 * hov),
+        };
+        p.add(glow.as_shape(rect, egui::CornerRadius::same(14)));
+        theme::gradient_rounded(p, rect, 14.0, a, b);
+        p.rect_stroke(
+            rect,
+            14,
+            Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.18 + 0.25 * hov)),
+            StrokeKind::Inside,
+        );
+        (egui::Color32::WHITE, egui::Color32::WHITE)
+    };
+    paint_icon(
+        p,
+        pos2(rect.left() + 10.0 + 8.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        16.0,
+        fg,
+    );
+    p.galley(
+        pos2(
+            rect.left() + 10.0 + 16.0 + 6.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        label_fg,
+    );
+    resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn badge_galley(ui: &egui::Ui, label: &str) -> std::sync::Arc<egui::Galley> {
@@ -1105,6 +1203,7 @@ mod tests {
                 channel: Channel::Stable,
             }),
             app_update: None,
+            pairing: None,
             notifications: notify_panel::PanelInput {
                 entries: &[],
                 badge: None,
