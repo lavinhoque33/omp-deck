@@ -1,7 +1,8 @@
 # cargo-deny policy: CI's `audit` job runs `cargo deny check advisories` (RustSec database:
 # vulnerabilities, yanked versions, unmaintained direct dependencies). Accepted advisories are
-# listed in docs/notes/mobile-relay.md "R5 security review" with the reason they do not apply;
-# add an `ignore` entry here only together with that written acceptance.
+# listed in docs/notes/mobile-relay.md "R5 security review" or docs/notes/mobile-pwa.md "Accepted
+# advisories" with the reason they do not apply; add an `ignore` entry here only together with that
+# written acceptance.
 
 [graph]
 all-features = true
@@ -9,4 +10,6 @@ all-features = true
 [advisories]
 unmaintained = "workspace"
 yanked = "deny"
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 via p256 0.13 (web-push-native 0.5): only ephemeral ECDH and public points; the VAPID key signs with ring. See docs/notes/mobile-pwa.md" },
+]

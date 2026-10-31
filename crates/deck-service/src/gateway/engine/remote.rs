@@ -21,7 +21,7 @@ use deck_remote::noise::{
 };
 use deck_remote::relay::{self, Hash, MAX_TOKENS, PeerId, close};
 
-use super::{Engine, Msg};
+use super::{Engine, Fin, Msg};
 use crate::gateway::protocol::{
     Done, GatewayError, MobileView, Mutation, RelayLink, RelayView, SecretText,
 };
@@ -214,6 +214,20 @@ impl Mobile {
     pub(super) fn permissions(&self, id: &str) -> Option<crate::gateway::protocol::Permissions> {
         let parts = self.parts.as_ref().ok()?;
         parts.registry.get(id).map(|d| d.permissions)
+    }
+
+    /// The paired devices (`None`: mobile access is unavailable).
+    pub(super) fn registry(&self) -> Option<&Registry> {
+        self.parts.as_ref().ok().map(|p| &p.registry)
+    }
+
+    pub(super) fn registry_mut(&mut self) -> Option<&mut Registry> {
+        self.parts.as_mut().ok().map(|p| &mut p.registry)
+    }
+
+    /// The PWA's origin, served by the configured relay.
+    pub(super) fn pwa_origin(&self) -> Option<String> {
+        self.relay.as_ref().map(|r| r.url.pwa_origin())
     }
 
     /// Ends the pairing window: its connection (if any) is closed and its token withdrawn.
@@ -767,6 +781,7 @@ impl Engine {
                         last_ts: candidate.hello.ts,
                         created_unix_ms: now,
                         last_seen_unix_ms: now,
+                        push: None,
                     })
                     .map_err(failed)?;
                 w.approve(at, now);
@@ -839,6 +854,22 @@ impl Engine {
                 // Nothing it asked for runs after this: unwritten commands and queued
                 // launches are cancelled.
                 self.cancel_client_work(&id);
+                // Pushes still queued for it are not sent.
+                self.notify.push.purge(&id);
+                // Its attachments go with it (off this thread: a directory removal). Marked
+                // first: a store still in flight removes what it writes after the removal. The
+                // mark lasts until that removal and those stores are done.
+                let cleanup = self.devices.revoked.revoke(&id);
+                self.spawn_worker("attachments", move || {
+                    let result = crate::attachments::AttachmentStore::open()
+                        .and_then(|s| s.remove_owner(&id))
+                        .map_err(|e| e.to_string());
+                    drop(cleanup);
+                    Fin::Logged {
+                        what: "removing a revoked device's attachments",
+                        result,
+                    }
+                });
                 Ok(Done::Unit)
             }
             Mutation::DeviceRename { id, name } => {

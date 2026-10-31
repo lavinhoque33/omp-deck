@@ -2,6 +2,10 @@
 #
 # Install: copy the binary to /usr/local/bin/omp-deck-relay, this file to
 # /etc/systemd/system/omp-deck-relay.service, then `systemctl enable --now omp-deck-relay`.
+# The phone app: copy the release archive's web/ to /usr/share/omp-deck-relay/web (a web/ next to
+# the binary is found too); anywhere else, pass it with --web-dir (drop-in below). The
+# directory must be readable by the dynamic user (world-readable files) and is read at startup:
+# restart after updating it. Without one the relay serves no app (logged once at startup).
 # It listens on 127.0.0.1:8080 behind a TLS reverse proxy (Caddyfile.example, nginx.conf.example).
 # --trust-forwarded-for honours X-Forwarded-For from loopback peers only (the proxy on this host);
 # any local user can connect from loopback too and forge it, so on a shared host its per-IP limits
@@ -22,6 +26,11 @@
 #   AmbientCapabilities=CAP_NET_BIND_SERVICE
 #   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 # (the key must be readable by the dynamic user: use LoadCredential= or a group-readable file).
+# Serving the phone app from a custom directory, e.g. /opt/omp-deck-relay/web:
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/local/bin/omp-deck-relay serve --listen 127.0.0.1:8080 --trust-forwarded-for \
+#     --state-dir /var/lib/omp-deck-relay --web-dir /opt/omp-deck-relay/web
 
 [Unit]
 Description=OmpDeck relay (omp-deck-relay)

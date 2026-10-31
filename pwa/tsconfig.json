@@ -1,7 +1,10 @@
 {
+  // The strict program: the transport, every non-JSX app module, the build script and the tests.
+  // JSX screens and the vendored upstream rendering are checked by tsconfig.app.json (upstream's
+  // flags), the service worker by tsconfig.sw.json (WebWorker globals).
   "compilerOptions": {
     "target": "ES2024",
-    "lib": ["ES2024"],
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "types": ["bun"],
@@ -16,5 +19,6 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "test"]
+  "include": ["src/remote", "src/app/**/*.ts", "src/push.ts", "src/env.d.ts", "test", "e2e", "build.ts"],
+  "exclude": ["src/sw.ts"]
 }

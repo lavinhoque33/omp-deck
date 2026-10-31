@@ -1,7 +1,8 @@
 #![cfg(feature = "noise")]
 //! The device application protocol against `tests/vectors/api-v1.json`, which the PWA tests read
 //! too: record bytes both ways, and one canonical JSON text per message variant (decode equals
-//! the Rust value, encode equals the text).
+//! the Rust value, encode equals the text). The slice-4 additions are in `api_s4` against
+//! `tests/vectors/api-s4.json`; variant coverage spans both files.
 //!
 //! Rewrite after an intentional protocol change:
 //! `OMPDECK_WRITE_VECTORS=1 cargo test -p deck-remote --test api`
@@ -10,6 +11,9 @@ use std::collections::BTreeSet;
 
 use deck_remote::api::*;
 use serde_json::{Value, json};
+
+mod api_s4;
+use api_s4 as s4;
 
 const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/api-v1.json");
 
@@ -816,6 +820,7 @@ fn feeds() -> Vec<(&'static str, Event)> {
         desktop_controlled: false,
         views: 1,
         requests,
+        pending_ui: vec![],
     };
     let item = |kind: InboxKind| InboxItem {
         live: live(),
@@ -858,6 +863,7 @@ fn feeds() -> Vec<(&'static str, Event)> {
                         title: None,
                         first_prompt: Some("Explain main".into()),
                         modified_unix_ms: 1_761_000_000_000,
+                        stub: false,
                     }],
                     truncated: false,
                 },
@@ -1011,6 +1017,7 @@ fn feeds() -> Vec<(&'static str, Event)> {
                             text: "hi".into(),
                             from_agent: false,
                             at_unix_ms: Some(1_761_000_000_000),
+                            images: vec![],
                         },
                         Item::Assistant {
                             text: "hello".into(),
@@ -1024,6 +1031,7 @@ fn feeds() -> Vec<(&'static str, Event)> {
                             intent: Some("Running tests".into()),
                             summary: "cargo test".into(),
                             args: "{\"command\":\"cargo test\"}".into(),
+                            args_value: None,
                         },
                         Item::ToolResult {
                             call_id: "c1".into(),
@@ -1031,6 +1039,8 @@ fn feeds() -> Vec<(&'static str, Event)> {
                             text: "ok".into(),
                             is_error: false,
                             truncated: true,
+                            details: None,
+                            images: vec![],
                         },
                         Item::Notice {
                             kind: "async-result".into(),
@@ -1215,6 +1225,7 @@ fn welcomes() -> Vec<(&'static str, Welcome)> {
             next_seq: 28,
             limits: Limits::default(),
             features: vec![],
+            push_key: String::new(),
         },
     )]
 }
@@ -1726,6 +1737,11 @@ fn shared_vectors_match() {
         on_disk == built,
         "api-v1.json drifted: OMPDECK_WRITE_VECTORS=1"
     );
+    // The R5 baseline: slice-4 additions must leave every v1 message's bytes unchanged.
+    assert!(
+        file == text,
+        "api-v1.json no longer regenerates byte-identically"
+    );
 }
 
 #[test]
@@ -1824,10 +1840,10 @@ fn rejected_requests_are_classified() {
     }
 }
 
-/// Every string inside each v1 request's op, replaced by one no version knows. Where serde
-/// refuses it as an unknown variant it was a tag or an enum value, which must answer
-/// `unsupported`; any other refusal `bad_request`. Fails when an op gains a nested enum that
-/// `Request::parse` does not classify.
+/// Every string inside each v1 and slice-4 request's op, replaced by one no version knows.
+/// Where serde refuses it as an unknown variant it was a tag or an enum value, which must
+/// answer `unsupported`; any other refusal `bad_request`. Fails when an op gains a nested enum
+/// that `Request::parse` does not classify.
 #[test]
 fn unknown_tags_and_enum_values_anywhere_in_an_op_are_unsupported() {
     fn strings(v: &Value, path: String, out: &mut Vec<String>) {
@@ -1847,7 +1863,7 @@ fn unknown_tags_and_enum_values_anywhere_in_an_op_are_unsupported() {
         }
     }
     let mut unsupported = BTreeSet::new();
-    for (case, request) in requests() {
+    for (case, request) in requests().into_iter().chain(s4::requests()) {
         let value = serde_json::to_value(&request).unwrap();
         let mut paths = Vec::new();
         strings(&value["op"], "/op".into(), &mut paths);
@@ -1869,10 +1885,12 @@ fn unknown_tags_and_enum_values_anywhere_in_an_op_are_unsupported() {
             }
         }
     }
-    // The op tag, the feed tag, the action type and the three plain enums.
-    let fields: BTreeSet<String> = ["op", "feed", "type", "mode", "side"]
-        .map(String::from)
-        .into();
+    // The op tag, the feed tag, the action/answer/decision/target types and the plain enums.
+    let fields: BTreeSet<String> = [
+        "op", "feed", "type", "mode", "side", "filter", "where", "split", "kind", "step", "choice",
+    ]
+    .map(String::from)
+    .into();
     assert_eq!(unsupported, fields);
 }
 
@@ -1936,6 +1954,93 @@ plain!(ChangeKind: Modified, Added, Deleted, Renamed, Copied, TypeChanged);
 plain!(Refusal: Precondition, DialogOpen, NoBracketedPaste);
 plain!(CancelReason: Exited, Detached, Closing, SessionChanged, NotAllowed);
 plain!(InputRefusal: NotAllowed, InputHeld, Exited, ReadOnly, Detached, Stale, Rejected);
+plain!(ComposeMode: Send, Steer, FollowUp, Insert);
+plain!(TreeFilter: Conversation, Default, All, Labeled);
+plain!(Split: None, Right, Down);
+plain!(ContinueWhere: Worktree, Main, SwitchBack);
+plain!(UpdateKind: Omp, Plugins, Stable, Canary);
+plain!(AppUpdateStep: Download, Apply);
+plain!(ConflictResolution: Keep, Overwrite, Both);
+plain!(UiKind: Select, Confirm, Input, Editor, Ask, Approve);
+plain!(MuxBackend: Tmux, Host);
+plain!(AgentStatus: Running, Done, Failed, Aborted, Interrupted, Parked);
+plain!(SyncInterval: Off, TenMinutes, ThirtyMinutes, Hourly, SixHours, Daily);
+plain!(InstallKind: UserDir, AppImage, Deb, Rpm, WindowsDir, Dev, Unsupported);
+plain!(GatewayMode: Off, WhileOpen, Background);
+plain!(TreeNodeKind:
+    User, Assistant, ToolResult, Developer, BashExecution, OtherRole, CustomMessage, Compaction,
+    BranchSummary, ModelChange, ModelUsage, ThinkingChange, Label, Custom, Setting);
+
+variants!(RestoreTarget, Some("type"), {
+    RestoreTarget::Project { .. } => RestoreTarget::Project { project: String::new() },
+    RestoreTarget::Dir { .. } => RestoreTarget::Dir { dir: String::new() },
+});
+
+variants!(UiAnswer, Some("type"), {
+    UiAnswer::Choice { .. } => UiAnswer::Choice { index: 0 },
+    UiAnswer::Choices { .. } => UiAnswer::Choices { indices: vec![] },
+    UiAnswer::Text { .. } => UiAnswer::Text { text: String::new() },
+    UiAnswer::Confirm { .. } => UiAnswer::Confirm { yes: true },
+    UiAnswer::Ask { .. } => UiAnswer::Ask { answers: vec![] },
+    UiAnswer::Approve { .. } => UiAnswer::Approve {
+        decision: ApproveDecision::Once {},
+    },
+    UiAnswer::Cancel {} => UiAnswer::Cancel {},
+});
+
+variants!(ApproveDecision, Some("type"), {
+    ApproveDecision::Once {} => ApproveDecision::Once {},
+    ApproveDecision::Session {} => ApproveDecision::Session {},
+    ApproveDecision::Deny {} => ApproveDecision::Deny {},
+    ApproveDecision::Grant { .. } => ApproveDecision::Grant {
+        index: 0,
+        always: false,
+    },
+});
+
+variants!(UpdatePhase, Some("state"), {
+    UpdatePhase::Idle {} => UpdatePhase::Idle {},
+    UpdatePhase::Checking {} => UpdatePhase::Checking {},
+    UpdatePhase::Downloading { .. } => UpdatePhase::Downloading { done: 0, total: None },
+    UpdatePhase::Applied {} => UpdatePhase::Applied {},
+    UpdatePhase::NeedsManual {} => UpdatePhase::NeedsManual {},
+    UpdatePhase::Failed { .. } => UpdatePhase::Failed { message: String::new() },
+});
+
+variants!(SettingKind, Some("type"), {
+    SettingKind::Bool {} => SettingKind::Bool {},
+    SettingKind::Number {} => SettingKind::Number {},
+    SettingKind::Enum { .. } => SettingKind::Enum { options: vec![] },
+    SettingKind::String {} => SettingKind::String {},
+    SettingKind::Array {} => SettingKind::Array {},
+    SettingKind::Record {} => SettingKind::Record {},
+});
+
+variants!(RestorePlanView, Some("type"), {
+    RestorePlanView::Drive { .. } => RestorePlanView::Drive {
+        name: String::new(),
+        created_unix_ms: None,
+        host: String::new(),
+        replaced: vec![],
+        added: vec![],
+        dirs: vec![],
+        removed: vec![],
+        safety_display: String::new(),
+    },
+    RestorePlanView::Project { .. } => RestorePlanView::Project {
+        target_display: String::new(),
+        create_target: false,
+        omp_exists: false,
+        omp_overwritten: vec![],
+        omp_added: vec![],
+        omp_skipped: vec![],
+        memory_exists: false,
+        memory_overwritten: vec![],
+        memory_added: vec![],
+        memory_skipped: vec![],
+        sessions: vec![],
+    },
+});
 
 variants!(SessionAction, Some("type"), {
     SessionAction::Handoff { .. } => SessionAction::Handoff { focus: None },
@@ -2022,7 +2127,157 @@ variants!(Op, Some("op"), {
         project: String::new(),
         files: vec![],
     },
+    Op::LastReply { .. } => Op::LastReply { session: e() },
+    Op::Export { .. } => Op::Export { session: e() },
+    Op::Blob { .. } => Op::Blob {
+        session: e(),
+        agent: None,
+        blob: e(),
+    },
+    Op::Download { .. } => Op::Download {
+        download: e(),
+        offset: 0,
+    },
+    Op::Tree { .. } => Op::Tree {
+        session: e(),
+        filter: TreeFilter::All,
+        cursor: None,
+        limit: 1,
+    },
+    Op::Browse { .. } => Op::Browse { dir: None },
+    Op::UsageActivity { .. } => Op::UsageActivity { days: 1 },
+    Op::UsageRefresh {} => Op::UsageRefresh {},
+    Op::OmpSettings {} => Op::OmpSettings {},
+    Op::DriveBackups {} => Op::DriveBackups {},
+    Op::SyncBackups { .. } => Op::SyncBackups { project: None },
+    Op::Presence { .. } => Op::Presence { visible: true },
+    Op::PushSubscribe { .. } => Op::PushSubscribe {
+        endpoint: e(),
+        p256dh: e(),
+        auth: e(),
+    },
+    Op::PushUnsubscribe {} => Op::PushUnsubscribe {},
+    Op::PushPrefs { .. } => Op::PushPrefs {
+        prefs: PushPrefs::default(),
+    },
+    Op::DeviceRename { .. } => Op::DeviceRename { name: e() },
+    Op::Unpair {} => Op::Unpair {},
+    Op::UploadBegin { .. } => Op::UploadBegin {
+        name: e(),
+        mime: e(),
+        size: 0,
+    },
+    Op::UploadChunk { .. } => Op::UploadChunk {
+        upload: e(),
+        offset: 0,
+        data: e(),
+    },
+    Op::UploadCancel { .. } => Op::UploadCancel { upload: e() },
+    Op::Compose { .. } => Op::Compose {
+        live: live(),
+        text: e(),
+        attachments: vec![],
+        mode: ComposeMode::Send,
+    },
+    Op::Review { .. } => Op::Review {
+        live: live(),
+        comments: vec![],
+        general: None,
+        send: false,
+    },
+    Op::AnswerUi { .. } => Op::AnswerUi {
+        live: live(),
+        request: e(),
+        value: UiAnswer::Cancel {},
+    },
+    Op::AgentKill { .. } => Op::AgentKill {
+        live: live(),
+        agent: e(),
+    },
+    Op::AgentRevive { .. } => Op::AgentRevive {
+        live: live(),
+        agent: e(),
+    },
+    Op::AgentChat { .. } => Op::AgentChat {
+        live: live(),
+        agent: e(),
+        text: e(),
+    },
+    Op::ForkAt { .. } => Op::ForkAt {
+        session: e(),
+        entry: e(),
+    },
+    Op::Navigate { .. } => Op::Navigate {
+        live: live(),
+        entry: e(),
+    },
+    Op::NewSessionIn { .. } => Op::NewSessionIn { dir: e() },
+    Op::RunningKill { .. } => Op::RunningKill { ids: vec![] },
+    Op::WorktreeCreate { .. } => Op::WorktreeCreate {
+        project: e(),
+        branch: e(),
+        base: None,
+        open: false,
+    },
+    Op::WorktreeMove { .. } => Op::WorktreeMove {
+        live: live(),
+        branch: e(),
+    },
+    Op::WorktreeFinish { .. } => Op::WorktreeFinish { project: e() },
+    Op::WorktreeContinue { .. } => Op::WorktreeContinue {
+        parked: e(),
+        r#where: ContinueWhere::Main,
+    },
+    Op::UpdateCheck {} => Op::UpdateCheck {},
+    Op::DriveBackup {} => Op::DriveBackup {},
+    Op::SyncBackup { .. } => Op::SyncBackup { project: e() },
+    Op::OpenOnDesktop { .. } => Op::OpenOnDesktop {
+        session: e(),
+        split: Split::None,
+    },
+    Op::CloseOnDesktop { .. } => Op::CloseOnDesktop { session: e() },
+    Op::WorktreeRemove { .. } => Op::WorktreeRemove {
+        project: e(),
+        park: false,
+    },
+    Op::OmpSet { .. } => Op::OmpSet {
+        key: e(),
+        value: Value::Null,
+    },
+    Op::OmpReset { .. } => Op::OmpReset { key: e() },
+    Op::UpdateRun { .. } => Op::UpdateRun {
+        kind: UpdateKind::Omp,
+    },
+    Op::AppUpdate { .. } => Op::AppUpdate {
+        step: AppUpdateStep::Download,
+    },
+    Op::DriveSignIn {} => Op::DriveSignIn {},
+    Op::DriveDelete { .. } => Op::DriveDelete { ids: vec![] },
+    Op::DriveRestorePrepare { .. } => Op::DriveRestorePrepare { id: e() },
+    Op::DriveRestoreApply { .. } => Op::DriveRestoreApply { handle: 0 },
+    Op::DriveRestoreDiscard { .. } => Op::DriveRestoreDiscard { handle: 0 },
+    Op::SyncAdd { .. } => Op::SyncAdd { dir: e() },
+    Op::SyncSet { .. } => Op::SyncSet {
+        project: e(),
+        parts: SyncParts::default(),
+        excluded: vec![],
+    },
+    Op::SyncRemove { .. } => Op::SyncRemove { project: e() },
+    Op::SyncDelete { .. } => Op::SyncDelete { ids: vec![] },
+    Op::SyncRestorePrepare { .. } => Op::SyncRestorePrepare {
+        backup: e(),
+        target: RestoreTarget::Dir { dir: e() },
+        parts: SyncParts::default(),
+    },
+    Op::SyncRestoreApply { .. } => Op::SyncRestoreApply {
+        handle: 0,
+        conflicts: vec![],
+    },
 });
+
+fn e() -> String {
+    String::new()
+}
 
 variants!(Feed, Some("feed"), {
     Feed::Projects {} => Feed::Projects {},
@@ -2039,6 +2294,19 @@ variants!(Feed, Some("feed"), {
         tail: 0,
     },
     Feed::Changes { .. } => Feed::Changes { project: String::new() },
+    Feed::Running {} => Feed::Running {},
+    Feed::Inventory { .. } => Feed::Inventory {
+        project: None,
+        limit: 1,
+    },
+    Feed::Context { .. } => Feed::Context { live: live() },
+    Feed::Usage {} => Feed::Usage {},
+    Feed::Agents { .. } => Feed::Agents { session: e() },
+    Feed::Worktrees { .. } => Feed::Worktrees { project: e() },
+    Feed::Drive {} => Feed::Drive {},
+    Feed::Sync {} => Feed::Sync {},
+    Feed::Updates {} => Feed::Updates {},
+    Feed::Device {} => Feed::Device {},
 });
 
 variants!(FeedValue, Some("feed"), {
@@ -2078,6 +2346,56 @@ variants!(FeedValue, Some("feed"), {
         error: None,
         truncated: false,
     },
+    FeedValue::Running { .. } => FeedValue::Running {
+        sessions: vec![],
+        server_bytes: None,
+        truncated: false,
+    },
+    FeedValue::Inventory { .. } => FeedValue::Inventory {
+        project: None,
+        total: 0,
+        entries: vec![],
+        truncated: false,
+    },
+    FeedValue::Context { .. } => FeedValue::Context {
+        live: live(),
+        context: None,
+    },
+    FeedValue::Usage { .. } => FeedValue::Usage {
+        usage: None,
+        fetched_unix_ms: None,
+        error: None,
+        fetching: false,
+        truncated: false,
+    },
+    FeedValue::Agents { .. } => FeedValue::Agents {
+        session: e(),
+        agents: vec![],
+        truncated: false,
+    },
+    FeedValue::Worktrees { .. } => FeedValue::Worktrees {
+        project: e(),
+        worktree: None,
+        parked: vec![],
+        truncated: false,
+    },
+    FeedValue::Drive { .. } => FeedValue::Drive {
+        available: false,
+        signed_in: false,
+        account: None,
+        last_backup_unix_ms: None,
+        interval: SyncInterval::Off,
+        busy: None,
+        error: None,
+    },
+    FeedValue::Sync { .. } => FeedValue::Sync {
+        rows: vec![],
+        interval: SyncInterval::Off,
+        busy: None,
+        truncated: false,
+    },
+    FeedValue::Updates { .. } => s4::updates(UpdatePhase::Idle {}),
+    FeedValue::Device { .. } => s4::device(),
 });
 
 variants!(Status, Some("state"), {
@@ -2099,6 +2417,7 @@ variants!(Item, Some("type"), {
         text: String::new(),
         from_agent: false,
         at_unix_ms: None,
+        images: vec![],
     },
     Item::Assistant { .. } => Item::Assistant {
         text: String::new(),
@@ -2112,6 +2431,7 @@ variants!(Item, Some("type"), {
         intent: None,
         summary: String::new(),
         args: String::new(),
+        args_value: None,
     },
     Item::ToolResult { .. } => Item::ToolResult {
         call_id: String::new(),
@@ -2119,6 +2439,8 @@ variants!(Item, Some("type"), {
         text: String::new(),
         is_error: false,
         truncated: false,
+        details: None,
+        images: vec![],
     },
     Item::Notice { .. } => Item::Notice {
         kind: String::new(),
@@ -2172,6 +2494,47 @@ variants!(Resp, Some("type"), {
         view: 1,
         mode: ViewMode::Observe,
     },
+    Resp::Text { .. } => Resp::Text {
+        text: e(),
+        truncated: false,
+    },
+    Resp::Download { .. } => Resp::Download {
+        download: e(),
+        name: e(),
+        mime: e(),
+        size: 0,
+    },
+    Resp::Chunk { .. } => Resp::Chunk {
+        data: e(),
+        eof: true,
+    },
+    Resp::Tree { .. } => Resp::Tree {
+        nodes: vec![],
+        active_leaf: None,
+        next_cursor: None,
+        truncated: false,
+    },
+    Resp::Dir { .. } => Resp::Dir {
+        dir: None,
+        display: e(),
+        parent: None,
+        entries: vec![],
+        truncated: false,
+    },
+    Resp::Activity { .. } => Resp::Activity { days: vec![] },
+    Resp::OmpSettings { .. } => Resp::OmpSettings {
+        groups: vec![],
+        truncated: false,
+    },
+    Resp::DriveBackups { .. } => Resp::DriveBackups {
+        hosts: vec![],
+        truncated: false,
+    },
+    Resp::SyncBackups { .. } => Resp::SyncBackups {
+        backups: vec![],
+        truncated: false,
+    },
+    Resp::Upload { .. } => Resp::Upload { upload: e() },
 });
 
 variants!(OutcomeView, Some("state"), {
@@ -2201,6 +2564,13 @@ variants!(DoneView, Some("type"), {
     DoneView::Answered { .. } => DoneView::Answered { applied: true },
     DoneView::Deleted { .. } => DoneView::Deleted { results: vec![] },
     DoneView::File { .. } => DoneView::File { session: None },
+    DoneView::Text { .. } => DoneView::Text { text: e() },
+    DoneView::Killed { .. } => DoneView::Killed { results: vec![] },
+    DoneView::RestorePlan { .. } => DoneView::RestorePlan {
+        handle: 1,
+        plan: s4::drive_plan(),
+        truncated: false,
+    },
 });
 
 variants!(RejectedView, Some("code"), {
@@ -2335,7 +2705,7 @@ impl Seen {
             assert!(!names[..i].contains(name), "{} {name} twice", T::TYPE);
             assert!(
                 self.0.contains(&(T::TYPE, name.clone())),
-                "api-v1.json has no {} {name}",
+                "the vectors have no {} {name}",
                 T::TYPE
             );
         }
@@ -2354,6 +2724,29 @@ impl Seen {
                     self.add(mode);
                 }
             }
+            Op::Tree { filter, .. } => self.add(filter),
+            Op::Compose { mode, .. } => self.add(mode),
+            Op::Review { comments, .. } => {
+                for c in comments {
+                    self.add(&c.side);
+                }
+            }
+            Op::AnswerUi { value, .. } => {
+                self.add(value);
+                if let UiAnswer::Approve { decision } = value {
+                    self.add(decision);
+                }
+            }
+            Op::WorktreeContinue { r#where, .. } => self.add(r#where),
+            Op::OpenOnDesktop { split, .. } => self.add(split),
+            Op::UpdateRun { kind } => self.add(kind),
+            Op::AppUpdate { step } => self.add(step),
+            Op::SyncRestorePrepare { target, .. } => self.add(target),
+            Op::SyncRestoreApply { conflicts, .. } => {
+                for c in conflicts {
+                    self.add(&c.choice);
+                }
+            }
             _ => {}
         }
     }
@@ -2366,6 +2759,16 @@ impl Seen {
                 match resp {
                     Resp::Outcome { outcome } => self.outcome(outcome),
                     Resp::Attached { mode, .. } => self.add(mode),
+                    Resp::Tree { nodes, .. } => {
+                        for n in nodes {
+                            self.add(&n.kind);
+                        }
+                    }
+                    Resp::OmpSettings { groups, .. } => {
+                        for e in groups.iter().flat_map(|g| &g.entries) {
+                            self.add(&e.kind);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2385,8 +2788,10 @@ impl Seen {
         match o {
             OutcomeView::Done { result } => {
                 self.add(result);
-                if let DoneView::Submitted { delivery, .. } = result {
-                    self.delivery(delivery);
+                match result {
+                    DoneView::Submitted { delivery, .. } => self.delivery(delivery),
+                    DoneView::RestorePlan { plan, .. } => self.add(plan),
+                    _ => {}
                 }
             }
             OutcomeView::Rejected { reason } => self.add(reason),
@@ -2427,6 +2832,9 @@ impl Seen {
                     for r in &s.requests {
                         self.delivery(&r.delivery);
                     }
+                    for u in &s.pending_ui {
+                        self.add(&u.kind);
+                    }
                 }
             }
             FeedValue::Inbox { inbox, .. } => {
@@ -2448,17 +2856,41 @@ impl Seen {
                     }
                 }
             }
+            FeedValue::Running { sessions, .. } => {
+                for s in sessions {
+                    self.add(&s.backend);
+                }
+            }
+            FeedValue::Agents { agents, .. } => {
+                for a in agents {
+                    self.add(&a.status);
+                }
+            }
+            FeedValue::Drive { interval, .. } | FeedValue::Sync { interval, .. } => {
+                self.add(interval)
+            }
+            FeedValue::Updates { app, .. } => {
+                self.add(&app.install);
+                self.add(&app.phase);
+            }
+            FeedValue::Device { mode, .. } => self.add(mode),
             _ => {}
         }
     }
 }
 
-/// Per type, every variant (tag or string) appears in `api-v1.json`.
+/// Per type, every variant (tag or string) appears in `api-v1.json` or `api-s4.json`.
 #[test]
 fn the_vectors_cover_every_variant() {
     let file: Value = serde_json::from_str(&std::fs::read_to_string(PATH).unwrap()).unwrap();
+    let s4_file: Value = serde_json::from_str(&std::fs::read_to_string(s4::PATH).unwrap()).unwrap();
     let mut seen = Seen::default();
-    for m in file["messages"].as_array().unwrap() {
+    for m in file["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(s4_file["messages"].as_array().unwrap())
+    {
         let text = m["json"].as_str().unwrap();
         match m["type"].as_str().unwrap() {
             "request" => seen.request(&serde_json::from_str(text).unwrap()),
@@ -2495,7 +2927,30 @@ fn the_vectors_cover_every_variant() {
     seen.covered::<ApiError>();
     seen.covered::<Event>();
     seen.covered::<TermEnd>();
-    for (_, r) in requests() {
+    assert_eq!(seen.covered::<ComposeMode>(), ComposeMode::NAMES);
+    assert_eq!(seen.covered::<TreeFilter>(), TreeFilter::NAMES);
+    assert_eq!(seen.covered::<Split>(), Split::NAMES);
+    assert_eq!(seen.covered::<ContinueWhere>(), ContinueWhere::NAMES);
+    assert_eq!(seen.covered::<UpdateKind>(), UpdateKind::NAMES);
+    assert_eq!(seen.covered::<AppUpdateStep>(), AppUpdateStep::NAMES);
+    assert_eq!(
+        seen.covered::<ConflictResolution>(),
+        ConflictResolution::NAMES
+    );
+    assert_eq!(seen.covered::<RestoreTarget>(), RestoreTarget::NAMES);
+    assert_eq!(seen.covered::<UiAnswer>(), UiAnswer::NAMES);
+    assert_eq!(seen.covered::<ApproveDecision>(), ApproveDecision::NAMES);
+    seen.covered::<UiKind>();
+    seen.covered::<MuxBackend>();
+    seen.covered::<AgentStatus>();
+    seen.covered::<SyncInterval>();
+    seen.covered::<InstallKind>();
+    seen.covered::<GatewayMode>();
+    seen.covered::<TreeNodeKind>();
+    seen.covered::<UpdatePhase>();
+    seen.covered::<SettingKind>();
+    seen.covered::<RestorePlanView>();
+    for (_, r) in requests().into_iter().chain(s4::requests()) {
         assert_eq!(serde_json::to_value(&r.op).unwrap()["op"], r.op.name());
     }
 

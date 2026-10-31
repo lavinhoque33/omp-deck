@@ -478,6 +478,15 @@ pub fn permission_badges(ui: &mut Ui, p: Permissions) {
     }
 }
 
+/// The push badge of a device: its text and hue.
+fn push_badge(push: bool) -> (&'static str, Hue) {
+    if push {
+        ("Notifications on", Hue::Teal)
+    } else {
+        ("Notifications off", Hue::Amber)
+    }
+}
+
 /// One device: name, platform, permission badges, fingerprint and presence. Hover (or the
 /// right-click menu) offers Rename, Permissions and Revoke.
 fn device_row(
@@ -550,7 +559,15 @@ fn device_row(
             }
         },
     );
-    ui.horizontal(|ui| permission_badges(ui, d.permissions));
+    ui.horizontal(|ui| {
+        permission_badges(ui, d.permissions);
+        let (text, hue) = push_badge(d.push);
+        badge::show(ui, None, text, hue, 10.5).on_hover_text(if d.push {
+            "This device receives push notifications"
+        } else {
+            "This device receives no push notifications"
+        });
+    });
     ui.horizontal(|ui| {
         ui.label(RichText::new("FINGERPRINT").size(10.0).color(pal.glyph));
         ui.add(
@@ -615,6 +632,7 @@ mod tests {
             created_unix_ms: 1,
             last_seen_unix_ms: last_seen_ms,
             online,
+            push: false,
         }
     }
 

@@ -72,6 +72,7 @@ mod app_update;
 mod bar;
 mod changes;
 mod ctl;
+mod desktop;
 mod drive;
 mod mobile;
 mod notifications;
@@ -183,19 +184,16 @@ enum PendingConfirm {
     KillRunning(Vec<String>),
     /// Restore a downloaded Google Drive backup over the local omp config.
     RestoreBackup(drive::PendingRestore),
-    /// Remove a clean worktree after moving the tabs inside it into the primary checkout:
-    /// merged ones with their branch, pushed ones parked (the branch stays).
+    /// Remove a clean, merged worktree (with its branch) or park a clean, pushed one (the
+    /// branch stays); the gateway moves the sessions inside it into the primary checkout.
     RemoveWorktree {
         wt: Worktree,
-        base: String,
-        how: deck_core::worktree::Removal,
+        park: bool,
     },
-    /// Check `target` out in the main checkout `primary` (a parked branch, or its base again);
-    /// `open` then opens the clicked session.
+    /// Check a parked branch out in the main checkout (`open`: and open the clicked session
+    /// there), or switch the main checkout back to the branch's base.
     SwitchMain {
         entry: SessionEntry,
-        primary: PathBuf,
-        target: String,
         open: bool,
     },
     /// Drop the project-backup row of a worktree that no longer exists.
@@ -427,6 +425,8 @@ pub struct App {
     /// Opens (sidebar, reopen) requested before the first snapshot of the backends: attaching a
     /// canonical name blindly could land in a session that now runs another file. Processed on arrival.
     deferred_opens: Vec<ClosedTab>,
+    /// Sessions the gateway asked this window to open (the sidebar's scan may not know them yet).
+    desktop_opens: Vec<desktop::DesktopOpen>,
     /// The Neutral font family was rebuilt from the final definitions (first frame).
     fonts_finalized: bool,
     /// Frames drawn since `frame_mark` (debug log `omp_deck::frames`, RUST_LOG=omp_deck::frames=debug).
@@ -628,6 +628,7 @@ impl App {
             dialog_target: None,
             next_tab_uid: 0,
             deferred_opens: Vec::new(),
+            desktop_opens: Vec::new(),
             agents_target: None,
             agents_view: AgentsView::default(),
             dash: DashState::default(),
@@ -670,6 +671,17 @@ impl App {
         };
         if let Some(e) = startup_error {
             app.toasts.error(&app.ctx, format!("Folder ignored: {e}"));
+        }
+        // The gateway started this window for a session or a link: show it as soon as it can.
+        if let Some(file) = cli.open {
+            app.desktop_opens.push(desktop::DesktopOpen::new(
+                file,
+                cli.split
+                    .unwrap_or(deck_service::gateway::protocol::Split::None),
+            ));
+        }
+        if let Some(url) = cli.open_url {
+            app.open_external(url);
         }
         app
     }
@@ -733,6 +745,9 @@ impl App {
             ClientEvent::Activate { target, token } => self.on_activate(&target, token.as_deref()),
             ClientEvent::ModelUnconfirmed { switch, .. } => self.on_model_unconfirmed(&switch),
             ClientEvent::CopyResult { target, result } => self.on_copy_result(&target, result),
+            ClientEvent::OpenSession { file, split } => self.on_open_session(file, split),
+            ClientEvent::CloseSession { file } => self.on_close_session(&file),
+            ClientEvent::OpenUrl { url } => self.open_external(url),
             // Consumed by `Gw` (outcomes, progress) or read from the caches (topic changes).
             ClientEvent::Changed { .. }
             | ClientEvent::Outcome { .. }
@@ -2160,13 +2175,8 @@ impl App {
             }
             PendingConfirm::StopSessions(paths) => self.execute_stop_sessions(paths),
             PendingConfirm::KillRunning(names) => self.execute_kill_running(names),
-            PendingConfirm::RemoveWorktree { wt, base, how } => self.execute_remove(wt, base, how),
-            PendingConfirm::SwitchMain {
-                entry,
-                primary,
-                target,
-                open,
-            } => self.execute_switch_main(entry, primary, target, open),
+            PendingConfirm::RemoveWorktree { wt, park } => self.execute_remove(wt, park),
+            PendingConfirm::SwitchMain { entry, open } => self.execute_switch_main(entry, open),
             PendingConfirm::DropSyncRow { path } => self.drop_sync_row(&path),
             PendingConfirm::Changes(w) => self.execute_changes_write(w),
             PendingConfirm::ClearDraft { .. } | PendingConfirm::RestoreBackup(_) => {}
@@ -2626,7 +2636,6 @@ impl App {
             });
             if let Ok(catalog) = &catalog {
                 app.omp_defaults = defaults_from_catalog(catalog);
-                app.wt.base_setting = crate::omp_settings::worktree_base_from_catalog(catalog);
             }
             let env = std::env::var("PI_CODING_AGENT_DIR").ok();
             let dir = config_dir_display(env.as_deref(), app.home.as_deref());
@@ -3135,6 +3144,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.file_drops.attach_window(ctx, frame);
         self.pump_gateway();
+        self.run_desktop_opens();
         self.poll_tabs();
         self.poll_settings();
         self.poll_gateway_mode();
@@ -3227,7 +3237,7 @@ impl eframe::App for App {
         self.show_action_dialog(&ctx);
         self.show_folder_dialog(&ctx);
         self.show_worktree_dialog(&ctx);
-        self.drive_worktrees(&ctx);
+        self.drive_worktrees();
         self.check_update_tabs();
         self.pump_update_queue();
         self.tick_app_update(&ctx);

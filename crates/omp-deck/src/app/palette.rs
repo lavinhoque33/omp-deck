@@ -702,9 +702,10 @@ impl App {
                 project_why.or(drive_why(drive)),
             );
         }
-        let finishing = worktree
+        let finish_state = worktree
             .as_ref()
-            .is_some_and(|w| self.wt.finishing.contains_key(&w.path));
+            .and_then(|w| self.wt.finishing.get(&w.path).copied());
+        let finishing = finish_state.is_some();
         let wt_why = need(worktree.is_some(), NOT_WORKTREE);
         add(
             "worktree.finish",
@@ -720,7 +721,10 @@ impl App {
             "Worktree: Cancel finishing",
             None,
             ICON_X,
-            wt_why.or(need(finishing, "Not finishing")),
+            wt_why.or(need(finishing, "Not finishing")).or(need(
+                finish_state == Some(true),
+                "Another device or window started it",
+            )),
         );
         add(
             "worktree.remove",

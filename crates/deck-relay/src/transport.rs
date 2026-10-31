@@ -1,4 +1,4 @@
-//! Accept-level connection limits and the pre-WebSocket deadline, shared by the plain and TLS
+//! Accept-level connection limits and the per-request HTTP deadlines, shared by the plain and TLS
 //! listeners: every TCP connection reserves a [`Slot`] before anything else happens (TLS handshake
 //! included) and holds it until the socket is dropped, so sockets that never finish TLS or HTTP
 //! count against the same caps as WebSockets.
@@ -9,14 +9,20 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::connect_info::Connected;
+use axum::extract::{ConnectInfo, Request};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::serve::{IncomingStream, Listener};
+use http_body::{Frame, SizeHint};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::Sleep;
+use tokio::time::{Instant, Sleep};
 
 use crate::Config;
 use crate::config::{ProxyRange, canonical, is_proxy};
@@ -133,54 +139,209 @@ impl Drop for Slot {
     }
 }
 
+/// The HTTP timeouts and request cap of one connection, until it upgrades to a WebSocket.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HttpLimits {
+    pub header: Duration,
+    pub keep_alive: Duration,
+    pub write_stall: Duration,
+    pub max_requests: u32,
+}
+
+impl HttpLimits {
+    pub fn of(config: &Config) -> HttpLimits {
+        HttpLimits {
+            header: config.header_timeout,
+            keep_alive: config.keep_alive_timeout,
+            write_stall: config.write_stall_timeout,
+            max_requests: config.max_requests_per_connection,
+        }
+    }
+}
+
+/// Where a connection's HTTP exchange is, shared between its [`Guarded`] I/O (which enforces the
+/// read deadline) and the [`track`] middleware (which sees requests start and responses end).
+pub(crate) struct Exchange {
+    limits: HttpLimits,
+    upgraded: AtomicBool,
+    state: Mutex<ExchangeState>,
+}
+
+struct ExchangeState {
+    phase: Phase,
+    requests: u32,
+    /// The task last parked on a pending read, woken when the phase changes its deadline.
+    reader: Option<Waker>,
+}
+
+#[derive(Clone, Copy)]
+enum Phase {
+    /// Request headers must be complete by then.
+    Headers(Instant),
+    /// A handler or its response body is running: no read deadline (the write stall applies).
+    Busy,
+    /// Between requests: closed by then unless traffic moves in either direction.
+    Idle(Instant),
+}
+
+impl Exchange {
+    fn new(limits: HttpLimits) -> Arc<Exchange> {
+        Arc::new(Exchange {
+            limits,
+            upgraded: AtomicBool::new(false),
+            state: Mutex::new(ExchangeState {
+                phase: Phase::Headers(Instant::now() + limits.header),
+                requests: 0,
+                reader: None,
+            }),
+        })
+    }
+
+    fn state(&self) -> MutexGuard<'_, ExchangeState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn upgraded(&self) -> bool {
+        self.upgraded.load(Ordering::Acquire)
+    }
+
+    /// The current read deadline; `waker` is woken when it changes.
+    fn read_deadline(&self, waker: &Waker) -> Option<Instant> {
+        let mut s = self.state();
+        match &mut s.reader {
+            Some(w) if w.will_wake(waker) => {}
+            slot => *slot = Some(waker.clone()),
+        }
+        match s.phase {
+            Phase::Headers(at) | Phase::Idle(at) => Some(at),
+            Phase::Busy => None,
+        }
+    }
+
+    /// Bytes arrived: on an idle connection they start the next request's header deadline.
+    fn read_progress(&self) {
+        let mut s = self.state();
+        if let Phase::Idle(_) = s.phase {
+            s.phase = Phase::Headers(Instant::now() + self.limits.header);
+        }
+    }
+
+    /// Response bytes left: a connection still sending is not idle.
+    fn write_progress(&self) {
+        let mut s = self.state();
+        if let Phase::Idle(_) = s.phase {
+            s.phase = Phase::Idle(Instant::now() + self.limits.keep_alive);
+        }
+    }
+
+    /// A request reached the router; `true`: it is the connection's last.
+    fn begin_request(&self) -> bool {
+        let mut s = self.state();
+        s.phase = Phase::Busy;
+        s.requests = s.requests.saturating_add(1);
+        s.requests >= self.limits.max_requests
+    }
+
+    /// The response body is done (or dropped): the connection goes idle.
+    fn end_request(&self) {
+        let reader = {
+            let mut s = self.state();
+            s.phase = Phase::Idle(Instant::now() + self.limits.keep_alive);
+            s.reader.take()
+        };
+        if let Some(w) = reader {
+            w.wake();
+        }
+    }
+}
+
 /// A connection holding its [`Slot`] for as long as the socket lives (through the HTTP exchange
-/// and the WebSocket after it). Until a handler marks it upgraded, I/O fails with `TimedOut` once
-/// the request deadline passes: slow or never-sent request headers and idle keep-alive both end
-/// there, which hyper on its own (no timer configured by `axum::serve`) would wait out forever.
+/// and the WebSocket after it). Until a handler marks it upgraded, I/O fails with `TimedOut` when
+/// the [`Exchange`]'s read deadline passes (slow or never-sent request headers, idle keep-alive)
+/// or a write makes no progress for [`HttpLimits::write_stall`]: `axum::serve` configures no hyper
+/// timer, so hyper on its own would wait these out forever.
 pub(crate) struct Guarded<S> {
     /// Declared first so it is dropped first: once the peer sees the socket close, the slot is
     /// already free.
     _slot: Slot,
     io: S,
-    deadline: Option<Pin<Box<Sleep>>>,
-    upgraded: Arc<AtomicBool>,
+    exchange: Arc<Exchange>,
+    read_timer: Option<Pin<Box<Sleep>>>,
+    write_timer: Option<Pin<Box<Sleep>>>,
+    /// `write_timer` runs for the current stall (reset on progress, not reallocated).
+    write_armed: bool,
 }
 
 impl<S> Guarded<S> {
-    pub fn new(io: S, slot: Slot, request_timeout: Duration) -> Guarded<S> {
+    pub fn new(io: S, slot: Slot, limits: HttpLimits) -> Guarded<S> {
         Guarded {
-            io,
             _slot: slot,
-            deadline: Some(Box::pin(tokio::time::sleep(request_timeout))),
-            upgraded: Arc::new(AtomicBool::new(false)),
+            io,
+            exchange: Exchange::new(limits),
+            read_timer: None,
+            write_timer: None,
+            write_armed: false,
         }
     }
 
-    /// Called while the inner I/O is pending: arms the deadline's wakeup, `Err` once it passed.
-    fn check_deadline(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
-        let Some(deadline) = &mut self.deadline else {
+    /// Whether the connection became a WebSocket (its timers are then dropped for good).
+    fn upgraded(&mut self) -> bool {
+        if !self.exchange.upgraded() {
+            return false;
+        }
+        self.read_timer = None;
+        self.write_timer = None;
+        true
+    }
+
+    /// Called while a read is pending: arms the read deadline's wakeup, `Err` once it passed.
+    fn check_read(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        let Some(deadline) = self.exchange.read_deadline(cx.waker()) else {
             return Ok(());
         };
-        if self.upgraded.load(Ordering::Acquire) {
-            self.deadline = None;
-            return Ok(());
+        let timer = self
+            .read_timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+        if timer.deadline() != deadline {
+            timer.as_mut().reset(deadline);
         }
-        match deadline.as_mut().poll(cx) {
+        match timer.as_mut().poll(cx) {
             Poll::Ready(()) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "no WebSocket upgrade before the request deadline",
+                "HTTP request deadline passed",
             )),
             Poll::Pending => Ok(()),
         }
     }
 
-    fn guard<T>(&mut self, cx: &mut Context<'_>, r: Poll<io::Result<T>>) -> Poll<io::Result<T>> {
-        if r.is_pending()
-            && let Err(e) = self.check_deadline(cx)
-        {
-            return Poll::Ready(Err(e));
+    fn guard_write<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        r: Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        if self.upgraded() {
+            return r;
         }
-        r
+        if r.is_ready() {
+            self.write_armed = false;
+            self.exchange.write_progress();
+            return r;
+        }
+        let at = Instant::now() + self.exchange.limits.write_stall;
+        let timer = self
+            .write_timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
+        if !self.write_armed {
+            timer.as_mut().reset(at);
+            self.write_armed = true;
+        }
+        match timer.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP response write stalled",
+            ))),
+            Poll::Pending => r,
+        }
     }
 }
 
@@ -191,8 +352,21 @@ impl<S: AsyncRead + Unpin> AsyncRead for Guarded<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let filled = buf.filled().len();
         let r = Pin::new(&mut this.io).poll_read(cx, buf);
-        this.guard(cx, r)
+        if this.upgraded() {
+            return r;
+        }
+        match r {
+            Poll::Pending => {
+                if let Err(e) = this.check_read(cx) {
+                    return Poll::Ready(Err(e));
+                }
+            }
+            Poll::Ready(Ok(())) if buf.filled().len() > filled => this.exchange.read_progress(),
+            Poll::Ready(_) => {}
+        }
+        r
     }
 }
 
@@ -204,7 +378,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Guarded<S> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let r = Pin::new(&mut this.io).poll_write(cx, buf);
-        this.guard(cx, r)
+        this.guard_write(cx, r)
     }
 
     fn poll_write_vectored(
@@ -214,7 +388,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Guarded<S> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let r = Pin::new(&mut this.io).poll_write_vectored(cx, bufs);
-        this.guard(cx, r)
+        this.guard_write(cx, r)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -224,7 +398,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Guarded<S> {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let r = Pin::new(&mut this.io).poll_flush(cx);
-        this.guard(cx, r)
+        this.guard_write(cx, r)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -233,24 +407,84 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Guarded<S> {
 }
 
 /// What handlers learn about their connection, for both plain and TLS listeners.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PeerAddr {
     pub addr: SocketAddr,
-    upgraded: Arc<AtomicBool>,
+    exchange: Arc<Exchange>,
+}
+
+impl std::fmt::Debug for PeerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerAddr")
+            .field("addr", &self.addr)
+            .finish()
+    }
 }
 
 impl PeerAddr {
-    /// The connection is becoming a WebSocket: lift the request deadline (the hello timeout and
+    /// The connection is becoming a WebSocket: lift the HTTP deadlines (the hello timeout and
     /// idle timeout take over).
     pub fn mark_upgraded(&self) {
-        self.upgraded.store(true, Ordering::Release);
+        self.exchange.upgraded.store(true, Ordering::Release);
     }
 
     fn of<S>(io: &Guarded<S>, addr: SocketAddr) -> PeerAddr {
         PeerAddr {
             addr,
-            upgraded: io.upgraded.clone(),
+            exchange: io.exchange.clone(),
         }
+    }
+}
+
+/// Router middleware: tells the connection's [`Exchange`] when a request starts and when its
+/// response body is done, and closes the connection after its last allowed request.
+pub(crate) async fn track(
+    ConnectInfo(peer): ConnectInfo<PeerAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let last = peer.exchange.begin_request();
+    let done = Done(peer.exchange);
+    let mut resp = next.run(req).await;
+    if last && resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        resp.headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    resp.map(|inner| Body::new(Tracked { inner, _done: done }))
+}
+
+/// Ends the request on drop: when hyper finished (or abandoned) the response body.
+struct Done(Arc<Exchange>);
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        self.0.end_request();
+    }
+}
+
+/// A response body that ends its request when dropped.
+struct Tracked {
+    inner: Body,
+    _done: Done,
+}
+
+impl HttpBody for Tracked {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -271,15 +505,15 @@ impl Connected<IncomingStream<'_, TlsListener>> for PeerAddr {
 pub(crate) struct Plain {
     listener: TcpListener,
     limits: Arc<Limits>,
-    request_timeout: Duration,
+    http: HttpLimits,
 }
 
 impl Plain {
-    pub fn new(listener: TcpListener, limits: Arc<Limits>, request_timeout: Duration) -> Plain {
+    pub fn new(listener: TcpListener, limits: Arc<Limits>, http: HttpLimits) -> Plain {
         Plain {
             listener,
             limits,
-            request_timeout,
+            http,
         }
     }
 }
@@ -297,7 +531,7 @@ impl Listener for Plain {
                 continue;
             };
             let _ = stream.set_nodelay(true);
-            return (Guarded::new(stream, slot, self.request_timeout), addr);
+            return (Guarded::new(stream, slot, self.http), addr);
         }
     }
 

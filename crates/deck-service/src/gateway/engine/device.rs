@@ -41,6 +41,14 @@ use crate::session_actions::{Action, CompactMode};
 use crate::status::TabStatus;
 use crate::statusfmt::Activity;
 
+mod dirs;
+mod s4;
+mod transfer;
+mod tree;
+mod views;
+
+pub(super) use s4::DeviceFin;
+
 /// Deleted sessions remembered (file → id) so a deletion's outcome names sessions, not files.
 const DELETED_IDS: usize = 4096;
 /// How deep a subagent transcript is searched for below its session's folder.
@@ -57,6 +65,11 @@ pub(super) struct Devices {
     deleted: HashMap<PathBuf, String>,
     /// Canonical forms of the folders and files the projections compare.
     canon: Canon,
+    /// Slice-4 sources: caches the s4 feeds and ops read.
+    s4: s4::Sources,
+    /// Attachment stores in flight and revocations of their owners: a store racing a
+    /// revocation cleans up after itself.
+    pub(super) revoked: Arc<crate::attachments::Revocations>,
 }
 
 /// One device session's engine side.
@@ -80,8 +93,15 @@ pub(super) struct DeviceConn {
     protocol: u32,
     /// What the device said it understands (`DeviceHello.features`): a gateway→device variant
     /// added after v1 is sent only to devices that list its feature.
-    #[expect(dead_code, reason = "v1 has no feature-gated variants yet")]
     features: BTreeSet<String>,
+    /// Open downloads and uploads.
+    transfers: transfer::Transfers,
+    /// Folder ids handed to it ([`api::Op::Browse`], [`api::Op::NewSessionIn`]).
+    dirs: dirs::DirTokens,
+    /// The app is in the foreground (`presence`): no Web Push is sent to it.
+    visible: bool,
+    /// `unpair` was answered: the registry entry goes once the reply is out (or this passes).
+    unpair_at: Option<std::time::Instant>,
 }
 
 #[derive(Default)]
@@ -121,7 +141,16 @@ impl DeviceConn {
             next_view: 1,
             protocol,
             features,
+            transfers: transfer::Transfers::default(),
+            dirs: dirs::DirTokens::default(),
+            visible: false,
+            unpair_at: None,
         }
+    }
+
+    /// The device speaks slice 4 ([`api::FEATURE_S4`]).
+    fn s4(&self) -> bool {
+        self.features.contains(api::FEATURE_S4)
     }
 
     /// `topic` has a new revision: the feeds projected from it are recomputed.
@@ -145,6 +174,28 @@ impl DeviceConn {
                 }
                 (Feed::Transcript { .. }, Topic::Transcript(p))
                 | (Feed::Changes { .. }, Topic::Changes(p)) => st.path.as_ref() == Some(p),
+                // The rows embed the running state; the scanned entries are reused.
+                (Feed::Inventory { .. }, Topic::Inventory | Topic::Running)
+                | (Feed::Usage {}, Topic::Usage)
+                | (Feed::Drive {}, Topic::Drive)
+                | (Feed::Updates {}, Topic::AppUpdate | Topic::OmpUpdate)
+                | (
+                    Feed::Agents { .. } | Feed::Context { .. },
+                    Topic::Fleet | Topic::Controllers | Topic::Live(_),
+                )
+                | (Feed::Running {}, Topic::Running | Topic::Sessions | Topic::Controllers)
+                | (Feed::Sync {}, Topic::Settings | Topic::Sessions | Topic::Drive)
+                | (Feed::Device {}, Topic::Settings | Topic::Mobile) => true,
+                (Feed::Worktrees { .. }, Topic::Worktrees(p)) => st.path.as_ref() == Some(p),
+                // The followed folders and files (repository, fleet target) follow the sessions.
+                (Feed::Worktrees { .. }, Topic::Sessions) => {
+                    follow = true;
+                    false
+                }
+                (Feed::Agents { .. } | Feed::Context { .. }, Topic::Sessions) => {
+                    follow = true;
+                    true
+                }
                 _ => false,
             };
             st.dirty |= hit;
@@ -269,6 +320,7 @@ fn summaries(g: &ProjectGroup, limit: u32) -> (u32, Vec<api::SessionSummary>) {
                 .as_deref()
                 .map(|p| cut_chars(p, api::FIRST_PROMPT_CHARS)),
             modified_unix_ms: unix_ms(s.modified),
+            stub: s.title.is_none() && s.first_prompt.is_none(),
         })
         .collect();
     (count(g.sessions.len()), list)
@@ -553,6 +605,8 @@ fn live_session(
         desktop_controlled,
         views: count(info.views),
         requests: own_requests(info, device),
+        // Filled from the session's control link ([`Engine::live_sessions`]).
+        pending_ui: Vec::new(),
     }
 }
 
@@ -696,10 +750,12 @@ fn item(t: &TranscriptItem) -> api::Item {
             text,
             from_agent,
             at: when,
+            images,
         } => api::Item::User {
             text: c(text),
             from_agent: *from_agent,
             at_unix_ms: at(when),
+            images: images.iter().map(views::image).collect(),
         },
         TranscriptItem::Assistant {
             text,
@@ -717,12 +773,14 @@ fn item(t: &TranscriptItem) -> api::Item {
             intent,
             summary,
             args,
+            args_value,
         } => api::Item::ToolCall {
             call_id: call_id.clone(),
             name: name.clone(),
             intent: intent.as_deref().map(c),
             summary: c(summary),
             args: c(args),
+            args_value: views::bounded(args_value.as_ref(), api::MAX_ARGS_VALUE),
         },
         TranscriptItem::ToolResult {
             call_id,
@@ -730,12 +788,16 @@ fn item(t: &TranscriptItem) -> api::Item {
             text,
             is_error,
             truncated,
+            details,
+            images,
         } => api::Item::ToolResult {
             call_id: call_id.clone(),
             name: name.clone(),
             text: c(text),
             is_error: *is_error,
             truncated: *truncated || text.len() > api::MAX_ITEM_TEXT,
+            details: views::bounded(details.as_ref(), api::MAX_DETAILS),
+            images: images.iter().map(views::image).collect(),
         },
         TranscriptItem::Notice { kind, text } => api::Item::Notice {
             kind: kind.clone(),
@@ -797,34 +859,10 @@ fn models(list: &[deck_core::omp::ModelInfo]) -> Vec<api::Model> {
 
 /// The models reply holding as many models as fit one record.
 fn models_reply(list: &[deck_core::omp::ModelInfo]) -> ReplyResult {
-    let all = models(list);
-    let reply = |n: usize| {
-        ReplyResult::Ok(Resp::Models {
-            models: all[..n].to_vec(),
-            truncated: n < all.len(),
-        })
-    };
-    // The largest id a reply can carry: whatever fits with it fits with any.
-    let size = |n: usize| {
-        serde_json::to_vec(&api::Reply {
-            id: u64::MAX,
-            result: reply(n),
-        })
-        .map_or(usize::MAX, |b| b.len())
-    };
-    if size(all.len()) <= api::MAX_REPLY {
-        return reply(all.len());
-    }
-    let (mut lo, mut hi) = (0, all.len());
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
-        if size(mid) <= api::MAX_REPLY {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    reply(lo)
+    views::fit_reply(&models(list), |models, truncated| Resp::Models {
+        models,
+        truncated,
+    })
 }
 
 fn diff(d: &deck_core::changes::FileDiff) -> api::Diff {
@@ -893,8 +931,8 @@ impl Engine {
             permissions: api_permissions(permissions),
             next_seq,
             limits: api::Limits::default(),
-            // This gateway's feature names: none in protocol 1.
-            features: Vec::new(),
+            features: vec![api::FEATURE_S4.to_owned()],
+            push_key: self.notify.push.public_key(),
         });
         let conn = next_id();
         self.next_seq += 1;
@@ -959,6 +997,7 @@ impl Engine {
     /// Per step: closed sessions go, permissions are re-read, feeds are recomputed.
     pub(super) fn step_devices(&mut self) {
         self.sync_devices();
+        self.step_s4_sources(std::time::Instant::now());
         let conns: Vec<u64> = self
             .conns
             .iter()
@@ -1044,9 +1083,28 @@ impl Engine {
         };
         let lowered = d.permissions.control && !perms.control;
         d.permissions = perms;
+        let now = std::time::Instant::now();
+        d.transfers.expire(now);
+        // `unpair` was answered: the device goes once its reply is out.
+        let unpair = d.unpair_at.map(|at| {
+            !d.out.control_pending() || now.saturating_duration_since(at) >= s4::UNPAIR_GRACE
+        });
         let mut feeds = std::mem::take(&mut d.feeds);
         let resubscribe = std::mem::take(&mut d.resubscribe);
         let out = d.out.clone();
+        match unpair {
+            Some(true) => {
+                if let Some(d) = self.device_mut(conn) {
+                    d.feeds = feeds;
+                }
+                if let Err(e) = self.mobile_execute(Mutation::DeviceRevoke { id: device }) {
+                    log::warn!("device protocol: unpairing failed: {e}");
+                }
+                return;
+            }
+            Some(false) => self.wake_within(std::time::Duration::from_millis(100)),
+            None => {}
+        }
         if lowered {
             self.end_typing_views(conn);
         }
@@ -1150,6 +1208,7 @@ impl Engine {
                     );
                 }
                 Feed::Projects {} | Feed::Sessions { .. } | Feed::Inbox {} => {}
+                other => self.s4_interest(other, st, &mut subs, &mut fleet),
             }
         }
         (subs, fleet)
@@ -1164,7 +1223,20 @@ impl Engine {
                 let desktop = m
                     .controlling()
                     .is_some_and(|v| self.views.get(&v).is_some_and(|v| v.owner.is_none()));
-                live_session(info, device, &groups, &self.devices.canon, desktop)
+                let mut s = live_session(info, device, &groups, &self.devices.canon, desktop);
+                // Only an extension that hooks omp's dialogs lists them (else the terminal
+                // answers them).
+                if let Some(link) = m.live.as_ref().filter(|l| l.client.ui_hook())
+                    && let Some(snap) = link.client.latest()
+                {
+                    s.pending_ui = snap
+                        .pending_ui
+                        .iter()
+                        .take(api::MAX_PENDING_UI)
+                        .map(views::ui_request)
+                        .collect();
+                }
+                s
             })
             .collect()
     }
@@ -1280,6 +1352,13 @@ impl Engine {
                 };
                 changes_feed(&self.devices.canon, feed, &value)
             }
+            other => match self.s4_feed_value(device, other, st) {
+                Some(body) => body,
+                None => {
+                    st.dirty = false;
+                    return;
+                }
+            },
         };
         st.dirty = false;
         let Some(body) = body else {
@@ -1413,6 +1492,14 @@ impl Engine {
             return;
         };
         let id = req.id;
+        let s4 = self.device_conn(conn).is_some_and(DeviceConn::s4);
+        let gated = match &req.op {
+            Op::Subscribe { feed } | Op::Unsubscribe { feed } => s4::s4_feed(feed),
+            op => s4::s4_op(op),
+        };
+        if gated && !s4 {
+            return self.device_answer(conn, id, Err(ApiError::Unsupported {}));
+        }
         if let Err(need) = req.op.allowed(api_permissions(perms)) {
             return self.device_answer(conn, id, Err(ApiError::NotAllowed { need }));
         }
@@ -1439,7 +1526,7 @@ impl Engine {
             if seq < floor {
                 return self.device_answer(conn, id, Err(ApiError::Expired {}));
             }
-            match self.device_mutation(&key, req.op) {
+            match self.device_mutation(conn, &key, req.op) {
                 Ok(op) => self.on_mutate(conn, id, key, self.epoch, op, Some(work)),
                 Err(e) => self.device_answer(conn, id, Err(e)),
             }
@@ -1465,7 +1552,7 @@ impl Engine {
                     seq,
                 };
                 let outcome = match self.journal.lookup(&key) {
-                    Ok(Some(o)) => self.outcome_view(&o),
+                    Ok(Some(o)) => self.outcome_view(&o, Some(&key), s4),
                     Ok(None) => api::OutcomeView::Unknown {},
                     Err(_) => api::OutcomeView::Expired {},
                 };
@@ -1505,8 +1592,8 @@ impl Engine {
                 self.device_answer(conn, id, r);
             }
             Op::Ping {} => self.device_answer(conn, id, Ok(Resp::Pong {})),
-            // Journaled ops were handled above.
-            _ => self.device_answer(conn, id, Err(bad("seq is required"))),
+            // The rest of slice 4 (journaled ops were handled above).
+            op => self.on_s4_request(conn, id, &device, op),
         }
     }
 
@@ -1535,6 +1622,7 @@ impl Engine {
                 }
             }
             Feed::Changes { project } => Some(resolve_project(&groups, project)?.to_path_buf()),
+            other => self.s4_feed_path(&groups, other)?,
         };
         let Some(d) = self.device_mut(conn) else {
             return Err(bad("the session ended"));
@@ -1710,7 +1798,12 @@ impl Engine {
     }
 
     /// The gateway mutation a journaled device operation becomes.
-    fn device_mutation(&mut self, key: &RequestKey, op: Op) -> Result<Mutation, ApiError> {
+    fn device_mutation(
+        &mut self,
+        conn: u64,
+        key: &RequestKey,
+        op: Op,
+    ) -> Result<Mutation, ApiError> {
         let submit = |this: &Self, live: &api::LiveRef, command: Command| {
             Ok(Mutation::Submit {
                 target: this.live_target(live)?,
@@ -1853,6 +1946,7 @@ impl Engine {
             | Op::Attach { .. }
             | Op::Detach { .. }
             | Op::Ping {} => return Err(bad("not a journaled operation")),
+            other => return self.s4_mutation(conn, key, other),
         })
     }
 
@@ -1862,12 +1956,14 @@ impl Engine {
         session_at(&self.groups(), path).or_else(|| self.devices.deleted.get(path).cloned())
     }
 
-    fn outcome_view(&self, o: &Outcome) -> api::OutcomeView {
+    /// `key`: the request it answers, when known; `s4`: the device speaks slice 4 (else its
+    /// results are shown as `unit`).
+    fn outcome_view(&self, o: &Outcome, key: Option<&RequestKey>, s4: bool) -> api::OutcomeView {
         use api::OutcomeView as O;
         match o {
             Outcome::Running => O::Running {},
             Outcome::Done(d) => O::Done {
-                result: self.done_view(d),
+                result: self.done_view(d, key, s4),
             },
             Outcome::Failed(m) => O::Failed {
                 message: self.devices.canon.scrub(m),
@@ -1883,8 +1979,11 @@ impl Engine {
         }
     }
 
-    fn done_view(&self, d: &Done) -> api::DoneView {
+    fn done_view(&self, d: &Done, key: Option<&RequestKey>, s4: bool) -> api::DoneView {
         use api::DoneView as D;
+        if let Some(v) = s4.then(|| s4::s4_done(self, d, key)).flatten() {
+            return v;
+        }
         match d {
             Done::Session(t) => D::Session { live: live_ref(t) },
             Done::Submitted(r) => submitted(r),
@@ -1898,6 +1997,9 @@ impl Engine {
                     })
                     .collect(),
             },
+            // A worktree folder (`worktree_create`/`worktree_continue` without a session to
+            // open) is no session file.
+            Done::Path(p) if p.extension().is_none_or(|e| e != "jsonl") => D::Unit {},
             Done::Path(p) => D::File {
                 session: self.session_of(p),
             },
@@ -1908,15 +2010,15 @@ impl Engine {
         }
     }
 
-    /// A reply to a device request in device terms.
-    pub(super) fn device_reply(&self, reply: Reply) -> ReplyResult {
+    /// A reply to a request of device session `d` in device terms.
+    pub(super) fn device_reply(&self, d: &DeviceConn, reply: Reply) -> ReplyResult {
         match reply {
             Ok(Answer::Accepted(a)) => ReplyResult::Ok(Resp::Accepted {
                 seq: a.key.seq,
                 duplicate: a.duplicate,
             }),
             Ok(Answer::Outcome(o)) => ReplyResult::Ok(Resp::Outcome {
-                outcome: self.outcome_view(&o),
+                outcome: self.outcome_view(&o, None, d.s4()),
             }),
             Ok(Answer::Models(list)) => models_reply(&list),
             Ok(Answer::Diff(d)) => ReplyResult::Ok(Resp::Diff { diff: diff(&d) }),
@@ -1925,12 +2027,12 @@ impl Engine {
         }
     }
 
-    /// What a device is told of an event for its client (`None`: nothing).
-    pub(super) fn device_event(&self, ev: &ServerEvent) -> Option<Event> {
+    /// What device session `d` is told of an event for its client (`None`: nothing).
+    pub(super) fn device_event(&self, d: &DeviceConn, ev: &ServerEvent) -> Option<Event> {
         match ev {
             ServerEvent::Outcome { key, outcome } => Some(Event::Outcome {
                 seq: key.seq,
-                outcome: self.outcome_view(outcome),
+                outcome: self.outcome_view(outcome, Some(key), d.s4()),
             }),
             ServerEvent::Progress { key, progress } => Some(Event::Progress {
                 seq: key.seq,
@@ -2062,6 +2164,30 @@ mod tests {
             mode: ViewMode::Observe,
         };
         assert_eq!(observe.allowed(view), Ok(()));
+    }
+
+    #[test]
+    fn the_inventory_feed_follows_the_running_sessions_too() {
+        let wake: Wake = Arc::new(|| {});
+        let mut d = DeviceConn::new(
+            DeviceOut::new(wake.clone(), wake),
+            Permissions::default(),
+            1,
+            1,
+            BTreeSet::new(),
+        );
+        d.feeds.insert(
+            Feed::Inventory {
+                project: None,
+                limit: 10,
+            },
+            FeedState::default(),
+        );
+        let dirty = |d: &DeviceConn| d.feeds.values().any(|s| s.dirty);
+        d.topic_changed(&Topic::Usage);
+        assert!(!dirty(&d));
+        d.topic_changed(&Topic::Running);
+        assert!(dirty(&d));
     }
 
     #[test]

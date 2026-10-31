@@ -508,6 +508,7 @@ impl Device {
                 next_seq: 0,
                 limits: api::Limits::default(),
                 features: Vec::new(),
+                push_key: String::new(),
             },
         };
         let end = Instant::now() + STEP;

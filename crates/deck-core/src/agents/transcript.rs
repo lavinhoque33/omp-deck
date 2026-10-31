@@ -1,7 +1,9 @@
 //! Subagent transcript → [`TranscriptItem`]s (docs/notes/agent-hub.md §6), with a live tail.
 
-use std::io;
-use std::path::PathBuf;
+use std::cell::Cell;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -9,15 +11,27 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-use super::TranscriptItem;
 use super::markup::{Segment, bracket_note, segments};
 use super::tail::{self, LineTail, cap_bytes, from_epoch_ms, line_type, one_line};
+use super::{ImageRef, TranscriptItem};
 use crate::status::lock;
 
 const MAX_TOOL_RESULT: usize = 16 * 1024;
 const MAX_THINKING: usize = 64 * 1024;
 const MAX_ARGS: usize = 4 * 1024;
+const MAX_ARG_LEAF: usize = 16 * 1024;
+const MAX_ARGS_VALUE: usize = 64 * 1024;
+const MAX_DETAILS: usize = 32 * 1024;
+/// `read_blob` reads at most this much of a transcript …
+const MAX_SCAN: u64 = 64 * 1024 * 1024;
+/// … decodes images up to this size …
+const MAX_BLOB: u64 = 20 * 1024 * 1024;
+/// … and skips lines longer than 20 MiB of base64 (4/3 expansion) plus envelope.
+const MAX_BLOB_LINE: usize = (MAX_BLOB as usize / 3 + 1) * 4 + 64 * 1024;
+/// omp's marker for an image kept in its content-addressed blob store.
+const BLOB_REF: &str = "blob:sha256:";
 const MAX_TEXT: usize = 256 * 1024;
 const MAX_NOTICE: usize = 16 * 1024;
 const MAX_SUMMARY: usize = 64 * 1024;
@@ -47,6 +61,7 @@ struct Message {
     tool_name: Option<String>,
     #[serde(rename = "isError")]
     is_error: Option<bool>,
+    details: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +81,9 @@ struct Part {
     name: Option<String>,
     arguments: Option<Value>,
     intent: Option<String>,
+    data: Option<String>,
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -134,7 +152,184 @@ fn count(v: Option<f64>) -> Option<u64> {
     v.filter(|v| v.is_finite() && *v >= 0.0).map(|v| v as u64)
 }
 
-/// First string among the usual argument keys, one line.
+/// Cuts every string leaf to [`MAX_ARG_LEAF`] bytes (`…` appended); `None` when the result is
+/// still over [`MAX_ARGS_VALUE`] serialized.
+fn structured_args(mut args: Value) -> Option<Value> {
+    fn cut(v: &mut Value) {
+        match v {
+            Value::String(s) if s.len() > MAX_ARG_LEAF => {
+                let (mut c, _) = cap_bytes(std::mem::take(s), MAX_ARG_LEAF);
+                c.push('…');
+                *s = c;
+            }
+            Value::Array(a) => a.iter_mut().for_each(cut),
+            Value::Object(o) => o.values_mut().for_each(cut),
+            _ => {}
+        }
+    }
+    cut(&mut args);
+    serde_json::to_vec(&args)
+        .is_ok_and(|b| b.len() <= MAX_ARGS_VALUE)
+        .then_some(args)
+}
+
+/// Stable id of an image: first 16 hex digits of SHA-256 over its `data` string.
+fn blob_id(data: &str) -> String {
+    use std::fmt::Write;
+    Sha256::digest(data.as_bytes())
+        .iter()
+        .take(8)
+        .fold(String::with_capacity(16), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+/// Decoded size of standard base64 `data` (padding aware).
+fn decoded_len(data: &str) -> u64 {
+    let pad = data.bytes().rev().take_while(|b| *b == b'=').count();
+    (data.len() as u64 / 4 * 3).saturating_sub(pad as u64)
+}
+
+fn image_ref(p: &Part) -> Option<ImageRef> {
+    if p.kind.as_deref() != Some("image") {
+        return None;
+    }
+    let data = p.data.as_deref()?;
+    Some(ImageRef {
+        blob: blob_id(data),
+        mime: p
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".into()),
+        bytes: if data.starts_with(BLOB_REF) {
+            0
+        } else {
+            decoded_len(data)
+        },
+    })
+}
+
+fn images_of(content: Option<&Content>) -> Vec<ImageRef> {
+    match content {
+        Some(Content::Parts(parts)) => parts.iter().filter_map(image_ref).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Finds the image `blob` in `transcript` and decodes it: `(mime, bytes)`.
+///
+/// A bounded scan: at most 64 MiB of the file is read, lines over 28 MiB are skipped unparsed,
+/// and an image whose decoded size exceeds `max_bytes` (itself capped at 20 MiB) yields `None`.
+/// A truncated last line is tolerated. Images omp externalized to its blob store
+/// (`<agent dir>/blobs/<sha256>`) are read from there, found by walking up to the `sessions`
+/// directory the transcript lives under.
+pub fn read_blob(
+    transcript: &Path,
+    blob: &str,
+    max_bytes: u64,
+) -> io::Result<Option<(String, Vec<u8>)>> {
+    use base64::Engine;
+    let max = max_bytes.min(MAX_BLOB);
+    let mut file = BufReader::new(File::open(transcript)?.take(MAX_SCAN));
+    let mut line = Vec::new();
+    loop {
+        let more = read_capped_line(&mut file, &mut line, MAX_BLOB_LINE)?;
+        if !more {
+            return Ok(None);
+        }
+        if line.is_empty() || memchr::memmem::find(&line, b"\"image\"").is_none() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(&line) else {
+            continue; // truncated tail or malformed line
+        };
+        let content = v.pointer("/message/content").or_else(|| v.get("content"));
+        let Some(parts) = content.and_then(Value::as_array) else {
+            continue;
+        };
+        for p in parts {
+            let Some(data) = p.get("data").and_then(Value::as_str) else {
+                continue;
+            };
+            if p.get("type").and_then(Value::as_str) != Some("image") || blob_id(data) != blob {
+                continue;
+            }
+            let mime = p
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream")
+                .to_owned();
+            if let Some(hash) = data.strip_prefix(BLOB_REF) {
+                return read_external(transcript, hash, max).map(|b| b.map(|b| (mime, b)));
+            }
+            if decoded_len(data) > max {
+                return Ok(None);
+            }
+            return Ok(base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .ok()
+                .map(|b| (mime, b)));
+        }
+    }
+}
+
+/// Reads one `\n`-terminated line (without it) into `buf`; a line over `cap` bytes is consumed
+/// but left empty. `false` at end of input with nothing read.
+fn read_capped_line(r: &mut impl BufRead, buf: &mut Vec<u8>, cap: usize) -> io::Result<bool> {
+    buf.clear();
+    let mut any = false;
+    let mut over = false;
+    loop {
+        let chunk = r.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        any = true;
+        let (take, done) = match memchr::memchr(b'\n', chunk) {
+            Some(i) => (i, true),
+            None => (chunk.len(), false),
+        };
+        if !over {
+            if buf.len() + take > cap {
+                over = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(&chunk[..take]);
+            }
+        }
+        r.consume(take + usize::from(done));
+        if done {
+            break;
+        }
+    }
+    Ok(any)
+}
+
+/// An externalized image: `<agent dir>/blobs/<hash>` beside the `sessions` ancestor.
+fn read_external(transcript: &Path, hash: &str, max: u64) -> io::Result<Option<Vec<u8>>> {
+    // omp only accepts canonical 64-hex hashes; anything else could escape the blob dir.
+    if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Ok(None);
+    }
+    let Some(agent_dir) = transcript
+        .ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == "sessions"))
+        .and_then(Path::parent)
+    else {
+        return Ok(None);
+    };
+    let path = agent_dir.join("blobs").join(hash);
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= max).then_some(bytes))
+}
+
 fn call_summary(args: &Value) -> String {
     ["command", "path", "pattern", "query", "url", "file", "i"]
         .iter()
@@ -293,6 +488,8 @@ fn map_message(line: &[u8], out: &mut Vec<TranscriptItem>) {
     match role {
         "user" => {
             let from_agent = m.attribution.as_deref() == Some("agent");
+            // Attachments ride on the first item the message yields.
+            let images = Cell::new(images_of(m.content.as_ref()));
             push_split_irc(
                 cap_bytes(text_of(m.content, "\n"), MAX_TEXT).0,
                 out,
@@ -300,17 +497,24 @@ fn map_message(line: &[u8], out: &mut Vec<TranscriptItem>) {
                     text,
                     from_agent,
                     at,
+                    images: images.take(),
                 },
             );
         }
         "toolResult" => {
+            let images = images_of(m.content.as_ref());
             let (text, truncated) = cap_bytes(text_of(m.content, "\n"), MAX_TOOL_RESULT);
+            let details = m
+                .details
+                .filter(|d| serde_json::to_vec(d).is_ok_and(|b| b.len() <= MAX_DETAILS));
             out.push(TranscriptItem::ToolResult {
                 call_id: m.tool_call_id.unwrap_or_default(),
                 name: m.tool_name.unwrap_or_default(),
                 text,
                 is_error: m.is_error == Some(true),
                 truncated,
+                details,
+                images,
             });
         }
         _ => {
@@ -354,6 +558,7 @@ fn map_message(line: &[u8], out: &mut Vec<TranscriptItem>) {
                                     intent: p.intent.filter(|i| !i.trim().is_empty()),
                                     summary: call_summary(&args),
                                     args: cap_bytes(pretty, MAX_ARGS).0,
+                                    args_value: structured_args(args),
                                 });
                             }
                             _ => {}

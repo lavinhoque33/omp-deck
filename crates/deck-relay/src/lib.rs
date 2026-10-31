@@ -9,6 +9,7 @@ pub mod rooms;
 mod server;
 mod tls;
 mod transport;
+mod web;
 
 use std::path::PathBuf;
 
@@ -20,13 +21,16 @@ pub use tls::load_tls;
 #[derive(Debug, thiserror::Error)]
 pub enum RelayError {
     #[error("{path}: {detail}", path = .0.display(), detail = .1)]
-    Io(PathBuf, #[source] std::io::Error),
+    Io(PathBuf, std::io::Error),
     #[error("{path}: {detail}", path = .0.display(), detail = .1)]
     Rooms(PathBuf, String),
+    /// The phone app directory (`--web-dir`) cannot be served.
+    #[error("web directory {path}: {detail}", path = .0.display(), detail = .1)]
+    Web(PathBuf, String),
     #[error("TLS: {0}")]
     Tls(String),
     #[error("random number generator: {0}")]
     Random(String),
     #[error("listener: {0}")]
-    Listen(#[source] std::io::Error),
+    Listen(std::io::Error),
 }

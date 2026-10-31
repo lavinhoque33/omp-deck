@@ -276,4 +276,5 @@ outdated owner. Step 1's "Windows runtime still requires Windows CI" is now answ
 real-omp live control and the GUI-through-gateway path (CI), plus the gateway CLI/e2e and task trigger measured
 on Windows 11 (see `contracts.md`). Not shown by CI: `install.ps1` drain/resume, enabling Always on from the
 Mobile access card on Windows, and gateway-originated toast delivery. Slice 3 progress (relay, Noise, pairing) is
-tracked in `mobile-relay.md`; the PWA (slice 4) remains unimplemented.
+tracked in `mobile-relay.md`. Slice 4 (the PWA, Web Push and the deferred gateway capabilities) has its own contract
+and step table in `mobile-pwa.md`.

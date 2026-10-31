@@ -206,6 +206,20 @@ pub enum ClientEvent {
     /// being refetched (`Changed` follows per topic); re-derive UI state and look accepted
     /// requests up again.
     Resync,
+    /// Open (or focus) the tab of the session file; a new tab goes beside the active one as
+    /// `split` says ("Open on desktop" from another client).
+    OpenSession {
+        file: PathBuf,
+        split: crate::gateway::protocol::Split,
+    },
+    /// Close the tab of the session file.
+    CloseSession {
+        file: PathBuf,
+    },
+    /// Open `url` in the desktop browser.
+    OpenUrl {
+        url: String,
+    },
 }
 
 /// A sent mutation: its key (allocated locally, not an id of the gateway), whether the gateway
@@ -946,6 +960,13 @@ impl Shared {
                 self.fetch_all();
                 self.push_event(ClientEvent::Resync);
             }
+            ServerEvent::OpenSession { file, split } => {
+                self.push_event(ClientEvent::OpenSession { file, split })
+            }
+            ServerEvent::CloseSession { file } => {
+                self.push_event(ClientEvent::CloseSession { file })
+            }
+            ServerEvent::OpenUrl { url } => self.push_event(ClientEvent::OpenUrl { url }),
         }
     }
 

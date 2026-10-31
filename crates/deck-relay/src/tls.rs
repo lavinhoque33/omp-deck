@@ -16,7 +16,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
 use crate::RelayError;
-use crate::transport::{Guarded, Limits, refuse};
+use crate::transport::{Guarded, HttpLimits, Limits, refuse};
 
 /// Loads a PEM certificate chain and private key (PKCS#8, PKCS#1 or SEC1).
 pub fn load_tls(cert: &Path, key: &Path) -> Result<Arc<rustls::ServerConfig>, RelayError> {
@@ -56,7 +56,7 @@ impl TlsListener {
         config: Arc<rustls::ServerConfig>,
         limits: Arc<Limits>,
         handshake_timeout: Duration,
-        request_timeout: Duration,
+        http: HttpLimits,
     ) -> std::io::Result<TlsListener> {
         let local = listener.local_addr()?;
         let acceptor = TlsAcceptor::from(config);
@@ -83,9 +83,7 @@ impl TlsListener {
                 tokio::spawn(async move {
                     match tokio::time::timeout(handshake_timeout, acceptor.accept(tcp)).await {
                         Ok(Ok(stream)) => {
-                            let _ = tx
-                                .send((Guarded::new(stream, slot, request_timeout), addr))
-                                .await;
+                            let _ = tx.send((Guarded::new(stream, slot, http), addr)).await;
                         }
                         Ok(Err(e)) => log::debug!("TLS handshake from {addr} failed: {e}"),
                         Err(_) => log::debug!("TLS handshake from {addr} timed out"),

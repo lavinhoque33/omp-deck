@@ -103,6 +103,34 @@ pub enum Effect {
     WithdrawAll,
     /// Mark the session as having an unseen finished turn (the tab's bell).
     Bell(SessionTarget),
+    /// A canonical event for the paired phones' Web Push (every event, whatever the desktop
+    /// policy; each device's prefs and presence decide on the gateway).
+    Mobile {
+        target: SessionTarget,
+        kind: MobileKind,
+        /// The session's label.
+        title: String,
+    },
+}
+
+/// Which push preference a canonical event falls under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MobileKind {
+    /// A turn ended (also one that failed).
+    TurnFinished,
+    Attention,
+    /// The session's process ended.
+    Ended,
+}
+
+impl MobileKind {
+    pub fn of(kind: &Kind) -> MobileKind {
+        match kind {
+            Kind::Finished | Kind::Error(_) => MobileKind::TurnFinished,
+            Kind::Attention => MobileKind::Attention,
+            Kind::Exited { .. } => MobileKind::Ended,
+        }
+    }
 }
 
 /// Result of one [`NotificationCenter::tick`].
@@ -310,7 +338,8 @@ impl NotificationCenter {
     /// looking at (`looking`: window focused and the session shown). A desktop pop-up follows
     /// [`tracker::desktop_wanted`], also for a session in view; that one stays with its inbox
     /// entry. Whether the inbox records an event for a session in view is decided by the caller
-    /// (`while_viewing`).
+    /// (`while_viewing`). Every recorded event is also offered to the phones
+    /// ([`Effect::Mobile`]), once, whatever the desktop policy.
     fn record(
         &mut self,
         key: SessionTarget,
@@ -328,6 +357,11 @@ impl NotificationCenter {
         }
         let (title, body) = tracker::describe(&kind, &known.title, &known.project);
         let sound = cfg.sound.then(|| Sound::of(&kind));
+        out.effects.push(Effect::Mobile {
+            target: key.clone(),
+            kind: MobileKind::of(&kind),
+            title: known.title.clone(),
+        });
         let entry = Entry::new(
             key.clone(),
             kind,
@@ -488,9 +522,15 @@ mod tests {
         assert_eq!(entries.len(), 1, "{effects:?}");
         assert!(matches!(&entries[0].kind, Kind::Error(Some(m)) if m == "rate limited"));
         assert!(!entries[0].armed, "recorded while looking");
-        assert!(
-            effects.is_empty(),
-            "no bell and no pop-up for a focused session in view: {effects:?}"
+        // The phones are still offered the event (their own presence decides).
+        assert_eq!(
+            effects,
+            [Effect::Mobile {
+                target: key.clone(),
+                kind: MobileKind::TurnFinished,
+                title: "fix bug".into(),
+            }],
+            "no bell and no pop-up for a focused session in view"
         );
     }
 
@@ -734,5 +774,119 @@ mod tests {
         assert!(c.dismiss(&old).is_empty());
         c.clicked(&old);
         assert!(c.inbox().entries().is_empty());
+    }
+
+    fn mobile(effects: &[Effect]) -> Vec<(SessionTarget, MobileKind)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Mobile { target, kind, .. } => Some((target.clone(), *kind)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_canonical_event_is_offered_to_the_phones_exactly_once_whatever_the_desktop_policy() {
+        // Pop-ups off entirely: the desktop shows nothing, the phones still get each event.
+        let cfg = NotifyConfig {
+            desktop: false,
+            ..NotifyConfig::default()
+        };
+        let key = target(SessionKey::tmux("omp-deck", "m1"), 1);
+        let mut c = center();
+        let t0 = Instant::now();
+        c.tick(t0, &[obs(&key, TabStatus::Busy, None, false)], false, &cfg);
+        let end = t0 + Duration::from_secs(10);
+        let mut effects = Vec::new();
+        for _ in 0..200 {
+            effects.extend(
+                c.tick(end, &[obs(&key, TabStatus::Idle, None, false)], false, &cfg)
+                    .effects,
+            );
+            if !c.inbox().entries().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // More ticks of the same state add nothing.
+        for i in 1..5 {
+            effects.extend(
+                c.tick(
+                    end + Duration::from_secs(i),
+                    &[obs(&key, TabStatus::Idle, None, false)],
+                    false,
+                    &cfg,
+                )
+                .effects,
+            );
+        }
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Show { .. })),
+            "{effects:?}"
+        );
+        assert_eq!(
+            mobile(&effects),
+            [(key.clone(), MobileKind::TurnFinished)],
+            "{effects:?}"
+        );
+        let effects = c
+            .tick(
+                end + Duration::from_secs(20),
+                &[obs(&key, TabStatus::Exited { clean: true }, None, false)],
+                false,
+                &cfg,
+            )
+            .effects;
+        assert_eq!(mobile(&effects), [(key, MobileKind::Ended)], "{effects:?}");
+    }
+
+    #[test]
+    fn a_late_verdict_the_tracker_dropped_offers_nothing_to_the_phones() {
+        let old = session_file(&[]);
+        let new = session_file(&[]);
+        let key = target(SessionKey::host("omp-deck", "m2"), 1);
+        let cfg = NotifyConfig::default();
+        let mut c = center();
+        let t0 = Instant::now();
+        c.tick(
+            t0,
+            &[obs(&key, TabStatus::Busy, Some(old.path()), false)],
+            false,
+            &cfg,
+        );
+        let end = t0 + Duration::from_secs(10);
+        let mut effects = c
+            .tick(
+                end,
+                &[obs(&key, TabStatus::Idle, Some(old.path()), false)],
+                false,
+                &cfg,
+            )
+            .effects;
+        for _ in 0..25 {
+            std::thread::sleep(Duration::from_millis(20));
+            effects.extend(
+                c.tick(
+                    end,
+                    &[obs(&key, TabStatus::Idle, Some(new.path()), false)],
+                    false,
+                    &cfg,
+                )
+                .effects,
+            );
+        }
+        assert!(mobile(&effects).is_empty(), "{effects:?}");
+    }
+
+    #[test]
+    fn mobile_kinds_follow_the_push_preferences() {
+        assert_eq!(MobileKind::of(&Kind::Finished), MobileKind::TurnFinished);
+        assert_eq!(MobileKind::of(&Kind::Error(None)), MobileKind::TurnFinished);
+        assert_eq!(MobileKind::of(&Kind::Attention), MobileKind::Attention);
+        assert_eq!(
+            MobileKind::of(&Kind::Exited { code: Some(1) }),
+            MobileKind::Ended
+        );
     }
 }

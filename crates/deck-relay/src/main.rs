@@ -31,6 +31,8 @@ serve options:
                                 from loopback or a --trusted-proxy (plain HTTP only)
   --trusted-proxy <ip or cidr>  a proxy address besides loopback whose X-Forwarded-For counts
                                 (repeatable; needs --trust-forwarded-for)
+  --web-dir <dir>               the phone app to serve (default: <binary dir>/web, then
+                                /usr/share/omp-deck-relay/web; neither: no app)
   --max-connections <n>         connections in total, pending TLS/HTTP included (default 1024)
   --max-connections-per-ip <n>  per client address, IPv6 per /64 (default 32)
   --max-devices-per-room <n>    (default 16)
@@ -56,6 +58,7 @@ struct Args {
     label: Option<String>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    web_dir: Option<PathBuf>,
     trust_forwarded_for: bool,
     trusted_proxies: Vec<ProxyRange>,
     /// `serve` limit overrides, applied in order.
@@ -104,6 +107,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--label" => a.label = Some(value("--label")?),
             "--tls-cert" => a.tls_cert = Some(PathBuf::from(value("--tls-cert")?)),
             "--tls-key" => a.tls_key = Some(PathBuf::from(value("--tls-key")?)),
+            "--web-dir" => a.web_dir = Some(PathBuf::from(value("--web-dir")?)),
             "--trust-forwarded-for" => a.trust_forwarded_for = true,
             "--trusted-proxy" => {
                 a.trusted_proxies.push(
@@ -175,6 +179,7 @@ fn only(a: &Args, serve: bool, label: bool, positional: usize) -> anyhow::Result
     let serve_only = a.listen.is_some()
         || a.tls_cert.is_some()
         || a.tls_key.is_some()
+        || a.web_dir.is_some()
         || a.trust_forwarded_for
         || !a.trusted_proxies.is_empty()
         || !a.limits.is_empty();
@@ -303,6 +308,7 @@ fn serve(a: &Args, state_dir: PathBuf) -> anyhow::Result<()> {
     config.trust_forwarded_for = a.trust_forwarded_for;
     config.trusted_proxies = a.trusted_proxies.clone();
     apply_limits(&mut config, &a.limits);
+    config.web_dir = a.web_dir.clone().or_else(default_web_dir);
     config.tls = match (&a.tls_cert, &a.tls_key) {
         (Some(cert), Some(key)) => Some(deck_relay::load_tls(cert, key)?),
         (None, None) => None,
@@ -321,6 +327,16 @@ fn serve(a: &Args, state_dir: PathBuf) -> anyhow::Result<()> {
         log::info!("stopped");
         Ok(())
     })
+}
+
+/// The phone app shipped with the relay: `web/` next to the binary (release archive), then the
+/// container image's `/usr/share/omp-deck-relay/web`.
+fn default_web_dir() -> Option<PathBuf> {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("web")));
+    let system = cfg!(unix).then(|| PathBuf::from("/usr/share/omp-deck-relay/web"));
+    beside.into_iter().chain(system).find(|dir| dir.is_dir())
 }
 
 async fn shutdown_signal() {

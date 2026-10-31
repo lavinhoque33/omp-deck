@@ -78,6 +78,27 @@ fn usage_errors_help_and_version() {
             .code(),
         Some(2)
     );
+    assert_eq!(
+        relay(&["list", "--state-dir", "x", "--web-dir", "web"])
+            .status
+            .code(),
+        Some(2),
+        "--web-dir is a serve option"
+    );
+    // An explicit --web-dir that cannot be read stops startup (exit 1, not a silent no-app).
+    let state = tempfile::tempdir().unwrap();
+    let missing = state.path().join("no-such-web");
+    let out = relay(&[
+        "serve",
+        "--listen",
+        "127.0.0.1:0",
+        "--state-dir",
+        state.path().to_str().unwrap(),
+        "--web-dir",
+        missing.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no-such-web"));
     let help = relay(&["--help"]);
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stderr).contains("usage: omp-deck-relay"));

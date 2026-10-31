@@ -374,9 +374,14 @@ impl Gw {
         key
     }
 
-    /// Asks the gateway to cancel an accepted job.
-    pub fn cancel(&mut self, key: RequestKey) {
-        let _ = self.client.mutate(Mutation::CancelJob(key));
+    /// Asks the gateway to cancel an accepted job; `done` runs once the gateway answered
+    /// (an error when it refused, e.g. a job of another client, or the job already ended).
+    pub fn cancel(
+        &mut self,
+        key: RequestKey,
+        done: impl FnOnce(&mut App, Result<(), String>) + 'static,
+    ) {
+        self.mutate_unit(Mutation::CancelJob(key), done);
     }
 
     // ------------------------------------------------------------------ per frame

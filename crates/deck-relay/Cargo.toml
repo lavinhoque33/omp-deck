@@ -17,6 +17,9 @@ path = "src/main.rs"
 [dependencies]
 deck-remote.workspace = true
 axum = { workspace = true, features = ["http1", "tokio", "ws"] }
+# Already in Cargo.lock via axum: names `Frame` for the response body wrapper that marks the end of a
+# request (per-request HTTP deadlines, src/transport.rs).
+http-body = "1"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # In-process TLS (`--tls-cert`/`--tls-key`) on the in-tree rustls 0.23 + ring.

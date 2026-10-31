@@ -1147,7 +1147,11 @@ async fn stalled_plain_sockets_count_against_the_caps() {
 
 #[tokio::test]
 async fn connections_that_do_not_upgrade_in_time_are_closed() {
-    let r = Relay::start(|c| c.request_timeout = Duration::from_millis(300)).await;
+    let r = Relay::start(|c| {
+        c.header_timeout = Duration::from_millis(300);
+        c.keep_alive_timeout = Duration::from_millis(300);
+    })
+    .await;
     let started = Instant::now();
     let silent = TcpStream::connect(r.addr).await.unwrap();
     let mut partial = TcpStream::connect(r.addr).await.unwrap();
@@ -1155,7 +1159,7 @@ async fn connections_that_do_not_upgrade_in_time_are_closed() {
         .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n")
         .await
         .unwrap();
-    // A keep-alive health check: answered, then closed at the deadline.
+    // A keep-alive health check: answered, then closed at the idle deadline.
     let mut keep_alive = TcpStream::connect(r.addr).await.unwrap();
     keep_alive
         .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")

@@ -141,7 +141,7 @@ export default async function ompdeckCtl(api: any) {
               model: r.history?.resolvedModel ?? null,
             }));
         } catch (e) { log("snapshot failed: " + e); }
-        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache, model: mainModel() };
+        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache, model: mainModel(), pendingUi: [...pendingUi.values()].map(p => p.summary) };
       };
       const write = (c: any, l: string) => { try { c.write(l); } catch {} };
       const push = (m: unknown) => {
@@ -150,6 +150,75 @@ export default async function ompdeckCtl(api: any) {
         for (const c of clients) write(c, l);
       };
       const schedule = () => { if (pending) return; pending = setTimeout(() => { pending = undefined; push(snapshot()); }, 50); };
+
+      // ---- structured UI requests: omp's dialogs (ask, approvals, select/confirm/input/editor) raced against a remote answer ----
+      // `ctx.ui` is one object shared by the TUI and the tools, so wrapping its members in place sees every request. The original (TUI) call
+      // and the remote answer race; the loser is aborted through the merged signal, so a phone answer closes the TUI dialog.
+      // Internal omp API: a member that is not a function is skipped and `uiHook` stays false (the gateway then lists no requests).
+      const uiState = (G.__ompdeckUi ??= { pending: new Map<number, { summary: any; resolve: (v: any) => void }>(), seq: 0, hook: false, onChange: () => {} });
+      const pendingUi: Map<number, { summary: any; resolve: (v: any) => void }> = uiState.pending;
+      uiState.onChange = schedule;
+      const str = (v: any, max = 16384): string | undefined => typeof v === "string" ? (v.length > max ? v.slice(0, max) : v) : undefined;
+      const opt = (o: any) => {
+        const label = str(typeof o === "string" ? o : o?.label); if (label === undefined) return undefined;
+        const description = typeof o === "object" ? str(o?.description) : undefined;
+        return description === undefined ? { label } : { label, description };
+      };
+      const opts = (list: any) => (Array.isArray(list) ? list : []).slice(0, 100).map(opt).filter((o: any) => o);
+      const summarize = (kind: string, a: any[]): any => {
+        const o = a[kind === "askDialog" || kind === "approve" ? 1 : 2];
+        const timeoutMs = typeof o?.timeout === "number" && Number.isFinite(o.timeout) && o.timeout > 0 ? Math.round(o.timeout) : undefined;
+        switch (kind) {
+          case "select": return { kind: "select", title: str(a[0]) ?? "", options: opts(a[1]), multi: o?.selectionMarker === "checkbox", initial: Number.isInteger(o?.initialIndex) ? o.initialIndex : undefined, timeoutMs };
+          case "confirm": return { kind: "confirm", title: str(a[0]) ?? "", message: str(a[1]), timeoutMs };
+          case "input": return { kind: "input", title: str(a[0]) ?? "", message: str(a[1]), timeoutMs };
+          case "editor": return { kind: "editor", title: str(a[0]) ?? "", prefill: str(a[1], 65536), timeoutMs };
+          case "askDialog": return {
+            kind: "ask", title: "Ask", timeoutMs,
+            questions: (Array.isArray(a[0]) ? a[0] : []).slice(0, 20).map((q: any) => ({
+              id: String(q?.id ?? ""), question: str(q?.question) ?? "", header: str(q?.header), options: opts(q?.options), multi: !!q?.multi,
+              recommended: Number.isInteger(q?.recommended) ? q.recommended : undefined,
+            })),
+          };
+          default: { // approve
+            const p = a[0] ?? {};
+            return {
+              kind: "approve", title: "Approval", timeoutMs,
+              approve: {
+                full: str(p.full) ?? "", compact: str(p.compact) ?? "", session: str(p.session),
+                grants: (Array.isArray(p.grants) ? p.grants : []).slice(0, 20).map((g: any) => ({ scope: String(g?.scope ?? ""), label: str(g?.label) ?? "", alwaysLabel: str(g?.alwaysLabel) ?? "" })),
+              },
+            };
+          }
+        }
+      };
+      const wrapUi = (ui: any) => {
+        if (!ui || typeof ui !== "object") return;
+        const MARK = Symbol.for("ompdeck.wrapped");
+        if (ui[MARK]) return; // wrapped by an earlier start() of this process; its closures share `uiState`
+        ui[MARK] = true;
+        const sigAt: Record<string, number> = { select: 2, confirm: 2, input: 2, editor: 2, askDialog: 1, approve: 1 };
+        let wrapped = 0;
+        for (const [m, at] of Object.entries(sigAt)) {
+          const orig = ui[m];
+          if (typeof orig !== "function") { log(`ui.${m} is not a function: not hooked`); continue; }
+          ui[m] = (...args: any[]) => {
+            const id = ++uiState.seq, ac = new AbortController();
+            const call = args.slice();
+            while (call.length <= at) call.push(undefined);
+            const o = { ...(call[at] ?? {}) };
+            o.signal = o.signal ? AbortSignal.any([o.signal, ac.signal]) : ac.signal;
+            call[at] = o;
+            const { promise: remoteP, resolve: remote } = Promise.withResolvers<any>();
+            try { pendingUi.set(id, { summary: { id, ...summarize(m, args) }, resolve: remote }); } catch (e) { log("ui summarize failed: " + e); }
+            uiState.onChange();
+            return Promise.race([new Promise<any>(r => r(orig.apply(ui, call))), remoteP]).finally(() => { pendingUi.delete(id); ac.abort(); uiState.onChange(); });
+          };
+          wrapped++;
+        }
+        // A partial wrap would hide the requests of the skipped members, so only a complete one reports a hook.
+        uiState.hook = wrapped === Object.keys(sigAt).length;
+      };
 
       // fork_at: omp's AgentSession.#zr: a cut at a tool-calling assistant (or inside its batch) extends over the matching toolResults so no call is left unpaired.
       function forkCut(sm: any, id: string): string {
@@ -209,6 +278,14 @@ export default async function ompdeckCtl(api: any) {
             return { ok: true, newFile };
           } finally { try { await m2.close?.(); } catch {} }
         }
+        if (cmd.t === "answer_ui") {
+          const want = rootFile();
+          if (typeof cmd.root !== "string" || !want || cmd.root !== want) return { ok: false, error: "session changed" };
+          const p = pendingUi.get(Number(cmd.id));
+          if (!p) return { ok: false, error: "no such request" };
+          p.resolve(cmd.value ?? undefined); // null = cancel, as a local Esc
+          return { ok: true };
+        }
         if (cmd.t !== "kill" && cmd.t !== "revive" && cmd.t !== "chat") return { ok: false, error: "unknown cmd" };
         // The tab may have moved to another root session (/new, /resume) since the command was composed.
         const want = rootFile();
@@ -246,7 +323,7 @@ export default async function ompdeckCtl(api: any) {
       // ---- endpoint ----
       const onOpen = (s: any) => {
         s.data = { buf: "" }; clients.add(s);
-        write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid }) + "\n" + JSON.stringify(snapshot()) + "\n");
+        write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid, ui_hook: uiState.hook }) + "\n" + JSON.stringify(snapshot()) + "\n");
       };
       const onData = (s: any, chunk: any) => {
         const st = s.data; if (!st) return;
@@ -381,6 +458,7 @@ export default async function ompdeckCtl(api: any) {
         releaseEndpoint();
       };
       try {
+        try { wrapUi(ctx.ui); } catch (e) { log("ui hook failed: " + e); uiState.hook = false; }
         offRegistry = registry.onChange(schedule); // registered/status_changed/metadata_changed(activity)/removed
         tick = setInterval(() => { if (!clients.size) return; if (modelKey() !== contextKey) recompute(); push(snapshot()); }, 1000); // safety net for isStreaming/mainIdle
         try { offProgress = api.events.on("task:subagent:progress", schedule); } catch (e) { log("progress listener failed: " + e); }

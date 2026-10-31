@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::RemoteError;
 use crate::gateway::protocol::{DeviceView, Permissions};
+use crate::gateway::push::PushSub;
 
 pub const FILE: &str = "devices.json";
 const VERSION: u32 = 1;
@@ -33,6 +34,10 @@ pub struct Device {
     pub last_ts: u64,
     pub created_unix_ms: u64,
     pub last_seen_unix_ms: u64,
+    /// Its Web Push subscription (slice 4; absent in older files). It goes with the record on
+    /// revoke and unpair, and is cleared when the push service reports it gone.
+    #[serde(default)]
+    pub push: Option<PushSub>,
 }
 
 impl Device {
@@ -46,6 +51,7 @@ impl Device {
             created_unix_ms: self.created_unix_ms,
             last_seen_unix_ms: self.last_seen_unix_ms,
             online,
+            push: self.push.is_some(),
         }
     }
 }
@@ -198,7 +204,41 @@ mod tests {
             last_ts: 10,
             created_unix_ms: 1,
             last_seen_unix_ms: 1,
+            push: None,
         }
+    }
+
+    #[test]
+    fn a_record_without_push_loads_and_removal_takes_the_subscription_along() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let mut old = serde_json::to_value(Stored {
+            version: VERSION,
+            devices: vec![device("a", 1)],
+        })
+        .unwrap();
+        old["devices"][0].as_object_mut().unwrap().remove("push");
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let mut reg = Registry::load(&path).unwrap();
+        assert_eq!(reg.get("a").unwrap().push, None);
+        assert!(!reg.get("a").unwrap().view(false).push);
+        let sub = PushSub {
+            endpoint: "https://push.example.com/x".into(),
+            p256dh: "k".into(),
+            auth: "a".into(),
+            prefs: Default::default(),
+            since_unix_ms: 5,
+        };
+        reg.update("a", |d| d.push = Some(sub.clone())).unwrap();
+        assert!(reg.get("a").unwrap().view(true).push);
+        assert_eq!(
+            Registry::load(&path).unwrap().get("a").unwrap().push,
+            Some(sub)
+        );
+        // Revoke and unpair remove the record: nothing of the subscription stays on disk.
+        reg.remove("a").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("push.example.com"), "{text}");
     }
 
     #[test]

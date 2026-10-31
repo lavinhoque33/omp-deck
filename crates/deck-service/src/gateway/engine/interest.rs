@@ -357,7 +357,8 @@ impl Engine {
             | Topic::Drive
             | Topic::Live(_)
             | Topic::OmpUpdate
-            | Topic::Mobile => {
+            | Topic::Mobile
+            | Topic::Worktrees(_) => {
                 return Err(GatewayError::Refused(format!(
                     "{topic:?} is not an interest-driven topic"
                 )));

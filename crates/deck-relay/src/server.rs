@@ -13,7 +13,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::get;
 use deck_remote::relay::{
@@ -30,7 +30,8 @@ use tokio::time::{Instant, timeout, timeout_at};
 use crate::config::{GATEWAY_DATA_SHARE, TOKEN_DATA_SHARE, canonical};
 use crate::conn::{Busy, Charge, Conn, Next, RateLimiter};
 use crate::tls::TlsListener;
-use crate::transport::{Limits, PeerAddr, Plain, Slot};
+use crate::transport::{HttpLimits, Limits, PeerAddr, Plain, Slot, track};
+use crate::web::WebApp;
 use crate::{Config, RelayError, rooms};
 
 /// Gateway hellos for rooms the relay does not know reload `rooms.json` at most this often.
@@ -45,13 +46,37 @@ where
     let local = listener.local_addr().map_err(RelayError::Listen)?;
     let tls = config.tls.clone();
     let handshake_timeout = config.tls_handshake_timeout;
-    let request_timeout = config.request_timeout;
+    let http = HttpLimits::of(&config);
+    let web = match &config.web_dir {
+        Some(dir) => {
+            let web = WebApp::load(dir, tls.is_some())?;
+            log::info!(
+                "serving the phone app from {} ({} files, {} bytes)",
+                dir.display(),
+                web.file_count(),
+                web.total_bytes()
+            );
+            Some(Arc::new(web))
+        }
+        None => {
+            log::info!("no web directory (--web-dir): the phone app is not served");
+            None
+        }
+    };
     let relay = Arc::new(Relay::new(config));
     let limits = relay.limits.clone();
-    let make = Router::new()
+    let mut router = Router::new()
         .route(GATEWAY_PATH, get(gateway_ws))
         .route(DEVICE_PATH, get(device_ws))
-        .route(HEALTH_PATH, get(|| async { "ok" }))
+        .route(HEALTH_PATH, get(|| async { "ok" }));
+    if let Some(web) = web {
+        router = router.fallback(move |method: Method, uri: Uri, headers: HeaderMap| {
+            let web = web.clone();
+            async move { web.respond(&method, uri.path(), &headers) }
+        });
+    }
+    let make = router
+        .layer(axum::middleware::from_fn(track))
         .with_state(relay.clone())
         .into_make_service_with_connect_info::<PeerAddr>();
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -60,9 +85,8 @@ where
     };
     let mut server = match tls {
         Some(tls) => {
-            let listener =
-                TlsListener::new(listener, tls, limits, handshake_timeout, request_timeout)
-                    .map_err(RelayError::Listen)?;
+            let listener = TlsListener::new(listener, tls, limits, handshake_timeout, http)
+                .map_err(RelayError::Listen)?;
             log::info!("listening on {local} (TLS)");
             tokio::spawn(
                 axum::serve(listener, make)
@@ -73,7 +97,7 @@ where
         None => {
             log::info!("listening on {local}");
             tokio::spawn(
-                axum::serve(Plain::new(listener, limits, request_timeout), make)
+                axum::serve(Plain::new(listener, limits, http), make)
                     .with_graceful_shutdown(stop)
                     .into_future(),
             )

@@ -294,6 +294,8 @@ pub enum Topic {
     /// Mobile access: the relay link, the gateway's key fingerprint, paired devices and the
     /// open pairing window (never a secret).
     Mobile,
+    /// The worktree state of the git repository holding this folder ([`WorktreesView`]).
+    Worktrees(PathBuf),
 }
 
 impl Topic {
@@ -307,6 +309,7 @@ impl Topic {
                 | Topic::Fleet
                 | Topic::Agents
                 | Topic::Transcript(_)
+                | Topic::Worktrees(_)
         )
     }
 }
@@ -337,6 +340,14 @@ pub enum Query {
     CheckBranch {
         repo: PathBuf,
         name: String,
+    },
+    /// Where `branch` would get its worktree (`dest`, else the default location below the
+    /// repository's primary checkout) and whether that location can be used now. The check is
+    /// the one [`Mutation::WorktreeNew`] applies.
+    WorktreeDestination {
+        repo: PathBuf,
+        branch: String,
+        dest: Option<PathBuf>,
     },
     ResolveWorktree(PathBuf),
     WorktreeStatus {
@@ -375,6 +386,8 @@ pub enum Query {
     /// Every live backend session with its memory, and the tmux server's own (the session
     /// manager's Running view and RAM column).
     RunningDetail,
+    /// Whether `worktree` can be removed or parked now, and why not ([`WorktreeVerdict`]).
+    WorktreeVerdict(Worktree),
 }
 
 /// A query's result.
@@ -392,6 +405,7 @@ pub enum Answer {
     Patch(String),
     RepoInfo(RepoInfo),
     CheckBranch,
+    WorktreeDestination(DestinationView),
     ResolveWorktree(Option<Worktree>),
     WorktreeStatus(WorktreeStatus),
     InferBase(Option<String>),
@@ -413,6 +427,96 @@ pub enum Answer {
     /// Subscribe/Unsubscribe/ClientState done.
     Done,
     RunningDetail(RunningDetail),
+    WorktreeVerdict(WorktreeVerdict),
+}
+
+/// [`Query::WorktreeDestination`]'s answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationView {
+    /// The location asked for, or the default one.
+    pub dest: PathBuf,
+    /// Why `dest` cannot be used (`None`: it can).
+    pub error: Option<String>,
+}
+
+/// [`Query::WorktreeVerdict`]: the worktree's merge target, its git state and what
+/// [`Mutation::WorktreeRetire`] would do.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeVerdict {
+    pub base: String,
+    pub status: WorktreeStatus,
+    pub verdict: Retirement,
+}
+
+/// What retiring a worktree can do now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Retirement {
+    /// Clean and merged into its base: remove it (`park: false`).
+    Remove,
+    /// Clean and pushed, not merged yet (an open PR): park it (`park: true`).
+    Park,
+    /// Neither; the explanation.
+    Blocked(String),
+}
+
+/// [`Topic::Worktrees`]: the repository holding `dir`, its linked worktrees with their merge
+/// targets and running flows, and the branches parked from it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreesView {
+    pub dir: PathBuf,
+    /// `None` until the first look finished; `Err`: not a repository, or git failed.
+    pub repo: Option<Result<RepoInfo, String>>,
+    /// `dir`'s own linked worktree (`None`: the main checkout or no repository).
+    pub worktree: Option<Worktree>,
+    /// Every linked worktree of the repository.
+    pub linked: Vec<WorktreeEntry>,
+    /// The branches parked from this repository.
+    pub parked: Vec<ParkedEntry>,
+}
+
+/// One linked worktree of [`WorktreesView`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeEntry {
+    pub worktree: Worktree,
+    /// Its merge target: the recorded one, else inferred; `None`: unknown.
+    pub base: Option<String>,
+    /// `base` was recorded when the worktree was made (not inferred).
+    pub base_recorded: bool,
+    /// The last look found it clean and pushed but not merged (park, not remove).
+    pub parkable: bool,
+    /// A finish or retire flow running on it.
+    pub flow: Option<WorktreeFlow>,
+}
+
+/// A flow the gateway runs on a worktree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorktreeFlow {
+    /// [`Mutation::WorktreeFinish`] `job`; `stage`: its latest progress text.
+    Finishing {
+        job: RequestKey,
+        stage: Option<String>,
+    },
+    /// [`Mutation::WorktreeRetire`] (or a finish that reached the removal).
+    Retiring { job: RequestKey, park: bool },
+}
+
+/// A parked branch and where it stands (`state`: `None` until looked at).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkedEntry {
+    pub record: deck_core::config::ParkedBranch,
+    pub state: Option<BranchState>,
+}
+
+/// Where [`Mutation::WorktreeContinue`] continues a parked branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ContinueIn {
+    /// A new worktree of the branch at the managed default location; the branch's sessions
+    /// move into it.
+    Worktree,
+    /// The main checkout switches to the branch.
+    Main,
+    /// The main checkout switches back to the branch's base; the branch stays parked.
+    SwitchBack,
 }
 
 /// [`Query::RunningDetail`].
@@ -468,6 +572,7 @@ pub enum TopicValue {
     },
     OmpUpdate(OmpUpdateView),
     Mobile(MobileView),
+    Worktrees(Box<WorktreesView>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -714,6 +819,9 @@ pub struct DeviceView {
     pub last_seen_unix_ms: u64,
     /// An encrypted session with it is open now.
     pub online: bool,
+    /// It has a Web Push subscription.
+    #[serde(default)]
+    pub push: bool,
 }
 
 /// What a device may do beyond viewing (view is implied).
@@ -794,6 +902,10 @@ impl std::fmt::Display for SecretText {
         f.write_str("<redacted>")
     }
 }
+
+/// The most backups one [`Mutation::DriveDeleteBackups`] / [`Mutation::ProjectDeleteBackups`]
+/// deletes.
+pub const MAX_BULK_DELETE: usize = 100;
 
 /// A mutation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -935,6 +1047,9 @@ pub enum Mutation {
     DriveDiscardRestore(u64),
     /// Permanently deletes a config backup (only config backups are accepted).
     DriveDeleteBackup(BackupFile),
+    /// Permanently deletes config backups one after another (at most [`MAX_BULK_DELETE`]),
+    /// stopping at the first failure; the failure names how many were deleted before it.
+    DriveDeleteBackups(Vec<BackupFile>),
     ProjectBackup {
         project: PathBuf,
         parts: Parts,
@@ -942,17 +1057,20 @@ pub enum Mutation {
         force: bool,
     },
     ProjectDeleteBackup(ProjectBackup),
+    /// Project backups deleted one after another, as [`Mutation::DriveDeleteBackups`].
+    ProjectDeleteBackups(Vec<ProjectBackup>),
     ProjectPrepareRestore {
         backup: ProjectBackup,
         target: PathBuf,
         parts: Parts,
     },
-    /// Apply a prepared restore. `conflicts` decides each backed-up session whose id exists
-    /// locally (missing = keep the local one); `stop` = backend sessions to kill first (the
-    /// local copies being overwritten).
+    /// Apply a prepared restore (only by the client that prepared it). `conflicts` decides each
+    /// backed-up session whose id exists locally (missing = keep the local one). The gateway
+    /// stops the sessions running the local copies it overwrites itself; `stop` is ignored.
     ProjectApplyRestore {
         handle: u64,
         conflicts: BTreeMap<String, ConflictChoice>,
+        #[serde(default)]
         stop: Vec<String>,
     },
     ProjectDiscardRestore(u64),
@@ -1011,6 +1129,110 @@ pub enum Mutation {
         id: String,
         permissions: Permissions,
     },
+    /// Review comments on `root`'s changes as one prompt, inserted at omp's cursor or sent
+    /// ([`Command::Review`](crate::controller::Command::Review)); answers like `Submit`.
+    Review {
+        target: SessionTarget,
+        root: PathBuf,
+        comments: Vec<ReviewItem>,
+        general: Option<String>,
+        send: bool,
+    },
+    /// Answers the session's pending dialog `request` ([`LiveSnapshot::pending_ui`]):
+    /// [`Done::Answered`] (`false`: it is gone).
+    AnswerUi {
+        target: SessionTarget,
+        request: u64,
+        answer: crate::ui_answer::UiAnswer,
+    },
+    /// Opens (or focuses) the session file's tab in the desktop app, starting it when no window
+    /// is open.
+    OpenOnDesktop {
+        file: PathBuf,
+        split: Split,
+    },
+    /// Closes the session file's tab in the desktop app (nothing to do without a window).
+    CloseOnDesktop {
+        file: PathBuf,
+    },
+    /// The Google sign-in, opened in the desktop browser and finished there:
+    /// [`Done::DriveAccount`]. Refused "needs desktop" without a desktop session.
+    DriveSignInOnDesktop,
+    /// A worktree on the new `branch` made from `base_ref` (`None`: the repository's current
+    /// branch, else `HEAD`) at `dest` (`None`: the managed default location); its merge target
+    /// is recorded. `open`: a session starts in it ([`Done::Session`]), else [`Done::Path`].
+    WorktreeNew {
+        repo: PathBuf,
+        branch: String,
+        base_ref: Option<String>,
+        dest: Option<PathBuf>,
+        open: bool,
+    },
+    /// omp's `/wt <branch>` in the session: it moves into a new worktree; the branch it is on
+    /// now is recorded as the merge target once it arrived. [`Done::Submitted`].
+    WorktreeMoveSession {
+        target: SessionTarget,
+        branch: String,
+    },
+    /// The finish flow: the worktree's session (opened when none runs) is asked to commit and
+    /// merge; after each of its turns the worktree is checked, and once clean and merged it is
+    /// retired like [`Mutation::WorktreeRetire`] (`park: false`): [`Done::Retired`]. Progress
+    /// texts explain the wait; cancellable until the removal starts.
+    WorktreeFinish {
+        worktree: Worktree,
+    },
+    /// Removes a clean, merged worktree (`park: false`) or parks a clean, pushed, unmerged one
+    /// (`park: true`, the branch is kept): running sessions in it move into the main checkout
+    /// (omp's `/move`, up to 30 s), the rest are stopped, every session file moves there, the
+    /// folder goes and the records are kept. [`Done::Retired`].
+    WorktreeRetire {
+        worktree: Worktree,
+        park: bool,
+    },
+    /// Continues the branch parked from `primary`. `session`: the parked session to open
+    /// (`None`: its newest); opened for `Worktree` and `Main` ([`Done::Session`]); `SwitchBack`
+    /// answers [`Done::Unit`].
+    WorktreeContinue {
+        primary: PathBuf,
+        branch: String,
+        session: Option<String>,
+        place: ContinueIn,
+    },
+}
+
+/// Where [`Mutation::OpenOnDesktop`] places a newly opened tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Split {
+    /// A tab of its own.
+    None,
+    Right,
+    Down,
+}
+
+impl Split {
+    /// The value of the desktop app's `--split` flag.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Split::None => "none",
+            Split::Right => "right",
+            Split::Down => "down",
+        }
+    }
+}
+
+/// One comment of [`Mutation::Review`]: lines `start..=end` of `file`'s diff on `side`
+/// (numbered in the file after the change; a range of deleted lines only is quoted from the
+/// file before it).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewItem {
+    pub file: ChangedFile,
+    pub side: DiffSide,
+    pub start: u32,
+    pub end: u32,
+    pub text: String,
+    /// The exact side of the diff to quote; `None` infers it from the diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_side: Option<crate::review::Side>,
 }
 
 impl Mutation {
@@ -1055,8 +1277,10 @@ impl Mutation {
             Mutation::DriveApplyRestore(_) => "drive-restore",
             Mutation::DriveDiscardRestore(_) => "drive-discard-restore",
             Mutation::DriveDeleteBackup(_) => "drive-delete-backup",
+            Mutation::DriveDeleteBackups(_) => "drive-delete-backups",
             Mutation::ProjectBackup { .. } => "project-backup",
             Mutation::ProjectDeleteBackup(_) => "project-delete-backup",
+            Mutation::ProjectDeleteBackups(_) => "project-delete-backups",
             Mutation::ProjectPrepareRestore { .. } => "project-prepare-restore",
             Mutation::ProjectApplyRestore { .. } => "project-restore",
             Mutation::ProjectDiscardRestore(_) => "project-discard-restore",
@@ -1081,6 +1305,16 @@ impl Mutation {
             Mutation::DeviceRevoke { .. } => "device-revoke",
             Mutation::DeviceRename { .. } => "device-rename",
             Mutation::DeviceSetPermissions { .. } => "device-permissions",
+            Mutation::Review { .. } => "review",
+            Mutation::AnswerUi { .. } => "answer-ui",
+            Mutation::OpenOnDesktop { .. } => "open-on-desktop",
+            Mutation::CloseOnDesktop { .. } => "close-on-desktop",
+            Mutation::DriveSignInOnDesktop => "drive-sign-in-on-desktop",
+            Mutation::WorktreeNew { .. } => "worktree-new",
+            Mutation::WorktreeMoveSession { .. } => "worktree-move-session",
+            Mutation::WorktreeFinish { .. } => "worktree-finish",
+            Mutation::WorktreeRetire { .. } => "worktree-retire",
+            Mutation::WorktreeContinue { .. } => "worktree-continue",
         }
     }
 
@@ -1096,7 +1330,10 @@ impl Mutation {
             | Mutation::SetSessionPath { target: t, .. }
             | Mutation::Ctl { target: t, .. }
             | Mutation::InboxOpen(t)
-            | Mutation::InboxDismiss(t) => Some(t),
+            | Mutation::InboxDismiss(t)
+            | Mutation::Review { target: t, .. }
+            | Mutation::AnswerUi { target: t, .. }
+            | Mutation::WorktreeMoveSession { target: t, .. } => Some(t),
             _ => None,
         }
     }
@@ -1123,6 +1360,8 @@ impl Mutation {
                 | Mutation::PairingDeny { .. }
                 | Mutation::DeviceRevoke { .. }
                 | Mutation::RelayClear
+                | Mutation::AnswerUi { .. }
+                | Mutation::CloseOnDesktop { .. }
         )
     }
 }
@@ -1214,6 +1453,15 @@ pub enum Done {
     },
     /// [`Mutation::RelocateSessions`]: per file, its new path or why it was not moved.
     Relocated(Vec<(PathBuf, Result<PathBuf, String>)>),
+    /// [`Mutation::WorktreeRetire`] / [`Mutation::WorktreeFinish`]: the git result, the ids of
+    /// the session files moved into the main checkout, how many running sessions moved there
+    /// and kept running, and whether it was parked.
+    Retired {
+        removed: Removed,
+        sessions: Vec<String>,
+        moved: u32,
+        parked: bool,
+    },
     Settings(Snapshot),
     Gateway(GatewayStatus),
     DriveLogin {
@@ -1297,6 +1545,12 @@ pub enum GatewayError {
     /// The job was cancelled (its final outcome is [`Outcome::Cancelled`]).
     #[error("cancelled")]
     Cancelled,
+    /// The session runs (in a backend) without a live-control link the request needs, e.g. a
+    /// fork of a session the gateway cannot ask to fork itself.
+    #[error(
+        "Session is running in the background without live control — open it and restart with live control to fork"
+    )]
+    NoLiveControl,
 }
 
 /// One reply (the payload of a `REPLY` message).
@@ -1355,6 +1609,20 @@ pub enum ServerEvent {
     },
     /// Events were dropped (the client lagged): refetch every cached topic.
     Resync,
+    /// Open (or focus) the tab of the session file `file`; a newly opened one goes beside the
+    /// active tab as `split` says. Sent to the focused (else the most recent) GUI.
+    OpenSession {
+        file: PathBuf,
+        split: Split,
+    },
+    /// Close the tab of the session file `file` (every GUI).
+    CloseSession {
+        file: PathBuf,
+    },
+    /// Open `url` in the desktop browser (the focused, else the most recent GUI).
+    OpenUrl {
+        url: String,
+    },
 }
 
 /// Why one frontend write was refused.

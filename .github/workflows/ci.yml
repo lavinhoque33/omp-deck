@@ -31,12 +31,14 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - name: PWA transport tests (Noise interop vectors)
+      - name: PWA typecheck, tests and build
         working-directory: pwa
         run: |
           bun install --frozen-lockfile
           bun run typecheck
           bun test
+          bun run build
+          test -f dist/index.html && test -f dist/sw.js && test -f dist/manifest.webmanifest
 
   # RustSec advisories (policy in deny.toml) and the PWA's npm advisories.
   audit:

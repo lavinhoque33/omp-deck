@@ -1,0 +1,492 @@
+/* The six phone themes, ported from the mockups' per-direction rules (index.html `.d1`…`.d6`).
+   The theme is the `data-theme` attribute on <html>; app.css's :root tokens are 01 Blueprint. */
+
+/* 01 Blueprint mobile: the same drafting system as desktop, not just a cyan skin. */
+[data-theme='blueprint'] .screen {
+  background-image: radial-gradient(#94a3b826 0.8px, transparent 1px);
+  background-size: 18px 18px;
+}
+[data-theme='blueprint'] h2 {
+  text-transform: uppercase;
+  font-size: 18px;
+  letter-spacing: 1.2px;
+}
+[data-theme='blueprint'] .chat h2,
+[data-theme='blueprint'] .terminal h2 {
+  font-size: 13px;
+  letter-spacing: 0;
+}
+[data-theme='blueprint'] .fleet-card {
+  outline: 1px solid #2e3540;
+  outline-offset: 3px;
+  margin-bottom: 15px;
+}
+[data-theme='blueprint'] .accordion {
+  border-radius: 0;
+  background: #111923;
+}
+[data-theme='blueprint'] .acc-head {
+  border-bottom: 1px dashed var(--border);
+  padding-bottom: 6px;
+}
+[data-theme='blueprint'] .sheet {
+  border-radius: 4px 4px 0 0;
+}
+[data-theme='blueprint'] .nav {
+  border-top: 3px double var(--border);
+}
+
+/* 02 Aurora glass: floating dock and nested translucent islands. */
+[data-theme='aurora'] {
+  --bg: #0b0c19;
+  --surface: #181b31;
+  --raised: #292c49;
+  --border: #626688;
+  --text: #e4e4fa;
+  --muted: #b2b7d2;
+  --accent: #b4a1ff;
+  --r: 17px;
+  --font: 'Geist';
+  --shadow: 0 8px 20px #03031080, inset 0 1px #ffffff18;
+  --heading: #f5f5ff;
+  --strong: #f1f0ff;
+  --nav-height: 65px;
+  --nav-gap: 17px;
+}
+[data-theme='aurora'] .screen {
+  background:
+    radial-gradient(ellipse at 100% 20%, #42427770, transparent 65%),
+    radial-gradient(ellipse at 0 80%, #195d6860, transparent 65%),
+    var(--bg);
+}
+[data-theme='aurora'] .top {
+  background: #191c32bb;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+[data-theme='aurora'] .session,
+[data-theme='aurora'] .fleet-card,
+[data-theme='aurora'] .tv-card,
+[data-theme='aurora'] .card {
+  background: linear-gradient(135deg, #30344bba, #171d30dd);
+  border-top-color: #8e94b1;
+}
+[data-theme='aurora'] .nav {
+  bottom: calc(17px + env(safe-area-inset-bottom));
+  left: 14px;
+  right: 14px;
+  height: 65px;
+  border: 1px solid var(--border);
+  border-radius: 25px;
+  background: #24283fea;
+  box-shadow: 0 10px 30px #0008;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  padding-top: 8px;
+}
+[data-theme='aurora'] .nav i {
+  line-height: 24px;
+}
+[data-theme='aurora'] .fab {
+  border-radius: 28px;
+}
+[data-theme='aurora'] .accordion {
+  background: #454165;
+  border-color: #c4b7ff;
+  border-left-width: 1px;
+  box-shadow: inset 0 1px #ffffff30;
+}
+[data-theme='aurora'] .sheet {
+  background: linear-gradient(150deg, #30314b, #181b31);
+  border-radius: 28px 28px 0 0;
+}
+[data-theme='aurora'] .sheet h3 {
+  font-weight: 500;
+}
+[data-theme='aurora'] .composer {
+  border-radius: 22px;
+}
+[data-theme='aurora'] .tv-card,
+[data-theme='aurora'] .approval {
+  border-radius: 14px;
+}
+[data-theme='aurora'] .user {
+  border-radius: 17px;
+}
+[data-theme='aurora'] .term {
+  background: #0a0b17;
+}
+[data-theme='aurora'] .term-status {
+  background: #0a0b17;
+  border-top-color: #3a3d5c;
+}
+[data-theme='aurora'] .keys button {
+  border-radius: 9px;
+}
+[data-theme='aurora'] .button,
+[data-theme='aurora'] .row-btn,
+[data-theme='aurora'] .icon-btn {
+  border-radius: 999px;
+}
+[data-theme='aurora'] .option,
+[data-theme='aurora'] .theme-swatch,
+[data-theme='aurora'] .banner,
+[data-theme='aurora'] .toast {
+  border-radius: 14px;
+}
+
+/* 03 Signal / 01: asymmetric signal rails and precision telemetry. */
+[data-theme='signal'] {
+  --bg: #090d0b;
+  --surface: #111a15;
+  --raised: #203126;
+  --border: #54705b;
+  --text: #e0efdc;
+  --muted: #a8bda6;
+  --accent: #c9ff45;
+  --r: 7px;
+  --font: 'Space';
+  --shadow: 3px 4px 0 #0008;
+  --heading: #f3fbef;
+  --strong: #ecf8e8;
+  --nav-height: 79px;
+}
+[data-theme='signal'] h2 {
+  font-size: 24px;
+  letter-spacing: -1px;
+}
+[data-theme='signal'] .chat h2,
+[data-theme='signal'] .terminal h2 {
+  font-size: 16px;
+  letter-spacing: -0.3px;
+}
+[data-theme='signal'] .top {
+  border-bottom: 2px solid var(--accent);
+}
+[data-theme='signal'] .session {
+  border-left: 3px solid #54705b;
+}
+[data-theme='signal'] .session.active {
+  border-left: 5px solid var(--accent);
+  background: #1b2b1b;
+}
+[data-theme='signal'] .project-title {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+[data-theme='signal'] .fab {
+  border-radius: 6px 19px 6px 19px;
+  box-shadow: 4px 4px 0 #5b792a;
+}
+[data-theme='signal'] .nav {
+  background: #0a120d;
+}
+[data-theme='signal'] .nav .selected {
+  border-top: 2px solid var(--accent);
+  padding-top: 2px;
+}
+[data-theme='signal'] .nav .selected i {
+  border: 0;
+  background: none;
+  box-shadow: none;
+}
+[data-theme='signal'] .fleet-card {
+  border-left: 4px solid var(--accent);
+}
+[data-theme='signal'] .accordion {
+  background: #293b1d;
+  border: 1px dashed var(--accent);
+  border-left: 4px solid var(--accent);
+}
+[data-theme='signal'] .sheet {
+  border-radius: 7px 7px 0 0;
+}
+[data-theme='signal'] .button.primary {
+  box-shadow: 3px 3px 0 #4a612c;
+}
+[data-theme='signal'] .tv-head,
+[data-theme='signal'] .card > header {
+  letter-spacing: 1px;
+}
+
+/* 04 Margin: editorial hierarchy, disciplined rules and a vermilion stamp. */
+[data-theme='margin'] {
+  --bg: #101010;
+  --surface: #1b1b1a;
+  --raised: #2d2d2a;
+  --border: #73716b;
+  --text: #eeeae2;
+  --muted: #bab5aa;
+  --accent: #ff8a65;
+  --r: 3px;
+  --font: 'Manrope';
+  --shadow: 0 5px 12px #0008;
+  --heading: #f7f3ea;
+  --strong: #f5f1e8;
+}
+[data-theme='margin'] h2 {
+  font-family: Georgia, serif;
+  font-weight: 400;
+  font-size: 29px;
+  letter-spacing: -0.8px;
+}
+[data-theme='margin'] .chat h2 {
+  font-size: 21px;
+}
+[data-theme='margin'] .terminal h2 {
+  font-size: 18px;
+}
+[data-theme='margin'] .top {
+  background: transparent;
+  border-bottom: 3px double var(--border);
+}
+[data-theme='margin'] .session {
+  background: transparent;
+  border-width: 0 0 1px;
+  border-radius: 0;
+  box-shadow: none;
+  padding-left: 3px;
+}
+[data-theme='margin'] .session.active {
+  box-shadow: inset 3px 0 var(--accent);
+  padding-left: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+[data-theme='margin'] .session.attention {
+  border-bottom-color: var(--accent);
+}
+[data-theme='margin'] .project-title {
+  font-weight: 700;
+  font-size: 13px;
+}
+[data-theme='margin'] .nav .selected i {
+  border-radius: 50%;
+  width: 32px;
+  background: var(--accent);
+  color: #101010;
+  box-shadow: 0 3px 8px #0009;
+}
+[data-theme='margin'] .fleet-card {
+  border-radius: 3px;
+  border-top: 2px solid var(--text);
+}
+[data-theme='margin'] .accordion {
+  background: #e0d9cc;
+  color: #171615;
+  border: 1px solid #fff;
+  border-left: 4px solid var(--accent);
+}
+[data-theme='margin'] .acc-head,
+[data-theme='margin'] .subagent {
+  color: #28251e;
+}
+[data-theme='margin'] .subagent .go {
+  color: #704022;
+}
+[data-theme='margin'] .sheet {
+  border-radius: 3px 3px 0 0;
+}
+[data-theme='margin'] .sheet h3 {
+  font: 25px Georgia, serif;
+}
+[data-theme='margin'] .pill {
+  border-radius: 3px;
+}
+[data-theme='margin'] .fab {
+  letter-spacing: 0.5px;
+}
+[data-theme='margin'] .speaker {
+  letter-spacing: 2px;
+}
+
+/* 05 Tidal: tactile, rounded tonal containers; compact data stays crisp. */
+[data-theme='tidal'] {
+  --bg: #11131b;
+  --surface: #202532;
+  --raised: #343e50;
+  --border: #64758e;
+  --text: #e4ebf8;
+  --muted: #b2c0d5;
+  --accent: #a4c8ff;
+  --r: 19px;
+  --font: 'Outfit';
+  --shadow: 0 6px 12px #03071188, inset 0 1px #cadbff25;
+  --heading: #f3f7ff;
+  --strong: #eff4ff;
+  --nav-height: 79px;
+}
+[data-theme='tidal'] .top {
+  border-bottom: 0;
+  background: transparent;
+}
+[data-theme='tidal'] h2 {
+  font-size: 28px;
+  font-weight: 500;
+}
+[data-theme='tidal'] .session {
+  min-height: 58px;
+  padding: 10px 12px;
+}
+[data-theme='tidal'] .search {
+  border-radius: 25px;
+  background: #2b3446;
+}
+[data-theme='tidal'] .project {
+  margin-bottom: 18px;
+}
+[data-theme='tidal'] .project-title {
+  font-size: 13px;
+}
+[data-theme='tidal'] .nav {
+  border-radius: 22px 22px 0 0;
+  background: #263045;
+  border-color: #708bad;
+}
+[data-theme='tidal'] .nav .selected i {
+  border-radius: 20px;
+  background: var(--accent);
+  color: #17263e;
+  width: 61px;
+}
+[data-theme='tidal'] .fab {
+  border-radius: 18px;
+  padding: 15px 21px;
+}
+[data-theme='tidal'] .fleet-card {
+  border-radius: 21px;
+  background: linear-gradient(140deg, #2e384b, #202532);
+}
+[data-theme='tidal'] .accordion {
+  border-radius: 12px;
+  background: #405879;
+  border: 1px solid #a4c8ff;
+  border-left-width: 1px;
+}
+[data-theme='tidal'] .sheet {
+  border-radius: 30px 30px 0 0;
+  background: #293448;
+}
+[data-theme='tidal'] .sheet .button {
+  border-radius: 23px;
+}
+[data-theme='tidal'] .chat h2,
+[data-theme='tidal'] .terminal h2 {
+  font-size: 19px;
+}
+[data-theme='tidal'] .chat .top,
+[data-theme='tidal'] .terminal .top {
+  border-bottom: 1px solid var(--border);
+}
+[data-theme='tidal'] .tv-head {
+  border-radius: 0;
+}
+[data-theme='tidal'] .tv-card,
+[data-theme='tidal'] .approval {
+  border-radius: 14px;
+}
+[data-theme='tidal'] .button {
+  border-radius: 12px;
+}
+[data-theme='tidal'] .composer {
+  border-radius: 22px;
+}
+[data-theme='tidal'] .user {
+  border-radius: 19px 19px 4px 19px;
+}
+
+/* 06 Field console: warm phosphor, ticket-like panels and hard keys. */
+[data-theme='field'] {
+  --bg: #0e100b;
+  --surface: #181b12;
+  --raised: #2c301e;
+  --border: #71784b;
+  --text: #e4e9bf;
+  --muted: #b3bc91;
+  --accent: #d2e875;
+  --r: 2px;
+  --font: 'JetBrains';
+  --shadow: 3px 3px 0 #000b;
+  --heading: #f1f5d6;
+  --strong: #eef2cf;
+  --sheet-edge: #ff9eae;
+}
+[data-theme='field'] .screen {
+  background-image: repeating-linear-gradient(0deg, #ffffff02 0 1px, transparent 1px 4px);
+  background-color: var(--bg);
+}
+[data-theme='field'] h2 {
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-size: 19px;
+}
+[data-theme='field'] .top {
+  border-bottom: 2px solid var(--border);
+}
+[data-theme='field'] .eyebrow {
+  letter-spacing: 2px;
+}
+[data-theme='field'] .connected {
+  background: #232a18;
+  color: #d2e875;
+  border-color: #71784b;
+}
+[data-theme='field'] .session {
+  border-style: dashed;
+  box-shadow: 3px 3px 0 #0008;
+}
+[data-theme='field'] .session.active {
+  border-style: solid;
+  border-left: 5px solid var(--accent);
+}
+[data-theme='field'] .search {
+  border-bottom: 3px solid var(--border);
+}
+[data-theme='field'] .nav {
+  border-top: 4px double var(--border);
+}
+[data-theme='field'] .nav button {
+  font-size: 9px;
+}
+[data-theme='field'] .nav .selected i {
+  background: #d2e875;
+  color: #11150a;
+  border-radius: 1px;
+}
+[data-theme='field'] .fab {
+  box-shadow: 4px 4px 0 #5e6535;
+  text-transform: uppercase;
+}
+[data-theme='field'] .tv-head[aria-expanded='true'] {
+  border-bottom-style: dashed;
+}
+[data-theme='field'] .fleet-card {
+  border-top: 3px double var(--border);
+}
+[data-theme='field'] .accordion {
+  background: #343e20;
+  border: 1px dashed var(--accent);
+  border-left: 4px solid var(--accent);
+}
+[data-theme='field'] .acc-head {
+  border-bottom: 1px dashed var(--border);
+  padding-bottom: 6px;
+}
+[data-theme='field'] .sheet {
+  border-radius: 2px;
+  border-top: 4px double var(--sheet-edge);
+}
+[data-theme='field'] .sheet h3 {
+  text-transform: uppercase;
+  font-size: 16px;
+}
+[data-theme='field'] .term,
+[data-theme='field'] .term-status {
+  background: #0e100b;
+  color: #dae6b2;
+}
+[data-theme='field'] .chat h2,
+[data-theme='field'] .terminal h2 {
+  font-size: 13px;
+  letter-spacing: 0;
+}

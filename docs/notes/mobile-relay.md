@@ -179,6 +179,7 @@ ignores OSC 52, since its replies would be typed into the session (R5; `deck_rem
 | R5 | Security review of R1–R4; freeze protocol v1 | findings fixed or accepted in writing | **done** (2026-10-29): R1/R2 (5) and R3 (5) code-review findings fixed earlier. Five parallel security reviews (crypto, relay, gateway, device layer, freeze) found 2 High (both design, user-accepted and documented: Control = code execution, relay host = PWA origin), 5 Medium (relay flood dropping the gateway, device resize memory exhaustion, work surviving revoke, View reading untracked files above the project, no version negotiation) and about 30 Low/Info findings. All fixed with regression tests or accepted in writing; a second review round closed every fix and its 4 new regressions (N1, N2, D11, the per-token admission bucket). Protocol v1 frozen (`wire_freeze.rs`, 7 pinned vector files); dependency advisories fixed (tokio 1.54.1) and CI `audit` job added. See "R5 security review" and "Protocol v1 freeze" |
 
 Slice 4 (PWA) starts after R5. Web Push (`web-push-native`, VAPID, fits the existing blocking `ureq`) belongs there.
+Its contract and steps are in `mobile-pwa.md`.
 
 ## Decisions (2026-10-27, user-accepted)
 
@@ -442,8 +443,9 @@ affecting another device; outcome lookup of another client's key is refused. Uni
 shared JSON vectors (`crates/deck-remote/tests/vectors/api-v1.json`, also read by `pwa/test`), class table, id
 resolution and projection hygiene (no absolute path, ctl key or foreign request key in any device view).
 
-Deferred to slice 4 with their PWA screens (additive ops/feeds behind `Welcome.features`, same capability layer):
-usage and context breakdown, session tree/fork-at/navigate, subagent kill/revive/chat, worktree flows, project
+Deferred to slice 4 with their PWA screens (contract `mobile-pwa.md`; additive ops/feeds behind `Welcome.features` `s4`,
+same capability layer): usage and context breakdown, session tree/fork-at/navigate, subagent kill/revive/chat, worktree
+flows, project
 backups/restores and Drive, omp settings, update jobs, running-process RAM, export/copy-last, attachments, review
 comments, the desktop-folder browser, explicit "open on desktop" actions, steering a busy session, Web Push.
 

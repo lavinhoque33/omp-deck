@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use deck_remote::api::{
     self, ApiError, Event, Feed, InputRefusal, MAX_APP_MESSAGE, MAX_REPLY, MAX_SNAPSHOT,
-    MAX_SNAPSHOT_CHUNK, Op, Record, Reply, ReplyResult, Request, RequestError, TermEnd, ViewMode,
+    MAX_SNAPSHOT_CHUNK, Record, Reply, ReplyResult, Request, RequestError, TermEnd, ViewMode,
 };
 use deck_remote::relay::close;
 use deck_term::{OutputEvent, OutputSubscription};
@@ -202,6 +202,11 @@ impl DeviceOut {
 
     pub fn drop_feed(&self, feed: &Feed) {
         lock(&self.q).feeds.retain(|(f, _)| f != feed);
+    }
+
+    /// Replies, events or the welcome are still queued for the link.
+    pub fn control_pending(&self) -> bool {
+        !lock(&self.q).control.is_empty()
     }
 
     pub fn attach(&self, view: NewView) {
@@ -454,10 +459,7 @@ impl Runtime {
                         self.answer(id, ApiError::BadRequest { message })?;
                     }
                     Ok(req) => {
-                        let bounds = match &req.op {
-                            Op::Subscribe { feed } | Op::Unsubscribe { feed } => feed.check(),
-                            _ => Ok(()),
-                        };
+                        let bounds = req.op.check();
                         if let Err(message) = req.check_seq().and(bounds) {
                             self.answer(req.id, ApiError::BadRequest { message })?;
                         } else if self.inflight >= api::MAX_INFLIGHT {

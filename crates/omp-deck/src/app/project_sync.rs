@@ -390,7 +390,11 @@ impl App {
     /// Asks the gateway to stop the running job (when it was sent as a request).
     fn cancel_job(&mut self) {
         if let Some(key) = self.sync.job.as_ref().and_then(|j| j.key.clone()) {
-            self.gw.cancel(key);
+            self.gw.cancel(key, |_, r| {
+                if let Err(e) = r {
+                    log::debug!("the project job was not cancelled: {e}");
+                }
+            });
         }
     }
 
@@ -1286,15 +1290,11 @@ impl App {
             self.toasts.info(&self.ctx, LANE_BUSY);
             return;
         }
-        // Running sessions on overwritten copies are stopped (their tabs closed) before the apply.
-        let mut stop: Vec<String> = Vec::new();
+        // This window's tabs on overwritten copies are closed (without being remembered); the
+        // gateway works out what runs them and stops it.
         for (id, path) in overwritten {
             let entry = local_entry(&id, &path);
-            for name in self.session_kill_names(&entry, true) {
-                if !stop.contains(&name) {
-                    stop.push(name);
-                }
-            }
+            self.session_kill_names(&entry, true);
         }
         if let Some(r) = &mut self.sync.restore {
             r.prepared = None;
@@ -1304,7 +1304,7 @@ impl App {
         let job = Mutation::ProjectApplyRestore {
             handle,
             conflicts: choices,
-            stop,
+            stop: Vec::new(),
         };
         self.send_job(job, |app, r| {
             app.sync.job = None;

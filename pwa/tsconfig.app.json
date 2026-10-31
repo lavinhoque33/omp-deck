@@ -1,0 +1,14 @@
+{
+  // The browser app: JSX screens plus the vendored oh-my-pi rendering, under upstream's flags
+  // (collab-web is written without `exactOptionalPropertyTypes`/`noUncheckedIndexedAccess`). The
+  // app's non-JSX modules are also checked strictly by tsconfig.json.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "types": [],
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false
+  },
+  "include": ["src/main.tsx", "src/app", "src/vendor", "src/env.d.ts"],
+  "exclude": ["src/sw.ts"]
+}

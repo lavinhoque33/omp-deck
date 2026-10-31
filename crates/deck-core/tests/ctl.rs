@@ -548,3 +548,80 @@ fn main_model_state_is_parsed_and_absent_or_malformed_is_none() {
     say(&mut s, &snapshot_line(9, ""));
     wait_for("older extension", || model().is_none());
 }
+
+#[test]
+fn pending_ui_hook_and_answer_round_trip() {
+    use deck_core::ctl::PendingUiKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = fake(tmp.path());
+    let client = CtlClient::spawn(tmp.path().to_path_buf(), || {});
+    let mut s = srv.accept();
+    // An older extension: no `ui_hook`, no `pendingUi`.
+    say(&mut s, HELLO);
+    say(&mut s, &snapshot_line(1, ""));
+    assert!(snapshot(&client).pending_ui.is_empty());
+    assert!(!client.ui_hook());
+
+    drop(s);
+    wait_for("disconnect", || !client.connected());
+    let mut s = srv.accept();
+    say(&mut s, r#"{"t":"hello","v":1,"pid":4242,"ui_hook":true}"#);
+    wait_for("hook", || client.ui_hook());
+
+    let pending = r#"[
+      {"id":1,"kind":"select","title":"Pick","options":[{"label":"a","description":"first"},{"label":"b"}],"multi":true,"initial":1,"timeoutMs":5000},
+      {"id":2,"kind":"confirm","title":"Sure?","message":"really"},
+      {"id":3,"kind":"input","title":"Name","message":"your name"},
+      {"id":4,"kind":"editor","title":"Edit","prefill":"draft"},
+      {"id":5,"kind":"ask","title":"Ask","questions":[{"id":"q1","question":"Color?","header":"H","options":[{"label":"red"},{"label":"blue"}],"multi":false,"recommended":1}]},
+      {"id":6,"kind":"approve","title":"Approval","approve":{"full":"Allow bash","compact":"bash","session":"for session","grants":[{"scope":"folder","label":"Dir","alwaysLabel":"Always dir"}]}},
+      {"id":7,"kind":"teleport","title":"future kind"},
+      {"kind":"select","title":"no id"}
+    ]"#
+    .replace('\n', "");
+    say(
+        &mut s,
+        &format!(r#"{{"t":"agents","pid":9,"agents":[],"pendingUi":{pending}}}"#),
+    );
+    wait_for("pending", || {
+        client.latest().is_some_and(|s| !s.pending_ui.is_empty())
+    });
+    let ui = client.latest().unwrap().pending_ui.clone();
+    assert_eq!(
+        ui.iter().map(|p| p.id).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6],
+        "unknown kinds and entries without an id are dropped"
+    );
+    assert_eq!(ui[0].kind, PendingUiKind::Select);
+    assert_eq!(ui[0].options[0].description.as_deref(), Some("first"));
+    assert!(ui[0].multi);
+    assert_eq!((ui[0].initial, ui[0].timeout_ms), (Some(1), Some(5000)));
+    assert_eq!(ui[1].message.as_deref(), Some("really"));
+    assert_eq!(ui[2].kind, PendingUiKind::Input);
+    assert_eq!(ui[3].prefill.as_deref(), Some("draft"));
+    assert_eq!(ui[4].questions[0].options[1].label, "blue");
+    assert_eq!(ui[4].questions[0].recommended, Some(1));
+    let a = ui[5].approve.as_ref().unwrap();
+    assert_eq!(a.session.as_deref(), Some("for session"));
+    assert_eq!(a.grants[0].always_label, "Always dir");
+
+    let rid = client.send(CtlCommand::AnswerUi {
+        id: 5,
+        value: serde_json::json!({"kind": "submit", "results": []}),
+        root: "/s/main.jsonl".into(),
+    });
+    let mut rd = BufReader::new(s.try_clone().unwrap());
+    let mut l = String::new();
+    rd.read_line(&mut l).unwrap();
+    let got: serde_json::Value = serde_json::from_str(&l).unwrap();
+    assert_eq!(got["t"], "answer_ui");
+    assert_eq!(got["rid"], rid);
+    assert_eq!(got["id"], 5);
+    assert_eq!(got["value"]["kind"], "submit");
+    assert_eq!(got["root"], "/s/main.jsonl");
+    say(
+        &mut s,
+        &format!(r#"{{"t":"reply","rid":{rid},"ok":false,"error":"no such request"}}"#),
+    );
+    wait_for("reply", || !client.take_replies().is_empty());
+}

@@ -1,5 +1,7 @@
 # omp-deck-relay container (docs/relay.md). Build from the repository root:
 #   podman build -f packaging/relay/Containerfile -t omp-deck-relay .
+# The image serves the phone app (pwa/, built in the `web` stage) from /usr/share/omp-deck-relay/web,
+# which the relay picks up without --web-dir.
 # Run (plain HTTP on 8080 behind a TLS proxy on the host; rooms.json lives in the volume). The
 # proxy's connections reach the relay from the container network's gateway (podman's default
 # bridge: 10.88.0.1, docker's: 172.17.0.1), so trust X-Forwarded-For from that address only;
@@ -10,6 +12,15 @@
 #     --trust-forwarded-for --trusted-proxy 10.88.0.1
 # Enroll a room:
 #   podman exec omp-deck-relay omp-deck-relay enroll --state-dir /var/lib/omp-deck-relay --label phone
+
+FROM docker.io/oven/bun:1.4.2 AS web
+WORKDIR /src/pwa
+# A host node_modules/ or dist/ in the build context is discarded: dependencies come from the lockfile.
+COPY pwa ./
+RUN rm -rf dist node_modules \
+    && bun install --frozen-lockfile \
+    && bun run build \
+    && test -f dist/index.html
 
 FROM docker.io/library/rust:1-slim-trixie AS build
 WORKDIR /src
@@ -25,6 +36,7 @@ FROM docker.io/library/debian:trixie-slim
 RUN useradd --system --uid 10001 --home-dir /var/lib/omp-deck-relay --shell /usr/sbin/nologin relay \
     && install -d -m 0700 -o relay -g relay /var/lib/omp-deck-relay
 COPY --from=build /usr/local/bin/omp-deck-relay /usr/local/bin/omp-deck-relay
+COPY --from=web /src/pwa/dist /usr/share/omp-deck-relay/web
 USER relay
 VOLUME /var/lib/omp-deck-relay
 EXPOSE 8080

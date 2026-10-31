@@ -31,12 +31,27 @@ desktop itself, and restrict who can administer it.
 
 ## Install
 
-The relay is a single binary (Linux or Windows, about 5 MB). Release archives do not ship
-it yet; build it from a checkout of this repository:
+The relay is a single binary (Linux or Windows, about 5 MB) plus the phone app's static files. A
+relay release archive keeps them side by side, and the relay finds `web/` next to its binary on its
+own:
+
+```text
+omp-deck-relay-<version>-x86_64-linux/
+  omp-deck-relay        (omp-deck-relay.exe on Windows)
+  web/                  the built phone app: index.html, sw.js, manifest.webmanifest, assets/…
+  omp-deck-relay.service, relay.md, licences
+```
+
+Each release ships `omp-deck-relay-<version>-x86_64-linux.tar.gz` (with a `.sha256`) in this layout. Copy the binary
+and `web/` to the same directory, or put `web/` at `/usr/share/omp-deck-relay/web`. On other platforms, build both
+from a checkout of this repository (the app needs [bun](https://bun.sh) 1.4.2):
 
 ```sh
 cargo build --release -p deck-relay
 install -m 0755 target/release/omp-deck-relay /usr/local/bin/
+(cd pwa && bun install --frozen-lockfile && bun run build)
+sudo mkdir -p /usr/share/omp-deck-relay
+sudo cp -r pwa/dist /usr/share/omp-deck-relay/web
 ```
 
 ### systemd (recommended on Linux)
@@ -58,8 +73,9 @@ Enroll rooms as the service's own user so `rooms.json` stays readable by it (see
 
 ### Container
 
-[`packaging/relay/Containerfile`](../packaging/relay/Containerfile) is a multi-stage build (Rust
-builder, Debian slim runtime, non-root user, state volume). Build from the repository root:
+[`packaging/relay/Containerfile`](../packaging/relay/Containerfile) is a multi-stage build (bun 1.4.2
+stage that builds the phone app into `/usr/share/omp-deck-relay/web`, Rust builder, Debian slim
+runtime, non-root user, state volume). Build from the repository root:
 
 ```sh
 podman build -f packaging/relay/Containerfile -t omp-deck-relay .
@@ -74,6 +90,55 @@ Inside the container the host's proxy connects from the bridge gateway (rootful 
 proxy's connections), so name it with `--trusted-proxy`; `X-Forwarded-For` from any other peer is ignored.
 Without `--trust-forwarded-for` behind a proxy every client shares the proxy's address, so the
 per-address limit (32) becomes a global cap. `docker` works the same way.
+
+## Serving the phone app
+
+Phones open the companion app (a PWA) from the relay's own origin, `https://relay.example.com/`, and
+its WebSocket connects back to the same origin. The relay serves it next to its WebSocket routes:
+
+- **Where from.** `--web-dir <dir>`; without it the relay uses `web/` next to its binary, then
+  `/usr/share/omp-deck-relay/web` (the container image). If none exists it serves no app and says so
+  once in the log at startup; the WebSocket routes work either way. An explicit `--web-dir` that
+  cannot be read stops startup.
+- **Read once.** Every file is read into memory at startup (at most 64 MiB in total, precompressed
+  siblings included); restart the relay after updating the app. Names starting with `.` are skipped.
+  Symlinks are followed only within the directory: one that leads outside it stops startup.
+- **Paths.** `/` serves `index.html`; every other path serves the file of that name or answers 404.
+  There is no SPA fallback, `/v1/*` never serves files (the relay protocol's namespace), and
+  `/v1/gateway`, `/v1/device` and `/healthz` always win. Only `GET` and `HEAD` are served; other
+  methods on a file answer 405.
+- **Compression.** A `name.br` or `name.gz` next to `name` is sent instead of it (with
+  `Content-Encoding`) when the request's `Accept-Encoding` allows it, brotli first; every file
+  response carries `Vary: Accept-Encoding`. The siblings themselves are not served as files.
+- **Revalidation.** Each body has a strong `ETag` (a hash of its content); a matching
+  `If-None-Match` gets `304 Not Modified`.
+- **Caching.** `assets/*` (the build's content-hashed names) is
+  `Cache-Control: public, max-age=31536000, immutable`; everything else (`index.html`, `sw.js`,
+  `manifest.webmanifest`, icons) is `no-cache`, so a new app version reaches phones on their next
+  load. Content types are explicit (`.webmanifest` is `application/manifest+json`, `.js`
+  `text/javascript`; also `.html`, `.css`, `.svg`, `.png`, `.woff2`, `.ico`, `.json`, `.txt` and a
+  few more); unknown extensions are `application/octet-stream`.
+- **Security headers** on every response from the app's paths (404 and 405 included):
+
+  | Header | Value |
+  |---|---|
+  | `Content-Security-Policy` | `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` |
+  | `Referrer-Policy` | `no-referrer` |
+  | `X-Content-Type-Options` | `nosniff` |
+  | `Cross-Origin-Opener-Policy` | `same-origin` |
+  | `Cross-Origin-Resource-Policy` | `same-origin` |
+  | `X-Frame-Options` | `DENY` |
+  | `Permissions-Policy` | `camera=(), microphone=(), geolocation=(), payment=(), usb=()` |
+  | `Strict-Transport-Security` | `max-age=31536000`, only with `--tls-cert` (behind a proxy, set it there if you want it) |
+
+  `style-src 'unsafe-inline'` is there for the terminal view: xterm.js injects `<style>` elements.
+  Scripts stay strictly same-origin. `connect-src 'self'` covers the relay's own `wss://` origin, so
+  the app's WebSocket needs no extra entry; that also means the app only talks to the relay it was
+  loaded from.
+
+Reverse proxies need nothing extra: the [Caddy](../packaging/relay/Caddyfile.example) and
+[nginx](../packaging/relay/nginx.conf.example) examples already pass every path through. Do not let
+the proxy strip or rewrite the headers above.
 
 ## TLS
 
@@ -158,11 +223,15 @@ everything. Defaults:
 | outbound queue per connection | 256 messages or 4 MiB | `--queue-messages`, `--queue-bytes` | close 4008. Toward the gateway, device data may fill at most ¼ of the queue per device token (both its connections, counted across reconnects, released as the gateway reads) and ¾ in total: the sending device is closed 4008 and the gateway stays. A gateway that stops reading is still dropped once the rest fills (taking its devices offline) |
 | message size | 65 535 bytes (device), 65 540 (gateway) | — (protocol) | close 4013 |
 | silence | 75 s (pings every 25 s) | `--idle-timeout-secs` | close 1000 |
-| WebSocket upgrade (counted from accept, or from the end of the TLS handshake with `--tls-cert`; also ends idle HTTP keep-alive such as health checks) | 10 s | — | socket closed |
+| HTTP request headers (counted from accept, or the end of the TLS handshake with `--tls-cert`; on a keep-alive connection from the next request's first byte) | 10 s | — | socket closed |
+| idle HTTP keep-alive (no traffic either way between requests) | 30 s | — | socket closed |
+| stalled HTTP response write (no progress) | 30 s | — | socket closed |
+| HTTP requests per connection | 100 | — | the last response carries `Connection: close` |
 | TLS handshake (`--tls-cert`) | 10 s | — | socket closed |
 | first message (hello) | 10 s | — | close 4001 |
 
-Other flags: `--trust-forwarded-for`, `--trusted-proxy`, `--device-admissions-per-sec`, `--tls-cert`/`--tls-key`.
+Other flags: `--trust-forwarded-for`, `--trusted-proxy`, `--device-admissions-per-sec`, `--tls-cert`/`--tls-key`,
+`--web-dir` ([Serving the phone app](#serving-the-phone-app)).
 Logging: `RUST_LOG` (default `info`;
 `debug` adds per-connection detail). A client that vanishes without a WebSocket close (process exit,
 network loss) is logged as `connection lost`, not as a protocol violation. Behind
@@ -186,7 +255,8 @@ limits): phones retry with backoff up to about 75 s.
 
 ## Upgrading
 
-Replace the binary (or rebuild the image) and restart. SIGTERM/SIGINT (Ctrl+C on Windows) closes
+Replace the binary and its `web/` directory together (or rebuild the image) and restart: the app is
+read at startup only. SIGTERM/SIGINT (Ctrl+C on Windows) closes
 every connection with code 1001 and exits within 5 s; gateways and devices reconnect on their own with
 backoff. Admission tokens live only in memory: each gateway re-registers its set right after
 reconnecting, so a restart needs no migration. `rooms.json` is the only persistent state.

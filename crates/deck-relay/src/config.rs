@@ -61,10 +61,19 @@ pub struct Config {
     pub shutdown_timeout: Duration,
     /// A TLS handshake must finish within this time.
     pub tls_handshake_timeout: Duration,
-    /// A connection must have upgraded to a WebSocket this long after accept (after the TLS
-    /// handshake with in-process TLS); otherwise it is closed. Bounds slow or never-sent request
-    /// headers and idle HTTP keep-alive (health checks).
-    pub request_timeout: Duration,
+    /// Until a connection upgrades to a WebSocket, each HTTP request's headers must have arrived
+    /// this long after the connection started (after the TLS handshake with in-process TLS) or,
+    /// on a keep-alive connection, after the request's first byte; otherwise it is closed.
+    pub header_timeout: Duration,
+    /// An HTTP keep-alive connection with no traffic in either direction between requests is
+    /// closed after this long.
+    pub keep_alive_timeout: Duration,
+    /// A response write that makes no progress this long closes the connection.
+    pub write_stall_timeout: Duration,
+    /// HTTP requests per connection: the last one is answered with `Connection: close`.
+    pub max_requests_per_connection: u32,
+    /// The phone app's files (`--web-dir`), read into memory at startup; `None` serves no app.
+    pub web_dir: Option<PathBuf>,
     pub max_devices_per_room: usize,
     /// Device admissions per room (each queues an `Open`, and later a `Closed`, on the gateway):
     /// over this rate, device hellos get `RATE_LIMITED` before anything is queued.
@@ -108,7 +117,11 @@ impl Config {
             close_timeout: Duration::from_secs(2),
             shutdown_timeout: Duration::from_secs(5),
             tls_handshake_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(10),
+            header_timeout: Duration::from_secs(10),
+            keep_alive_timeout: Duration::from_secs(30),
+            write_stall_timeout: Duration::from_secs(30),
+            max_requests_per_connection: 100,
+            web_dir: None,
             max_devices_per_room: 16,
             device_admissions: AdmissionRate::DEVICE,
             token_admissions: AdmissionRate::TOKEN,

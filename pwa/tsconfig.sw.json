@@ -1,0 +1,10 @@
+{
+  // The service worker: WebWorker globals instead of the DOM.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2024", "WebWorker"],
+    "types": []
+  },
+  "include": ["src/sw.ts", "src/push.ts"],
+  "exclude": []
+}

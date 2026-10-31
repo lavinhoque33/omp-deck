@@ -328,21 +328,6 @@ pub fn defaults_from_catalog(catalog: &SettingsCatalog) -> Defaults {
     Defaults { model, level }
 }
 
-/// omp's `worktree.base` setting (where it keeps managed worktrees): the configured value, `None`
-/// when unset or blank (the default location then applies).
-pub fn worktree_base_from_catalog(catalog: &SettingsCatalog) -> Option<String> {
-    catalog
-        .tabs
-        .iter()
-        .flat_map(|t| &t.settings)
-        .find(|s| s.key == "worktree.base")
-        .and_then(|s| s.value.as_ref())
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-}
-
 #[cfg(test)]
 mod tests {
     use deck_core::omp::SettingsTab;
@@ -364,35 +349,6 @@ mod tests {
             description: format!("About {key}"),
             secret: false,
         }
-    }
-
-    #[test]
-    fn worktree_base_is_the_configured_value_only() {
-        let catalog = |value: Option<Value>| SettingsCatalog {
-            tabs: vec![SettingsTab {
-                id: "tools".into(),
-                label: "Tools".into(),
-                settings: vec![setting(
-                    "worktree.base",
-                    SettingKind::String,
-                    value,
-                    Some(json!("/default")),
-                )],
-            }],
-        };
-        assert_eq!(worktree_base_from_catalog(&catalog(None)), None);
-        assert_eq!(
-            worktree_base_from_catalog(&catalog(Some(json!("  ")))),
-            None
-        );
-        assert_eq!(
-            worktree_base_from_catalog(&catalog(Some(json!(" ~/wts ")))).as_deref(),
-            Some("~/wts")
-        );
-        assert_eq!(
-            worktree_base_from_catalog(&SettingsCatalog { tabs: vec![] }),
-            None
-        );
     }
 
     fn model() -> Model {

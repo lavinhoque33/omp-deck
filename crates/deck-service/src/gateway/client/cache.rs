@@ -89,7 +89,8 @@ pub struct StateCache {
     pub fleet: Slot<Option<FleetSnapshot>>,
     /// [`Topic::Agents`] (interest-driven).
     pub agents: Slot<Option<AgentsSnapshot>>,
-    /// Every other interest-driven topic (`Inventory`, `Changes`, `Tree`, `Transcript`, `Live`).
+    /// Every other interest-driven topic (`Inventory`, `Changes`, `Tree`, `Transcript`, `Live`,
+    /// `Worktrees`).
     other: Mutex<HashMap<Topic, (u64, TopicValue)>>,
     revisions: AtomicU64,
 }

@@ -16,6 +16,7 @@ mod remote;
 mod schedules;
 mod sessions;
 mod spelling;
+pub(super) mod worktree;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
@@ -189,6 +190,19 @@ pub(crate) enum Fin {
         what: &'static str,
         result: Result<(), String>,
     },
+    /// A review prompt was built (or refused) for the `Review` mutation `key`.
+    ReviewBuilt {
+        key: RequestKey,
+        target: SessionTarget,
+        send: bool,
+        result: Result<String, GatewayError>,
+    },
+    /// A desktop sign-in's Google URL: shown by a GUI, else the app opens on it.
+    OpenUrl(String),
+    /// A device operation's worker result ([`device::DeviceFin`]).
+    Device(Box<device::DeviceFin>),
+    /// A worktree flow's worker result ([`worktree::WtFin`]).
+    Worktree(Box<worktree::WtFin>),
 }
 
 /// A signed-in Google account: its email and last backup from this machine.
@@ -421,6 +435,8 @@ pub(crate) struct Engine {
     mobile: remote::Mobile,
     /// Device-protocol state shared by every device session.
     devices: device::Devices,
+    /// The worktree flows ([`worktree`]).
+    worktree: worktree::Worktrees,
 
     barrier: Option<MaintenanceMarker>,
     exit_requested: bool,
@@ -493,7 +509,8 @@ impl Engine {
             settings.on_change(move || w());
         }
         let now = Instant::now();
-        let notify = notify::Notify::new(wake.clone());
+        // Loads (or creates) the VAPID key `push.key` in the secrets dir.
+        let notify = notify::Notify::new(wake.clone(), &profile.secrets_dir());
         let manifest = state_dir.join(sessions::MANIFEST);
         let omp_found = omp.is_some();
         // Creates (and protects) the secrets dir; a failure only disables mobile access.
@@ -541,6 +558,7 @@ impl Engine {
             interest: interest::Interest::default(),
             mobile,
             devices: device::Devices::default(),
+            worktree: worktree::Worktrees::default(),
             barrier: None,
             exit_requested: false,
             stopping: false,
@@ -627,6 +645,7 @@ impl Engine {
         self.refresh_settings();
         self.step_sessions(now);
         self.step_interest(now);
+        self.step_worktrees(now);
         self.step_notifications(now);
         self.step_schedules(now);
         self.step_lifetime(now);
@@ -673,6 +692,7 @@ impl Engine {
     fn on_fin(&mut self, fin: Fin) {
         match fin {
             Fin::Mutation { key, result } => self.job_finished(key, result),
+            Fin::Worktree(fin) => self.on_worktree_fin(*fin),
             Fin::Progress { key, progress } => self.job_progress(key, progress),
             Fin::Query { conn, id, reply } => self.reply(conn, id, reply),
             Fin::Settings {
@@ -715,6 +735,14 @@ impl Engine {
                     log::warn!("opening OmpDeck for a notification failed: {e}");
                 }
             }
+            Fin::ReviewBuilt {
+                key,
+                target,
+                send,
+                result,
+            } => self.on_review_built(key, target, send, result),
+            Fin::OpenUrl(url) => self.open_url(url),
+            Fin::Device(f) => self.on_device_fin(*f),
         }
     }
 
@@ -794,7 +822,7 @@ impl Engine {
     fn reply(&self, conn: u64, id: u64, reply: Reply) {
         match self.conns.get(&conn).map(|c| &c.sink) {
             Some(Sink::Local(out)) => out.reply(id, &reply),
-            Some(Sink::Device(d)) => d.out.reply(id, self.device_reply(reply)),
+            Some(Sink::Device(d)) => d.out.reply(id, self.device_reply(d, reply)),
             None => {}
         }
     }
@@ -805,7 +833,7 @@ impl Engine {
             match &c.sink {
                 Sink::Local(out) => out.event(ev),
                 Sink::Device(d) => {
-                    if let Some(ev) = self.device_event(ev) {
+                    if let Some(ev) = self.device_event(d, ev) {
                         d.out.event(&ev);
                     }
                 }
@@ -820,7 +848,7 @@ impl Engine {
                 Sink::Local(out) if c.is(Role::Gui) => out.event(ev),
                 Sink::Device(d) => {
                     if let ServerEvent::ModelUnconfirmed { .. } = ev
-                        && let Some(ev) = self.device_event(ev)
+                        && let Some(ev) = self.device_event(d, ev)
                     {
                         d.out.event(&ev);
                     }
@@ -947,6 +975,7 @@ impl Engine {
                 let list = self.worktree_sessions(&wt.path);
                 self.reply(conn, id, Ok(Answer::WorktreeSessions(list)));
             }
+            Query::WorktreeVerdict(wt) => self.query_verdict(conn, id, wt.clone()),
             _ => {
                 let ctx = self.job_ctx();
                 self.spawn_worker("query", move || {
@@ -1336,6 +1365,7 @@ impl Engine {
             Topic::OmpUpdate => TopicValue::OmpUpdate(self.sched.omp_view()),
             Topic::Mobile => TopicValue::Mobile(self.mobile_view()),
             Topic::Live(key) => self.live_value(key),
+            Topic::Worktrees(dir) => self.worktrees_value(dir),
             Topic::Inventory
             | Topic::Changes(_)
             | Topic::Tree(_)
