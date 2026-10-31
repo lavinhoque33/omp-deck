@@ -1051,11 +1051,16 @@ mod tests {
             ..Default::default()
         };
         // The style is process-global and other tests switch it too: a frame counts only when
-        // the style and density were ours from before the first pass to after the last.
+        // the style and density were ours from before the first pass to after the last, with no
+        // other `apply` in between (one that switched density and back would go unnoticed).
         let ours = || theme::style() == style && theme::compact() == compact;
         for _ in 0..50 {
             theme::apply(&ctx, style, density, font, true);
+            let applied = theme::applied();
             let row_mid = tabs::tab_hit_h() / 2.0;
+            if !ours() {
+                continue;
+            }
             let mut shapes = Vec::new();
             for _ in 0..3 {
                 let mut out = ctx.run_ui(raw.clone(), |ui| {
@@ -1064,7 +1069,7 @@ mod tests {
                 out.textures_delta.clear();
                 shapes = out.shapes;
             }
-            if !ours() {
+            if !ours() || theme::applied() != applied {
                 continue;
             }
             let mut texts = 0;
