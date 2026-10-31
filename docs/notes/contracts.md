@@ -3225,7 +3225,9 @@ deleted).
   use. Host-key verification uses public-key operations only. Marvin needs an attacker timing many private-key
   operations, which this one-signature-per-login pattern does not offer. Dropping the feature would break RSA-key
   logins.
-- Wired into the gateway and the GUI in 0.20.0 (next section).
+- Wired into the gateway and the GUI in 0.20.0 (next section). The gateway's `Service` reads `google-drive.json` and
+  `backup-server.json` from the served profile's `app_root()`. That is `config_dir()` for the default profile; an
+  explicit `--settings` profile keeps its own on every platform, since Windows' config dir ignores the environment.
 
 ## Backup destinations in the gateway and the GUI (0.20.0)
 

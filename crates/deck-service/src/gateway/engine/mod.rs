@@ -483,10 +483,20 @@ impl Engine {
             log::warn!("live control extension unavailable: no per-user data directory");
         }
         let omp = super::resolve_omp(context.omp.as_deref());
-        let service = Arc::new(Service::new(
-            deck_core::backup::drive::Credentials::detect(),
-            root.agent_dir(),
-        ));
+        // The backup credentials belong to the served profile: `app_root()` is `config_dir()` for
+        // the default profile, and an explicit profile (`--settings`) keeps its own on every
+        // platform (Windows' config dir ignores the environment).
+        let app_root = profile.app_root();
+        let service = Arc::new(Service {
+            store: deck_core::backup::drive::AccountStore::at(app_root.join("google-drive.json")),
+            server_store: deck_core::backup::server::ServerStore::at(
+                app_root.join("backup-server.json"),
+            ),
+            ..Service::new(
+                deck_core::backup::drive::Credentials::detect(),
+                root.agent_dir(),
+            )
+        });
         let waker = Waker::new(tx.clone());
         let wake = waker.callback();
         let sessions_watch = {
