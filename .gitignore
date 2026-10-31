@@ -5,3 +5,4 @@
 !packaging/**/*.png
 !crates/omp-deck/assets/*.png
 !docs/**/*.png
+!pwa/public/*.png
