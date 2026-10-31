@@ -449,6 +449,17 @@ pub fn omp_reset(ctx: &JobCtx, key: &str) -> Result<Done, GatewayError> {
         .map_err(failed)
 }
 
+pub fn account_policies(
+    ctx: &JobCtx,
+    provider: &str,
+    policies: &[deck_core::usage::AccountPolicy],
+) -> Result<Done, GatewayError> {
+    ctx.omp()?
+        .set_account_policies(provider, policies)
+        .map(Done::Setting)
+        .map_err(failed)
+}
+
 /// The definition directories (file reads), omp's agent settings (`omp config get`) and its
 /// built-in agents (`omp agents unpack`), side by side.
 fn agent_catalog(ctx: &JobCtx, projects: &[PathBuf]) -> agent_defs::Catalog {

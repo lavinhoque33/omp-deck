@@ -472,10 +472,11 @@ pub enum TopicValue {
         revision: u64,
         items: Vec<TranscriptItem>,
     },
+    /// Boxed: the snapshot carries the agents, the context breakdown and the session's accounts.
     Live {
         target: Option<SessionTarget>,
         connected: bool,
-        snapshot: Option<LiveSnapshot>,
+        snapshot: Option<Box<LiveSnapshot>>,
     },
     OmpUpdate(OmpUpdateView),
 }
@@ -875,6 +876,12 @@ pub enum Mutation {
     OmpReset {
         key: String,
     },
+    /// Replace `provider`'s entries of omp's `auth.accountPolicies` with `policies` (empty: back to
+    /// omp's automatic order); other providers' entries are kept as they are.
+    AccountPolicies {
+        provider: String,
+        policies: Vec<deck_core::usage::AccountPolicy>,
+    },
     /// Edit one agent definition file if it still has `revision` (see `agent_defs::save`).
     AgentEdit {
         path: PathBuf,
@@ -993,6 +1000,7 @@ impl Mutation {
             Mutation::SwitchBranch { .. } => "git-switch",
             Mutation::OmpSet { .. } => "omp-set",
             Mutation::OmpReset { .. } => "omp-reset",
+            Mutation::AccountPolicies { .. } => "account-policies",
             Mutation::AgentEdit { .. } => "agent-edit",
             Mutation::AgentCreate { .. } => "agent-create",
             Mutation::AgentCustomize { .. } => "agent-customize",

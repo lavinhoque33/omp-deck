@@ -768,6 +768,17 @@ impl Engine {
                     move |ctx, _, _| jobs::omp_reset(ctx, &setting),
                 );
             }
+            Mutation::AccountPolicies { provider, policies } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "account-policies",
+                    false,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| jobs::account_policies(ctx, &provider, &policies),
+                );
+            }
             Mutation::AgentEdit {
                 path,
                 revision,

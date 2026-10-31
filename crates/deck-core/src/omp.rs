@@ -1103,25 +1103,42 @@ impl Omp {
     /// Returns the saved value (secrets: `Value::Null`; their stdout is never returned or logged).
     pub fn set_setting(&self, setting: &Setting, value: &Value) -> Result<Value, OmpError> {
         let encoded = encode_value(&setting.kind, value)?;
-        if setting.key.is_empty() || setting.key.starts_with('-') {
-            return Err(failed(format!("Invalid setting key: {}", setting.key)));
+        self.set_encoded(&setting.key, &encoded, setting.secret)
+    }
+
+    fn set_encoded(&self, key: &str, encoded: &str, secret: bool) -> Result<Value, OmpError> {
+        if key.is_empty() || key.starts_with('-') {
+            return Err(failed(format!("Invalid setting key: {key}")));
         }
-        if setting.secret {
-            log::debug!("omp config set {} (secret, value not logged)", setting.key);
+        if secret {
+            log::debug!("omp config set {key} (secret, value not logged)");
         } else {
-            log::debug!("omp config set {} = {encoded}", setting.key);
+            log::debug!("omp config set {key} = {encoded}");
         }
         let out = self.run(
-            &["config", "set", &setting.key, "--json", "--", &encoded],
-            setting.secret.then_some(encoded.as_str()),
+            &["config", "set", key, "--json", "--", encoded],
+            secret.then_some(encoded),
         )?;
-        if setting.secret {
+        if secret {
             return Ok(Value::Null);
         }
         match serde_json::from_str::<Value>(out.stdout.trim()) {
             Ok(Value::Object(m)) => Ok(m.get("value").cloned().unwrap_or(Value::Null)),
             _ => Err(OmpError::Parse(out.stdout.trim().to_string())),
         }
+    }
+
+    /// Replaces `provider`'s entries of `auth.accountPolicies` with `policies`, keeping every
+    /// other entry as omp has it (read, merged and written back). Returns the saved array.
+    pub fn set_account_policies(
+        &self,
+        provider: &str,
+        policies: &[crate::usage::AccountPolicy],
+    ) -> Result<Value, OmpError> {
+        const KEY: &str = "auth.accountPolicies";
+        let current = self.get_setting(KEY)?;
+        let next = crate::usage::replace_account_policies(&current, provider, policies);
+        self.set_encoded(KEY, &next.to_string(), false)
     }
 
     /// `omp config reset <key> --json`.

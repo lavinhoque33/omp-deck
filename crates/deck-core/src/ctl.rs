@@ -234,6 +234,31 @@ pub struct LiveSnapshot {
     pub context: Option<ContextBreakdown>,
     /// The main session's in-memory model state; `None` from older extensions or on any failure.
     pub model: Option<LiveModel>,
+    /// The OAuth account the main session uses for its current model's provider (omp's
+    /// `authStorage.oauth.identity`); `None` from older extensions, for api-key providers, or on
+    /// any failure.
+    pub account: Option<LiveAccount>,
+}
+
+/// An omp session's OAuth account for one provider, and the provider's stored accounts it can be
+/// pinned to.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LiveAccount {
+    /// omp's provider id (`anthropic`).
+    pub provider: String,
+    pub identity: crate::usage::OAuthIdentity,
+    /// Chosen with `/session pin` (or [`CtlCommand::PinAccount`]): omp no longer re-ranks it.
+    pub pinned: bool,
+    /// The provider's stored OAuth accounts (`authStorage.oauth.accounts`), in omp's order.
+    pub credentials: Vec<LiveCredential>,
+}
+
+/// One stored OAuth account of a provider.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LiveCredential {
+    /// omp's credential id: what [`CtlCommand::PinAccount`] names.
+    pub id: String,
+    pub identity: crate::usage::OAuthIdentity,
 }
 
 /// What the main session runs right now. Unlike the session file (written from the first message
@@ -304,6 +329,14 @@ pub enum CtlCommand {
         root: PathBuf,
         entry_id: String,
     },
+    /// Pin the main session to the stored OAuth account `credential` of `provider`, the provider
+    /// of its current model (`None`: unpin, omp picks again). Refused while streaming, and when
+    /// `root` (if given) or the model's provider no longer match.
+    PinAccount {
+        root: Option<PathBuf>,
+        provider: String,
+        credential: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -354,6 +387,40 @@ struct WireSnapshot {
     context: Option<Lenient<WireContext>>,
     #[serde(default)]
     model: Option<Lenient<WireModel>>,
+    #[serde(default)]
+    account: Option<Lenient<WireAccount>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireAccount {
+    provider: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    org_id: Option<String>,
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    credentials: Vec<Lenient<WireCredential>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireCredential {
+    credential_id: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    org_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -521,6 +588,47 @@ impl From<WireSnapshot> for LiveSnapshot {
                     None
                 }
             },
+            account: match w.account {
+                Some(Lenient::Ok(a)) => {
+                    let identity = crate::usage::OAuthIdentity::new(
+                        a.email.as_deref(),
+                        a.account_id.as_deref(),
+                        a.project_id.as_deref(),
+                        a.org_id.as_deref(),
+                    );
+                    identity
+                        .filter(|_| !a.provider.is_empty())
+                        .map(|identity| LiveAccount {
+                            provider: a.provider,
+                            identity,
+                            pinned: a.pinned,
+                            credentials: a
+                                .credentials
+                                .into_iter()
+                                .filter_map(|c| match c {
+                                    Lenient::Ok(c) if !c.credential_id.is_empty() => {
+                                        let identity = crate::usage::OAuthIdentity::new(
+                                            c.email.as_deref(),
+                                            c.account_id.as_deref(),
+                                            c.project_id.as_deref(),
+                                            c.org_id.as_deref(),
+                                        )?;
+                                        Some(LiveCredential {
+                                            id: c.credential_id,
+                                            identity,
+                                        })
+                                    }
+                                    _ => None,
+                                })
+                                .collect(),
+                        })
+                }
+                None => None,
+                Some(Lenient::Bad(_)) => {
+                    log::debug!("ctl: ignored malformed account");
+                    None
+                }
+            },
         }
     }
 }
@@ -541,6 +649,13 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
         }
         CtlCommand::Navigate { root, entry_id } => {
             serde_json::json!({"rid": rid, "t": "navigate", "entryId": entry_id, "root": root})
+        }
+        CtlCommand::PinAccount {
+            root,
+            provider,
+            credential,
+        } => {
+            serde_json::json!({"rid": rid, "t": "pin_account", "root": root, "provider": provider, "credentialId": credential})
         }
     };
     let mut line = v.to_string().into_bytes();

@@ -110,6 +110,21 @@ pub struct UsageReport {
     pub notes: Vec<String>,
     #[serde(default, deserialize_with = "tolerant")]
     pub metadata: UsageMetadata,
+    #[serde(default, deserialize_with = "tolerant")]
+    pub policy: Option<UsagePolicy>,
+}
+
+impl UsageReport {
+    /// The account the report belongs to, by its metadata.
+    pub fn account(&self) -> Option<OAuthIdentity> {
+        let m = &self.metadata;
+        OAuthIdentity::new(
+            m.email.as_deref(),
+            m.account_id.as_deref(),
+            m.project_id.as_deref(),
+            m.org_id.as_deref(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
@@ -127,9 +142,257 @@ pub struct UsageMetadata {
     pub tier: Option<String>,
     #[serde(default, deserialize_with = "tolerant")]
     pub project_id: Option<String>,
+    #[serde(default, deserialize_with = "tolerant")]
+    pub org_id: Option<String>,
     /// omp's `metadata.daybreak` flag (Codex accounts on the daybreak program).
     #[serde(default, deserialize_with = "tolerant")]
     pub daybreak: bool,
+}
+
+impl UsageMetadata {
+    /// Who the report belongs to: `email`, else `orgName`, else `accountId` (first non-empty).
+    pub fn identity(&self) -> Option<&str> {
+        [&self.email, &self.org_name, &self.account_id]
+            .into_iter()
+            .filter_map(|o| o.as_deref())
+            .find(|s| !s.is_empty())
+    }
+}
+
+/// The identity fields of a stored OAuth account: what omp's session identity
+/// (`authStorage.oauth.identity`) reports and what an `auth.accountPolicies[].account` matches
+/// (every given field equal, exact strings).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+}
+
+impl OAuthIdentity {
+    /// Empty strings dropped; `None` when no field is left.
+    pub fn new(
+        email: Option<&str>,
+        account_id: Option<&str>,
+        project_id: Option<&str>,
+        org_id: Option<&str>,
+    ) -> Option<OAuthIdentity> {
+        let keep = |s: Option<&str>| s.filter(|s| !s.trim().is_empty()).map(str::to_owned);
+        let id = OAuthIdentity {
+            email: keep(email),
+            account_id: keep(account_id),
+            project_id: keep(project_id),
+            org_id: keep(org_id),
+        };
+        (id != OAuthIdentity::default()).then_some(id)
+    }
+
+    /// Both name the same account (case-insensitive): two emails decide (with the org ids, when
+    /// both have one), else the account ids, else the project ids.
+    pub fn same_account(&self, other: &OAuthIdentity) -> bool {
+        let both =
+            |a: &Option<String>, b: &Option<String>| match (norm(a.as_deref()), norm(b.as_deref()))
+            {
+                (Some(a), Some(b)) => Some(a == b),
+                _ => None,
+            };
+        if let Some(same) = both(&self.email, &other.email) {
+            return same && both(&self.org_id, &other.org_id) != Some(false);
+        }
+        both(&self.account_id, &other.account_id)
+            .or_else(|| both(&self.project_id, &other.project_id))
+            .unwrap_or(false)
+    }
+
+    /// omp's `auth.accountPolicies` matcher: every field this key gives equals `account`'s.
+    fn selects(&self, account: &OAuthIdentity) -> bool {
+        let eq = |k: &Option<String>, a: &Option<String>| k.is_none() || k == a;
+        eq(&self.email, &account.email)
+            && eq(&self.account_id, &account.account_id)
+            && eq(&self.project_id, &account.project_id)
+            && eq(&self.org_id, &account.org_id)
+    }
+}
+
+/// The fewest identity fields of `target` that select it and no other of `accounts` (a provider's
+/// stored accounts, `target` among them): what an `auth.accountPolicies[].account` should say.
+/// omp refuses a policy that matches several accounts, so `None` when no key is unique.
+pub fn policy_key(target: &OAuthIdentity, accounts: &[OAuthIdentity]) -> Option<OAuthIdentity> {
+    let OAuthIdentity {
+        email,
+        account_id,
+        project_id,
+        org_id,
+    } = target;
+    let key = |e: bool, a: bool, p: bool, o: bool| OAuthIdentity {
+        email: email.clone().filter(|_| e),
+        account_id: account_id.clone().filter(|_| a),
+        project_id: project_id.clone().filter(|_| p),
+        org_id: org_id.clone().filter(|_| o),
+    };
+    [
+        key(true, false, false, false),
+        key(true, false, false, true),
+        key(false, true, false, false),
+        key(true, true, false, false),
+        key(false, false, true, false),
+        key(true, false, true, false),
+        key(true, true, true, true),
+    ]
+    .into_iter()
+    .filter(|k| k.email.is_some() || k.account_id.is_some() || k.project_id.is_some())
+    .find(|k| accounts.iter().filter(|a| k.selects(a)).count() == 1 && k.selects(target))
+}
+
+/// One entry of omp's `auth.accountPolicies` (config.yml), as OmpDeck writes it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountPolicy {
+    pub provider: String,
+    pub account: OAuthIdentity,
+    /// Higher goes first among accounts outside their reserve and under 85 % of the 5 h window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    /// Remaining % at which the account steps behind the others (`None`: `retry.usageReservePct`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_pct: Option<u32>,
+    /// Remaining % at which a session moves back to this (higher-priority) account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaim_above_pct: Option<u32>,
+}
+
+/// `current` (omp's `auth.accountPolicies` value, other entries kept verbatim) with every entry of
+/// `provider` replaced by `policies`, appended at the end. A non-array value counts as empty.
+pub fn replace_account_policies(
+    current: &serde_json::Value,
+    provider: &str,
+    policies: &[AccountPolicy],
+) -> serde_json::Value {
+    let mine = |v: &serde_json::Value| v.get("provider").and_then(|p| p.as_str()) == Some(provider);
+    let kept = current
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| !mine(v))
+        .cloned();
+    let new = policies
+        .iter()
+        .filter(|p| p.provider == provider)
+        .filter_map(|p| serde_json::to_value(p).ok());
+    serde_json::Value::Array(kept.chain(new).collect())
+}
+
+/// How omp routes one account under `auth.accountPolicies` (`policy` of a report or of an account
+/// without usage; present only for providers that have policies).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsagePolicy {
+    #[serde(default, deserialize_with = "tolerant")]
+    pub priority: f64,
+    #[serde(default, deserialize_with = "tolerant")]
+    pub reserve_pct: f64,
+    /// `override` (the account's own `reservePct`) or `global` (`retry.usageReservePct`).
+    #[serde(default, deserialize_with = "tolerant")]
+    pub reserve_source: String,
+    #[serde(default, deserialize_with = "tolerant")]
+    pub reclaim_above_pct: Option<f64>,
+    #[serde(default, deserialize_with = "tolerant")]
+    pub state: PolicyState,
+    #[serde(default, deserialize_with = "tolerant")]
+    pub remaining_pct: Option<f64>,
+}
+
+impl UsagePolicy {
+    /// The account's own reserve; `None` when it follows `retry.usageReservePct`.
+    pub fn own_reserve(&self) -> Option<f64> {
+        (self.reserve_source == "override").then_some(self.reserve_pct)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyState {
+    Eligible,
+    InsideReserve,
+    Exhausted,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// What one report says about whose it is, lowercased, for matching an [`OAuthIdentity`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReportIdentity {
+    email: Option<String>,
+    org_id: Option<String>,
+    /// `metadata.accountId` and every limit's `scope.accountId`.
+    account_ids: Vec<String>,
+    /// `metadata.projectId` and every limit's `scope.projectId`.
+    project_ids: Vec<String>,
+    /// omp matches limit by limit: a report without limits matches nobody.
+    has_limits: bool,
+}
+
+/// Trimmed, lowercased, `None` when empty (omp's identity normalisation).
+fn norm(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+}
+
+impl ReportIdentity {
+    pub fn of(r: &UsageReport) -> ReportIdentity {
+        let m = &r.metadata;
+        let collect = |meta: Option<&str>, scope: fn(&UsageScope) -> Option<&str>| {
+            let mut ids: Vec<String> = Vec::new();
+            let all = std::iter::once(meta).chain(r.limits.iter().map(|l| scope(&l.scope)));
+            for id in all.filter_map(norm) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            ids
+        };
+        ReportIdentity {
+            email: norm(m.email.as_deref()),
+            org_id: norm(m.org_id.as_deref()),
+            account_ids: collect(m.account_id.as_deref(), |s| s.account_id.as_deref()),
+            project_ids: collect(m.project_id.as_deref(), |s| s.project_id.as_deref()),
+            has_limits: !r.limits.is_empty(),
+        }
+    }
+
+    /// Port of omp's `limitMatchesActiveAccount` over the report's limits: org ids must agree
+    /// (an org-only identity then matches); two emails decide alone; else an account id, else a
+    /// project id, must appear on the report or one of its limits.
+    pub fn matches(&self, id: &OAuthIdentity) -> bool {
+        if !self.has_limits {
+            return false;
+        }
+        let account = norm(id.account_id.as_deref());
+        let email = norm(id.email.as_deref());
+        let project = norm(id.project_id.as_deref());
+        let org = norm(id.org_id.as_deref());
+        if org.is_some() || self.org_id.is_some() {
+            if org != self.org_id {
+                return false;
+            }
+            if account.is_none() && email.is_none() && project.is_none() {
+                return true;
+            }
+        }
+        if let (Some(e), Some(mine)) = (&email, &self.email) {
+            return e == mine;
+        }
+        account.is_some_and(|a| self.account_ids.contains(&a))
+            || project.is_some_and(|p| self.project_ids.contains(&p))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
@@ -156,6 +419,8 @@ pub struct UsageLimit {
 pub struct UsageScope {
     #[serde(default, deserialize_with = "tolerant")]
     pub account_id: Option<String>,
+    #[serde(default, deserialize_with = "tolerant")]
+    pub project_id: Option<String>,
     #[serde(default, deserialize_with = "tolerant")]
     pub model_id: Option<String>,
     #[serde(default, deserialize_with = "tolerant")]
@@ -287,6 +552,17 @@ pub struct UnavailableAccount {
     pub email: Option<String>,
     #[serde(default, rename = "accountId", deserialize_with = "tolerant")]
     pub account_id: Option<String>,
+    #[serde(default, rename = "projectId", deserialize_with = "tolerant")]
+    pub project_id: Option<String>,
+    #[serde(default, rename = "orgId", deserialize_with = "tolerant")]
+    pub org_id: Option<String>,
+    #[serde(default, rename = "orgName", deserialize_with = "tolerant")]
+    pub org_name: Option<String>,
+    /// `oauth` or `api_key`.
+    #[serde(default, rename = "type", deserialize_with = "tolerant")]
+    pub kind: Option<String>,
+    #[serde(default, deserialize_with = "tolerant")]
+    pub policy: Option<UsagePolicy>,
     #[serde(
         default,
         alias = "cause",
@@ -304,6 +580,19 @@ impl UnavailableAccount {
             .filter_map(|o| o.as_deref())
             .find(|s| !s.is_empty())
             .unwrap_or("account")
+    }
+
+    /// The OAuth account this entry names; `None` for api keys and nameless entries.
+    pub fn account(&self) -> Option<OAuthIdentity> {
+        if self.kind.as_deref().is_some_and(|k| k != "oauth") {
+            return None;
+        }
+        OAuthIdentity::new(
+            self.email.as_deref(),
+            self.account_id.as_deref(),
+            self.project_id.as_deref(),
+            self.org_id.as_deref(),
+        )
     }
 }
 
@@ -497,6 +786,20 @@ pub struct ProviderCard {
     pub idle: bool,
     pub reset_credits: Option<ResetSummary>,
     pub daybreak_accounts: Vec<String>,
+    /// The same card over each report alone, in omp's order, when the provider has more than one
+    /// report (empty otherwise): [`Self::windows`] averages accounts, these do not.
+    pub per_account: Vec<AccountCard>,
+}
+
+/// One account's own card within a multi-account provider.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AccountCard {
+    /// [`UsageMetadata::identity`], else `account N`; unique within the provider.
+    pub label: String,
+    /// Built from this account's report only; it carries no unavailable accounts.
+    pub card: ProviderCard,
+    /// Whose report it is, to find the account an omp session uses.
+    pub identity: ReportIdentity,
 }
 
 impl ProviderCard {
@@ -857,6 +1160,11 @@ fn build_card(
         && windows
             .iter()
             .all(|w| w.fraction.is_some_and(|f| f < IDLE_FRACTION));
+    let per_account = if reports.len() > 1 {
+        account_cards(provider, reports, now_ms)
+    } else {
+        Vec::new()
+    };
     ProviderCard {
         provider: provider.to_string(),
         name: provider_display_name(provider),
@@ -868,7 +1176,155 @@ fn build_card(
         idle,
         reset_credits,
         daybreak_accounts,
+        per_account,
     }
+}
+
+/// One [`AccountCard`] per report; a repeated identity gets ` (2)`, ` (3)`… so labels stay unique.
+fn account_cards(provider: &str, reports: &[&UsageReport], now_ms: i64) -> Vec<AccountCard> {
+    let mut out: Vec<AccountCard> = Vec::with_capacity(reports.len());
+    for (i, r) in reports.iter().enumerate() {
+        let base = r
+            .metadata
+            .identity()
+            .map_or_else(|| format!("account {}", i + 1), str::to_owned);
+        let mut label = base.clone();
+        let mut n = 1;
+        while out.iter().any(|a| a.label == label) {
+            n += 1;
+            label = format!("{base} ({n})");
+        }
+        let mut card = build_card(provider, std::slice::from_ref(r), &[], 0, now_ms);
+        // Alone, the report is always `account 1`; name it as the page does.
+        for d in &mut card.daybreak_accounts {
+            d.clone_from(&label);
+        }
+        out.push(AccountCard {
+            label,
+            card,
+            identity: ReportIdentity::of(r),
+        });
+    }
+    out
+}
+
+/// One provider's OAuth accounts as `auth.accountPolicies` sees them, highest priority first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyProvider {
+    pub provider: String,
+    pub name: String,
+    pub accounts: Vec<PolicyAccount>,
+    /// omp measures this provider's quotas, so reserve and reclaim apply (omp rejects them
+    /// otherwise).
+    pub usage_capable: bool,
+    /// Some account carries a `policy`: omp has entries for this provider.
+    pub has_policies: bool,
+}
+
+/// One OAuth account of a [`PolicyProvider`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyAccount {
+    /// `email`, else `accountId`; with ` · org` when another account shares it.
+    pub label: String,
+    pub identity: OAuthIdentity,
+    /// What a policy entry names it by (see [`policy_key`]); `None`: no entry can single it out.
+    pub key: Option<OAuthIdentity>,
+    /// This account's own card; `None` for an account without usage.
+    pub card: Option<ProviderCard>,
+    /// Why the account has no usage report.
+    pub reason: Option<String>,
+    pub policy: Option<UsagePolicy>,
+}
+
+/// The OAuth accounts of every provider in `snap` (reports and `accountsWithoutUsage`; disabled
+/// credentials take no part in routing), each provider's ordered by `policy.priority` descending,
+/// snapshot order breaking ties.
+pub fn policy_providers(snap: &UsageSnapshot, now_ms: i64) -> Vec<PolicyProvider> {
+    struct Raw<'a> {
+        provider: &'a str,
+        identity: OAuthIdentity,
+        org_name: Option<&'a str>,
+        report: Option<&'a UsageReport>,
+        reason: Option<&'a str>,
+        policy: Option<&'a UsagePolicy>,
+    }
+    let reports = snap.reports.iter().filter_map(|r| {
+        Some(Raw {
+            provider: &r.provider,
+            identity: r.account()?,
+            org_name: r.metadata.org_name.as_deref(),
+            report: Some(r),
+            reason: None,
+            policy: r.policy.as_ref(),
+        })
+    });
+    let without = snap.accounts_without_usage.iter().filter_map(|u| {
+        Some(Raw {
+            provider: &u.provider,
+            identity: u.account()?,
+            org_name: u.org_name.as_deref(),
+            report: None,
+            reason: Some(
+                u.reason
+                    .as_deref()
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or("usage unavailable"),
+            ),
+            policy: u.policy.as_ref(),
+        })
+    });
+    let mut groups: Vec<(&str, Vec<Raw>)> = Vec::new();
+    for raw in reports.chain(without).filter(|r| !r.provider.is_empty()) {
+        match groups.iter_mut().find(|(p, _)| *p == raw.provider) {
+            Some((_, v)) => v.push(raw),
+            None => groups.push((raw.provider, vec![raw])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(provider, raws)| {
+            let ids: Vec<OAuthIdentity> = raws.iter().map(|r| r.identity.clone()).collect();
+            let base = |id: &OAuthIdentity| {
+                id.email
+                    .clone()
+                    .or_else(|| id.account_id.clone())
+                    .or_else(|| id.project_id.clone())
+                    .unwrap_or_else(|| "account".to_owned())
+            };
+            let mut accounts: Vec<PolicyAccount> = raws
+                .iter()
+                .map(|r| {
+                    let mut label = base(&r.identity);
+                    if ids.iter().filter(|o| base(o) == label).count() > 1
+                        && let Some(org) = r.org_name.or(r.identity.org_id.as_deref())
+                    {
+                        label = format!("{label} · {org}");
+                    }
+                    PolicyAccount {
+                        label,
+                        key: policy_key(&r.identity, &ids),
+                        identity: r.identity.clone(),
+                        card: r.report.map(|rep| {
+                            build_card(provider, std::slice::from_ref(&rep), &[], 0, now_ms)
+                        }),
+                        reason: r.reason.map(str::to_owned),
+                        policy: r.policy.cloned(),
+                    }
+                })
+                .collect();
+            let priority = |a: &PolicyAccount| a.policy.as_ref().map_or(0.0, |p| p.priority);
+            accounts.sort_by(|a, b| priority(b).total_cmp(&priority(a)));
+            PolicyProvider {
+                provider: provider.to_owned(),
+                name: provider_display_name(provider),
+                usage_capable: raws
+                    .iter()
+                    .any(|r| r.report.is_some_and(|r| !r.limits.is_empty())),
+                has_policies: raws.iter().any(|r| r.policy.is_some()),
+                accounts,
+            }
+        })
+        .collect()
 }
 
 fn claude_window_name(id: &str) -> &str {
@@ -984,16 +1440,47 @@ fn summarize_resets(reports: &[&UsageReport], now_ms: i64) -> Option<ResetSummar
     })
 }
 
-/// The window with the highest used fraction over all cards: (provider name, window label, used
-/// fraction, status). Ties keep the first card/window.
-pub fn tightest(cards: &[ProviderCard]) -> Option<(&str, &str, f64, LimitStatus)> {
-    let mut best: Option<(&str, &str, f64, LimitStatus)> = None;
-    for c in cards {
-        for w in &c.windows {
+/// The fullest quota window of [`tightest`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tightest<'a> {
+    /// Provider display name.
+    pub provider: &'a str,
+    /// The [`AccountCard::label`] holding the window; `None` on a single-account provider.
+    pub account: Option<&'a str>,
+    pub window: &'a str,
+    pub used: f64,
+    pub status: LimitStatus,
+}
+
+/// The window with the highest used fraction over all cards, read per account for a
+/// multi-account provider (never the mean). Ties keep the first card/account/window.
+pub fn tightest(cards: &[ProviderCard]) -> Option<Tightest<'_>> {
+    fn consider<'a>(
+        best: &mut Option<Tightest<'a>>,
+        provider: &'a str,
+        account: Option<&'a str>,
+        card: &'a ProviderCard,
+    ) {
+        for w in &card.windows {
             let Some(f) = w.fraction else { continue };
-            if best.is_none_or(|(_, _, b, _)| f > b) {
-                best = Some((&c.name, &w.label, f, w.status));
+            if best.is_none_or(|b| f > b.used) {
+                *best = Some(Tightest {
+                    provider,
+                    account,
+                    window: &w.label,
+                    used: f,
+                    status: w.status,
+                });
             }
+        }
+    }
+    let mut best = None;
+    for c in cards {
+        if c.per_account.is_empty() {
+            consider(&mut best, &c.name, None, c);
+        }
+        for a in &c.per_account {
+            consider(&mut best, &c.name, Some(&a.label), &a.card);
         }
     }
     best
@@ -1663,7 +2150,10 @@ mod tests {
         );
         assert!(c.windows.iter().all(|w| w.window_tag.is_none()));
         let t = tightest(&cards).unwrap();
-        assert_eq!((t.0, t.1, t.2), ("Anthropic", "Claude 7 Day", 0.815));
+        assert_eq!(
+            (t.provider, t.account, t.window, t.used),
+            ("Anthropic", None, "Claude 7 Day", 0.815)
+        );
     }
 
     #[test]
@@ -1738,6 +2228,287 @@ mod tests {
             c.windows[0].resets_in_ms,
             Some(3_600_000),
             "reset of the fullest account"
+        );
+    }
+
+    #[test]
+    fn multi_account_provider_keeps_each_account_on_its_own_card() {
+        let account = |email: Option<&str>, used: f64, resets_in: i64| {
+            let mut r = report(
+                "anthropic",
+                vec![limit(
+                    "Claude 7 Day",
+                    "7d",
+                    used,
+                    LimitStatus::Ok,
+                    Some(NOW + resets_in),
+                )],
+            );
+            r.metadata.email = email.map(Into::into);
+            r
+        };
+        let mut s = snap(vec![
+            account(Some("a@x.test"), 0.8, 3_600_000),
+            account(Some("a@x.test"), 0.95, 1_800_000),
+            account(None, 0.1, 7_200_000),
+        ]);
+        s.accounts_without_usage.push(UnavailableAccount {
+            provider: "anthropic".into(),
+            label: Some("old@x.test".into()),
+            ..UnavailableAccount::default()
+        });
+        let c = &provider_cards(&s, NOW)[0];
+        let pages: Vec<(&str, Option<f64>, Option<i64>, LimitStatus)> = c
+            .per_account
+            .iter()
+            .map(|a| {
+                let w = &a.card.windows[0];
+                (a.label.as_str(), w.fraction, w.resets_in_ms, w.status)
+            })
+            .collect();
+        assert_eq!(
+            pages,
+            [
+                ("a@x.test", Some(0.8), Some(3_600_000), LimitStatus::Ok),
+                ("a@x.test (2)", Some(0.95), Some(1_800_000), LimitStatus::Ok),
+                ("account 3", Some(0.1), Some(7_200_000), LimitStatus::Ok),
+            ],
+            "each account's own fraction and reset, never the mean"
+        );
+        assert!(
+            c.per_account
+                .iter()
+                .all(|a| a.card.accounts == 1 && a.card.unavailable_accounts.is_empty()),
+            "unavailable accounts stay on the provider card"
+        );
+        assert_eq!(c.unavailable_accounts, ["old@x.test"]);
+        let t = tightest(std::slice::from_ref(c)).unwrap();
+        assert_eq!(
+            (t.account, t.used),
+            (Some("a@x.test (2)"), 0.95),
+            "the fullest account, not the mean"
+        );
+
+        let single = &provider_cards(&snap(vec![account(Some("a@x.test"), 0.5, 1)]), NOW)[0];
+        assert!(single.per_account.is_empty());
+    }
+
+    #[test]
+    fn policy_key_is_the_smallest_unique_identity() {
+        let id = |e: Option<&str>, a: Option<&str>, o: Option<&str>| {
+            OAuthIdentity::new(e, a, None, o).unwrap()
+        };
+        let work = id(Some("me@x.test"), Some("acc-1"), Some("org-work"));
+        let home = id(Some("me@x.test"), Some("acc-2"), Some("org-home"));
+        let other = id(Some("you@x.test"), None, None);
+        let all = [work.clone(), home.clone(), other.clone()];
+        assert_eq!(
+            policy_key(&other, &all),
+            Some(id(Some("you@x.test"), None, None))
+        );
+        assert_eq!(
+            policy_key(&work, &all),
+            Some(id(Some("me@x.test"), None, Some("org-work"))),
+            "a shared email takes the org along"
+        );
+        let twins = [
+            id(Some("me@x.test"), None, None),
+            id(Some("me@x.test"), None, None),
+        ];
+        assert_eq!(
+            policy_key(&twins[0], &twins),
+            None,
+            "nothing tells them apart"
+        );
+        let nameless = OAuthIdentity::new(None, Some("acc-9"), None, None).unwrap();
+        assert_eq!(
+            policy_key(&nameless, std::slice::from_ref(&nameless)),
+            Some(nameless.clone())
+        );
+    }
+
+    #[test]
+    fn replacing_a_providers_policies_keeps_every_other_entry_verbatim() {
+        let current = serde_json::json!([
+            {"provider": "anthropic", "account": {"email": "old@x.test"}, "priority": 3},
+            {"provider": "openai-codex", "account": {"email": "c@x.test"}, "reservePct": 20, "custom": true},
+            "garbage",
+        ]);
+        let new = AccountPolicy {
+            provider: "anthropic".into(),
+            account: OAuthIdentity::new(Some("a@x.test"), None, None, None).unwrap(),
+            priority: Some(2),
+            reserve_pct: None,
+            reclaim_above_pct: Some(60),
+        };
+        assert_eq!(
+            replace_account_policies(&current, "anthropic", &[new]),
+            serde_json::json!([
+                {"provider": "openai-codex", "account": {"email": "c@x.test"}, "reservePct": 20, "custom": true},
+                "garbage",
+                {"provider": "anthropic", "account": {"email": "a@x.test"}, "priority": 2, "reclaimAbovePct": 60},
+            ])
+        );
+        assert_eq!(
+            replace_account_policies(&serde_json::Value::Null, "anthropic", &[]),
+            serde_json::json!([]),
+            "unset, then reset to automatic"
+        );
+    }
+
+    #[test]
+    fn policy_objects_and_credential_identities_parse() {
+        let s = UsageSnapshot::parse(
+            r#"{"reports":[{"provider":"anthropic","metadata":{"email":"a@x.test","orgId":"o1"},
+                 "policy":{"priority":10,"reservePct":15,"reserveSource":"override","reclaimAbovePct":60,
+                           "state":"inside-reserve","remainingPct":12.5},"limits":[]}],
+               "accountsWithoutUsage":[{"provider":"anthropic","type":"oauth","email":"b@x.test","orgId":"o2",
+                 "policy":{"priority":0,"reservePct":10,"reserveSource":"global","state":"wat"}},
+                 {"provider":"anthropic","type":"api_key","label":"key"}]}"#,
+        )
+        .unwrap();
+        let p = s.reports[0].policy.as_ref().unwrap();
+        assert_eq!(
+            (
+                p.priority,
+                p.own_reserve(),
+                p.reclaim_above_pct,
+                p.state,
+                p.remaining_pct
+            ),
+            (
+                10.0,
+                Some(15.0),
+                Some(60.0),
+                PolicyState::InsideReserve,
+                Some(12.5)
+            )
+        );
+        let b = &s.accounts_without_usage[0];
+        assert_eq!(
+            b.policy.as_ref().map(|p| (p.own_reserve(), p.state)),
+            Some((None, PolicyState::Unknown))
+        );
+        assert_eq!(
+            b.account(),
+            OAuthIdentity::new(Some("b@x.test"), None, None, Some("o2"))
+        );
+        assert_eq!(
+            s.accounts_without_usage[1].account(),
+            None,
+            "an api key is no OAuth account"
+        );
+        assert_eq!(
+            s.reports[0].account().unwrap().org_id.as_deref(),
+            Some("o1")
+        );
+    }
+
+    #[test]
+    fn policy_providers_group_oauth_accounts_by_priority() {
+        let s = UsageSnapshot::parse(
+            r#"{"reports":[
+                {"provider":"anthropic","metadata":{"email":"me@x.test","orgId":"o-w","orgName":"Work"},
+                 "limits":[{"id":"5h","amount":{"usedFraction":0.5}}],"policy":{"priority":1,"state":"eligible"}},
+                {"provider":"anthropic","metadata":{"email":"me@x.test","orgId":"o-h"},
+                 "limits":[{"id":"5h","amount":{"usedFraction":0.1}}],"policy":{"priority":5,"state":"eligible"}},
+                {"provider":"openai","metadata":{},"limits":[]}],
+               "accountsWithoutUsage":[
+                {"provider":"anthropic","type":"oauth","email":"third@x.test","reason":"backoff"},
+                {"provider":"zai","type":"api_key","label":"key"}],
+               "disabledCredentials":[{"provider":"anthropic","type":"oauth","email":"gone@x.test"}]}"#,
+        )
+        .unwrap();
+        let groups = policy_providers(&s, NOW);
+        assert_eq!(
+            groups.len(),
+            1,
+            "api keys and nameless reports are no OAuth accounts"
+        );
+        let g = &groups[0];
+        assert!(g.usage_capable && g.has_policies);
+        let rows: Vec<(&str, Option<&str>, bool)> = g
+            .accounts
+            .iter()
+            .map(|a| (a.label.as_str(), a.reason.as_deref(), a.card.is_some()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("me@x.test · o-h", None, true),
+                ("me@x.test · Work", None, true),
+                ("third@x.test", Some("backoff"), false),
+            ],
+            "priority first, a shared email shows its org, disabled credentials stay out"
+        );
+        assert_eq!(
+            g.accounts[0].key,
+            OAuthIdentity::new(Some("me@x.test"), None, None, Some("o-h"))
+        );
+    }
+
+    #[test]
+    fn report_identity_matches_like_omps_active_account_check() {
+        let parse = |meta: &str, scope: &str| {
+            let s = UsageSnapshot::parse(&format!(
+                r#"{{"reports":[{{"provider":"p","metadata":{meta},
+                   "limits":[{{"label":"L","scope":{scope},"amount":{{"usedFraction":0.1}}}}]}}]}}"#
+            ))
+            .unwrap();
+            ReportIdentity::of(&s.reports[0])
+        };
+        let id = |email: Option<&str>, account: Option<&str>, org: Option<&str>| OAuthIdentity {
+            email: email.map(Into::into),
+            account_id: account.map(Into::into),
+            org_id: org.map(Into::into),
+            ..OAuthIdentity::default()
+        };
+        let work = parse(r#"{"email":" Work@X.test ","accountId":"acc-1"}"#, "{}");
+        assert!(
+            work.matches(&id(Some("work@x.test"), None, None)),
+            "case and blanks"
+        );
+        assert!(
+            !work.matches(&id(Some("other@x.test"), Some("acc-1"), None)),
+            "two emails decide alone"
+        );
+        assert!(work.matches(&id(None, Some("ACC-1"), None)));
+        assert!(
+            !work.matches(&id(None, None, None)),
+            "an empty identity matches nothing"
+        );
+
+        let scoped = parse("{}", r#"{"accountId":"acc-2","projectId":"proj"}"#);
+        assert!(
+            scoped.matches(&id(None, Some("acc-2"), None)),
+            "a limit's scope id"
+        );
+        assert!(scoped.matches(&OAuthIdentity {
+            project_id: Some("proj".into()),
+            ..OAuthIdentity::default()
+        }));
+
+        let org = parse(r#"{"email":"a@x.test","orgId":"org-1"}"#, "{}");
+        assert!(
+            org.matches(&id(None, None, Some("org-1"))),
+            "an org-only identity"
+        );
+        assert!(
+            !org.matches(&id(Some("a@x.test"), None, Some("org-2"))),
+            "orgs disagree"
+        );
+        assert!(
+            !org.matches(&id(Some("a@x.test"), None, None)),
+            "the report names an org the identity lacks"
+        );
+
+        let s = UsageSnapshot::parse(
+            r#"{"reports":[{"provider":"p","metadata":{"email":"a@x.test"},"limits":[]}]}"#,
+        )
+        .unwrap();
+        assert!(
+            !ReportIdentity::of(&s.reports[0]).matches(&id(Some("a@x.test"), None, None)),
+            "no limits, no match"
         );
     }
 

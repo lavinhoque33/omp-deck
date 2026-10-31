@@ -62,7 +62,7 @@ impl App {
                         connected: true,
                         snapshot: Some(snap),
                         ..
-                    }) => Some(Arc::new(snap)),
+                    }) => Some(Arc::from(snap)),
                     _ => None,
                 };
             }

@@ -8,7 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use deck_core::ctl::{CtlClient, CtlCommand, CtlReply, LiveModel, LiveSnapshot, LiveStatus};
+use deck_core::ctl::{
+    CtlClient, CtlCommand, CtlReply, LiveAccount, LiveCredential, LiveModel, LiveSnapshot,
+    LiveStatus,
+};
+use deck_core::usage::OAuthIdentity;
 
 const HELLO: &str = r#"{"t":"hello","v":1,"pid":4242}"#;
 
@@ -547,4 +551,83 @@ fn main_model_state_is_parsed_and_absent_or_malformed_is_none() {
     wait_for("model again", || model().is_some());
     say(&mut s, &snapshot_line(9, ""));
     wait_for("older extension", || model().is_none());
+}
+
+#[test]
+fn session_account_is_parsed_and_absent_empty_or_malformed_is_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = fake(tmp.path());
+    let client = CtlClient::spawn(tmp.path().to_path_buf(), || {});
+    let mut s = srv.accept();
+    say(&mut s, HELLO);
+    let with = |a: &str| {
+        let a = a.replace('\n', "");
+        format!(r#"{{"t":"agents","pid":9,"agents":[],"account":{a}}}"#)
+    };
+    let account = || client.latest().and_then(|s| s.account.clone());
+
+    say(
+        &mut s,
+        &with(
+            r#"{"provider":"anthropic","email":"me@x.test","accountId":null,"orgId":"org-1","pinned":true,
+                "credentials":[{"credentialId":"c1","email":"me@x.test","orgId":"org-1"},
+                               {"credentialId":"","email":"ghost@x.test"},{"email":"no-id@x.test"},
+                               {"credentialId":"c2","accountId":"acc-2"}]}"#,
+        ),
+    );
+    wait_for("account", || account().is_some());
+    let me = OAuthIdentity {
+        email: Some("me@x.test".into()),
+        org_id: Some("org-1".into()),
+        ..OAuthIdentity::default()
+    };
+    assert_eq!(
+        account(),
+        Some(LiveAccount {
+            provider: "anthropic".into(),
+            identity: me.clone(),
+            pinned: true,
+            credentials: vec![
+                LiveCredential {
+                    id: "c1".into(),
+                    identity: me
+                },
+                LiveCredential {
+                    id: "c2".into(),
+                    identity: OAuthIdentity {
+                        account_id: Some("acc-2".into()),
+                        ..OAuthIdentity::default()
+                    },
+                },
+            ],
+        }),
+        "credentials without an id are skipped"
+    );
+
+    // An identity naming nobody, a missing provider, a wrong type → none; the snapshot survives.
+    say(&mut s, &with(r#"{"provider":"anthropic","email":" "}"#));
+    wait_for("blank identity", || {
+        client.latest().is_some_and(|s| s.account.is_none())
+    });
+    say(&mut s, &with(r#"{"provider":"p","projectId":"proj"}"#));
+    wait_for("project only", || {
+        account().is_some_and(|a| a.identity.project_id.as_deref() == Some("proj"))
+    });
+    say(&mut s, &with(r#"{"email":"me@x.test"}"#));
+    wait_for("no provider", || account().is_none());
+    assert_eq!(client.latest().unwrap().pid, 9);
+    say(&mut s, &with(r#"{"provider":"p","accountId":"a"}"#));
+    wait_for("account again", || account().is_some());
+    say(&mut s, &with(r#"{"provider":"p","email":7}"#));
+    wait_for("wrong type", || account().is_none());
+
+    // null (api-key provider) and an older extension without the field
+    say(&mut s, &with(r#"{"provider":"p","accountId":"a"}"#));
+    wait_for("account again", || account().is_some());
+    say(&mut s, &with("null"));
+    wait_for("null account", || account().is_none());
+    say(&mut s, &with(r#"{"provider":"p","accountId":"a"}"#));
+    wait_for("account again", || account().is_some());
+    say(&mut s, &snapshot_line(9, ""));
+    wait_for("no field", || account().is_none());
 }

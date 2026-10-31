@@ -94,6 +94,8 @@ impl App {
             self.bar_view.set_live_model(live_model);
             self.bar_view
                 .set_context(live.as_deref().and_then(|l| l.context.as_ref()));
+            self.bar_view
+                .set_account(live.as_deref().and_then(|l| l.account.as_ref()));
             self.bar_view.set_usage(self.usage.summary());
             self.bar_view.update(snap.as_ref(), &tab.cwd, &self.models);
             if tab.copy.is_none() {

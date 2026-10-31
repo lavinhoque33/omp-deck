@@ -986,7 +986,8 @@ tuned for contrast on white (zinc/tailwind-600 family). OSC 10/11/4 replies foll
 - Icons: lucide icon font (ISC; license shipped) replaces Material Symbols everywhere (both styles);
   `egui_material_icons` dependency removed.
 - Density Compact: tighter sidebar rows/headers, tab row, title row, menus, tree/picker rows, paddings.
-  The status bar keeps its user-tuned size (41 px bar, model chip 1.3 × max(path, 213 px)).
+  The status bar keeps its user-tuned size (41 px bar, model chip 1.3 × 213 px in every session, at most 52 % of
+  the bar; it does not follow the path chip, so a long worktree path cannot push usage out).
 - Settings → Appearance: Theme (Dark/Light), Style (Neutral/Midnight neon), Density (Compact/Comfortable);
   live switch, persisted.
 - Sidebar expansion: open(group) = filtering || override(group) ?? (group == active tab's project group).
@@ -1023,7 +1024,16 @@ shape, stats.db schema, extension imports, timings).
     effective status (explicit, else used ≥1 exhausted / ≥0.9 warning / ok), `idle` when every window
     < 0.5 % used and no credits/notes, sort active by max fraction desc then name, display names
     (`anthropic` → `Anthropic`, `openai-codex` → `Codex`, …), accounts count + unavailable account labels,
-    reset-credit summary text. `tightest(&[ProviderCard]) -> Option<(provider name, window label, used_fraction, status)>`.
+    reset-credit summary text. A provider with several reports also carries `per_account:
+    Vec<AccountCard { label, card: ProviderCard, identity: ReportIdentity }>` — the same card built from each
+    report alone (label = `email` / `orgName` / `accountId`, else `account N`, made unique); the Usage view pages
+    through these instead of showing the mean. `tightest(&[ProviderCard]) -> Option<Tightest { provider, account,
+    window, used, status }>` reads windows per account for such providers (`account` = the page label, else `None`).
+  - `ReportIdentity::of(&UsageReport)` (lowercased `metadata.email`/`orgId`, account/project ids from metadata and
+    every limit's `scope`) `.matches(&OAuthIdentity { email, account_id, project_id, org_id })`: port of omp's
+    `limitMatchesActiveAccount` — org ids must agree (an org-only identity then matches), two emails decide alone,
+    else an account id, else a project id, must appear; a report without limits matches nobody.
+    `UsageMetadata.org_id` and `UsageScope.project_id` parsed for it.
   - `stats_db_path() -> PathBuf` (`~/$PI_CONFIG_DIR/stats.db`, `PI_CONFIG_DIR` default `.omp`).
   - `activity(db, days) -> Result<Activity, UsageError>`: read-only open (`SQLITE_OPEN_READ_ONLY`, WAL
     tolerated, busy timeout); per local day `cost, requests, tokens` (omp's query) and per model
@@ -1040,6 +1050,18 @@ shape, stats.db schema, extension imports, timings).
   {snapcompactSavings:true})` (+ per-tool schema tokens) on `session_start`, `session_switch`,
   `agent_end`, `turn_end`, model change, and caches it; snapshots carry the cached value (no model blob).
   Any failure → field omitted.
+- `deck_core::ctl`: `LiveSnapshot.account: Option<LiveAccount { provider, identity: OAuthIdentity, pinned: bool,
+  credentials: Vec<LiveCredential { id, identity }> }>` — the OAuth account the main session uses for its current
+  model's provider. Extension: `mainAccount()` =
+  `session.modelRegistry.authStorage.oauth.identity(model.provider, session.sessionId)` (what omp's own status line
+  shows: the session's sticky credential once a request went out, before that omp's default pick); `pinned` =
+  `authStorage.sessions.get(provider, sessionId)` is an explicit oauth record (`/session pin`); `credentials` =
+  `authStorage.oauth.accounts(provider, sessionId)` (omp's numeric `credentialId` sent as a string). Wire
+  `account: {provider, email, accountId, projectId, orgId, pinned, credentials: [{credentialId, email, accountId,
+  projectId, orgId}]} | null`. Null for api-key providers; an identity naming nobody, a missing provider or a
+  malformed value → `None`; credentials without an id or identity are skipped. Additive, no protocol bump. The
+  extension pushes a snapshot every second while a client is connected, so a `/session pin` typed in the terminal
+  shows within ~1 s.
 
 ### omp-deck
 
@@ -1048,13 +1070,18 @@ shape, stats.db schema, extension imports, timings).
   `activity` when the view opens (≥ 10 min apart). UI thread never blocks.
 - Status bar **usage chip** (gauge icon + tightest `NN% left`, coloured by status; dropped first when
   narrow; hidden when there are no reports). Hover: compact per-provider cards (bars = remaining,
-  `resets in …`). Click, ⋯ menu "Usage…", app menu, Ctrl+Shift+U → **Usage view**.
+  `resets in …`). Click, ⋯ menu "Usage…", app menu, Ctrl+Shift+U → **Usage view**. A multi-account provider shows
+  one account in the chip and in the hover, both from `usage_view::shown_page`: the page whose report matches the
+  focused tab's `LiveSnapshot.account` (`CardView::in_use`, same provider only; labelled `email · in use`, or
+  `email · pinned` when the session is pinned), else the page last picked in the Usage view's pager (labelled
+  `email · i / N`), else the first.
+  `BarView::set_account` bumps `rev`; the segment-width cache also keys on the shown page.
 - **Usage view** (modal like the session tree): header "Usage" + "Updated Xs ago" + refresh;
   tabs **Overview** (stats strip: Tightest quota, Past year, Last 30 days + sparkline, Busiest day;
   provider cards with remaining bars, `NN% left`, `resets in`, resets banked, unavailable accounts,
   "untouched: …" footnote; activity heatmap 53×7 with month labels + "N active days · longest streak M
-  days") and **Details** (per provider table Limit | Account | Left | Resets; top models last 30 days).
-  Empty states: no accounts (hint `omp /login`), fetch error inline with Retry, omp missing.
+  days"), **Details** (per provider table Limit | Account | Left | Resets; top models last 30 days) and
+  **Accounts** (see below). Empty states: no accounts (hint `omp /login`), fetch error inline with Retry, omp missing.
 - **Context tooltip**: rich hover on the status-bar context chip: model + window header,
   `used / window (pct)` (+ "estimated" when not anchored), stacked category meter with the
   auto-compact threshold mark, legend rows (swatch, label, tokens, % of window) for categories, free
@@ -1062,6 +1089,63 @@ shape, stats.db schema, extension imports, timings).
   savings, top tool schemas (≤ 8 + "N more"), skills count. Without a breakdown (no live control /
   old extension): current numbers + note that the full breakdown needs live control.
 - Both styles (Neutral default, Neon) and Compact/Comfortable density; lucide icons; no per-frame allocation.
+
+### Accounts tab: omp's account order (`auth.accountPolicies`) and the session pin
+
+Facts (omp 18.14.0): a policy entry is `{provider, account: {email?, accountId?, projectId?, orgId?}, priority?,
+reservePct?, reclaimAbovePct?}`; `account` needs one of email/accountId/projectId and matches by exact equality of
+every field it gives; two entries matching one account, or reserve/reclaim on a provider without usage reports,
+make omp throw when it resolves that provider's credentials; an entry matching nobody is ignored;
+`reclaimAbovePct` must be above the account's reserve (own, else `retry.usageReservePct`). omp's ranking puts
+blocked, spent, inside-reserve and ≥ 85 %-of-5h accounts last before `priority` decides; a session keeps its
+account until it is spent or in reserve, or a higher-priority account is above its reclaim level. `omp config set`
+does not validate the shape; running sessions pick up the change. `omp usage --json` adds `policy: {priority,
+reservePct, reserveSource: "global"|"override", reclaimAbovePct?, state: "eligible"|"inside-reserve"|"exhausted"|
+"unknown", remainingPct?}` to reports and `accountsWithoutUsage` entries of providers with policies.
+
+- `deck_core::usage`:
+  - `OAuthIdentity` (camelCase serde, `None` fields skipped) `::new(email, account_id, project_id, org_id)` (empty
+    strings dropped, `None` when nothing is left), `.same_account(&other)` (case-insensitive: two emails decide, org
+    ids too when both have one; else account ids, else project ids).
+  - `policy_key(target, accounts) -> Option<OAuthIdentity>`: the fewest fields of `target` that select it alone among
+    `accounts` by omp's matcher — {email}, {email, org}, {accountId}, {email, accountId}, {projectId},
+    {email, projectId}, all; `None` when even all fields match another account.
+  - `AccountPolicy { provider, account, priority, reserve_pct, reclaim_above_pct }` (omp's entry, `None` skipped);
+    `replace_account_policies(current: &Value, provider, &[AccountPolicy]) -> Value`: other entries (other providers,
+    non-objects, unknown fields) kept verbatim in place, `provider`'s dropped, the new ones appended.
+  - `UsagePolicy` (`policy` above; `own_reserve()` = `reservePct` when `override`), `PolicyState` (unknown →
+    `Unknown`); `UsageReport.policy`, `UnavailableAccount.{project_id, org_id, org_name, kind ("type"), policy}`,
+    `UsageReport::account()` / `UnavailableAccount::account()` (api keys → `None`).
+  - `policy_providers(snap, now_ms) -> Vec<PolicyProvider { provider, name, accounts: Vec<PolicyAccount { label,
+    identity, key, card: Option<ProviderCard>, reason, policy }>, usage_capable, has_policies }>`: OAuth accounts from
+    reports and `accountsWithoutUsage` (disabled credentials take no part in routing), `priority` descending then
+    snapshot order; a label shared by two accounts gets ` · orgName` (else orgId).
+- `Omp::set_account_policies(provider, &[AccountPolicy]) -> Value`: `omp config get auth.accountPolicies`, then
+  `replace_account_policies`, then `omp config set auth.accountPolicies --json -- <array>` (the same private
+  `set_encoded` path as `set_setting`); returns the saved array.
+- Gateway: `Mutation::AccountPolicies { provider, policies }` (label `account-policies`, not allowed in maintenance)
+  → job `jobs::account_policies` → `Done::Setting(saved array)`. Empty `policies` = back to omp's automatic order.
+- ctl: `CtlCommand::PinAccount { root: Option<PathBuf>, provider, credential: Option<String> }`, wire
+  `{t:"pin_account", root, provider, credentialId}`. Extension: root checked only when both sides have one; refused
+  when `provider` is not the main session's model provider, while streaming, or for an unknown credential;
+  `credentialId` mapped back to omp's own id, then `session.pinCurrentProviderOAuthAccount(id)`; `null` →
+  `authStorage.sessions.clear(provider, sessionId)`. Reply `{ok}`; a snapshot follows at once.
+- omp-deck: `usage_state::AccountGroup` (providers with ≥ 2 OAuth accounts or with policies; rows = label, identity,
+  key, quota pills, reason, policy state, own reserve, reclaim) in `Summary.accounts`; `merged_draft(group, draft)`
+  keeps a draft's order/values across refreshes (accounts gone drop out, new ones append; same-identity accounts by
+  count); `account_policies(group, rows, global_reserve)`: priority `n − i` over the rows that have a key (rows
+  without one get no entry: omp ranks them below every rule), reserve/reclaim only when `usage_capable`, a reclaim at
+  or under the effective reserve dropped.
+- Accounts tab (`usage_view::accounts`): routing note; one card per group: "your order" / "omp's automatic order",
+  "Reset to automatic" (only with policies), the focused tab's account and whether it is pinned; per row ↑/↓,
+  rank, label (weak with a tooltip when it has no key), `inside reserve`/`used up` badge, no-usage reason, quota
+  pills, and Reserve (stepper, "default" = `retry.usageReservePct`, ✕ back to default) / Reclaim above (off, or a
+  stepper kept above the reserve, ✕ off) where omp measures quotas. For the focused tab's provider: `this tab`
+  (+ lock when pinned), Pin (the matching `LiveCredential`) / Unpin. A dirty draft (`ViewState.drafts`) shows
+  Discard / Save order; Save → `UsageAction::SaveAccounts` → `Mutation::AccountPolicies`, toast, forced
+  `UsageRefresh`; the draft stays until a newer summary arrives. Pin/Unpin → `UsageAction::Pin` →
+  `ctl_command(PinAccount)`, toast with omp's refusal reason. `retry.usageReservePct` is shown, never written
+  (it also drives omp's model fallback); read from the settings catalog (`usage_reserve_from_catalog`, 10 until read).
 
 ## Tab activity indicators, "Open tabs" sidebar section
 
@@ -2676,12 +2760,13 @@ total badge, one section per source (assistant replies / side-model calls) with 
 notes for gaps; the data rules of the earlier text version are unchanged.
 
 Status-bar usage chip (not hovered) shows the **selected model's provider**, not the tightest quota overall:
-`Summary::quota_of(provider)` (provider id = the selector's `provider/` prefix) → `ProviderQuota.pills`, the fullest
+`Summary::card_of(provider)` (provider id = the selector's `provider/` prefix) → the shown page's
+`CardPage.pills` (the account the session uses, see the usage chip above), the fullest
 window of ~5 h length (`5h`, blue tag) and of ~a week (`wk`, violet tag), lengths from `CardWindow.window_ms`
 (`durationMs`, else the id: `5h`/`7d`/`1w`). A warning/exhausted window turns its pill amber/red. A provider with
 neither window shows its two shortest measured windows (`1d`, `mo`, …, teal); a provider with no measurable window
 (or no model selected) falls back to the old tightest-overall chip, prefixed with that provider's name. The hover
-card is unchanged (all providers).
+card lists all providers.
 
 ## Settings-backup manager, dialog padding, UI font
 

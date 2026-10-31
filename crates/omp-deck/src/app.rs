@@ -422,6 +422,8 @@ pub struct App {
     bar_view: statusbar::BarView,
     /// omp's default model/thinking from its settings (refreshed with the catalog).
     omp_defaults: statusbar::Defaults,
+    /// omp's `retry.usageReservePct` (refreshed with the catalog); `None` until it is read.
+    omp_usage_reserve: Option<u32>,
     picker: PickerState,
     models: ModelsCache,
     dialog: Option<bar::ActionDialog>,
@@ -626,6 +628,7 @@ impl App {
             model_sent: None,
             bar_view: statusbar::BarView::default(),
             omp_defaults: statusbar::Defaults::default(),
+            omp_usage_reserve: None,
             picker: PickerState::default(),
             models: ModelsCache::default(),
             dialog: None,
@@ -2638,6 +2641,7 @@ impl App {
             if let Ok(catalog) = &catalog {
                 app.omp_defaults = defaults_from_catalog(catalog);
                 app.wt.base_setting = crate::omp_settings::worktree_base_from_catalog(catalog);
+                app.omp_usage_reserve = crate::omp_settings::usage_reserve_from_catalog(catalog);
             }
             let env = std::env::var("PI_CODING_AGENT_DIR").ok();
             let dir = config_dir_display(env.as_deref(), app.home.as_deref());

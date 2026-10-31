@@ -401,7 +401,9 @@ impl Engine {
                 TopicValue::Live {
                     target: Some(m.ctl.target().clone()),
                     connected: link.is_some_and(|l| l.client.connected()),
-                    snapshot: link.and_then(|l| l.client.latest()).map(|s| (*s).clone()),
+                    snapshot: link
+                        .and_then(|l| l.client.latest())
+                        .map(|s| Box::new((*s).clone())),
                 }
             }
             None => TopicValue::Live {

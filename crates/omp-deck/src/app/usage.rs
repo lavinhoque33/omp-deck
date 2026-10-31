@@ -4,7 +4,8 @@
 
 use std::time::{Instant, SystemTime};
 
-use deck_core::usage::ACTIVITY_DAYS;
+use deck_core::ctl::CtlCommand;
+use deck_core::usage::{ACTIVITY_DAYS, AccountPolicy};
 use deck_service::gateway::protocol::{Answer, Mutation, Query, Topic};
 use egui::{Key, Modifiers};
 
@@ -98,6 +99,7 @@ impl App {
             return;
         }
         let now = Instant::now();
+        let live = self.live_snapshot();
         let input = ViewInput {
             load: self.usage.load(),
             summary: self.usage.summary(),
@@ -107,6 +109,9 @@ impl App {
             activity_loading: self.usage.activity_loading(),
             fetching: self.usage.fetching(),
             age_secs: self.usage.age_secs(now_ms()),
+            session: live.as_ref().and_then(|s| s.account.as_ref()),
+            // omp's own default when the catalog has not been read.
+            global_reserve: self.omp_usage_reserve.unwrap_or(10),
         };
         let actions = usage_view::show(ctx, &mut self.usage_ui, &input);
         // "Updated Xs ago" ticks while the view is open.
@@ -126,7 +131,92 @@ impl App {
                     self.close_usage();
                     self.open_install_tab();
                 }
+                UsageAction::SaveAccounts {
+                    provider,
+                    name,
+                    policies,
+                } => self.save_account_policies(provider, name, policies),
+                UsageAction::Pin {
+                    provider,
+                    credential,
+                    label,
+                } => self.pin_account(provider, credential, label),
             }
         }
+    }
+
+    /// Writes `provider`'s `auth.accountPolicies` entries, then re-reads omp's usage so the page
+    /// shows how omp now routes.
+    fn save_account_policies(
+        &mut self,
+        provider: String,
+        name: String,
+        policies: Vec<AccountPolicy>,
+    ) {
+        let reset = policies.is_empty();
+        self.usage_ui.saving = Some(provider.clone());
+        self.gw.mutate(
+            Mutation::AccountPolicies {
+                provider: provider.clone(),
+                policies,
+            },
+            move |app, result| {
+                app.usage_ui.saving = None;
+                match result {
+                    Ok(_) => {
+                        app.usage_ui.saved(provider, app.usage.summary());
+                        app.toasts.success(
+                            &app.ctx,
+                            if reset {
+                                format!("{name}: omp orders the accounts by itself again")
+                            } else {
+                                format!("{name}: account order saved")
+                            },
+                        );
+                        app.start_usage_fetch();
+                    }
+                    Err(e) => app.toasts.error(
+                        &app.ctx,
+                        format!(
+                            "Account order not saved: {}",
+                            crate::summary::strip_context(&e)
+                        ),
+                    ),
+                }
+                app.ctx.request_repaint();
+            },
+        );
+    }
+
+    /// `/session pin` (or unpin, `credential: None`) for the focused tab's omp session.
+    fn pin_account(&mut self, provider: String, credential: Option<String>, label: Option<String>) {
+        let command = CtlCommand::PinAccount {
+            root: self.ctl_root().map(std::path::Path::to_path_buf),
+            provider,
+            credential,
+        };
+        let sent = self.ctl_command(command, move |app, result| {
+            app.usage_ui.pinning = false;
+            let done = match &label {
+                Some(l) => format!("This tab is pinned to {l}"),
+                None => "omp chooses this tab's account again".to_owned(),
+            };
+            match result {
+                Ok(r) if r.ok => app.toasts.success(&app.ctx, done),
+                Ok(r) => app.toasts.error(
+                    &app.ctx,
+                    format!(
+                        "omp refused: {}",
+                        r.error.as_deref().unwrap_or("no reason given")
+                    ),
+                ),
+                Err(e) => app.toasts.error(
+                    &app.ctx,
+                    format!("Pin failed: {}", crate::summary::strip_context(&e)),
+                ),
+            }
+            app.ctx.request_repaint();
+        });
+        self.usage_ui.pinning = sent;
     }
 }

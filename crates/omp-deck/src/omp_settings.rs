@@ -350,6 +350,20 @@ pub fn worktree_base_from_catalog(catalog: &SettingsCatalog) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// omp's `retry.usageReservePct` (configured, else its default): the reserve of accounts whose
+/// `auth.accountPolicies` entry sets none.
+pub fn usage_reserve_from_catalog(catalog: &SettingsCatalog) -> Option<u32> {
+    catalog
+        .tabs
+        .iter()
+        .flat_map(|t| &t.settings)
+        .find(|s| s.key == "retry.usageReservePct")
+        .and_then(|s| s.value.as_ref().or(s.default.as_ref()))
+        .and_then(Value::as_f64)
+        .filter(|v| (0.0..=100.0).contains(v))
+        .map(|v| v.round() as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use deck_core::omp::SettingsTab;
