@@ -118,6 +118,10 @@ host), so closing a tab or the whole app leaves omp running.
   light. The terminal colors follow the style, and a Comfortable density option is available (Settings → OmpDeck).
   "Separated panels" (on by default) shows the sidebar and main area as separate rounded, bordered panels, like VS Code.
   Integrated title bar (or native decorations), persisted window geometry and open tabs.
+- **Mobile companion (preview)**: control your omp sessions from your phone through a relay you host yourself:
+  conversations with send / steer / follow-up, image attachments, answers to omp's questions, a terminal view,
+  agents, changes and review comments, worktrees, session manager, usage, omp settings, backups and push
+  notifications. See [Mobile companion](#mobile-companion-preview).
 
 OmpDeck never writes to the omp session store directly; changes go through omp's own CLI.
 
@@ -446,6 +450,30 @@ longer need it). Parked sessions carry a "parked" badge and offer **Continue in 
 that branch, the sessions move back into it) and **Continue in main checkout** (switches the main checkout to
 the branch after showing which other running sessions there will see it; refused while the main checkout has
 uncommitted changes), plus **Switch main checkout back to …**. Unpushed work is never parked.
+
+## Mobile companion (preview)
+
+**Preview:** the protocol and app are complete and tested end to end, but notifications on a real phone have
+not been verified yet. Feedback is welcome.
+
+The phone app is a web app (PWA) that talks to OmpDeck on your desktop through a **relay you host yourself**.
+The relay only forwards end-to-end encrypted frames (Noise); it never sees your sessions, keys or content. There
+is no public relay.
+
+1. Run the relay on a server your phone can reach over HTTPS. The release's `omp-deck-relay-<version>-x86_64-linux`
+   archive holds the binary, the phone app (`web/`) and a systemd unit. Setup, TLS, containers and room
+   enrollment are in [docs/relay.md](docs/relay.md).
+2. In OmpDeck: **Settings → OmpDeck → General → Mobile access**. Turn it on, set the relay URL and the room key
+   from `omp-deck-relay enroll`, and pick **While open** or **Always on**. With Always on the phone also works
+   while OmpDeck's window is closed, and it survives logins and crashes.
+3. **Pair a device** shows a QR code. Scan it with the phone, check that both screens show the same
+   fingerprint, and approve the device with the permissions it gets: **View** (read only), **Control** (prompts,
+   steering, terminal input, starting sessions) and **Manage** (deleting, settings, backups, updates).
+   Paired devices are listed in the same card, with their notification state, and can be revoked there.
+
+On the phone, add the app to the home screen. Push notifications (turn finished, needs input, session ended) need
+an HTTPS relay; they are skipped while the app is open on the phone. Google Drive sign-in and other desktop-only
+steps are handed to the desktop ("Sign in on the desktop").
 
 ## Uninstall
 
