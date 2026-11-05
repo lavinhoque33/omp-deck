@@ -2153,11 +2153,13 @@ u UU N... 100644 100644 100644 100644 3333 4444 5555 src/conflict.rs
         assert_eq!(run_capture(c, Duration::from_secs(30), Some(&cancel)), None);
         assert!(t.elapsed() < Duration::from_secs(5));
 
+        // The success case only proves stdout is captured: its deadline must outlast a slow
+        // process start on a loaded CI runner (Windows took over 5 s once), not test the timeout.
         let mut c = Command::new("echo");
         c.arg("hi");
         assert_eq!(
-            run_capture(c, Duration::from_secs(5), None).unwrap(),
-            b"hi\n"
+            run_capture(c, Duration::from_secs(60), None).as_deref(),
+            Some(&b"hi\n"[..])
         );
     }
 

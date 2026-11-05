@@ -1150,7 +1150,6 @@ mod tests {
             .clear();
         crate::ui_fonts::finalize(&ctx);
         let font = deck_core::config::UiFont::Auto;
-        let compact = density == deck_core::config::Density::Compact;
         let tabs = [test_tab(&ctx, 1, "alpha"), test_tab(&ctx, 2, "beta")];
         let labels = HashMap::new();
         let busy = HashSet::new();
@@ -1222,50 +1221,35 @@ mod tests {
             )),
             ..Default::default()
         };
-        // The style is process-global and other tests switch it too: a frame counts only when
-        // the style and density were ours from before the first pass to after the last, with no
-        // other `apply` in between (one that switched density and back would go unnoticed).
-        let ours = || theme::style() == style && theme::compact() == compact;
-        for _ in 0..50 {
-            theme::apply(&ctx, style, density, font, true);
-            let applied = theme::applied();
-            let row_mid = tabs::tab_hit_h() / 2.0;
-            if !ours() {
-                continue;
-            }
-            let mut shapes = Vec::new();
-            for _ in 0..3 {
-                let mut out = ctx.run_ui(raw.clone(), |ui| {
-                    show(ui, &input);
-                });
-                out.textures_delta.clear();
-                shapes = out.shapes;
-            }
-            if !ours() || theme::applied() != applied {
-                continue;
-            }
-            let mut texts = 0;
-            for cs in &shapes {
-                if let egui::Shape::Text(t) = &cs.shape {
-                    let y = t.galley.rect.translate(t.pos.to_vec2()).center().y;
-                    let off = y - row_mid;
-                    assert!(
-                        off.abs() <= 0.5,
-                        "{style:?}/{density:?}: {:?} off by {off}",
-                        t.galley.text()
-                    );
-                    texts += 1;
-                }
-            }
-            // Logo glyph + name, 2 × (icon, title), the active ✕, badge icon + label, bell,
-            // gear, menu.
-            assert!(
-                texts >= 11,
-                "{style:?}/{density:?}: row painted {texts} texts"
-            );
-            return;
+        theme::apply(&ctx, style, density, font, true);
+        let row_mid = tabs::tab_hit_h() / 2.0;
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(raw.clone(), |ui| {
+                show(ui, &input);
+            });
+            out.textures_delta.clear();
+            shapes = out.shapes;
         }
-        panic!("{style:?}/{density:?}: the global style kept changing under the test");
+        let mut texts = 0;
+        for cs in &shapes {
+            if let egui::Shape::Text(t) = &cs.shape {
+                let y = t.galley.rect.translate(t.pos.to_vec2()).center().y;
+                let off = y - row_mid;
+                assert!(
+                    off.abs() <= 0.5,
+                    "{style:?}/{density:?}: {:?} off by {off}",
+                    t.galley.text()
+                );
+                texts += 1;
+            }
+        }
+        // Logo glyph + name, 2 × (icon, title), the active ✕, badge icon + label, bell,
+        // gear, menu.
+        assert!(
+            texts >= 11,
+            "{style:?}/{density:?}: row painted {texts} texts"
+        );
     }
 
     #[test]

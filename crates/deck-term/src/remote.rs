@@ -772,12 +772,17 @@ pub(crate) mod tests {
         let (mut t, host, _log) = connect();
         host.send(RemoteEvent::Exited(Some(3))).expect("send");
         host.send(RemoteEvent::Closed).expect("send");
-        let mut exited = None;
-        until(&mut t, "exit", |t| {
-            exited = exited.or(t.poll().exited);
-            exited.is_some()
-        });
-        assert_eq!(exited, Some(3));
+        // `exited` is reported by exactly one poll, so only this loop may poll (`until` polls
+        // between its checks and would swallow it).
+        let deadline = Instant::now() + TIMEOUT;
+        let exited = loop {
+            if let Some(code) = t.poll().exited {
+                break code;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for exit");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(exited, 3);
         assert_eq!(t.exit_code(), Some(3));
         assert_eq!(t.banner.as_deref(), Some("[process exited: 3]"));
         std::thread::sleep(Duration::from_millis(50));

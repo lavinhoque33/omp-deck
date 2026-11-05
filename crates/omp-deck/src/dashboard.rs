@@ -1728,48 +1728,36 @@ mod tests {
     #[test]
     fn the_tools_strip_has_a_fixed_height_in_every_mode() {
         for style in UiStyle::ALL {
-            // The style is process-global and other tests switch it: only a run whose style stayed
-            // ours from the first pass to the last counts.
-            let mut checked = false;
-            for _ in 0..50 {
-                let mut h = harness();
-                theme::apply(&h.ctx, style, Density::Comfortable, UiFont::Auto, true);
-                let applied = theme::applied();
-                let none = HashMap::new();
-                let bare = total(&mut h, &none);
-                let ready = HashMap::from([(h.key.clone(), Gate::Ready)]);
-                let with = total(&mut h, &ready);
-                let m = h.st.manage.entry(h.key.clone()).or_default();
-                m.selecting = true;
-                m.sel.click(&["Alpha", "Beta"], "Alpha", false);
-                let selecting = total(&mut h, &ready);
-                let busy = HashMap::from([(h.key.clone(), Gate::Busy)]);
-                let deleting = total(&mut h, &busy);
-                let blocked = HashMap::from([(h.key.clone(), Gate::Blocked(" - "))]);
-                let locked = total(&mut h, &blocked);
-                if theme::style() != style || theme::applied() != applied {
-                    continue;
-                }
+            let mut h = harness();
+            theme::apply(&h.ctx, style, Density::Comfortable, UiFont::Auto, true);
+            let none = HashMap::new();
+            let bare = total(&mut h, &none);
+            let ready = HashMap::from([(h.key.clone(), Gate::Ready)]);
+            let with = total(&mut h, &ready);
+            let m = h.st.manage.entry(h.key.clone()).or_default();
+            m.selecting = true;
+            m.sel.click(&["Alpha", "Beta"], "Alpha", false);
+            let selecting = total(&mut h, &ready);
+            let busy = HashMap::from([(h.key.clone(), Gate::Busy)]);
+            let deleting = total(&mut h, &busy);
+            let blocked = HashMap::from([(h.key.clone(), Gate::Blocked(" - "))]);
+            let locked = total(&mut h, &blocked);
+            assert!(
+                (with - bare - (tools_h() + SECTION_GAP)).abs() < 0.01,
+                "{style:?}: strip added {} (expected {})",
+                with - bare,
+                tools_h() + SECTION_GAP
+            );
+            for (name, t) in [
+                ("selecting", selecting),
+                ("deleting", deleting),
+                ("blocked", locked),
+            ] {
                 assert!(
-                    (with - bare - (tools_h() + SECTION_GAP)).abs() < 0.01,
-                    "{style:?}: strip added {} (expected {})",
-                    with - bare,
-                    tools_h() + SECTION_GAP
+                    (t - with).abs() < 0.01,
+                    "{style:?}: {name} moved {with} -> {t}"
                 );
-                for (name, t) in [
-                    ("selecting", selecting),
-                    ("deleting", deleting),
-                    ("blocked", locked),
-                ] {
-                    assert!(
-                        (t - with).abs() < 0.01,
-                        "{style:?}: {name} moved {with} -> {t}"
-                    );
-                }
-                checked = true;
-                break;
             }
-            assert!(checked, "{style:?}: the global style kept changing");
         }
     }
 

@@ -29,22 +29,44 @@ pub use palettes::Palette;
 
 use palettes::rgb;
 
-/// Index into [`UiStyle::ALL`] of the active style.
-static STYLE: AtomicU8 = AtomicU8::new(0);
-static COMPACT: AtomicU8 = AtomicU8::new(1);
-/// Index into [`UiFont::ALL`] of the chosen UI font.
-static UI_FONT: AtomicU8 = AtomicU8::new(0);
-/// The "Separated panels" setting (`AppConfig::separated_panels`, default on).
-static SEPARATED: AtomicBool = AtomicBool::new(true);
-/// Bumped by every [`apply`]: layout tests share the process-global style with tests running in
-/// parallel and count a frame only when no other `apply` ran while it was laid out.
-#[cfg(test)]
-static APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The active style, density, UI font and "Separated panels" setting.
+struct Current {
+    /// Index into [`UiStyle::ALL`].
+    style: AtomicU8,
+    compact: AtomicU8,
+    /// Index into [`UiFont::ALL`].
+    ui_font: AtomicU8,
+    /// `AppConfig::separated_panels`, default on.
+    separated: AtomicBool,
+}
 
-/// How many times [`apply`] has run in this process.
+impl Current {
+    const fn new() -> Current {
+        Current {
+            style: AtomicU8::new(0),
+            compact: AtomicU8::new(1),
+            ui_font: AtomicU8::new(0),
+            separated: AtomicBool::new(true),
+        }
+    }
+}
+
+/// Runs `f` on the active settings: process-wide in the app (the UI thread sets them, painters
+/// anywhere read them).
+#[cfg(not(test))]
+fn with_active<R>(f: impl FnOnce(&Current) -> R) -> R {
+    static ACTIVE: Current = Current::new();
+    f(&ACTIVE)
+}
+
+/// Per thread in tests: each test runs on its own thread, applies its own style and lays out
+/// synchronously there, so parallel tests never switch the style under each other.
 #[cfg(test)]
-pub fn applied() -> u64 {
-    APPLIED.load(Ordering::SeqCst)
+fn with_active<R>(f: impl FnOnce(&Current) -> R) -> R {
+    thread_local! {
+        static ACTIVE: Current = const { Current::new() };
+    }
+    ACTIVE.with(f)
 }
 
 /// The structure of every style, in [`UiStyle::ALL`] order: as designed, and with separated panels.
@@ -55,26 +77,28 @@ static LOOKS_SEPARATED: LazyLock<[Look; 18]> =
 /// The active style.
 pub fn style() -> UiStyle {
     UiStyle::ALL
-        .get(usize::from(STYLE.load(Ordering::Relaxed)))
+        .get(usize::from(with_active(|a| {
+            a.style.load(Ordering::Relaxed)
+        })))
         .copied()
         .unwrap_or_default()
 }
 
 /// Structure of the active style.
 pub fn look() -> &'static Look {
-    let looks = if SEPARATED.load(Ordering::Relaxed) {
+    let looks = if with_active(|a| a.separated.load(Ordering::Relaxed)) {
         &LOOKS_SEPARATED
     } else {
         &LOOKS
     };
-    &looks[usize::from(STYLE.load(Ordering::Relaxed)).min(looks.len() - 1)]
+    &looks[usize::from(with_active(|a| a.style.load(Ordering::Relaxed))).min(looks.len() - 1)]
 }
 
 /// Structure of `style` under the current "Separated panels" setting (previews of styles that
 /// are not active).
 pub fn look_of(style: UiStyle) -> Look {
     let look = look::look_of(style);
-    if SEPARATED.load(Ordering::Relaxed) {
+    if with_active(|a| a.separated.load(Ordering::Relaxed)) {
         look::separated(look)
     } else {
         look
@@ -83,7 +107,7 @@ pub fn look_of(style: UiStyle) -> Look {
 
 /// Sets the "Separated panels" setting; takes effect with the next [`apply`].
 pub fn set_separated(on: bool) {
-    SEPARATED.store(on, Ordering::Relaxed);
+    with_active(|a| a.separated.store(on, Ordering::Relaxed));
 }
 
 /// Whether a flat-family look is active: every style but Neon (flat, hairlines, JetBrains Mono).
@@ -93,7 +117,7 @@ pub fn flat() -> bool {
 
 /// Whether the Compact density is active.
 pub fn compact() -> bool {
-    COMPACT.load(Ordering::Relaxed) != 0
+    with_active(|a| a.compact.load(Ordering::Relaxed) != 0)
 }
 
 /// `compact` or `comfortable` metric depending on the active density.
@@ -108,7 +132,9 @@ pub fn dens(compact_px: f32, comfortable_px: f32) -> f32 {
 /// The chosen UI font.
 pub fn ui_font() -> UiFont {
     UiFont::ALL
-        .get(usize::from(UI_FONT.load(Ordering::Relaxed)))
+        .get(usize::from(with_active(|a| {
+            a.ui_font.load(Ordering::Relaxed)
+        })))
         .copied()
         .unwrap_or_default()
 }
@@ -206,12 +232,13 @@ impl Palette {
 /// every explicit `ui_font` is prepared once by [`crate::ui_fonts::finalize`].
 pub fn apply(ctx: &Context, style: UiStyle, density: Density, ui_font: UiFont, dark: bool) {
     let idx = UiStyle::ALL.iter().position(|s| *s == style).unwrap_or(0);
-    STYLE.store(idx as u8, Ordering::Relaxed);
-    COMPACT.store(u8::from(density == Density::Compact), Ordering::Relaxed);
     let font_idx = UiFont::ALL.iter().position(|f| *f == ui_font).unwrap_or(0);
-    UI_FONT.store(font_idx as u8, Ordering::Relaxed);
-    #[cfg(test)]
-    APPLIED.fetch_add(1, Ordering::SeqCst);
+    with_active(|a| {
+        a.style.store(idx as u8, Ordering::Relaxed);
+        a.compact
+            .store(u8::from(density == Density::Compact), Ordering::Relaxed);
+        a.ui_font.store(font_idx as u8, Ordering::Relaxed);
+    });
     let flat = style != UiStyle::Neon;
     let look = look_of(style);
     let family = family_for(&look, flat, ui_font);
