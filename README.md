@@ -749,9 +749,11 @@ Google's push service, and reconnects.
    Clicking elsewhere in OmpDeck (or Esc) only hides the pairing dialog: a **Pairing** pill in the title bar brings
    it back until the pairing ends. Only **Cancel** / **Deny** end it.
 
-On the phone, add the app to the home screen. Push notifications (turn finished, needs input, session ended) need
-an HTTPS relay; they are skipped while the app is open on the phone. Google Drive sign-in and other desktop-only
-steps are handed to the desktop ("Sign in on the desktop").
+On the phone, add the app to the home screen: tap **Install** on the app's banner where the browser offers it
+(Chrome, Edge, Opera, Samsung Internet), otherwise follow the banner's hint to the browser's own menu entry. The
+pairing is stored per browser, so pair and install from the same one. Push notifications (turn finished, needs
+input, session ended) need an HTTPS relay; they are skipped while the app is open on the phone. Google Drive sign-in
+and other desktop-only steps are handed to the desktop ("Sign in on the desktop").
 
 ## Uninstall
 

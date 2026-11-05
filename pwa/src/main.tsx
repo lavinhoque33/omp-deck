@@ -13,6 +13,7 @@ import { type Link, inviteFromHash, linkFromHash } from './app/nav.ts';
 import { type ThemeId, applyTheme, loadTheme, saveTheme } from './app/theme.ts';
 import { DesktopsContext } from './app/ui/hooks.ts';
 import { askOthersToReload, registerServiceWorker } from './app/update.ts';
+import { watchInstall } from './app/install.ts';
 import './styles/app.css';
 import './styles/themes.css';
 
@@ -40,6 +41,9 @@ function isStandalone(): boolean {
     (navigator as Navigator & { standalone?: boolean }).standalone === true
   );
 }
+
+// Before anything async: Chromium may fire `beforeinstallprompt` right after load.
+watchInstall(window);
 
 // The invite and deep link are read once and removed from the URL at once (the invite is a
 // secret; it must not stay in history or be bookmarked).

@@ -704,6 +704,10 @@ button:focus-visible,
 .banner .grow {
   color: var(--text);
 }
+.banner .install-help {
+  display: block;
+  margin-top: 3px;
+}
 
 /* ---- form fields ---- */
 .field {

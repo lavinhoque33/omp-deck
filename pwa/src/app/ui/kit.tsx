@@ -3,6 +3,7 @@
 
 import { type ReactNode, createContext, useContext, useEffect, useId, useSyncExternalStore } from 'react';
 import { applyUpdate, cancelUpdate, updates } from '../update.ts';
+import { install, installHelp, promptInstall } from '../install.ts';
 import type { Tab } from '../nav.ts';
 import { hasS4 } from '../client.ts';
 import { useClient, useClientState, useDesktops, useDesktopsState, useNow } from './hooks.ts';
@@ -398,13 +399,37 @@ export function BottomNav({ tab, badge, onSelect }: { tab: Tab; badge: string | 
 
 // ---- banners --------------------------------------------------------------------------------------
 
-/** iOS needs a Home Screen install for persistent storage and notifications. */
+/** Home Screen install: the browser's own dialog where it offers one, else where its menu entry is. */
 export function InstallHint({ standalone }: { standalone: boolean }): ReactNode {
+  const offer = useSyncExternalStore(install.subscribe, install.get);
   if (standalone) return null;
+  if (offer.installed) {
+    return (
+      <div className="banner" role="status">
+        <span>✓</span>
+        <span className="grow">Installed. Open OmpDeck from your Home screen.</span>
+      </div>
+    );
+  }
+  if (offer.canPrompt) {
+    return (
+      <div className="banner">
+        <span>⇪</span>
+        <span className="grow">Install OmpDeck to keep your pairing and get notifications.</span>
+        <button type="button" className="button primary" disabled={offer.prompting} onClick={() => void promptInstall()}>
+          Install
+        </button>
+      </div>
+    );
+  }
+  const help = installHelp({ userAgent: navigator.userAgent, maxTouchPoints: navigator.maxTouchPoints, secure: window.isSecureContext });
   return (
     <div className="banner">
       <span>⇪</span>
-      <span className="grow">Add to Home Screen to keep your pairing and get notifications.</span>
+      <span className="grow">
+        Add to Home Screen to keep your pairing and get notifications.
+        <span className="muted install-help">{help}</span>
+      </span>
     </div>
   );
 }

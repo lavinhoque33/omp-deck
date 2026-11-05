@@ -490,7 +490,11 @@ A browser allows one `PushSubscription` per service-worker registration, bound t
   - A fresh static key is generated for every pairing (R5 A4).
   - `navigator.storage.persist()` is requested after pairing.
   - A missing key means "re-pair" (for that desktop).
-  - The app shows "Add to Home Screen to keep your pairing and get notifications" when not standalone.
+  - Install banner when not standalone (`src/app/install.ts`, `InstallHint`): `beforeinstallprompt` is captured at boot
+    (default prevented) and turns the banner into an **Install** button that opens the browser's own dialog (Chromium:
+    Chrome, Edge, Opera, Samsung Internet); `appinstalled` or an accepted dialog shows "Installed". Without a prompt the
+    banner names the browser's own menu entry (Opera, Samsung Internet, Edge, Firefox, iOS Safari, generic), or says
+    that installing needs `https://` on an insecure origin.
 - **Several desktops** (`src/app/desktops.ts`, `Desktops`):
   - **One live connection: the active desktop.** Switching stops the current `Client` (its link closes with a normal
     close) and starts one for the chosen pairing. The whole app remounts by pairing id, so screens, inbox, drafts and
