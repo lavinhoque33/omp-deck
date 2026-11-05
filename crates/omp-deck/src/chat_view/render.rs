@@ -112,6 +112,7 @@ fn with_click(cx: &Cx, ui: &mut Ui, n: &SNode, add: impl FnOnce(&mut Ui)) {
 /// Dispatch by kind.
 fn kind(cx: &Cx, ui: &mut Ui, n: &SNode) {
     match n.kind.as_str() {
+        "col" if n.role() == "omp.job.tile" => tools::job_tile(cx, ui, n),
         "col" => col(cx, ui, n),
         "row" => row(cx, ui, n),
         "spacer" => {
@@ -213,6 +214,25 @@ fn measure_salted(
     );
     f(&mut child);
     child.min_rect().width()
+}
+
+/// Natural width of one child, for sibling layouts that pin extras to a row's right edge.
+pub fn measure_child(
+    cx: &Cx,
+    ui: &mut Ui,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    c: &SNode,
+) -> f32 {
+    measure_salted(ui, salt, &|ui| node(cx, ui, c)) + 1.0
+}
+
+/// Natural width of an ad-hoc row fragment (not a node), under its own id salt.
+pub fn measure_fragment(
+    ui: &mut Ui,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    f: &dyn Fn(&mut Ui),
+) -> f32 {
+    measure_salted(ui, salt, f)
 }
 
 fn row(cx: &Cx, ui: &mut Ui, n: &SNode) {
@@ -394,6 +414,11 @@ fn bounded(cx: &Cx, ui: &mut Ui, c: &SNode, w: f32, fill: bool) {
         }
         node(cx, ui, c);
     });
+}
+
+/// One child held to `w` px, for sibling layouts that pin extras to a row's right edge.
+pub fn bounded_child(cx: &Cx, ui: &mut Ui, c: &SNode, w: f32) {
+    bounded(cx, ui, c, w, false);
 }
 
 /// A `wrap: true` row. Children are measured at their natural width, packed greedily into lines

@@ -683,13 +683,7 @@ pub fn toggle_more(cx: &Cx, n: &SNode) {
     let open = more_open(cx, n);
     let k = more_key(n);
     cx.loc(|l| {
-        l.folds.insert(
-            k,
-            FoldOverride {
-                collapsed: open,
-                gen_: 0,
-            },
-        );
+        l.folds.insert(k, FoldOverride { collapsed: open });
     });
 }
 

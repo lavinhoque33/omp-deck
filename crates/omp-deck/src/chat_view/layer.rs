@@ -28,6 +28,12 @@ const MAX_TEXTURE: u32 = 1800;
 
 // ---- images ---------------------------------------------------------------------------------
 
+/// Decodes `bytes` into an RGBA image no larger than [`MAX_TEXTURE`] a side. Shared with the
+/// agent transcript popup, whose images arrive as raw bytes rather than TSP blobs.
+pub(crate) fn decode_image_bytes(bytes: &[u8]) -> Option<egui::ColorImage> {
+    decode(bytes)
+}
+
 /// Decodes `bytes` into an RGBA image no larger than [`MAX_TEXTURE`] a side.
 fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
     let img = image::load_from_memory(bytes).ok()?;

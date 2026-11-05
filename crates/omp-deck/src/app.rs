@@ -2246,6 +2246,7 @@ impl App {
                     .id_salt(uid)
                     .font_size(font_size)
                     .hide_duplicates(bar_shows_session)
+                    .agents(self.agents_view.metas())
                     .show(ui);
                 refused = out.refused;
                 redirect = out.redirect;

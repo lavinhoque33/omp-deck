@@ -43,6 +43,16 @@ pub fn open(cx: &Cx) -> bool {
 
 /// Shows the open menu (if any). `opened` is [`open`]'s answer for this frame.
 pub fn show(cx: &Cx, ui: &Ui, id: egui::Id, opened: bool) {
+    show_inner(cx, ui, id, opened, None);
+}
+
+/// [`show`] for a standalone burst: the menu holds the text entries over its `ords` node
+/// ords (standalone bursts never claim cards or the composer).
+pub(crate) fn show_standalone(cx: &Cx, ui: &Ui, id: egui::Id, opened: bool, ords: u32) {
+    show_inner(cx, ui, id, opened, Some(ords));
+}
+
+fn show_inner(cx: &Cx, ui: &Ui, id: egui::Id, opened: bool, standalone: Option<u32>) {
     let Some(menu) = cx.loc(|l| l.menu.clone()) else {
         return;
     };
@@ -57,7 +67,10 @@ pub fn show(cx: &Cx, ui: &Ui, id: egui::Id, opened: bool) {
     .style(crate::theme::menu_style)
     .open_memory(opened.then_some(SetOpenCommand::Bool(true)))
     .width(WIDTH)
-    .show(|ui| body(cx, ui, &menu));
+    .show(|ui| match standalone {
+        Some(ords) => standalone_entries(cx, ui, ords),
+        None => body(cx, ui, &menu),
+    });
     if cx.loc(|l| std::mem::take(&mut l.refocus)) {
         ui.memory_mut(|m| m.request_focus(id));
     }
@@ -89,6 +102,18 @@ fn text_entries(cx: &Cx, ui: &mut Ui) {
     if menu_item(ui, glyph("list"), "Select all", None, true, false).clicked() {
         cx.loc(|l| l.tsel.select_all(cx.snap));
         done(cx, ui);
+    }
+}
+
+/// [`text_entries`] for a standalone surface (`snap` holds its synthetic nodes, not a chat
+/// document): "Copy" and "Select all" over its `ords` node ords. `ords` also scopes what the
+/// entries act on when no text is hit.
+pub(crate) fn standalone_entries(cx: &Cx, ui: &mut Ui, ords: u32) {
+    copy_selection(cx, ui);
+    if menu_item(ui, glyph("list"), "Select all", None, ords > 0, false).clicked() && ords > 0 {
+        cx.loc(|l| l.tsel.select_all_ords(cx.snap, ords));
+        cx.loc(|l| l.refocus = true);
+        ui.close();
     }
 }
 

@@ -601,6 +601,7 @@ impl App {
                 PopupAction::Open(id) => self.open_agent(&session, &id, tab),
                 PopupAction::Copy { text, what } => self.copy_text(&text, what),
                 PopupAction::OpenFile(path) => self.open_path(path),
+                PopupAction::OpenUrl(url) => self.open_chat_link(url),
                 PopupAction::Error(message) => self.toasts.error(&self.ctx, message),
                 PopupAction::Kill(id) => self.request_kill_agent(id),
                 PopupAction::Revive(id) => self.send_ctl_revive(id),

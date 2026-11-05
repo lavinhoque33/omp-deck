@@ -48,6 +48,8 @@ pub enum PopupAction {
         what: &'static str,
     },
     OpenFile(PathBuf),
+    /// A link in rendered markdown was clicked.
+    OpenUrl(String),
     Error(String),
     /// Ask to kill this agent (the app confirms first).
     Kill(String),
@@ -297,10 +299,20 @@ fn popup_body(
                             "Tool calls, thinking and replies appear here as the agent works.",
                         );
                     } else {
-                        st.transcript.show(ui, a.status == AgentStatus::Running);
+                        let path = st.transcript_path.clone();
+                        if let Some(url) =
+                            st.transcript
+                                .show(ui, a.status == AgentStatus::Running, &path)
+                        {
+                            out.push(PopupAction::OpenUrl(url));
+                        }
                     }
                 }
-                PopupTab::Output => st.output.ui(ui, a),
+                PopupTab::Output => {
+                    if let Some(url) = st.output.ui(ui, a) {
+                        out.push(PopupAction::OpenUrl(url));
+                    }
+                }
                 PopupTab::Task => {
                     if a.task.trim().is_empty() {
                         empty_state(
@@ -313,8 +325,12 @@ fn popup_body(
                     } else {
                         // The task text only changes with the file-inferred snapshot.
                         let generation = view.base_version as usize;
-                        st.task_md
-                            .show(ui, Id::unique("agent-task-md"), &a.task, generation);
+                        if let Some(url) =
+                            st.task_md
+                                .show(ui, Id::unique("agent-task-md"), &a.task, generation)
+                        {
+                            out.push(PopupAction::OpenUrl(url));
+                        }
                     }
                 }
             }

@@ -267,6 +267,47 @@ impl Tsel {
         self.span.is_some()
     }
 
+    /// The selection's endpoints as `(ord, seq, char)` ranges: `((from ord, seq, char),
+    /// (to ord, seq, char))`, for callers that render their own item list (see
+    /// [`collect`]).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn span_ords(&self) -> Option<((u32, u32, usize), (u32, u32, usize))> {
+        let s = self.span?;
+        Some((
+            (s.from.0.ord, s.from.0.seq, s.from.1),
+            (s.to.0.ord, s.to.0.seq, s.to.1),
+        ))
+    }
+
+    /// Selects everything of a standalone surface with `ords` message nodes (under the
+    /// synthetic `main` root, so ords 1..=`ords`).
+    pub(crate) fn select_all_ords(&mut self, snap: &Snap, ords: u32) {
+        if ords == 0 {
+            return;
+        }
+        let Some(first) = snap.id_at(1) else {
+            return;
+        };
+        let Some(last) = snap.id_at(ords) else {
+            return;
+        };
+        self.anchor = Some(Point {
+            node: first.to_owned(),
+            ord: 1,
+            after: String::new(),
+            seq: 0,
+            ch: 0,
+        });
+        self.focus = Some(Point {
+            node: last.to_owned(),
+            ord: ords,
+            after: String::new(),
+            seq: u32::MAX,
+            ch: usize::MAX,
+        });
+        self.span = self.resolve(snap);
+    }
+
     pub fn clear(&mut self) {
         self.anchor = None;
         self.focus = None;
@@ -277,7 +318,6 @@ impl Tsel {
     }
 
     /// Starts a frame: the registry of the frame before is what the pointer hits, and the
-    /// selection is resolved against the document as it is now.
     pub fn begin(&mut self, snap: &Snap) {
         std::mem::swap(&mut self.runs, &mut self.prev);
         self.runs.clear();
@@ -790,9 +830,27 @@ pub fn copy(cx: &Cx, ui: &mut Ui, width: f32) -> Option<String> {
     }
     let holding = |ord: u32| items.partition_point(|it| it.ord <= ord).saturating_sub(1);
     let (first, last) = (holding(span.from.0.ord), holding(span.to.0.ord));
+    collect(cx, ui, width, first, last, |cx, child, idx| {
+        transcript::item(cx, child, items[idx], false);
+    })
+}
+
+/// [`copy`] for a caller-owned item list: renders items `first..=last` invisibly through `draw`
+/// (which must draw item `idx`'s runs with `cx.in_node(ord, …)` at the same ords the visible
+/// frame used) and joins the runs inside the selection in document order. `width` is the
+/// column's width.
+pub(crate) fn collect(
+    cx: &Cx,
+    ui: &mut Ui,
+    width: f32,
+    first: usize,
+    last: usize,
+    draw: impl Fn(&Cx, &mut Ui, usize),
+) -> Option<String> {
+    let span = cx.loc(|l| l.tsel.span)?;
     cx.loc(|l| l.tsel.got = Some(Vec::new()));
     let origin = ui.max_rect().min;
-    for (idx, it) in items.iter().enumerate().take(last + 1).skip(first) {
+    for idx in first..=last {
         cx.loc(|l| l.tsel.item = idx as u32);
         let mut child = ui.new_child(
             UiBuilder::new()
@@ -803,7 +861,7 @@ pub fn copy(cx: &Cx, ui: &mut Ui, width: f32) -> Option<String> {
         child.set_clip_rect(everything());
         child.set_width(width);
         child.style_mut().interaction.selectable_labels = false;
-        transcript::item(cx, &mut child, it, false);
+        draw(cx, &mut child, idx);
     }
     let got = cx.loc(|l| l.tsel.got.take()).unwrap_or_default();
     let text = join(got, &span);

@@ -437,6 +437,7 @@ impl App {
                         let out = crate::chat_view::ChatView::new(t.terminal_mut())
                             .id_salt(uid)
                             .font_size(font_size)
+                            .agents(self.agents_view.metas())
                             .show(&mut child);
                         refused = refused.or(out.refused);
                         if let Some(r) = out.redirect {

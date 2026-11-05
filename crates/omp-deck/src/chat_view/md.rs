@@ -953,6 +953,258 @@ pub fn show_text(
     });
 }
 
+// ---- standalone (non-chat callers) ------------------------------------------------------------
+//
+// The agent transcript/output/task panes render markdown through the same renderers and the same
+// `tsel` selection as the chat: runs register under synthetic node ords, the pointer handler
+// drives the selection, and copies re-render the selected items invisibly. A standalone surface
+// is a *burst*: `begin` (nodes + pointer + pending copy), one `draw` per message, `finish`
+// (outbox + right-click menu).
+
+/// State for rendering chat markdown outside a chat view (the agent transcript popup): the
+/// parsed-document cache, the scratch the renderers borrow through [`Cx`], and the synthetic
+/// nodes the selection resolves against.
+#[derive(Default)]
+pub struct Standalone {
+    loc: super::ctx::Local,
+    snap: super::snap::Snap,
+    /// Document order of the burst's nodes (synthetic ids, one per message drawn).
+    ords: Vec<String>,
+}
+
+impl Standalone {
+    /// Whether the surface holds a selection.
+    pub fn has_selection(&self) -> bool {
+        self.loc.tsel.has_selection()
+    }
+
+    /// Asks for a copy of the selection: answered at the next burst's start (see
+    /// [`begin_standalone`]).
+    pub fn want_copy(&mut self) {
+        self.loc.tsel.want_copy = true;
+    }
+
+    /// Drops the selection.
+    pub fn clear_selection(&mut self) {
+        self.loc.tsel.clear();
+    }
+}
+
+/// What a standalone frame hands back.
+#[derive(Default)]
+pub struct StandaloneOut {
+    /// A link the reader clicked.
+    pub open_url: Option<String>,
+}
+
+/// A standalone burst in progress: borrows the state for the whole draw (nodes live in
+/// `st.snap`, scratch in `st.loc`).
+pub struct Burst<'a> {
+    st: &'a mut Standalone,
+    ink: Ink,
+    now: std::time::Instant,
+    opened: Option<String>,
+}
+
+/// Starts a burst: `ids` are the messages drawn this frame in document order (synthetic node
+/// ids, stable across frames for a stable selection), `width` the text column's width. Handles
+/// the pointer for the selection and answers a pending copy by re-rendering through `draw`
+/// (which must draw item `idx` exactly as the visible frame does). `menu_id` scopes the
+/// right-click menu ("Copy", "Select all"); `menu` shows it and needs the same `Cx` the burst
+/// holds, so it runs inside [`Burst::finish`].
+pub fn begin_standalone<'a>(
+    st: &'a mut Standalone,
+    ui: &mut Ui,
+    mono_size: f32,
+    ids: &[String],
+    width: f32,
+    draw: impl Fn(&Cx, &mut Ui, usize),
+) -> Burst<'a> {
+    begin_standalone_inner(st, ui, mono_size, ids, width, &draw)
+}
+
+fn begin_standalone_inner<'a>(
+    st: &'a mut Standalone,
+    ui: &mut Ui,
+    mono_size: f32,
+    ids: &[String],
+    width: f32,
+    draw: &dyn Fn(&Cx, &mut Ui, usize),
+) -> Burst<'a> {
+    st.ords.clear();
+    st.ords.extend(ids.iter().cloned());
+    st.snap.set_nodes(&st.ords);
+    st.loc.tsel.begin(&st.snap);
+    let view = ui.clip_rect();
+    let chat = ui.max_rect();
+    st.loc.tsel.pointer(
+        ui.ctx(),
+        &st.snap,
+        &super::tsel::Area {
+            chat,
+            view,
+            layer: ui.layer_id(),
+        },
+    );
+    let ink = Ink::new(ui, mono_size);
+    let now = std::time::Instant::now();
+    // A pending copy re-renders the selected items invisibly (the chat's `copy`, with the
+    // caller's draw): text the virtualized rows never laid out copies too.
+    if std::mem::take(&mut st.loc.tsel.want_copy)
+        && let Some(((fo, _, _), (to, _, _))) = st.loc.tsel.span_ords()
+    {
+        // Ords count the synthetic `main` root (message `i` is ord `i + 1`).
+        let cx = Cx::new(&st.snap, &ink, &mut st.loc, now, false, false);
+        let first = (fo.min(to) as usize).saturating_sub(1);
+        let last = (fo.max(to) as usize).saturating_sub(1);
+        if let Some(text) = super::tsel::collect(&cx, ui, width, first, last, draw) {
+            ui.ctx().copy_text(text);
+        }
+    }
+    Burst {
+        st,
+        ink,
+        now,
+        opened: None,
+    }
+}
+
+impl Burst<'_> {
+    /// Draws message `idx`'s `text` (its `ids[idx]` node): the runs register under ord `idx`,
+    /// so a drag across messages selects across them.
+    pub fn draw(&mut self, ui: &mut Ui, idx: usize, key: &str, gen_: u64, text: &str) {
+        // The `Cx` borrows `st` while `draw` runs; it is rebuilt per message (cheap: no
+        // allocation past the outbox) because `show_text` needs `&Cx` and the burst owns `st`.
+        let cx = Cx::new(
+            &self.st.snap,
+            &self.ink,
+            &mut self.st.loc,
+            self.now,
+            false,
+            false,
+        );
+        cx.in_node(idx as u32 + 1, || {
+            show_text(&cx, ui, key, gen_, text, &[], false);
+        });
+        let (out, animate) = cx.into_out();
+        if let Some(after) = animate {
+            ui.ctx().request_repaint_after(after);
+        }
+        if let Some(text) = out.copy {
+            ui.ctx().copy_text(text);
+        }
+        if self.opened.is_none() {
+            self.opened = out.open_url;
+        }
+    }
+
+    /// Draws `text` as one selectable mono run of message `idx` (tool args/results, verbatim
+    /// tag bodies): laid out at the available width, wrapped like the labels it replaces.
+    pub fn mono(&mut self, ui: &mut Ui, idx: usize, text: &str, color: Color32) {
+        let cx = Cx::new(
+            &self.st.snap,
+            &self.ink,
+            &mut self.st.loc,
+            self.now,
+            false,
+            false,
+        );
+        cx.in_node(idx as u32 + 1, || {
+            mono_run(&cx, ui, text, color);
+        });
+        let (out, animate) = cx.into_out();
+        if let Some(after) = animate {
+            ui.ctx().request_repaint_after(after);
+        }
+        if let Some(text) = out.copy {
+            ui.ctx().copy_text(text);
+        }
+        if self.opened.is_none() {
+            self.opened = out.open_url;
+        }
+    }
+
+    /// Ends the burst: the right-click menu ("Copy", "Select all") and the frame's outbox.
+    pub fn finish(self, ui: &mut Ui, menu_id: egui::Id) -> StandaloneOut {
+        let ords = self.st.ords.len() as u32;
+        let cx = Cx::new(
+            &self.st.snap,
+            &self.ink,
+            &mut self.st.loc,
+            self.now,
+            false,
+            false,
+        );
+        // A right click on the text opens the menu (the chat's own entries, over the burst's
+        // ords instead of the chat document).
+        let click = ui
+            .input(|i| {
+                i.pointer
+                    .secondary_clicked()
+                    .then(|| i.pointer.interact_pos())
+                    .flatten()
+            })
+            .filter(|p| ui.max_rect().contains(*p));
+        if let Some(pos) = click {
+            cx.loc(|l| l.ctx_click = Some(pos));
+        }
+        let opened_menu = super::menu::open(&cx);
+        super::menu::show_standalone(&cx, ui, menu_id, opened_menu, ords);
+        let (out, animate) = cx.into_out();
+        if let Some(after) = animate {
+            ui.ctx().request_repaint_after(after);
+        }
+        if let Some(text) = out.copy {
+            ui.ctx().copy_text(text);
+        }
+        StandaloneOut {
+            open_url: self.opened.or(out.open_url),
+        }
+    }
+}
+
+/// One selectable mono run of the current node: `text` laid out at the available width (the
+/// transcript's tool args/results, verbatim tag bodies). `pub(crate)` for the standalone
+/// collect path, which re-renders through the same function.
+pub(crate) fn mono_run(cx: &Cx, ui: &mut Ui, text: &str, color: Color32) {
+    let mut job = LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        TextFormat::simple(FontId::new(12.0, egui::FontFamily::Monospace), color),
+    );
+    let _ = render::para(cx, ui, job, color, &[], RunOpts::BLOCK);
+}
+
+/// Markdown `text` in the chat renderer's language (wrapped tables, code blocks, theme ink),
+/// without a chat surface behind it: a one-message burst (selectable, with the right-click
+/// menu). `mono_size` is the terminal font size mono blocks follow; `key`/`gen_` identify the
+/// cached parse the same way [`show_text`] does. A code block's Copy button copies straight to
+/// the clipboard.
+pub fn show_standalone(
+    st: &mut Standalone,
+    ui: &mut Ui,
+    mono_size: f32,
+    key: &str,
+    gen_: u64,
+    text: &str,
+) -> StandaloneOut {
+    let ids = vec![key.to_owned()];
+    let text = text.to_owned();
+    let mut b = begin_standalone(
+        st,
+        ui,
+        mono_size,
+        &ids,
+        ui.available_width(),
+        |cx, ui, _| {
+            cx.in_node(1, || show_text(cx, ui, key, gen_, &text, &[], false));
+        },
+    );
+    b.draw(ui, 0, key, gen_, &text);
+    b.finish(ui, egui::Id::unique("standalone-md"))
+}
+
 /// The caret's colour this frame (blinks), `None` when motion is reduced.
 fn stream_caret(cx: &Cx, ui: &Ui) -> Option<Color32> {
     if cx.ink.reduce_motion {

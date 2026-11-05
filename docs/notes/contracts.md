@@ -668,8 +668,8 @@ impl AppConfig {
 Facts: `docs/notes/agent-hub.md` (file layout §2, parent↔child mapping + status inference §3, live
 tail rules §4, render shapes §6). Read-only from files; no collab guest; kill/chat/revive are NOT done
 natively (only "Open in omp's Agent Hub" = `ESC a` injection via the existing injector).
-UI dependency: `egui_commonmark` 0.26 (workspace dep, `default-features = false, features = ["pulldown_cmark"]`)
-for assistant text / output markdown.
+UI dependency (historical): `egui_commonmark` 0.26 rendered assistant text / output markdown until the transcript popup
+moved onto the chat view's own renderer (`chat_view::md`, see "Transcript popup on the chat renderer").
 
 ```rust
 // deck_core::agents (new)
@@ -736,7 +736,7 @@ UI (omp-deck): status bar "Agents" chip with live counts (running spinner only w
 right-side Agent Hub panel for the active tab's session: aggregate header, search, tree/flat,
 cards (status, id, agent type, model, task gist, cost/duration/requests/tools/tokens, current tool,
 age). Clicking a card opens a resizable transcript popup (header facts + Transcript / Output / Task
-tabs; markdown via egui_commonmark; collapsible thinking & tool results; live follow while Running;
+tabs; markdown via the chat view's renderer (originally egui_commonmark); collapsible thinking & tool results; live follow while Running;
 copy output; prev/next agent). The old "Agent hub" action becomes "Open omp's Agent Hub (TUI)" in ⋯.
 
 ## Wave 5: live subagent control, title strip, larger status bar
@@ -3636,6 +3636,24 @@ Removes the step-2 known limits. Shared interfaces:
   painted outside the sheet; role default 40 % master / 60 % detail, explicit props win. Layer `sheet()` bounds and
   clips its body and header band. Gate: `recorded_jobs_overlay_keeps_both_panes_inside_sheet` (real 18.15.0 ops,
   `chat_view/jobs-overlay.json`, widths 1100/700/450).
+
+### Task cards, wait tiles, transcript popup on the chat renderer (after 0.26.3)
+- **Folds survive live updates** (`chat_view/ctx.rs` `Cx::collapsed`/`toggle`): a local flip (`FoldOverride { collapsed }`)
+  retires only when omp's `collapsed` prop matches it or the reader flips back. Before, any prop change (a running
+  card's stats tick) dropped it, so a live `Task` / `waiting on N jobs` card snapped shut right after a click. omp keeps
+  fold state for card roots only; nested rows (agent rows, checklist phases) never echo, so their flips stay local.
+  Captured omp 18.16.0 documents: `chat_view/task-cards.json`. Foreground and background `agent` nodes carry the same
+  props (`name`, `agent`, `model`, `thinking`, `task`, `stats`).
+- **Wait tiles enriched**: omp's `omp.job.tile` names a task job by agent id but never carries its model (its classic TUI
+  badges it). `ChatView::agents(&[AgentMeta { id, agent, model, thinking }])` (cached in `AgentsView`, rebuilt only on
+  snapshot change) → `Cx.agents`; `tools::tile_agent` matches exact id, else breadcrumb (`A.B` ↔ `A>B`); matched one-row
+  tiles show type badge + model chip + thinking right-aligned; unmatched tiles unchanged.
+- **Settled agents keep their thinking level** as a muted text badge (live agents keep the effort ring).
+- **Transcript popup on the chat renderer** (user bug: overlapping table cells): `transcript_view`/`agent_output` render
+  through `chat_view::md::show_standalone` (wrapped tables, code, links → `PopupAction::OpenUrl` → `open_chat_link`);
+  selection across rows with Ctrl+C / Copy via the chat `tsel` machinery; `egui_commonmark` removed. User and
+  tool-result `images` (`ImageRef` blobs) decode on worker threads into ≤ 240 px previews with a click-to-enlarge
+  modal; an unreadable blob shows an `image · mime · size` chip.
 
 ## Wave 21: omp screens redirected to OmpDeck's own, with parity (user, 2026-11-03)
 

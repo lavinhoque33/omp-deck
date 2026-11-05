@@ -35,11 +35,14 @@ pub struct Out {
     pub redirect: Option<Redirect>,
 }
 
-/// A fold flipped locally, until omp's echo (`set collapsed`) arrives (the node's generation moves).
+/// A fold flipped locally, until omp's echo (its `collapsed` prop matching the flip) arrives.
+/// omp keeps fold state for card roots only; nested nodes (agent rows, checklist phases)
+/// never echo, so their flips are terminal-local and hold until the reader flips them back.
+/// (An earlier version dropped the flip on any prop change, so a live card's stats ticks
+/// snapped it shut a frame after the click.)
 #[derive(Debug, Clone, Copy)]
 pub struct FoldOverride {
     pub collapsed: bool,
-    pub gen_: u64,
 }
 
 /// Look of plain text where the nodes do not say otherwise: the reading face in the transcript,
@@ -67,6 +70,36 @@ pub struct Cx<'a> {
     pub hide_duplicates: bool,
     /// A node of the layer that omp opened and is closing: not drawn (see `redirect`).
     pub hidden: Option<&'a str>,
+    /// What OmpDeck knows about this tab's subagents (identity + model per registry id),
+    /// for rows omp's TSP leaves bare: a `wait` card's job tiles name a task job but never
+    /// carry its model, while omp's own TUI badges it. Borrowed per frame from the app's
+    /// already-refreshed agent data: no file or socket reads happen here.
+    pub agents: &'a [AgentMeta],
+}
+
+/// The identity of one subagent, as the agents dashboard resolved it (transcript plus the
+/// live overlay when the control link is up), reduced to what a chat row shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentMeta {
+    /// The registry id (the transcript file stem): what TSP tiles and agent rows name.
+    pub id: String,
+    /// `session_init.agent` ("task", "scout", …).
+    pub agent: Option<String>,
+    /// `provider/id` (latest model_change, else resolvedModel).
+    pub model: Option<String>,
+    /// Explicit thinking level, when the agent resolved one.
+    pub thinking: Option<String>,
+}
+
+impl AgentMeta {
+    pub fn of(a: &deck_core::agents::AgentSummary) -> AgentMeta {
+        AgentMeta {
+            id: a.id.clone(),
+            agent: a.agent.clone(),
+            model: a.model.clone(),
+            thinking: crate::agent_model::agent_thinking(a).map(str::to_owned),
+        }
+    }
 }
 
 /// A toast from the document's ring, kept by `seq` so it shows for its whole `ttl` although omp
@@ -288,6 +321,7 @@ impl<'a> Cx<'a> {
             can_edit,
             hide_duplicates: false,
             hidden: None,
+            agents: &[],
         }
     }
 
@@ -374,26 +408,30 @@ impl<'a> Cx<'a> {
         self.snap.sf.as_str()
     }
 
-    /// `n`'s fold state: a local flip not yet echoed by omp, else its `collapsed` prop.
+    /// `n`'s fold state: a local flip omp has not echoed yet, else its `collapsed` prop.
+    /// A flip survives unrelated prop updates (a live card's stats ticks); it retires once
+    /// omp's prop matches it — or when the reader flips the node back to omp's state.
     pub fn collapsed(&self, n: &SNode) -> bool {
-        let o = self.loc(|l| l.folds.get(&n.id).copied());
-        match o {
-            Some(o) if o.gen_ == n.gen_ => o.collapsed,
-            _ => n.flag("collapsed"),
-        }
+        let flip = self.loc(|l| match l.folds.get(&n.id).copied() {
+            Some(o) if o.collapsed == n.flag("collapsed") => {
+                l.folds.remove(&n.id);
+                None
+            }
+            o => o,
+        });
+        flip.map_or_else(|| n.flag("collapsed"), |o| o.collapsed)
     }
 
     /// Folds/unfolds `n`: flips it locally and tells omp.
     pub fn toggle(&self, n: &SNode) {
         let collapsed = !self.collapsed(n);
         self.loc(|l| {
-            l.folds.insert(
-                n.id.clone(),
-                FoldOverride {
-                    collapsed,
-                    gen_: n.gen_,
-                },
-            );
+            if collapsed == n.flag("collapsed") {
+                // Back to omp's state: no override left to echo.
+                l.folds.remove(&n.id);
+            } else {
+                l.folds.insert(n.id.clone(), FoldOverride { collapsed });
+            }
         });
         self.send(events::toggle(self.sf(), &n.id, n.str("key"), collapsed));
     }
@@ -449,6 +487,82 @@ mod tests {
     use crate::chat_view::snap::tests::{fixture_mirror, sync_doc};
 
     #[test]
+    fn a_fold_survives_unrelated_prop_updates_until_omp_echoes_it() {
+        use crate::chat_view::snap::tests::feed_frame;
+        use serde_json::json;
+        let mut m = fixture_mirror(usize::MAX);
+        // A collapsed task card like omp's (see the captured `Task · 2 agents` card).
+        feed_frame(
+            &mut m,
+            &json!([[
+                "add",
+                "t",
+                "main",
+                serde_json::Value::Null,
+                {
+                    "id": "t",
+                    "k": "tool",
+                    "p": {
+                        "role": "omp.tool.task",
+                        "name": "task",
+                        "title": "Task",
+                        "target": "2 agents",
+                        "targetKind": "text",
+                        "status": "running",
+                        "frame": "card",
+                        "collapsible": true,
+                        "collapsed": true,
+                        "preview": "none",
+                    },
+                },
+            ]]),
+        );
+        let mut s = Snap::default();
+        sync_doc(&mut s, &m);
+        let tool = "t".to_owned();
+        let gen0 = s.get(&tool).map(|n| n.gen_).unwrap_or(0);
+        let mut loc = Local::default();
+        let ink = crate::chat_view::style::test_ink();
+        // Expand: the flip shows at once, ahead of omp's echo.
+        {
+            let cx = Cx::new(&s, &ink, &mut loc, Instant::now(), true, true);
+            let n = cx.snap.get(&tool).expect("tool");
+            assert!(cx.collapsed(n), "omp's fixture card starts collapsed");
+            cx.toggle(n);
+            assert!(!cx.collapsed(n), "the flip shows at once");
+        }
+        // omp redraws the card for a live update (a stats tick) without touching
+        // `collapsed`: the generation moves but the fold holds.
+        feed_frame(&mut m, &json!([["set", tool, {"stats": {"age": 4321}}]]));
+        assert!(sync_doc(&mut s, &m), "the update syncs");
+        assert_ne!(
+            s.get(&tool).map(|n| n.gen_),
+            Some(gen0),
+            "the update moved gen_"
+        );
+        {
+            let cx = Cx::new(&s, &ink, &mut loc, Instant::now(), true, true);
+            let n = cx.snap.get(&tool).expect("tool");
+            assert!(
+                !cx.collapsed(n),
+                "a live update must not snap the card shut"
+            );
+        }
+        // omp's echo (the `collapsed` prop now matches the flip) retires the override.
+        feed_frame(&mut m, &json!([["set", tool, {"collapsed": false}]]));
+        assert!(sync_doc(&mut s, &m), "the echo syncs");
+        {
+            let cx = Cx::new(&s, &ink, &mut loc, Instant::now(), true, true);
+            let n = cx.snap.get(&tool).expect("tool");
+            assert!(!cx.collapsed(n), "the echo keeps the card open");
+            assert!(
+                !loc.folds.contains_key(&tool),
+                "the echo retires the override"
+            );
+        }
+    }
+
+    #[test]
     fn pruning_forgets_what_belongs_to_nodes_that_are_gone() {
         let m = fixture_mirror(usize::MAX);
         let mut snap = Snap::default();
@@ -463,10 +577,7 @@ mod tests {
             l.path_dirs.insert(id.to_owned(), (1, 600, String::new()));
             l.copied.insert(id.to_owned(), now);
         }
-        let fold = FoldOverride {
-            collapsed: true,
-            gen_: 1,
-        };
+        let fold = FoldOverride { collapsed: true };
         l.folds.insert(format!("{live}\0more"), fold);
         l.folds.insert("gone\0more".to_owned(), fold);
         l.folds.insert("gone".to_owned(), fold);

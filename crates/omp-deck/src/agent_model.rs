@@ -401,6 +401,9 @@ pub struct AgentsView {
     pub cards: Vec<CardView>,
     /// Lowercase `id agent model gist task` haystack per agent, for the search box.
     pub search: Vec<String>,
+    /// [`AgentMeta`] per agent, same order as the snapshot: what the chat view borrows to
+    /// enrich rows omp's TSP leaves bare. Rebuilt with the cards (not per frame).
+    metas: Vec<crate::chat_view::AgentMeta>,
     pub counts: Counts,
     /// `$1.23 · 4.2M tok · 120 req · 340 tools`.
     pub totals: String,
@@ -409,6 +412,11 @@ pub struct AgentsView {
 impl AgentsView {
     pub fn agents(&self) -> &[AgentSummary] {
         self.snap.as_ref().map_or(&[], |s| s.agents.as_slice())
+    }
+
+    /// The chat view's per-frame borrow: identity + model per subagent id.
+    pub fn metas(&self) -> &[crate::chat_view::AgentMeta] {
+        &self.metas
     }
 
     /// Rebuild when the snapshot or the live overlay (by identity or content) changed, ages when
@@ -480,6 +488,7 @@ impl AgentsView {
         let Some(snap) = self.snap.clone() else {
             self.cards.clear();
             self.search.clear();
+            self.metas.clear();
             self.counts = Counts::default();
             self.totals.clear();
             return;
@@ -511,6 +520,7 @@ impl AgentsView {
                 live: live.get(a.id.as_str()).copied(),
             })
             .collect();
+        self.metas = agents.iter().map(crate::chat_view::AgentMeta::of).collect();
         if !(keep_search && self.search.len() == agents.len()) {
             self.search = agents
                 .iter()

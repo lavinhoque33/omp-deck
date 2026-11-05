@@ -1,0 +1,263 @@
+{
+ "task": [
+  {
+   "c": [
+    {
+     "id": "cap-t.0",
+     "k": "text",
+     "p": {
+      "lines": 2,
+      "role": "omp.tool.context",
+      "spans": [
+       {
+        "s": "muted",
+        "t": "Capture context: two helpers report back."
+       }
+      ],
+      "wrap": "word"
+     }
+    },
+    {
+     "c": [
+      {
+       "id": "cap-t.CapOne/0",
+       "k": "md",
+       "p": {
+        "role": "omp.task.assignment",
+        "text": "Report that the job is done."
+       }
+      }
+     ],
+     "id": "cap-t.CapOne",
+     "k": "agent",
+     "p": {
+      "agent": "task",
+      "badges": [
+       {
+        "text": "background"
+       }
+      ],
+      "collapsed": true,
+      "collapsible": true,
+      "model": "fake/fake-1",
+      "name": "CapOne",
+      "stats": {
+       "age": 162
+      },
+      "status": "running",
+      "task": "Report that the job is done."
+     }
+    },
+    {
+     "c": [
+      {
+       "id": "cap-t.CapTwo/0",
+       "k": "md",
+       "p": {
+        "role": "omp.task.assignment",
+        "text": "Report that the job is done."
+       }
+      }
+     ],
+     "id": "cap-t.CapTwo",
+     "k": "agent",
+     "p": {
+      "agent": "task",
+      "badges": [
+       {
+        "text": "background"
+       }
+      ],
+      "collapsed": true,
+      "collapsible": true,
+      "model": "fake/fake-1",
+      "name": "CapTwo",
+      "stats": {
+       "age": 162
+      },
+      "status": "running",
+      "task": "Report that the job is done."
+     }
+    }
+   ],
+   "id": "cap-t",
+   "k": "tool",
+   "p": {
+    "age": 448,
+    "badges": [
+     {
+      "text": "background"
+     }
+    ],
+    "collapsed": true,
+    "collapsible": true,
+    "frame": "card",
+    "key": "call_1",
+    "name": "task",
+    "preview": "none",
+    "role": "omp.tool.task",
+    "status": "running",
+    "target": "2 agents",
+    "targetKind": "text",
+    "title": "Task"
+   }
+  }
+ ],
+ "wait": [
+  {
+   "c": [
+    {
+     "c": [
+      {
+       "c": [
+        {
+         "c": [
+          {
+           "id": "cap-v.tiles/2l24n2hgmks19/head/0",
+           "k": "text",
+           "p": {
+            "role": "omp.job.tile.dot",
+            "spans": [
+             {
+              "fx": "pulse",
+              "s": "accent",
+              "t": "\u25cf"
+             }
+            ],
+            "wrap": "none"
+           }
+          },
+          {
+           "id": "cap-v.tiles/2l24n2hgmks19/head/1",
+           "k": "text",
+           "p": {
+            "grow": 1,
+            "role": "omp.job.tile.title",
+            "spans": [
+             {
+              "t": "CapOne"
+             }
+            ],
+            "truncate": "end",
+            "wrap": "none"
+           }
+          },
+          {
+           "id": "cap-v.tiles/2l24n2hgmks19/head/clock",
+           "k": "elapsed",
+           "p": {
+            "age": 607,
+            "format": "short"
+           }
+          }
+         ],
+         "id": "cap-v.tiles/2l24n2hgmks19/head",
+         "k": "row",
+         "p": {
+          "align": "center",
+          "gap": "xs",
+          "role": "omp.job.tile.head"
+         }
+        }
+       ],
+       "id": "cap-v.tiles/2l24n2hgmks19",
+       "k": "col",
+       "p": {
+        "gap": "xs",
+        "role": "omp.job.tile",
+        "tone": "accent"
+       }
+      },
+      {
+       "c": [
+        {
+         "c": [
+          {
+           "id": "cap-v.tiles/ls09yh6azr74/head/0",
+           "k": "text",
+           "p": {
+            "role": "omp.job.tile.dot",
+            "spans": [
+             {
+              "fx": "pulse",
+              "s": "accent",
+              "t": "\u25cf"
+             }
+            ],
+            "wrap": "none"
+           }
+          },
+          {
+           "id": "cap-v.tiles/ls09yh6azr74/head/1",
+           "k": "text",
+           "p": {
+            "grow": 1,
+            "role": "omp.job.tile.title",
+            "spans": [
+             {
+              "t": "CapTwo"
+             }
+            ],
+            "truncate": "end",
+            "wrap": "none"
+           }
+          },
+          {
+           "id": "cap-v.tiles/ls09yh6azr74/head/clock",
+           "k": "elapsed",
+           "p": {
+            "age": 607,
+            "format": "short"
+           }
+          }
+         ],
+         "id": "cap-v.tiles/ls09yh6azr74/head",
+         "k": "row",
+         "p": {
+          "align": "center",
+          "gap": "xs",
+          "role": "omp.job.tile.head"
+         }
+        }
+       ],
+       "id": "cap-v.tiles/ls09yh6azr74",
+       "k": "col",
+       "p": {
+        "gap": "xs",
+        "role": "omp.job.tile",
+        "tone": "accent"
+       }
+      }
+     ],
+     "id": "cap-v.tiles",
+     "k": "row",
+     "p": {
+      "gap": "none",
+      "role": "omp.job.tiles",
+      "wrap": true
+     }
+    }
+   ],
+   "id": "cap-v",
+   "k": "tool",
+   "p": {
+    "age": 582,
+    "collapsed": true,
+    "collapsible": true,
+    "frame": "card",
+    "key": "call_2",
+    "name": "wait",
+    "preview": "children",
+    "role": "omp.tool.wait",
+    "status": "running",
+    "title": [
+     {
+      "s": "toolTitle strong",
+      "t": "waiting on 2 jobs"
+     }
+    ],
+    "tone": "info"
+   }
+  }
+ ]
+}

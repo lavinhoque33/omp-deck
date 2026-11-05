@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::chat_view::{MdStandalone, show_md_standalone};
 use crate::icons::{ICON_FILE_TEXT, ICON_INFO};
 use deck_core::agents::{AgentStatus, AgentSummary};
-use egui::{Frame, Id, Margin, RichText, Ui};
-use egui_commonmark::{CommonMarkCache, CommonMarkScrollOptions, CommonMarkViewer};
+use egui::{Frame, Id, Margin, RichText, ScrollArea, Ui};
 
-use crate::theme::{self, Palette};
+use crate::theme::Palette;
 use crate::widgets::{Spin, empty_state, icon_text};
 
 /// Output files larger than this are previewed, not rendered whole.
@@ -25,33 +25,59 @@ const RECHECK: Duration = Duration::from_secs(3);
 /// `(mtime, len)` of the file a text was read from.
 type Version = (Option<SystemTime>, u64);
 
-/// Markdown viewer whose viewport cache is dropped whenever the width or the content changes
-/// (egui_commonmark keeps page size and split points across frames).
+/// Markdown viewer through the chat view's renderer (one renderer for both surfaces), in its
+/// own scroll area.
 #[derive(Default)]
 pub struct MdPane {
-    cache: CommonMarkCache,
-    sig: Option<(i32, usize)>,
+    md: MdStandalone,
 }
 
 impl MdPane {
-    /// `generation` identifies the content: any change of it invalidates the cached layout.
-    pub fn show(&mut self, ui: &mut Ui, id: Id, text: &str, generation: usize) {
-        let sig = (ui.available_width().round() as i32, generation);
-        if self.sig != Some(sig) {
-            self.cache.clear_viewer(&id);
-            self.sig = Some(sig);
+    /// `generation` identifies the content: any change of it invalidates the cached parse.
+    /// Returns a clicked link, if any.
+    pub fn show(&mut self, ui: &mut Ui, id: Id, text: &str, generation: usize) -> Option<String> {
+        // Copy chords with a selection (the burst answers at its start next frame, before the
+        // pane draws); Esc clears. The transcript pane handles its own in `copy_keys`.
+        let has = self.md.has_selection();
+        if has {
+            let mut copy = false;
+            let mut clear = false;
+            ui.input(|i| {
+                for e in &i.events {
+                    match e {
+                        egui::Event::Copy => copy = true,
+                        egui::Event::Key {
+                            key: egui::Key::C,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.command && !modifiers.alt => copy = true,
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if !modifiers.any() => clear = true,
+                        _ => {}
+                    }
+                }
+            });
+            if copy {
+                self.md.want_copy();
+            }
+            if clear {
+                self.md.clear_selection();
+            }
         }
-        let pal = Palette::of_ui(ui);
-        ui.scope(|ui| {
-            theme::markdown_style(ui.style_mut(), pal);
-            CommonMarkViewer::new().show_scrollable(
-                id,
-                ui,
-                &mut self.cache,
-                &CommonMarkScrollOptions::default().viewport_cache(true),
-                text,
-            );
-        });
+        let mut opened = None;
+        ScrollArea::vertical()
+            .id_salt(id)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let r = show_md_standalone(&mut self.md, ui, 13.0, "pane", generation as u64, text);
+                opened = r.open_url;
+            });
+        opened
     }
 }
 
@@ -253,7 +279,8 @@ impl OutputPane {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, a: &AgentSummary) {
+    /// Returns a clicked link, if any.
+    pub fn ui(&mut self, ui: &mut Ui, a: &AgentSummary) -> Option<String> {
         let pal = Palette::of_ui(ui);
         if a.output_path.is_none() {
             self.sync(ui.ctx(), a);
@@ -272,7 +299,7 @@ impl OutputPane {
                 ),
             };
             empty_state(ui, ICON_FILE_TEXT, pal.weak, why, sub);
-            return;
+            return None;
         }
         self.sync(ui.ctx(), a);
         let Some(loaded) = &self.loaded else {
@@ -292,11 +319,11 @@ impl OutputPane {
                     ui.label(RichText::new("Reading output…").color(pal.weak));
                 });
             }
-            return;
+            return None;
         };
         if loaded.text.trim().is_empty() {
             empty_state(ui, ICON_FILE_TEXT, pal.weak, "The output file is empty", "");
-            return;
+            return None;
         }
         if loaded.truncated {
             Frame::NONE
@@ -325,7 +352,7 @@ impl OutputPane {
             Id::unique("agent-output-md"),
             &loaded.text,
             self.generation,
-        );
+        )
     }
 }
 

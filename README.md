@@ -152,7 +152,8 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
   Ctrl+Shift+A or the status-bar Agents chip shows one card per open tab and per session still
   running in the background, with its state (working, needs input, idle, ended), model, context use, cost,
   tokens, changed files and last reply; expand a card to see its subagents and open their transcripts (running
-  subagents are listed first). Search and filter by state; click a card to jump to that session.
+  subagents are listed first; transcripts render tables, links and image previews like the chat view, and their text
+  can be selected and copied). Search and filter by state; click a card to jump to that session.
   For tabs running with live control, **Clean up** stops and deletes every subagent that is not running, **Select**
   lets you tick subagents (Shift+click for a range) and **Delete** them, and each row has a delete button on hover.
   Deleting is permanent: omp stops tracking the agent and its transcript, output and nested agents are removed.

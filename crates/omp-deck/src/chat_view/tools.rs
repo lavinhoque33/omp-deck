@@ -20,7 +20,7 @@ use egui::{
 use serde_json::Value;
 
 use super::ansi::more_button;
-use super::ctx::{Claim, Cx, RowGrid, Tx};
+use super::ctx::{AgentMeta, Claim, Cx, RowGrid, Tx};
 use super::events;
 use super::glyphs;
 use super::paint;
@@ -1648,13 +1648,186 @@ pub fn agent(cx: &Cx, ui: &mut Ui, n: &SNode) {
 
 /// Whether an agent of `status` still shows its thinking-effort ring: a finished one has no
 /// effort left to show, and the arc reads as a running spinner next to the done mark.
+/// Settled agents show the level as a static text badge instead (see [`thinking_badge`]).
 fn shows_effort(status: &str) -> bool {
     !matches!(status, "done" | "failed" | "aborted")
 }
 
+/// omp's `thinkingXxx` theme token (or a plain level) to the level name (`xhigh`).
+/// Empty for `off`/`inherit` (nothing to show) and unknown tokens.
+pub fn thinking_level(raw: &str) -> &str {
+    let level = raw.trim().trim_start_matches("thinking");
+    let level = level.strip_prefix("Level").unwrap_or(level);
+    let level = match level {
+        "Minimal" => "minimal",
+        "Low" => "low",
+        "Medium" => "medium",
+        "High" => "high",
+        "Xhigh" => "xhigh",
+        other => other,
+    };
+    match level.to_ascii_lowercase().as_str() {
+        "minimal" => "minimal",
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" | "max" => "xhigh",
+        "auto" => "auto",
+        _ => "",
+    }
+}
+
+/// A settled agent's thinking level as a static text badge (`med`, `xhigh`): the effort ring
+/// would read as a running spinner next to the done mark. Empty levels show nothing.
+fn thinking_badge(cx: &Cx, ui: &mut Ui, level: &str) {
+    if level.is_empty() || level == "auto" {
+        return;
+    }
+    render::badge(
+        cx,
+        ui,
+        deck_service::statusfmt::thinking_short(level),
+        Some("muted"),
+    );
+}
+
+/// The model chip beside an agent name, as `agent` heads draw it, with the thinking level:
+/// the effort ring while the agent is live, a static text badge once settled.
+fn model_identity(cx: &Cx, ui: &mut Ui, model: &str, thinking: Option<&str>, live: bool) {
+    let ink = cx.ink;
+    let mut job = LayoutJob::default();
+    job.append(
+        &text::clean(model),
+        0.0,
+        Base::new(ink.label(LABEL), ink.dim(), ink).format_plain(),
+    );
+    job.wrap.max_rows = 1;
+    job.wrap.max_width = (ui.available_width() - 16.0).max(20.0);
+    chip(ui, ink, job, ink.chip(), ink.line(), Sense::hover());
+    let level = thinking.map(thinking_level).unwrap_or("");
+    if live {
+        if !level.is_empty() {
+            render::ring(cx, ui, render::effort_fill(level), 11.0, ink.accent_text());
+        }
+    } else {
+        thinking_badge(cx, ui, level);
+    }
+}
+
+/// The [`AgentMeta`] a job tile names: a task job's title is its agent id (omp's
+/// `tileTitle`), with nesting dots rendered as breadcrumbs (`Anna.Bob` → `Anna>Bob`).
+/// Prefers an exact id hit, else the dotted breadcrumb form; `None` without a title.
+pub fn tile_agent<'a>(agents: &'a [AgentMeta], tile: &SNode, snap: &Snap) -> Option<&'a AgentMeta> {
+    let title = snap
+        .kids(tile)
+        .find(|c| c.role() == "omp.job.tile.head")
+        .and_then(|h| snap.kids(h).find(|c| c.role() == "omp.job.tile.title"))
+        .map(text::node_plain)
+        .filter(|t| !t.trim().is_empty())?;
+    agents
+        .iter()
+        .find(|a| a.id == title)
+        .or_else(|| agents.iter().find(|a| a.id.replace('.', ">") == title))
+}
+
+/// A `wait` card's job tile: omp's dot/title/clock head, plus the agent's type badge,
+/// model chip and thinking level from [`Cx::agents`] when the tile names a known task job.
+/// omp's TSP never carries the job's model here; its own TUI badges it.
+pub fn job_tile(cx: &Cx, ui: &mut Ui, n: &SNode) {
+    let kids: Vec<&SNode> = cx.snap.kids(n).collect();
+    let enrich = tile_agent(cx.agents, n, cx.snap)
+        .filter(|a| a.model.as_deref().filter(|m| !m.is_empty()).is_some() || a.agent.is_some());
+    match enrich {
+        // The head is all the tile shows (a one-row tile, as omp describes it): the head
+        // keeps its own layout and the identity rides its line, right-aligned.
+        Some(a) if kids.len() == 1 && kids[0].role() == "omp.job.tile.head" => {
+            head_with_identity(cx, ui, n, kids[0], a);
+        }
+        _ => render::children(cx, ui, n),
+    }
+}
+
+/// A job tile's head row with the agent's identity pinned to the right edge.
+fn head_with_identity(cx: &Cx, ui: &mut Ui, tile: &SNode, head: &SNode, a: &AgentMeta) {
+    let gap = render::step(head.str("gap"));
+    let kids: Vec<&SNode> = cx
+        .snap
+        .kids(head)
+        .filter(|c| !render::blank(cx, c))
+        .collect();
+    let live = kids.iter().any(|c| c.kind == "elapsed");
+    let mut widths: Vec<f32> = kids
+        .iter()
+        .map(|c| render::measure_child(cx, ui, ("tile-head", tile.id.as_str(), c.id.as_str()), c))
+        .collect();
+    let id_w = render::measure_fragment(ui, ("tile-id", tile.id.as_str()), &|ui| {
+        identity_line(cx, ui, a, live);
+    });
+    let total = ui.available_width().max(0.0);
+    let gaps = gap * kids.len().max(1) as f32;
+    let room = (total - gaps - id_w).max(0.0);
+    let fixed: f32 = widths.iter().sum();
+    if fixed > room && fixed > 0.0 {
+        let shrink = room / fixed;
+        for w in &mut widths {
+            *w *= shrink;
+        }
+    }
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for (c, w) in kids.iter().zip(widths) {
+            render::bounded_child(cx, ui, c, w);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            identity_line(cx, ui, a, live);
+        });
+    });
+}
+
+/// Type badge + model chip + thinking level of a tile's agent, as agent heads draw them.
+fn identity_line(cx: &Cx, ui: &mut Ui, a: &AgentMeta, live: bool) {
+    ui.spacing_mut().item_spacing.x = 7.0;
+    if live {
+        if let Some(level) = a
+            .thinking
+            .as_deref()
+            .map(thinking_level)
+            .filter(|l| !l.is_empty())
+        {
+            render::ring(
+                cx,
+                ui,
+                render::effort_fill(level),
+                11.0,
+                cx.ink.accent_text(),
+            );
+        }
+    } else {
+        thinking_badge(
+            cx,
+            ui,
+            a.thinking.as_deref().map(thinking_level).unwrap_or(""),
+        );
+    }
+    if let Some(model) = a.model.as_deref().filter(|m| !m.is_empty()) {
+        let ink = cx.ink;
+        let mut job = LayoutJob::default();
+        job.append(
+            &text::clean(model),
+            0.0,
+            Base::new(ink.label(LABEL), ink.dim(), ink).format_plain(),
+        );
+        job.wrap.max_rows = 1;
+        job.wrap.max_width = (ui.available_width() - 16.0).max(20.0);
+        chip(ui, ink, job, ink.chip(), ink.line(), Sense::hover());
+    }
+    if let Some(kind) = a.agent.as_deref().filter(|k| !k.is_empty()) {
+        render::badge(cx, ui, kind, Some("muted"));
+    }
+}
+
 fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let ink = cx.ink;
-    ui.spacing_mut().item_spacing.y = 0.0;
     let status = n.str("status").unwrap_or("pending");
     let lk = agent_look(status).unwrap_or(FALLBACK);
     let running = status == "running";
@@ -1709,19 +1882,7 @@ fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
                 render::badge(cx, ui, kind, Some("muted"));
             }
             if let Some(model) = n.str("model").filter(|m| !m.is_empty()) {
-                let mut job = LayoutJob::default();
-                job.append(
-                    &text::clean(model),
-                    0.0,
-                    Base::new(ink.label(LABEL), ink.dim(), ink).format_plain(),
-                );
-                job.wrap.max_rows = 1;
-                job.wrap.max_width = (ui.available_width() - 16.0).max(20.0);
-                chip(ui, ink, job, ink.chip(), ink.line(), Sense::hover());
-                if let Some(level) = n.str("thinking").filter(|_| shows_effort(status)) {
-                    let level = level.trim_start_matches("thinking").to_ascii_lowercase();
-                    render::ring(cx, ui, render::effort_fill(&level), 11.0, ink.accent_text());
-                }
+                model_identity(cx, ui, model, n.str("thinking"), shows_effort(status));
             }
         },
     );
@@ -2249,6 +2410,94 @@ mod tests {
         "pending", "running", "done", "failed", "aborted", "idle", "parked",
     ];
     const ITEM_STATUSES: [&str; 5] = ["pending", "active", "done", "dropped", "blocked"];
+
+    #[test]
+    fn thinking_tokens_reduce_to_level_names() {
+        for (raw, want) in [
+            ("thinkingXhigh", "xhigh"),
+            ("thinkingHigh", "high"),
+            ("thinkingMedium", "medium"),
+            ("thinkingLow", "low"),
+            ("thinkingMinimal", "minimal"),
+            ("thinkingLevelHigh", "high"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("auto", "auto"),
+            ("off", ""),
+            ("inherit", ""),
+            ("", ""),
+            ("thinkingBogus", ""),
+        ] {
+            assert_eq!(thinking_level(raw), want, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn job_tiles_resolve_to_their_agent() {
+        use super::super::ctx::AgentMeta;
+        use super::super::snap::tests::{fixture_mirror, sync_doc};
+        use crate::chat_view::snap::tests::feed_frame;
+        let mut m = fixture_mirror(usize::MAX);
+        let tile = |id: &str, title: &str| {
+            json!({
+                "id": id, "k": "col", "p": {"role": "omp.job.tile"},
+                "c": [{
+                    "id": format!("{id}/head"), "k": "row",
+                    "p": {"role": "omp.job.tile.head"},
+                    "c": [{
+                        "id": format!("{id}/title"), "k": "text",
+                        "p": {"role": "omp.job.tile.title", "spans": [{"t": title}]},
+                    }],
+                }],
+            })
+        };
+        feed_frame(
+            &mut m,
+            &json!([
+                [
+                    "add",
+                    "tile-plain",
+                    "main",
+                    null,
+                    tile("tile-plain", "CapOne")
+                ],
+                [
+                    "add",
+                    "tile-nested",
+                    "main",
+                    null,
+                    tile("tile-nested", "Anna>Bob")
+                ],
+                ["add", "tile-none", "main", null, tile("tile-none", "cron")],
+            ]),
+        );
+        let mut snap = Snap::default();
+        sync_doc(&mut snap, &m);
+        let agents = vec![
+            AgentMeta {
+                id: "CapOne".into(),
+                agent: Some("task".into()),
+                model: Some("fake/fake-1".into()),
+                thinking: None,
+            },
+            AgentMeta {
+                id: "Anna.Bob".into(),
+                agent: Some("task".into()),
+                model: Some("fake/fake-1".into()),
+                thinking: None,
+            },
+        ];
+        let hit = |id: &str| {
+            tile_agent(&agents, snap.get(id).expect("tile"), &snap).map(|a| a.id.as_str())
+        };
+        assert_eq!(hit("tile-plain"), Some("CapOne"));
+        assert_eq!(hit("tile-nested"), Some("Anna.Bob"));
+        assert_eq!(hit("tile-none"), None);
+        assert_eq!(
+            tile_agent(&[], snap.get("tile-plain").expect("tile"), &snap),
+            None
+        );
+    }
 
     #[test]
     fn image_open_menu_does_not_require_a_tool_target_kind() {

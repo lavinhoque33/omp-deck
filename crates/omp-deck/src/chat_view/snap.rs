@@ -190,6 +190,57 @@ impl Snap {
         }
     }
 
+    /// The node ids of a standalone surface (see `md::Standalone`): `ids` in document order.
+    /// The nodes hang under a synthetic `main` root (like the chat's transcript region), so
+    /// `tsel` resolves endpoints and copies against them the same way. A different list than
+    /// the current one invalidates the selection.
+    pub(crate) fn set_nodes(&mut self, ids: &[String]) {
+        let same = self.order.len() == ids.len() + 1
+            && self.order[1..].iter().zip(ids).all(|(a, b)| a == b);
+        if same {
+            return;
+        }
+        self.nodes.clear();
+        self.order.clear();
+        self.next_gen += 1;
+        self.nodes.insert(
+            "main".to_owned(),
+            SNode {
+                id: "main".to_owned(),
+                kind: "col".to_owned(),
+                props: Props::new(),
+                children: ids.to_vec(),
+                parent: None,
+                changed: Instant::now(),
+                gen_: self.next_gen,
+                sub: 0,
+                ord: 0,
+                seen: self.pass,
+            },
+        );
+        self.order.push("main".to_owned());
+        for (i, id) in ids.iter().enumerate() {
+            self.next_gen += 1;
+            self.nodes.insert(
+                id.clone(),
+                SNode {
+                    id: id.clone(),
+                    kind: "md".to_owned(),
+                    props: Props::new(),
+                    children: Vec::new(),
+                    parent: Some("main".to_owned()),
+                    changed: Instant::now(),
+                    gen_: self.next_gen,
+                    sub: 0,
+                    ord: (i + 1) as u32,
+                    seen: self.pass,
+                },
+            );
+            self.order.push(id.clone());
+        }
+        self.resets += 1;
+    }
+
     /// Whether the surface exists (it is open in the document as of the last sync).
     pub fn is_open(&self) -> bool {
         !self.sf.is_empty()
@@ -411,6 +462,23 @@ pub(crate) mod tests {
     /// Syncs `s` to `m` as a terminal at its document's revision in reset epoch 0 would.
     pub(crate) fn sync_doc(s: &mut Snap, m: &Mirror) -> bool {
         s.sync(m.document(), m.document().revision(), 0)
+    }
+
+    /// Feeds one more program frame (ops of surface `s:1`) into `m`, sequenced after its last.
+    pub(crate) fn feed_frame(m: &mut Mirror, ops: &Value) {
+        let seq = m
+            .document()
+            .surface("s:1")
+            .and_then(|s| s.last_seq())
+            .unwrap_or(0)
+            + 1;
+        let body = serde_json::json!({"sf": "s:1", "s": seq, "ops": ops});
+        let wire = encode_message(
+            Verb::Frame,
+            &[],
+            &serde_json::to_vec(&body).expect("frame JSON"),
+        );
+        m.feed(&wire, Instant::now());
     }
 
     pub(crate) fn fixture_mirror(n: usize) -> Mirror {

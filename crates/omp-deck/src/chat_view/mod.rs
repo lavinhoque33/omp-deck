@@ -42,7 +42,15 @@ use std::time::Instant;
 use deck_term::{Terminal, TspRefused, input};
 use egui::{Event, EventFilter, Rect, Sense, Ui, pos2, vec2};
 
+pub(crate) use ctx::AgentMeta;
+pub(crate) use ctx::Cx as MdCx;
 use ctx::{Cx, Local};
+pub(crate) use layer::decode_image_bytes;
+pub(crate) use md::{
+    Burst as MdBurst, Standalone as MdStandalone, StandaloneOut as MdStandaloneOut,
+    begin_standalone as begin_md_standalone, mono_run as md_mono_run,
+    show_standalone as show_md_standalone, show_text as md_show_text,
+};
 pub(crate) use paint::{hairline, pop};
 pub use redirect::Redirect;
 use snap::Snap;
@@ -63,6 +71,7 @@ pub struct ChatView<'a> {
     font_size: f32,
     id_salt: Option<u64>,
     hide_duplicates: bool,
+    agents: &'a [ctx::AgentMeta],
 }
 
 /// What a frame of the chat view reports back to the app.
@@ -139,6 +148,7 @@ impl<'a> ChatView<'a> {
             font_size: 14.0,
             id_salt: None,
             hide_duplicates: false,
+            agents: &[],
         }
     }
 
@@ -163,12 +173,21 @@ impl<'a> ChatView<'a> {
         self
     }
 
+    /// The tab's subagents (identity + model per registry id), enriching rows omp's TSP
+    /// leaves bare (the `wait` card's job tiles). Borrowed: the caller keeps it alive and
+    /// refreshed; empty when the tab has no agent data.
+    pub fn agents(mut self, agents: &'a [ctx::AgentMeta]) -> Self {
+        self.agents = agents;
+        self
+    }
+
     pub fn show(self, ui: &mut Ui) -> ChatResponse {
         let ChatView {
             term,
             font_size,
             id_salt,
             hide_duplicates,
+            agents,
         } = self;
         term.poll();
         let ctx = ui.ctx().clone();
@@ -405,6 +424,7 @@ impl<'a> ChatView<'a> {
         let mut cx = Cx::new(snap, &ink, loc, now, focused, snap.can_edit);
         cx.hide_duplicates = hide_duplicates && !paged;
         cx.hidden = hidden;
+        cx.agents = agents;
         if paged {
             page::show(&cx, ui, rect, id);
         } else {
@@ -642,6 +662,7 @@ mod tests {
         opened: Vec<String>,
         modifiers: Modifiers,
         hide_duplicates: bool,
+        agents: Vec<AgentMeta>,
         width: f32,
         /// The redirects the view reported, in order.
         redirects: Vec<Redirect>,
@@ -788,6 +809,7 @@ mod tests {
                 opened: Vec::new(),
                 modifiers: Modifiers::NONE,
                 hide_duplicates: false,
+                agents: Vec::new(),
                 width: 900.0,
                 redirects: Vec::new(),
             };
@@ -817,6 +839,7 @@ mod tests {
             let opened = &mut self.opened;
             let redirects = &mut self.redirects;
             let hide_duplicates = self.hide_duplicates;
+            let agents = std::mem::take(&mut self.agents);
             let mut id = egui::Id::NULL;
             // As in the app: clicks on the chat's own widgets do not take its keyboard focus away.
             self.ctx.options_mut(|o| {
@@ -826,12 +849,14 @@ mod tests {
                 let shown = ChatView::new(term)
                     .id_salt(7)
                     .hide_duplicates(hide_duplicates)
+                    .agents(&agents)
                     .show(ui);
                 id = shown.response.id;
                 opened.extend(shown.open_url);
                 redirects.extend(shown.redirect);
             });
             out.textures_delta.clear();
+            self.agents = agents;
             self.id = id;
             out
         }
@@ -1037,6 +1062,22 @@ mod tests {
         serde_json::Value::Array(ops)
     }
 
+    /// Nodes of one case of `task-cards.json` (real omp 18.16.0 captures: a background
+    /// `Task · 2 agents` card and a `waiting on 2 jobs` card) added to `main`.
+    fn card_ops(case: &str) -> serde_json::Value {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("task-cards.json")).expect("task cards fixture");
+        let mut ops: Vec<serde_json::Value> =
+            ["1", "n", "o", "q", "s", "u", "v", "x", "z", "10", "11"]
+                .into_iter()
+                .map(|id| serde_json::json!(["del", id]))
+                .collect();
+        for n in cases[case].as_array().expect("fixture case") {
+            ops.push(serde_json::json!(["add", n["id"], "main", null, n]));
+        }
+        serde_json::Value::Array(ops)
+    }
+
     fn boxes(out: &egui::FullOutput) -> Vec<Rect> {
         fn walk(shape: &Shape, out: &mut Vec<Rect>) {
             match shape {
@@ -1129,6 +1170,106 @@ mod tests {
                 "button {button:?}, footer right {right}"
             );
         }
+    }
+
+    #[test]
+    fn recorded_wait_tiles_gain_their_agents_model_and_thinking() {
+        // Real omp 18.16.0 capture: `waiting on 2 jobs` tiles name the task jobs but carry
+        // no model. With the agents snapshot the tiles show type badge + model chip;
+        // without it the rows stay exactly as omp described them.
+        let metas = || {
+            vec![
+                AgentMeta {
+                    id: "CapOne".into(),
+                    agent: Some("task".into()),
+                    model: Some("fake/fake-1".into()),
+                    thinking: Some("high".into()),
+                },
+                AgentMeta {
+                    id: "CapTwo".into(),
+                    agent: Some("task".into()),
+                    model: Some("fake/fake-1".into()),
+                    thinking: None,
+                },
+            ]
+        };
+        let mut h = Harness::with_frames("wait-enrich", &[card_ops("wait")]);
+        h.hide_duplicates = true;
+        h.agents = metas();
+        show_until(&mut h, "waiting on 2 jobs");
+        for _ in 0..8 {
+            h.frame(vec![]);
+        }
+        let out = h.frame(vec![]);
+        let chips: Vec<_> = galleys(&out)
+            .into_iter()
+            .filter(|g| g.2 == "fake/fake-1")
+            .collect();
+        assert_eq!(chips.len(), 2, "each tile shows its model chip");
+        let cap = centre_of(&out, "CapOne").expect("tile title");
+        assert!(
+            chips.iter().any(|(p, s, _)| (p.y - cap.y).abs() < s.y),
+            "the chip rides the tile's own line, right-aligned"
+        );
+        // No agent data: the rows are omp's bare dot/title/clock.
+        let mut bare = Harness::with_frames("wait-bare", &[card_ops("wait")]);
+        bare.hide_duplicates = true;
+        show_until(&mut bare, "waiting on 2 jobs");
+        for _ in 0..8 {
+            bare.frame(vec![]);
+        }
+        let out = bare.frame(vec![]);
+        assert!(
+            galleys(&out).iter().all(|g| g.2 != "fake/fake-1"),
+            "without the snapshot no chip appears"
+        );
+    }
+
+    #[test]
+    fn recorded_task_card_expands_on_click_and_shows_its_agents() {
+        // Real omp 18.16.0 capture: a collapsed background `Task · 2 agents` card whose
+        // agents carry name/type/model. Clicking the head expands it (a `toggle` event
+        // with the new state goes to omp) and the agent rows appear.
+        let mut h = Harness::with_frames("task-expand", &[card_ops("task")]);
+        h.hide_duplicates = true;
+        let out = show_until(&mut h, "Task");
+        assert!(
+            centre_of(&out, "CapOne").is_none(),
+            "collapsed: no agent rows"
+        );
+        let at = centre_of(&out, "Task").expect("task head");
+        click_at(&mut h, at);
+        let out = show_until(&mut h, "CapOne");
+        for want in ["CapOne", "CapTwo", "fake/fake-1"] {
+            assert!(
+                centre_of(&out, want).is_some(),
+                "expanded: {want} is painted"
+            );
+        }
+        let typed = h.typed(b"\"collapsed\":false");
+        let text = String::from_utf8_lossy(&typed);
+        assert!(
+            text.contains("\"ev\":\"toggle\"") && text.contains("cap-t"),
+            "the toggle event reaches omp: {text:?}"
+        );
+    }
+
+    #[test]
+    fn recorded_task_card_stays_open_across_live_updates() {
+        // The card above keeps streaming (stats ticks re-render it) while expanded: a
+        // prop update that leaves `collapsed` alone must not snap it shut again.
+        let ops = serde_json::json!([["set", "cap-t", {"stats": {"age": 9876}}]]);
+        let mut h = Harness::with_frames_later("task-holds", &[card_ops("task")], &[ops]);
+        h.hide_duplicates = true;
+        let out = show_until(&mut h, "Task");
+        click_at(&mut h, centre_of(&out, "Task").expect("task head"));
+        show_until(&mut h, "CapOne");
+        h.release_later();
+        let out = show_until(&mut h, "CapOne");
+        assert!(
+            centre_of(&out, "CapTwo").is_some(),
+            "still expanded after the live update"
+        );
     }
 
     #[test]

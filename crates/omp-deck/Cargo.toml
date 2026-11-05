@@ -24,9 +24,7 @@ dirs.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
-egui_commonmark.workspace = true
-# The chat view parses assistant markdown itself (line height, selectable runs, streaming); the version
-# egui_commonmark already pulls in.
+# The chat view parses assistant markdown itself (line height, selectable runs, streaming).
 pulldown-cmark = { version = "0.13", default-features = false }
 # Chat view syntax highlighting: pure Rust (fancy-regex, no onig); the syntaxes are bat's set (TypeScript, TOML,
 # ...) from two-face, scopes are mapped onto the active style's palette, never to syntect themes.
