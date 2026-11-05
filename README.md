@@ -9,10 +9,11 @@ A native desktop home for omp — persistent coding sessions, parallel agents, a
   <a href="#requirements"><img alt="Platforms: Linux | Windows" src="https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-blue"></a>
 </p>
 
-<img src="docs/images/hero.png" alt="OmpDeck's Blueprint desktop with project sidebar, an omp session and the status bar" width="100%">
+<img src="docs/images/hero.png" alt="OmpDeck's chat view in the Slate Ink style: project sidebar, an omp session drawn as a native conversation with tool cards, and the status bar" width="100%">
 
 OmpDeck is a native Rust / egui desktop app for [`omp`](https://github.com/can1357/oh-my-pi) (oh-my-pi),
-the coding-agent TUI, with a project sidebar and fully interactive terminal tabs.
+the coding-agent TUI, with a project sidebar and session tabs that show omp as a native chat view (the default)
+or as a fully interactive terminal.
 Sessions run outside the app in a dedicated tmux server or OmpDeck's own session host, so closing a tab
 or the whole app leaves omp running.
 It runs on Linux and Windows 10 (1809+) / 11, with arm64 builds on a best-effort basis.
@@ -26,19 +27,23 @@ A shipped phone companion lets you work with the same sessions through a self-ho
 
 <table>
   <tr>
-    <td><img src="docs/images/split.png" alt="Two omp sessions side by side in split view" width="100%"><br><b>Split view</b> — work across sessions.</td>
+    <td><img src="docs/images/split.png" alt="Two omp sessions side by side in split view, both in the chat view" width="100%"><br><b>Split view</b> — work across sessions.</td>
     <td><img src="docs/images/agents.png" alt="Agents dashboard with session and subagent activity" width="100%"><br><b>Agents dashboard</b> — follow parallel work.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/model-picker.png" alt="Model picker with favorites, model roles and thinking levels over the chat view" width="100%"><br><b>Model picker</b> — switch model and thinking.</td>
+    <td><img src="docs/images/terminal.png" alt="The same session in the terminal view, showing omp's own TUI" width="100%"><br><b>Terminal view</b> — omp's own TUI, one switch away.</td>
   </tr>
   <tr>
     <td><img src="docs/images/tree.png" alt="Session tree with conversation branches" width="100%"><br><b>Session tree</b> — navigate and fork.</td>
     <td><img src="docs/images/sessions.png" alt="Session manager with sortable session records" width="100%"><br><b>Session manager</b> — inspect and organize.</td>
   </tr>
   <tr>
-    <td><img src="docs/images/changes.png" alt="Changes panel showing a diff and review comment" width="100%"><br><b>Changes</b> — review and send feedback.</td>
+    <td><img src="docs/images/changes.png" alt="Changes panel showing a diff and review comment next to the chat view" width="100%"><br><b>Changes</b> — review and send feedback.</td>
     <td><img src="docs/images/palette.png" alt="Command palette listing OmpDeck actions" width="100%"><br><b>Command palette</b> — find any action.</td>
   </tr>
   <tr>
-    <td><img src="docs/images/styles.png" alt="The same window in the Neon, Ember, Indigo Night and Phosphor styles" width="100%"><br><b>18 styles</b> — Neon, Ember, Indigo Night and Phosphor shown.</td>
+    <td><img src="docs/images/styles.png" alt="The chat view in the Blueprint, Neon, Ember and Phosphor styles" width="100%"><br><b>18 styles</b> — Blueprint (default), Neon, Ember and Phosphor shown.</td>
     <td><img src="docs/images/mobile-access.png" alt="Mobile access settings with relay and paired phone" width="100%"><br><b>Mobile access</b> — pair your phone.</td>
   </tr>
 </table>
