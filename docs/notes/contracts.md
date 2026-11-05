@@ -1870,6 +1870,20 @@ Recon facts with file:line evidence: `docs/notes/wave15.md`.
   tab is the active one with live control (activate it first if it is open); for a session without a tab the
   popup is read-only with "Open session for live control".
 - The old right-panel hub UI is removed (dead code deleted); its subagent card renderer and view model are reused.
+- Subagent order (tree mode, `agent_model::visible`): at each sibling level the subtrees holding a running agent
+  come first; snapshot order (newest sibling first) is kept inside both groups. Flat mode: running first.
+- **Deleting subagents** (user-approved: stop + remove files, irreversible): per card "Clean up" (every non-advisor
+  subagent that is not running and has no running descendant; `keep_running: true`), "Select" mode with checkboxes
+  (Shift range, select all) + "Delete…", and a per-row hover trash / context-menu "Delete agent…"
+  (`keep_running: false`). Danger confirm bound to (tab uid, ctl key, session path), revalidated on confirm. Only
+  for cards of a session tab with live control — any tab, not just the active one (`Mutation::Ctl` with that tab's
+  own target and session file as `root`). Sends `CtlCommand::DeleteAgents { root, agents: Vec<DeleteTarget { id,
+  transcript }>, keep_running }` with the top-most targets (a parent covers its nested agents); reply `value` =
+  `DeleteOutcome { deleted, skipped: [{id, reason}] }`. Extension (`delete_agents`): root check; target validated
+  (transcript inside the root's artifact dir, stem = id, advisors refused); `keep_running` skips a target when it or a
+  nested agent runs in omp; otherwise nested-first abort (running) + `lifecycle.release` (unregisters), then removes
+  `<id>.jsonl`, `.jsonl.tombstone`, `.md`, `.patch`, `.nested-*.patch` and the `<id>/` dir (symlinks unlinked, never
+  followed). Sessions started before this release answer `unknown cmd` → "restart with live control".
 
 ### omp-deck — review comments (Changes panel)
 - Diff rows become clickable: hover shows a "+" in the gutter; click opens an inline multi-line comment editor
@@ -3093,7 +3107,10 @@ deleted).
   plugins > bundled, so a file of a built-in's name replaces it. Extension/plugin agents are not listed.
   `discover(agent_dir, cwds)` → `Catalog{dirs, bare_roots, settings}`: the user `AgentDir` first (even when
   missing), then project dirs deduped and sorted; `bare_roots` = project cwds with no `.omp/agents` above them
-  (where a new project agent would go: `<cwd>/.omp/agents`).
+  (where a new project agent would go: `<cwd>/.omp/agents`). Project dirs also include the existing
+  `.omp/agents` of each cwd's subfolders (breadth-first, ≤ 3 levels below, ≤ 2000 directories read per cwd, not
+  into hidden folders, `node_modules`, `target` or symlinks; omp's global `.omp` = `agent_dir`'s parent
+  skipped). omp applies such a dir only to sessions started at or below its folder; the page says so.
 - Built-ins: `Omp::bundled_agent_sources()` runs `omp agents unpack --dir <temp dir> --json` and reads back only
   the `written` files directly in that temp dir (removed afterwards); `bundled(&[(file, content)])` parses them
   like files into an `AgentDir{scope: Scope::Bundled}` under pseudo paths `omp:bundled/<file>` (`BUNDLED_PREFIX`,

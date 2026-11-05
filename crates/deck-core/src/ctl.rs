@@ -508,6 +508,18 @@ pub enum CtlCommand {
         provider: String,
         credential: Option<String>,
     },
+    /// Delete subagents of the live tab's session for good: each target (and every agent nested
+    /// under it) is aborted if running, released and unregistered from omp's registry, then its
+    /// files are removed (`<id>.jsonl`, `.jsonl.tombstone`, `.md`, `.patch`, `.nested-*.patch`
+    /// and the `<id>/` directory of nested agents and artifacts). With `keep_running`, a target
+    /// that is running in omp — or has a running nested agent — is skipped instead. Advisor
+    /// transcripts are never deleted. Reply `value` = [`DeleteOutcome`]; `ok: false` only when
+    /// the whole command is refused (`session changed`, older extension: `unknown cmd`).
+    DeleteAgents {
+        root: PathBuf,
+        agents: Vec<DeleteTarget>,
+        keep_running: bool,
+    },
 }
 
 /// How much of the branch left behind by [`CtlCommand::Navigate`] omp summarises into the new
@@ -521,6 +533,38 @@ pub enum BranchSummary {
     Summarize,
     /// "Summarize with custom prompt": these instructions steer the summary.
     Custom(String),
+}
+
+/// One subagent [`CtlCommand::DeleteAgents`] removes: its id and transcript, as scanned
+/// (`AgentSummary::{id, path}`). The extension refuses a transcript outside the root session's
+/// artifact directory or whose file stem is not `id`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeleteTarget {
+    pub id: String,
+    pub transcript: PathBuf,
+}
+
+/// What [`CtlCommand::DeleteAgents`] did, from the reply's `value`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeleteOutcome {
+    /// Requested ids whose agent and files are gone.
+    pub deleted: Vec<String>,
+    /// Requested ids left alone, with why (`running`, `not found`, `advisor`, `outside session`,
+    /// or the error that stopped it).
+    pub skipped: Vec<SkippedAgent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkippedAgent {
+    pub id: String,
+    pub reason: String,
+}
+
+impl DeleteOutcome {
+    /// The outcome carried by a successful reply; `None` when the reply has none (refused).
+    pub fn of(reply: &CtlReply) -> Option<DeleteOutcome> {
+        serde_json::from_value(reply.value.clone()?).ok()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -903,6 +947,18 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
             credential,
         } => {
             serde_json::json!({"rid": rid, "t": "pin_account", "root": root, "provider": provider, "credentialId": credential})
+        }
+        CtlCommand::DeleteAgents {
+            root,
+            agents,
+            keep_running,
+        } => {
+            let agents: Vec<_> = agents
+                .iter()
+                .map(|a| serde_json::json!({"id": a.id, "file": a.transcript}))
+                .collect();
+            serde_json::json!({"rid": rid, "t": "delete_agents", "root": root,
+                "agents": agents, "keepRunning": keep_running})
         }
     };
     let mut line = v.to_string().into_bytes();

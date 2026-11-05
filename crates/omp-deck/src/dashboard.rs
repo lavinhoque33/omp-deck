@@ -17,12 +17,13 @@ use deck_core::ctl::LiveSnapshot;
 use deck_core::fleet::FleetSnapshot;
 use egui::text::LayoutJob;
 use egui::{
-    Align, Align2, Color32, CursorIcon, Frame, Galley, Id, Margin, Painter, Rect, RichText,
+    Align, Align2, Color32, CursorIcon, Frame, Galley, Id, Layout, Margin, Painter, Rect, RichText,
     ScrollArea, Sense, Sides, Stroke, StrokeKind, TextEdit, Ui, UiBuilder, pos2, vec2,
 };
 
 use crate::agent_ctl::{CtlView, Link, Restart};
-use crate::agent_hub::{self, RowAction, RowsInput, RowsState};
+use crate::agent_hub::{self, Manage, RowAction, RowsInput, RowsState};
+use crate::agent_manage::{self, Gate, Plan, Scope, Select};
 use crate::agent_model::AgentsView;
 use crate::badge::{self, Badge, Hue};
 use crate::dashboard_model::{
@@ -31,14 +32,17 @@ use crate::dashboard_model::{
     card_height, columns, layout, visible,
 };
 use crate::icons::{
-    ICON_BRAIN, ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CPU, ICON_FOLDER,
-    ICON_FOLDER_GIT_2, ICON_GIT_BRANCH, ICON_LIST, ICON_LIST_TREE, ICON_NETWORK, ICON_SEARCH,
-    ICON_SPARKLES, ICON_TERMINAL, ICON_X, Icon,
+    ICON_BRAIN, ICON_BROOM, ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CPU,
+    ICON_FOLDER, ICON_FOLDER_GIT_2, ICON_GIT_BRANCH, ICON_LIST, ICON_LIST_CHECKS, ICON_LIST_TREE,
+    ICON_NETWORK, ICON_SEARCH, ICON_SPARKLES, ICON_TERMINAL, ICON_TRASH_2, ICON_X, Icon,
 };
+use crate::sessions_view::paint_checkbox;
 use crate::statusbar::level_color;
 use crate::tabs::paint_status;
 use crate::theme::{self, Palette, acc, skin};
-use crate::widgets::{Spin, empty_state, icon_text, paint_icon};
+use crate::widgets::{
+    DRAFT_BELOW, DraftButton, DraftKind, Spin, draft_height, empty_state, icon_text, paint_icon,
+};
 use crate::{card, tips};
 use deck_core::config::UiStyle;
 use deck_service::statusfmt::ContextLevel;
@@ -55,6 +59,33 @@ pub struct SessionAgents {
     snap: Arc<AgentsSnapshot>,
     pub view: AgentsView,
     pub rows: RowsState,
+}
+
+/// What the card of one session offers for deleting its subagents: select mode with its checked
+/// rows, and the clean-up plan, both against the session's current agents.
+#[derive(Default)]
+struct ManageState {
+    selecting: bool,
+    sel: Select,
+    /// The session and view version `sel` was pruned and `cleanup` computed for.
+    synced: Option<(PathBuf, u64)>,
+    cleanup: Plan,
+}
+
+impl ManageState {
+    fn sync(&mut self, session: &Path, view: &AgentsView) {
+        if matches!(&self.synced, Some((p, v)) if p == session && *v == view.version) {
+            return;
+        }
+        self.synced = Some((session.to_path_buf(), view.version));
+        let checked = !self.sel.is_empty();
+        self.sel.prune(view.agents());
+        // Everything that was checked is gone (deleted): nothing left to act on.
+        if checked && self.sel.is_empty() {
+            self.selecting = false;
+        }
+        self.cleanup = agent_manage::cleanup(view.agents());
+    }
 }
 
 /// Dashboard state owned by the app.
@@ -81,6 +112,10 @@ pub struct DashState {
     order_key: Option<u64>,
     grid: Grid,
     grid_key: Option<u64>,
+    manage: HashMap<CardKey, ManageState>,
+    /// Cards with a delete request in flight (kept when the dashboard closes: the reply still
+    /// arrives).
+    pub deleting: HashSet<CardKey>,
 }
 
 impl Default for DashState {
@@ -104,6 +139,8 @@ impl Default for DashState {
             order_key: None,
             grid: Grid::default(),
             grid_key: None,
+            manage: HashMap::new(),
+            deleting: HashSet::new(),
         }
     }
 }
@@ -140,11 +177,36 @@ impl DashState {
         self.grid_key = None;
         self.scroll_to = None;
         self.counts = [0; 4];
+        self.manage.clear();
+    }
+
+    /// Some card is in select mode.
+    pub fn selecting(&self) -> bool {
+        self.manage.values().any(|m| m.selecting)
+    }
+
+    /// Leaves select mode on every card and forgets what was checked (Esc).
+    pub fn cancel_selecting(&mut self) {
+        for m in self.manage.values_mut() {
+            m.selecting = false;
+            m.sel.clear();
+        }
+    }
+
+    /// `ids` of this card are gone: uncheck them; select mode ends once nothing is left checked.
+    pub fn forget_deleted(&mut self, key: &CardKey, ids: &[String]) {
+        if let Some(m) = self.manage.get_mut(key) {
+            m.sel.remove(ids);
+            if m.sel.is_empty() {
+                m.selecting = false;
+            }
+        }
     }
 
     /// Installs freshly built cards (and the fleet they came from).
     pub fn set_cards(&mut self, cards: Vec<Card>, fleet: Option<Arc<FleetSnapshot>>, sig: u64) {
         self.counts = FILTERS.map(|f| cards.iter().filter(|c| f.admits(c.status)).count());
+        self.manage.retain(|k, _| cards.iter().any(|c| &c.key == k));
         self.cards = cards;
         self.cards_ver += 1;
         self.sig = Some(sig);
@@ -246,6 +308,14 @@ pub enum DashAction {
     },
     Kill(String),
     Revive(String),
+    /// Ask to delete subagents of a card's session: the plan was computed against what the card
+    /// showed; the app confirms first.
+    Delete {
+        key: CardKey,
+        session: PathBuf,
+        plan: Plan,
+        scope: Scope,
+    },
     /// Restart the active session with live control.
     Restart,
 }
@@ -255,6 +325,8 @@ pub struct DashInput<'a> {
     pub ctl_active: &'a CtlView<'a>,
     /// Read-only stand-in for every other session.
     pub ctl_idle: &'a CtlView<'a>,
+    /// What each card's agents may be deleted through (absent: no controls).
+    pub gates: &'a HashMap<CardKey, Gate>,
     /// The subagent whose popup is open: `(session, id)`.
     pub popup: Option<(&'a Path, &'a str)>,
 }
@@ -526,6 +598,7 @@ fn grid(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>, out: &mut Vec<Da
         tree,
         cards_ver,
         scroll_to,
+        manage,
         ..
     } = st;
     let tree = *tree;
@@ -555,6 +628,8 @@ fn grid(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>, out: &mut Vec<Da
                 ui.visuals().dark_mode,
                 theme::style().key(),
                 theme::ui_font().key(),
+                input.gates.len(),
+                tools_h().round() as i32,
             ));
             if *grid_key != Some(key) {
                 let items: Vec<Item> = order
@@ -575,7 +650,12 @@ fn grid(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>, out: &mut Vec<Da
                             } else {
                                 0.0
                             };
-                            height += g.pad_top + note_h + rows_h + g.pad_bottom;
+                            let tools_h = if input.gates.contains_key(&card.key) {
+                                tools_h() + SECTION_GAP
+                            } else {
+                                0.0
+                            };
+                            height += g.pad_top + note_h + tools_h + rows_h + g.pad_bottom;
                         }
                         Item { height, wide: open }
                     })
@@ -616,8 +696,10 @@ fn grid(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>, out: &mut Vec<Da
                     },
                     note: note.filter(|_| card.active),
                     popup: input.popup,
+                    gate: input.gates.get(&card.key).copied(),
                 };
-                if let Some(k) = paint_card(ui, card, sa, &paint, out) {
+                let ms = open.then(|| manage.entry(card.key.clone()).or_default());
+                if let Some(k) = paint_card(ui, card, sa, ms, &paint, out) {
                     toggled = Some(k);
                 }
             }
@@ -637,6 +719,8 @@ struct CardPaint<'a> {
     ctl: &'a CtlView<'a>,
     note: Option<&'static str>,
     popup: Option<(&'a Path, &'a str)>,
+    /// Deleting is offered (absent: no controls on this card).
+    gate: Option<Gate>,
 }
 
 fn status_color(pal: &Palette, s: Status) -> Color32 {
@@ -688,6 +772,7 @@ fn paint_card(
     ui: &mut Ui,
     card: &Card,
     sa: Option<&mut SessionAgents>,
+    mut ms: Option<&mut ManageState>,
     c: &CardPaint<'_>,
     out: &mut Vec<DashAction>,
 ) -> Option<CardKey> {
@@ -1171,6 +1256,16 @@ fn paint_card(
                 }
                 y += NOTE_H + SECTION_GAP;
             }
+            let session = card.session.clone().unwrap_or_default();
+            if let (Some(gate), Some(ms)) = (c.gate, ms.as_deref_mut()) {
+                ms.sync(&session, &sa.view);
+                let r = Rect::from_min_size(
+                    pos2(rect.left() + g.rows_l, y),
+                    vec2(rect.width() - g.rows_l - g.rows_r, tools_h()),
+                );
+                tools_strip(ui, r, ms, gate, &*sa, &card.key, &session, out);
+                y += tools_h() + SECTION_GAP;
+            }
             let inner = Rect::from_min_max(
                 pos2(rect.left() + g.rows_l, y),
                 pos2(rect.right() - g.rows_r, rect.bottom() - g.foot),
@@ -1185,7 +1280,6 @@ fn paint_card(
                     rect.bottom() - g.foot - g.pad_bottom,
                 );
             }
-            let session = card.session.clone().unwrap_or_default();
             let selected = c
                 .popup
                 .filter(|(s, _)| *s == session.as_path())
@@ -1198,17 +1292,41 @@ fn paint_card(
                         tree: c.tree,
                         selected,
                         ctl: c.ctl,
+                        manage: c.gate.map(|gate| Manage {
+                            gate,
+                            select: ms.as_deref().filter(|m| m.selecting).map(|m| &m.sel),
+                        }),
                     };
                     agent_hub::rows(ui, &mut sa.rows, &input, inner.width(), &mut rows);
                     for a in rows {
-                        out.push(match a {
-                            RowAction::Open(id) => DashAction::Agent {
+                        match a {
+                            RowAction::Open(id) => out.push(DashAction::Agent {
                                 session: session.clone(),
                                 id,
-                            },
-                            RowAction::Kill(id) => DashAction::Kill(id),
-                            RowAction::Revive(id) => DashAction::Revive(id),
-                        });
+                            }),
+                            RowAction::Kill(id) => out.push(DashAction::Kill(id)),
+                            RowAction::Revive(id) => out.push(DashAction::Revive(id)),
+                            RowAction::Delete(id) => {
+                                let plan = agent_manage::selected(
+                                    sa.view.agents(),
+                                    &HashSet::from([id.clone()]),
+                                );
+                                if !plan.is_empty() {
+                                    out.push(DashAction::Delete {
+                                        key: card.key.clone(),
+                                        session: session.clone(),
+                                        plan,
+                                        scope: Scope::One(id),
+                                    });
+                                }
+                            }
+                            RowAction::Toggle { id, shift } => {
+                                if let Some(ms) = ms.as_deref_mut() {
+                                    let order = sa.rows.selectable_ids(sa.view.agents());
+                                    ms.sel.click(&order, &id, shift);
+                                }
+                            }
+                        }
                     }
                 });
             });
@@ -1221,6 +1339,185 @@ fn paint_card(
         out.push(DashAction::OpenCard(card.key.clone()));
     }
     toggled
+}
+
+/// Height of the select / clean-up strip above a card's subagent rows (a drafted button and the
+/// base shadow it paints below itself).
+fn tools_h() -> f32 {
+    draft_height() + DRAFT_BELOW
+}
+
+/// Cards narrower than this drop the optional words of the strip (the "Clear" link, the
+/// "Deleting…" label).
+const STRIP_ROOMY: f32 = 330.0;
+
+/// A line of strip text, centered on the buttons' height.
+fn strip_text(ui: &mut Ui, text: &str, color: Color32) {
+    let g = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), theme::label_font(12.0), color);
+    let (r, _) = ui.allocate_exact_size(vec2(g.size().x, draft_height()), Sense::hover());
+    ui.painter()
+        .galley(pos2(r.left(), r.center().y - g.size().y / 2.0), g, color);
+}
+
+/// The row of controls above a card's subagents: Select / Clean up, or in select mode the
+/// select-all box, the count, Clear, Cancel and Delete. Its height is fixed ([`tools_h`]), so the
+/// card's geometry never depends on the mode.
+#[allow(clippy::too_many_arguments)]
+fn tools_strip(
+    ui: &mut Ui,
+    rect: Rect,
+    ms: &mut ManageState,
+    gate: Gate,
+    sa: &SessionAgents,
+    key: &CardKey,
+    session: &Path,
+    out: &mut Vec<DashAction>,
+) {
+    let pal = Palette::of_ui(ui);
+    let roomy = rect.width() >= STRIP_ROOMY;
+    let agents = sa.view.agents();
+    ui.scope_builder(
+        UiBuilder::new()
+            .id_salt(("agent-tools", key))
+            .max_rect(rect)
+            .layout(Layout::left_to_right(Align::Min)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            // What a disabled control says when hovered.
+            let tip = |r: egui::Response, on: &str| {
+                r.on_hover_text(if gate.ready() { on } else { gate.why() })
+            };
+            if !ms.selecting {
+                let select = DraftButton::new("Select")
+                    .icon(ICON_LIST_CHECKS)
+                    .enabled(gate.ready())
+                    .show(ui);
+                if tip(select, "Check subagents to delete several at once").clicked() {
+                    ms.selecting = true;
+                }
+                let n = ms.cleanup.total;
+                let label = if n > 0 && gate != Gate::Busy {
+                    format!("Clean up ({n})")
+                } else {
+                    "Clean up".to_owned()
+                };
+                let nothing = ms.cleanup.is_empty();
+                let clean = DraftButton::new(&label)
+                    .icon(ICON_BROOM)
+                    .enabled(gate.ready() && !nothing)
+                    .show(ui);
+                let on = if nothing {
+                    "Nothing to clean up: every subagent is running or has a running child"
+                } else {
+                    "Delete every subagent that is not running…"
+                };
+                if tip(clean, on).clicked() && gate.ready() && !nothing {
+                    out.push(DashAction::Delete {
+                        key: key.clone(),
+                        session: session.to_path_buf(),
+                        plan: ms.cleanup.clone(),
+                        scope: Scope::CleanUp,
+                    });
+                }
+            } else {
+                let order = sa.rows.selectable_ids(agents);
+                let (cr, cb) = ui.allocate_exact_size(vec2(22.0, draft_height()), Sense::click());
+                paint_checkbox(
+                    ui.painter(),
+                    pos2(cr.center().x, cr.center().y),
+                    ms.sel.check(&order),
+                    cb.hovered(),
+                    pal,
+                );
+                if cb
+                    .on_hover_text("Select or unselect every agent in the list")
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    ms.sel.toggle_all(&order);
+                }
+                let n = ms.sel.len();
+                strip_text(
+                    ui,
+                    &if n == 0 {
+                        "None selected".to_owned()
+                    } else {
+                        format!("{n} selected")
+                    },
+                    if n == 0 { pal.weak } else { pal.text_strong },
+                );
+                if n > 0 && roomy {
+                    let (r, resp) =
+                        ui.allocate_exact_size(vec2(40.0, draft_height()), Sense::click());
+                    let col = if resp.hovered() {
+                        pal.text_strong
+                    } else {
+                        pal.weak
+                    };
+                    let g = ui.painter().layout_no_wrap(
+                        "Clear".to_owned(),
+                        theme::label_font(12.0),
+                        col,
+                    );
+                    ui.painter()
+                        .galley(pos2(r.left(), r.center().y - g.size().y / 2.0), g, col);
+                    if resp
+                        .on_hover_text("Uncheck everything")
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        ms.sel.clear();
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let plan = agent_manage::selected(agents, ms.sel.ids());
+                    let delete = DraftButton::new("Delete…")
+                        .icon(ICON_TRASH_2)
+                        .kind(DraftKind::Danger)
+                        .enabled(gate.ready() && !plan.is_empty())
+                        .show(ui);
+                    let on = if plan.is_empty() {
+                        "Check at least one agent"
+                    } else {
+                        "Delete the checked agents…"
+                    };
+                    if tip(delete, on).clicked() && gate.ready() && !plan.is_empty() {
+                        out.push(DashAction::Delete {
+                            key: key.clone(),
+                            session: session.to_path_buf(),
+                            plan,
+                            scope: Scope::Selected,
+                        });
+                    }
+                    let cancel = DraftButton::new("Cancel").show(ui);
+                    if cancel.on_hover_text("Leave select mode (Esc)").clicked() {
+                        ms.selecting = false;
+                        ms.sel.clear();
+                    }
+                    if gate == Gate::Busy {
+                        busy_mark(ui, pal, false);
+                    }
+                });
+            }
+            if gate == Gate::Busy && !ms.selecting {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    busy_mark(ui, pal, roomy);
+                });
+            }
+        },
+    );
+}
+
+/// The "a delete is in flight" mark of the strip: a spinner (and its word, in a roomy card).
+fn busy_mark(ui: &mut Ui, pal: &Palette, word: bool) {
+    let (r, _) = ui.allocate_exact_size(vec2(draft_height(), draft_height()), Sense::hover());
+    Spin::new(16.0, pal.accent_b).paint_at(ui, r.center());
+    if word {
+        strip_text(ui, "Deleting…", pal.weak);
+    }
 }
 
 /// Hover card of a session card: id, folder, branch, model and session file.
@@ -1307,4 +1604,191 @@ fn note_strip(ui: &mut Ui, rect: Rect, text: &str, ctl: &CtlView<'_>) -> bool {
         pal.weak,
     );
     pressed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dashboard_model::{CardSrc, Extra};
+    use deck_core::agents::AgentStatus;
+    use deck_core::config::{Density, UiFont, UiStyle};
+    use deck_core::fleet::FleetSession;
+
+    fn agent(id: &str, parent: Option<&str>, status: AgentStatus) -> AgentSummary {
+        AgentSummary {
+            id: id.to_owned(),
+            parent_id: parent.map(str::to_owned),
+            depth: usize::from(parent.is_some()),
+            path: PathBuf::from(format!("/s/{id}.jsonl")),
+            advisor: false,
+            agent: Some("task".to_owned()),
+            model: None,
+            thinking: None,
+            task_gist: format!("work on {id}"),
+            task: String::new(),
+            status,
+            error: None,
+            current: None,
+            created: None,
+            last_activity: None,
+            duration: None,
+            requests: 1,
+            tool_calls: 1,
+            tokens: 10,
+            cost: 0.0,
+            context_tokens: None,
+            output_path: None,
+        }
+    }
+
+    struct Harness {
+        ctx: egui::Context,
+        st: DashState,
+        key: CardKey,
+    }
+
+    fn harness() -> Harness {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::install(&ctx, crate::ui_fonts::UiFonts::none());
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .textures_delta
+            .clear();
+        crate::ui_fonts::finalize(&ctx);
+        let key = CardKey::Tab(1);
+        let session = PathBuf::from("/s/root.jsonl");
+        let now = SystemTime::UNIX_EPOCH;
+        let src = CardSrc {
+            key: key.clone(),
+            title: "root",
+            cwd: Path::new("/work"),
+            session: Some(session.as_path()),
+            id: "root",
+            status: Status::Idle,
+            activity_at: None,
+            active: false,
+        };
+        let card = Card::build(&src, None, &Extra::default(), now);
+        let agents = vec![
+            agent("Alpha", None, AgentStatus::Done),
+            agent("Alpha.Kid", Some("Alpha"), AgentStatus::Running),
+            agent("Beta", None, AgentStatus::Failed),
+            agent("Gamma", None, AgentStatus::Done),
+        ];
+        let fleet = FleetSnapshot {
+            sessions: vec![Arc::new(FleetSession {
+                session,
+                agents: Arc::new(agents),
+                ..FleetSession::default()
+            })],
+        };
+        let mut st = DashState::default();
+        st.show_with(Some(key.clone()));
+        st.set_cards(vec![card], Some(Arc::new(fleet)), 1);
+        st.update_views(None, now);
+        Harness { ctx, st, key }
+    }
+
+    fn frame(h: &mut Harness, gates: &HashMap<CardKey, Gate>) -> Vec<DashAction> {
+        let reqs = HashMap::new();
+        let errors = HashMap::new();
+        let ctl = CtlView {
+            link: Link::ReadOnly,
+            restart: crate::agent_ctl::Restart::Hidden,
+            reqs: &reqs,
+            errors: &errors,
+        };
+        let input = DashInput {
+            ctl_active: &ctl,
+            ctl_idle: &ctl,
+            gates,
+            popup: None,
+        };
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 1400.0))),
+            ..Default::default()
+        };
+        let mut actions = Vec::new();
+        let mut out = h.ctx.run_ui(raw, |ui| {
+            actions = show(ui, &mut h.st, &input);
+        });
+        out.textures_delta.clear();
+        actions
+    }
+
+    /// The grid's total height after three frames (layout settles over the first ones).
+    fn total(h: &mut Harness, gates: &HashMap<CardKey, Gate>) -> f32 {
+        for _ in 0..3 {
+            frame(h, gates);
+        }
+        h.st.grid.total
+    }
+
+    /// The strip adds exactly its fixed height to an open card, and neither select mode, a
+    /// checked row, a delete in flight nor a blocked card moves anything else.
+    #[test]
+    fn the_tools_strip_has_a_fixed_height_in_every_mode() {
+        for style in UiStyle::ALL {
+            // The style is process-global and other tests switch it: only a run whose style stayed
+            // ours from the first pass to the last counts.
+            let mut checked = false;
+            for _ in 0..50 {
+                let mut h = harness();
+                theme::apply(&h.ctx, style, Density::Comfortable, UiFont::Auto, true);
+                let applied = theme::applied();
+                let none = HashMap::new();
+                let bare = total(&mut h, &none);
+                let ready = HashMap::from([(h.key.clone(), Gate::Ready)]);
+                let with = total(&mut h, &ready);
+                let m = h.st.manage.entry(h.key.clone()).or_default();
+                m.selecting = true;
+                m.sel.click(&["Alpha", "Beta"], "Alpha", false);
+                let selecting = total(&mut h, &ready);
+                let busy = HashMap::from([(h.key.clone(), Gate::Busy)]);
+                let deleting = total(&mut h, &busy);
+                let blocked = HashMap::from([(h.key.clone(), Gate::Blocked(" - "))]);
+                let locked = total(&mut h, &blocked);
+                if theme::style() != style || theme::applied() != applied {
+                    continue;
+                }
+                assert!(
+                    (with - bare - (tools_h() + SECTION_GAP)).abs() < 0.01,
+                    "{style:?}: strip added {} (expected {})",
+                    with - bare,
+                    tools_h() + SECTION_GAP
+                );
+                for (name, t) in [
+                    ("selecting", selecting),
+                    ("deleting", deleting),
+                    ("blocked", locked),
+                ] {
+                    assert!(
+                        (t - with).abs() < 0.01,
+                        "{style:?}: {name} moved {with} -> {t}"
+                    );
+                }
+                checked = true;
+                break;
+            }
+            assert!(checked, "{style:?}: the global style kept changing");
+        }
+    }
+
+    #[test]
+    fn select_mode_paints_without_actions_and_cancels_cleanly() {
+        let mut h = harness();
+        theme::apply(
+            &h.ctx,
+            UiStyle::ALL[0],
+            Density::Comfortable,
+            UiFont::Auto,
+            true,
+        );
+        let ready = HashMap::from([(h.key.clone(), Gate::Ready)]);
+        assert!(frame(&mut h, &ready).is_empty());
+        h.st.manage.entry(h.key.clone()).or_default().selecting = true;
+        assert!(frame(&mut h, &ready).is_empty());
+        assert!(h.st.selecting());
+        h.st.cancel_selecting();
+        assert!(!h.st.selecting());
+    }
 }

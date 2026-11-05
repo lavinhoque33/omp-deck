@@ -68,6 +68,7 @@ use crate::usage_view;
 use crate::widgets::{empty_state, icon_text, menu_item};
 
 mod agent_config;
+mod agent_delete;
 mod agents;
 mod app_update;
 mod backup;
@@ -164,6 +165,8 @@ enum PendingConfirm {
         key: String,
         session: Option<PathBuf>,
     },
+    /// Delete subagents (and their files) of a session tab's card through the control link.
+    DeleteAgents(agent_delete::DeleteAsk),
     /// Restart a read-only tab's omp with the control extension (tab by `uid`).
     RestartLive {
         uid: u64,
@@ -2361,6 +2364,7 @@ impl App {
                 key,
                 session,
             } => self.confirm_kill_agent(id, uid, &key, session.as_deref()),
+            PendingConfirm::DeleteAgents(ask) => self.confirm_delete_agents(ask),
             PendingConfirm::RestartLive { uid, session } => {
                 self.execute_restart_live(uid, &session);
             }

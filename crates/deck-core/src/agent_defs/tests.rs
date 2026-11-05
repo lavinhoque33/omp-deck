@@ -246,6 +246,51 @@ fn discovery_follows_omp_precedence_dirs() {
 }
 
 #[test]
+fn discovery_lists_nested_project_dirs_within_bounds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    // omp's global dir lives inside the walked tree: its `.omp/agents` is no project's.
+    let agent = ws.join("home/.omp/agent");
+    let mk = |rel: &str| {
+        let d = ws.join(rel).join(".omp/agents");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("x.md"), "---\nname: x\ndescription: d\n---\nX").unwrap();
+    };
+    for rel in [
+        "a",
+        "a/b/c",
+        "a/b/c/d",
+        "node_modules/p",
+        "target/p",
+        ".hidden/p",
+        "home",
+    ] {
+        mk(rel);
+    }
+    fs::create_dir_all(&agent).unwrap();
+
+    let roots =
+        |cat: &Catalog| -> Vec<PathBuf> { cat.dirs[1..].iter().map(|d| d.root.clone()).collect() };
+    // Three levels down at most: `a/b/c/d` is four below `ws`.
+    let cat = discover(&agent, std::slice::from_ref(&ws));
+    assert_eq!(
+        roots(&cat),
+        vec![ws.join("a"), ws.join("a/b/c")],
+        "{cat:#?}"
+    );
+    assert!(cat.dirs[1..].iter().all(|d| d.scope == Scope::Project));
+    // Nested agents do not apply to the cwd itself: it stays a place to create one.
+    assert_eq!(cat.bare_roots, vec![ws.clone()]);
+
+    // Depth counts from each cwd; `ws/a`, found from both, is listed once.
+    let cat = discover(&agent, &[ws.clone(), ws.join("a")]);
+    assert_eq!(
+        roots(&cat),
+        vec![ws.join("a"), ws.join("a/b/c"), ws.join("a/b/c/d")]
+    );
+}
+
+#[test]
 fn save_checks_the_revision_and_the_path() {
     let tmp = tempfile::tempdir().unwrap();
     let agent = tmp.path().join("agent");

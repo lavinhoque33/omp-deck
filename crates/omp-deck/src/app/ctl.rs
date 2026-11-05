@@ -239,6 +239,18 @@ impl App {
                 .error(&self.ctx, "Live control is not connected for this tab");
             return false;
         };
+        self.ctl_command_to(target, command, done);
+        true
+    }
+
+    /// Sends `command` to the live-control socket of the session `target` (any tab's, not only
+    /// the active one); `done` gets omp's reply (or why none came).
+    pub(super) fn ctl_command_to(
+        &mut self,
+        target: SessionTarget,
+        command: CtlCommand,
+        done: impl FnOnce(&mut App, Result<CtlReply, String>) + 'static,
+    ) {
         self.gw
             .mutate(Mutation::Ctl { target, command }, move |app, result| {
                 done(
@@ -249,7 +261,6 @@ impl App {
                     }),
                 );
             });
-        true
     }
 
     /// Send a command addressed to the active tab's current session file.

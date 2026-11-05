@@ -151,8 +151,11 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
 
   Ctrl+Shift+A or the status-bar Agents chip shows one card per open tab and per session still
   running in the background, with its state (working, needs input, idle, ended), model, context use, cost,
-  tokens, changed files and last reply; expand a card to see its subagents and open their transcripts. Search and
-  filter by state; click a card to jump to that session.
+  tokens, changed files and last reply; expand a card to see its subagents and open their transcripts (running
+  subagents are listed first). Search and filter by state; click a card to jump to that session.
+  For tabs running with live control, **Clean up** stops and deletes every subagent that is not running, **Select**
+  lets you tick subagents (Shift+click for a range) and **Delete** them, and each row has a delete button on hover.
+  Deleting is permanent: omp stops tracking the agent and its transcript, output and nested agents are removed.
 
   </details>
 
@@ -216,7 +219,8 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
 
   Settings → Agents, or "Settings: Agents" in the palette shows omp's built-in agents (task,
   scout, reviewer, …) and every custom one omp finds, yours (`~/.omp/agent/agents`) and each project's
-  (`.omp/agents`). Enable or disable any agent (`task.disabledAgents`). Built-ins are read-only: pick a model
+  (`.omp/agents`, including those in its subfolders up to three levels down, which apply to sessions started in that
+  subfolder). Enable or disable any agent (`task.disabledAgents`). Built-ins are read-only: pick a model
   for one (written to `task.agentModelOverrides`; role aliases such as `@smol` show the model the role is set
   to) or **Customize** it, which copies it into your agents or a project's, where the copy replaces it. **New
   agent** creates a custom agent for you or for any project with sessions. For custom agents, pick the model

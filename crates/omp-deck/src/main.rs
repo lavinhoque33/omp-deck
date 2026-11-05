@@ -6,6 +6,7 @@ mod advisor_page;
 mod agent_config;
 mod agent_ctl;
 mod agent_hub;
+mod agent_manage;
 mod agent_model;
 mod agent_output;
 mod agent_popup;

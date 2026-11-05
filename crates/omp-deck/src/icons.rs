@@ -47,6 +47,7 @@ pub const ICON_BELL: Icon = Icon::new("\u{e059}");
 pub const ICON_BOOKMARK: Icon = Icon::new("\u{e060}");
 pub const ICON_BOT: Icon = Icon::new("\u{e1bb}");
 pub const ICON_BRAIN: Icon = Icon::new("\u{e3c6}");
+pub const ICON_BROOM: Icon = Icon::new("\u{e730}");
 pub const ICON_CHART_PIE: Icon = Icon::new("\u{e06b}");
 pub const ICON_CHECK: Icon = Icon::new("\u{e06c}");
 pub const ICON_CHEVRON_DOWN: Icon = Icon::new("\u{e06d}");

@@ -355,14 +355,24 @@ impl App {
 
     /// Esc closes the dashboard when nothing in front of it wants the key. True when consumed.
     pub(super) fn consume_dashboard_escape(&mut self, ctx: &egui::Context) -> bool {
-        self.dash.open
+        let free = self.dash.open
             && self.popup.is_none()
             && self.tree.is_none()
             && !self.usage_open
             && !self.sessions.open
             && !self.modal_open()
-            && !egui::Popup::is_any_open(ctx)
-            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+            && !egui::Popup::is_any_open(ctx);
+        if !free {
+            return false;
+        }
+        // Select mode first: Esc leaves it and the dashboard stays.
+        if self.dash.selecting() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.dash.cancel_selecting();
+            }
+            return false;
+        }
+        ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
     }
 
     /// Esc closes the popup, unless a menu is open (it takes the key first). True when consumed.
@@ -424,9 +434,11 @@ impl App {
             reqs: &no_reqs,
             errors: &no_errors,
         };
+        let gates = self.delete_gates();
         let input = DashInput {
             ctl_active: &ctl_active,
             ctl_idle: &ctl_idle,
+            gates: &gates,
             popup: self
                 .popup
                 .as_ref()
@@ -443,6 +455,12 @@ impl App {
                 DashAction::Agent { session, id } => self.open_dash_agent(&session, &id),
                 DashAction::Kill(id) => self.request_kill_agent(id),
                 DashAction::Revive(id) => self.send_ctl_revive(id),
+                DashAction::Delete {
+                    key,
+                    session,
+                    plan,
+                    scope,
+                } => self.request_delete_agents(key, session, plan, scope),
                 DashAction::Restart => self.request_restart_live(),
             }
         }

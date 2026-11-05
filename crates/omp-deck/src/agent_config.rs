@@ -1,5 +1,5 @@
 //! Settings → Agents: the task agents omp offers (see [`deck_core::agent_defs`]): its built-ins,
-//! the user's (`<agent dir>/agents`) and each known project's `.omp/agents`.
+//! the user's (`<agent dir>/agents`) and each known project's `.omp/agents` (its subfolders' too).
 //!
 //! - A definition file: its model (the status bar's model dropdown, written to the file's `model`
 //!   entry) and system prompt (the file's body) are edited in place; it can be deleted.
@@ -656,7 +656,8 @@ pub fn show(ui: &mut Ui, state: &mut AgentsState, input: &AgentsInput<'_>) -> Ve
         egui::Label::new(
             RichText::new(
                 "The task agents omp offers: its built-ins, yours and each project's \
-                 .omp/agents. Changes apply to the next task an agent runs, in running \
+                 .omp/agents (subfolders included; those apply to sessions started in that \
+                 subfolder). Changes apply to the next task an agent runs, in running \
                  sessions too.",
             )
             .color(pal.weak),

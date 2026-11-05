@@ -9,7 +9,8 @@ use std::sync::Arc;
 use crate::icons::Icon;
 use crate::icons::{
     ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_PAUSE,
-    ICON_CIRCLE_STOP, ICON_MOON_STAR, ICON_PLAY, ICON_REFRESH_CW, ICON_SQUARE, ICON_TRIANGLE_ALERT,
+    ICON_CIRCLE_STOP, ICON_MOON_STAR, ICON_PLAY, ICON_REFRESH_CW, ICON_SQUARE, ICON_TRASH_2,
+    ICON_TRIANGLE_ALERT,
 };
 use deck_core::agents::{AgentStatus, AgentSummary};
 use deck_core::ctl::LiveStatus;
@@ -18,9 +19,12 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Align2, Color32, CursorIcon, FontFamily, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 
 use crate::agent_ctl::{self, CtlView};
+use crate::agent_manage::{Gate, Select};
 use crate::agent_model::{self, AgentsView, CardView, MetricKind, status_label};
 use crate::badge::{Badge, Hue};
 use crate::icons::{ICON_BRAIN, ICON_CPU};
+use crate::sessions_model::Check;
+use crate::sessions_view::paint_checkbox;
 use crate::theme::{self, Palette};
 use crate::widgets::{Spin, paint_icon};
 
@@ -141,6 +145,16 @@ impl RowsState {
         self.total = y;
         y
     }
+
+    /// The rows that can be checked (advisors cannot), in display order, as last prepared.
+    pub fn selectable_ids<'a>(&self, agents: &'a [AgentSummary]) -> Vec<&'a str> {
+        self.order
+            .iter()
+            .filter_map(|&i| agents.get(i))
+            .filter(|a| !a.advisor)
+            .map(|a| a.id.as_str())
+            .collect()
+    }
 }
 
 pub enum RowAction {
@@ -148,6 +162,21 @@ pub enum RowAction {
     /// Ask to kill this agent (the app confirms first).
     Kill(String),
     Revive(String),
+    /// Ask to delete this agent and its files (the app confirms first).
+    Delete(String),
+    /// A row was clicked in select mode (`shift`: extend the range from the anchor).
+    Toggle {
+        id: String,
+        shift: bool,
+    },
+}
+
+/// Deleting and selecting, for a card whose session can offer them.
+#[derive(Clone, Copy)]
+pub struct Manage<'a> {
+    pub gate: Gate,
+    /// `Some` in select mode: the checked rows.
+    pub select: Option<&'a Select>,
 }
 
 pub struct RowsInput<'a> {
@@ -156,6 +185,7 @@ pub struct RowsInput<'a> {
     /// Agent whose popup is open (highlighted).
     pub selected: Option<&'a str>,
     pub ctl: &'a CtlView<'a>,
+    pub manage: Option<Manage<'a>>,
 }
 
 /// Paints the rows prepared by [`RowsState::prepare`] for the same `width` and mode, `width` wide
@@ -195,6 +225,12 @@ pub fn rows(
             tree_depth: tree.then_some(depth),
             selected: input.selected == Some(a.id.as_str()),
             act: card_act(input.ctl, a, c),
+            // An advisor's transcript is observability only: it is never deleted.
+            manage: input.manage.filter(|_| !a.advisor).map(|m| RowManage {
+                gate: m.gate,
+                selecting: m.select.is_some(),
+                checked: m.select.is_some_and(|s| s.contains(&a.id)),
+            }),
         };
         match card(
             ui,
@@ -208,6 +244,11 @@ pub fn rows(
             CardClick::ToggleChildren => toggled = Some(a.id.clone()),
             CardClick::Act(CardAct::Kill) => out.push(RowAction::Kill(a.id.clone())),
             CardClick::Act(CardAct::Revive) => out.push(RowAction::Revive(a.id.clone())),
+            CardClick::Delete => out.push(RowAction::Delete(a.id.clone())),
+            CardClick::Toggle { shift } => out.push(RowAction::Toggle {
+                id: a.id.clone(),
+                shift,
+            }),
             CardClick::None => {}
         }
     }
@@ -274,6 +315,8 @@ enum CardClick {
     Open,
     ToggleChildren,
     Act(CardAct),
+    Delete,
+    Toggle { shift: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -287,6 +330,16 @@ struct CardOpts {
     tree_depth: Option<usize>,
     selected: bool,
     act: Option<CardAct>,
+    manage: Option<RowManage>,
+}
+
+/// What one row offers for deleting.
+#[derive(Clone, Copy)]
+struct RowManage {
+    gate: Gate,
+    /// The card is in select mode: the row shows a checkbox and a click toggles it.
+    selecting: bool,
+    checked: bool,
 }
 
 fn card_act(ctl: &CtlView<'_>, a: &AgentSummary, c: &CardView) -> Option<CardAct> {
@@ -313,7 +366,10 @@ fn card(
         tree_depth,
         selected,
         act,
+        manage,
     } = opts;
+    let selecting = manage.is_some_and(|m| m.selecting);
+    let checked = manage.is_some_and(|m| m.checked);
     let (tree, depth) = (tree_depth.is_some(), tree_depth.unwrap_or(0));
     let pal = Palette::of_ui(ui);
     let sh = shown(pal, a.status, c.live);
@@ -356,7 +412,7 @@ fn card(
     } else {
         tint
     };
-    theme::acc::paint_sub(&p, id, pal, rect, hovered, selected, fill);
+    theme::acc::paint_sub(&p, id, pal, rect, hovered, selected || checked, fill);
     p.rect_filled(
         Rect::from_min_max(
             pos2(rect.left() + 1.0, rect.top() + 10.0),
@@ -408,14 +464,16 @@ fn card(
         )
     });
     // Model then thinking, as on the session card; thinking is dropped first when space is short.
-    let mut limit = right;
+    // Select mode keeps the checkbox's corner free.
+    let head_right = if selecting { right - 24.0 } else { right };
+    let mut limit = head_right;
     if let Some(b) = &model_badge
-        && x + id_w + 24.0 + b.width() < right
+        && x + id_w + 24.0 + b.width() < head_right
     {
         if let Some(t) = &thinking_badge
-            && x + id_w + 24.0 + b.width() + 6.0 + t.width() < right
+            && x + id_w + 24.0 + b.width() + 6.0 + t.width() < head_right
         {
-            let r = t.paint_at(&p, right - t.width(), mid);
+            let r = t.paint_at(&p, head_right - t.width(), mid);
             limit = r.left() - 6.0;
         }
         let r = b.paint_at(&p, limit - b.width(), mid);
@@ -466,6 +524,15 @@ fn card(
         p.rect_filled(r, 8, badge_fill);
         p.galley(pos2(x + 6.0, mid - g.size().y / 2.0), g, col);
         x += w + 6.0;
+    }
+    if selecting {
+        paint_checkbox(
+            &p,
+            pos2(right - 8.0, mid),
+            if checked { Check::All } else { Check::None },
+            hovered,
+            pal,
+        );
     }
     y += 22.0;
 
@@ -567,6 +634,42 @@ fn card(
         }
         rx = r.left() - 8.0;
     }
+    // Delete: always reserves its slot (the metric badges must not shift on hover); the glyph
+    // shows while the row is hovered.
+    if let Some(m) = manage.filter(|m| !m.selecting) {
+        let r = Rect::from_center_size(pos2(rx - 11.0, my), vec2(22.0, 22.0));
+        let b = ui.interact(r, id.with("del"), Sense::click());
+        let on = m.gate.ready();
+        if hovered || b.hovered() {
+            if b.hovered() && on {
+                p.rect_filled(r, 11, pal.danger.gamma_multiply(0.22));
+            }
+            paint_icon(
+                &p,
+                r.center(),
+                Align2::CENTER_CENTER,
+                ICON_TRASH_2,
+                16.0,
+                if on {
+                    pal.danger
+                        .gamma_multiply(if b.hovered() { 1.0 } else { 0.6 })
+                } else {
+                    pal.weak.gamma_multiply(0.6)
+                },
+            );
+        }
+        if on {
+            if b.on_hover_text("Delete this agent…")
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .clicked()
+            {
+                click = CardClick::Delete;
+            }
+        } else {
+            b.on_hover_text(m.gate.why());
+        }
+        rx = r.left() - 8.0;
+    }
     if tree && c.children > 0 {
         let label = c.children.to_string();
         let g = p.layout_no_wrap(label, crate::theme::font(11.5), pal.text);
@@ -618,7 +721,7 @@ fn card(
         bx += b.width() + 5.0;
     }
 
-    if act.is_some() {
+    if act.is_some() || manage.is_some() {
         resp.context_menu(|ui| {
             if let Some(act) = act {
                 let label = match act {
@@ -630,11 +733,29 @@ fn card(
                     ui.close();
                 }
             }
+            if let Some(m) = manage {
+                let b = ui.add_enabled(m.gate.ready(), egui::Button::new("Delete agent…"));
+                let b = if m.gate.ready() {
+                    b
+                } else {
+                    b.on_disabled_hover_text(m.gate.why())
+                };
+                if b.clicked() {
+                    click = CardClick::Delete;
+                    ui.close();
+                }
+            }
         });
     }
     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() && matches!(click, CardClick::None)
     {
-        click = CardClick::Open;
+        click = if selecting {
+            CardClick::Toggle {
+                shift: ui.input(|i| i.modifiers.shift),
+            }
+        } else {
+            CardClick::Open
+        };
     }
     click
 }

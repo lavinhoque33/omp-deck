@@ -156,8 +156,8 @@ impl App {
         self.ctx.request_repaint();
     }
 
-    /// Reread the agent definitions: the user's, those of every project with sessions, and
-    /// omp's built-ins.
+    /// Reread the agent definitions: the user's, those of every project with sessions (and of
+    /// its subfolders), and omp's built-ins.
     fn load_agents(&mut self) {
         let projects = self
             .groups()

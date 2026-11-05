@@ -127,6 +127,11 @@ Safety:
 - Pushes use the same shape on registry change (50 ms coalesced), on `task:subagent:progress`, and every 1 s while a client is connected.
 - Client → server: `{"rid":N,"t":"list"|"kill"|"revive"|"chat","id":"<AgentId>","text":"…"}`.
 - Replies: `{"t":"reply","rid":N,"ok":true,…}` or `{"ok":false,"error":"…"}`. `list` replies with `snapshot` inside the reply.
+- Agents dashboard delete: `{"t":"delete_agents","root":…,"agents":[{"id","file"}],"keepRunning":bool}`
+  → `{ok:true, value:{deleted:[ids], skipped:[{id, reason}]}}`. omp has no subagent delete of its own; the op is
+  abort (running) + `lifecycle.release(id, ref)` without tombstone (= unregister) + removing the transcript, its
+  sidecars and its nested `<id>/` dir, since a later persisted scan re-registers any transcript left on disk. Contract:
+  `docs/notes/contracts.md` "agents dashboard".
 
 ## Extension source (final version, throwaway, deleted)
 

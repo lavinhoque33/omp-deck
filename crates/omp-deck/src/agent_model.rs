@@ -85,9 +85,10 @@ impl Counts {
     }
 }
 
-/// Indices into `agents` in display order. Tree mode keeps snapshot order (parent before child)
-/// and hides collapsed subtrees. Flat mode lists everything: running first, then most recent
-/// activity.
+/// Indices into `agents` in display order. Tree mode keeps snapshot order (parent before child,
+/// depth-first) except that at every sibling level the subtrees holding a running agent come
+/// first (stable: the order inside each group is the snapshot's), and hides collapsed subtrees.
+/// Flat mode lists everything: running first, then most recent activity.
 pub fn visible(agents: &[AgentSummary], tree: bool, collapsed: &HashSet<String>) -> Vec<usize> {
     if !tree {
         let mut out: Vec<usize> = (0..agents.len()).collect();
@@ -111,7 +112,9 @@ pub fn visible(agents: &[AgentSummary], tree: bool, collapsed: &HashSet<String>)
             .as_deref()
             .and_then(|p| by_id.get(p).copied())
     };
-    (0..agents.len())
+    let order = running_first(agents, &parent);
+    order
+        .into_iter()
         .filter(|&i| {
             if collapsed.is_empty() {
                 return true;
@@ -131,6 +134,60 @@ pub fn visible(agents: &[AgentSummary], tree: bool, collapsed: &HashSet<String>)
             true
         })
         .collect()
+}
+
+/// Depth-first order of the whole forest with, at each sibling level, the subtrees that contain a
+/// running agent lifted in front of the others. Without a running agent that is the snapshot's
+/// own order, which is returned as it is.
+fn running_first(agents: &[AgentSummary], parent: &impl Fn(usize) -> Option<usize>) -> Vec<usize> {
+    let n = agents.len();
+    let mut lifted = vec![false; n];
+    for (i, a) in agents.iter().enumerate() {
+        if a.status != AgentStatus::Running {
+            continue;
+        }
+        // Mark the agent and its ancestors, stopping at the first one already marked.
+        let mut cur = Some(i);
+        let mut guard = n;
+        while let Some(c) = cur {
+            if lifted[c] || guard == 0 {
+                break;
+            }
+            lifted[c] = true;
+            guard -= 1;
+            cur = parent(c);
+        }
+    }
+    if !lifted.contains(&true) {
+        return (0..n).collect();
+    }
+    let mut kids: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut roots = Vec::new();
+    for i in 0..n {
+        match parent(i) {
+            Some(p) if p != i => kids[p].push(i),
+            _ => roots.push(i),
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let push_level = |stack: &mut Vec<usize>, level: &[usize]| {
+        // Popped from the back: push the not-lifted group first, each group reversed.
+        stack.extend(level.iter().rev().filter(|&&k| !lifted[k]));
+        stack.extend(level.iter().rev().filter(|&&k| lifted[k]));
+    };
+    push_level(&mut stack, &roots);
+    while let Some(i) = stack.pop() {
+        if std::mem::replace(&mut seen[i], true) {
+            continue;
+        }
+        out.push(i);
+        push_level(&mut stack, &kids[i]);
+    }
+    // A parent cycle has no root: keep such rows (in snapshot order) rather than lose them.
+    out.extend((0..n).filter(|&i| !seen[i]));
+    out
 }
 
 // ------------------------------------------------------------------ formatting
@@ -566,6 +623,91 @@ mod tests {
         let collapsed: HashSet<String> = ["Alpha.Kid".to_owned()].into();
         let v = visible(&a, true, &collapsed);
         assert_eq!(ids(&a, &v), ["Beta", "Beta.Leaf", "Alpha", "Alpha.Kid"]);
+    }
+
+    /// Two roots with a running descendant among quiet ones.
+    fn mixed() -> Vec<AgentSummary> {
+        use AgentStatus::{Done, Failed, Running};
+        vec![
+            agent("A", None, Done, 10),
+            agent("A1", Some("A"), Done, 11),
+            agent("A2", Some("A"), Running, 12),
+            agent("B", None, Done, 20),
+            agent("B1", Some("B"), Failed, 21),
+            agent("C", None, Running, 30),
+            agent("C1", Some("C"), Done, 31),
+            agent("D", None, Done, 40),
+        ]
+    }
+
+    #[test]
+    fn a_running_child_lifts_its_whole_parent_subtree() {
+        let a = mixed();
+        let v = visible(&a, true, &HashSet::new());
+        // A (holds A2) and C (runs) lead; inside A the running A2 precedes its quiet sibling;
+        // B and D keep their relative order behind them, each parent still before its child.
+        assert_eq!(ids(&a, &v), ["A", "A2", "A1", "C", "C1", "B", "B1", "D"]);
+    }
+
+    #[test]
+    fn without_a_running_agent_tree_order_is_the_snapshot_order() {
+        let mut a = mixed();
+        for x in &mut a {
+            x.status = AgentStatus::Done;
+        }
+        let v = visible(&a, true, &HashSet::new());
+        assert_eq!(v, (0..a.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_collapsed_subtree_stays_hidden_but_keeps_its_lifted_place() {
+        let a = mixed();
+        let collapsed: HashSet<String> = ["A".to_owned()].into();
+        let v = visible(&a, true, &collapsed);
+        assert_eq!(ids(&a, &v), ["A", "C", "C1", "B", "B1", "D"]);
+        let collapsed: HashSet<String> = ["C".to_owned(), "B".to_owned()].into();
+        let v = visible(&a, true, &collapsed);
+        assert_eq!(ids(&a, &v), ["A", "A2", "A1", "C", "B", "D"]);
+    }
+
+    #[test]
+    fn deep_running_agents_lift_every_ancestor_level() {
+        use AgentStatus::{Done, Running};
+        let a = vec![
+            agent("P", None, Done, 1),
+            agent("Q", None, Done, 2),
+            agent("Q.x", Some("Q"), Done, 3),
+            agent("Q.y", Some("Q"), Done, 4),
+            agent("Q.y.deep", Some("Q.y"), Running, 5),
+        ];
+        let v = visible(&a, true, &HashSet::new());
+        assert_eq!(ids(&a, &v), ["Q", "Q.y", "Q.y.deep", "Q.x", "P"]);
+    }
+
+    #[test]
+    fn a_status_change_rebuilds_the_view_so_the_order_is_recomputed() {
+        let base = Arc::new(AgentsSnapshot {
+            agents: mixed()
+                .into_iter()
+                .map(|mut x| {
+                    x.status = AgentStatus::Done;
+                    x
+                })
+                .collect(),
+            ..AgentsSnapshot::default()
+        });
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let mut view = AgentsView::default();
+        view.update(Some(&base), None, now);
+        let quiet = view.version;
+        let first = visible(view.agents(), true, &HashSet::new());
+        assert_eq!(first, (0..8).collect::<Vec<_>>());
+        // omp reports D running: the version moves (what the rows' cache keys on) and D leads.
+        let live = live_of(vec![live_agent("D", LiveStatus::Running, None)]);
+        view.update(Some(&base), Some(&live), now);
+        assert_ne!(view.version, quiet);
+        let lifted = visible(view.agents(), true, &HashSet::new());
+        assert_eq!(ids(view.agents(), &lifted)[0], "D");
     }
 
     #[test]

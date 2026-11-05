@@ -441,8 +441,112 @@ export default async function ompdeckCtl(api: any) {
         return { ok: true, value: { thinking: typeof sess.thinkingLevel === "string" ? sess.thinkingLevel : null }, message: `Thinking set to ${r.level}.` };
       }
 
+      // == Subagent deletion (OmpDeck's "clean up" / batch delete): stop each target (and the agents nested under it) through the
+      // lifecycle manager like the Hub's `x` but WITHOUT a tombstone (the ref is unregistered), then remove its files: a later
+      // persisted-roster scan re-registers any transcript still on disk. Never throws: per-target failures become `skipped`.
+      // Races: the awaits (abort/release) let the world move, so containment is re-checked right before any removal; with
+      // `keepRunning` nothing is ever aborted and a ref that started running meanwhile stops its target (already released
+      // refs keep their files, so omp's scan re-registers them). An in-flight persisted scan may re-register a just-deleted
+      // id as a fileless parked ref: such ghosts are unregistered right away and again ~2 s and ~10 s later.
+      const realOrNull = (p: string): string | null => { try { return fs.realpathSync(p); } catch { return null; } };
+      const lstatOrNull = (p: string): fs.Stats | null => { try { return fs.lstatSync(p); } catch { return null; } };
+      async function deleteAgents(cmd: any): Promise<any> {
+        const root = rootFile();
+        if (typeof cmd.root !== "string" || !root || cmd.root !== root) return { ok: false, error: "session changed" };
+        if (!root.endsWith(".jsonl")) return { ok: false, error: "unsupported session file" };
+        const keepRunning = cmd.keepRunning === true;
+        const lifecycle = AgentLifecycleManager.global();
+        const artifactDir = path.resolve(root).slice(0, -".jsonl".length);
+        const realArtifact = realOrNull(artifactDir);
+        const deleted: string[] = [];
+        const skipped: { id: string; reason: string }[] = [];
+        const skip = (id: string, reason: string) => { skipped.push({ id, reason }); };
+
+        // Normalise and dedupe by resolved transcript; shallow transcripts first so an ancestor is handled before its nested agents.
+        const seen = new Set<string>();
+        const targets: { id: string; file: string }[] = [];
+        for (const t of Array.isArray(cmd.agents) ? cmd.agents : []) {
+          const id = typeof t?.id === "string" ? t.id : "";
+          const raw = typeof t?.file === "string" ? t.file : "";
+          // `.`/`..` or a separator in the id would make `<dir>/<id>` leave `<dir>`.
+          if (!id || id === "." || id === ".." || id.includes("/") || id.includes("\\") || !raw || !path.isAbsolute(raw) || !raw.endsWith(".jsonl") || path.basename(raw) !== id + ".jsonl") { skip(id || String(t?.id ?? ""), "invalid target"); continue; }
+          if (id.startsWith("__advisor")) { skip(id, "advisor"); continue; } // observability-only transcripts
+          const file = path.resolve(raw);
+          if (!file.startsWith(artifactDir + path.sep)) { skip(id, "outside session"); continue; }
+          if (seen.has(file)) continue;
+          seen.add(file);
+          targets.push({ id, file });
+        }
+        const depth = (f: string) => f.split(path.sep).length;
+        targets.sort((a, b) => depth(a.file) - depth(b.file));
+        // The directory is missing (holds nothing) or really lives in the artifact dir (no symlinked component out of it).
+        const contained = (d: string): boolean => {
+          const r = realOrNull(d);
+          return r === null || (!!realArtifact && (r === realArtifact || r.startsWith(realArtifact + path.sep)));
+        };
+
+        const removedDirs: string[] = []; // nested dirs of deleted targets
+        for (const { id, file } of targets) {
+          try {
+            if (removedDirs.some(d => file.startsWith(d + path.sep))) { deleted.push(id); continue; } // covered by a deleted ancestor
+            const dir = path.dirname(file);
+            const realDir = realOrNull(dir);
+            if (!contained(dir)) { skip(id, "outside session"); continue; }
+            const nested = path.join(dir, id);
+            if (path.dirname(nested) !== dir || nested === dir) { skip(id, "invalid target"); continue; } // strict child of `dir`, whatever the id
+            const refs = registry.list()
+              .filter((r: any) => {
+                if (r.kind !== "sub" || !r.sessionFile) return false;
+                const f = path.resolve(r.sessionFile);
+                if (f !== file && !f.startsWith(nested + path.sep)) return false;
+                try { return !!sessionFileBelongsToRoot(f, root); } catch { return false; }
+              })
+              .sort((a: any, b: any) => depth(path.resolve(b.sessionFile)) - depth(path.resolve(a.sessionFile))); // deepest first
+            if (!lstatOrNull(file) && !refs.length) { skip(id, "not found"); continue; }
+            if (keepRunning && refs.some((r: any) => r.status === "running")) { skip(id, "running"); continue; }
+            let blocked = false;
+            for (const r of refs) {
+              if (keepRunning && r.status === "running") { blocked = true; break; } // started running since the check above
+              if (!keepRunning && r.status === "running" && r.session) await r.session.abort({ reason: "OmpDeck delete" });
+              await lifecycle.release(r.id, r); // no tombstone: unregistered
+            }
+            if (blocked) { skip(id, "running"); continue; }
+            // Teardown awaited: the filesystem may have changed under us. Nothing is removed unless `dir` is still the same place inside the artifact dir.
+            if (realOrNull(dir) !== realDir || !contained(dir) || realOrNull(artifactDir) !== realArtifact) { skip(id, "outside session"); continue; }
+            const sidecars = [file, file + ".tombstone", ...["md", "json", "patch"].map(ext => path.join(dir, `${id}.${ext}`))];
+            try {
+              for (const e of fs.readdirSync(dir)) if (e.startsWith(id + ".nested-") && e.endsWith(".patch")) sidecars.push(path.join(dir, e));
+            } catch {}
+            for (const f of sidecars) fs.rmSync(f, { force: true });
+            const n = lstatOrNull(nested);
+            if (n?.isSymbolicLink()) fs.unlinkSync(nested); // never follow a link out of the artifact dir
+            else if (n) fs.rmSync(nested, { recursive: true, force: true });
+            removedDirs.push(nested);
+            deleted.push(id);
+          } catch (e: any) { log(`delete_agents ${id} failed: ${e}`); skip(id, String(e?.message ?? e)); }
+        }
+        const sweep = () => {
+          try {
+            let any = false;
+            for (const r of registry.list()) {
+              if (r.kind !== "sub" || !deleted.includes(r.id) || r.session || (r.status !== "parked" && r.status !== "aborted")) continue;
+              if (!r.sessionFile || fs.existsSync(r.sessionFile) || !sessionFileBelongsToRoot(r.sessionFile, root)) continue;
+              registry.unregister(r.id, r); any = true;
+            }
+            if (any) schedule();
+          } catch (e) { log("delete_agents sweep failed: " + e); }
+        };
+        if (deleted.length) {
+          sweep();
+          for (const ms of [2000, 10000]) { const t: any = setTimeout(sweep, ms); t?.unref?.(); }
+        }
+        schedule();
+        return { ok: true, value: { deleted, skipped } };
+      }
+
       async function handle(cmd: any): Promise<any> {
         if (cmd.t === "list") return { ok: true, snapshot: snapshot() };
+        if (cmd.t === "delete_agents") return deleteAgents(cmd);
         if (cmd.t === "fork_at" || cmd.t === "navigate") {
           const want = rootFile();
           if (typeof cmd.root !== "string" || !want || cmd.root !== want) return { ok: false, error: "session changed" };

@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use deck_core::ctl::{
-    CtlClient, CtlCommand, CtlReply, LiveAccount, LiveCredential, LiveModel, LiveSnapshot,
-    LiveStatus,
+    CtlClient, CtlCommand, CtlReply, DeleteOutcome, DeleteTarget, LiveAccount, LiveCredential,
+    LiveModel, LiveSnapshot, LiveStatus, SkippedAgent,
 };
 use deck_core::usage::OAuthIdentity;
 
@@ -813,4 +813,93 @@ fn session_account_is_parsed_and_absent_empty_or_malformed_is_none() {
     wait_for("account again", || account().is_some());
     say(&mut s, &snapshot_line(9, ""));
     wait_for("no field", || account().is_none());
+}
+
+#[test]
+fn delete_agents_wire_format_and_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = fake(tmp.path());
+    let client = CtlClient::spawn(tmp.path().to_path_buf(), || {});
+    let mut s = srv.accept();
+    say(&mut s, HELLO);
+    say(&mut s, &snapshot_line(1, ""));
+    snapshot(&client);
+
+    let rid = client.send(CtlCommand::DeleteAgents {
+        root: "/s/main.jsonl".into(),
+        agents: vec![
+            DeleteTarget {
+                id: "0-A".into(),
+                transcript: "/s/main/0-A.jsonl".into(),
+            },
+            DeleteTarget {
+                id: "1-B".into(),
+                transcript: "/s/main/0-A/1-B.jsonl".into(),
+            },
+        ],
+        keep_running: true,
+    });
+    let mut line = String::new();
+    BufReader::new(s.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+        serde_json::json!({
+            "rid": rid,
+            "t": "delete_agents",
+            "root": "/s/main.jsonl",
+            "agents": [
+                {"id": "0-A", "file": "/s/main/0-A.jsonl"},
+                {"id": "1-B", "file": "/s/main/0-A/1-B.jsonl"},
+            ],
+            "keepRunning": true,
+        })
+    );
+
+    say(
+        &mut s,
+        &format!(
+            r#"{{"t":"reply","rid":{rid},"ok":true,"value":{{"deleted":["0-A"],"skipped":[{{"id":"1-B","reason":"running"}}]}}}}"#
+        ),
+    );
+    let mut replies = Vec::new();
+    wait_for("the reply", || {
+        replies.extend(client.take_replies());
+        !replies.is_empty()
+    });
+    assert_eq!(replies[0].0, rid);
+    assert_eq!(
+        DeleteOutcome::of(&replies[0].1),
+        Some(DeleteOutcome {
+            deleted: vec!["0-A".into()],
+            skipped: vec![SkippedAgent {
+                id: "1-B".into(),
+                reason: "running".into(),
+            }],
+        })
+    );
+
+    // a refused command (stale root, extension from before this release) carries no outcome
+    for error in ["session changed", "unknown cmd"] {
+        let refused = CtlReply {
+            ok: false,
+            error: Some(error.into()),
+            ..CtlReply::default()
+        };
+        assert_eq!(DeleteOutcome::of(&refused), None);
+    }
+    // an all-empty outcome parses; a value of another shape does not
+    let empty = CtlReply {
+        ok: true,
+        value: Some(serde_json::json!({"deleted": [], "skipped": []})),
+        ..CtlReply::default()
+    };
+    assert_eq!(DeleteOutcome::of(&empty), Some(DeleteOutcome::default()));
+    let other = CtlReply {
+        ok: true,
+        value: Some(serde_json::json!({"doc": 1})),
+        ..CtlReply::default()
+    };
+    assert_eq!(DeleteOutcome::of(&other), None);
 }

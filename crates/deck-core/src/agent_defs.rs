@@ -3,7 +3,8 @@
 //! from its cwd (project; replaces a user agent of the same name), plus omp's built-in agents
 //! ([`Scope::Bundled`], read-only: what `omp agents unpack` writes, parsed with [`bundled`]),
 //! which any user or project agent of the same name replaces. Extension/plugin packages are not
-//! listed: not files the user owns.
+//! listed: not files the user owns. [`discover`] also lists the `.omp/agents` of a project's
+//! subfolders (bounded walk): omp applies those only to sessions started at or below them.
 //!
 //! Reading mirrors omp's `parseAgent` + `parseFrontmatter`: CRLF normalized, leading HTML
 //! comments skipped, a `---` block up to the first `\n---`, then the trimmed body. Only the keys
@@ -16,7 +17,7 @@
 //! replaces the file atomically (through a symlink to its target, keeping its permissions);
 //! `create` never replaces a file; `delete` checks the revision too. Blocking: call from a worker.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::ops::Range;
@@ -32,6 +33,13 @@ pub const PROJECT_CONFIG_DIR: &str = ".omp";
 
 /// Names omp reserves for its own sessions (`main`, `sub`): a definition using one is skipped.
 const RESERVED_NAMES: [&str; 2] = ["main", "sub"];
+
+/// How many levels below a project cwd [`discover`] looks for nested `.omp/agents`.
+const NESTED_DEPTH: usize = 3;
+/// Directories [`discover`] reads below one project cwd at most (huge trees like `/tmp`).
+const NESTED_MAX_DIRS: usize = 2000;
+/// Folder names never descended into: dependencies and build output.
+const NESTED_SKIP: [&str; 2] = ["node_modules", "target"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scope {
@@ -273,23 +281,27 @@ pub fn project_agents_dir(cwd: &Path) -> Option<PathBuf> {
 }
 
 /// Lists the user directory under `agent_dir` and the project directories of `project_cwds`
-/// (each resolved like omp does; several cwds sharing one directory list it once). A cwd no
+/// (each resolved like omp does; several cwds sharing one directory list it once), plus the
+/// existing `.omp/agents` of their subfolders up to [`NESTED_DEPTH`] levels down. A cwd no
 /// `.omp/agents` applies to is a [`Catalog::bare_roots`] entry. `settings` is left unset.
 pub fn discover(agent_dir: &Path, project_cwds: &[PathBuf]) -> Catalog {
     let user = agent_dir.join(AGENTS_DIR);
+    // omp's global `.omp` (holding the agent dir) is no project's.
+    let global = agent_dir.parent();
     let mut dirs = vec![read_dir(Scope::User, &user, agent_dir)];
     let mut projects = Vec::new();
     let mut bare_roots = Vec::new();
     // omp resolves from a session's cwd, which exists; a vanished folder has no sessions.
     for cwd in project_cwds.iter().filter(|c| c.is_dir()) {
         match project_agents_dir(cwd) {
-            Some(d) if same_dir(&d, &user) => {}
             Some(d) => projects.push(d),
             None => bare_roots.push(cwd.clone()),
         }
+        nested_agents_dirs(cwd, global, &mut projects);
     }
     projects.sort();
     projects.dedup();
+    projects.retain(|d| !same_dir(d, &user));
     bare_roots.sort();
     bare_roots.dedup();
     for dir in projects {
@@ -303,6 +315,43 @@ pub fn discover(agent_dir: &Path, project_cwds: &[PathBuf]) -> Catalog {
         dirs,
         bare_roots,
         settings: None,
+    }
+}
+
+/// Pushes the existing `.omp/agents` of `cwd`'s subfolders, up to [`NESTED_DEPTH`] levels below
+/// it, breadth-first and capped at [`NESTED_MAX_DIRS`] directories read. Hidden folders,
+/// [`NESTED_SKIP`] and symlinks are not descended into; `global` (omp's own `.omp`) is skipped.
+fn nested_agents_dirs(cwd: &Path, global: Option<&Path>, out: &mut Vec<PathBuf>) {
+    let mut queue = VecDeque::from([(cwd.to_path_buf(), 0)]);
+    let mut read = 0;
+    while let Some((dir, depth)) = queue.pop_front() {
+        if read == NESTED_MAX_DIRS {
+            break;
+        }
+        read += 1;
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name == PROJECT_CONFIG_DIR {
+                // The cwd's own `.omp` is `project_agents_dir`'s.
+                let omp = entry.path();
+                let agents = omp.join(AGENTS_DIR);
+                if depth > 0 && agents.is_dir() && !global.is_some_and(|g| same_dir(&omp, g)) {
+                    out.push(agents);
+                }
+            } else if depth < NESTED_DEPTH
+                && !name.starts_with('.')
+                && !NESTED_SKIP.contains(&name)
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+            {
+                queue.push_back((entry.path(), depth + 1));
+            }
+        }
     }
 }
 
