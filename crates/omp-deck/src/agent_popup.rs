@@ -544,7 +544,7 @@ fn status_pill(ui: &mut Ui, sh: &Shown) {
     ui.painter().rect_stroke(
         rect,
         13,
-        Stroke::new(1.0, color.gamma_multiply(0.6)),
+        crate::badge::outline(ui.pixels_per_point(), color.gamma_multiply(0.6)),
         StrokeKind::Inside,
     );
     if sh.spin {

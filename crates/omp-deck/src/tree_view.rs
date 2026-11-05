@@ -2431,7 +2431,7 @@ fn pill(
             p.rect_stroke(
                 rect,
                 10,
-                Stroke::new(1.0, c.gamma_multiply(0.45)),
+                crate::badge::outline(p.pixels_per_point(), c.gamma_multiply(0.45)),
                 StrokeKind::Inside,
             );
         }

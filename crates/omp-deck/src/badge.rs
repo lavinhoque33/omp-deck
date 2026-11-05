@@ -111,7 +111,7 @@ impl Badge {
         p.rect_stroke(
             rect,
             r,
-            Stroke::new(1.0, self.tint.gamma_multiply(0.45)),
+            outline(p.pixels_per_point(), self.tint.gamma_multiply(0.45)),
             StrokeKind::Inside,
         );
         let cy = rect.center().y;
@@ -141,6 +141,14 @@ impl Badge {
         }
         resp
     }
+}
+
+/// The outline of a tinted pill: exactly one physical pixel (more on 2× screens) at any zoom. A
+/// 1-point stroke is thinner than a pixel below zoom 1, and egui paints such strokes as a 2-pixel
+/// translucent ridge whose overlapping segments double up where the arcs meet the straight edges,
+/// so a translucent outline looked dotted.
+pub fn outline(pixels_per_point: f32, color: Color32) -> Stroke {
+    Stroke::new(pixels_per_point.round().max(1.0) / pixels_per_point, color)
 }
 
 /// Shorthand: a single-run badge allocated in `ui`.

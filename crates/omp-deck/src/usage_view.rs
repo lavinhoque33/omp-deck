@@ -1226,7 +1226,10 @@ fn reset_card(
 fn chip(ui: &mut Ui, text: &str, color: Color32) {
     Frame::NONE
         .fill(color.gamma_multiply(0.16))
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
+        .stroke(crate::badge::outline(
+            ui.pixels_per_point(),
+            color.gamma_multiply(0.6),
+        ))
         .corner_radius(theme::rad(4, 9))
         .inner_margin(Margin::symmetric(7, 2))
         .show(ui, |ui| {

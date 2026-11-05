@@ -1368,7 +1368,7 @@ pub(crate) fn pill(
     tp.rect_stroke(
         r,
         theme::rad(4, 9),
-        Stroke::new(1.0, color.gamma_multiply(0.55)),
+        crate::badge::outline(tp.pixels_per_point(), color.gamma_multiply(0.55)),
         StrokeKind::Inside,
     );
     tp.galley(
