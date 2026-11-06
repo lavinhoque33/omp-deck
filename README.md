@@ -63,18 +63,19 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
 
 ## Features
 
-- **Session sidebar**: Browse persisted sessions by project and switch between open tabs.
+- **Session sidebar**: Browse persisted sessions by project and see every running session at a glance.
 
   <details><summary>More</summary>
 
-  An "Open tabs" section pinned at the top lists every open tab with its status
-  (click to switch, ✕ or middle-click to close), above every omp session grouped by project (only the active
-  tab's project is expanded; the rest stay collapsed until you open them), newest first, with titles, relative age,
-  a running indicator (sessions open in a tab show the tab's working spinner / needs-input badge instead),
-  a filter box, background auto-refresh, and context menus (open, copy/move to another
-  project, copy path/id/resume command, "Restart session" for running sessions, "Stop session process",
-  and "Delete session…"). Deleting is permanent: it removes the session file and its subagent transcripts
-  and artifacts (stopping a running session first) and cannot be undone.
+  Every omp session grouped by project (only the active tab's project is expanded; the rest stay collapsed until you
+  open them), newest first: each session hangs off its project folder on a branch line, with its title, relative age
+  and a status marker on the branch (running, the tab's working spinner or needs-input badge), worktree branches on a
+  second line. The folder scope sits at the top with the filter box; a resizable, collapsible **Running** dock at the
+  bottom lists every live session (tabbed ones first, with a window marker; ✕ or middle-click closes the tab, a
+  tab-less one attaches on click). Background auto-refresh and context menus (open, copy/move to another project,
+  copy path/id/resume command, "Restart session" for running sessions, "Stop session process", and "Delete
+  session…"). Deleting is permanent: it removes the session file and its subagent transcripts and artifacts
+  (stopping a running session first) and cannot be undone.
 
   </details>
 
@@ -84,7 +85,7 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
 
   Open, focus, middle-click close, reopen the last closed tab. Each tab shows omp's state: a
   spinner while the agent works and an amber "!" badge with a tinted tab when it waits for your input,
-  also on background tabs. Right-clicking a tab (or its "Open tabs" row) shows "Close tab" plus the
+  also on background tabs. Right-clicking a tab (or its Running dock row) shows "Close tab" plus the
   session's full sidebar menu. Closing a tab only detaches; "Stop session process" stops omp.
   Tabs re-attach to their live sessions on the next launch.
 

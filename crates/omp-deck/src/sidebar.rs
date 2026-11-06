@@ -142,7 +142,7 @@ pub enum SidebarAction {
     BrowseScope,
     /// A path typed into the scope menu.
     TypedScope(String),
-    /// Switch to the tab at this strip index ("Open tabs").
+    /// Switch to the tab at this strip index (Running dock rows).
     ActivateTab(usize),
     /// Close the tab at this strip index (same path as the tab strip's ✕).
     CloseTab(usize),
@@ -208,6 +208,10 @@ pub struct SidebarOutput {
     pub actions: Vec<SidebarAction>,
     /// The user clicked something in the sidebar (other than the filter box).
     pub interacted: bool,
+    /// The dock height the grab strip settled on this frame (`None` = unchanged).
+    pub dock_height: Option<f32>,
+    /// The dock's collapsed state changed this frame.
+    pub dock_collapsed: Option<bool>,
 }
 
 pub struct SidebarInput<'a> {
@@ -242,14 +246,16 @@ pub struct SidebarInput<'a> {
     pub picker_available: bool,
     /// The native folder dialog is open.
     pub picking: bool,
-    /// Every open tab in strip order ("Open tabs" section) with the session labels and the active
-    /// index.
+    /// Every open tab in strip order with the session labels and the active index.
     pub tabs: &'a [Tab],
     pub labels: &'a HashMap<PathBuf, String>,
     pub active_tab: usize,
     /// Live omp state (`Busy` / `Attention` only) of sessions open in a tab, by session file.
     pub tab_activity: &'a HashMap<&'a Path, TabStatus>,
-    /// Project backup entries of the context menus.
+    /// Height of the Running dock (`AppConfig.running_dock_height`; 0 = fit its rows, at most
+    /// six) and whether it is folded to its header.
+    pub dock_height: f32,
+    pub dock_collapsed: bool,
     pub backup: BackupMenu<'a>,
     /// Worktrees (by folder) that were sent the finish prompt and are being waited for.
     pub finishing: &'a HashMap<PathBuf, bool>,
@@ -454,6 +460,11 @@ pub struct SidebarCache {
     running: running::RunningCache,
 }
 
+/// Extra height of a session row carrying a branch chip (the chip sits on a second line).
+fn chip_line_h() -> f32 {
+    theme::dens(12.0, 14.0)
+}
+
 fn row_h() -> f32 {
     theme::dens(28.0, 36.0)
 }
@@ -462,17 +473,126 @@ fn header_h() -> f32 {
     theme::dens(28.0, 32.0)
 }
 
+/// Branch-ledger geometry of one project group: the folder glyph's x (the header's inset plus
+/// chevron + gap), the rail hanging off its centre, the stub of each row, and the row box. The
+/// header text metrics stay in the header painters; this only fixes the rail/box columns so the
+/// header, the rows and the elbow all agree.
+#[derive(Clone, Copy)]
+struct LedgerGeom {
+    /// x of the rail (the folder glyph's centre).
+    rail_x: f32,
+    /// Left x of the row box (the stub's end, 17 px right of the rail).
+    box_x: f32,
+}
+
+impl LedgerGeom {
+    fn of(header_rect: &Rect) -> LedgerGeom {
+        // The header is inset 6 px in the group plate; the chevron sits at its left, the folder
+        // glyph after it. Both painters centre the glyph at this x.
+        let rail_x = header_rect.left() + if theme::flat() { 31.0 } else { 34.0 };
+        // The row box starts at the stub's end.
+        let box_x = rail_x + 17.0;
+        LedgerGeom { rail_x, box_x }
+    }
+
+    /// The row box: from the stub's end to 8 px before the group's right edge.
+    fn row_box(&self, row: &Rect) -> Rect {
+        Rect::from_min_max(
+            pos2(self.box_x, row.top() + 1.0),
+            pos2(row.right() - 8.0, row.bottom() - 1.0),
+        )
+    }
+
+    /// The stub's y: the row's first-line centre.
+    fn stub_y(&self, row: &Rect, two_line: bool) -> f32 {
+        if two_line {
+            // The title line fills the upper `row_h()` of the box (inset 1 px).
+            row.top() + 1.0 + row_h() / 2.0
+        } else {
+            row.center().y
+        }
+    }
+}
+
+/// The ledger rail colour: `mix(panel, weak, 0.62)` (plain `stroke` vanishes at 1 px).
+fn rail_color(pal: &Palette) -> Color32 {
+    theme::mix(pal.panel, pal.weak, 0.62)
+}
+
+/// A filled `ok` dot with a soft halo (flat styles) or glow (Neon).
+fn ok_dot(p: &egui::Painter, pal: &Palette, c: egui::Pos2, r: f32) {
+    if theme::flat() {
+        let dark = pal.bg.r() < 128;
+        p.circle_filled(
+            c,
+            r + 2.5,
+            pal.ok.gamma_multiply(if dark { 0.25 } else { 0.18 }),
+        );
+        p.circle_filled(c, r, pal.ok);
+    } else {
+        theme::glow_dot(p, c, r, pal.ok, theme::GLOW_REST);
+    }
+}
+
 pub fn show(
     ui: &mut Ui,
     input: &SidebarInput<'_>,
     filter: &mut String,
     cache: &mut SidebarCache,
 ) -> SidebarOutput {
-    let pal = Palette::of_ui(ui);
     let mut out = SidebarOutput::default();
-    open_tabs_section(ui, input, &mut out);
-    running::section(ui, input, &mut cache.running, &mut out);
+    // Full sidebar height: the dock's 55 % clamp is computed against it.
+    let sidebar_h = ui.available_rect_before_wrap().height();
+    // Branch Ledger, top to bottom: scope bar → filter row → optional new-session button →
+    // project groups (scroll, fills the rest) → Running dock pinned at the bottom.
+    show_scope_bar(ui, input, &mut cache.scope_ui, &mut out);
+    ui.add_space(theme::dens(6.0, 8.0));
+    show_filter_row(ui, input, filter, &mut out);
+    ui.add_space(theme::dens(6.0, 8.0));
+    if let Some(dir) = input.scope
+        && scope_bar::new_session_button(ui, dir)
+    {
+        out.actions.push(SidebarAction::New(dir.to_path_buf()));
+        out.interacted = true;
+    }
+    if input.scope.is_some() {
+        ui.add_space(8.0);
+    }
 
+    // The dock pins to the bottom: measure it (syncing its cache so the count is current),
+    // then paint the groups in exactly the remaining height and the dock below them.
+    let body = ui.available_rect_before_wrap();
+    let dock_h = running::measure(ui, input, &mut cache.running, sidebar_h);
+    let gap = theme::dens(6.0, 8.0);
+    let groups_rect = Rect::from_min_max(
+        body.min,
+        pos2(body.right(), (body.bottom() - dock_h - gap).max(body.top())),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(groups_rect)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    show_groups(&mut child, input, filter, cache, &mut out);
+    ui.advance_cursor_after_rect(groups_rect);
+    if dock_h > 0.0 {
+        ui.add_space(gap);
+        running::show_dock(ui, input, &mut cache.running, dock_h, sidebar_h, &mut out);
+    }
+    out
+}
+
+/// The scope bar and its actions.
+fn show_scope_bar(
+    ui: &mut Ui,
+    input: &SidebarInput<'_>,
+    state: &mut ScopeState,
+    out: &mut SidebarOutput,
+) {
+    let total = input
+        .groups
+        .map(|gs| gs.iter().map(|g| g.sessions.len()).sum())
+        .unwrap_or(0);
     let scope_actions = scope_bar::chip(
         ui,
         &ScopeInput {
@@ -480,8 +600,9 @@ pub fn show(
             recent: input.recent,
             picker_available: input.picker_available,
             picking: input.picking,
+            total,
         },
-        &mut cache.scope_ui,
+        state,
     );
     for a in scope_actions {
         out.interacted = true;
@@ -497,21 +618,29 @@ pub fn show(
             },
         });
     }
-    ui.add_space(theme::dens(6.0, 8.0));
+}
 
-    let field_h = theme::dens(28.0, 36.0);
+/// The filter row: search field, session-manager and refresh keys.
+fn show_filter_row(
+    ui: &mut Ui,
+    input: &SidebarInput<'_>,
+    filter: &mut String,
+    out: &mut SidebarOutput,
+) {
+    let pal = Palette::of_ui(ui);
+    let field_h = theme::dens(26.0, 32.0);
     let neutral = theme::flat();
+    let row_h = theme::dens(28.0, 36.0);
     ui.allocate_ui_with_layout(
-        vec2(ui.available_width(), field_h),
+        vec2(ui.available_width(), row_h),
         egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if header_button(ui, ICON_REFRESH_CW, "Rescan sessions now", input.refreshing).clicked()
-            {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if filter_key(ui, ICON_REFRESH_CW, "Rescan sessions now", input.refreshing).clicked() {
                 out.actions.push(SidebarAction::Refresh);
                 out.interacted = true;
             }
-            if header_button(
+            if filter_key(
                 ui,
                 ICON_HARD_DRIVE,
                 "Session manager — sizes, bulk delete / copy / move (Ctrl+Shift+S)",
@@ -524,44 +653,91 @@ pub fn show(
             }
             let id = Id::unique("sidebar-filter");
             let focused = ui.memory(|m| m.has_focus(id));
-            ui.add(
+            let resp = ui.add(
                 egui::TextEdit::singleline(filter)
                     .id(id)
                     .prefix(icon_text(
                         ICON_SEARCH,
-                        if neutral { 15.0 } else { 17.0 },
+                        if neutral { 13.0 } else { 15.0 },
                         pal.weak,
                     ))
                     .hint_text("Search sessions…")
                     .align(egui::Align2::LEFT_CENTER)
                     .min_size(vec2(0.0, field_h))
                     .desired_width(ui.available_width())
-                    .margin(Margin::symmetric(
-                        if neutral { 8 } else { 10 },
-                        if neutral { 4 } else { 8 },
-                    ))
+                    .margin(Margin::symmetric(8, 4))
                     .frame(
                         Frame::new()
-                            .fill(if neutral { pal.bg } else { pal.surface })
-                            .corner_radius(if neutral { theme::ui_rad(8) } else { 11 })
+                            .fill(pal.surface)
+                            .corner_radius(if neutral { theme::ui_rad(3) } else { 6 })
                             .stroke(Stroke::new(
                                 1.0,
                                 if focused { pal.accent } else { pal.stroke },
                             )),
                     ),
             );
+            if focused {
+                // Soft accent glow around the focused field.
+                ui.painter().rect_stroke(
+                    resp.rect.expand(2.0),
+                    if neutral { theme::ui_rad(3) + 2 } else { 8 },
+                    Stroke::new(1.0, pal.accent.gamma_multiply(0.30)),
+                    StrokeKind::Inside,
+                );
+            }
         },
     );
-    ui.add_space(theme::dens(6.0, 8.0));
-    if let Some(dir) = input.scope
-        && scope_bar::new_session_button(ui, dir)
-    {
-        out.actions.push(SidebarAction::New(dir.to_path_buf()));
-        out.interacted = true;
+}
+
+/// A bordered 26 px filter key with depth (session manager, refresh).
+fn filter_key(ui: &mut Ui, icon: Icon, tip: &str, spinning: bool) -> egui::Response {
+    let pal = Palette::of_ui(ui);
+    let side = 26.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click());
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
+    if ui.is_rect_visible(rect) {
+        let radius = if theme::flat() { theme::ui_rad(3) } else { 6 };
+        paint_key_box(ui.painter(), pal, rect, radius, KeyTone::Plain, 1.0);
+        if spinning {
+            ui.put(
+                Rect::from_center_size(rect.center(), vec2(16.0, 16.0)),
+                crate::widgets::Spin::new(14.0, pal.accent_b),
+            );
+        } else {
+            paint_icon(
+                ui.painter(),
+                rect.center(),
+                Align2::CENTER_CENTER,
+                icon,
+                14.0,
+                theme::mix(pal.weak, pal.text_strong, hov),
+            );
+        }
+        if hov > 0.01 {
+            ui.painter().rect_stroke(
+                rect,
+                radius,
+                Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(hov)),
+                StrokeKind::Inside,
+            );
+        }
     }
-    if input.scope.is_some() {
-        ui.add_space(8.0);
-    }
+    resp.on_hover_text(tip)
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// The project groups: empty states, or the scroll area of expanded groups. Paints into `ui`
+/// (the caller sizes it to the space between the filter row and the dock).
+fn show_groups(
+    ui: &mut Ui,
+    input: &SidebarInput<'_>,
+    filter: &str,
+    cache: &mut SidebarCache,
+    out: &mut SidebarOutput,
+) {
+    let pal = Palette::of_ui(ui);
 
     let Some(groups) = input.groups else {
         ui.add_space(24.0);
@@ -570,7 +746,7 @@ pub fn show(
             ui.add_space(6.0);
             ui.label(RichText::new("Scanning sessions…").color(pal.weak));
         });
-        return out;
+        return;
     };
     if !input.root_exists && input.scope.is_none() {
         empty_state(
@@ -589,7 +765,7 @@ pub fn show(
                     .color(pal.weak),
             );
         });
-        return out;
+        return;
     }
     if groups.is_empty() && input.scope.is_none() {
         empty_state(
@@ -608,7 +784,7 @@ pub fn show(
                     .color(pal.weak),
             );
         });
-        return out;
+        return;
     }
 
     let query = filter.trim().to_lowercase();
@@ -657,7 +833,7 @@ pub fn show(
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             for family in families {
-                any_shown |= show_group(ui, &pass, family, (expansion, ages), &mut out);
+                any_shown |= show_group(ui, &pass, family, (expansion, ages), &mut *out);
             }
             if !any_shown {
                 if filtering {
@@ -676,7 +852,6 @@ pub fn show(
                 }
             }
         });
-    out
 }
 
 /// What every group of one frame needs.
@@ -841,38 +1016,77 @@ fn show_group(
         state.set_open(!open);
     }
     state.store(ui.ctx());
-    state.show_body_unindented(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 2.0;
-        for r in family.rows.iter().filter(|r| pass.is_shown(r)) {
+    // The rows that show, with their contexts: collected so each row knows whether it is the
+    // last (the elbow) and what the rail connects to.
+    let shown_rows: Vec<LedgerRow<'_>> = family
+        .rows
+        .iter()
+        .filter(|r| pass.is_shown(r))
+        .filter_map(|r| {
             let row_group = &pass.groups[r.group];
-            let Some(entry) = row_group.sessions.get(r.session) else {
-                continue;
-            };
-            let row = RowCtx {
+            let entry = row_group.sessions.get(r.session)?;
+            let chip =
+                RowWorktree::of(row_group, &entry.id, input.removed, &input.parked).map(|wt| {
+                    let own = match wt {
+                        RowWorktree::Live(w) => input.finishing.get(&w.path).copied(),
+                        _ => None,
+                    };
+                    RowChip {
+                        finishing: own.is_some(),
+                        own_finish: own == Some(true),
+                        wt,
+                    }
+                });
+            Some(LedgerRow {
+                entry,
                 selected: input.active_path == Some(entry.path.as_path()),
                 running: input.running.is_running(&entry.id, &entry.path)
                     || input.open_paths.contains(&entry.path.as_path()),
-                chip: RowWorktree::of(row_group, &entry.id, input.removed, &input.parked).map(
-                    |wt| {
-                        let own = match wt {
-                            RowWorktree::Live(w) => input.finishing.get(&w.path).copied(),
-                            _ => None,
-                        };
-                        RowChip {
-                            finishing: own.is_some(),
-                            own_finish: own == Some(true),
-                            wt,
-                        }
-                    },
-                ),
-            };
-            let age = ages.get(pass.age_key, input.now, entry);
-            session_row(ui, entry, age, &row, input, out);
+                chip,
+            })
+        })
+        .collect();
+    let geom = LedgerGeom::of(&hdr.rect);
+    state.show_body_unindented(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let n = shown_rows.len();
+        if n == 0 {
+            return;
+        }
+        // Row rects are deterministic (full-width rows on a 2 px pitch), so the rail is
+        // painted first from the precomputed layout; the rows then paint their stubs, halos
+        // and markers over it.
+        let left = ui.cursor().left();
+        let w = ui.available_width();
+        let mut top = ui.cursor().top();
+        let mut rects = Vec::with_capacity(n);
+        for row in &shown_rows {
+            let h = row_h()
+                + if row.chip.is_some() {
+                    chip_line_h()
+                } else {
+                    0.0
+                };
+            rects.push(Rect::from_min_size(pos2(left, top), vec2(w, h)));
+            top += h + 2.0;
+        }
+        paint_rail(ui, &geom, &hdr.rect, &rects);
+        for (k, row) in shown_rows.iter().enumerate() {
+            let age = ages.get(pass.age_key, input.now, row.entry);
+            session_row(ui, row, age, &geom, k + 1 == n, input, out);
         }
         ui.add_space(2.0);
     });
     ui.add_space(4.0);
     true
+}
+
+/// One ledger row of a group body: its entry plus what the row paints.
+struct LedgerRow<'a> {
+    entry: &'a SessionEntry,
+    selected: bool,
+    running: bool,
+    chip: Option<RowChip<'a>>,
 }
 
 /// A worktree action's hover button as the row needs it every frame: the icon and whether it is
@@ -1119,45 +1333,12 @@ fn scope_empty(ui: &mut Ui, dir: &Path) {
     });
 }
 
-fn header_button(ui: &mut Ui, icon: Icon, tip: &str, spinning: bool) -> egui::Response {
-    let pal = Palette::of_ui(ui);
-    let (rect, resp) = ui.allocate_exact_size(
-        vec2(theme::dens(28.0, 32.0), theme::dens(28.0, 36.0)),
-        Sense::click(),
-    );
-    let hov = ui
-        .ctx()
-        .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
-    let p = ui.painter();
-    let neutral = theme::flat();
-    p.rect_filled(
-        rect,
-        if neutral { 8 } else { 10 },
-        theme::hover_fill(pal).gamma_multiply(0.85 * hov),
-    );
-    if spinning {
-        ui.put(
-            Rect::from_center_size(rect.center(), vec2(16.0, 16.0)),
-            crate::widgets::Spin::new(if neutral { 14.0 } else { 16.0 }, pal.accent_b),
-        );
-    } else {
-        paint_icon(
-            p,
-            rect.center(),
-            Align2::CENTER_CENTER,
-            icon,
-            if neutral { 15.0 } else { 19.0 },
-            theme::mix(pal.weak, pal.text_strong, hov),
-        );
-    }
-    resp.on_hover_text(tip)
-        .on_hover_cursor(CursorIcon::PointingHand)
-}
-
 struct HeaderResult {
     resp: egui::Response,
     /// The header body (not a button) was clicked.
     toggle: bool,
+    /// The header's rect: the ledger rail hangs off its folder glyph's centre.
+    rect: Rect,
 }
 
 struct HeaderSpec<'a> {
@@ -1193,17 +1374,15 @@ struct HeaderGeom {
 }
 
 impl HeaderGeom {
-    /// Width at the right of the name taken by buttons.
+    /// Width at the right of the name taken by keys (20 px keys on a 23 px pitch).
     fn reserved(&self, base: f32) -> f32 {
-        base + 28.0 + if self.wt.is_some() { 28.0 } else { 0.0 }
+        base + 23.0 + if self.wt.is_some() { 23.0 } else { 0.0 }
     }
 }
 
-/// Hover animation of a header and its buttons (0..=1).
+/// Hover animation of a header (0..=1).
 struct HeaderHover {
     hov: f32,
-    plus: f32,
-    wt: f32,
 }
 
 fn group_header(
@@ -1214,17 +1393,19 @@ fn group_header(
 ) -> HeaderResult {
     let pal = Palette::of_ui(ui);
     let group = spec.group;
-    let (rect, resp) =
+    let (full, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), header_h()), Sense::click());
+    // The header plate is inset 6 px; the rail hangs off the inset folder glyph.
+    let rect = full.shrink2(vec2(6.0, 0.0));
     let plus_rect =
-        Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(24.0, 24.0));
+        Rect::from_center_size(pos2(rect.right() - 14.0, rect.center().y), vec2(20.0, 20.0));
     let plus = ui.interact(plus_rect, resp.id.with("new"), Sense::click());
-    let wt_rect = plus_rect.translate(vec2(-28.0, 0.0));
+    let wt_rect = plus_rect.translate(vec2(-23.0, 0.0));
     let wt_btn = spec
         .wt_button
         .then(|| ui.interact(wt_rect, resp.id.with("new-wt"), Sense::click()));
     let (view, _) = view_action(spec.default_view, None);
-    let view_rect = plus_rect.translate(vec2(if spec.wt_button { -56.0 } else { -28.0 }, 0.0));
+    let view_rect = plus_rect.translate(vec2(if spec.wt_button { -46.0 } else { -23.0 }, 0.0));
     let view_button = ui
         .interact(view_rect, resp.id.with("new-view"), Sense::click())
         .on_hover_text(if view == SessionView::Chat {
@@ -1241,8 +1422,6 @@ fn group_header(
     let ctx = ui.ctx().clone();
     let hover = HeaderHover {
         hov: ctx.animate_bool_with_time(resp.id.with("hov"), hov_raw, 0.1),
-        plus: ctx.animate_bool_with_time(plus.id.with("hov"), plus.hovered(), 0.1),
-        wt: ctx.animate_bool_with_time(resp.id.with("wt-hov"), over(&wt_btn), 0.1),
     };
     let geom = HeaderGeom {
         rect,
@@ -1260,13 +1439,13 @@ fn group_header(
         }
         paint_header_extras(p, pal, &geom, &hover);
         if hover.hov > 0.01 {
-            paint_icon(
+            paint_key_at(
                 p,
-                view_rect.center(),
-                Align2::CENTER_CENTER,
+                pal,
+                view_rect,
                 view_icon(view),
-                16.0,
-                pal.accent,
+                KeyTone::Plain,
+                hover.hov,
             );
         }
     }
@@ -1286,6 +1465,7 @@ fn group_header(
     let none = HeaderResult {
         resp: resp.clone(),
         toggle: false,
+        rect,
     };
     if plus.clicked() {
         out.actions.push(SidebarAction::New(group.cwd.clone()));
@@ -1305,7 +1485,7 @@ fn group_header(
         return none;
     }
     let toggle = resp.clicked() && !view_button.hovered() && !over(&wt_btn) && !plus.hovered();
-    HeaderResult { resp, toggle }
+    HeaderResult { resp, toggle, rect }
 }
 
 /// Hover card of a project header: folder and session count.
@@ -1359,7 +1539,8 @@ fn header_job(
             &format!("  {hint}"),
             0.0,
             TextFormat {
-                font_id: crate::theme::font(hint_px),
+                // Parent path: `weak` mono.
+                font_id: egui::FontId::new(hint_px, egui::FontFamily::Monospace),
                 color: pal.weak,
                 ..Default::default()
             },
@@ -1371,28 +1552,12 @@ fn header_job(
     job
 }
 
-/// The hover button that starts a session in a new worktree.
+/// The hover key that starts a session in a new worktree.
 fn paint_header_extras(p: &egui::Painter, pal: &Palette, geom: &HeaderGeom, hover: &HeaderHover) {
     if let Some(r) = geom.wt
         && hover.hov > 0.01
     {
-        if theme::flat() {
-            p.rect_filled(r, 6, pal.raised.gamma_multiply(hover.hov * hover.wt));
-        } else {
-            p.rect_filled(
-                r,
-                8,
-                theme::mix(pal.raised, pal.accent, hover.wt * 0.5).gamma_multiply(hover.hov),
-            );
-        }
-        paint_icon(
-            p,
-            r.center(),
-            Align2::CENTER_CENTER,
-            ICON_GIT_BRANCH_PLUS,
-            if theme::flat() { 15.0 } else { 17.0 },
-            theme::mix(pal.weak, pal.text_strong, hover.wt).gamma_multiply(hover.hov),
-        );
+        paint_key_at(p, pal, r, ICON_GIT_BRANCH_PLUS, KeyTone::Plain, hover.hov);
     }
 }
 
@@ -1407,7 +1572,7 @@ fn paint_header_neon(
     hover: &HeaderHover,
 ) {
     let rect = geom.rect;
-    paint_header_chrome(p, pal, rect, open_t, hover.hov);
+    paint_header_plate(p, pal, rect, open_t, hover.hov);
     paint_icon(
         p,
         pos2(rect.left() + 34.0, rect.center().y),
@@ -1416,9 +1581,12 @@ fn paint_header_neon(
         18.0,
         pal.accent,
     );
+    // Below ~250 px the parent path drops and the name takes the row.
+    let narrow = rect.width() < 250.0;
+    let hint: &str = if narrow { "" } else { text.1 };
     let job = header_job(
         pal,
-        text,
+        (text.0, hint),
         (14.0, 11.5),
         rect.width() - 46.0 - geom.reserved(40.0),
     );
@@ -1428,31 +1596,21 @@ fn paint_header_neon(
         galley,
         pal.text,
     );
-    let g = p.layout_no_wrap(
+    let count = p.layout_no_wrap(
         spec.shown.to_string(),
         crate::theme::font(11.5),
         pal.weak.gamma_multiply(1.0 - hover.hov),
     );
-    let chip = Rect::from_center_size(
-        pos2(rect.right() - 16.0, rect.center().y),
-        vec2((g.size().x + 12.0).max(22.0), 18.0),
+    p.galley(
+        pos2(
+            rect.right() - 14.0 - count.size().x / 2.0,
+            rect.center().y - count.size().y / 2.0,
+        ),
+        count,
+        pal.weak,
     );
-    p.rect_filled(chip, 9, pal.surface.gamma_multiply(1.0 - hover.hov));
-    p.galley(chip.center() - g.size() / 2.0, g, pal.weak);
     if hover.hov > 0.01 {
-        p.rect_filled(
-            geom.plus,
-            8,
-            theme::mix(pal.raised, pal.accent, hover.plus * 0.5).gamma_multiply(hover.hov),
-        );
-        paint_icon(
-            p,
-            geom.plus.center(),
-            Align2::CENTER_CENTER,
-            ICON_PLUS,
-            17.0,
-            theme::mix(pal.weak, pal.text_strong, hover.plus).gamma_multiply(hover.hov),
-        );
+        paint_key_at(p, pal, geom.plus, ICON_PLUS, KeyTone::Accent, hover.hov);
     }
 }
 
@@ -1468,7 +1626,7 @@ fn paint_header_neutral(
     hover: &HeaderHover,
 ) {
     let rect = geom.rect;
-    paint_header_chrome(p, pal, rect, open_t, hover.hov);
+    paint_header_plate(p, pal, rect, open_t, hover.hov);
     let y = rect.center().y;
     paint_icon(
         p,
@@ -1476,12 +1634,15 @@ fn paint_header_neutral(
         Align2::CENTER_CENTER,
         header_icon(open_t),
         15.0,
-        theme::mix(pal.glyph, pal.text_strong, open_t * 0.5),
+        theme::mix(pal.glyph, pal.accent, open_t),
     );
+    // Below ~250 px the parent path drops and the name takes the row.
+    let narrow = rect.width() < 250.0;
+    let hint: &str = if narrow { "" } else { text.1 };
     let job = header_job(
         pal,
-        text,
-        (13.0, 11.0),
+        (text.0, hint),
+        (13.0, 10.0),
         rect.width() - 44.0 - geom.reserved(40.0),
     );
     let galley = p.layout_job(job);
@@ -1492,7 +1653,7 @@ fn paint_header_neutral(
     );
     let count = p.layout_no_wrap(
         spec.shown.to_string(),
-        crate::theme::font(11.0),
+        theme::label_font(10.0),
         pal.weak.gamma_multiply(1.0 - hover.hov),
     );
     p.galley(
@@ -1504,31 +1665,46 @@ fn paint_header_neutral(
         pal.weak,
     );
     if hover.hov > 0.01 {
-        p.rect_filled(
-            geom.plus,
-            6,
-            pal.raised.gamma_multiply(hover.hov * hover.plus),
-        );
-        paint_icon(
-            p,
-            geom.plus.center(),
-            Align2::CENTER_CENTER,
-            ICON_PLUS,
-            15.0,
-            theme::mix(pal.weak, pal.text_strong, hover.plus).gamma_multiply(hover.hov),
-        );
+        paint_key_at(p, pal, geom.plus, ICON_PLUS, KeyTone::Accent, hover.hov);
     }
 }
 
-/// Header hover wash and the open/closed chevron at the left (Neon: rotated by `open_t`).
-fn paint_header_chrome(p: &egui::Painter, pal: &Palette, rect: Rect, open_t: f32, hov: f32) {
+/// Header plate: an expanded group keeps a persistent `surface` fill + 1 px `stroke` plate;
+/// hover adds a `hover_bg` fill + 1 px `hover_line` border + soft glow. Then the open/closed
+/// chevron at the left (Neon: rotated by `open_t`).
+fn paint_header_plate(p: &egui::Painter, pal: &Palette, rect: Rect, open_t: f32, hov: f32) {
     let color = theme::mix(pal.weak, pal.text_strong, hov);
-    if hov > 0.01 {
-        let radius = if theme::flat() { 6 } else { 9 };
+    let radius = if theme::flat() { theme::ui_rad(6) } else { 9 };
+    // The open plate fades with the expand animation; hover paints over it.
+    let open = open_t.clamp(0.0, 1.0) * (1.0 - hov);
+    if open > 0.01 {
         p.rect(
             rect,
             radius,
+            pal.surface.gamma_multiply(open),
+            Stroke::new(1.0, pal.stroke.gamma_multiply(open)),
+            StrokeKind::Inside,
+        );
+    }
+    if hov > 0.01 {
+        p.rect_filled(
+            rect,
+            radius,
             theme::hover_fill(pal).gamma_multiply(0.75 * hov),
+        );
+        let neutral = theme::flat();
+        p.rect_stroke(
+            rect.expand(if neutral { 1.0 } else { 2.0 }),
+            radius + 1,
+            Stroke::new(
+                1.0,
+                theme::hover_stroke(pal).gamma_multiply(if neutral { 0.22 } else { 0.35 } * hov),
+            ),
+            StrokeKind::Inside,
+        );
+        p.rect_stroke(
+            rect,
+            radius,
             Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(hov)),
             StrokeKind::Inside,
         );
@@ -1553,236 +1729,8 @@ fn paint_header_chrome(p: &egui::Painter, pal: &Palette, rect: Rect, open_t: f32
     ));
 }
 
-/// Most rows the "Open tabs" list shows before it scrolls.
-const OPEN_TABS_MAX_ROWS: f32 = 6.0;
 /// Icon slot of the status indicators in sidebar rows.
 const STATUS_SIZE: f32 = 14.0;
-
-/// Header of a pinned section ("Open tabs", "Running sessions"): chevron, title in the UI font,
-/// the count and, while `waiting > 0` sessions need the user, the attention badge (the body may
-/// be collapsed). A click toggles; the returned state shows the body. `default_open` applies
-/// until the user toggles (egui memory is not persisted, so it applies on every launch).
-fn section_header(
-    ui: &mut Ui,
-    out: &mut SidebarOutput,
-    (salt, title): (&str, &str),
-    count: usize,
-    waiting: usize,
-    default_open: bool,
-) -> CollapsingState {
-    let pal = Palette::of_ui(ui);
-    let id = ui.make_persistent_id(salt);
-    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
-    let open_t = state.openness(ui.ctx());
-    let (rect, resp) =
-        ui.allocate_exact_size(vec2(ui.available_width(), header_h()), Sense::click());
-    let hov = ui
-        .ctx()
-        .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
-    if ui.is_rect_visible(rect) {
-        let p = ui.painter();
-        paint_header_chrome(p, pal, rect, open_t, hov);
-        let x = rect.left() + if theme::flat() { 26.0 } else { 28.0 };
-        let y = rect.center().y;
-        let size = if theme::flat() { 13.0 } else { 14.0 };
-        p.text(
-            pos2(x, y),
-            Align2::LEFT_CENTER,
-            title,
-            theme::font(size),
-            pal.text_strong,
-        );
-        let mut right = rect.right() - 10.0;
-        let count = p.text(
-            pos2(right, y),
-            Align2::RIGHT_CENTER,
-            count.to_string(),
-            theme::font(size - 2.0),
-            pal.weak,
-        );
-        right = count.left() - 10.0;
-        if waiting > 0 {
-            let c = pos2(right - STATUS_SIZE / 2.0, y);
-            tabs::paint_status(ui, c, STATUS_SIZE, TabStatus::Attention);
-        }
-    }
-    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-        state.toggle(ui);
-        out.interacted = true;
-    }
-    state.store(ui.ctx());
-    state
-}
-
-/// "Open tabs": every tab in strip order with its status indicator; a click activates, the ✕ or a
-/// middle click closes. Pinned above the session list (its own capped scroll area).
-fn open_tabs_section(ui: &mut Ui, input: &SidebarInput<'_>, out: &mut SidebarOutput) {
-    if input.tabs.is_empty() {
-        return;
-    }
-    let pal = Palette::of_ui(ui);
-    let waiting = input
-        .tabs
-        .iter()
-        .enumerate()
-        .filter(|(i, t)| t.status(*i == input.active_tab) == TabStatus::Attention)
-        .count();
-    let mut state = section_header(
-        ui,
-        out,
-        ("open-tabs", "Open tabs"),
-        input.tabs.len(),
-        waiting,
-        false,
-    );
-    state.show_body_unindented(ui, |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt("open-tabs-list")
-            .max_height((row_h() + 2.0) * OPEN_TABS_MAX_ROWS)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                for (i, tab) in input.tabs.iter().enumerate() {
-                    open_tab_row(ui, input, i, tab, out);
-                }
-            });
-    });
-    ui.add_space(theme::dens(6.0, 8.0));
-    let sep = ui.available_rect_before_wrap();
-    ui.painter()
-        .hline(sep.x_range(), sep.top(), Stroke::new(1.0, pal.stroke));
-    ui.add_space(theme::dens(6.0, 8.0));
-}
-
-fn open_tab_row(
-    ui: &mut Ui,
-    input: &SidebarInput<'_>,
-    i: usize,
-    tab: &Tab,
-    out: &mut SidebarOutput,
-) {
-    let pal = Palette::of_ui(ui);
-    let active = i == input.active_tab;
-    let status = tab.status(active);
-    let label = tab.label(input.labels);
-    let folder = tab.cwd.file_name().and_then(|n| n.to_str());
-    let neutral = theme::flat();
-
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h()), Sense::click());
-    let close_rect =
-        Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(20.0, 20.0));
-    let close = ui.interact(close_rect, resp.id.with("close"), Sense::click());
-    let (view, view_label) = view_action(input.default_view, Some(tab.view()));
-    let view_why = view_switch_reason(tab, view, input.host_available);
-    let view_rect = close_rect.translate(vec2(-26.0, 0.0));
-    let view_button = ui
-        .interact(view_rect, resp.id.with("session-view"), Sense::click())
-        .on_hover_text(view_why.unwrap_or(view_label));
-    let ctx = ui.ctx().clone();
-    let hov = ctx.animate_bool_with_time(
-        resp.id.with("hov"),
-        resp.hovered() || close.hovered() || view_button.hovered() || resp.context_menu_opened(),
-        0.12,
-    );
-    let sel = ctx.animate_bool_with_time(resp.id.with("sel"), active, 0.18);
-    if active && sel < 1.0 {
-        // Just activated (from anywhere): keep its row in view.
-        ui.scroll_to_rect(rect, None);
-    }
-    if ui.is_rect_visible(rect) {
-        let pill = rect.shrink2(vec2(2.0, 0.0));
-        let p = ui.painter();
-        paint_row_bg(p, pal, pill, (hov, sel));
-        if status == TabStatus::Attention {
-            tabs::paint_attention_pill(p, pal, pill, if neutral { 6 } else { 10 });
-        }
-        let ic = pos2(
-            pill.left() + if neutral { 15.0 } else { 19.0 },
-            pill.center().y,
-        );
-        if !tabs::paint_status(ui, ic, STATUS_SIZE, status) {
-            let (icon, col) = tab.kind_icon(pal, sel);
-            paint_icon(p, ic, Align2::CENTER_CENTER, icon, STATUS_SIZE, col);
-        }
-        let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.6));
-        let mut job = LayoutJob::default();
-        job.append(
-            label,
-            0.0,
-            TextFormat {
-                font_id: theme::font(if neutral { 13.0 } else { 13.5 }),
-                color,
-                ..Default::default()
-            },
-        );
-        if let Some(folder) = folder {
-            job.append(
-                &format!("  {folder}"),
-                0.0,
-                TextFormat {
-                    font_id: theme::font(11.0),
-                    color: pal.weak,
-                    ..Default::default()
-                },
-            );
-        }
-        let text_x = pill.left() + if neutral { 28.0 } else { 32.0 };
-        job.wrap.max_width = (view_rect.left() - 4.0 - text_x).max(10.0);
-        job.wrap.max_rows = 1;
-        job.wrap.break_anywhere = true;
-        let galley = p.layout_job(job);
-        p.galley(
-            pos2(text_x, pill.center().y - galley.size().y / 2.0),
-            galley,
-            color,
-        );
-        if hov > 0.01 {
-            paint_icon(
-                p,
-                view_rect.center(),
-                Align2::CENTER_CENTER,
-                view_icon(view),
-                14.0,
-                if view_why.is_none() {
-                    pal.accent
-                } else {
-                    pal.weak
-                },
-            );
-            let ch = ctx.animate_bool_with_time(close.id.with("hov"), close.hovered(), 0.1);
-            p.circle_filled(
-                close_rect.center(),
-                10.0,
-                theme::hover_fill(pal).gamma_multiply(ch),
-            );
-            paint_icon(
-                p,
-                close_rect.center(),
-                Align2::CENTER_CENTER,
-                ICON_X,
-                14.0,
-                theme::mix(pal.weak, pal.text_strong, ch).gamma_multiply(hov),
-            );
-        }
-    }
-    let close = close.on_hover_text("Close tab");
-    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    tabs::hover_card(&resp, pal, tab, label, status);
-    if close.clicked() || resp.middle_clicked() {
-        out.actions.push(SidebarAction::CloseTab(i));
-    } else if view_button.clicked() {
-        if view_why.is_none() {
-            out.actions
-                .push(SidebarAction::SwitchView { uid: tab.uid, view });
-            out.interacted = true;
-        }
-    } else if resp.clicked() {
-        out.actions.push(SidebarAction::ActivateTab(i));
-        out.interacted = true;
-    }
-    let env = input.menu_env();
-    theme::context_menu(&resp, 230.0, |ui| tab_menu(ui, i, tab, &env, out));
-}
 
 /// The branch chip of a session that runs in a worktree of the project.
 struct RowChip<'a> {
@@ -1862,23 +1810,53 @@ impl RowChip<'_> {
     }
 }
 
-/// What one session row shows besides its entry.
-struct RowCtx<'a> {
-    running: bool,
-    selected: bool,
-    chip: Option<RowChip<'a>>,
+/// Paints the rail of an expanded group: a 1 px vertical line from the centre of the header's
+/// folder glyph through its rows (the precomputed `rects`). Each row paints its own stub /
+/// elbow / marker over it (those need the row's hover/selection). The last row uses an elbow
+/// instead of rail + stub, so the rail ends above its rect.
+fn paint_rail(ui: &mut Ui, geom: &LedgerGeom, hdr_rect: &Rect, rects: &[Rect]) {
+    let Some(last) = rects.last() else { return };
+    let pal = Palette::of_ui(ui);
+    let p = ui.painter();
+    let top = hdr_rect.center().y + 6.0;
+    let bottom = if rects.len() == 1 {
+        // A single row still hangs off the rail: it ends at the row's stub.
+        geom.stub_y(last, last.height() > row_h() + 1.0)
+    } else {
+        last.top() - 1.0
+    };
+    if bottom > top {
+        p.vline(geom.rail_x, top..=bottom, Stroke::new(1.0, rail_color(pal)));
+    }
+}
+
+/// The status marker a ledger row shows on its stub.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Marker {
+    /// Nothing placed (idle ring or running dot, painted inline).
+    Plain,
+    /// In-flight delete/move/copy, or the tab's live Busy state: spinner.
+    Spin,
+    /// The tab's live Attention state: warn disc with `!`.
+    Attention,
 }
 
 fn session_row(
     ui: &mut Ui,
-    entry: &SessionEntry,
+    row: &LedgerRow<'_>,
     age_text: &str,
-    row: &RowCtx<'_>,
+    geom: &LedgerGeom,
+    last: bool,
     input: &SidebarInput<'_>,
     out: &mut SidebarOutput,
 ) {
     let pal = Palette::of_ui(ui);
+    let entry = row.entry;
     let (running, selected) = (row.running, row.selected);
+    let removed_wt = matches!(
+        row.chip.as_ref().map(|c| c.wt),
+        Some(RowWorktree::Removed(..))
+    );
     // A delete/move/copy of this session is in flight on a worker.
     let busy = input.busy.contains(&entry.path);
     // The live omp state of a tab showing this session (replaces the LED).
@@ -1887,16 +1865,29 @@ fn session_row(
         .get(entry.path.as_path())
         .copied()
         .filter(|_| !busy);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h()), Sense::click());
+    let marker = if busy {
+        Marker::Spin
+    } else {
+        match live {
+            Some(TabStatus::Busy) => Marker::Spin,
+            Some(TabStatus::Attention) => Marker::Attention,
+            _ => Marker::Plain,
+        }
+    };
+    let two_line = row.chip.is_some();
+    let h = row_h() + if two_line { chip_line_h() } else { 0.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
     let env = input.menu_env();
     // The worktree actions: a hover button each (the same actions as the context menu's).
-    let slots: Vec<Slot> = row
+    let slots: Vec<(Slot, KeyTone)> = row
         .chip
         .as_ref()
         .map(|c| {
+            let tones = slot_tones(c);
             slots(c, input.omp_available)
                 .into_iter()
-                .flatten()
+                .zip(tones)
+                .filter_map(|(s, t)| s.map(|s| (s, t)))
                 .collect()
         })
         .unwrap_or_default();
@@ -1918,17 +1909,21 @@ fn session_row(
         .and_then(|t| view_switch_reason(t, other_view, input.host_available));
     let mut slots = slots;
     if view_offer.is_some() {
-        slots.push(Slot {
-            icon: view_icon(other_view),
-            enabled: view_why.is_none(),
-        });
+        slots.push((
+            Slot {
+                icon: view_icon(other_view),
+                enabled: view_why.is_none(),
+            },
+            KeyTone::Plain,
+        ));
     }
-    let pill_rect = rect.shrink2(vec2(2.0, 0.0));
+    let pill = geom.row_box(&rect);
+    let stub_y = geom.stub_y(&rect, two_line);
     let btn_rects: Vec<Rect> = (0..slots.len())
         .map(|k| {
             Rect::from_center_size(
-                pos2(pill_rect.right() - 14.0 - 28.0 * k as f32, rect.center().y),
-                vec2(24.0, 24.0),
+                pos2(pill.right() - 8.0 - 10.0 - 23.0 * k as f32, stub_y),
+                vec2(20.0, 20.0),
             )
         })
         .collect();
@@ -1937,17 +1932,9 @@ fn session_row(
         .enumerate()
         .map(|(k, r)| ui.interact(*r, resp.id.with(("act", k)), Sense::click()))
         .collect();
-    // Width at the right of the row the buttons take: the title and chip never move for them.
-    let acts_w = if slots.is_empty() {
-        0.0
-    } else {
-        14.0 + 28.0 * slots.len() as f32
-    };
     let over_btn = btns.iter().any(egui::Response::hovered);
     // The buttons show (and the age hides) while the row is hovered or its menu is open.
     let show_btns = !slots.is_empty() && (resp.hovered() || over_btn || resp.context_menu_opened());
-    // What the chip may take: the title keeps at least ~90 px beside the age / the buttons.
-    let chip_budget = pill_rect.width() - 32.0 - 90.0 - acts_w.max(46.0);
     let ctx = ui.ctx().clone();
     let hov = ctx.animate_bool_with_time(
         resp.id.with("hov"),
@@ -1955,93 +1942,133 @@ fn session_row(
         0.12,
     );
     let sel = ctx.animate_bool_with_time(resp.id.with("sel"), selected, 0.18);
-    let btn_hov: Vec<f32> = btns
-        .iter()
-        .map(|b| ctx.animate_bool_with_time(b.id.with("hov"), b.hovered(), 0.1))
-        .collect();
+    if selected && sel < 1.0 {
+        // Just activated (from anywhere): keep its row in view.
+        ui.scroll_to_rect(rect, None);
+    }
     if ui.is_rect_visible(rect) {
-        let pill = rect.shrink2(vec2(2.0, 0.0));
         let p = ui.painter();
-        if theme::flat() {
-            let badge = row
-                .chip
-                .as_ref()
-                .map(|c| c.badge(p, pal, 10.5, chip_budget));
-            paint_row_neutral(
+        paint_row_bg(p, pal, pill, (hov, sel));
+        // Stub or elbow from the rail to the box, in accent when selected (with a glow),
+        // `hover_line` on hover, rail colour at rest.
+        let line = if sel > 0.01 {
+            pal.accent.gamma_multiply(sel.max(0.4))
+        } else if hov > 0.01 {
+            theme::mix(rail_color(pal), theme::hover_stroke(pal), hov)
+        } else {
+            rail_color(pal)
+        };
+        let line = line.gamma_multiply(if removed_wt { 0.5 } else { 1.0 });
+        if last {
+            // From the rail's end (1 px above the previous row's 2 px gap) down to the stub.
+            paint_elbow(p, geom.rail_x, rect.top() - 3.0, geom.box_x, stub_y, line);
+        } else {
+            p.hline(geom.rail_x..=geom.box_x, stub_y, Stroke::new(1.0, line));
+        }
+        if sel > 0.5 && !theme::flat() {
+            theme::glow_dot(
                 p,
-                pal,
-                pill,
-                (entry.label(), age_text),
-                (running, busy || live.is_some()),
-                (hov, sel),
-                (badge.as_ref(), acts_w, show_btns),
+                pos2((geom.rail_x + geom.box_x) / 2.0, stub_y),
+                2.0,
+                pal.accent,
+                theme::GLOW_REST,
+            );
+        }
+        // Status marker on the stub with a 2 px `panel` halo that cuts the line.
+        let dot = pos2(geom.rail_x + 5.0, stub_y);
+        match marker {
+            Marker::Spin => {
+                p.circle_filled(dot, 7.5, pal.panel);
+                crate::widgets::Spin::new(11.0, pal.accent_b).paint_at(ui, dot);
+            }
+            Marker::Attention => {
+                p.circle_filled(dot, 7.5, pal.panel);
+                tabs::paint_status(ui, dot, 11.0, TabStatus::Attention);
+            }
+            Marker::Plain => {
+                p.circle_filled(dot, 5.5, pal.panel);
+                if running {
+                    if selected {
+                        p.circle_stroke(dot, 4.5, Stroke::new(1.0, pal.accent));
+                    }
+                    ok_dot(p, pal, dot, 3.0);
+                } else {
+                    let ring = if selected { pal.accent } else { pal.weak };
+                    p.circle_stroke(dot, 3.5, Stroke::new(1.5, ring));
+                }
+            }
+        }
+        // Title 12 `text` (one size below the header), age `weak` 10 right-aligned. The
+        // chip sits on the second line under the title.
+        let title_c = theme::mix(pal.text, pal.text_strong, sel.max(hov));
+        let title_c = title_c.gamma_multiply(if removed_wt { 0.5 } else { 1.0 });
+        let text_left = pill.left() + 8.0;
+        let age = p.layout_no_wrap(age_text.to_owned(), theme::font(10.0), pal.weak);
+        let acts_w = if slots.is_empty() {
+            0.0
+        } else {
+            23.0 * slots.len() as f32 - 3.0
+        };
+        let mut text_right = if show_btns {
+            pill.right() - 8.0 - acts_w - 6.0
+        } else {
+            pill.right() - 8.0 - age.size().x - 6.0
+        };
+        text_right = text_right.max(text_left + 20.0);
+        let mut job =
+            LayoutJob::simple_singleline(entry.label().to_owned(), theme::font(12.0), title_c);
+        if removed_wt {
+            job.sections.iter_mut().for_each(|s| {
+                s.format.strikethrough = Stroke::new(1.0, pal.weak);
+            });
+        }
+        job.wrap.max_width = (text_right - text_left).max(10.0);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = p.layout_job(job);
+        p.galley(
+            pos2(text_left, stub_y - galley.size().y / 2.0),
+            galley,
+            title_c,
+        );
+        if !show_btns {
+            p.galley(
+                pos2(
+                    pill.right() - 8.0 - age.size().x,
+                    stub_y - age.size().y / 2.0,
+                ),
+                age,
+                pal.weak,
             );
         } else {
-            let badge = row
-                .chip
-                .as_ref()
-                .map(|c| c.badge(p, pal, 11.0, chip_budget));
-            paint_row_bg(p, pal, pill, (hov, sel));
-            // Status dot.
-            let dot = pos2(pill.left() + 19.0, pill.center().y);
-            if busy || live.is_some() {
-                // The spinner / tab status is placed below, once the painter borrow ends.
-            } else if running {
-                theme::glow_dot(p, dot, 3.5, pal.ok, theme::GLOW_REST);
-            } else {
-                p.circle_filled(dot, 2.8, pal.weak.gamma_multiply(0.45));
+            for ((slot, tone), r) in slots.iter().zip(&btn_rects) {
+                if slot.enabled {
+                    paint_key_at(p, pal, *r, slot.icon, *tone, hov);
+                } else {
+                    paint_key_box(
+                        p,
+                        pal,
+                        *r,
+                        if theme::flat() { theme::ui_rad(3) } else { 6 },
+                        KeyTone::Plain,
+                        hov,
+                    );
+                    crate::widgets::paint_icon(
+                        p,
+                        r.center(),
+                        Align2::CENTER_CENTER,
+                        slot.icon,
+                        12.0,
+                        pal.weak.gamma_multiply(0.45 * hov),
+                    );
+                }
             }
-            // Age chip.
-            let age = p.layout_no_wrap(age_text.to_owned(), crate::theme::font(11.5), pal.weak);
-            let chip = Rect::from_center_size(
-                pos2(
-                    pill.right() - 10.0 - (age.size().x + 12.0) / 2.0,
-                    pill.center().y,
-                ),
-                vec2(age.size().x + 12.0, 18.0),
-            );
-            if !show_btns {
-                p.rect_filled(chip, 9, pal.bg.gamma_multiply(0.55 + 0.45 * sel));
-                p.galley(chip.center() - age.size() / 2.0, age, pal.weak);
-            }
-            // Title.
-            let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.5));
-            let mut job = LayoutJob::simple_singleline(
-                entry.label().to_owned(),
-                // One step below the project header's 14 px name.
-                crate::theme::font(13.0),
-                color,
-            );
-            let mut text_right = chip.left().min(pill.right() - acts_w);
-            if let Some(b) = &badge {
-                text_right -= 6.0 + b.width();
-                b.paint_at(p, text_right, pill.center().y);
-            }
-            job.wrap.max_width = (text_right - pill.left() - 32.0 - 8.0).max(10.0);
-            job.wrap.max_rows = 1;
-            job.wrap.break_anywhere = true;
-            let galley = p.layout_job(job);
-            p.galley(
-                pos2(pill.left() + 32.0, pill.center().y - galley.size().y / 2.0),
-                galley,
-                color,
-            );
         }
-        if show_btns {
-            paint_row_acts(p, pal, &slots, &btn_rects, &btn_hov, hov);
+        if let Some(chip) = &row.chip {
+            let badge = chip.badge(p, pal, 9.0, pill.width() - 16.0);
+            let l2y = pill.top() + 1.0 + row_h() + chip_line_h() / 2.0;
+            badge.paint_at(p, text_left, l2y);
         }
-    }
-    let dot = pos2(
-        rect.left() + 2.0 + if theme::flat() { 15.0 } else { 19.0 },
-        rect.center().y,
-    );
-    if busy {
-        ui.put(
-            Rect::from_center_size(dot, vec2(12.0, 12.0)),
-            crate::widgets::Spin::new(12.0, pal.accent_b),
-        );
-    } else if let Some(status) = live {
-        tabs::paint_status(ui, dot, STATUS_SIZE, status);
     }
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     for (k, btn) in btns.iter().enumerate() {
@@ -2059,7 +2086,7 @@ fn session_row(
     let clicked = btns
         .iter()
         .enumerate()
-        .find(|(k, b)| b.clicked() && slots[*k].enabled)
+        .find(|(k, b)| b.clicked() && slots[*k].0.enabled)
         .map(|(k, _)| k);
     if let Some(k) = clicked {
         if k == work_slots {
@@ -2088,6 +2115,61 @@ fn session_row(
     theme::context_menu(&resp, 230.0, |ui| {
         session_menu(ui, entry, running, true, &env, out)
     });
+    row_hover_card(
+        &resp, pal, entry, age_text, row, busy, live, running, over_btn,
+    );
+}
+
+/// The elbow (└, radius 5) of the last row: from the rail above down to the stub height, then
+/// right to the box.
+fn paint_elbow(p: &egui::Painter, rail_x: f32, top: f32, box_x: f32, stub_y: f32, color: Color32) {
+    let r = 5.0;
+    p.vline(rail_x, top..=stub_y - r, Stroke::new(1.0, color));
+    p.add(egui::Shape::line(
+        arc_points(pos2(rail_x + r, stub_y - r), r, 90.0, 90.0),
+        Stroke::new(1.0, color),
+    ));
+    p.hline(rail_x + r..=box_x, stub_y, Stroke::new(1.0, color));
+}
+
+/// Points along a circular arc centred at `c`: `start_deg` for `sweep_deg` (screen angles,
+/// y down).
+fn arc_points(c: egui::Pos2, r: f32, start_deg: f32, sweep_deg: f32) -> Vec<egui::Pos2> {
+    const N: usize = 8;
+    (0..=N)
+        .map(|k| {
+            let a = (start_deg + sweep_deg * k as f32 / N as f32).to_radians();
+            c + vec2(r * a.cos(), r * a.sin())
+        })
+        .collect()
+}
+
+/// Tones of the worktree hover keys: Finish violet, Remove danger, parked Continue ×2 plain.
+fn slot_tones(chip: &RowChip<'_>) -> [KeyTone; 2] {
+    match chip.wt {
+        RowWorktree::Live(_) if chip.finishing => [KeyTone::Plain, KeyTone::Danger],
+        RowWorktree::Live(_) => [KeyTone::Violet, KeyTone::Danger],
+        RowWorktree::Parked(..) => [KeyTone::Accent, KeyTone::Plain],
+        RowWorktree::Removed(..) => [KeyTone::Plain, KeyTone::Plain],
+    }
+}
+
+/// The hover card of a ledger row: id, folder, file, branch, update time.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one card, its facts are separate"
+)]
+fn row_hover_card(
+    resp: &egui::Response,
+    pal: &Palette,
+    entry: &SessionEntry,
+    age_text: &str,
+    row: &LedgerRow<'_>,
+    busy: bool,
+    live: Option<TabStatus>,
+    running: bool,
+    over_btn: bool,
+) {
     const KEY_W: f32 = 76.0;
     let tone = live.map_or(Color32::TRANSPARENT, |s| tips::status_tone(pal, s));
     let mut head = card::Header::new(ICON_MESSAGES_SQUARE, entry.label()).tone(tone);
@@ -2109,7 +2191,7 @@ fn session_row(
         return;
     }
     card::hover(
-        &resp,
+        resp,
         340.0,
         false,
         &head,
@@ -2186,162 +2268,176 @@ fn session_row(
         },
     );
 }
+/// Height of a Running dock row (fixed 28 px in both densities).
+fn dock_row_h() -> f32 {
+    28.0
+}
 
-/// Neutral session row: status dot at the left, age at the right, the worktree chip left of the
-/// age (background: [`paint_row_bg`]).
-fn paint_row_neutral(
-    p: &egui::Painter,
-    pal: &Palette,
-    pill: Rect,
-    (label, age_text): (&str, &str),
-    (running, placed): (bool, bool),
-    (hov, sel): (f32, f32),
-    (chip, acts_w, show_btns): (Option<&badge::Badge>, f32, bool),
-) {
-    paint_row_bg(p, pal, pill, (hov, sel));
-    let y = pill.center().y;
-    let dot = pos2(pill.left() + 15.0, y);
-    if placed {
-        // The spinner / tab status is placed by the caller.
-    } else if running {
-        p.circle_filled(dot, 3.0, pal.ok);
-    } else {
-        p.circle_filled(dot, 2.5, pal.weak.gamma_multiply(0.4));
-    }
-    let age = p.layout_no_wrap(age_text.to_owned(), crate::theme::font(11.0), pal.weak);
-    let age_x = pill.right() - 10.0 - age.size().x;
-    // With hover buttons the age gives way to them (it fades out while the row is hovered).
-    let mut text_right = age_x.min(pill.right() - acts_w);
-    if let Some(b) = chip {
-        text_right -= 6.0 + b.width();
-        b.paint_at(p, text_right, y);
-    }
-    let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.6));
-    // One step below the project header's 13 px name.
-    let mut job = LayoutJob::simple_singleline(label.to_owned(), crate::theme::font(12.0), color);
-    job.wrap.max_width = (text_right - pill.left() - 28.0 - 8.0).max(10.0);
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    let galley = p.layout_job(job);
-    p.galley(
-        pos2(pill.left() + 28.0, y - galley.size().y / 2.0),
-        galley,
-        color,
-    );
-    if !show_btns {
-        p.galley(pos2(age_x, y - age.size().y / 2.0), age, pal.weak);
+/// Corner radius of ledger row boxes and dock rows.
+fn row_radius() -> u8 {
+    if theme::flat() { theme::ui_rad(3) } else { 6 }
+}
+
+/// The accent tint of a bordered action key's icon and border.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyTone {
+    Plain,
+    Accent,
+    Ok,
+    Danger,
+    Violet,
+}
+
+impl KeyTone {
+    fn color(self, pal: &Palette) -> Color32 {
+        match self {
+            KeyTone::Plain => pal.glyph,
+            KeyTone::Accent => pal.accent,
+            KeyTone::Ok => pal.ok,
+            KeyTone::Danger => pal.danger,
+            KeyTone::Violet => crate::badge::Hue::Violet.color(pal),
+        }
     }
 }
 
-/// The hover buttons of a session row, drawn like the project header's: a raised rounded square
-/// with the action's icon, lifting on hover; disabled actions are dimmed.
-fn paint_row_acts(
-    p: &egui::Painter,
-    pal: &Palette,
-    slots: &[Slot],
-    rects: &[Rect],
-    btn_hov: &[f32],
-    hov: f32,
-) {
-    if hov <= 0.01 {
-        return;
-    }
-    for ((act, r), over) in slots.iter().zip(rects).zip(btn_hov) {
-        let over = if act.enabled { *over } else { 0.0 };
-        if theme::flat() {
-            p.rect_filled(*r, 6, pal.raised.gamma_multiply(hov * over));
-        } else {
-            p.rect_filled(
-                *r,
-                8,
-                theme::mix(pal.raised, pal.accent, over * 0.5).gamma_multiply(hov),
+/// A bordered action key with depth: `panel` fill, `stroke` border tinted toward its tone, 1 px
+/// dark bottom shadow (lighter on light themes). Allocates the hit rect and paints the icon.
+fn ledger_key(ui: &mut Ui, icon: Icon, tip: &str, side: f32, tone: KeyTone) -> egui::Response {
+    let pal = Palette::of_ui(ui);
+    let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click());
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
+    if ui.is_rect_visible(rect) {
+        paint_key_at(ui.painter(), pal, rect, icon, tone, 1.0);
+        if hov > 0.01 {
+            ui.painter().rect_stroke(
+                rect,
+                if theme::flat() { theme::ui_rad(3) } else { 6 },
+                Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(hov)),
+                StrokeKind::Inside,
             );
         }
-        let tint = if act.enabled {
-            theme::mix(pal.weak, pal.text_strong, over)
-        } else {
-            pal.weak.gamma_multiply(0.45)
-        };
-        paint_icon(
-            p,
-            r.center(),
-            Align2::CENTER_CENTER,
-            act.icon,
-            if theme::flat() { 15.0 } else { 17.0 },
-            tint.gamma_multiply(hov),
-        );
     }
+    resp.on_hover_text(tip)
+        .on_hover_cursor(CursorIcon::PointingHand)
 }
 
-/// List row hover and selection. Hover lifts the row (raised fill + a bright outline, also on the
-/// active row); selection: Neutral raised fill + 2 px accent edge, Neon accent-tinted card with a
-/// gradient edge.
+/// Paints a bordered key at an already-allocated rect (hover rows manage their own hit rects).
+fn paint_key_at(
+    p: &egui::Painter,
+    pal: &Palette,
+    rect: Rect,
+    icon: Icon,
+    tone: KeyTone,
+    alpha: f32,
+) {
+    let radius = if theme::flat() { theme::ui_rad(3) } else { 6 };
+    paint_key_box(p, pal, rect, radius, tone, alpha);
+    let size = (rect.width() * 0.6).clamp(11.0, 15.0);
+    crate::widgets::paint_icon(
+        p,
+        rect.center(),
+        Align2::CENTER_CENTER,
+        icon,
+        size,
+        tone.color(pal).gamma_multiply(alpha),
+    );
+}
+
+/// The key's box: fill, tinted border, bottom shadow. `alpha` fades it with the row's hover.
+fn paint_key_box(
+    p: &egui::Painter,
+    pal: &Palette,
+    rect: Rect,
+    radius: u8,
+    tone: KeyTone,
+    alpha: f32,
+) {
+    // 1 px dark bottom shadow, lighter on light themes.
+    let dark = pal.bg.r() < 128;
+    let shadow = if dark {
+        Color32::from_black_alpha(160)
+    } else {
+        Color32::from_black_alpha(48)
+    };
+    p.rect_filled(
+        Rect::from_min_max(
+            pos2(rect.left() + 1.0, rect.bottom() - 1.0),
+            pos2(rect.right() - 1.0, rect.bottom()),
+        ),
+        0,
+        shadow.gamma_multiply(alpha),
+    );
+    p.rect_filled(rect, radius, pal.panel.gamma_multiply(alpha));
+    let tint = match tone {
+        KeyTone::Plain => pal.stroke,
+        _ => theme::mix(pal.stroke, tone.color(pal), 0.6),
+    };
+    p.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, tint.gamma_multiply(alpha)),
+        StrokeKind::Inside,
+    );
+}
+
+/// Ledger row background and selection. Selected: accent 11 % wash + 1 px accent border (and a
+/// 2 px `accent_a→accent_b` bar inside the box's left edge for `Sel::GradBar` styles). Hover:
+/// `hover_bg` + 1 px `hover_line` border (2 px for `Hover::Hard`) + soft glow. Neon keeps its
+/// larger radii and glow dots through the same structure.
 fn paint_row_bg(p: &egui::Painter, pal: &Palette, pill: Rect, (hov, sel): (f32, f32)) {
     let neutral = theme::flat();
     let lk = theme::look();
-    let radius = if neutral { theme::ui_rad(6) } else { 10 };
-    p.rect_filled(
-        pill,
-        radius,
-        theme::hover_fill(pal).gamma_multiply(0.75 * hov * (1.0 - sel)),
-    );
+    let radius = row_radius();
     if sel > 0.01 {
-        if neutral {
-            if lk.sel == theme::Sel::Tint {
-                p.rect(
-                    pill,
-                    radius,
-                    theme::skin::alpha(pal.accent, (28.0 * sel) as u8),
-                    Stroke::new(1.0, theme::skin::alpha(pal.accent, (110.0 * sel) as u8)),
-                    StrokeKind::Inside,
-                );
-            } else {
-                p.rect_filled(pill, radius, pal.raised.gamma_multiply(sel));
-                let bar = Rect::from_center_size(
-                    pos2(pill.left() + 1.0, pill.center().y),
-                    vec2(2.0, 14.0 * sel),
-                );
-                if lk.sel == theme::Sel::GradBar {
-                    theme::skin::gradient_card(
-                        p,
-                        egui::Id::unique("row-bar"),
-                        bar,
-                        1.0,
-                        (pal.accent_a, pal.accent_b),
-                        theme::skin::Dir::Down,
-                    );
-                } else {
-                    p.rect_filled(bar, 1, pal.accent);
-                }
-            }
-        } else {
-            p.rect(
-                pill,
-                radius,
-                theme::mix(pal.surface, pal.accent, 0.20).gamma_multiply(sel),
-                Stroke::new(1.0, pal.accent.gamma_multiply(0.5 * sel)),
-                StrokeKind::Inside,
-            );
+        p.rect(
+            pill,
+            radius,
+            pal.accent.gamma_multiply(0.11 * sel),
+            Stroke::new(1.0, pal.accent.gamma_multiply(sel)),
+            StrokeKind::Inside,
+        );
+        p.rect_stroke(
+            pill.shrink(1.0),
+            radius.saturating_sub(1),
+            Stroke::new(1.0, pal.accent.gamma_multiply(0.18 * sel)),
+            StrokeKind::Inside,
+        );
+        if lk.sel == theme::Sel::GradBar {
             let bar = Rect::from_center_size(
-                pos2(pill.left() + 3.0, pill.center().y),
-                vec2(3.0, 20.0 * sel),
+                pos2(pill.left() + 2.0, pill.center().y),
+                vec2(2.0, (pill.height() - 8.0).max(8.0) * sel),
             );
-            let mut m = egui::epaint::Mesh::default();
-            m.colored_vertex(bar.left_top(), pal.accent_a);
-            m.colored_vertex(bar.right_top(), pal.accent_a);
-            m.colored_vertex(bar.left_bottom(), pal.accent_b);
-            m.colored_vertex(bar.right_bottom(), pal.accent_b);
-            m.add_triangle(0, 1, 2);
-            m.add_triangle(1, 3, 2);
-            p.add(Shape::mesh(m));
+            theme::skin::gradient_card(
+                p,
+                egui::Id::unique("ledger-bar"),
+                bar,
+                1.0,
+                (pal.accent_a, pal.accent_b),
+                theme::skin::Dir::Down,
+            );
         }
     }
     if hov > 0.01 {
+        p.rect_filled(
+            pill,
+            radius,
+            theme::hover_fill(pal).gamma_multiply(0.75 * hov * (1.0 - sel)),
+        );
         let w = if lk.card.hover == theme::Hover::Hard {
             2.0
         } else {
             1.0
         };
+        // Soft `hover_line` glow: an outer ring at low alpha (Neon glows harder).
+        let glow_a = if neutral { 0.22 } else { 0.35 };
+        p.rect_stroke(
+            pill.expand(if neutral { 1.0 } else { 2.0 }),
+            radius + 1,
+            Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(glow_a * hov)),
+            StrokeKind::Inside,
+        );
         p.rect_stroke(
             pill,
             radius,
@@ -2406,8 +2502,8 @@ impl SidebarInput<'_> {
     }
 }
 
-/// A tab's context menu (tab strip and "Open tabs" rows): the tab items, then its session's full
-/// menu once the session file is listed.
+/// A tab's context menu (tab strip and Running dock rows): the tab items, then its session's
+/// full menu once the session file is listed.
 pub fn tab_menu(ui: &mut Ui, i: usize, tab: &Tab, env: &MenuEnv<'_>, out: &mut SidebarOutput) {
     if menu_item(ui, ICON_X, "Close tab", None, true, false).clicked() {
         out.actions.push(SidebarAction::CloseTab(i));

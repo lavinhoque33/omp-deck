@@ -131,6 +131,10 @@ pub struct AppConfig {
     pub palette_recent: Vec<String>,
     /// Width of the changes panel in points (0 = default).
     pub changes_panel_width: f32,
+    /// Height of the sidebar's "Running" dock in points (0 = fit its rows, at most six).
+    pub running_dock_height: f32,
+    /// The "Running" dock folded to its header.
+    pub running_dock_collapsed: bool,
     /// Split-view layout of the global tab set (`panes` index into `open_tabs`).
     pub split: Option<SplitState>,
     /// Lifetime of the per-user mobile-companion gateway (`Off` for configs that predate it).
@@ -282,6 +286,8 @@ impl Default for AppConfig {
             skipped_app_version: None,
             palette_recent: Vec::new(),
             changes_panel_width: 0.0,
+            running_dock_height: 0.0,
+            running_dock_collapsed: false,
             removed_worktrees: BTreeMap::new(),
             parked_branches: Vec::new(),
             split: None,

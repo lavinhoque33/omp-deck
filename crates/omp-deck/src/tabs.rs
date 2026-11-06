@@ -21,9 +21,7 @@ use crate::icons::{
 use crate::titlebar::strip_omp_prefix;
 use crate::{card, tips};
 use deck_service::status::TabStatus;
-use egui::{
-    Align2, Color32, CursorIcon, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
-};
+use egui::{Align2, Color32, CursorIcon, Painter, Pos2, Sense, Stroke, Ui, pos2, vec2};
 
 use crate::sidebar::{self, MenuEnv, SidebarAction, SidebarOutput};
 use crate::theme::{self, Palette, skin};
@@ -355,12 +353,6 @@ fn paint_attention_badge(p: &Painter, pal: &Palette, c: Pos2, size: f32) {
     let ink = Stroke::new((size * 0.12).max(1.6), pal.bg);
     p.line_segment([c + vec2(0.0, -r * 0.5), c + vec2(0.0, r * 0.12)], ink);
     p.circle_filled(c + vec2(0.0, r * 0.5), ink.width * 0.6, pal.bg);
-}
-
-/// Warn wash and outline over a row/pill whose tab waits for the user.
-pub fn paint_attention_pill(p: &Painter, pal: &Palette, rect: Rect, radius: u8) {
-    let (fill, stroke) = attention_tone(pal);
-    p.rect(rect, radius, fill, stroke, StrokeKind::Inside);
 }
 
 /// Fill and outline of the attention wash.

@@ -1,16 +1,16 @@
-//! Sidebar scope: the chip at the top that says whether the sidebar shows every project or one
-//! folder, its menu (all projects, recent folders, open folder…, current-folder actions) and the
-//! folder's "New session" button.
+//! Sidebar scope: the breadcrumb plate at the top that says whether the sidebar shows every
+//! project or one folder, its menu (all projects, recent folders, open folder…, current-folder
+//! actions) and the folder's "New session" button.
 
 use std::path::{Path, PathBuf};
 
 use crate::icons::{
-    ICON_CHECK, ICON_CHEVRONS_UP_DOWN, ICON_COPY, ICON_FOLDER, ICON_FOLDER_OPEN, ICON_FOLDER_PLUS,
-    ICON_GLOBE, ICON_PLUS, ICON_X,
+    ICON_CHECK, ICON_CHEVRON_RIGHT, ICON_CHEVRONS_UP_DOWN, ICON_COPY, ICON_FOLDER,
+    ICON_FOLDER_OPEN, ICON_FOLDER_PLUS, ICON_GLOBE, ICON_PLUS, ICON_X, Icon,
 };
 use egui::{
-    Align2, CursorIcon, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui,
-    pos2, vec2,
+    Align2, Color32, CursorIcon, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind,
+    TextEdit, Ui, pos2, vec2,
 };
 
 use crate::folder_scope::{folder_name, parent_display};
@@ -26,6 +26,21 @@ pub struct ScopeInput<'a> {
     pub picker_available: bool,
     /// The native folder dialog is open.
     pub picking: bool,
+    /// Sessions shown under the current scope (the total pill).
+    pub total: usize,
+}
+
+/// `text` on one line, cut with an ellipsis at `width` (the plate never grows a second line).
+fn one_line(
+    p: &egui::Painter,
+    text: String,
+    font_id: egui::FontId,
+    color: Color32,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text, font_id, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(8.0));
+    p.layout_job(job)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -56,22 +71,66 @@ impl ScopeState {
     }
 }
 
-fn chip_h() -> f32 {
-    theme::dens(32.0, 40.0)
+fn chip_h(scoped: bool) -> f32 {
+    if scoped {
+        theme::dens(48.0, 54.0)
+    } else {
+        theme::dens(36.0, 42.0)
+    }
 }
 const MENU_W: f32 = 300.0;
 
-/// The scope chip; its menu opens on click. In folder mode a ✕ on the chip returns to all projects.
+/// Depth shadow of a bordered key: 1 px dark at the bottom (lighter on light themes).
+fn key_shadow(pal: &Palette) -> Color32 {
+    if pal.bg.r() < 128 {
+        Color32::from_black_alpha(160)
+    } else {
+        Color32::from_black_alpha(48)
+    }
+}
+
+/// Paints a bordered 22 px key at `rect` (the scope bar's chevron / clear keys).
+fn paint_bar_key(p: &egui::Painter, pal: &Palette, rect: Rect, icon: Icon, alpha: f32) {
+    let radius = if theme::flat() { theme::ui_rad(3) } else { 6 };
+    p.rect_filled(
+        Rect::from_min_max(
+            pos2(rect.left() + 1.0, rect.bottom() - 1.0),
+            pos2(rect.right() - 1.0, rect.bottom()),
+        ),
+        0,
+        key_shadow(pal).gamma_multiply(alpha),
+    );
+    p.rect_filled(rect, radius, pal.panel.gamma_multiply(alpha));
+    p.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, pal.stroke.gamma_multiply(alpha)),
+        StrokeKind::Inside,
+    );
+    paint_icon(
+        p,
+        rect.center(),
+        Align2::CENTER_CENTER,
+        icon,
+        13.0,
+        pal.glyph.gamma_multiply(alpha),
+    );
+}
+
+/// The scope bar: full-width breadcrumb plate (`globe › All projects` or the folder's two
+/// lines), total sessions pill, bordered chevron key (plus a clear ✕ key when scoped). Its
+/// menu opens on click.
 pub fn chip(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState) -> Vec<ScopeAction> {
     let pal = Palette::of_ui(ui);
     let mut actions = Vec::new();
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), chip_h()), Sense::click());
-    let clear_rect =
-        Rect::from_center_size(pos2(rect.right() - 20.0, rect.center().y), vec2(26.0, 26.0));
-    let clear = input
-        .scope
-        .is_some()
-        .then(|| ui.interact(clear_rect, resp.id.with("clear"), Sense::click()));
+    let scoped = input.scope.is_some();
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), chip_h(scoped)), Sense::click());
+    let key_rect =
+        Rect::from_center_size(pos2(rect.right() - 19.0, rect.center().y), vec2(22.0, 22.0));
+    let _key = ui.interact(key_rect, resp.id.with("menu-key"), Sense::click());
+    let clear_rect = key_rect.translate(vec2(-26.0, 0.0));
+    let clear = scoped.then(|| ui.interact(clear_rect, resp.id.with("clear"), Sense::click()));
     let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
     let hov = ui.ctx().animate_bool_with_time(
         resp.id.with("hov"),
@@ -82,105 +141,128 @@ pub fn chip(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState) -> Vec<
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         let neutral = theme::flat();
-        let (fill, stroke) = match input.scope {
-            Some(_) if neutral => (
-                theme::mix(pal.surface, pal.raised, hov),
-                pal.accent.gamma_multiply(0.45 + 0.35 * hov),
-            ),
-            Some(_) => (
-                theme::mix(pal.surface, pal.accent, 0.14 + 0.06 * hov),
-                pal.accent.gamma_multiply(0.45 + 0.35 * hov),
-            ),
-            None => (
-                theme::mix(pal.surface, pal.raised, hov),
-                theme::mix(pal.stroke, pal.accent, 0.5 * hov),
-            ),
-        };
-        p.rect(
+        let radius = if neutral { theme::ui_rad(6) } else { 9 };
+        // Fill `surface` with an `accent_a` 6 % wash at its left, 1 px `stroke` border.
+        theme::skin::gradient_corners(
+            p,
+            resp.id.with("wash"),
             rect,
-            if neutral { theme::ui_rad(8) } else { 11 },
-            fill,
-            Stroke::new(1.0, stroke),
+            [radius as f32; 4],
+            (theme::mix(pal.surface, pal.accent_a, 0.06), pal.surface),
+            theme::skin::Dir::Right,
+        );
+        p.rect_stroke(
+            rect,
+            radius,
+            Stroke::new(1.0, pal.stroke),
             StrokeKind::Inside,
         );
-        let (icon, color) = match input.scope {
-            Some(_) => (ICON_FOLDER_OPEN, pal.accent),
-            None => (ICON_GLOBE, pal.weak),
-        };
+        // Accent underline fading to transparent by 55 % of the width.
+        let line_y = rect.bottom() - 0.5;
+        let w = rect.width() * 0.55;
+        let mut m = egui::epaint::Mesh::default();
+        m.colored_vertex(pos2(rect.left(), line_y), pal.accent.gamma_multiply(0.7));
+        m.colored_vertex(pos2(rect.left() + w, line_y), Color32::TRANSPARENT);
+        m.colored_vertex(
+            pos2(rect.left(), line_y + 1.0),
+            pal.accent.gamma_multiply(0.7),
+        );
+        m.colored_vertex(pos2(rect.left() + w, line_y + 1.0), Color32::TRANSPARENT);
+        m.add_triangle(0, 1, 2);
+        m.add_triangle(1, 3, 2);
+        p.add(egui::Shape::mesh(m));
+        if hov > 0.01 {
+            p.rect_stroke(
+                rect,
+                radius,
+                Stroke::new(1.0, theme::hover_stroke(pal).gamma_multiply(hov)),
+                StrokeKind::Inside,
+            );
+        }
+        // Breadcrumb: globe › name.
+        let mut x = rect.left() + 11.0;
+        let cy = rect.center().y;
         paint_icon(
             p,
-            pos2(
-                rect.left() + if neutral { 16.0 } else { 20.0 },
-                rect.center().y,
-            ),
+            pos2(x + 7.5, cy),
             Align2::CENTER_CENTER,
-            icon,
-            if neutral { 16.0 } else { 20.0 },
-            color,
+            ICON_GLOBE,
+            15.0,
+            pal.glyph,
         );
-        let right = if input.scope.is_some() {
-            clear_rect.left() - 2.0
+        x += 19.0;
+        paint_icon(
+            p,
+            pos2(x + 6.0, cy),
+            Align2::CENTER_CENTER,
+            ICON_CHEVRON_RIGHT,
+            12.0,
+            pal.weak,
+        );
+        x += 16.0;
+        let right = if scoped {
+            clear_rect.left() - 6.0
         } else {
-            rect.right() - 10.0
+            key_rect.left() - 6.0
         };
-        let chevron = pos2(right - 9.0, rect.center().y);
-        paint_icon(
-            p,
-            chevron,
-            Align2::CENTER_CENTER,
-            ICON_CHEVRONS_UP_DOWN,
-            if neutral { 14.0 } else { 17.0 },
-            theme::mix(pal.weak, pal.text_strong, hov),
+        // Total pill before the keys.
+        let tot = p.layout_no_wrap(input.total.to_string(), theme::font(9.0), pal.weak);
+        let pill = Rect::from_center_size(
+            pos2(right - (tot.size().x + 12.0) / 2.0 - 2.0, cy),
+            vec2(tot.size().x + 12.0, 15.0),
         );
-        let text_x = rect.left() + if neutral { 32.0 } else { 38.0 };
-        let max_w = (chevron.x - 14.0 - text_x).max(10.0);
+        let text_right = if right - pill.width() - 14.0 > x + 30.0 {
+            p.rect_filled(pill, 7, pal.panel);
+            p.rect_stroke(pill, 7, Stroke::new(1.0, pal.stroke), StrokeKind::Inside);
+            p.galley(pill.center() - tot.size() / 2.0, tot, pal.weak);
+            pill.left() - 6.0
+        } else {
+            right
+        };
+        let max_w = (text_right - x).max(10.0);
         match input.scope {
             Some(dir) => {
-                let name = p.layout(
+                paint_icon(
+                    p,
+                    pos2(x + 7.5, cy),
+                    Align2::CENTER_CENTER,
+                    ICON_FOLDER_OPEN,
+                    15.0,
+                    pal.accent,
+                );
+                let name = one_line(
+                    p,
                     folder_name(dir),
-                    crate::theme::font(if neutral { 13.0 } else { 14.5 }),
+                    theme::font(13.0),
+                    pal.text_strong,
+                    max_w - 20.0,
+                );
+                let sub = one_line(
+                    p,
+                    parent_display(dir),
+                    egui::FontId::new(10.0, egui::FontFamily::Monospace),
+                    pal.weak,
+                    max_w - 20.0,
+                );
+                let total = name.size().y + sub.size().y + 1.0;
+                let top = cy - total / 2.0;
+                p.galley(pos2(x + 20.0, top), name.clone(), pal.text_strong);
+                p.galley(pos2(x + 20.0, top + name.size().y + 1.0), sub, pal.weak);
+            }
+            None => {
+                let g = one_line(
+                    p,
+                    "All projects".to_owned(),
+                    theme::font(13.0),
                     pal.text_strong,
                     max_w,
                 );
-                let parent = parent_display(dir);
-                let sub = p.layout(parent, crate::theme::font(11.0), pal.weak, max_w);
-                let total = name.size().y + sub.size().y + 1.0;
-                let top = rect.center().y - total / 2.0;
-                p.galley(pos2(text_x, top), name.clone(), pal.text_strong);
-                p.galley(pos2(text_x, top + name.size().y + 1.0), sub, pal.weak);
-            }
-            None => {
-                let g = p.layout(
-                    "All projects".to_owned(),
-                    crate::theme::font(if neutral { 13.0 } else { 14.0 }),
-                    pal.text,
-                    max_w,
-                );
-                p.galley(
-                    pos2(text_x, rect.center().y - g.size().y / 2.0),
-                    g,
-                    pal.text,
-                );
+                p.galley(pos2(x, cy - g.size().y / 2.0), g, pal.text_strong);
             }
         }
-        if let Some(clear) = &clear {
-            let ch = ui
-                .ctx()
-                .animate_bool_with_time(clear.id.with("hov"), clear.hovered(), 0.1);
-            let p = ui.painter();
-            p.circle_filled(
-                clear_rect.center(),
-                11.0,
-                theme::mix(pal.raised, pal.accent, 0.45).gamma_multiply(ch),
-            );
-            paint_icon(
-                p,
-                clear_rect.center(),
-                Align2::CENTER_CENTER,
-                ICON_X,
-                16.0,
-                theme::mix(pal.weak, pal.text_strong, ch),
-            );
+        paint_bar_key(p, pal, key_rect, ICON_CHEVRONS_UP_DOWN, 1.0);
+        if scoped {
+            paint_bar_key(p, pal, clear_rect, ICON_X, 1.0);
         }
     }
 
@@ -304,34 +386,55 @@ fn menu(ui: &mut Ui, input: &ScopeInput<'_>, state: &mut ScopeState, out: &mut V
 /// Full-width "New session in <folder>" button; true when clicked.
 pub fn new_session_button(ui: &mut Ui, folder: &Path) -> bool {
     let pal = Palette::of_ui(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
     let hov = ui
         .ctx()
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
     let p = ui.painter();
+    let radius = if theme::flat() { theme::ui_rad(3) } else { 6 };
+    // Accent border + wash + depth (a dark bottom edge, lighter on light themes).
+    p.rect_filled(
+        Rect::from_min_max(
+            pos2(rect.left() + 2.0, rect.bottom() - 2.0),
+            pos2(rect.right() - 2.0, rect.bottom()),
+        ),
+        0,
+        key_shadow(pal),
+    );
     p.rect(
         rect,
-        10,
-        pal.accent.gamma_multiply(0.14 + 0.16 * hov),
-        Stroke::new(1.0, pal.accent.gamma_multiply(0.5 + 0.4 * hov)),
+        radius,
+        theme::mix(pal.panel, pal.accent, 0.10 + 0.06 * hov),
+        Stroke::new(1.0, pal.accent.gamma_multiply(0.6 + 0.3 * hov)),
         StrokeKind::Inside,
     );
+    // Inner accent highlight along the top.
+    p.hline(
+        (rect.left() + radius as f32)..=(rect.right() - radius as f32),
+        rect.top() + 1.0,
+        Stroke::new(1.0, pal.accent.gamma_multiply(0.25)),
+    );
+    let label = format!("New session in {}", folder_name(folder));
+    let g = p.layout(
+        label,
+        crate::theme::font(11.0),
+        pal.text_strong,
+        rect.width() - 24.0,
+    );
+    // Centred icon + label.
+    let total = 13.0 + 7.0 + g.size().x;
+    let mut x = rect.center().x - total / 2.0;
     paint_icon(
         p,
-        pos2(rect.left() + 18.0, rect.center().y),
+        pos2(x + 6.5, rect.center().y),
         Align2::CENTER_CENTER,
         ICON_PLUS,
-        19.0,
+        13.0,
         pal.accent,
     );
-    let g = p.layout(
-        format!("New session in {}", folder_name(folder)),
-        crate::theme::font(13.5),
-        pal.text_strong,
-        rect.width() - 46.0,
-    );
+    x += 20.0;
     p.galley(
-        pos2(rect.left() + 34.0, rect.center().y - g.size().y / 2.0),
+        pos2(x, rect.center().y - g.size().y / 2.0),
         g,
         pal.text_strong,
     );

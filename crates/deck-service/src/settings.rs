@@ -301,6 +301,8 @@ settings! {
     SkippedAppVersion(skipped_app_version: Option<String>) = Shared,
     PaletteRecent(palette_recent: Vec<String>) = Device,
     ChangesPanelWidth(changes_panel_width: f32) = Device,
+    RunningDockHeight(running_dock_height: f32) = Device,
+    RunningDockCollapsed(running_dock_collapsed: bool) = Device,
     GatewayMode(gateway_mode: GatewayMode) = Device,
     SessionView(session_view: SessionView) = Shared,
 }

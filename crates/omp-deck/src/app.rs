@@ -1952,6 +1952,8 @@ impl App {
             labels: &self.labels,
             active_tab: self.active,
             tab_activity: &tab_activity,
+            dock_height: self.cfg.running_dock_height,
+            dock_collapsed: self.cfg.running_dock_collapsed,
             backup: crate::sidebar::BackupMenu {
                 place: &place,
                 off: self.backup_menu_off(),
@@ -1992,6 +1994,18 @@ impl App {
             self.dirty = true;
         }
         let out = panel.inner;
+        if let Some(h) = out.dock_height
+            && (h - self.cfg.running_dock_height).abs() > 1.0
+        {
+            self.cfg.running_dock_height = h;
+            self.dirty = true;
+        }
+        if let Some(collapsed) = out.dock_collapsed
+            && collapsed != self.cfg.running_dock_collapsed
+        {
+            self.cfg.running_dock_collapsed = collapsed;
+            self.dirty = true;
+        }
         if out.interacted {
             self.focus_pending = true;
         }

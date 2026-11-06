@@ -1,6 +1,6 @@
-//! "Running sessions": every session still alive in the session backends (tmux or the OmpDeck
-//! host), with or without an open tab. Pinned under "Open tabs" in its own capped scroll area.
-
+//! The Running dock pinned to the sidebar's bottom: every session still alive in the session
+//! backends (tmux or the OmpDeck host), with or without an open tab. A grab strip resizes it,
+//! the header folds it; rows with a tab come first in strip order.
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -12,22 +12,32 @@ use deck_core::sessions::SessionEntry;
 use deck_service::backend::kind_label;
 use deck_service::status::TabStatus;
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Align2, CursorIcon, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Align2, CursorIcon, Id, Rect, Sense, Stroke, Ui, pos2, vec2};
 
 use super::{
-    STATUS_SIZE, SidebarAction, SidebarInput, SidebarOutput, paint_row_bg, row_h, section_header,
-    session_menu, tab_menu,
+    KeyTone, STATUS_SIZE, SidebarAction, SidebarInput, SidebarOutput, dock_row_h, ledger_key,
+    paint_key_at, paint_row_bg, row_radius, session_menu, tab_menu, view_action, view_icon,
+    view_switch_reason,
 };
 use crate::badge::{self, Hue};
 use crate::folder_scope;
-use crate::icons::{ICON_APP_WINDOW, ICON_CIRCLE_STOP, ICON_PLAY, ICON_TERMINAL};
+use crate::icons::{
+    ICON_APP_WINDOW, ICON_CHEVRON_DOWN, ICON_CHEVRON_UP, ICON_CIRCLE_STOP, ICON_PLAY,
+    ICON_TERMINAL, ICON_X,
+};
 use crate::tabs;
-use crate::theme::{self, Palette};
+use crate::theme::{self, Palette, skin};
 use crate::widgets::{menu_item, paint_icon};
 use crate::{card, tips};
 
-/// Most rows the list shows before it scrolls.
+/// Most rows the dock fits before it scrolls.
 const MAX_ROWS: f32 = 6.0;
+/// Height of the grab strip above the dock header.
+const GRAB_H: f32 = 11.0;
+/// Height of the dock header.
+fn header_h() -> f32 {
+    32.0
+}
 
 /// One live session of the section.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,50 +195,265 @@ fn status_of(input: &SidebarInput<'_>, row: &Row) -> TabStatus {
         None => TabStatus::of(None, input.running.activity_of(&row.name), false),
     }
 }
+/// Whether the dock shows at all: hidden when blind, nothing alive, or nothing in scope.
+fn rows_for<'c>(cache: &'c mut RunningCache, input: &SidebarInput<'_>) -> &'c [Row] {
+    if input.running.blind || input.running.alive.is_empty() {
+        return &[];
+    }
+    let rows = cache.sync(input);
+    if rows.is_empty() { &[] } else { rows }
+}
 
-pub(super) fn section(
+/// The dock's chrome height: grab strip + header + top border.
+fn chrome_h() -> f32 {
+    GRAB_H + header_h() + 1.0
+}
+
+/// Clamps the dock body to [one row, 55 % of the sidebar] given the sidebar height.
+fn clamp_body(want: f32, sidebar_h: f32) -> f32 {
+    let max = (sidebar_h * 0.55 - chrome_h()).max(dock_row_h() + 8.0);
+    want.clamp(dock_row_h() + 8.0, max)
+}
+
+/// The dock's height for this frame (0 = hidden). `sidebar_h` is the full sidebar height the
+/// 55 % clamp is computed against.
+pub(super) fn dock_height_for(input: &SidebarInput<'_>, rows: usize, sidebar_h: f32) -> f32 {
+    if rows == 0 {
+        return 0.0;
+    }
+    if input.dock_collapsed {
+        return chrome_h();
+    }
+    let fit = (dock_row_h() + 2.0) * (rows as f32).min(MAX_ROWS) + 8.0;
+    let body = if input.dock_height > 0.0 {
+        clamp_body(input.dock_height - chrome_h(), sidebar_h)
+    } else {
+        clamp_body(fit, sidebar_h)
+    };
+    chrome_h() + body
+}
+
+/// Measures the dock without painting or interacting: syncs the cache so the count is current
+/// and returns the height [`show_dock`] will take (0 = hidden). `sidebar_h` is the full
+/// sidebar height the 55 % clamp is computed against.
+pub(super) fn measure(
+    _ui: &mut Ui,
+    input: &SidebarInput<'_>,
+    cache: &mut RunningCache,
+    sidebar_h: f32,
+) -> f32 {
+    let rows = rows_for(cache, input);
+    dock_height_for(input, rows.len(), sidebar_h)
+}
+
+/// The Running dock: grab strip, header (title, count pill, attention dot, collapse key) and
+/// the rows. `height` is the [`measure`]d height.
+pub(super) fn show_dock(
     ui: &mut Ui,
     input: &SidebarInput<'_>,
     cache: &mut RunningCache,
+    height: f32,
+    sidebar_h: f32,
     out: &mut SidebarOutput,
 ) {
-    if input.running.blind || input.running.alive.is_empty() {
+    let rows: Vec<Row> = rows_for(cache, input).to_vec();
+    if rows.is_empty() || height <= 0.0 {
         return;
     }
-    let rows = cache.sync(input);
-    if rows.is_empty() {
+    let total = ui.available_width();
+    let top = ui.cursor().top();
+    let rect = Rect::from_min_size(pos2(ui.cursor().left(), top), vec2(total, height));
+    // Claim the whole dock rect up front so the groups scroll area never overlaps it.
+    ui.advance_cursor_after_rect(rect);
+    if !ui.is_rect_visible(rect) {
         return;
     }
     let pal = Palette::of_ui(ui);
+    let p = ui.painter();
+    // Top edge: 1 px `stroke` border.
+    p.hline(
+        rect.x_range(),
+        rect.top() + 0.5,
+        Stroke::new(1.0, pal.stroke),
+    );
+    let strip = Rect::from_min_size(
+        pos2(rect.left(), rect.top() + 1.0),
+        vec2(rect.width(), GRAB_H),
+    );
+    // Grab strip: `surface→panel` gradient with four centred dots.
+    theme::gradient_rect(p, strip, pal.surface, pal.panel, false);
+    for k in 0..4 {
+        let c = pos2(strip.center().x + (k as f32 - 1.5) * 7.0, strip.center().y);
+        p.circle_filled(c, 1.5, pal.weak);
+    }
+    let grab_id = Id::unique("running-dock-grab");
+    let grab = ui.interact(strip, grab_id, Sense::click_and_drag());
+    let grab = grab.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    if grab.dragged() {
+        // Dragging up from the strip unfolds a collapsed dock.
+        if input.dock_collapsed {
+            out.dock_collapsed = Some(false);
+        } else if let Some(dy) =
+            ui.input(|i| (i.pointer.delta().y != 0.0).then_some(i.pointer.delta().y))
+        {
+            let next = chrome_h() + clamp_body(height - chrome_h() - dy, sidebar_h);
+            if (next - input.dock_height).abs() > 1.0 {
+                out.dock_height = Some(next);
+            }
+        }
+    }
+    let head = Rect::from_min_size(
+        pos2(rect.left(), strip.bottom()),
+        vec2(rect.width(), header_h()),
+    );
+    p.rect_filled(
+        Rect::from_min_max(head.min, pos2(head.right(), head.bottom() + 1.0)),
+        0,
+        pal.surface,
+    );
+    p.hline(
+        head.x_range(),
+        head.bottom() + 0.5,
+        Stroke::new(1.0, pal.stroke),
+    );
     let waiting = rows
         .iter()
         .filter(|r| status_of(input, r) == TabStatus::Attention)
         .count();
-    let mut state = section_header(
-        ui,
-        out,
-        ("running-sessions", "Running sessions"),
-        rows.len(),
-        waiting,
-        true,
+    // Header contents in a child row: title, count pill, attention dot, spacer, collapse key.
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(head.shrink2(vec2(6.0, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    state.show_body_unindented(ui, |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt("running-sessions-list")
-            .max_height((row_h() + 2.0) * MAX_ROWS)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                for row in rows {
-                    running_row(ui, input, row, out);
-                }
-            });
+    child.spacing_mut().item_spacing.x = 6.0;
+    child.label(
+        egui::RichText::new("Running")
+            .font(theme::font(12.5))
+            .color(pal.text_strong),
+    );
+    count_pill(&mut child, pal, rows.len());
+    if waiting > 0 {
+        // The warn glow dot stays visible while collapsed.
+        let (dot_rect, _) = child.allocate_exact_size(vec2(11.0, 11.0), Sense::hover());
+        theme::glow_dot(
+            child.painter(),
+            dot_rect.center(),
+            3.5,
+            pal.warn,
+            theme::GLOW_REST,
+        );
+    }
+    child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let key = ledger_key(
+            ui,
+            if input.dock_collapsed {
+                ICON_CHEVRON_UP
+            } else {
+                ICON_CHEVRON_DOWN
+            },
+            if input.dock_collapsed {
+                "Expand the Running dock"
+            } else {
+                "Collapse the Running dock"
+            },
+            22.0,
+            KeyTone::Plain,
+        );
+        if key.clicked() {
+            out.dock_collapsed = Some(!input.dock_collapsed);
+            out.interacted = true;
+        }
     });
-    ui.add_space(theme::dens(6.0, 8.0));
-    let sep = ui.available_rect_before_wrap();
-    ui.painter()
-        .hline(sep.x_range(), sep.top(), Stroke::new(1.0, pal.stroke));
-    ui.add_space(theme::dens(6.0, 8.0));
+    if input.dock_collapsed {
+        return;
+    }
+    let body_rect = Rect::from_min_max(
+        pos2(rect.left(), head.bottom() + 1.0),
+        pos2(rect.right(), rect.bottom()),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(body_rect)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    egui::ScrollArea::vertical()
+        .id_salt("running-dock-list")
+        .auto_shrink([false, false])
+        .show(&mut child, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.add_space(3.0);
+            for row in &rows {
+                running_row(ui, input, row, out);
+            }
+            ui.add_space(3.0);
+        });
+}
+
+/// The header's count pill: accent border and text.
+fn count_pill(ui: &mut Ui, pal: &Palette, n: usize) {
+    let text = n.to_string();
+    let g = ui
+        .painter()
+        .layout_no_wrap(text, theme::font(9.0), pal.accent);
+    let (rect, _) =
+        ui.allocate_exact_size(vec2((g.size().x + 10.0).max(18.0), 15.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 7, pal.panel);
+    p.rect_stroke(
+        rect,
+        7,
+        Stroke::new(1.0, skin::alpha(pal.accent, 153)),
+        egui::StrokeKind::Inside,
+    );
+    p.galley(rect.center() - g.size() / 2.0, g, pal.accent);
+}
+
+/// The tab-less row's dashed "attach" pill at rest (play icon in `ok`): returns its width.
+fn attach_pill(p: &egui::Painter, pal: &Palette, pill: Rect) -> f32 {
+    let text = p.layout_no_wrap("attach".to_owned(), theme::font(9.0), pal.weak);
+    let w = 9.0 + 4.0 + text.size().x + 10.0;
+    let rect = Rect::from_min_size(
+        pos2(pill.right() - 8.0 - w, pill.center().y - 8.0),
+        vec2(w, 16.0),
+    );
+    p.rect_filled(rect, 2, pal.panel);
+    let dash = egui::Shape::dashed_line(
+        &[
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ],
+        Stroke::new(1.0, pal.stroke),
+        3.0,
+        2.0,
+    );
+    // `dashed_line` connects the points in order; close the loop by hand.
+    p.add(dash);
+    p.add(egui::Shape::dashed_line(
+        &[rect.left_bottom(), rect.left_top()],
+        Stroke::new(1.0, pal.stroke),
+        3.0,
+        2.0,
+    ));
+    paint_icon(
+        p,
+        pos2(rect.left() + 5.0 + 4.5, rect.center().y),
+        Align2::CENTER_CENTER,
+        ICON_PLAY,
+        9.0,
+        pal.ok,
+    );
+    p.galley(
+        pos2(
+            rect.left() + 9.0 + 4.0 + 4.0,
+            rect.center().y - text.size().y / 2.0,
+        ),
+        text,
+        pal.weak,
+    );
+    w + 8.0
 }
 
 fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut SidebarOutput) {
@@ -251,61 +476,95 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
         .or_else(|| tab.map(|t| t.cwd.as_path()));
     let folder = cwd.and_then(Path::file_name).and_then(|n| n.to_str());
     let active = row.tab == Some(input.active_tab);
-    let neutral = theme::flat();
+    let attention = status == TabStatus::Attention;
 
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h()), Sense::click());
-    let (view, view_label) = super::view_action(input.default_view, tab.map(tabs::Tab::view));
-    let view_why = tab.and_then(|t| super::view_switch_reason(t, view, input.host_available));
-    let view_rect =
-        egui::Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(22.0, 22.0));
-    let view_button = tab.is_some().then(|| {
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), dock_row_h()), Sense::click());
+    let pill = rect.shrink2(vec2(8.0, 1.0));
+    let (view, view_label) = view_action(input.default_view, tab.map(tabs::Tab::view));
+    let view_why = tab.and_then(|t| view_switch_reason(t, view, input.host_available));
+    // Tabbed rows: view-switch + close-tab keys on hover (the old Open-tabs row's keys).
+    let close_rect =
+        Rect::from_center_size(pos2(pill.right() - 10.0, pill.center().y), vec2(20.0, 20.0));
+    let view_rect = close_rect.translate(vec2(-23.0, 0.0));
+    let close_btn = tab
+        .is_some()
+        .then(|| ui.interact(close_rect, resp.id.with("close"), Sense::click()));
+    let view_btn = tab.is_some().then(|| {
         ui.interact(view_rect, resp.id.with("session-view"), Sense::click())
             .on_hover_text(view_why.unwrap_or(view_label))
     });
-    let over_view = view_button.as_ref().is_some_and(egui::Response::hovered);
+    // Tab-less rows: the attach key on hover.
+    let attach_btn = tab.is_none().then(|| {
+        ui.interact(close_rect, resp.id.with("attach"), Sense::click())
+            .on_hover_text(match entry {
+                Some(_) => "Open this session",
+                None => "Attach to this live session",
+            })
+    });
+    let over_key = close_btn.as_ref().is_some_and(egui::Response::hovered)
+        || view_btn.as_ref().is_some_and(egui::Response::hovered)
+        || attach_btn.as_ref().is_some_and(egui::Response::hovered);
     let ctx = ui.ctx().clone();
     let hov = ctx.animate_bool_with_time(
         resp.id.with("hov"),
-        resp.hovered() || over_view || resp.context_menu_opened(),
+        resp.hovered() || over_key || resp.context_menu_opened(),
         0.12,
     );
     let sel = ctx.animate_bool_with_time(resp.id.with("sel"), active, 0.18);
     if ui.is_rect_visible(rect) {
-        let pill = rect.shrink2(vec2(2.0, 0.0));
         let p = ui.painter();
         paint_row_bg(p, pal, pill, (hov, sel));
-        if status == TabStatus::Attention {
-            tabs::paint_attention_pill(p, pal, pill, if neutral { 6 } else { 10 });
-        }
-        let ic = pos2(
-            pill.left() + if neutral { 15.0 } else { 19.0 },
-            pill.center().y,
-        );
-        if !tabs::paint_status(ui, ic, STATUS_SIZE, status) {
-            if neutral {
-                p.circle_filled(ic, 3.0, pal.ok);
-            } else {
-                theme::glow_dot(p, ic, 3.5, pal.ok, theme::GLOW_REST);
-            }
-        }
-        // Marks a session that already has a tab.
-        let mut text_right = pill.right() - 8.0;
-        if view_button.is_some() {
-            let c = view_rect.center();
-            let icon = if hov > 0.01 {
-                super::view_icon(view)
-            } else {
-                ICON_APP_WINDOW
-            };
-            paint_icon(
-                p,
-                c,
-                Align2::CENTER_CENTER,
-                icon,
-                14.0,
-                theme::mix(pal.weak, pal.accent, 0.5 + 0.5 * sel),
+        if attention {
+            // Warn 9 % wash + warn border (the tab strip's attention wash is heavier: 13 %).
+            p.rect(
+                pill,
+                row_radius(),
+                pal.warn.gamma_multiply(0.09),
+                Stroke::new(1.0, pal.warn.gamma_multiply(0.5)),
+                egui::StrokeKind::Inside,
             );
-            text_right = c.x - 12.0;
+        }
+        let ic = pos2(pill.left() + 13.0, pill.center().y);
+        if !tabs::paint_status(ui, ic, STATUS_SIZE, status) {
+            theme::glow_dot(p, ic, 3.0, pal.ok, theme::GLOW_REST);
+        }
+        // Right side. Tabbed rows: accent window marker at rest, keys on hover. Tab-less
+        // rows: dashed attach pill at rest, the Attach key on hover.
+        let text_right;
+        if tab.is_some() {
+            if hov > 0.01 {
+                paint_key_at(
+                    p,
+                    pal,
+                    view_rect,
+                    view_icon(view),
+                    if view_why.is_none() {
+                        KeyTone::Accent
+                    } else {
+                        KeyTone::Plain
+                    },
+                    hov,
+                );
+                paint_key_at(p, pal, close_rect, ICON_X, KeyTone::Plain, hov);
+                text_right = view_rect.left() - 4.0;
+            } else {
+                paint_icon(
+                    p,
+                    pos2(pill.right() - 14.0, pill.center().y),
+                    Align2::CENTER_CENTER,
+                    ICON_APP_WINDOW,
+                    13.0,
+                    theme::mix(pal.weak, pal.accent, 0.5 + 0.5 * sel),
+                );
+                text_right = pill.right() - 26.0;
+            }
+        } else if hov > 0.01 {
+            paint_key_at(p, pal, close_rect, ICON_PLAY, KeyTone::Ok, hov);
+            text_right = close_rect.left() - 4.0;
+        } else {
+            let w = attach_pill(p, pal, pill);
+            text_right = pill.right() - 8.0 - w;
         }
         let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.6));
         let mut job = LayoutJob::default();
@@ -313,25 +572,35 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
             label,
             0.0,
             TextFormat {
-                // One step below the section header's 13/14 px.
-                font_id: theme::font(if neutral { 12.0 } else { 13.0 }),
+                font_id: theme::font(12.0),
                 color,
                 ..Default::default()
             },
         );
-        if let Some(folder) = folder {
+        let mut folder_w = 0.0;
+        if let Some(folder) = folder
+            && hov <= 0.01
+        {
+            // Faint folder, max ~64 px; the keys take its place on hover.
+            let mut name = folder.to_owned();
+            let mut g = p.layout_no_wrap(name.clone(), theme::font(10.0), pal.weak);
+            while g.size().x > 64.0 && name.len() > 4 {
+                name.pop();
+                g = p.layout_no_wrap(format!("{name}…"), theme::font(10.0), pal.weak);
+            }
+            folder_w = g.size().x + 8.0;
             job.append(
-                &format!("  {folder}"),
+                &format!("  {name}"),
                 0.0,
                 TextFormat {
-                    font_id: theme::font(if neutral { 10.5 } else { 11.0 }),
+                    font_id: theme::font(10.0),
                     color: pal.weak,
                     ..Default::default()
                 },
             );
         }
-        let text_x = pill.left() + if neutral { 28.0 } else { 32.0 };
-        job.wrap.max_width = (text_right - text_x).max(10.0);
+        let text_x = pill.left() + 26.0;
+        job.wrap.max_width = (text_right - text_x - folder_w.min(20.0)).max(10.0);
         job.wrap.max_rows = 1;
         job.wrap.break_anywhere = true;
         let galley = p.layout_job(job);
@@ -342,7 +611,15 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
         );
     }
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    if view_button.as_ref().is_some_and(egui::Response::clicked) {
+    let close_clicked = close_btn.as_ref().is_some_and(egui::Response::clicked);
+    let view_clicked = view_btn.as_ref().is_some_and(egui::Response::clicked);
+    let attach_clicked = attach_btn.as_ref().is_some_and(egui::Response::clicked);
+    if close_clicked || (resp.middle_clicked() && tab.is_some()) {
+        if let Some(i) = row.tab {
+            out.actions.push(SidebarAction::CloseTab(i));
+            out.interacted = true;
+        }
+    } else if view_clicked {
         if view_why.is_none() {
             if let Some(t) = tab {
                 out.actions
@@ -350,7 +627,7 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
             }
             out.interacted = true;
         }
-    } else if resp.clicked() {
+    } else if attach_clicked || resp.clicked() {
         out.actions.push(match (row.tab, entry) {
             (Some(i), _) => SidebarAction::ActivateTab(i),
             (None, Some(e)) => SidebarAction::Open(e.clone()),

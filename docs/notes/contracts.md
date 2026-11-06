@@ -3902,3 +3902,83 @@ picked **B — Turn trails** (`B-turn-trails.png`). Reference: omp 18.16.0 `pack
   row text + "Full content needs the updated OmpDeck gateway — restart OmpDeck". Items are stored once as
   `Arc<Vec<TranscriptItem>>` with their copy text; `TranscriptView::sync` runs only when the shown entry changes.
   The reading view is `TranscriptView::new(false).opened()`: every row starts expanded (tool call + result visible).
+
+## Sidebar "Branch Ledger" + Running dock (user, 2026-11-05)
+
+User: "give the left sidebar a visual uplift … show me some creative and modern alternative options". Round 1 (A–F) and
+round 2 (G–K) mockups in `~/omp-deck-sidebar-mockups/` (generator of G: `/tmp/sidebar-mock-G/gen.py`). Round-2 brief from
+the user: "make the sessions (under a project folder) more indented, move the all projects section to the top, followed by
+open tabs and running sections in tab view at the bottom". The user picked **G — Branch Ledger** (`G-branch-ledger.png`)
+and changed it: "get rid of open tabs altogether, only running processes part is needed (since it already shows tab
+indicator for open tabs), and reorder them to move the open tabbed ones to the top".
+
+### Structure (top → bottom; every style, both densities)
+1. **Scope bar** (replaces the scope chip, same menu/actions): full-width breadcrumb plate `globe › All projects`, total
+   sessions pill, a bordered chevrons-up-down key. Folder scope = two lines (name `text_strong` / parent `weak` mono) +
+   clear ✕ key. Fill `surface` with an `accent_a` 6 % wash at its left, 1 px `stroke` border, an accent underline
+   fading to transparent by 55 % of the width; hover = `hover_line` outline. Height `dens(36,42)` / two-line `dens(48,54)`.
+2. **Filter row**: search field (`surface`, `stroke` border, focus = accent border + soft accent glow), session-manager
+   and refresh as bordered 26 px keys with depth (1 px dark bottom shadow). "New session in <folder>" button under it
+   while a folder is scoped (accent border + wash + depth).
+3. **Project groups** (scroll area, fills the space between the filter row and the dock).
+4. **Running dock** pinned to the sidebar's bottom (only when running rows exist; hidden when `blind` / none alive /
+   none in scope). The pinned **"Open tabs" section is removed** (tabs stay in the tab bar; a tabbed session shows in the
+   dock with its window marker).
+
+### Project header
+- `header_h()` row inset 6 px: chevron, folder glyph, name (`text_strong` 13 UI font), parent path (`weak` mono 10, same
+  line; dropped below ~250 px width), count right (`weak` mono 10).
+- Expanded group = persistent plate (`surface` fill + 1 px `stroke`), folder glyph in `accent`.
+- Hover = `hover_bg` fill + 1 px `hover_line` border + soft `hover_line` glow; the count gives way to bordered 20 px icon
+  keys with depth: **+** New session (accent-tinted), New session in worktree (git-branch-plus, when allowed),
+  New chat/terminal session. Same actions, gates, tooltips, menu and hover card as today.
+
+### Session rows (the "ledger")
+- **Rail**: a 1 px vertical line drops from the centre of the expanded header's folder glyph through all its rows;
+  colour `rail = mix(panel, weak, 0.62)` (plain `stroke` vanishes at 1 px). Each row hangs off it by a 17 px horizontal
+  **stub** at the row's first-line centre; the last row uses a rounded elbow (└, radius 5) instead of rail + stub.
+- **Status marker sits on the stub** (with a 2 px `panel` halo that cuts the line): idle = hollow 7 px ring (`weak`,
+  1.5 px); running = filled `ok` dot with glow; Busy = spinner (`accent_b`) 11 px; Attention = `warn` disc with `!`
+  (existing badge) 11 px; in-flight delete/move/copy = spinner.
+- **Row box** starts at the stub's end (title ≈ 50 px right of the chevron vs ≈ 16 today) and ends 8 px before the
+  edge: title 12 `text` (one size below the header), age `weak` 10 right-aligned. Single-line rows `row_h()`.
+- **Branch chips move to a second line** under the title (row grows by `dens(12,14)`): live worktree Teal, Finishing…
+  Amber, `parked · <branch>` Violet, removed = dimmed row + struck title + grey chip.
+- **Selected** (the active tab's session): accent 11 % wash + 1 px accent border; its stub/elbow drawn in accent with a
+  glow; idle ring turns accent, running dot gets an accent ring. `Sel::GradBar` styles add a 2 px `accent_a→accent_b`
+  bar inside the box's left edge.
+- **Hover**: `hover_bg` + 1 px `hover_line` border (2 px for `Hover::Hard`) + soft glow, stub/elbow in `hover_line`,
+  title `text_strong`; the age gives way to bordered 20 px keys with depth (worktree Finish violet, Remove danger,
+  parked Continue ×2, open in chat/terminal view). Same actions/gates/tooltips/menu/hover card as today.
+- Narrow (220 px): indent and rail stay; paths and dock folder names drop first, then titles ellipsize.
+
+### Running dock
+- Top edge: 1 px `stroke` border, then an 11 px **grab strip** (four 3 px `weak` dots centred, `surface→panel`
+  gradient, `ResizeVertical` cursor) that drags the dock height; header 32 px (`surface`, `stroke` bottom border):
+  title "Running" (`text_strong`), count pill (accent border/text), a `warn` glow dot when any row needs attention
+  (stays visible while collapsed), spacer, bordered collapse chevron key.
+- Height: `AppConfig.running_dock_height` (Device setting; 0 = fit rows, max six) clamped to [header + one row,
+  55 % of the sidebar]; `AppConfig.running_dock_collapsed` folds it to the grab strip + header. Both persist through the
+  settings service like `sidebar_width`.
+- Rows (28 px, inset 8): status glyph 14 (Attention badge / Busy spinner / Exited / Bell / idle `ok` glow dot), label
+  12, faint folder 10 (max ~64 px). **Order: rows with a tab first (tab-strip order), then the rest newest session file
+  first, unlisted last by name** (today's `running::order`, kept).
+  - With a tab: accent window marker at rest; hover → view-switch + **close tab ✕** (detach, as the old Open-tabs row);
+    middle-click closes the tab; the active tab's row is selected (accent wash + border).
+  - Without a tab: dashed "attach" pill (play icon in `ok`) at rest; hover → Attach (play) key.
+  - Attention row: `warn` 9 % wash + `warn` border. Hover as session rows. Context menus and hover card unchanged
+    (`tab_menu` / `session_menu` / unlisted Open + Stop).
+- Colours only from the active palette (`Palette`) and the fixed badge hues; depth shadows via the existing skin
+  helpers (lighter on light themes). Neon keeps its larger radii/glow but uses the same structure.
+
+### As built (Branch Ledger)
+- Supersedes the sidebar parts of "Tab activity indicators, \"Open tabs\" sidebar section" and the Wave 15 "Sidebar
+  sections" note: `open_tabs_section` / `open_tab_row` are gone; `SidebarAction::{ActivateTab, CloseTab}` now come
+  from the dock rows. `running::order` is unchanged.
+- `sidebar.rs`: `LedgerGeom` (rail x = folder glyph centre, box x = rail + 17) shared by the header painters and
+  rows; `paint_rail` paints the group's rail from precomputed row rects (2 px pitch), each row its stub / elbow /
+  marker. `sidebar/running.rs` = the dock (grab strip, header, rows); `scope_bar.rs` = breadcrumb plate (one-line
+  truncation, never wraps at 220 px).
+- New Device settings `RunningDockHeight` / `RunningDockCollapsed` (deck-service `settings!`): the GUI writes them
+  through the settings service like `sidebar_width`. A gateway built before them drops the fields — ship the gateway
+  and the GUI together (they are one release).
