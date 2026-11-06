@@ -916,6 +916,14 @@ fn tool_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
 
     let w = finite_width(ui);
     let head_h = if inline { INLINE_H } else { HEAD_H };
+    // The body's width as `body_scope` lays it out (inline: under the rail; card: in the margins).
+    let body_w = if inline {
+        w - 18.0
+    } else {
+        w - if running { 16.0 } else { 12.0 } - 12.0
+    }
+    .max(40.0);
+    let can_fold = collapsible && has_body && foldable(cx, ui, n, collapsed, pv, body_w);
     let bg = (!inline).then(|| paint::reserve(ui.painter()));
     let (head_rect, _) = ui.allocate_exact_size(vec2(w, head_h), Sense::hover());
     let hid = ui.scope_id().with(("tool-head", n.id.as_str()));
@@ -1019,21 +1027,24 @@ fn tool_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
         &n.id,
         head_rect,
         pad,
-        |ui| head_right(cx, ui, n, lk, ms, hot, collapsible.then_some(collapsed)),
+        |ui| head_right(cx, ui, n, lk, ms, hot, can_fold.then_some(collapsed)),
         |ui| head_left(cx, ui, n, lk),
     );
     let mut head = head;
     if let Some(i) = n.str("intent").filter(|i| !i.trim().is_empty()) {
         head = head.on_hover_text(text::clean(i).into_owned());
     }
-    if collapsible || action.is_some() {
+    if can_fold || action.is_some() {
         head = head.on_hover_cursor(CursorIcon::PointingHand);
     }
     if head.clicked() {
-        if collapsible {
+        if can_fold {
             cx.toggle(n);
         } else if let Some(a) = action {
             cx.click(n, a);
+        } else if collapsible {
+            // omp may still show more unfolded than its folded body tells (`find`'s extra ranges).
+            cx.toggle(n);
         }
     }
 
@@ -1410,6 +1421,15 @@ fn target(cx: &Cx, ui: &mut Ui, n: &SNode) {
     }
 }
 
+/// The compact mono look of a tool body.
+fn body_tx(ink: &Ink) -> Tx {
+    Tx {
+        font: ink.mono(0.95),
+        color: ink.text(),
+        line: None,
+    }
+}
+
 /// Body of a tool: its children in a compact mono look, clamped per `clamp` (collapsed previews).
 fn body_scope(
     cx: &Cx,
@@ -1424,11 +1444,7 @@ fn body_scope(
     let w = (right - left).max(40.0);
     let top = ui.cursor().top();
     let region = Rect::from_min_size(pos2(left, top), vec2(w, 10_000.0));
-    let tx = Tx {
-        font: ink.mono(0.95),
-        color: ink.text(),
-        line: None,
-    };
+    let tx = body_tx(ink);
     let Some((rows, tail)) = clamp_rows(clamp) else {
         ui.scope_builder(
             UiBuilder::new()
@@ -1446,7 +1462,7 @@ fn body_scope(
         return;
     };
     let row_h = ui.ctx().fonts_mut(|f| f.row_height(&tx.font)).max(10.0);
-    let m = measure_body(cx, ui, n, w, &tx);
+    let m = measure_body(cx, ui, n, w, &tx, true);
     let plan = plan_clamp(rows.max(1), tail, row_h, m.h, m.grid.as_ref());
     let more_id = ui.scope_id().with(("tool-more", n.id.as_str()));
     // A tail keeps its end, so what was left out sits above it.
@@ -1601,18 +1617,27 @@ fn more_label(ui: &Ui, id: Id, hidden: Option<usize>, tail: bool) -> Arc<str> {
 struct BodyMeasure {
     sub: u64,
     bucket: i32,
+    /// The fold state it was laid out in (its blocks clamp only while folded).
+    folded: bool,
     h: f32,
     /// The first run of text rows its renderers reported, `top` relative to the body's top.
     grid: Option<RowGrid>,
+    /// A block in it is cut by a clamp it has only while the tool is folded.
+    fold_cut: bool,
+    /// omp shortened it for the fold itself ("3 more files", "4 earlier") or it holds a fold
+    /// of its own that follows this one.
+    shortened: bool,
 }
 
-/// [`BodyMeasure`] of `n`'s body at width `w`, remembered until its subtree or the width changes.
-fn measure_body(cx: &Cx, ui: &mut Ui, n: &SNode, w: f32, tx: &Tx) -> BodyMeasure {
+/// [`BodyMeasure`] of `n`'s body at width `w` in fold state `folded`, remembered until its
+/// subtree, the width or the fold state changes.
+fn measure_body(cx: &Cx, ui: &mut Ui, n: &SNode, w: f32, tx: &Tx, folded: bool) -> BodyMeasure {
     let key = ui.scope_id().with(("tool-body-h", n.id.as_str()));
     let bucket = w.round() as i32;
     if let Some(m) = ui.data(|d| d.get_temp::<BodyMeasure>(key))
         && m.sub == n.sub
         && m.bucket == bucket
+        && m.folded == folded
     {
         return m;
     }
@@ -1626,17 +1651,90 @@ fn measure_body(cx: &Cx, ui: &mut Ui, n: &SNode, w: f32, tx: &Tx) -> BodyMeasure
             .sizing_pass(),
     );
     probe.set_width(w);
-    cx.loc(|l| l.row_grids = Some(Vec::new()));
+    // A tool nested in this body measures its own body meanwhile: keep ours around it.
+    let (grids_out, probe_out) = cx.loc(|l| {
+        (
+            l.row_grids.replace(Vec::new()),
+            l.fold_probe.replace((n.id.clone(), false)),
+        )
+    });
     body_children(cx, &mut probe, n, tx);
-    let grids = cx.loc(|l| l.row_grids.take()).unwrap_or_default();
+    let (grids, fold_cut) = cx.loc(|l| {
+        (
+            std::mem::replace(&mut l.row_grids, grids_out).unwrap_or_default(),
+            std::mem::replace(&mut l.fold_probe, probe_out).is_some_and(|(_, cut)| cut),
+        )
+    });
     let m = BodyMeasure {
         sub: n.sub,
         bucket,
+        folded,
         h: probe.min_rect().height(),
         grid: RowGrid::merged(grids.into_iter().map(|g| g.moved(-rect.top())).collect()),
+        fold_cut,
+        shortened: cx
+            .snap
+            .find(n, &|c| {
+                !c.hidden()
+                    && (c.flag("collapsible")
+                        || (c.kind == "text" && counts_left_out(&text::node_plain(c))))
+            })
+            .is_some(),
     };
     ui.data_mut(|d| d.insert_temp(key, m.clone()));
     m
+}
+
+/// Whether `s` counts what a renderer left out: "3 more files", "+2 more", "4 earlier". omp's
+/// folded tool bodies end with such a line where unfolding shows the rest.
+fn counts_left_out(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() || (i > 0 && b[i - 1].is_ascii_alphanumeric()) {
+            i += 1;
+            continue;
+        }
+        let end = i + b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+        // `end` follows ASCII digits, so it is a char boundary.
+        let rest = &s[end..];
+        let word = |w: &str| {
+            rest.strip_prefix(w)
+                .is_some_and(|after| after.chars().next().is_none_or(|c| !c.is_alphanumeric()))
+        };
+        if word(" more") || word(" earlier") {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+/// Whether folding `n` (a tool with a visible body, clamped per `pv` while folded) changes what
+/// it shows, so its head offers the fold chevron. omp marks every tool with a body collapsible,
+/// but its terminal only offers to expand where something is left out: a hidden body, a clamp
+/// that cuts it, or a body omp shortened for the fold. `w` is the body's width.
+fn foldable(cx: &Cx, ui: &mut Ui, n: &SNode, collapsed: bool, pv: Preview, w: f32) -> bool {
+    if pv == Preview::None {
+        return true;
+    }
+    // Open: what folding would hide is what the folded body hid when last drawn. A tool never
+    // seen folded (it streams open, or starts open) keeps the chevron rather than measuring.
+    let seen = cx.loc(|l| l.fold_seen.get(&n.id).copied());
+    if !collapsed && seen != Some(false) {
+        return true;
+    }
+    let tx = body_tx(cx.ink);
+    let m = measure_body(cx, ui, n, w, &tx, collapsed);
+    let cut = clamp_rows(pv).is_some_and(|(rows, tail)| {
+        let row_h = ui.ctx().fonts_mut(|f| f.row_height(&tx.font)).max(10.0);
+        plan_clamp(rows.max(1), tail, row_h, m.h, m.grid.as_ref()).cut
+    });
+    let now = cut || m.fold_cut || m.shortened;
+    if collapsed && seen != Some(now) {
+        cx.loc(|l| l.fold_seen.insert(n.id.clone(), now));
+    }
+    now
 }
 
 // ---- agent ----------------------------------------------------------------------------------
@@ -1833,7 +1931,10 @@ fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let running = status == "running";
     let collapsible = n.flag("collapsible");
     let collapsed = collapsible && cx.collapsed(n);
-    let has_body = !collapsed && cx.snap.kids(n).any(|c| !render::blank(cx, c));
+    // omp describes an agent's body folded or not: the fold hides something only when it has one.
+    let body = cx.snap.kids(n).any(|c| !render::blank(cx, c));
+    let can_fold = collapsible && body;
+    let has_body = body && !collapsed;
     if running {
         cx.animate();
     }
@@ -1863,7 +1964,7 @@ fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
         (14.0, 10.0),
         |ui| {
             ui.spacing_mut().item_spacing.x = 7.0;
-            if collapsible {
+            if can_fold {
                 render::chevron(ui, ink.dim(), !collapsed);
             }
             hover_buttons(cx, ui, n, hot);
@@ -1890,7 +1991,11 @@ fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
         head.clone().on_hover_text(task);
     }
     if collapsible {
-        let head = head.clone().on_hover_cursor(CursorIcon::PointingHand);
+        let head = if can_fold {
+            head.clone().on_hover_cursor(CursorIcon::PointingHand)
+        } else {
+            head.clone()
+        };
         if head.clicked() {
             cx.toggle(n);
         }

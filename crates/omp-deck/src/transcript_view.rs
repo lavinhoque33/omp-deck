@@ -646,6 +646,7 @@ struct ImageLoaded {
 /// the rows draw, so the rows take everything else through this handle.
 struct RowKit<'a> {
     flipped: &'a mut HashSet<usize>,
+    open_all: bool,
     revision: Option<u64>,
     transcript: &'a PathBuf,
     images: &'a mut HashMap<String, ImageSlot>,
@@ -656,7 +657,7 @@ struct RowKit<'a> {
 
 impl RowKit<'_> {
     fn is_open(&self, items: &[TranscriptItem], i: usize, row: Row) -> bool {
-        default_open(items, row) ^ self.flipped.contains(&i)
+        (self.open_all || default_open(items, row)) ^ self.flipped.contains(&i)
     }
 
     fn toggle(&mut self, i: usize) {
@@ -722,6 +723,8 @@ pub struct TranscriptView {
     width: f32,
     /// Rows whose open state differs from [`default_open`].
     flipped: HashSet<usize>,
+    /// Every row starts open (a single-entry preview), not just [`default_open`] ones.
+    open_all: bool,
     pub follow: bool,
     jump: bool,
     md: MdStandalone,
@@ -742,6 +745,7 @@ impl TranscriptView {
             offsets: Vec::new(),
             width: 0.0,
             flipped: HashSet::new(),
+            open_all: false,
             follow,
             jump: follow,
             md: MdStandalone::default(),
@@ -751,6 +755,12 @@ impl TranscriptView {
             images_tx: None,
             zoomed: None,
         }
+    }
+
+    /// Every row starts expanded (the session tree's single-entry preview).
+    pub fn opened(mut self) -> TranscriptView {
+        self.open_all = true;
+        self
     }
 
     /// Scroll to the end and keep following.
@@ -825,6 +835,7 @@ impl TranscriptView {
             offsets,
             width: view_w,
             flipped,
+            open_all,
             follow,
             jump,
             md,
@@ -843,6 +854,7 @@ impl TranscriptView {
         });
         let mut kit = RowKit {
             flipped,
+            open_all: *open_all,
             revision: *revision,
             transcript,
             images,

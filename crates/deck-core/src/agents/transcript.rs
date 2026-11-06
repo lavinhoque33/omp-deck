@@ -411,6 +411,19 @@ fn incoming_line(body: &str) -> (Option<String>, &str) {
     }
 }
 
+/// What the tree preview shows for one line: like [`map_line`], but for the tree's needs —
+/// hidden entries become visible as notices instead of vanishing. The subagent transcript
+/// behaviour of `map_line` itself is unchanged (hidden custom messages stay hidden there).
+/// `custom_message` regardless of `display` → `Notice { kind: customType, text }` (advisor:
+/// its qualifier + note text); `developer` and `custom`-role messages → `Notice`;
+/// `branch_summary` → `Notice { kind: "branch_summary" }`; `compaction` → `Compaction`.
+/// Assistant text/thinking/tool calls/error map exactly as in the transcript.
+pub fn entry_items(line: &[u8]) -> Vec<TranscriptItem> {
+    let mut out = Vec::new();
+    map_entry(line, &mut out);
+    out
+}
+
 /// Maps one transcript line to zero or more items; unknown/hidden/malformed lines add nothing.
 fn map_line(line: &[u8], out: &mut Vec<TranscriptItem>) {
     match line_type(line) {
@@ -466,6 +479,141 @@ fn map_line(line: &[u8], out: &mut Vec<TranscriptItem>) {
         }
         _ => {}
     }
+}
+
+/// Tree-preview variant of [`map_line`]: every entry kind yields what the preview pane shows,
+/// WITHOUT adding `TranscriptItem` variants.
+fn map_entry(line: &[u8], out: &mut Vec<TranscriptItem>) {
+    match line_type(line) {
+        Some("message") => map_entry_message(line, out),
+        Some("custom_message") => {
+            let Some(m) = parse::<CustomMessage>(line, "custom_message") else {
+                return;
+            };
+            let kind = m.custom_type.clone().unwrap_or_else(|| "message".into());
+            let text = if kind == "advisor" {
+                advisor_entry_text(line)
+            } else {
+                cap_bytes(text_of(m.content, "\n"), MAX_NOTICE).0
+            };
+            if kind.starts_with("irc") {
+                push_split_irc(text, out, |text| TranscriptItem::Notice {
+                    kind: kind.clone(),
+                    text,
+                });
+            } else {
+                out.push(TranscriptItem::Notice { kind, text });
+            }
+        }
+        Some("branch_summary") => {
+            let summary = parse_branch_summary(line);
+            out.push(TranscriptItem::Notice {
+                kind: "branch_summary".to_owned(),
+                text: summary,
+            });
+        }
+        Some("compaction") => {
+            if let Some(c) = parse::<Compaction>(line, "compaction") {
+                out.push(TranscriptItem::Compaction {
+                    tokens_before: count(c.tokens_before),
+                    tokens_after: count(c.tokens_after),
+                    summary: cap_bytes(c.summary.unwrap_or_default(), MAX_SUMMARY).0,
+                });
+            }
+        }
+        // Model/thinking/label/settings and everything else: the UI shows the row text.
+        _ => {}
+    }
+}
+
+/// `branch_summary` entry's `summary` string.
+#[derive(Deserialize)]
+struct BranchSummaryLine {
+    summary: Option<String>,
+}
+
+fn parse_branch_summary(line: &[u8]) -> String {
+    parse::<BranchSummaryLine>(line, "branch_summary")
+        .and_then(|b| b.summary)
+        .map(|s| cap_bytes(s, MAX_SUMMARY).0)
+        .unwrap_or_default()
+}
+
+/// Advisor note text for a tree preview: the qualifier + note bodies omp's tree row shows.
+fn advisor_entry_text(line: &[u8]) -> String {
+    #[derive(Deserialize)]
+    struct Details {
+        #[serde(default)]
+        notes: Vec<AdvisorNote>,
+    }
+    #[derive(Deserialize)]
+    struct AdvisorNote {
+        note: Option<String>,
+        advisor: Option<String>,
+        severity: Option<String>,
+    }
+    let details: Option<Details> = serde_json::from_slice::<Value>(line)
+        .ok()
+        .and_then(|v| v.get("details").cloned())
+        .and_then(|d| serde_json::from_value(d).ok());
+    let notes = details.map(|d| d.notes).unwrap_or_default();
+    let mut texts = Vec::new();
+    let mut advisors: Vec<String> = Vec::new();
+    let mut severities: Vec<String> = Vec::new();
+    for n in notes {
+        if let Some(t) = n.note {
+            texts.push(t);
+        }
+        if let Some(a) = n.advisor
+            && !a.is_empty()
+            && a != "default"
+            && !advisors.contains(&a)
+        {
+            advisors.push(a);
+        }
+        if let Some(s) = n.severity
+            && !s.is_empty()
+            && !severities.contains(&s)
+        {
+            severities.push(s);
+        }
+    }
+    let qualifier = advisors
+        .into_iter()
+        .chain(severities)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = texts.join(" ");
+    let text = if qualifier.is_empty() {
+        body
+    } else if body.is_empty() {
+        qualifier.clone()
+    } else {
+        format!("{qualifier}: {body}")
+    };
+    cap_bytes(text, MAX_NOTICE).0
+}
+
+/// Tree-preview message mapping: user/assistant/toolResult exactly as the transcript mapper;
+/// `developer` and `custom`-role messages become `Notice` instead of staying hidden.
+fn map_entry_message(line: &[u8], out: &mut Vec<TranscriptItem>) {
+    let head = &line[..line.len().min(ROLE_PEEK)];
+    let has = |role: &[u8]| memchr::memmem::find(head, role).is_some();
+    if has(b"\"role\":\"developer\"") || has(b"\"role\":\"custom\"") {
+        let parsed: Option<MessageEntry> = parse(line, "developer/custom");
+        let Some(entry) = parsed else { return };
+        let role = entry_role(line);
+        let kind = role.unwrap_or_else(|| "developer".to_owned());
+        let text = cap_bytes(text_of(entry.message.content, "\n"), MAX_NOTICE).0;
+        out.push(TranscriptItem::Notice { kind, text });
+        return;
+    }
+    map_message(line, out);
+}
+
+/// The `role` string of a `message` line (ids/roles never need unescaping).
+fn entry_role(line: &[u8]) -> Option<String> {
+    tail::simple_str(line, "role", ROLE_PEEK.min(line.len())).map(str::to_owned)
 }
 
 fn map_message(line: &[u8], out: &mut Vec<TranscriptItem>) {

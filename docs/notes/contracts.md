@@ -3845,3 +3845,60 @@ draft and never touches it (text, caret, pasted blocks, images stay).
   over-context check mirrors `selector-controller.ts` exactly (`contextWindow ?? 0`, `tokens ?? 0`). Live tests
   (`ctl_tree_live`) assert a current omp never answers `unsupported`; CI's Windows job installs the latest omp but runs
   only `ctl_live`, so drift is caught by local live runs.
+
+## Session tree redesign "Turn trails" + omp 18.16 `/tree` parity (user, 2026-11-05)
+
+User: "improve the visuals of the session tree, it looks kind of dated compared to the chat view … check if it's able to
+do everything omps tree can do, if not, we need to add support". Five mockups in `~/omp-deck-tree-mockups/`; the user
+picked **B — Turn trails** (`B-turn-trails.png`). Reference: omp 18.16.0 `packages/tui/src/overlays/tree-selector.ts`
+(native picker `layout:"tree"`, `preview:"side"`) + `selector-controller.ts`.
+
+### Gaps closed
+- **Preview pane** (omp's side preview): the selected entry's full content drawn chat-style (prompt, reply with thinking
+  and tool calls, tool call + result, notices, branch summary, compaction), kind title, label, meta badges (time, cost
+  before, model, entry id) and an action bar (Go here, Summarize & go, Fork, Label, Re-answer on ask results, Copy). The
+  label editor lives in the pane, as in omp. Replaces the per-row hover card and the per-row `before $X` badges.
+- **Cancel a running branch summary** (omp: Esc → `session.abortBranchSummary()`, tree shown again): busy strip with
+  Cancel / Esc → ctl `AbortBranchSummary`; the navigate reply `summarization cancelled` is an info toast and the tree stays.
+- **Initial filter** = omp's `treeFilterMode` when the user set it explicitly; otherwise OmpDeck's Conversation default.
+- **Ctrl+C closes** the tree; Shift+L labels (plain L kept).
+- **Row text** follows omp 18.16: `\r`, `\n`, `\t`, U+2028, U+2029 fold to spaces; user rows accent + bold.
+
+### deck-core interfaces (landed)
+- `tree::TreeNode.line: Option<LineSpan>` (`#[serde(default)]`), `LineSpan { offset: u64, len: u64 }` = the node's JSONL
+  line without its newline; filled for one-shot loads and the watcher (title-line rewrites never move later lines).
+- `tree::read_entry(path, &SessionTree, i) -> io::Result<EntryDetail>` (blocking, worker threads only);
+  `EntryDetail { items: Vec<agents::TranscriptItem>, truncated: bool }`. Reads only the span (cap 8 MiB → empty +
+  `truncated`); a line whose `id` differs → `InvalidData` "session file changed". A tool result is preceded by its
+  `ToolCall` (parent walk to the nearest assistant). Mapping = `agents::entry_items(line)`: like the subagent transcript,
+  plus every `custom_message` (any `display`), `developer`/`custom` roles and `branch_summary` as `Notice`; no new
+  `TranscriptItem` variants. `map_line` (subagent transcripts) is unchanged.
+- `ctl::CtlCommand::AbortBranchSummary { root }` → `{"t":"abort_branch_summary","root"}`; the extension checks the root
+  and calls `mainSession().abortBranchSummary()` (`cancelling unavailable` when omp lacks it). Commands run concurrently
+  per connection, so it reaches omp while `navigate` awaits. A mid-summary cancel has no deterministic live test (a
+  summary can't be held open reliably); wire test + no-op live test only.
+
+### omp-deck (Turn trails)
+- Window: gradient header band + hairline (icon tile, title, session subtitle, entry/branch badges, live dot, close),
+  toolbar (text filter tabs, active = washed accent tab with a cut corner; search right), body = navigator (list head
+  `TURN TIMELINE · N shown / M`, cards, legend + fork-point count) | preview pane; busy strip; one-row keycap footer.
+- Rows are outlined cards (corners nw 0 / ne 10 / se 0 / sw 10) beside the graph gutter: messages 38 px, tool rows 28 px
+  indented under their turn in mono; user rows accent-washed and bold accent; alternate-branch rows violet-washed;
+  summary/compaction distinct; selected = gradient + accent border + pop; tags for label / you are here / N branches; age.
+  Variable row heights via prefix sums rebuilt with the layout. Colours from the active style's palette.
+
+### As built (Turn trails)
+- `omp-deck/src/tree_view/`: `mod.rs` (window, header, toolbar, columns, list, row painting, busy strip, summary
+  dialog, footer), `geometry.rs` (38/28 px cards, 5 px gap, prefix sums, `visible_range`), `keys.rs`, `paint.rs`,
+  `preview.rs`, `tests.rs`. The old single-file `tree_view.rs` is gone.
+- Row actions: the hovered row swaps its age for compact icon buttons (Go here, Fork, Re-answer on ask results, Label),
+  same gates/tooltips as the pane's action bar; pills (label, you are here, N branches) sit left of the measured age.
+- Window: default 74 % × 82 % of the screen, capped to the screen minus 48 px. The body and the footer split exactly
+  the remaining rect (allocating more grows a resizable egui window every frame). The pane's label editor + action bar
+  are pinned to its bottom edge at the height measured last frame (the bar wraps on narrow panes).
+- Preview: one worker read per selection, cache by node id (cap 32). Entry lines never change in omp's append-only
+  file, so tree revisions don't re-read; `InvalidData` drops the entry and retries only once the tree revision moved,
+  a second failure shows an inline note. `line == None` (a gateway older than the GUI) never requests and shows the
+  row text + "Full content needs the updated OmpDeck gateway — restart OmpDeck". Items are stored once as
+  `Arc<Vec<TranscriptItem>>` with their copy text; `TranscriptView::sync` runs only when the shown entry changes.
+  The reading view is `TranscriptView::new(false).opened()`: every row starts expanded (tool call + result visible).

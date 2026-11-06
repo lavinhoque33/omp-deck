@@ -15,7 +15,9 @@ mod transcript;
 mod watcher;
 
 pub use scan::AgentsScanner;
-pub use transcript::{TranscriptReader, TranscriptUpdate, TranscriptWatcher, read_blob};
+pub use transcript::{
+    TranscriptReader, TranscriptUpdate, TranscriptWatcher, entry_items, read_blob,
+};
 pub use watcher::AgentsWatcher;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

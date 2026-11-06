@@ -198,14 +198,18 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
 
   </details>
 
-- **Session tree**: Browse conversation branches, fork and navigate with recorded cost context.
+- **Session tree**: Browse conversation branches, preview any entry, fork and navigate with recorded cost context.
 
   <details><summary>More</summary>
 
-  Browse the session tree, fork or navigate from a node. Each entry shows its
-  recorded cumulative cost **before** that entry, across all branches (compaction does not reset it).
-  Missing or unreadable earlier usage is marked with `≥`; hover for a higher-precision subtotal
-  and scope details. Unrecorded live subagent spend is not included.
+  Ctrl+Shift+B shows the conversation as a timeline of turns: your prompts, replies and (with the Default / All
+  filters) tool calls, beside a branch graph. Selecting an entry previews its full content on the right — the
+  prompt, the reply with its tool calls, or a tool call with its result — with its time, model and the recorded
+  cumulative cost **before** that entry, across all branches (compaction does not reset it; missing or unreadable
+  earlier usage is marked with `≥`; unrecorded live subagent spend is not included). Go here, Summarize & go, Fork,
+  Label, Re-answer and Copy sit under the preview and as hover buttons on each row; a running branch summary can be
+  cancelled (Esc) and the tree stays open. Like omp's `/tree`, the initial filter follows omp's `treeFilterMode`
+  setting when you set it, and Ctrl+C or Esc closes the tree.
 
   </details>
 

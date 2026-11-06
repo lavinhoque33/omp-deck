@@ -19,6 +19,7 @@ use crate::agent_ctl::Link;
 use crate::tabs::{ClosedTab, TabRole};
 use crate::titlebar;
 use crate::toast::ToastKind;
+use crate::tree_layout::Filter;
 use crate::tree_view::{self, TreeAction, TreeInput, TreeState};
 use deck_service::statusfmt::Activity;
 
@@ -121,6 +122,27 @@ fn live_action_gate(
     }
 }
 
+/// omp's `treeFilterMode`, when the user set it explicitly (the catalog `value`, not the
+/// `default`): the initial filter of the tree window. Otherwise OmpDeck keeps its Conversation
+/// default.
+fn initial_filter(catalog: &SettingsCatalog) -> Option<Filter> {
+    let value = catalog
+        .tabs
+        .iter()
+        .flat_map(|t| &t.settings)
+        .find(|s| s.key == "treeFilterMode")
+        .and_then(|s| s.value.as_ref())
+        .and_then(serde_json::Value::as_str)?;
+    Some(match value {
+        "default" => Filter::Default,
+        "no-tools" => Filter::NoTools,
+        "user-only" => Filter::UserOnly,
+        "labeled-only" => Filter::Labeled,
+        "all" => Filter::All,
+        _ => return None,
+    })
+}
+
 /// omp's `branchSummary.enabled` in the settings catalog (its effective value, else the default).
 fn branch_summary_enabled(catalog: &SettingsCatalog) -> Option<bool> {
     catalog
@@ -211,14 +233,18 @@ impl App {
             summary_enabled: None,
             labeling: false,
         });
-        // Go here asks about a branch summary only while omp's setting is on.
+        // Go here asks about a branch summary only while omp's setting is on; the initial
+        // filter follows omp's `treeFilterMode` when the user set it explicitly.
         self.gw.query(Query::OmpSettings, move |app, result| {
-            let enabled = match result {
-                Ok(Answer::OmpSettings(c)) => branch_summary_enabled(&c),
-                _ => None,
+            let (enabled, filter) = match result {
+                Ok(Answer::OmpSettings(c)) => (branch_summary_enabled(&c), initial_filter(&c)),
+                _ => (None, None),
             };
             if let Some(t) = app.tree.as_mut().filter(|t| t.session == session) {
                 t.summary_enabled = enabled;
+                if let Some(f) = filter {
+                    t.state.set_initial_filter(f);
+                }
                 app.ctx.request_repaint();
             }
         });
@@ -424,6 +450,15 @@ impl App {
             TreeOp::Reanswer => "Waiting for your answer in the tab…",
             TreeOp::Fork => "Forking…",
         });
+        let summarizing = self.tree_busy.as_ref().is_some_and(|b| {
+            matches!(
+                b.op,
+                TreeOp::Navigate {
+                    summarizing: true,
+                    ..
+                }
+            )
+        });
         let live = self
             .live_snapshot()
             .filter(|_| self.ctl_root() == Some(session.as_path()));
@@ -441,12 +476,14 @@ impl App {
                 revision: ui_state.revision,
                 error: ui_state.error.as_deref(),
                 live_leaf: live.as_ref().and_then(|s| s.leaf.as_deref()),
+                session: Some(session.as_path()),
                 navigate,
                 fork,
                 summary_prompt: ui_state.summary_enabled == Some(true),
                 label,
                 reanswer: navigate,
                 busy,
+                summarizing,
                 now,
             },
         );
@@ -465,8 +502,33 @@ impl App {
                 TreeAction::Reanswer { entry } => self.tree_reanswer(&session, entry),
                 TreeAction::Copy { text, what } => self.copy_text(&text, what),
                 TreeAction::Notice(text) => self.toasts.info(&self.ctx, text),
+                TreeAction::CancelSummary => self.tree_cancel_summary(&session),
+                TreeAction::OpenUrl(url) => self.open_chat_link(url),
             }
         }
+    }
+
+    /// Cancel omp's running branch summary (Esc / Cancel in the tree while summarizing). The
+    /// tree stays open; the navigate reply "summarization cancelled" lands as an info toast. The
+    /// abort's own reply carries no outcome: it must not consume the navigate's busy state.
+    fn tree_cancel_summary(&mut self, session: &Path) {
+        if !self.tree_busy.as_ref().is_some_and(|b| {
+            matches!(
+                b.op,
+                TreeOp::Navigate {
+                    summarizing: true,
+                    ..
+                }
+            )
+        }) {
+            return;
+        }
+        self.ctl_command(
+            CtlCommand::AbortBranchSummary {
+                root: session.to_path_buf(),
+            },
+            |_, _| {},
+        );
     }
 
     fn tree_fork(&mut self, session: &Path, entry: String, what: String) {
@@ -617,6 +679,16 @@ impl App {
             // Cancelling the question is the user's own choice, not a failure.
             if busy.op == TreeOp::Reanswer && why == "cancelled" {
                 self.toasts.info(&self.ctx, "Re-answer cancelled");
+            } else if matches!(
+                busy.op,
+                TreeOp::Navigate {
+                    summarizing: true,
+                    ..
+                }
+            ) && why == "summarization cancelled"
+            {
+                // The user cancelled the summary: like omp, the tree stays open.
+                self.toasts.info(&self.ctx, "Summary cancelled");
             } else {
                 self.tree_failed(busy.op, &why);
             }

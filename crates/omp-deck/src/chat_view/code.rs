@@ -942,6 +942,9 @@ pub fn show_code(cx: &Cx, ui: &mut Ui, n: &SNode) {
         .filter_map(Value::as_u64)
         .max()
         .map(|v| v as u32);
+    if ansi::fold_preview(n).is_some_and(|p| total > p.lines) {
+        cx.note_fold_cut(n);
+    }
     let pv = ansi::preview(cx, n).map(|p| ansi::Preview { tail: false, ..p });
     let expanded = pv.is_some() && ansi::more_open(cx, n);
     let (count, foot) = clamp(total, pv, expanded);

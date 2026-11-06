@@ -153,6 +153,45 @@ fn navigate_summarises_the_branch_left_and_redraws_the_tab() {
     );
 }
 
+/// Aborting with no summary in flight is a no-op success: the leaf is unchanged and no
+/// `branch_summary` entry appears. (A mid-flight cancel — Navigate+Summarize aborted while the
+/// model streams the summary — is intentionally not tested here: the harness cannot hit that
+/// window deterministically. A 10 s-paced summary completed before the abort landed; request
+/// counting as a start signal is polluted by unrelated side requests such as title
+/// generation; and an abort that lands before summarization starts is a silent no-op, so a
+/// pass would prove nothing about cancellation.)
+#[test]
+fn abort_branch_summary_without_a_summary_is_a_noop() {
+    let Some(live) = Live::start("abort", script, |_| {}, |_| None) else {
+        eprintln!("skipping: OMPDECK_TEST_OMP is not set");
+        return;
+    };
+    turn(&live, "one");
+    let leaf_before = live.client().latest().and_then(|s| s.leaf.clone());
+    let file = live.session_file();
+    let abort = live.ctl(
+        CtlCommand::AbortBranchSummary { root: file.clone() },
+        Duration::from_secs(30),
+    );
+    assert!(abort.ok, "{abort:?}");
+    assert_eq!(
+        live.client().latest().and_then(|s| s.leaf.clone()),
+        leaf_before
+    );
+    assert!(live.entries().iter().all(|e| e["type"] != "branch_summary"));
+    // A stale root is refused like every other tab-bound command.
+    let stale = live.ctl(
+        CtlCommand::AbortBranchSummary {
+            root: "/some/other.jsonl".into(),
+        },
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        (stale.ok, stale.error.as_deref()),
+        (false, Some("session changed"))
+    );
+}
+
 #[test]
 fn labels_advisors_and_the_task_model_apply_to_the_running_session() {
     let Some(live) = Live::start(

@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use deck_core::tree::{NodeKind, RecordedCost, SessionTree, TreeNode, TreeWatcher};
+use deck_core::tree::{
+    EntryDetail, LineSpan, NodeKind, RecordedCost, SessionTree, TreeNode, TreeWatcher, read_entry,
+};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -875,4 +877,179 @@ fn watcher_cost_prefix_matches_a_fresh_load_and_restarts_on_replacement() {
     assert_eq!(before(&t, "y"), rc(2.0, false));
     assert_eq!(before(&second, "end"), rc(1.75, false));
     assert_eq!(before(&third, "late"), rc(1.75, true));
+}
+
+// ---- line spans + read_entry -------------------------------------------------------------------
+
+/// Byte offsets of every line (without newlines) in `body`.
+fn spans_of(body: &str) -> Vec<LineSpan> {
+    let mut out = Vec::new();
+    let mut off = 0u64;
+    for line in body.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        out.push(LineSpan {
+            offset: off,
+            len: content.len() as u64,
+        });
+        off += line.len() as u64;
+    }
+    out
+}
+
+#[test]
+fn spans_address_exactly_each_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = msg("a", None, "user", "");
+    let b = msg("b", Some("a"), "assistant", "");
+    let path = session(tmp.path(), "s.jsonl", &[&a, &b]);
+    let body = fs::read_to_string(&path).unwrap();
+    let spans = spans_of(&body);
+    // Line 0 is the session header (no node); lines 1.. are a, b.
+    let t = SessionTree::load(&path).unwrap();
+    assert_eq!(node(&t, "a").line, Some(spans[1]));
+    assert_eq!(node(&t, "b").line, Some(spans[2]));
+    for id in ["a", "b"] {
+        let span = node(&t, id).line.unwrap();
+        let got = &body.as_bytes()[span.offset as usize..(span.offset + span.len) as usize];
+        assert!(got.starts_with(format!(r#"{{"type":"message","id":"{id}""#).as_bytes()));
+    }
+}
+
+#[test]
+fn spans_stay_correct_across_incremental_appends_and_truncated_tails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = msg("a", None, "user", "");
+    let path = session(tmp.path(), "s.jsonl", &[&a]);
+    let w = TreeWatcher::spawn(path.clone(), || {});
+    wait_for("first tree", || w.latest().is_some());
+    let b = msg("b", Some("a"), "assistant", "");
+    let (head, tail) = b.split_at(b.len() / 2);
+    append(&path, head);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(w.latest().unwrap().nodes.len(), 1);
+    append(&path, &format!("{tail}\n"));
+    let c = msg("c", Some("b"), "user", "");
+    append(&path, &format!("{c}\n"));
+    wait_for("appends", || w.latest().is_some_and(|t| t.nodes.len() == 3));
+    let got = w.latest().unwrap();
+    let fresh = SessionTree::load(&path).unwrap();
+    assert_eq!(*got, fresh);
+    let body = fs::read_to_string(&path).unwrap();
+    for id in ["a", "b", "c"] {
+        let span = node(&got, id).line.expect("a span");
+        let got_line = &body.as_bytes()[span.offset as usize..(span.offset + span.len) as usize];
+        assert!(got_line.starts_with(format!(r#"{{"type":"message","id":"{id}""#).as_bytes()));
+    }
+}
+
+#[test]
+fn read_entry_returns_prompts_assistant_calls_and_notices() {
+    use deck_core::agents::TranscriptItem;
+    let tmp = tempfile::tempdir().unwrap();
+    let user = r#"{"type":"message","id":"u","parentId":null,"timestamp":"t","message":{"role":"user","content":[{"type":"text","text":"fix login"}]}}"#.to_owned();
+    let assistant = r#"{"type":"message","id":"a","parentId":"u","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"reading"},{"type":"thinking","thinking":"hmm"},{"type":"toolCall","id":"c1","name":"read","arguments":{"path":"/x"}}],"stopReason":"toolUse"}}"#.to_owned();
+    let r1 = r#"{"type":"message","id":"r1","parentId":"a","timestamp":"t","message":{"role":"toolResult","toolCallId":"c1","toolName":"read","content":[{"type":"text","text":"ok"}]}}"#.to_owned();
+    let r2 = r#"{"type":"message","id":"r2","parentId":"r1","timestamp":"t","message":{"role":"toolResult","toolCallId":"c1","toolName":"read","content":[{"type":"text","text":"ok again"}]}}"#.to_owned();
+    let hidden = r#"{"type":"custom_message","id":"h","parentId":"r2","timestamp":"t","customType":"m","content":"secret","display":false}"#.to_owned();
+    let summary = r#"{"type":"branch_summary","id":"bs","parentId":"h","timestamp":"t","summary":"did things"}"#.to_owned();
+    let refs: Vec<&str> = [&user, &assistant, &r1, &r2, &hidden, &summary]
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let path = session(tmp.path(), "s.jsonl", &refs);
+    let t = SessionTree::load(&path).unwrap();
+    let detail = |id: &str| read_entry(&path, &t, t.index[id]).unwrap();
+    assert!(!detail("u").truncated);
+    assert!(matches!(
+        &detail("u").items[..],
+        [TranscriptItem::User { text, .. }] if text == "fix login"
+    ));
+    let a = detail("a");
+    assert!(
+        a.items
+            .iter()
+            .any(|i| matches!(i, TranscriptItem::Assistant { text, .. } if text == "reading"))
+    );
+    assert!(
+        a.items
+            .iter()
+            .any(|i| matches!(i, TranscriptItem::Thinking { text } if text == "hmm"))
+    );
+    assert!(
+        a.items
+            .iter()
+            .any(|i| matches!(i, TranscriptItem::ToolCall { call_id, .. } if call_id == "c1"))
+    );
+    // Parallel results: each result is preceded by its call from the assistant ancestor.
+    for id in ["r1", "r2"] {
+        let d = detail(id);
+        assert_eq!(d.items.len(), 2, "{id}: {d:?}");
+        assert!(matches!(
+            &d.items[0],
+            TranscriptItem::ToolCall { call_id, .. } if call_id == "c1"
+        ));
+        assert!(matches!(&d.items[1], TranscriptItem::ToolResult { .. }));
+    }
+    assert!(matches!(
+        &detail("h").items[..],
+        [TranscriptItem::Notice { kind, text }] if kind == "m" && text == "secret"
+    ));
+    assert!(matches!(
+        &detail("bs").items[..],
+        [TranscriptItem::Notice { kind, text }] if kind == "branch_summary" && text == "did things"
+    ));
+    // Model/thinking/label rows carry no content: empty items.
+    let model = r#"{"type":"model_change","id":"m","parentId":"bs","timestamp":"t","model":"a/b"}"#;
+    let path2 = session(tmp.path(), "s2.jsonl", &[&user, model]);
+    let t2 = SessionTree::load(&path2).unwrap();
+    assert_eq!(
+        read_entry(&path2, &t2, t2.index["m"]).unwrap().items.len(),
+        0
+    );
+}
+
+#[test]
+fn read_entry_rejects_replaced_files_and_caps_huge_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = msg("a", None, "user", "");
+    let path = session(tmp.path(), "s.jsonl", &[&a]);
+    let t = SessionTree::load(&path).unwrap();
+    // Replaced file: the span now addresses a different id.
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            r#"{"type":"session","version":3,"id":"s","cwd":"/w"}"#,
+            msg("b", None, "user", "")
+        ),
+    )
+    .unwrap();
+    let err = read_entry(&path, &t, t.index["a"]).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), "session file changed");
+    // Over the 8 MiB cap: empty + truncated (span kept, from a synthetic tree).
+    let mut huge = t.clone();
+    let i = huge.index["a"];
+    let mut replaced = (*huge.nodes[i]).clone();
+    replaced.line = Some(LineSpan {
+        offset: 0,
+        len: 9 * 1024 * 1024,
+    });
+    huge.nodes[i] = Arc::new(replaced);
+    let d: EntryDetail = read_entry(&path, &huge, i).unwrap();
+    assert!(d.truncated && d.items.is_empty());
+}
+
+#[test]
+fn row_text_folds_carriage_returns_and_unicode_separators() {
+    let line = |text: &str| {
+        let v = serde_json::json!({
+            "type": "message", "id": "u", "parentId": null,
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        });
+        load_lines(&[v.to_string()])
+    };
+    assert_eq!(line("a\rb\nc\td e f").nodes[0].text, "a b c d e f");
+    let t = load("rich.jsonl");
+    assert_eq!(t.labels.get("a2").map(String::as_str), Some("final"));
 }

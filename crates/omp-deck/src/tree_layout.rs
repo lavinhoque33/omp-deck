@@ -729,6 +729,7 @@ mod tests {
                     attribution: None,
                     user_request: matches!(kind, NodeKind::User),
                     tool_name: None,
+                    line: None,
                 })
             })
             .collect();
@@ -1344,6 +1345,7 @@ mod ask_tests {
             attribution: None,
             user_request: false,
             tool_name: tool.map(str::to_owned),
+            line: None,
         }
     }
 

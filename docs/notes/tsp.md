@@ -112,3 +112,18 @@ hello/ack harness and replays them through a fake omp.
   `omp.app.git-narrow` on `cols`).
 - Not covered: `deck-service` injection (`composer::TspComposer::of`) still reads the frozen inline surface while a
   page is open.
+
+## Fold chevrons (`tools::foldable`, `render::card`/`section`, `tools::agent`)
+- omp sets `collapsible: true` on every tool with a body (`tool-execution.ts` `collapsible: hasBody`), but its terminal
+  only offers to expand where something is left out ("… N more lines (ctrl+o to expand)"). The chevron (and the
+  pointer cursor) is therefore drawn only when folding changes what the node shows:
+  - tool `preview: "none"`: always (the fold hides the body);
+  - tool `{lines}`/`{tail}`/`"children"`: the measured body is taller than the tool clamp, an `ansi`/`code` block in
+    it is longer than its own `preview` (reported via `Cx::note_fold_cut` while the body is measured), or omp shortened
+    the folded body itself — a `text` node counting what was left out (`3 more files`, `+2 more`, `4 earlier`: read
+    previews, grep, find, eval status) or a nested collapsible node. Open tools reuse the answer from when they were
+    last drawn folded (`Local::fold_seen`); a tool never seen folded keeps the chevron;
+  - card/section: folded, or open with a non-blank body (omp may omit a folded body, e.g. synthetic user messages);
+  - agent: a non-blank body (omp describes it folded or not).
+- A head click still toggles a collapsible node without a chevron (a tool's declared click action wins), so renderers
+  that show more unfolded without saying so (`find`'s extra ranges) stay reachable.

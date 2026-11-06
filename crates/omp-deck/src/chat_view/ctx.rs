@@ -181,6 +181,12 @@ pub struct Local {
     /// While a tool body is being measured: the runs of equal-height rows its renderers drew
     /// (see [`Cx::note_rows`]).
     pub row_grids: Option<Vec<RowGrid>>,
+    /// While a tool body is being measured: the tool's id and whether a block in it is cut by a
+    /// clamp it only has while the tool is folded (see [`Cx::note_fold_cut`]).
+    pub fold_probe: Option<(String, bool)>,
+    /// Whether folding each tool changed what it showed, as measured when last drawn folded
+    /// (see `tools::foldable`).
+    pub fold_seen: HashMap<String, bool>,
     pub frame: u64,
     /// Screen rect of the composer's caret last frame (anchors the slash menu).
     pub caret: Option<Rect>,
@@ -346,6 +352,25 @@ impl<'a> Cx<'a> {
         self.loc(|l| {
             if let Some(g) = &mut l.row_grids {
                 g.push(grid);
+            }
+        });
+    }
+
+    /// A block whose fold clamp cuts it (`total` lines over its `preview`) reports it, so the
+    /// tool it folds with knows folding hides something. Only taken while that tool's body is
+    /// being measured; free otherwise.
+    pub fn note_fold_cut(&self, n: &SNode) {
+        if self.loc(|l| l.fold_probe.is_none()) {
+            return;
+        }
+        let Some(owner) = super::ansi::disclosure(self, n) else {
+            return;
+        };
+        self.loc(|l| {
+            if let Some((id, cut)) = &mut l.fold_probe
+                && *id == owner.id
+            {
+                *cut = true;
             }
         });
     }

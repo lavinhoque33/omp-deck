@@ -445,6 +445,14 @@ pub enum CtlCommand {
         #[serde(default)]
         summary: BranchSummary,
     },
+    /// Cancel a running branch summary started by [`CtlCommand::Navigate`] (omp's Esc in the
+    /// `/tree` selector → `session.abortBranchSummary()`): the pending navigate answers
+    /// `{ok:false,error:"summarization cancelled"}` and the leaf is unchanged. No-op (`ok:true`)
+    /// when nothing is summarising. Refused (`session changed`) when `root` is no longer the
+    /// tab's session, or `cancelling unavailable` on an omp without the abort method.
+    AbortBranchSummary {
+        root: PathBuf,
+    },
     /// Set (or, with `None`/blank, remove) the label of `entry_id` in the live tab's session
     /// (`sessionManager.appendLabelChange`; any state, an append). Unknown entry → `ok: false`.
     SetLabel {
@@ -918,6 +926,9 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
             };
             serde_json::json!({"rid": rid, "t": "navigate", "entryId": entry_id, "root": root,
                 "summarize": summarize, "customInstructions": instructions})
+        }
+        CtlCommand::AbortBranchSummary { root } => {
+            serde_json::json!({"rid": rid, "t": "abort_branch_summary", "root": root})
         }
         CtlCommand::SetLabel {
             root,

@@ -591,6 +591,16 @@ export default async function ompdeckCtl(api: any) {
             return { ok: true, newFile };
           } finally { try { await m2.close?.(); } catch {} }
         }
+        if (cmd.t === "abort_branch_summary") {
+          // == Esc in the /tree selector while it summarises: aborts the in-flight navigate's
+          // summary; that navigate then answers "summarization cancelled". Commands run
+          // concurrently per connection, so this reaches omp while navigate awaits.
+          if (typeof cmd.root !== "string" || cmd.root !== rootFile()) return { ok: false, error: "session changed" };
+          const sess = mainSession();
+          if (typeof sess?.abortBranchSummary !== "function") return { ok: false, error: "cancelling unavailable" };
+          sess.abortBranchSummary();
+          return { ok: true };
+        }
         if (cmd.t === "answer_ui") {
           const want = rootFile();
           if (typeof cmd.root !== "string" || !want || cmd.root !== want) return { ok: false, error: "session changed" };

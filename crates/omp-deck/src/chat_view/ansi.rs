@@ -594,63 +594,70 @@ fn pos_usize(v: &Value) -> Option<usize> {
     v.as_f64().filter(|x| *x >= 1.0).map(|x| x as usize)
 }
 
-/// `n`'s preview: its `preview` (`{lines}`, `{tail}` or `"auto"`; none inside an open
-/// disclosure, which gives way) or, always, a plain `lines` / `tail` count prop.
+/// `n`'s preview: its `preview` (see [`fold_preview`]; none inside an open disclosure, which
+/// gives way) or, always, a plain `lines` / `tail` count prop.
 pub fn preview(cx: &Cx, n: &SNode) -> Option<Preview> {
+    fixed_preview(n).or_else(|| fold_preview(n).filter(|_| !open_disclosure(cx, n)))
+}
+
+/// The plain `lines` / `tail` count props: a clamp that holds whatever the enclosing fold does.
+fn fixed_preview(n: &SNode) -> Option<Preview> {
     if let Some(l) = n.get("tail").and_then(pos_usize) {
         return Some(Preview {
             lines: l,
             tail: true,
         });
     }
-    if let Some(l) = n.get("lines").and_then(pos_usize) {
-        return Some(Preview {
-            lines: l,
-            tail: false,
-        });
+    n.get("lines").and_then(pos_usize).map(|l| Preview {
+        lines: l,
+        tail: false,
+    })
+}
+
+/// The clamp `n` has only while its disclosure is folded: its `preview` prop (`{lines}`,
+/// `{tail}` or `"auto"`), unless a plain count prop clamps it anyway.
+pub fn fold_preview(n: &SNode) -> Option<Preview> {
+    if fixed_preview(n).is_some() {
+        return None;
     }
     let follow = n.flag("follow");
-    let p = match n.get("preview")? {
-        Value::String(s) if s == "auto" => Preview {
+    match n.get("preview")? {
+        Value::String(s) if s == "auto" => Some(Preview {
             lines: AUTO_LINES,
             tail: follow,
-        },
-        Value::Object(o) => {
-            if let Some(l) = o.get("tail").and_then(pos_usize) {
-                Preview {
-                    lines: l,
-                    tail: true,
-                }
-            } else {
-                Preview {
-                    lines: o.get("lines").and_then(pos_usize).unwrap_or(AUTO_LINES),
-                    tail: follow,
-                }
+        }),
+        Value::Object(o) => Some(if let Some(l) = o.get("tail").and_then(pos_usize) {
+            Preview {
+                lines: l,
+                tail: true,
             }
-        }
-        _ => return None,
-    };
-    if open_disclosure(cx, n) {
-        None
-    } else {
-        Some(p)
+        } else {
+            Preview {
+                lines: o.get("lines").and_then(pos_usize).unwrap_or(AUTO_LINES),
+                tail: follow,
+            }
+        }),
+        _ => None,
     }
+}
+
+/// The collapsible card/tool/section/agent nearest above `n`: the fold its clamps follow.
+pub fn disclosure<'a>(cx: &Cx<'a>, n: &SNode) -> Option<&'a SNode> {
+    let mut cur = n.parent.as_deref();
+    while let Some(id) = cur {
+        let p = cx.snap.get(id)?;
+        if matches!(p.kind.as_str(), "tool" | "card" | "section" | "agent") && p.flag("collapsible")
+        {
+            return Some(p);
+        }
+        cur = p.parent.as_deref();
+    }
+    None
 }
 
 /// Whether `n` sits in a collapsible card/tool/section that is currently open.
 pub fn open_disclosure(cx: &Cx, n: &SNode) -> bool {
-    let mut cur = n.parent.as_deref();
-    while let Some(id) = cur {
-        let Some(p) = cx.snap.get(id) else {
-            break;
-        };
-        if matches!(p.kind.as_str(), "tool" | "card" | "section" | "agent") && p.flag("collapsible")
-        {
-            return !cx.collapsed(p);
-        }
-        cur = p.parent.as_deref();
-    }
-    false
+    disclosure(cx, n).is_some_and(|p| !cx.collapsed(p))
 }
 
 /// Whether `n` sits below a node of `kind`.
@@ -972,15 +979,16 @@ pub fn plain(cx: &Cx, n: &SNode) -> String {
 /// Kind `ansi`: tool output in the terminal font, selectable, clamped by its preview.
 pub fn show(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let pv = preview(cx, n);
-    draw(cx, ui, n, pv);
+    draw(cx, ui, n, pv, fold_preview(n));
 }
 
 /// Kind `rows`: pre-rendered ANSI lines (migration fallback).
 pub fn show_rows(cx: &Cx, ui: &mut Ui, n: &SNode) {
-    draw(cx, ui, n, None);
+    draw(cx, ui, n, None, None);
 }
 
-fn draw(cx: &Cx, ui: &mut Ui, n: &SNode, pv: Option<Preview>) {
+/// `fold` is the clamp `n` has while its disclosure is folded (see [`fold_preview`]).
+fn draw(cx: &Cx, ui: &mut Ui, n: &SNode, pv: Option<Preview>, fold: Option<Preview>) {
     let ink = cx.ink;
     let font = ink.mono(0.95);
     let color = n.tone().map_or_else(|| ink.text(), |t| ink.tone(t));
@@ -1003,6 +1011,9 @@ fn draw(cx: &Cx, ui: &mut Ui, n: &SNode, pv: Option<Preview>) {
     };
     if view.total == 0 {
         return;
+    }
+    if fold.is_some_and(|p| view.total > p.lines) {
+        cx.note_fold_cut(n);
     }
     let id = ui.scope_id().with(("ansi-more", n.id.as_str()));
     let plan = footer_plan(pv, expanded, view.before, view.after, view.total);

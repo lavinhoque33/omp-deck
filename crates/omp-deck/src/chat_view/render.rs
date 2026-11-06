@@ -593,6 +593,9 @@ fn card(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let bare = n.str("variant") == Some("bare");
     let collapsible = n.flag("collapsible");
     let collapsed = collapsible && cx.collapsed(n);
+    // Folded, the body is hidden (omp may not even describe it then); open, folding hides
+    // something only when there is a body.
+    let can_fold = collapsible && (collapsed || cx.snap.kids(n).any(|c| !blank(cx, c)));
     let status = n.str("status");
     // IRC identity keeps its warning outline even when delivery reports an error; the
     // message's status text and content still convey the error independently.
@@ -635,7 +638,7 @@ fn card(cx: &Cx, ui: &mut Ui, n: &SNode) {
         let head_rect = head.map(|job| {
             let resp = ui
                 .horizontal(|ui| {
-                    if collapsible {
+                    if can_fold {
                         chevron(ui, ink.dim(), !collapsed);
                     }
                     if irc {
@@ -763,10 +766,13 @@ fn section(cx: &Cx, ui: &mut Ui, n: &SNode) {
     } else {
         head_job(cx, n, &base)
     };
+    // Folded, the body is hidden (omp may not even describe it then); open, folding hides
+    // something only when there is a body.
+    let can_fold = collapsible && (collapsed || body.iter().any(|c| !blank(cx, c)));
     let took = n.num("took");
     let resp = ui
         .horizontal(|ui| {
-            if collapsible {
+            if can_fold {
                 chevron(ui, ink.dim(), !collapsed);
             }
             match (&head, head_child) {
@@ -797,7 +803,7 @@ fn section(cx: &Cx, ui: &mut Ui, n: &SNode) {
             ui.scope_id().with(("fold", &n.id)),
             Sense::click(),
         );
-        if r.hovered() {
+        if can_fold && r.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
         if r.clicked() {

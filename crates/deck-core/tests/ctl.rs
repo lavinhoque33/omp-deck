@@ -302,6 +302,40 @@ fn fork_at_and_navigate_round_trip() {
 }
 
 #[test]
+fn abort_branch_summary_encodes_and_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = fake(tmp.path());
+    let client = CtlClient::spawn(tmp.path().to_path_buf(), || {});
+    let mut s = srv.accept();
+    say(&mut s, HELLO);
+    say(&mut s, &snapshot_line(1, ""));
+    snapshot(&client);
+
+    let cmd = CtlCommand::AbortBranchSummary {
+        root: "/s/main.jsonl".into(),
+    };
+    let back: CtlCommand = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+    assert_eq!(back, cmd);
+    let rid = client.send(cmd);
+    let mut line = String::new();
+    BufReader::new(s.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+        serde_json::json!({"rid": rid, "t": "abort_branch_summary", "root": "/s/main.jsonl"})
+    );
+    say(&mut s, &format!(r#"{{"t":"reply","rid":{rid},"ok":true}}"#));
+    let mut replies = Vec::new();
+    wait_for("the abort reply", || {
+        replies.extend(client.take_replies());
+        !replies.is_empty()
+    });
+    assert_eq!(replies[0].0, rid);
+    assert!(replies[0].1.ok);
+}
+
+#[test]
 fn navigate_summary_and_new_commands_encode_and_replies_carry_value_and_message() {
     use deck_core::ctl::BranchSummary;
     use deck_core::omp::AdvisorScope;

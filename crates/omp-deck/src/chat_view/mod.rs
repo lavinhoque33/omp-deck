@@ -24,7 +24,7 @@ mod layer;
 mod md;
 mod menu;
 mod page;
-mod paint;
+pub(crate) mod paint;
 mod redirect;
 mod render;
 mod select;

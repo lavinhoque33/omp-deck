@@ -20,7 +20,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -119,6 +119,13 @@ fn is_user_initiator(custom_type: &str) -> bool {
     matches!(custom_type, "skill-prompt" | "collab-prompt")
 }
 
+/// Byte range of one entry's JSONL line (without its newline) in the session file, for
+/// targeted reads (the preview pane). Offsets are file bytes from the start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LineSpan {
+    pub offset: u64,
+    pub len: u64,
+}
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TreeNode {
     pub id: String,
@@ -172,6 +179,10 @@ pub struct TreeNode {
     /// nodes of their own.
     #[serde(default)]
     pub tool_name: Option<String>,
+    /// Byte range of the entry's line in the session file (without the newline). `None` for
+    /// trees deserialized from before spans existed.
+    #[serde(default)]
+    pub line: Option<LineSpan>,
 }
 
 /// A sum of omp's recorded `usage.cost.total` (USD) over a prefix of the session file.
@@ -290,6 +301,136 @@ impl SessionTree {
     }
 }
 
+/// Longest entry line `read_entry` materialises (8 MiB): over it → empty + truncated.
+const ENTRY_CAP: usize = 8 * 1024 * 1024;
+
+/// Full content of one entry for the preview pane: the transcript items of its line.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EntryDetail {
+    pub items: Vec<crate::agents::TranscriptItem>,
+    pub truncated: bool,
+}
+
+/// Reads one entry's line (blocking; the UI calls it from a worker thread): seeks to the
+/// node's span, verifies the line's `id` still equals the node id (a mismatch means the file
+/// was replaced/rewritten → `InvalidData` "session file changed"), then maps it with the
+/// subagent transcript mapper's tree mode. `ToolResult` nodes prepend the matching `ToolCall`
+/// from the nearest assistant ancestor (parallel results chain assistant → result1 → result2).
+/// Other kinds without content (model/thinking/label/settings…) yield empty items.
+pub fn read_entry(path: &Path, tree: &SessionTree, i: usize) -> io::Result<EntryDetail> {
+    let node = tree
+        .nodes
+        .get(i)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no such tree node"))?;
+    let span = node
+        .line
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "session file changed"))?;
+    let line = read_span(path, span)?;
+    let Some(line) = line else {
+        return Ok(EntryDetail {
+            items: Vec::new(),
+            truncated: true,
+        });
+    };
+    verify_id(&line, &node.id)?;
+    let mut items = crate::agents::entry_items(&line);
+    if node.kind == NodeKind::ToolResult {
+        let want = tool_call_id(&line);
+        if let Some(want) = want.filter(|w| !w.is_empty())
+            && let Some(call) = find_tool_call(path, tree, i, &want)?
+        {
+            items.insert(0, call);
+        }
+    }
+    Ok(EntryDetail {
+        items,
+        truncated: false,
+    })
+}
+
+/// Reads the node's span: `None` when it is over the cap (the line is longer than 8 MiB).
+fn read_span(path: &Path, span: LineSpan) -> io::Result<Option<Vec<u8>>> {
+    if span.len > ENTRY_CAP as u64 {
+        return Ok(None);
+    }
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(span.offset))?;
+    let mut line = vec![0u8; span.len as usize];
+    file.read_exact(&mut line).map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(io::ErrorKind::InvalidData, "session file changed")
+        } else {
+            e
+        }
+    })?;
+    Ok(Some(line))
+}
+
+/// The line still belongs to the node: its top-level `id` equals the node id.
+fn verify_id(line: &[u8], id: &str) -> io::Result<()> {
+    let ok = serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+        .as_deref()
+        == Some(id);
+    if ok {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session file changed",
+        ))
+    }
+}
+
+/// A tool result line's `toolCallId`.
+fn tool_call_id(line: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/message/toolCallId")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+}
+
+/// The `ToolCall` item with `call_id == want` on the nearest `Assistant` ancestor's line:
+/// walks parent links up (parallel results chain assistant → result1 → result2). Missing →
+/// `None` (just the result is shown).
+fn find_tool_call(
+    path: &Path,
+    tree: &SessionTree,
+    i: usize,
+    want: &str,
+) -> io::Result<Option<crate::agents::TranscriptItem>> {
+    let mut cur = tree.parent_index(i);
+    for _ in 0..tree.nodes.len() {
+        let Some(p) = cur else { break };
+        let Some(ancestor) = tree.nodes.get(p) else {
+            break;
+        };
+        if ancestor.kind == NodeKind::Assistant {
+            let Some(span) = ancestor.line else { break };
+            let Some(line) = read_span(path, span)? else {
+                break;
+            };
+            // The ancestor may itself have moved under a rewrite: only trust its calls when
+            // its id still matches.
+            if verify_id(&line, &ancestor.id).is_err() {
+                break;
+            }
+            return Ok(crate::agents::entry_items(&line).into_iter().find(|item| {
+                matches!(
+                    item,
+                    crate::agents::TranscriptItem::ToolCall { call_id, .. } if call_id == want
+                )
+            }));
+        }
+        cur = tree.parent_index(p);
+    }
+    Ok(None)
+}
+
 // ---- row text ----------------------------------------------------------------------------------
 
 fn is_control(c: char) -> bool {
@@ -316,14 +457,15 @@ fn skip_escape(it: &mut std::str::Chars<'_>) {
     }
 }
 
-/// omp's `sanitizeTreeField`: ANSI and control characters dropped, `\n`/`\t` → space, trimmed.
+/// omp's `sanitizeTreeField`: ANSI and control characters dropped, `\r`/`\n`/`\t`/U+2028/U+2029
+/// → space, trimmed.
 fn clean(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(TEXT_LIMIT * 4));
     let mut it = s.chars();
     while let Some(c) = it.next() {
         match c {
             '\x1b' => skip_escape(&mut it),
-            '\n' | '\t' => out.push(' '),
+            '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => out.push(' '),
             c if is_control(c) => {}
             c => out.push(c),
         }
@@ -512,7 +654,13 @@ fn format_tool_call(name: &str, raw: Option<&RawValue>) -> String {
             let short: String = cmd
                 .chars()
                 .take(50)
-                .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+                .map(|c| {
+                    if matches!(c, '\r' | '\n' | '\t' | '\u{2028}' | '\u{2029}') {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
                 .collect();
             let more = if cmd.chars().nth(50).is_some() {
                 "..."
@@ -1390,6 +1538,8 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
             attribution,
             user_request,
             tool_name,
+            // Filled by the builder, which knows the file offset.
+            line: None,
         },
         label,
         calls,
@@ -1516,6 +1666,8 @@ fn parse_oversize(
             attribution: None,
             user_request,
             tool_name,
+            // Filled by the builder, which knows the file offset.
+            line: None,
         },
         label: None,
         calls: Vec::new(),
@@ -1552,11 +1704,13 @@ struct Builder {
 
 enum LineRead {
     Eof,
-    /// `bytes` includes the newline; `over` = more than the cap, only the first `cap` kept and
-    /// `leaf` is the top-level `activeLeafId` found while skipping the rest.
+    /// `bytes` includes the newline; `content` is the line's length without it (capped at
+    /// `MAX_LINE` for oversized lines); `over` = more than the cap, only the first `cap`
+    /// kept and `leaf` is the top-level `activeLeafId` found while skipping the rest.
     Line {
         complete: bool,
         bytes: usize,
+        content: usize,
         over: bool,
         leaf: Option<Option<String>>,
     },
@@ -1676,6 +1830,7 @@ impl LeafScan {
 fn read_line<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> io::Result<LineRead> {
     buf.clear();
     let mut total = 0;
+    let mut content = 0usize;
     let mut over = false;
     let mut scan = LeafScan::default();
     loop {
@@ -1687,6 +1842,7 @@ fn read_line<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> io::Result
                 LineRead::Line {
                     complete: false,
                     bytes: total,
+                    content,
                     over,
                     leaf: scan.result,
                 }
@@ -1696,6 +1852,7 @@ fn read_line<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> io::Result
             Some(p) => (&chunk[..p], p + 1, true),
             None => (chunk, chunk.len(), false),
         };
+        content += piece.len();
         if over {
             scan.feed(piece);
         } else {
@@ -1715,6 +1872,7 @@ fn read_line<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> io::Result
             return Ok(LineRead::Line {
                 complete: true,
                 bytes: total,
+                content: content.min(cap),
                 over,
                 leaf: scan.result,
             });
@@ -1731,7 +1889,12 @@ impl Builder {
     }
 
     /// Adds one parsed line. Returns false for a malformed line (skipped).
-    fn ingest(&mut self, bytes: &[u8], over: Option<(usize, Option<Option<String>>)>) -> bool {
+    fn ingest(
+        &mut self,
+        bytes: &[u8],
+        over: Option<(usize, Option<Option<String>>)>,
+        span: Option<LineSpan>,
+    ) -> bool {
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return true;
         }
@@ -1740,7 +1903,9 @@ impl Builder {
             None => parse_line(bytes, &self.tools),
         };
         match parsed {
-            Ok(Some(p)) => {
+            Ok(Some(mut p)) => {
+                // Even prefix-only nodes keep their span for targeted reads.
+                p.node.line = span;
                 self.add(p);
                 true
             }
@@ -1751,7 +1916,6 @@ impl Builder {
             }
         }
     }
-
     fn add(&mut self, mut p: Parsed) {
         if self.index.contains_key(p.node.id.as_str()) {
             log::debug!("tree: duplicate entry id {}", p.node.id);
@@ -1828,15 +1992,24 @@ impl Builder {
                 LineRead::Line {
                     complete,
                     bytes,
+                    content,
                     over,
                     leaf,
                 } => {
+                    // `self.offset` is the byte before this line's first byte; the title line
+                    // is rewritten in place (same length), so later offsets never move. Only
+                    // a node that parses keeps the span; header/title/blank/malformed lines
+                    // leave no node behind, but the offset still advances past them.
+                    let span = Some(LineSpan {
+                        offset: self.offset,
+                        len: content as u64,
+                    });
                     let over = over.then_some((bytes, leaf));
                     if complete {
-                        if !self.ingest(&buf, over) {
+                        if !self.ingest(&buf, over, span) {
                             self.cost.incomplete = true; // the skipped line may have been billed
                         }
-                    } else if over.is_none() && self.ingest(&buf, None) {
+                    } else if over.is_none() && self.ingest(&buf, None, span) {
                         // a valid last line without its newline yet
                     } else {
                         break; // truncated: wait for the rest
@@ -2039,8 +2212,9 @@ mod tests {
     fn clean_strips_controls_ansi_and_folds_whitespace() {
         assert_eq!(
             clean("  a\n\tb\r\x07c \x1b[31mred\x1b[0m\x1b]0;t\x07 "),
-            "a  bc red"
+            "a  b c red"
         );
+        assert_eq!(clean("a b c"), "a b c");
         assert_eq!(truncate_chars("héllo", 2), "hé");
     }
 
