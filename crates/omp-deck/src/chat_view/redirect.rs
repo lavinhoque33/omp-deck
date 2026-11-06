@@ -1,5 +1,6 @@
 //! Redirects: omp's own screens (`/settings`, the Alt+P model picker, `/usage`, `/resume`,
-//! `/tree`) are answered by OmpDeck's own counterparts, which do everything omp's do.
+//! `/tree`, the agents hub) are answered by OmpDeck's own counterparts, which do everything
+//! omp's do.
 //!
 //! Three ways in, one outcome ([`Redirect`] on the frame's response):
 //!
@@ -13,9 +14,13 @@
 //!   them (a remapped chord, double Esc, a slash-menu click, an omp action) is recognised in the
 //!   pre-draw snapshot, redirected and closed with Esc in the same frame; the surface is never
 //!   drawn. The model hub (Alt+M) and every other picker or overlay are never caught.
-//! * **Clicked** (`Cx::click`): the composer's model and cost facts, drawn in split panes.
+//! * **Clicked** (`Cx::click`): the composer's model and cost facts and the HUD's agents
+//!   segment (`agents.open`), drawn in split panes.
 //!
-//! The identifications are those of omp 18.16.0's recorded TSP (`redirect-fixtures.json`).
+//! The identifications are those of omp 18.16.0's recorded TSP (`redirect-fixtures.json`) and,
+//! for the agents hub, 18.17.0's (`hub-fixtures.json`): a `picker` node of the session's `layer`
+//! whose `tabs` hold the ids `agents` and `activity` (omp's `/agents`, the agent definitions,
+//! has the same title, icon and noun but no tabs).
 
 use std::time::{Duration, Instant};
 
@@ -41,6 +46,9 @@ pub enum Redirect {
     Resume { foreign: Option<ForeignSource> },
     /// `/tree`, double Esc with `doubleEscapeAction: tree`.
     Tree,
+    /// omp's agents hub (Alt+A, Ctrl+S, `←←` on an empty composer, `/hub`, the HUD's agents
+    /// segment); `activity` when it shows its Activity tab (`/hub`).
+    AgentHub { activity: bool },
 }
 
 // ---- typed ----------------------------------------------------------------------------------
@@ -85,6 +93,7 @@ fn command(text: &str, popup: Option<&str>) -> Option<Redirect> {
             foreign: Some(ForeignSource::Codex),
         }),
         ("tree", "") => Some(Redirect::Tree),
+        ("hub", "") => Some(Redirect::AgentHub { activity: true }),
         _ => None,
     }
 }
@@ -279,18 +288,29 @@ pub fn catch_page(page: &Snap) -> Option<Caught> {
 
 /// What the layer node `n` is, if one of the redirected screens: the Alt+P picker ("Switch
 /// model"; the task and role pickers carry other titles), the usage overlay, the session picker
-/// of `/resume`, the tree picker.
+/// of `/resume`, the tree picker, the agents hub.
 fn layer_screen(n: &SNode) -> Option<Redirect> {
     match n.kind.as_str() {
         "picker" => match (n.str("title"), n.str("noun"), n.str("icon")) {
             (Some("Switch model"), ..) => Some(Redirect::ModelPicker),
             (Some("Session tree"), ..) if n.str("layout") == Some("tree") => Some(Redirect::Tree),
             (_, Some("sessions"), Some("history")) => Some(Redirect::Resume { foreign: None }),
+            (Some("Agents"), ..) if hub_tab(n).is_some() => Some(Redirect::AgentHub {
+                activity: hub_tab(n) == Some(true),
+            }),
             _ => None,
         },
         "overlay" if n.role() == "omp.overlay.usage" => Some(Redirect::Usage { reset: false }),
         _ => None,
     }
+}
+
+/// Whether the picker `n` is the agents hub (its tabs are `agents` and `activity`; omp's `/agents`
+/// has none) and, if so, whether it shows its Activity tab.
+fn hub_tab(n: &SNode) -> Option<bool> {
+    let tabs = n.get("tabs")?.as_array()?;
+    let has = |id: &str| tabs.iter().any(|t| t["id"].as_str() == Some(id));
+    (has("agents") && has("activity")).then(|| n.str("tab") == Some("activity"))
 }
 
 /// The first redirected screen open in the session's `layer`.

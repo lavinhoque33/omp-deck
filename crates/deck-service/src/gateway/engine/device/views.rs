@@ -869,6 +869,7 @@ mod tests {
             agent: None,
             model: None,
             thinking: None,
+            model_role: None,
             task_gist: String::new(),
             task: String::new(),
             status: deck_core::agents::AgentStatus::Done,

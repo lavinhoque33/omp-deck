@@ -500,6 +500,7 @@ mod tests {
             advisor: false,
             agent: None,
             model: None,
+            model_role: None,
             thinking: None,
             task_gist: String::new(),
             task: String::new(),

@@ -128,6 +128,18 @@ impl Tab {
         &self.term
     }
 
+    /// Why an injected command cannot go in while omp's chat views a subagent (the composer
+    /// is addressed to it), else `None`. Reads the TSP document, so ask only once a command was
+    /// refused, never per frame.
+    pub fn viewing_refusal(&self) -> Option<String> {
+        let tsp = self.term.tsp();
+        if !tsp.live() {
+            return None;
+        }
+        tsp.with(deck_service::composer::TspComposer::of)
+            .viewing_refusal()
+    }
+
     pub fn terminal_mut(&mut self) -> &mut Terminal {
         &mut self.term
     }

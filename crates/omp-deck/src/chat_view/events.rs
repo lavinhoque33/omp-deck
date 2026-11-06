@@ -63,6 +63,41 @@ pub fn action_value(sf: &str, id: &str, act: &str, value: Option<&str>) -> Event
     }
 }
 
+/// The subagent omp's chat is retargeted at (the `omp.composer.agent` text of the composer's
+/// `omp.composer.focus` row), `None` while it shows the main session.
+pub fn viewing(snap: &Snap) -> Option<&str> {
+    let dock = snap.region("dock")?;
+    let focus = snap.by_role(dock, "omp.composer.focus")?;
+    let agent = snap.by_role(focus, "omp.composer.agent")?;
+    Some(agent.text())
+}
+
+/// How retargeting omp's chat at a subagent goes on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FocusStep {
+    /// The chat already views it.
+    Viewing,
+    /// Send this event.
+    Send(Event),
+}
+
+/// What it takes to retarget omp's chat at the subagent `agent`: omp's `focus:<id>` composer
+/// action, the one its own agent hub fires (it revives a parked agent first; an unknown id only
+/// toasts). Addressed to the composer's editor, which the editor component routes by node.
+/// `None` while the composer is not on the surface.
+pub fn focus(snap: &Snap, agent: &str) -> Option<FocusStep> {
+    let composer = snap.composer()?;
+    if viewing(snap) == Some(agent) {
+        return Some(FocusStep::Viewing);
+    }
+    Some(FocusStep::Send(action_value(
+        &snap.sf,
+        &composer.id,
+        &format!("focus:{agent}"),
+        None,
+    )))
+}
+
 /// A native edit: replace the UTF-16 range `[from, to)` with `text` and put the caret at
 /// `cursor`; `len` is the text length (UTF-16) the terminal saw.
 pub fn edit(sf: &str, id: &str, from: u32, to: u32, text: &str, cursor: u32, len: u32) -> Event {
@@ -190,5 +225,47 @@ mod tests {
             resolve_click(&s, copy, "select", false),
             Click::Send(select("s:1", &copy.id, &copy.id))
         );
+    }
+
+    #[test]
+    fn focus_targets_the_composer_unless_already_viewing_the_agent() {
+        use crate::chat_view::snap::tests::{feed_frame, fixture_mirror, sync_doc};
+
+        let mut mirror = fixture_mirror(usize::MAX);
+        let mut snap = Snap::default();
+        sync_doc(&mut snap, &mirror);
+        let composer = snap.composer().expect("recorded composer").id.clone();
+        let sent = |snap: &Snap, agent: &str| {
+            let Some(FocusStep::Send(event)) = focus(snap, agent) else {
+                panic!("a different agent requires an action");
+            };
+            j(&event)
+        };
+        assert_eq!(viewing(&snap), None);
+        assert_eq!(
+            sent(&snap, "Agent"),
+            json!({"ev": "action", "sf": "s:1", "id": composer, "act": "focus:Agent"})
+        );
+
+        // omp 18.17's focus row, kept independently of the old session recording.
+        let row: Value =
+            serde_json::from_str(include_str!("focus-fixtures.json")).expect("focus fixture");
+        feed_frame(&mut mirror, &json!([["add", "3.focus", "dock", null, row]]));
+        sync_doc(&mut snap, &mirror);
+        assert_eq!(viewing(&snap), Some("Probe"));
+        assert_eq!(focus(&snap, "Probe"), Some(FocusStep::Viewing));
+        assert_eq!(
+            sent(&snap, "Other"),
+            json!({"ev": "action", "sf": "s:1", "id": composer, "act": "focus:Other"})
+        );
+
+        // The focus banner alone is not an input target.
+        feed_frame(&mut mirror, &json!([["del", composer]]));
+        sync_doc(&mut snap, &mirror);
+        assert_eq!(viewing(&snap), Some("Probe"));
+        assert_eq!(focus(&snap, "Probe"), None);
+        assert_eq!(focus(&snap, "Other"), None);
+        assert_eq!(viewing(&Snap::default()), None);
+        assert_eq!(focus(&Snap::default(), "Agent"), None);
     }
 }

@@ -1,5 +1,5 @@
 //! Pages: the `screen` surface omp opens in the session's place while one of its fullscreen
-//! overlays is up (`/git`, the agents hub, `/models`, …; omp's `native/backend.ts` pauses the
+//! overlays is up (`/git`, …; omp's `native/backend.ts` pauses the
 //! inline surface meanwhile). omp keeps the keyboard focus in that overlay, so a view that kept
 //! drawing the frozen session would look dead while every key and click went to something
 //! invisible. The page is drawn from the same node renderers as the session; what omp could not

@@ -395,11 +395,14 @@ fn pi(s: &ScreenText, r: usize) -> Option<Region> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TspComposer {
     /// [`Composer::Missing`] when no sendable `editor` stands in the dock or the cursor is not
-    /// in it: an `omp.editor.ask*` (ask, approval) replaces the composer, and any other dialog
-    /// takes the surface's focus away from the editor. Otherwise the editor's text.
+    /// in it: an `omp.editor.ask*` (ask, approval) replaces the composer, any other dialog
+    /// takes its focus, or [`Self::viewing`] redirects input to a subagent. Otherwise its text.
     pub state: Composer,
     /// `(surface id, editor id)` of the sendable editor.
     pub target: Option<(String, String)>,
+    /// The subagent in the dock's `omp.composer.focus` row. Injected commands must never
+    /// reach that session; ordinary user input remains omp's responsibility.
+    pub viewing: Option<String>,
     /// The program's hello advertised `send`: an event may submit text atomically.
     pub can_send: bool,
     /// Attachment chips the composer carries (a pasted file drop shows up as one).
@@ -414,13 +417,21 @@ impl TspComposer {
     /// found by kind and `sendable`, never by id.
     pub fn of(document: &Document) -> TspComposer {
         let can_send = document.program().is_some_and(|p| p.supports("send"));
-        let missing = |chips, popup| TspComposer {
+        let missing = |chips, popup, viewing: Option<&str>| TspComposer {
             state: Composer::Missing,
             target: None,
+            viewing: viewing.map(str::to_owned),
             can_send,
             chips,
             popup,
         };
+        let Some(surface) = document.inline() else {
+            return missing(0, false, None);
+        };
+        let mut scan = DockScan::default();
+        if let Some(dock) = surface.node("dock") {
+            scan.visit(dock);
+        }
         // A fullscreen overlay (omp's git page, model manager, settings…) is a second, `screen`
         // surface that freezes the inline one: all input goes to it until it closes, so the
         // inline composer is not addressable meanwhile.
@@ -429,14 +440,7 @@ impl TspComposer {
             .iter()
             .any(|s| s.is_open() && s.mode() != Mode::Inline)
         {
-            return missing(0, false);
-        }
-        let Some(surface) = document.inline() else {
-            return missing(0, false);
-        };
-        let mut scan = DockScan::default();
-        if let Some(dock) = surface.node("dock") {
-            scan.visit(dock);
+            return missing(scan.chips, false, scan.viewing);
         }
         let mut layer = DockScan::default();
         if let Some(node) = surface.node("layer") {
@@ -444,18 +448,27 @@ impl TspComposer {
         }
         let popup = layer.popup;
         let Some((editor, text)) = scan.editor else {
-            return missing(scan.chips, popup);
+            return missing(scan.chips, popup, scan.viewing);
         };
-        if scan.asking || surface.focus() != Some(editor) {
-            return missing(scan.chips, popup);
+        if scan.asking || scan.viewing.is_some() || surface.focus() != Some(editor) {
+            return missing(scan.chips, popup, scan.viewing);
         }
         TspComposer {
             state: draft_with_chips(text, scan.chips),
             target: Some((surface.id().to_owned(), editor.to_owned())),
+            viewing: None,
             can_send,
             chips: scan.chips,
             popup,
         }
+    }
+
+    /// Why injected input is refused while omp is displaying a subagent transcript.
+    /// Other missing-composer states keep the caller's existing refusal message.
+    pub fn viewing_refusal(&self) -> Option<String> {
+        self.viewing
+            .as_ref()
+            .map(|id| format!("Viewing subagent {id} — press Esc to return to the main session"))
     }
 
     /// Changes whenever the composer shows something new (text or attachments).
@@ -493,6 +506,7 @@ fn draft_of(text: &str) -> Composer {
 struct DockScan<'a> {
     /// The first sendable editor: its id and text.
     editor: Option<(&'a str, &'a str)>,
+    viewing: Option<&'a str>,
     asking: bool,
     popup: bool,
     chips: usize,
@@ -503,6 +517,9 @@ impl<'a> DockScan<'a> {
         let role = node.str_prop("role").unwrap_or_default();
         self.asking |= role.starts_with("omp.editor.ask");
         self.popup |= role == "omp.autocomplete";
+        if node.kind() == "row" && role == "omp.composer.focus" {
+            self.viewing = focused_agent(node);
+        }
         if role == "omp.composer.chip" {
             self.chips += 1;
         }
@@ -516,6 +533,13 @@ impl<'a> DockScan<'a> {
             self.visit(child);
         }
     }
+}
+
+fn focused_agent(node: NodeRef<'_>) -> Option<&str> {
+    if node.kind() == "text" && node.str_prop("role") == Some("omp.composer.agent") {
+        return node.str_prop("text");
+    }
+    node.children().find_map(focused_agent)
 }
 
 #[cfg(test)]
@@ -932,6 +956,88 @@ mod tests {
             &["edit"],
         );
         assert!(!TspComposer::of(&doc).can_send);
+    }
+
+    #[test]
+    fn recorded_subagent_focus_blocks_injection_until_returning_to_main() {
+        // omp 18.17.0 focus-live-tree.json: dock's composer subtree, trimmed to focus + input.
+        let mut composer = serde_json::json!({
+            "id": "3", "k": "col", "p": {"role": "omp.editor"},
+            "c": [
+                {"id": "3.focus", "k": "row", "p": {
+                    "role": "omp.composer.focus", "gap": "xs", "align": "center",
+                    "title": "Viewing subagent Probe: what you send goes to it"
+                }, "c": [
+                    {"id": "3.focus/icon", "k": "icon", "p": {"name": "eye"}},
+                    {"id": "3.focus/label", "k": "text", "p": {"text": "Viewing", "wrap": "none"}},
+                    {"id": "3.focus/agent", "k": "text", "p": {
+                        "role": "omp.composer.agent", "text": "Probe", "wrap": "none"
+                    }},
+                    {"id": "3.focus/exit", "k": "row", "p": {
+                        "role": "omp.composer.exit", "gap": "xs", "align": "center",
+                        "title": "Back to the main session  esc", "actions": {"click": "focus:Main"}
+                    }, "c": [
+                        {"id": "3.focus/exit/key", "k": "kbd", "p": {"keys": ["escape"]}},
+                        {"id": "3.focus/exit/label", "k": "text", "p": {"text": "main", "wrap": "none"}}
+                    ]}
+                ]},
+                {"id": "3.line", "k": "row", "p": {
+                    "role": "omp.composer.line", "align": "start", "gap": "sm"
+                }, "c": [
+                    {"id": "3.line/input", "k": "editor", "p": {
+                        "text": "", "cursor": 0, "sendable": true,
+                        "placeholder": "Message Probe", "maxLines": 18
+                    }}
+                ]}
+            ]
+        });
+        let read = |node| {
+            TspComposer::of(&tsp_document(
+                serde_json::json!([node]),
+                serde_json::json!([]),
+                Some("3.line/input"),
+                &["edit", "send"],
+            ))
+        };
+        let focused = read(composer.clone());
+        assert_eq!(focused.state, Composer::Missing);
+        assert_eq!(focused.viewing.as_deref(), Some("Probe"));
+        assert_eq!(focused.target, None);
+        assert_eq!(
+            focused.viewing_refusal().as_deref(),
+            Some("Viewing subagent Probe — press Esc to return to the main session")
+        );
+        // Esc removes the focus row; the same sendable input becomes available again.
+        composer["c"].as_array_mut().expect("children").remove(0);
+        let main = read(composer);
+        assert_eq!(main.state, Composer::Empty);
+        assert_eq!(main.viewing, None);
+        assert_eq!(main.viewing_refusal(), None);
+        assert_eq!(
+            main.target,
+            Some(("s".to_owned(), "3.line/input".to_owned()))
+        );
+    }
+
+    #[test]
+    fn subagent_labels_outside_a_dock_focus_row_do_not_block_the_composer() {
+        let label = serde_json::json!({
+            "id": "agent", "k": "text", "p": {"role": "omp.composer.agent", "text": "Other"}
+        });
+        let layer_focus = serde_json::json!({
+            "id": "focus", "k": "row", "p": {"role": "omp.composer.focus"},
+            "c": [{"id": "layer-agent", "k": "text",
+                   "p": {"role": "omp.composer.agent", "text": "Other"}}]
+        });
+        let c = TspComposer::of(&tsp_document(
+            serde_json::json!([editor("draft", true), label]),
+            serde_json::json!([layer_focus]),
+            Some("ed"),
+            &["send"],
+        ));
+        assert_eq!(c.state, Composer::Draft("draft".to_owned()));
+        assert_eq!(c.viewing, None);
+        assert!(c.target.is_some());
     }
 
     #[test]

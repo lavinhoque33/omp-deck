@@ -1777,7 +1777,7 @@ pub fn thinking_level(raw: &str) -> &str {
 
 /// A settled agent's thinking level as a static text badge (`med`, `xhigh`): the effort ring
 /// would read as a running spinner next to the done mark. Empty levels show nothing.
-fn thinking_badge(cx: &Cx, ui: &mut Ui, level: &str) {
+pub(super) fn thinking_badge(cx: &Cx, ui: &mut Ui, level: &str) {
     if level.is_empty() || level == "auto" {
         return;
     }
@@ -1822,10 +1822,47 @@ pub fn tile_agent<'a>(agents: &'a [AgentMeta], tile: &SNode, snap: &Snap) -> Opt
         .and_then(|h| snap.kids(h).find(|c| c.role() == "omp.job.tile.title"))
         .map(text::node_plain)
         .filter(|t| !t.trim().is_empty())?;
-    agents
-        .iter()
-        .find(|a| a.id == title)
-        .or_else(|| agents.iter().find(|a| a.id.replace('.', ">") == title))
+    named_agent(agents, &title)
+}
+
+pub(super) fn named_agent<'a>(agents: &'a [AgentMeta], title: &str) -> Option<&'a AgentMeta> {
+    agents.iter().find(|a| a.id == title).or_else(|| {
+        agents.iter().find(|a| {
+            a.id.chars()
+                .map(|c| if c == '.' { '>' } else { c })
+                .eq(title.chars())
+        })
+    })
+}
+
+/// Restrict sheet enrichment to omp's jobs overlay, never similarly shaped generic lists.
+pub(super) fn in_jobs_sheet(cx: &Cx, n: &SNode) -> bool {
+    let mut node = Some(n);
+    while let Some(n) = node {
+        if n.role() == "omp.overlay.jobs" {
+            return true;
+        }
+        node = n.parent.as_deref().and_then(|id| cx.snap.get(id));
+    }
+    false
+}
+
+/// Task job ids are agent registry ids; older labels use the tile's breadcrumb spelling.
+pub(super) fn sheet_agent<'a>(
+    cx: &'a Cx,
+    n: &SNode,
+    list: Option<&SNode>,
+) -> Option<&'a AgentMeta> {
+    if n.kind != "item" || n.str("icon") != Some("agent") || !in_jobs_sheet(cx, n) {
+        return None;
+    }
+    let id = list
+        .and_then(|l| n.id.strip_prefix(l.id.as_str()))?
+        .strip_prefix('/')?;
+    cx.agents.iter().find(|a| a.id == id).or_else(|| {
+        let label = n.arr("label").first()?.get("t")?.as_str()?.trim();
+        named_agent(cx.agents, label)
+    })
 }
 
 /// A `wait` card's job tile: omp's dot/title/clock head, plus the agent's type badge,
@@ -1883,7 +1920,7 @@ fn head_with_identity(cx: &Cx, ui: &mut Ui, tile: &SNode, head: &SNode, a: &Agen
 }
 
 /// Type badge + model chip + thinking level of a tile's agent, as agent heads draw them.
-fn identity_line(cx: &Cx, ui: &mut Ui, a: &AgentMeta, live: bool) {
+pub(super) fn identity_line(cx: &Cx, ui: &mut Ui, a: &AgentMeta, live: bool) {
     ui.spacing_mut().item_spacing.x = 7.0;
     if live {
         if let Some(level) = a
@@ -1907,21 +1944,33 @@ fn identity_line(cx: &Cx, ui: &mut Ui, a: &AgentMeta, live: bool) {
             a.thinking.as_deref().map(thinking_level).unwrap_or(""),
         );
     }
+    let kind = a.agent.as_deref().filter(|k| !k.is_empty());
     if let Some(model) = a.model.as_deref().filter(|m| !m.is_empty()) {
-        let ink = cx.ink;
-        let mut job = LayoutJob::default();
-        job.append(
-            &text::clean(model),
-            0.0,
-            Base::new(ink.label(LABEL), ink.dim(), ink).format_plain(),
-        );
-        job.wrap.max_rows = 1;
-        job.wrap.max_width = (ui.available_width() - 16.0).max(20.0);
-        chip(ui, ink, job, ink.chip(), ink.line(), Sense::hover());
+        // The type badge after the chip keeps its room: the chip shortens, never the badge.
+        let reserve = kind.map_or(0.0, |k| {
+            render::measure_fragment(ui, ("identity-kind", k), &|ui| {
+                render::badge(cx, ui, k, Some("muted"));
+            }) + ui.spacing().item_spacing.x
+        });
+        model_chip(cx, ui, model, reserve);
     }
-    if let Some(kind) = a.agent.as_deref().filter(|k| !k.is_empty()) {
+    if let Some(kind) = kind {
         render::badge(cx, ui, kind, Some("muted"));
     }
+}
+
+/// Shared by wait tiles and the jobs sheet's Model fact; `reserve` = width kept free after it.
+pub(super) fn model_chip(cx: &Cx, ui: &mut Ui, model: &str, reserve: f32) {
+    let ink = cx.ink;
+    let mut job = LayoutJob::default();
+    job.append(
+        &text::clean(model),
+        0.0,
+        Base::new(ink.label(LABEL), ink.dim(), ink).format_plain(),
+    );
+    job.wrap.max_rows = 1;
+    job.wrap.max_width = (ui.available_width() - 16.0 - reserve).max(20.0);
+    chip(ui, ink, job, ink.chip(), ink.line(), Sense::hover());
 }
 
 fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {

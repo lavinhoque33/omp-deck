@@ -118,6 +118,8 @@ struct Requests {
     chat_url: Option<String>,
     /// An omp screen that OmpDeck answers with its own, and the pane that asked.
     redirect: Option<(usize, crate::chat_view::Redirect)>,
+    /// How the pending "Open in chat view" request ended.
+    focus_outcome: Option<crate::chat_view::FocusOutcome>,
     copy_link: Option<String>,
 }
 
@@ -380,6 +382,7 @@ impl App {
         let pal = Palette::of_ui(ui);
         let mut frame = Requests::default();
         let mut refused = None;
+        let focus_ready = self.focus_ready();
         theme::skin::central(ui, pal, true, |ui| {
             let area = ui.max_rect();
             let rects = panes::pane_rects(self.split.layout(), area, self.split.ratios());
@@ -434,12 +437,27 @@ impl App {
                     let uid = t.uid;
                     let chat = t.terminal().tsp().live();
                     let (response, url) = if chat {
+                        let want = super::chat_focus::request(
+                            self.pending_focus.as_ref(),
+                            t,
+                            index == Some(self.active),
+                            focus_ready,
+                        );
                         let out = crate::chat_view::ChatView::new(t.terminal_mut())
                             .id_salt(uid)
                             .font_size(font_size)
-                            .agents(self.agents_view.metas())
+                            // The cached view follows the active session, not every visible pane.
+                            .agents(if index == Some(self.active) {
+                                self.agents_view.metas()
+                            } else {
+                                &[]
+                            })
+                            .focus_agent(want)
                             .show(&mut child);
                         refused = refused.or(out.refused);
+                        if out.focus.is_some() {
+                            frame.focus_outcome = out.focus;
+                        }
                         if let Some(r) = out.redirect {
                             frame.redirect = Some((slot, r));
                         }
@@ -562,6 +580,9 @@ impl App {
             self.close_pane(slot);
         } else if let Some(slot) = frame.focus {
             self.focus_pane(slot);
+        }
+        if let Some(outcome) = frame.focus_outcome {
+            self.finish_focus(outcome);
         }
         // The redirect acts on the pane's tab: it is the active one first.
         if let Some((slot, redirect)) = frame.redirect {

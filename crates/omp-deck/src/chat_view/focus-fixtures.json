@@ -1,0 +1,30 @@
+{
+  "id": "3.focus",
+  "k": "row",
+  "p": {
+    "role": "omp.composer.focus",
+    "gap": "xs",
+    "align": "center",
+    "title": "Viewing subagent Probe: what you send goes to it"
+  },
+  "c": [
+    {"id": "3.focus/icon", "k": "icon", "p": {"name": "eye"}},
+    {"id": "3.focus/label", "k": "text", "p": {"text": "Viewing", "wrap": "none"}},
+    {"id": "3.focus/agent", "k": "text", "p": {"role": "omp.composer.agent", "text": "Probe", "wrap": "none"}},
+    {
+      "id": "3.focus/exit",
+      "k": "row",
+      "p": {
+        "role": "omp.composer.exit",
+        "gap": "xs",
+        "align": "center",
+        "title": "Back to the main session  esc",
+        "actions": {"click": "focus:Main"}
+      },
+      "c": [
+        {"id": "3.focus/exit/key", "k": "kbd", "p": {"keys": ["escape"]}},
+        {"id": "3.focus/exit/label", "k": "text", "p": {"text": "main", "wrap": "none"}}
+      ]
+    }
+  ]
+}

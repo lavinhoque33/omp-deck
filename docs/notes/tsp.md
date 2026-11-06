@@ -92,11 +92,13 @@ hello/ack harness and replays them through a fake omp.
 - Host snapshots carry only the alacritty grid; TSP state must be kept beside it for reattach (later step).
 
 ## Pages: omp's fullscreen overlays are `screen` surfaces (`chat_view/page.rs`)
-- Fullscreen overlays (the git app from the composer's git segment `status.git`, `/git`, `/models`, the agents hub,
-  `/settings`) make omp's native backend (`packages/tui/src/native/backend.ts` `render()`) open a **second surface with
+- Fullscreen overlays (the git app from the composer's git segment `status.git`, `/git`, `/models`, `/settings`) make
+  omp's native backend (`packages/tui/src/native/backend.ts` `render()`) open a **second surface with
   `mode:"screen"`**, same `role:"omp.session"`, with its own `main`/`dock`/`layer` regions. The inline `s:1` stays
   open but frozen, and omp routes **every key and click to the overlay**: a view that keeps drawing the inline surface
   looks dead until the overlay is closed (this was the "branch icon freezes the chat" bug).
+- The agents hub is *not* one of these pages: with `picker` advertised it is a `picker` node in the inline `layer`
+  (contracts "Wave 22").
 - The view therefore keeps two `Snap`+`Local` pairs (node ids such as `main`, `layer`, `s` collide across surfaces):
   `Follow::Session` = the open inline `omp.session`, `Follow::Page` = the newest open non-inline surface. While a page
   is open (and the process has not exited) `show()` draws it instead of the transcript and dock, and TSP events are

@@ -1,0 +1,23 @@
+[
+  ["add", "layer.ov-w", "layer", null, {
+    "id": "layer.ov-w", "k": "overlay",
+    "p": {"anchor": "center", "size": "lg", "modal": true, "role": "omp.overlay.jobs", "head": "Background jobs"},
+    "c": [{"id": "w", "k": "col", "c": [
+      {"id": "w.split", "k": "row", "p": {"role": "omp.jobs.split"}, "c": [
+        {"id": "w.split/master", "k": "col", "p": {"role": "omp.jobs.master"}, "c": [
+          {"id": "w.split/master/jobs", "k": "list", "p": {"selected": "w.split/master/jobs/Probe", "max": {"lines": 12}, "actions": {"click": "select", "dblclick": "activate"}}, "c": [
+            {"id": "w.split/master/jobs/agent-Probe", "k": "text", "p": {"role": "omp.jobs.group", "text": "Task jobs"}},
+            {"id": "w.split/master/jobs/Probe", "k": "item", "p": {"label": [{"t": "Probe"}], "value": [{"t": "7.9s", "s": "mono"}], "icon": "agent", "tone": "pending", "title": "Probe\nRunning · task · Probe", "aria": "Probe, running, 7.9s"}},
+            {"id": "w.split/master/jobs/Unknown", "k": "item", "p": {"label": [{"t": "Unknown"}], "icon": "agent", "title": "Unknown\nRunning · task · Unknown"}},
+            {"id": "w.split/master/jobs/Bash", "k": "item", "p": {"label": [{"t": "Bash"}], "icon": "terminal", "title": "Bash\nRunning · bash · Bash"}}
+          ]}
+        ]},
+        {"id": "w.split/detail", "k": "col", "p": {"role": "omp.jobs.detail"}, "c": [
+          {"id": "w.split/detail/title", "k": "text", "p": {"role": "omp.jobs.title", "text": "Probe"}},
+          {"id": "w.split/detail/facts", "k": "kv", "p": {"role": "omp.jobs.facts", "items": [{"k": "Agent", "v": [{"t": "Probe", "s": "mono"}]}]}},
+          {"id": "w.split/detail/out", "k": "ansi", "p": {"role": "omp.jobs.output", "text": "Running agent Probe..."}}
+        ]}
+      ]}
+    ]}]
+  }]
+]

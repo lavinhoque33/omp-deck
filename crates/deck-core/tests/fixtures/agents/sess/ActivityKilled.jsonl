@@ -1,0 +1,4 @@
+{"type":"title","v":1,"title":""}
+{"type":"session","version":3,"id":"01a1","timestamp":"2026-10-21T10:03:00.000Z","cwd":"/x","parentSession":"/x/sess.jsonl"}
+{"type":"session_init","id":"si","parentId":null,"timestamp":"2026-10-21T10:03:00.020Z","task":"Killed job.","tools":[],"agent":"task","resolvedModel":"a/b"}
+{"type":"message","id":"a","parentId":null,"timestamp":"2026-10-21T10:03:20.000Z","message":{"role":"assistant","content":[],"provider":"a","model":"b","stopReason":"aborted","errorMessage":"Interrupted by user","timestamp":1792577020000}}

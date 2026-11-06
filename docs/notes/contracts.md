@@ -3662,8 +3662,8 @@ view** to OmpDeck's counterparts, "but add the missing omp functionalities to th
 anything"; for the tree: add the missing features, then redirect. Facts: `agent://RedirectFacts`, `agent://OmpRoutes`,
 `agent://DeckHooks` (summarised here). omp 18.16.0 is installed; routes were read at v18.16.0 and must be re-verified live
 (sandbox `PI_CODING_AGENT_DIR`) by whoever implements them. omp's own screens stay reachable in the **terminal view**
-(redirects are chat-view only). Kept as omp's (not redirected): `/model` hub (Alt+M), `/git`, agent hub, `/jobs`, `/copy`,
-rewind, `/login`, `/marketplace`.
+(redirects are chat-view only). Kept as omp's (not redirected): `/model` hub (Alt+M), `/git`, `/jobs`, `/copy`,
+rewind, `/login`, `/marketplace`. (The agent hub was kept here too; Wave 22 redirects it to the agents dashboard.)
 
 ### Redirect mechanism (omp-deck `chat_view/` + app glue)
 - `ChatResponse.redirect: Option<Redirect>`; `pub enum Redirect { OmpSettings, ModelPicker, Usage { reset: bool },
@@ -3982,3 +3982,124 @@ indicator for open tabs), and reorder them to move the open tabbed ones to the t
 - New Device settings `RunningDockHeight` / `RunningDockCollapsed` (deck-service `settings!`): the GUI writes them
   through the settings service like `sidebar_width`. A gateway built before them drops the fields — ship the gateway
   and the GUI together (they are one release).
+
+## Wave 22: omp's agent hub → the agents dashboard (full parity), jobs model + thinking (user, 2026-11-06)
+
+User: omp's Agents hub (chat view) does nothing the dashboard doesn't except "open transcript in the chat view, Esc
+restores the parent" → add that (and every other hub feature: user picked **full parity**) to the dashboard and redirect
+the hub to it; omp's Background jobs sheet should show each task job's model + thinking level. Supersedes the Wave 21 line
+"Kept as omp's: … agent hub" (the hub is now redirected; `/jobs` stays omp's, enriched in place).
+
+Facts (omp **18.17.0**, recorded live; recordings `~/omp-hub-recordings-18.17/` = omp's `PI_TUI_TSP_RECORD` JSONL +
+extracted trees; research `agent://OmpHubJobsFacts`, `agent://DeckHubJobsMap`, `agent://AgentDataSources`,
+`agent://LiveFocusHub`):
+- The hub is **not a page**: with `picker` advertised it is a `picker` node directly in the inline `s:1` surface's
+  `layer` (no role; id changes per open). Props: `title:"Agents"`, `icon:"users"`, `size:"lg"`,
+  `tabs:[{id:"agents"},{id:"activity"}]`, `tab`, `noun:"agents"|"events"`, actions `open|revive|kill|view|filter|close`
+  (Activity: `open|follow|agents|filter|close`, `/hub` adds `scopes` all/errors/responses/tools). omp's `/agents`
+  (agent definitions) has the same title/icon/noun but **no `tabs`** → discriminator = picker whose `tabs` holds ids
+  `agents` and `activity`. Opened by Alt+A (`ESC a`), Ctrl+S, `←←` on an empty composer, `/hub` (Activity tab), HUD
+  segment `…running/agents` action `agents.open`. One Esc closes it (~0.3 s).
+- Hub row: `facts {cost, time (ms running | string settled), req, tools, tok, ctx (0–1)}`, `title "Context X / Y"`,
+  `chips[0]` = model (dot `thinking<Level>`), `badges` = role tag (`title:"Model role"`), `N unread`, `↳ <parent>`
+  (flat view, parent ≠ Main), `read-only` (advisor). Subtitle = `$cost · duration · N req · N tok`. Sort: status
+  (running < idle < parked < aborted), last activity desc, id. Filter: fuzzy over `"<id> <displayName>"`.
+- **Open transcript** = omp's `focus:<agentId>`: the TSP event `{"ev":"action","sf":"s:1","id":<node>,"act":"focus:<id>"}`
+  (`chat_view::events::action`) sent to the `omp.editor` composer root (or its `editor` child / any node inside it)
+  retargets omp's chat (main region, composer model/effort/context, placeholder "Message <id>") at the subagent's live
+  session, reviving a parked one; typed input then steers it. omp inserts `<root>.focus` = row
+  `role:"omp.composer.focus"` (eye icon, "Viewing", `omp.composer.agent` text = id, `omp.composer.crumb`s for nested
+  ancestors with `click:"focus:<c>"`, `omp.composer.exit` with `click:"focus:Main"` + kbd escape). Esc on an empty draft
+  → back to Main (~1.5 s). Unknown id → toast `omp.toast.status` "Unknown agent …", view unchanged. Agent id = registry
+  id = transcript file stem (`Ab34.TwoRowsResearch`).
+- Jobs sheet `omp.overlay.jobs`: list items `<list>/<jobId>` (task job: job id = agent id), `icon:"agent"` for task
+  jobs, label spans (`"<agentId> "` strong only when it differs from the label), `title "…\n<Status> · task · <id>"`;
+  detail `omp.jobs.facts` kv item `{k:"Agent", v:[{t:<agentId>, s:"mono"}]}`; 18.17 adds `omp.jobs.group` rows. No
+  model/thinking anywhere in the sheet.
+- Persisted per subagent (offline, jsonl): role = `session_init.modelRole`, else `model_change.role` only when it is a
+  known role key; context window not persisted (catalogue `ModelsCache` via `AgentSummary.model`); activity from
+  assistant/toolResult `message` entries, `custom_message` `irc:incoming`, `custom` `session_exit`, assistant
+  `stopReason` error/aborted, `<id>.jsonl.tombstone` (mtime = kill). Park/revive and unread IRC are live-only.
+
+### deck-core (`agents`, `ctl`, `assets/ompdeck-ctl.ts`)
+- `AgentSummary.model_role: Option<String>` (lowercase role key) — `session_init.modelRole` wins; else the latest
+  `model_change.role` when it is one of `default smol slow vision plan commit tiny memory task advisor widget image web
+  speech dictation judge`; never `subagent:*`/`temporary`/`fallback`/`prewalk`. Folded in the existing incremental scan.
+- New `agents::activity` (re-exported from `agents`):
+  ```rust
+  pub enum ActivityKind { Response, Tool, Irc, Lifecycle }
+  pub enum ActivityStatus { Success, Error, Aborted, Pending }
+  pub struct ActivityRow {
+      pub id: String,            // "<agent>:response:<entryId>" | "<agent>:tool:<callId>" | "<agent>:irc:<n>" | "<agent>:life:<n>"
+      pub agent_id: String,
+      pub at: SystemTime,
+      pub kind: ActivityKind,
+      pub title: String,         // "Response" | tool name | "IRC from <x>" | "Spawned"/"Error"/"Aborted"/"Exited"/"Killed"
+      pub summary: String,       // one line, whitespace collapsed, ≤ 240 chars
+      pub status: ActivityStatus,
+      pub call_id: Option<String>,   // Tool rows (anchor in the transcript)
+  }
+  pub struct ActivityWatcher;  // spawn(agents: Vec<(String /*id*/, PathBuf)>, on_update: impl Fn() + Send + 'static)
+                               // set_agents(Vec<(String, PathBuf)>), latest() -> Arc<Vec<ActivityRow>> (newest first,
+                               // ≤ 2000), revision() -> u64; drop = stop. Poll 500 ms.
+  ```
+  Per agent: tail starts at `max(0, size − 256 KiB)` (first partial line skipped), ≤ 256 rows kept; tool rows `Pending`
+  until their toolResult (`isError` → Error, else Success; `at` = max(call, result)); summary rule = omp's (`args.i` /
+  `args.intent`, else read→path, grep→`pattern · path`, glob→path, bash→command, write/edit→path, else
+  path/query/name/task/title, else compact JSON); responses = assistant text parts; IRC = `irc:incoming` (from =
+  `details.from`); lifecycle = spawn (`session_init`/header time, summary = task gist), assistant `stopReason`
+  error/aborted (summary = errorMessage), `session_exit` (summary = reason), tombstone (Killed, mtime). Reads bounded
+  and incremental (reuse `LineTail`); no work when not spawned.
+- `ctl::LiveAgent.unread: Option<u32>` (`#[serde(default)]`); the extension's snapshot adds `unread` from a cached
+  `createAgentHubRuntime({}).irc.unreadCount(id)` (`@oh-my-pi/pi-coding-agent/modes/agent-hub-runtime`), any failure →
+  `null` (older omp keeps working). `parent` `"Main"` means top-level.
+
+### deck-service (`composer.rs`)
+- `TspComposer.viewing: Option<String>` = the `omp.composer.agent` text of an `omp.composer.focus` row in the dock.
+  While `Some`, `state = Composer::Missing` and `target = None`: OmpDeck's injected commands (status-bar model/effort,
+  compact, handoff, review Send, queued `/reload-plugins`, Resume here, …) never reach the viewed subagent. Where the
+  refusal reason is shown, it reads "Viewing subagent <id> — press Esc to return to the main session".
+
+### omp-deck
+- **Redirect** (chat view only; terminal view keeps omp's hub): `Redirect::AgentHub { activity: bool }`; `/hub` typed →
+  `activity: true`; `layer_screen` catches the picker above (activity = its `tab == "activity"`) and the existing latch
+  closes it; the HUD `agents.open` click is intercepted like `status.model`. `/agents`, `/jobs` untouched. App:
+  `apply_redirect` → `dash.show_with(card of that tab)` (never toggles it closed), Activity tab when `activity`.
+  Fixtures from `~/omp-hub-recordings-18.17/` added to the redirect tests (hub caught by every route, `/agents` not).
+- **Open in chat view** (`DashAction`/popup action; row hover button + popup button + row context menu entry):
+  activates the card's tab (opening it when the session has none), closes the dashboard/popup, and sends
+  `focus:<agent id>` once through a `ChatView` builder option when the tab is TSP-live with a composer (pending ≤ 15 s,
+  else a toast). Disabled with a reason for advisors and for sessions whose tab is in the terminal view. Esc / the
+  exit chip / crumbs are omp's own; the `omp.composer.focus` header is drawn as a clear "Viewing <id> · Esc main"
+  chip (accent outline) with clickable crumbs/exit.
+- **Dashboard parity**: top tabs **Agents | Activity**. Agents rows gain the role badge (tag table: key uppercased;
+  `title "Model role"`), `N unread` (live), `↳ <parent>` chip in flat view, a ctx bar (`context_tokens` / catalogue
+  window, tooltip `Context X / Y`, hidden when unknown), hub sort order, and fuzzy id/name match added to the search;
+  the card's subagent section header shows `$cost · duration · N req · N tok` (omp's aggregate). Revive = parked or
+  aborted with live control. **Activity**: rows of one session's subagents (session chooser; default = focused card) via
+  `ActivityWatcher` only while the tab is shown; filter All/Errors/Responses/Tools, agent scope All / selected / its
+  subtree, Follow (stick to newest), search; row = kind glyph, status tone, title, summary, agent, relative time; click
+  → agent popup at that row (Tool → its call, Response → the assistant message at `at`, else the end); hover button
+  Open in chat view.
+- **Jobs sheet**: in `omp.overlay.jobs`, task-job list items and the `omp.jobs.facts` Agent value are matched to
+  `Cx::agents` (exact id, then the existing `tile_agent` fallback) and get the model chip + thinking badge (same look as
+  wait tiles; detail adds Model / Thinking rows). Split panes: only the pane of the tab the metas belong to gets them.
+
+### As built (Wave 22)
+- deck-core: `AgentSummary.model_role` (`#[serde(default)]`); `agents::{ActivityKind, ActivityStatus, ActivityRow,
+  ActivityWatcher, AgentActivity}` (`AgentActivity` = the synchronous core; `LineTail::seek_start_window` starts a tail
+  at `len − 256 KiB` on a line boundary); `ctl::LiveAgent.unread` (extension: cached `createAgentHubRuntime({})`, live
+  value `0` observed on 18.17.0).
+- deck-service: `TspComposer.viewing` + `TspComposer::viewing_refusal()`; the injector refuses every step (hotkeys,
+  draft clear, attachments) while viewing.
+- omp-deck: `Redirect::AgentHub`; `DashTab`, `DashAction::{OpenInChat, AgentAt}`, `dashboard::activity`;
+  `PopupAction::OpenInChat`, `PopupState::at` + `transcript_view::Anchor`; `ChatView::focus_agent` → `FocusOutcome`
+  (`events::focus`/`viewing`); `agent_ctl::chat_blocked`; `Tab::viewing_refusal()` used by `app/bar.rs` and
+  `resume_model`. Deviations: pending focus keyed by session path (a tab-less card opens its tab asynchronously);
+  hub sort applies to the flat view (tree view keeps spawn order with running subtrees first).
+- `tools::identity_line` reserves the type badge's width before the model chip, so a jobs-sheet row never clips it.
+- Verified live (omp 18.17.0, Xvfb, sandbox `PI_CODING_AGENT_DIR`): Alt+A → dashboard (omp's hub gone); popup "Open
+  in chat view" on a nested parked subagent → Viewing chip with the parent crumb; Compact refused with the viewing
+  text; Esc → main transcript; `/hub` → Activity (130 events, Errors 4); error row → popup at that failed call; flat
+  view `↳ BackendFoundation` chips; jobs sheet row + detail show `opencode-go/deepseek-v4.1-flash` / `low` / `task`.
+  The ctx bar is hidden for subagents whose model is not in the catalogue (logged-out provider), by design.

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use deck_core::agents::{AgentSummary, AgentsSnapshot};
+use deck_core::config::SessionView;
 use deck_core::ctl::LiveSnapshot;
 use deck_core::fleet::FleetSnapshot;
 use egui::text::LayoutJob;
@@ -24,7 +25,7 @@ use egui::{
 use crate::agent_ctl::{CtlView, Link, Restart};
 use crate::agent_hub::{self, Manage, RowAction, RowsInput, RowsState};
 use crate::agent_manage::{self, Gate, Plan, Scope, Select};
-use crate::agent_model::AgentsView;
+use crate::agent_model::{AgentsView, Metric, MetricKind};
 use crate::badge::{self, Badge, Hue};
 use crate::dashboard_model::{
     Card, CardKey, FILTERS, GAP, Grid, Item, PAD, Query, REPLY_LINE_H, REPLY_LINES, ROW_AGENTS,
@@ -36,6 +37,7 @@ use crate::icons::{
     ICON_FOLDER, ICON_FOLDER_GIT_2, ICON_GIT_BRANCH, ICON_LIST, ICON_LIST_CHECKS, ICON_LIST_TREE,
     ICON_NETWORK, ICON_SEARCH, ICON_SPARKLES, ICON_TERMINAL, ICON_TRASH_2, ICON_X, Icon,
 };
+use crate::model_picker::ModelsCache;
 use crate::sessions_view::paint_checkbox;
 use crate::statusbar::level_color;
 use crate::tabs::paint_status;
@@ -88,8 +90,22 @@ impl ManageState {
     }
 }
 
+/// What the dashboard shows: omp's agent hub has the same two tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DashTab {
+    /// The session cards with their subagents.
+    #[default]
+    Agents,
+    /// The events of one session's subagents (see `activity`).
+    Activity,
+}
+
+mod activity;
+
 /// Dashboard state owned by the app.
 pub struct DashState {
+    pub tab: DashTab,
+    pub activity: activity::ActivityState,
     pub open: bool,
     pub query: String,
     pub filter: StatusFilter,
@@ -121,6 +137,8 @@ pub struct DashState {
 impl Default for DashState {
     fn default() -> Self {
         DashState {
+            tab: DashTab::Agents,
+            activity: activity::ActivityState::default(),
             open: false,
             query: String::new(),
             filter: StatusFilter::All,
@@ -152,8 +170,9 @@ fn hash_of(x: &impl Hash) -> u64 {
 }
 
 impl DashState {
-    /// Shows the dashboard; `focus` = the card to expand and scroll into view.
-    pub fn show_with(&mut self, focus: Option<CardKey>) {
+    /// Shows the dashboard on `tab`; `focus` = the card to expand and scroll into view.
+    pub fn show_with(&mut self, focus: Option<CardKey>, tab: DashTab) {
+        self.tab = tab;
         self.open = true;
         self.focus_search = true;
         if let Some(key) = focus {
@@ -256,9 +275,12 @@ impl DashState {
     pub fn update_views(
         &mut self,
         active: Option<(&Path, Option<&Arc<LiveSnapshot>>)>,
+        models: &ModelsCache,
         now: SystemTime,
     ) {
         for (path, sa) in &mut self.sessions {
+            sa.view
+                .set_windows(models.generation, || models.context_windows());
             let live = active
                 .filter(|(p, _)| *p == path.as_path())
                 .and_then(|(_, l)| l);
@@ -308,6 +330,17 @@ pub enum DashAction {
     },
     Kill(String),
     Revive(String),
+    /// Open a subagent's transcript at the row an Activity event names.
+    AgentAt {
+        session: PathBuf,
+        id: String,
+        anchor: crate::transcript_view::Anchor,
+    },
+    /// Open a subagent in its session's chat view (omp's own "open transcript").
+    OpenInChat {
+        session: PathBuf,
+        id: String,
+    },
     /// Ask to delete subagents of a card's session: the plan was computed against what the card
     /// showed; the app confirms first.
     Delete {
@@ -327,6 +360,8 @@ pub struct DashInput<'a> {
     pub ctl_idle: &'a CtlView<'a>,
     /// What each card's agents may be deleted through (absent: no controls).
     pub gates: &'a HashMap<CardKey, Gate>,
+    /// The view each card's session is open in (absent: the default for new tabs).
+    pub views: &'a HashMap<CardKey, SessionView>,
     /// The subagent whose popup is open: `(session, id)`.
     pub popup: Option<(&'a Path, &'a str)>,
 }
@@ -342,7 +377,13 @@ pub fn show(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>) -> Vec<DashA
         .show(ui, |ui| {
             header(ui, st, &mut out);
             ui.add_space(12.0);
-            if st.cards.is_empty() {
+            if st.tab == DashTab::Activity {
+                activity::show(ui, st, input, &mut out);
+            } else {
+                st.activity.stop();
+            }
+            if st.tab == DashTab::Activity {
+            } else if st.cards.is_empty() {
                 empty_state(
                     ui,
                     ICON_NETWORK,
@@ -406,6 +447,11 @@ fn header(ui: &mut Ui, st: &mut DashState, out: &mut Vec<DashAction>) {
             if !st.cards.is_empty() {
                 pill(ui, &st.cards.len().to_string(), pal.weak, pal.raised);
             }
+            for (tab, label) in [(DashTab::Agents, "Agents"), (DashTab::Activity, "Activity")] {
+                if filter_chip_plain(ui, label, st.tab == tab).clicked() {
+                    st.tab = tab;
+                }
+            }
             if st.fleet.is_none() && st.cards.iter().any(|c| c.session.is_some()) {
                 ui.add(Spin::new(14.0, pal.accent));
                 ui.label(
@@ -444,6 +490,9 @@ fn header(ui: &mut Ui, st: &mut DashState, out: &mut Vec<DashAction>) {
         },
     );
     ui.add_space(8.0);
+    if st.tab == DashTab::Activity {
+        return;
+    }
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
         search_box(ui, st);
@@ -531,11 +580,20 @@ fn mix_fill(pal: &Palette) -> Color32 {
     theme::mix(pal.surface, pal.accent, 0.1)
 }
 
+/// A tab chip without a count.
+fn filter_chip_plain(ui: &mut Ui, label: &str, on: bool) -> egui::Response {
+    filter_chip_text(ui, label, on)
+}
+
 fn filter_chip(ui: &mut Ui, label: &str, n: usize, on: bool) -> egui::Response {
+    filter_chip_text(ui, &format!("{label}  {n}"), on)
+}
+
+fn filter_chip_text(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
     let pal = Palette::of_ui(ui);
     let color = if on { pal.accent } else { pal.weak };
     let g = ui.painter().layout_no_wrap(
-        format!("{label}  {n}"),
+        text.to_owned(),
         theme::font(12.0),
         if on { pal.text_strong } else { pal.text },
     );
@@ -697,6 +755,7 @@ fn grid(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>, out: &mut Vec<Da
                     note: note.filter(|_| card.active),
                     popup: input.popup,
                     gate: input.gates.get(&card.key).copied(),
+                    session_view: input.views.get(&card.key).copied().unwrap_or_default(),
                 };
                 let ms = open.then(|| manage.entry(card.key.clone()).or_default());
                 if let Some(k) = paint_card(ui, card, sa, ms, &paint, out) {
@@ -721,6 +780,8 @@ struct CardPaint<'a> {
     popup: Option<(&'a Path, &'a str)>,
     /// Deleting is offered (absent: no controls on this card).
     gate: Option<Gate>,
+    /// The view the card's session is open in.
+    session_view: SessionView,
 }
 
 fn status_color(pal: &Palette, s: Status) -> Color32 {
@@ -764,6 +825,41 @@ fn chip_right(p: &Painter, right: f32, cy: f32, text: &str, fg: Color32, bg: Col
     }
     p.galley(pos2(r.left() + 7.0, cy - g.size().y / 2.0), g, fg);
     r.left()
+}
+
+/// The aggregate of a card's subagents (cost, time, requests, tokens) as one badge each: the value
+/// in the metric's hue, its unit (`req`, `tok`) as a dim key. Badges that do not fit before
+/// `limit` are dropped, last first. Returns the x after the last one drawn.
+fn paint_aggregate(
+    p: &Painter,
+    pal: &Palette,
+    metrics: &[Metric],
+    mut x: f32,
+    limit: f32,
+    cy: f32,
+) -> f32 {
+    for m in metrics {
+        let hue = match m.kind {
+            MetricKind::Cost => Hue::Green,
+            MetricKind::Time => Hue::Amber,
+            MetricKind::Requests => Hue::Blue,
+            MetricKind::Tools => Hue::Orange,
+            MetricKind::Tokens => Hue::Teal,
+        };
+        let tint = hue.color(pal);
+        let b = match m.text.split_once(' ') {
+            Some((value, key)) => {
+                Badge::new(p, None, &[(value, tint), (key, pal.weak)], tint, 11.0)
+            }
+            None => Badge::single(p, None, &m.text, tint, 11.0),
+        };
+        if x + b.width() > limit {
+            break;
+        }
+        b.paint_at(p, x, cy);
+        x += b.width() + 5.0;
+    }
+    x
 }
 
 /// Paints one card (and its expanded subagent rows); returns the card to toggle when its
@@ -1209,7 +1305,9 @@ fn paint_card(
                 rx += w + 10.0;
             }
         }
-        if lk.kind != theme::Acc::Row {
+        if lk.kind == theme::Acc::Row {
+            paint_aggregate(&p, pal, &sa.view.aggregate, rx, slots.right, cy);
+        } else {
             let hint = p.layout_no_wrap(
                 if c.open { "Hide" } else { "Show" }.to_owned(),
                 theme::label_font(11.5),
@@ -1229,6 +1327,7 @@ fn paint_card(
                 acc::paint_segbar(&p, bar, &segs);
                 fill_end = bar.left() - 8.0;
             }
+            let rx = paint_aggregate(&p, pal, &sa.view.aggregate, rx, fill_end, cy);
             acc::paint_dashed_fill(&p, pal, header, rx + 4.0, fill_end);
             p.galley(pos2(hx, cy - hint.size().y / 2.0), hint, pal.weak);
         }
@@ -1296,6 +1395,7 @@ fn paint_card(
                             gate,
                             select: ms.as_deref().filter(|m| m.selecting).map(|m| &m.sel),
                         }),
+                        session_view: c.session_view,
                     };
                     agent_hub::rows(ui, &mut sa.rows, &input, inner.width(), &mut rows);
                     for a in rows {
@@ -1306,6 +1406,10 @@ fn paint_card(
                             }),
                             RowAction::Kill(id) => out.push(DashAction::Kill(id)),
                             RowAction::Revive(id) => out.push(DashAction::Revive(id)),
+                            RowAction::OpenInChat(id) => out.push(DashAction::OpenInChat {
+                                session: session.clone(),
+                                id,
+                            }),
                             RowAction::Delete(id) => {
                                 let plan = agent_manage::selected(
                                     sa.view.agents(),
@@ -1623,6 +1727,7 @@ mod tests {
             advisor: false,
             agent: Some("task".to_owned()),
             model: None,
+            model_role: None,
             thinking: None,
             task_gist: format!("work on {id}"),
             task: String::new(),
@@ -1682,9 +1787,9 @@ mod tests {
             })],
         };
         let mut st = DashState::default();
-        st.show_with(Some(key.clone()));
+        st.show_with(Some(key.clone()), DashTab::Agents);
         st.set_cards(vec![card], Some(Arc::new(fleet)), 1);
-        st.update_views(None, now);
+        st.update_views(None, &ModelsCache::default(), now);
         Harness { ctx, st, key }
     }
 
@@ -1701,6 +1806,7 @@ mod tests {
             ctl_active: &ctl,
             ctl_idle: &ctl,
             gates,
+            views: &HashMap::new(),
             popup: None,
         };
         let raw = egui::RawInput {

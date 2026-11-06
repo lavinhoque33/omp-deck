@@ -121,6 +121,35 @@ fn parses_hello_and_snapshot_including_parked() {
     });
     assert_eq!(updates.load(Ordering::SeqCst), before + 1);
 }
+#[test]
+fn unread_is_parsed_and_absent_without_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = fake(tmp.path());
+    let client = CtlClient::spawn(tmp.path().to_path_buf(), || {});
+    let mut s = srv.accept();
+    say(&mut s, HELLO);
+    // Older extensions send no `unread`: it deserializes as None, not an error.
+    say(&mut s, &snapshot_line(4242, AGENTS));
+    let snap = snapshot(&client);
+    assert!(snap.agents.iter().all(|a| a.unread.is_none()));
+    // Newer extensions send a count (and null stays None).
+    say(
+        &mut s,
+        &snapshot_line(
+            4242,
+            r#" {"id":"0-A","name":"Alpha","status":"running","unread":3},
+ {"id":"1-B","name":"Beta","status":"parked","unread":null}"#,
+        ),
+    );
+    wait_for("unread snapshot", || {
+        client
+            .latest()
+            .is_some_and(|s| s.agents.iter().any(|a| a.unread == Some(3)))
+    });
+    let snap = client.latest().unwrap();
+    assert_eq!(snap.agents[0].unread, Some(3));
+    assert_eq!(snap.agents[1].unread, None);
+}
 
 #[test]
 fn reconnects_after_server_restart() {

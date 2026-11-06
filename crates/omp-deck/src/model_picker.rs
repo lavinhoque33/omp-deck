@@ -89,6 +89,14 @@ impl ModelsCache {
         &self.list
     }
 
+    /// Context window in tokens per `provider/id`, for the models that report one.
+    pub fn context_windows(&self) -> HashMap<String, u64> {
+        self.list
+            .iter()
+            .filter_map(|m| Some((m.selector.clone(), m.context_window?)))
+            .collect()
+    }
+
     pub fn is_loading(&self) -> bool {
         self.state == LoadState::Loading
     }

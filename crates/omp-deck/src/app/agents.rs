@@ -16,14 +16,15 @@ use deck_service::gateway::running::RunningSnapshot;
 use egui::{Key, Modifiers};
 
 use super::App;
-use crate::agent_ctl::{CtlView, Link, Restart};
+use crate::agent_ctl::{self, CtlView, Link, Restart};
 use crate::agent_model::{self, AgentsView};
 use crate::agent_popup::{self, PopupAction, PopupInput, PopupState, PopupTab};
-use crate::dashboard::{self, DashAction, DashInput, DashState};
+use crate::dashboard::{self, DashAction, DashInput, DashState, DashTab};
 use crate::dashboard_model::{Card, CardKey, CardSrc, Extra, Status};
 use crate::tabs::{ClosedTab, Tab, TabRole};
 use crate::theme::{self, Palette};
 use crate::toast::ToastKind;
+use crate::transcript_view::Anchor;
 use deck_service::statusfmt::short_model_name;
 
 /// What the dashboard knows about a session file from the sidebar's scan.
@@ -161,6 +162,7 @@ impl App {
     /// view (the status bar's counts, the live overlay, the popup of the active session).
     pub(super) fn drive_agents(&mut self) {
         self.drive_ctl();
+        self.expire_focus();
         let want = match self.tabs.get(self.active) {
             Some(t) if t.role == TabRole::Session => {
                 t.session_path_owned().map(|session| AgentsTarget {
@@ -181,6 +183,9 @@ impl App {
                 .is_some_and(|t| t.session == s.session)
         });
         let live = self.live_snapshot();
+        let models = &self.models;
+        self.agents_view
+            .set_windows(models.generation, || models.context_windows());
         self.agents_view
             .update(snap.as_ref(), live.as_ref(), SystemTime::now());
         // The popup needs a session it can read: the active one, or the dashboard's.
@@ -240,8 +245,11 @@ impl App {
             self.dash.set_cards(cards, fleet, sig);
         }
         let root = self.ctl_root().map(Path::to_path_buf);
-        self.dash
-            .update_views(root.as_deref().map(|p| (p, live.as_ref())), now);
+        self.dash.update_views(
+            root.as_deref().map(|p| (p, live.as_ref())),
+            &self.models,
+            now,
+        );
     }
 
     /// Everything the cards are built from, hashed in place: no allocation and no scan of the
@@ -316,13 +324,18 @@ impl App {
             self.close_dashboard();
             return;
         }
+        self.open_dashboard(focus_active, DashTab::Agents);
+    }
+
+    /// Shows the dashboard on `tab` (it stays open when it already is: never a toggle).
+    pub(super) fn open_dashboard(&mut self, focus_active: bool, tab: DashTab) {
         let focus = focus_active
             .then(|| match self.tabs.get(self.active) {
                 Some(t) if t.role == TabRole::Session => Some(CardKey::Tab(t.uid)),
                 _ => None,
             })
             .flatten();
-        self.dash.show_with(focus);
+        self.dash.show_with(focus, tab);
         // The terminals leave the screen: tell omp its focus is gone.
         for t in self.tabs.iter_mut() {
             t.terminal_mut().set_focused(false);
@@ -383,7 +396,7 @@ impl App {
     }
 
     /// Drops the popup and stops following its transcript.
-    fn close_popup_topic(&mut self) {
+    pub(super) fn close_popup_topic(&mut self) {
         if let Some(p) = self.popup.take() {
             self.gw.unsubscribe(&Topic::Transcript(p.transcript_path));
         }
@@ -394,7 +407,24 @@ impl App {
         self.focus_pending = true;
     }
 
+    /// Whether the subagent `id` of `session` is an advisor; `None` while no view knows it.
+    pub(super) fn agent_is_advisor(&self, session: &Path, id: &str) -> Option<bool> {
+        let (view, _) = popup_source(
+            self.agents_target.as_ref(),
+            &self.agents_view,
+            &self.dash,
+            session,
+            id,
+        )?;
+        view.agents().iter().find(|a| a.id == id).map(|a| a.advisor)
+    }
+
     fn open_agent(&mut self, session: &Path, id: &str, tab: PopupTab) {
+        self.open_agent_at(session, id, tab, None);
+    }
+
+    /// [`App::open_agent`], the transcript starting at `anchor` when given.
+    fn open_agent_at(&mut self, session: &Path, id: &str, tab: PopupTab, anchor: Option<Anchor>) {
         let state = {
             let Some((view, _)) = popup_source(
                 self.agents_target.as_ref(),
@@ -408,7 +438,11 @@ impl App {
             let Some(agent) = view.agents().iter().find(|a| a.id == id) else {
                 return;
             };
-            PopupState::new(session.to_path_buf(), agent, tab)
+            let state = PopupState::new(session.to_path_buf(), agent, tab);
+            match anchor {
+                Some(a) => state.at(a),
+                None => state,
+            }
         };
         self.close_popup_topic();
         self.gw
@@ -435,10 +469,12 @@ impl App {
             errors: &no_errors,
         };
         let gates = self.delete_gates();
+        let views = self.dash_views();
         let input = DashInput {
             ctl_active: &ctl_active,
             ctl_idle: &ctl_idle,
             gates: &gates,
+            views: &views,
             popup: self
                 .popup
                 .as_ref()
@@ -452,9 +488,15 @@ impl App {
             match a {
                 DashAction::Close => self.close_dashboard(),
                 DashAction::OpenCard(key) => self.open_dash_card(&key),
-                DashAction::Agent { session, id } => self.open_dash_agent(&session, &id),
+                DashAction::Agent { session, id } => self.open_dash_agent(&session, &id, None),
+                DashAction::AgentAt {
+                    session,
+                    id,
+                    anchor,
+                } => self.open_dash_agent(&session, &id, Some(anchor)),
                 DashAction::Kill(id) => self.request_kill_agent(id),
                 DashAction::Revive(id) => self.send_ctl_revive(id),
+                DashAction::OpenInChat { session, id } => self.open_in_chat_view(&session, &id),
                 DashAction::Delete {
                     key,
                     session,
@@ -467,7 +509,7 @@ impl App {
     }
 
     /// Focus the card's tab, or open its session in a new one; the dashboard closes.
-    fn open_dash_card(&mut self, key: &CardKey) {
+    pub(super) fn open_dash_card(&mut self, key: &CardKey) {
         match key {
             CardKey::Tab(uid) => {
                 if let Some(i) = self.tab_index(*uid) {
@@ -493,7 +535,7 @@ impl App {
 
     /// Subagent clicked in the dashboard: activate the session's tab when there is one (live
     /// control follows the active tab), keep the dashboard, show the popup.
-    fn open_dash_agent(&mut self, session: &Path, id: &str) {
+    fn open_dash_agent(&mut self, session: &Path, id: &str, anchor: Option<Anchor>) {
         let tab = self
             .tabs
             .iter()
@@ -503,8 +545,12 @@ impl App {
         {
             self.activate_keeping_dashboard(i);
         }
-        let mode = self.popup.as_ref().map_or(PopupTab::Transcript, |p| p.tab);
-        self.open_agent(session, id, mode);
+        let mode = if anchor.is_some() {
+            PopupTab::Transcript
+        } else {
+            self.popup.as_ref().map_or(PopupTab::Transcript, |p| p.tab)
+        };
+        self.open_agent_at(session, id, mode, anchor);
     }
 
     /// "Open session for live control" in a read-only popup.
@@ -530,6 +576,10 @@ impl App {
             return;
         }
         let link_here = self.ctl_link();
+        let popup_view = self
+            .popup
+            .as_ref()
+            .map_or(self.cfg.session_view, |p| self.session_view_of(&p.session));
         let Some(st) = self.popup.as_mut() else {
             return;
         };
@@ -560,7 +610,13 @@ impl App {
             self.close_popup_topic();
             return;
         };
-        let order = agent_model::visible(view.agents(), true, &HashSet::new());
+        let chat_blocked = agent_ctl::chat_blocked(view.agents()[index].advisor, popup_view);
+        let order = agent_model::visible(
+            view.agents(),
+            |i| view.cards.get(i).and_then(|c| c.live),
+            true,
+            &HashSet::new(),
+        );
         let no_reqs = HashMap::new();
         let no_errors = HashMap::new();
         let ctl = CtlView {
@@ -578,6 +634,7 @@ impl App {
                 order: &order,
                 needs_open: !active,
                 ctl: &ctl,
+                chat_blocked,
             },
         );
         // Links in rendered markdown go through the same allow-listed opener as terminal links.
@@ -605,6 +662,7 @@ impl App {
                 PopupAction::Error(message) => self.toasts.error(&self.ctx, message),
                 PopupAction::Kill(id) => self.request_kill_agent(id),
                 PopupAction::Revive(id) => self.send_ctl_revive(id),
+                PopupAction::OpenInChat(id) => self.open_in_chat_view(&session, &id),
                 PopupAction::Chat { agent, text } => self.send_ctl_chat(agent, text),
                 PopupAction::OpenSession => self.open_popup_session(),
             }

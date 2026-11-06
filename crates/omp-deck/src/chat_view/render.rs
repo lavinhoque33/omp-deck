@@ -1480,7 +1480,8 @@ pub fn item(cx: &Cx, ui: &mut Ui, n: &SNode, list: Option<&SNode>, selected: boo
     let disabled = n.flag("disabled");
     let w = ui.available_width();
     let id = ui.scope_id().with(("item", n.id.as_str()));
-    let height = 28.0;
+    let agent = tools::sheet_agent(cx, n, list);
+    let height = if agent.is_some() { 54.0 } else { 28.0 };
     let (rect, _) = ui.allocate_exact_size(vec2(w, height), Sense::hover());
     let resp = ui.interact(
         rect,
@@ -1523,7 +1524,7 @@ pub fn item(cx: &Cx, ui: &mut Ui, n: &SNode, list: Option<&SNode>, selected: boo
         ink.text()
     };
     let mut x = rect.left() + 8.0;
-    let cy = rect.center().y;
+    let cy = rect.top() + 14.0;
     if let Some(ic) = n.str("icon") {
         glyphs::paint(p, ic, pos2(x + 7.0, cy), 13.0, tone.unwrap_or(ink.dim()));
         x += 22.0;
@@ -1572,6 +1573,19 @@ pub fn item(cx: &Cx, ui: &mut Ui, n: &SNode, list: Option<&SNode>, selected: boo
             let g = p.layout_job(job);
             p.galley(pos2(x, cy - g.size().y / 2.0), g, ink.dim());
         }
+    }
+    if let Some(agent) = agent {
+        let identity = Rect::from_min_max(
+            pos2(rect.left() + 30.0, rect.top() + 28.0),
+            pos2(rect.right() - 8.0, rect.bottom() - 2.0),
+        );
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .max_rect(identity)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        child.set_clip_rect(identity.intersect(ui.clip_rect()));
+        tools::identity_line(cx, &mut child, agent, false);
     }
     if !disabled {
         let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
@@ -1679,6 +1693,41 @@ fn kv(cx: &Cx, ui: &mut Ui, n: &SNode) {
                     ui.add(egui::Label::new(k).selectable(false));
                     para(cx, ui, v, ink.strong(), &[], RunOpts::LINE);
                     ui.end_row();
+                    if n.role() == "omp.jobs.facts"
+                        && it.get("k").and_then(Value::as_str) == Some("Agent")
+                        && tools::in_jobs_sheet(cx, n)
+                        && let Some(id) = it
+                            .get("v")
+                            .and_then(Value::as_array)
+                            .and_then(|spans| spans.first())
+                            .and_then(|span| span.get("t"))
+                            .and_then(Value::as_str)
+                        && let Some(agent) = tools::named_agent(cx.agents, id)
+                    {
+                        if let Some(model) = agent.model.as_deref().filter(|m| !m.is_empty()) {
+                            ui.label(
+                                RichText::new("Model")
+                                    .font(ink.label(12.0))
+                                    .color(ink.dim()),
+                            );
+                            tools::model_chip(cx, ui, model, 0.0);
+                            ui.end_row();
+                        }
+                        if let Some(level) = agent
+                            .thinking
+                            .as_deref()
+                            .map(tools::thinking_level)
+                            .filter(|level| !level.is_empty() && *level != "auto")
+                        {
+                            ui.label(
+                                RichText::new("Thinking")
+                                    .font(ink.label(12.0))
+                                    .color(ink.dim()),
+                            );
+                            tools::thinking_badge(cx, ui, level);
+                            ui.end_row();
+                        }
+                    }
                 }
             });
     };

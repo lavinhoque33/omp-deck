@@ -137,13 +137,25 @@ impl From<crate::gw::MutateError> for Failure {
 }
 
 /// The end of a typed command (`/resume …`): `Ok` when omp's terminal took it, else why not.
-pub fn delivery_result(d: &Delivery) -> Result<(), String> {
+/// `viewing` is asked only when a dialog refusal needs it: the text of the tab's "viewing a
+/// subagent" refusal, if omp's chat is on one.
+pub fn delivery_result(
+    d: &Delivery,
+    viewing: impl FnOnce() -> Option<String>,
+) -> Result<(), String> {
+    let viewing_text;
     let why = match d {
         Delivery::Delivered | Delivery::Unobserved => return Ok(()),
         Delivery::Refused(Refusal::Precondition(_)) => {
             "omp was not ready for the command (it is working or waiting for an answer)"
         }
-        Delivery::Refused(Refusal::DialogOpen) => "an omp dialog is open in the tab",
+        Delivery::Refused(Refusal::DialogOpen) => match viewing() {
+            Some(text) => {
+                viewing_text = text;
+                viewing_text.as_str()
+            }
+            None => "an omp dialog is open in the tab",
+        },
         Delivery::Refused(Refusal::NoBracketedPaste) => "omp is not ready to take input yet",
         Delivery::Declined => "the unsent draft in the tab was kept",
         Delivery::Aborted => "omp started working before the command went in",
@@ -737,17 +749,30 @@ mod tests {
 
     #[test]
     fn a_typed_command_counts_as_resumed_only_when_the_terminal_took_it() {
-        assert_eq!(delivery_result(&Delivery::Delivered), Ok(()));
-        assert_eq!(delivery_result(&Delivery::Unobserved), Ok(()));
+        let none = || None;
+        assert_eq!(delivery_result(&Delivery::Delivered, none), Ok(()));
+        assert_eq!(delivery_result(&Delivery::Unobserved, none), Ok(()));
         for d in [
             Delivery::Refused(Refusal::DialogOpen),
             Delivery::Declined,
             Delivery::Aborted,
             Delivery::Stalled,
         ] {
-            let e = delivery_result(&d).unwrap_err();
+            let e = delivery_result(&d, none).unwrap_err();
             assert!(e.starts_with("The command was not delivered"), "{e}");
         }
+    }
+
+    #[test]
+    fn a_dialog_refusal_while_viewing_a_subagent_says_how_to_return() {
+        let viewing = || Some("Viewing subagent Probe — press Esc to return".to_owned());
+        let e = delivery_result(&Delivery::Refused(Refusal::DialogOpen), viewing).unwrap_err();
+        assert!(e.contains("Viewing subagent Probe — press Esc"), "{e}");
+        assert!(!e.contains("dialog"), "{e}");
+        // Only a dialog refusal asks: any other end never reads the document.
+        let never = || -> Option<String> { panic!("asked") };
+        assert!(delivery_result(&Delivery::Stalled, never).is_err());
+        assert_eq!(delivery_result(&Delivery::Delivered, never), Ok(()));
     }
 
     #[test]

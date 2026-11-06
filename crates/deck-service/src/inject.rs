@@ -701,6 +701,11 @@ fn atomic_text(payload: &Payload, tsp: Option<&TspComposer>) -> Option<String> {
 fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut Poll) -> Step {
     let now = env.now;
     let wait_until = |t: Instant| Step::Wait(t.saturating_duration_since(now));
+    // Focus mode retargets even composer hotkeys and pending multi-step input at the subagent.
+    // Refuse before any write, including a draft-clear or attachment continuation.
+    if env.tsp.is_some_and(|read| read().viewing.is_some()) {
+        return Step::Dropped(End::DialogOpen);
+    }
     if a.started_idle && env.activity != Activity::Idle && !matches!(a.stage, Stage::Start) {
         return Step::Aborted;
     }
@@ -2082,6 +2087,7 @@ mod tests {
         activity: Activity,
         /// `None` = no composer to address (an ask or dialog took it).
         text: Option<String>,
+        viewing: Option<String>,
         can_send: bool,
         chips: usize,
         popup: bool,
@@ -2102,6 +2108,7 @@ mod tests {
                 base: Instant::now(),
                 activity: Activity::Idle,
                 text: Some(String::new()),
+                viewing: None,
                 can_send: true,
                 chips: 0,
                 popup: false,
@@ -2129,6 +2136,7 @@ mod tests {
                     .as_ref()
                     .map(|_| ("s:1".to_owned(), "3.line/input".to_owned())),
                 state,
+                viewing: self.viewing.clone(),
                 can_send: self.can_send,
                 chips: self.chips,
                 popup: self.popup,
@@ -2285,6 +2293,46 @@ mod tests {
         assert_eq!(writes, vec![CTRL_C_KEY], "no send over the draft");
         assert_eq!(ended, vec![("Prompt".to_owned(), End::Stalled)]);
         assert!(fx.recall.is_empty() && fx.sent.is_empty());
+    }
+
+    #[test]
+    fn tsp_viewing_a_subagent_refuses_every_injected_input_without_writing() {
+        for can_send in [false, true] {
+            let mut fx = TspFixture::new();
+            fx.can_send = can_send;
+            fx.viewing = Some("Probe".to_owned());
+            let mut inj = Injector::default();
+            inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+            inj.push(Job::text("Insert", "text", false));
+            inj.push(Job::key("Hotkey", Key::Char('p'), ALT_SHIFT, Requires::Any));
+            let (writes, ended) = fx.drain(&mut inj);
+            assert!(writes.is_empty());
+            assert_eq!(
+                ended,
+                vec![
+                    ("Compact".to_owned(), End::DialogOpen),
+                    ("Insert".to_owned(), End::DialogOpen),
+                    ("Hotkey".to_owned(), End::DialogOpen),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn tsp_focus_switch_during_draft_confirmation_never_clears_the_subagent() {
+        for can_send in [false, true] {
+            let mut fx = TspFixture::new();
+            fx.can_send = can_send;
+            fx.text = Some("draft".to_owned());
+            let mut inj = Injector::default();
+            inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+            assert!(fx.poll(&mut inj, 0).confirm.is_some());
+            fx.viewing = Some("Probe".to_owned());
+            inj.answer(true);
+            let (writes, ended) = fx.drain(&mut inj);
+            assert!(writes.is_empty());
+            assert_eq!(ended, vec![("Compact".to_owned(), End::DialogOpen)]);
+        }
     }
 
     #[test]

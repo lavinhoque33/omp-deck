@@ -75,6 +75,7 @@ pub const ICON_CROSSHAIR: Icon = Icon::new("\u{e0ac}");
 pub const ICON_DOWNLOAD: Icon = Icon::new("\u{e0b2}");
 pub const ICON_ELLIPSIS: Icon = Icon::new("\u{e0b6}");
 pub const ICON_EXTERNAL_LINK: Icon = Icon::new("\u{e0b9}");
+pub const ICON_EYE: Icon = Icon::new("\u{e0ba}");
 pub const ICON_FILE_PEN_LINE: Icon = Icon::new("\u{e320}");
 pub const ICON_FILE_PLUS: Icon = Icon::new("\u{e0c9}");
 pub const ICON_FILE_TEXT: Icon = Icon::new("\u{e0cc}");

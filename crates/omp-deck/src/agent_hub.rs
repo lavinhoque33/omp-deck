@@ -13,6 +13,7 @@ use crate::icons::{
     ICON_TRIANGLE_ALERT,
 };
 use deck_core::agents::{AgentStatus, AgentSummary};
+use deck_core::config::SessionView;
 use deck_core::ctl::LiveStatus;
 use egui::Galley;
 use egui::text::{LayoutJob, TextFormat};
@@ -22,7 +23,7 @@ use crate::agent_ctl::{self, CtlView};
 use crate::agent_manage::{Gate, Select};
 use crate::agent_model::{self, AgentsView, CardView, MetricKind, status_label};
 use crate::badge::{Badge, Hue};
-use crate::icons::{ICON_BRAIN, ICON_CPU};
+use crate::icons::{ICON_BRAIN, ICON_CPU, ICON_EYE};
 use crate::sessions_model::Check;
 use crate::sessions_view::paint_checkbox;
 use crate::theme::{self, Palette};
@@ -121,7 +122,12 @@ impl RowsState {
             return self.total;
         }
         if self.order_key != Some(key) {
-            self.order = agent_model::visible(agents, tree, &self.collapsed);
+            self.order = agent_model::visible(
+                agents,
+                |i| view.cards.get(i).and_then(|c| c.live),
+                tree,
+                &self.collapsed,
+            );
             self.order_key = Some(key);
         }
         if self.gist_key != Some(gist_key) {
@@ -162,6 +168,8 @@ pub enum RowAction {
     /// Ask to kill this agent (the app confirms first).
     Kill(String),
     Revive(String),
+    /// Open this agent in the session's chat view (omp's own "open transcript").
+    OpenInChat(String),
     /// Ask to delete this agent and its files (the app confirms first).
     Delete(String),
     /// A row was clicked in select mode (`shift`: extend the range from the anchor).
@@ -186,6 +194,8 @@ pub struct RowsInput<'a> {
     pub selected: Option<&'a str>,
     pub ctl: &'a CtlView<'a>,
     pub manage: Option<Manage<'a>>,
+    /// The view the session's tab is open in: decides whether "Open in chat view" is offered.
+    pub session_view: SessionView,
 }
 
 /// Paints the rows prepared by [`RowsState::prepare`] for the same `width` and mode, `width` wide
@@ -225,6 +235,7 @@ pub fn rows(
             tree_depth: tree.then_some(depth),
             selected: input.selected == Some(a.id.as_str()),
             act: card_act(input.ctl, a, c),
+            chat_blocked: agent_ctl::chat_blocked(a.advisor, input.session_view),
             // An advisor's transcript is observability only: it is never deleted.
             manage: input.manage.filter(|_| !a.advisor).map(|m| RowManage {
                 gate: m.gate,
@@ -244,6 +255,7 @@ pub fn rows(
             CardClick::ToggleChildren => toggled = Some(a.id.clone()),
             CardClick::Act(CardAct::Kill) => out.push(RowAction::Kill(a.id.clone())),
             CardClick::Act(CardAct::Revive) => out.push(RowAction::Revive(a.id.clone())),
+            CardClick::OpenInChat => out.push(RowAction::OpenInChat(a.id.clone())),
             CardClick::Delete => out.push(RowAction::Delete(a.id.clone())),
             CardClick::Toggle { shift } => out.push(RowAction::Toggle {
                 id: a.id.clone(),
@@ -315,6 +327,7 @@ enum CardClick {
     Open,
     ToggleChildren,
     Act(CardAct),
+    OpenInChat,
     Delete,
     Toggle { shift: bool },
 }
@@ -330,6 +343,8 @@ struct CardOpts {
     tree_depth: Option<usize>,
     selected: bool,
     act: Option<CardAct>,
+    /// Why the row cannot be opened in the chat view (`None`: it can).
+    chat_blocked: Option<&'static str>,
     manage: Option<RowManage>,
 }
 
@@ -366,6 +381,7 @@ fn card(
         tree_depth,
         selected,
         act,
+        chat_blocked,
         manage,
     } = opts;
     let selecting = manage.is_some_and(|m| m.selecting);
@@ -497,20 +513,42 @@ fn card(
         pal.text_strong,
     );
     x = id_end + 8.0;
-    let badges: [(Option<&str>, Color32); 3] = [
-        (
-            (sh.label != status_label(a.status)).then_some(sh.label),
-            color,
-        ),
-        (
-            a.agent.as_deref(),
+    // Status word (when omp's differs from the file's), agent kind, model role, advisor, unread
+    // IRC and, in the flat list, the parent: the hub's badges.
+    let mut badges: Vec<(String, Color32, Option<&'static str>)> = Vec::with_capacity(6);
+    if sh.label != status_label(a.status) {
+        badges.push((sh.label.to_owned(), color, None));
+    }
+    if let Some(kind) = a.agent.as_deref() {
+        badges.push((
+            kind.to_owned(),
             if theme::flat() { pal.text } else { pal.accent },
-        ),
-        (a.advisor.then_some("advisor"), pal.warn),
-    ];
-    for (text, col) in badges {
-        let Some(text) = text else { continue };
-        let g = p.layout_no_wrap(text.to_owned(), crate::theme::font(10.5), col);
+            None,
+        ));
+    }
+    if !c.role.is_empty() {
+        badges.push((c.role.clone(), Hue::Blue.color(pal), Some("Model role")));
+    }
+    if a.advisor {
+        badges.push(("advisor".to_owned(), pal.warn, None));
+    }
+    if c.unread > 0 {
+        badges.push((
+            format!("{} unread", c.unread),
+            Hue::Amber.color(pal),
+            Some("IRC messages the main session has not read"),
+        ));
+    }
+    if !tree && let Some(parent) = &c.parent {
+        badges.push((
+            format!("↳ {parent}"),
+            pal.weak,
+            Some("Spawned by this agent"),
+        ));
+    }
+    let mut tips: Vec<(Rect, String)> = Vec::new();
+    for (text, col, tip) in badges {
+        let g = p.layout_no_wrap(text, crate::theme::font(10.5), col);
         let w = g.size().x + 12.0;
         if x + w > limit {
             break;
@@ -523,6 +561,9 @@ fn card(
         };
         p.rect_filled(r, 8, badge_fill);
         p.galley(pos2(x + 6.0, mid - g.size().y / 2.0), g, col);
+        if let Some(tip) = tip {
+            tips.push((r, tip.to_owned()));
+        }
         x += w + 6.0;
     }
     if selecting {
@@ -634,6 +675,45 @@ fn card(
         }
         rx = r.left() - 8.0;
     }
+    // Open in chat view: reserves its slot like Delete (the metric badges must not shift on
+    // hover); the glyph shows while the row is hovered, dimmed when the chat view cannot show it.
+    {
+        let r = Rect::from_center_size(pos2(rx - 11.0, my), vec2(22.0, 22.0));
+        let b = ui.interact(r, id.with("chat"), Sense::click());
+        let on = chat_blocked.is_none();
+        if hovered || b.hovered() {
+            if b.hovered() && on {
+                p.rect_filled(r, 11, pal.accent.gamma_multiply(0.22));
+            }
+            paint_icon(
+                &p,
+                r.center(),
+                Align2::CENTER_CENTER,
+                ICON_EYE,
+                16.0,
+                if on {
+                    pal.accent
+                        .gamma_multiply(if b.hovered() { 1.0 } else { 0.6 })
+                } else {
+                    pal.weak.gamma_multiply(0.6)
+                },
+            );
+        }
+        match chat_blocked {
+            None => {
+                if b.on_hover_text("Open in chat view")
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    click = CardClick::OpenInChat;
+                }
+            }
+            Some(why) => {
+                b.on_hover_text(why);
+            }
+        }
+        rx = r.left() - 8.0;
+    }
     // Delete: always reserves its slot (the metric badges must not shift on hover); the glyph
     // shows while the row is hovered.
     if let Some(m) = manage.filter(|m| !m.selecting) {
@@ -721,32 +801,75 @@ fn card(
         bx += b.width() + 5.0;
     }
 
-    if act.is_some() || manage.is_some() {
-        resp.context_menu(|ui| {
-            if let Some(act) = act {
-                let label = match act {
-                    CardAct::Kill => "Kill agent…",
-                    CardAct::Revive => "Revive agent",
-                };
-                if ui.button(label).clicked() {
-                    click = CardClick::Act(act);
-                    ui.close();
-                }
+    // The context-menu entries are also the row's hover buttons (see above).
+    resp.context_menu(|ui| {
+        let b = ui.add_enabled(
+            chat_blocked.is_none(),
+            egui::Button::new("Open in chat view"),
+        );
+        let b = match chat_blocked {
+            Some(why) => b.on_disabled_hover_text(why),
+            None => b,
+        };
+        if b.clicked() {
+            click = CardClick::OpenInChat;
+            ui.close();
+        }
+        if let Some(act) = act {
+            let label = match act {
+                CardAct::Kill => "Kill agent…",
+                CardAct::Revive => "Revive agent",
+            };
+            if ui.button(label).clicked() {
+                click = CardClick::Act(act);
+                ui.close();
             }
-            if let Some(m) = manage {
-                let b = ui.add_enabled(m.gate.ready(), egui::Button::new("Delete agent…"));
-                let b = if m.gate.ready() {
-                    b
-                } else {
-                    b.on_disabled_hover_text(m.gate.why())
-                };
-                if b.clicked() {
-                    click = CardClick::Delete;
-                    ui.close();
-                }
+        }
+        if let Some(m) = manage {
+            let b = ui.add_enabled(m.gate.ready(), egui::Button::new("Delete agent…"));
+            let b = if m.gate.ready() {
+                b
+            } else {
+                b.on_disabled_hover_text(m.gate.why())
+            };
+            if b.clicked() {
+                click = CardClick::Delete;
+                ui.close();
             }
-        });
+        }
+    });
+    // The context bar along the bottom edge: a hairline track, filled up to the used share.
+    if let Some(cx) = &c.ctx {
+        let track = Rect::from_min_max(
+            pos2(left, rect.bottom() - 5.0),
+            pos2(right, rect.bottom() - 3.0),
+        );
+        let tone = if cx.frac >= 0.9 {
+            pal.danger
+        } else if cx.frac >= 0.7 {
+            pal.warn
+        } else {
+            pal.accent_b
+        };
+        p.rect_filled(track, 1, pal.stroke.gamma_multiply(0.7));
+        p.rect_filled(
+            Rect::from_min_max(
+                track.min,
+                pos2(track.left() + track.width() * cx.frac, track.max.y),
+            ),
+            1,
+            tone,
+        );
+        tips.push((track.expand2(vec2(0.0, 4.0)), cx.tip.clone()));
     }
+    // One tooltip for the whole row, chosen by what the pointer is on.
+    let tip = ui
+        .input(|i| i.pointer.hover_pos())
+        .and_then(|pos| tips.into_iter().find(|(r, _)| r.contains(pos)));
+    let resp = match tip {
+        Some((_, tip)) => resp.on_hover_text(tip),
+        None => resp,
+    };
     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() && matches!(click, CardClick::None)
     {
         click = if selecting {

@@ -74,6 +74,7 @@ mod app_update;
 mod backup;
 mod bar;
 mod changes;
+mod chat_focus;
 mod ctl;
 mod desktop;
 mod mobile;
@@ -463,6 +464,8 @@ pub struct App {
     dash: DashState,
     dash_index: agents::DashIndex,
     popup: Option<PopupState>,
+    /// An "Open in chat view" waiting for its tab's chat view.
+    pending_focus: Option<chat_focus::PendingFocus>,
     tree: Option<tree::TreeUi>,
     tree_busy: Option<tree::TreeBusy>,
     usage: Usage,
@@ -662,6 +665,7 @@ impl App {
             dash: DashState::default(),
             dash_index: agents::DashIndex::default(),
             popup: None,
+            pending_focus: None,
             tree: None,
             tree_busy: None,
             usage: Usage::new(false),
@@ -2234,6 +2238,8 @@ impl App {
         let mut copy_link = None;
         let mut refused = None;
         let mut redirect = None;
+        let mut focus = None;
+        let focus_ready = self.focus_ready();
         let pal = Palette::of_ui(ui);
         let font_size = self.terminal_font_size();
         // A single chat pane under the bar: the bar already shows what the composer would repeat.
@@ -2255,15 +2261,18 @@ impl App {
             ctx.options_mut(|o| o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never);
             let uid = tab.uid;
             let chat = tab.terminal().tsp().live();
+            let want = chat_focus::request(self.pending_focus.as_ref(), tab, true, focus_ready);
             let (response, url) = if chat {
                 let out = crate::chat_view::ChatView::new(tab.terminal_mut())
                     .id_salt(uid)
                     .font_size(font_size)
                     .hide_duplicates(bar_shows_session)
                     .agents(self.agents_view.metas())
+                    .focus_agent(want)
                     .show(ui);
                 refused = out.refused;
                 redirect = out.redirect;
+                focus = out.focus;
                 (out.response, out.open_url)
             } else {
                 let out = TerminalView::new(tab.terminal_mut())
@@ -2303,6 +2312,9 @@ impl App {
         }
         if let Some(url) = chat_url {
             self.open_chat_link(url);
+        }
+        if let Some(outcome) = focus {
+            self.finish_focus(outcome);
         }
         if let Some(redirect) = redirect {
             self.apply_redirect(redirect);

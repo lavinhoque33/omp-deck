@@ -47,6 +47,49 @@ impl LineTail {
         }
     }
 
+    /// Positions a fresh tail at `max(0, len − window)`, skipping the first partial line so
+    /// polling starts on a line boundary. No-op once the tail has seen a file (including
+    /// after a reset, which replays from the top like the scan core). A missing file is left
+    /// for [`LineTail::poll`] to report.
+    pub(crate) fn seek_start_window(&mut self, window: u64) -> io::Result<()> {
+        if self.id.is_some() {
+            return Ok(());
+        }
+        let mut file = platform::open_regular_file(&self.path)?;
+        let md = file.metadata()?;
+        let id = platform::file_identity(&file)?;
+        let len = md.len();
+        if len <= window {
+            self.id = Some(id);
+            return Ok(());
+        }
+        // At a line boundary already when the byte before the window is a newline; otherwise
+        // scan forward to the next one and start past it (the cut line is dropped).
+        file.seek(SeekFrom::Start(len - window - 1))?;
+        let mut one = [0u8; 1];
+        if file.read_exact(&mut one).is_err() || one[0] == b'\n' {
+            self.id = Some(id);
+            self.offset = len - window;
+            return Ok(());
+        }
+        let mut pos = len - window;
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            if let Some(i) = memchr(b'\n', &buf[..n]) {
+                pos += i as u64 + 1;
+                break;
+            }
+            pos += n as u64;
+        }
+        self.id = Some(id);
+        self.offset = pos;
+        Ok(())
+    }
+
     pub fn poll(&mut self) -> io::Result<Chunk> {
         // Regular files only: a FIFO is never opened, a link never followed (`platform`).
         let mut file = platform::open_regular_file(&self.path)?;

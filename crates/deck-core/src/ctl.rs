@@ -239,6 +239,10 @@ pub struct LiveAgent {
     pub streaming: Option<bool>,
     pub session_file: Option<PathBuf>,
     pub model: Option<String>,
+    /// Live-only IRC unread count (`IrcBus.unreadCount`); `None` from older extensions or on
+    /// any failure.
+    #[serde(default)]
+    pub unread: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -789,6 +793,8 @@ struct WireAgent {
     session_file: Option<PathBuf>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    unread: Option<u32>,
 }
 
 impl From<WireSnapshot> for LiveSnapshot {
@@ -807,6 +813,7 @@ impl From<WireSnapshot> for LiveSnapshot {
                     streaming: a.streaming,
                     session_file: a.session_file,
                     model: a.model,
+                    unread: a.unread,
                 }),
                 Lenient::Bad(_) => {
                     log::debug!("ctl: skipped malformed agent entry");

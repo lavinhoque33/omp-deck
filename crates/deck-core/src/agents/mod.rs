@@ -8,12 +8,14 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+pub mod activity;
 pub mod markup;
 mod scan;
 pub(crate) mod tail;
 mod transcript;
 mod watcher;
 
+pub use activity::{ActivityKind, ActivityRow, ActivityStatus, ActivityWatcher, AgentActivity};
 pub use scan::AgentsScanner;
 pub use transcript::{
     TranscriptReader, TranscriptUpdate, TranscriptWatcher, entry_items, read_blob,
@@ -43,6 +45,11 @@ pub struct AgentSummary {
     pub agent: Option<String>,
     /// `provider/id` (latest model_change, else resolvedModel).
     pub model: Option<String>,
+    /// Lowercase model-role key (`session_init.modelRole` wins, else the latest known
+    /// `model_change.role`); `None` when unknown or only junk (`subagent:*`, `temporary`,
+    /// `fallback`, `prewalk`, …) was seen.
+    #[serde(default)]
+    pub model_role: Option<String>,
     pub thinking: Option<String>,
     /// Preamble stripped, `# Target` section preferred, ≤ 1000 chars.
     pub task_gist: String,

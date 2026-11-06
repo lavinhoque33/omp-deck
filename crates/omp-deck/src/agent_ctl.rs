@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use deck_core::config::SessionView;
 use deck_core::ctl::LiveStatus;
 
 /// How long a tab launched with the extension may take to open its socket before it counts as
@@ -123,8 +124,22 @@ pub fn can_kill(link: Link, live: Option<LiveStatus>) -> bool {
     link == Link::Live && matches!(live, Some(LiveStatus::Running | LiveStatus::Idle))
 }
 
+/// Why a subagent cannot be opened in the chat view, if it cannot: an advisor has no session of
+/// its own to show, and a session open in the terminal view has no chat view to show it in.
+pub fn chat_blocked(advisor: bool, view: SessionView) -> Option<&'static str> {
+    if advisor {
+        Some("Advisors have no session of their own to view")
+    } else if view == SessionView::Terminal {
+        Some("This session is open in the terminal view: switch it to the chat view first")
+    } else {
+        None
+    }
+}
+
+/// Revive wakes a parked agent and restarts a killed one (omp's hub `r`; the extension's
+/// `revive` is `lifecycle.ensureLive`, which has no status guard).
 pub fn can_revive(link: Link, live: Option<LiveStatus>) -> bool {
-    link == Link::Live && live == Some(LiveStatus::Parked)
+    link == Link::Live && matches!(live, Some(LiveStatus::Parked | LiveStatus::Aborted))
 }
 
 /// Chat steers running agents, prompts idle ones and wakes parked ones.
@@ -227,6 +242,14 @@ mod tests {
     }
 
     #[test]
+    fn advisors_and_terminal_view_sessions_cannot_be_opened_in_the_chat_view() {
+        assert_eq!(chat_blocked(false, SessionView::Chat), None);
+        assert!(chat_blocked(true, SessionView::Chat).is_some());
+        assert!(chat_blocked(false, SessionView::Terminal).is_some());
+        assert!(chat_blocked(true, SessionView::Terminal).is_some());
+    }
+
+    #[test]
     fn live_controls_follow_the_agent_state() {
         let l = Link::Live;
         assert!(can_kill(l, Some(LiveStatus::Running)));
@@ -235,7 +258,10 @@ mod tests {
         assert!(!can_kill(l, Some(LiveStatus::Aborted)));
         assert!(!can_kill(l, None));
         assert!(can_revive(l, Some(LiveStatus::Parked)));
+        assert!(can_revive(l, Some(LiveStatus::Aborted)));
         assert!(!can_revive(l, Some(LiveStatus::Idle)));
+        assert!(!can_revive(l, Some(LiveStatus::Running)));
+        assert!(!can_revive(l, None));
         for ok in [LiveStatus::Running, LiveStatus::Idle, LiveStatus::Parked] {
             assert!(can_chat(l, Some(ok)));
             assert_eq!(chat_disabled_reason(l, Some(ok)), None);

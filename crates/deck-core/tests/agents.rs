@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use deck_core::agents::{
-    AgentStatus, AgentSummary, AgentsScanner, AgentsSnapshot, AgentsTarget, AgentsWatcher,
-    TranscriptItem, TranscriptReader, TranscriptWatcher,
+    ActivityKind, ActivityRow, ActivityStatus, ActivityWatcher, AgentActivity, AgentStatus,
+    AgentSummary, AgentsScanner, AgentsSnapshot, AgentsTarget, AgentsWatcher, TranscriptItem,
+    TranscriptReader, TranscriptWatcher,
 };
 
 fn fixtures() -> PathBuf {
@@ -68,14 +69,16 @@ fn scan_lists_real_agents_in_tree_order_and_skips_junk() {
             "RunningAgent",
             "RunningAgent.Helper",
             "InterruptedAgent",
+            "ActivityKilled",
             "KilledAgent",
             "FailedAgent",
             "__advisor",
+            "ActivityAgent",
             "DoneAgent",
         ]
     );
     let depths: Vec<usize> = snap.agents.iter().map(|a| a.depth).collect();
-    assert_eq!(depths, [0, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(depths, [0, 1, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(
         find(&snap, "RunningAgent.Helper").parent_id.as_deref(),
         Some("RunningAgent")
@@ -145,6 +148,62 @@ fn dead_owner_turns_inferred_running_into_interrupted_only() {
     assert_eq!(find(&snap, "DoneAgent").status, AgentStatus::Done);
     assert_eq!(find(&snap, "FailedAgent").status, AgentStatus::Failed);
     assert_eq!(find(&snap, "KilledAgent").status, AgentStatus::Aborted);
+}
+#[test]
+fn model_role_prefers_session_init_and_ignores_junk_change_roles() {
+    let (d, session) = store();
+    let mk = |init_role: Option<&str>, change_role: Option<&str>| {
+        let mut lines = vec![
+            r#"{"type":"title","v":1,"title":""}"#.to_owned(),
+            r#"{"type":"session","version":3,"id":"01a1","timestamp":"2026-10-21T10:00:00.000Z","cwd":"/x","parentSession":"/x/sess.jsonl"}"#.to_owned(),
+        ];
+        if let Some(role) = change_role {
+            lines.push(format!(
+                r#"{{"type":"model_change","id":"m","parentId":null,"timestamp":"2026-10-21T10:00:00.010Z","model":"a/b","role":"{role}"}}"#
+            ));
+        }
+        let init = match init_role {
+            Some(role) => format!(r#""modelRole":"{role}","#),
+            None => String::new(),
+        };
+        lines.push(format!(
+            r#"{{"type":"session_init","id":"si","parentId":null,"timestamp":"2026-10-21T10:00:00.020Z",{init}"task":"t","tools":[],"agent":"task","resolvedModel":"a/b"}}"#
+        ));
+        lines.push(
+            r#"{"type":"message","id":"a","parentId":null,"timestamp":"2026-10-21T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"stopReason":"stop","timestamp":1792576805000}}"#.to_owned(),
+        );
+        lines.join("\n") + "\n"
+    };
+    let dir = d.path().join("sess");
+    // session_init wins over a known change role.
+    fs::write(dir.join("RoleA.jsonl"), mk(Some("slow"), Some("smol"))).unwrap();
+    // No init role: latest known change role applies.
+    fs::write(dir.join("RoleB.jsonl"), mk(None, Some("smol"))).unwrap();
+    // Junk change roles never surface.
+    for (id, junk) in [
+        ("RoleJunkSub", "subagent:RoleJunkSub"),
+        ("RoleJunkTmp", "temporary"),
+        ("RoleJunkFb", "fallback"),
+        ("RoleJunkPre", "prewalk"),
+    ] {
+        fs::write(dir.join(format!("{id}.jsonl")), mk(None, Some(junk))).unwrap();
+    }
+    let snap = AgentsScanner::new(session).scan(true);
+    assert_eq!(
+        find(&snap, "RoleA").model_role.as_deref(),
+        Some("slow"),
+        "session_init.modelRole wins"
+    );
+    assert_eq!(find(&snap, "RoleB").model_role.as_deref(), Some("smol"));
+    for id in ["RoleJunkSub", "RoleJunkTmp", "RoleJunkFb", "RoleJunkPre"] {
+        assert_eq!(
+            find(&snap, id).model_role,
+            None,
+            "junk model_change.role is ignored ({id})"
+        );
+    }
+    // Pre-existing fixtures carry no role at all.
+    assert_eq!(find(&snap, "DoneAgent").model_role, None);
 }
 
 #[test]
@@ -249,7 +308,7 @@ fn malformed_and_truncated_lines_never_break_a_scan() {
     );
     let snap = AgentsScanner::new(session).scan(true);
     assert_eq!(find(&snap, "FailedAgent").status, AgentStatus::Failed);
-    assert_eq!(snap.agents.len(), 7);
+    assert_eq!(snap.agents.len(), 9);
 }
 
 #[test]
@@ -547,7 +606,7 @@ fn agents_watcher_publishes_changes_and_stops_on_drop() {
     }));
     let snap = wait_for(|| watcher.latest());
     assert_eq!(snap.session, session);
-    assert_eq!(snap.agents.len(), 7);
+    assert_eq!(snap.agents.len(), 9);
     assert_eq!(updates.load(Ordering::SeqCst), 1);
 
     // Owner exit alone republishes: the Running agent becomes Interrupted.
@@ -560,7 +619,7 @@ fn agents_watcher_publishes_changes_and_stops_on_drop() {
             .latest()
             .filter(|s| find(s, "RunningAgent").status == AgentStatus::Interrupted)
     });
-    assert_eq!(snap.agents.len(), 7);
+    assert_eq!(snap.agents.len(), 9);
 
     // A new agent shows up on a later rescan (≤ 3 s idle cadence).
     let nested = d.path().join("sess/Fresh.jsonl");
@@ -633,7 +692,7 @@ fn symlinked_and_fifo_transcripts_are_ignored_without_hanging() {
     fs::remove_file(dir.join("FailedAgent.md")).unwrap();
     std::os::unix::fs::symlink(dir.join("DoneAgent.md"), dir.join("FailedAgent.md")).unwrap();
     let snap = AgentsScanner::new(session).scan(true);
-    assert_eq!(snap.agents.len(), 7, "{:?}", ids(&snap));
+    assert_eq!(snap.agents.len(), 9, "{:?}", ids(&snap));
     assert!(find(&snap, "FailedAgent").output_path.is_none());
 }
 
@@ -658,4 +717,168 @@ fn trailing_bookkeeping_does_not_inflate_duration_or_last_activity() {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
     assert_eq!(last.as_millis(), 1_792_576_921_000);
+}
+// ---------------------------------------------------------------------------------------------
+// Activity feed
+
+fn activity_rows(path: &Path, id: &str) -> Vec<ActivityRow> {
+    let mut core = AgentActivity::new();
+    core.set_agents(vec![(id.to_owned(), path.to_owned())], &Default::default());
+    assert!(core.refresh().unwrap());
+    core.rows()
+}
+
+fn activity_kind<'a>(rows: &'a [ActivityRow], id: &str) -> &'a ActivityRow {
+    rows.iter().find(|r| r.id == id).unwrap_or_else(|| {
+        panic!(
+            "no activity row {id} in {:?}",
+            rows.iter().map(|r| &r.id).collect::<Vec<_>>()
+        )
+    })
+}
+
+#[test]
+fn activity_rows_from_a_fixture_transcript() {
+    let (_d, session) = store();
+    let dir = session.parent().unwrap().join("sess");
+    let rows = activity_rows(&dir.join("ActivityAgent.jsonl"), "ActivityAgent");
+    // Spawned (task gist), response, two tools (success + error), IRC, error lifecycle, exit.
+    let spawned = activity_kind(&rows, "ActivityAgent:life:0");
+    assert_eq!(spawned.kind, ActivityKind::Lifecycle);
+    assert_eq!(spawned.title, "Spawned");
+    assert_eq!(spawned.summary, "Build the activity feed.");
+    assert_eq!(spawned.status, ActivityStatus::Success);
+
+    let resp = rows
+        .iter()
+        .find(|r| r.kind == ActivityKind::Response)
+        .unwrap();
+    assert_eq!(resp.title, "Response");
+    assert_eq!(resp.summary, "Starting the work. Second line here.");
+    assert_eq!(resp.status, ActivityStatus::Success);
+
+    let ok = activity_kind(&rows, "ActivityAgent:tool:tu1");
+    assert_eq!((ok.kind, ok.title.as_str()), (ActivityKind::Tool, "read"));
+    assert_eq!(ok.summary, "Reading the library");
+    assert_eq!(ok.status, ActivityStatus::Success);
+    assert_eq!(ok.call_id.as_deref(), Some("tu1"));
+    assert!(
+        ok.at >= spawned.at,
+        "tool result time wins over the call time"
+    );
+
+    let err = activity_kind(&rows, "ActivityAgent:tool:tu2");
+    assert_eq!(err.status, ActivityStatus::Error);
+    assert_eq!(err.summary, "cargo test -p deck-core");
+
+    let irc = rows.iter().find(|r| r.kind == ActivityKind::Irc).unwrap();
+    assert_eq!(irc.title, "IRC from Main");
+    assert_eq!(irc.summary, "Please review this");
+
+    let life_err = rows
+        .iter()
+        .find(|r| r.kind == ActivityKind::Lifecycle && r.title == "Error")
+        .unwrap();
+    assert_eq!(life_err.status, ActivityStatus::Error);
+    assert_eq!(life_err.summary, "rate limited");
+
+    let exit = rows
+        .iter()
+        .find(|r| r.kind == ActivityKind::Lifecycle && r.title == "Exited")
+        .unwrap();
+    assert_eq!(exit.summary, "dispose");
+
+    // Newest first.
+    for w in rows.windows(2) {
+        assert!(w[0].at >= w[1].at);
+    }
+}
+
+#[test]
+fn activity_tombstone_becomes_killed_and_missing_unread_stays_none() {
+    let (_d, session) = store();
+    let dir = session.parent().unwrap().join("sess");
+    let path = dir.join("ActivityKilled.jsonl");
+    let mut tomb = path.as_os_str().to_owned();
+    tomb.push(".tombstone");
+    let mut core = AgentActivity::new();
+    core.set_agents(
+        vec![("ActivityKilled".to_owned(), path.clone())],
+        &std::collections::HashMap::from([(path, PathBuf::from(tomb))]),
+    );
+    assert!(core.refresh().unwrap());
+    let rows = core.rows();
+    let killed = rows
+        .iter()
+        .find(|r| r.kind == ActivityKind::Lifecycle && r.title == "Killed")
+        .expect("tombstone row");
+    assert_eq!(killed.status, ActivityStatus::Aborted);
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == ActivityKind::Lifecycle && r.title == "Aborted")
+    );
+}
+
+#[test]
+fn activity_window_start_skips_the_partial_first_line() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("W.jsonl");
+    // A filler line pushes the header past the 256 KiB window; the cut line is dropped and the
+    // later complete lines still fold.
+    let filler = "x".repeat(300 * 1024);
+    let lines = [
+        format!(
+            r#"{{"type":"session","version":3,"id":"01a1","timestamp":"2026-10-21T10:00:00.000Z","cwd":"/x","parentSession":"/x","pad":"{filler}"}}"#
+        ),
+        r#"{"type":"session_init","id":"si","parentId":null,"timestamp":"2026-10-21T10:00:00.020Z","task":"Window task.","tools":[],"agent":"task","resolvedModel":"a/b"}"#.to_owned(),
+        r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-10-21T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Visible response."}],"stopReason":"stop","timestamp":1792576805000}}"#.to_owned(),
+    ];
+    fs::write(&p, lines.join("\n") + "\n").unwrap();
+    let rows = activity_rows(&p, "W");
+    assert!(
+        rows.iter().any(|r| r.kind == ActivityKind::Lifecycle
+            && r.title == "Spawned"
+            && r.summary == "Window task."),
+        "spawned row survives the window cut: {:?}",
+        rows.iter().map(|r| &r.id).collect::<Vec<_>>()
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == ActivityKind::Response && r.summary == "Visible response."),
+        "response after the window cut folds"
+    );
+}
+
+#[test]
+fn activity_per_agent_cap_and_watcher_merge() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("C.jsonl");
+    let mut lines = vec![
+        r#"{"type":"session","version":3,"id":"01a1","timestamp":"2026-10-21T10:00:00.000Z","cwd":"/x","parentSession":"/x"}"#.to_owned(),
+        r#"{"type":"session_init","id":"si","parentId":null,"timestamp":"2026-10-21T10:00:00.020Z","task":"Cap.","tools":[],"agent":"task","resolvedModel":"a/b"}"#.to_owned(),
+    ];
+    for i in 0..300 {
+        let ts = 1792576805000 + i as i64;
+        lines.push(format!(
+            r#"{{"type":"message","id":"a{i}","parentId":null,"timestamp":"2026-10-21T10:00:05.000Z","message":{{"role":"assistant","content":[{{"type":"text","text":"reply {i}"}}],"stopReason":"stop","timestamp":{ts}}}}}"#
+        ));
+    }
+    fs::write(&p, lines.join("\n") + "\n").unwrap();
+    let rows = activity_rows(&p, "C");
+    assert_eq!(rows.len(), 256, "per-agent cap holds");
+
+    // The watcher merges agents newest-first and fires on_update.
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = Arc::clone(&hits);
+    let w = ActivityWatcher::spawn(vec![("C".to_owned(), p.clone())], move || {
+        h.fetch_add(1, Ordering::SeqCst);
+    });
+    let rows = wait_for(|| {
+        let rows = w.latest();
+        (!rows.is_empty()).then_some(rows)
+    });
+    assert_eq!(rows.len(), 256);
+    assert!(w.revision() >= 1);
+    assert!(hits.load(Ordering::SeqCst) >= 1);
+    drop(w);
 }

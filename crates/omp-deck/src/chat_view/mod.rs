@@ -72,6 +72,16 @@ pub struct ChatView<'a> {
     id_salt: Option<u64>,
     hide_duplicates: bool,
     agents: &'a [ctx::AgentMeta],
+    focus_agent: Option<&'a str>,
+}
+
+/// How asking omp to view a subagent ([`ChatView::focus_agent`]) ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusOutcome {
+    /// omp was asked, or already views that agent: nothing more to do.
+    Done,
+    /// omp cannot be asked (read-only, exited, disconnected): give up.
+    Refused(TspRefused),
 }
 
 /// What a frame of the chat view reports back to the app.
@@ -85,6 +95,9 @@ pub struct ChatResponse {
     /// An omp screen that OmpDeck answers with its own (see [`Redirect`]): the view already
     /// kept omp from opening it, or closed it again before drawing it.
     pub redirect: Option<Redirect>,
+    /// The outcome of the pending [`ChatView::focus_agent`] request; `None` while it still waits
+    /// for the session surface (composer shown, no page open) or for omp's input.
+    pub focus: Option<FocusOutcome>,
 }
 
 /// Per-view state kept in egui memory.
@@ -149,6 +162,7 @@ impl<'a> ChatView<'a> {
             id_salt: None,
             hide_duplicates: false,
             agents: &[],
+            focus_agent: None,
         }
     }
 
@@ -181,6 +195,14 @@ impl<'a> ChatView<'a> {
         self
     }
 
+    /// Retargets omp's chat at this subagent once the session surface shows its composer
+    /// (omp's own "open transcript": `focus:<id>`); the outcome is [`ChatResponse::focus`].
+    /// Keep passing it until the response reports an outcome.
+    pub fn focus_agent(mut self, agent: Option<&'a str>) -> Self {
+        self.focus_agent = agent;
+        self
+    }
+
     pub fn show(self, ui: &mut Ui) -> ChatResponse {
         let ChatView {
             term,
@@ -188,6 +210,7 @@ impl<'a> ChatView<'a> {
             id_salt,
             hide_duplicates,
             agents,
+            focus_agent,
         } = self;
         term.poll();
         let ctx = ui.ctx().clone();
@@ -273,7 +296,7 @@ impl<'a> ChatView<'a> {
                 }
             });
         }
-        // While omp shows a page (a fullscreen overlay: `/git`, the agents hub, …) it owns the
+        // While omp shows a page (a fullscreen overlay: `/git`, …) it owns the
         // keyboard and the session surface is frozen: the page is what the view draws and what
         // the pointer and keys address. A dead session keeps the session surface (and its banner).
         // An omp screen with an OmpDeck counterpart is closed again before it is drawn.
@@ -369,6 +392,24 @@ impl<'a> ChatView<'a> {
             }
             route_dropped_files(ui, term, &response);
         }
+        // omp's "open transcript" for a subagent, once the session surface shows its composer:
+        // the document echoes it with the `omp.composer.focus` row, which ends the request.
+        let mut focus = None;
+        if let Some(agent) = focus_agent
+            && exit.is_none()
+            && !paged
+        {
+            match events::focus(snap, agent) {
+                Some(events::FocusStep::Viewing) => focus = Some(FocusOutcome::Done),
+                Some(events::FocusStep::Send(event)) => match term.send_tsp(&event) {
+                    Ok(()) => focus = Some(FocusOutcome::Done),
+                    // omp is busy with an injected command, or not up yet: ask again next frame.
+                    Err(TspRefused::Held | TspRefused::NotLive) => ctx.request_repaint(),
+                    Err(r) => focus = Some(FocusOutcome::Refused(r)),
+                },
+                None => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+            }
+        }
         // A right click that lands on the chat itself (not on a floating layer above it).
         let click = ui
             .input(|i| {
@@ -418,6 +459,7 @@ impl<'a> ChatView<'a> {
                 open_url: None,
                 refused,
                 redirect: redirected,
+                focus,
             };
         }
 
@@ -478,6 +520,7 @@ impl<'a> ChatView<'a> {
             open_url: out.open_url,
             refused,
             redirect: redirected.or(out.redirect),
+            focus,
         }
     }
 }
@@ -823,7 +866,15 @@ mod tests {
         }
 
         /// One frame with `events`; the shapes it painted.
-        fn frame(&mut self, mut events: Vec<Event>) -> egui::FullOutput {
+        fn frame(&mut self, events: Vec<Event>) -> egui::FullOutput {
+            self.frame_focus(events, None).0
+        }
+
+        fn frame_focus(
+            &mut self,
+            mut events: Vec<Event>,
+            agent: Option<&str>,
+        ) -> (egui::FullOutput, Option<FocusOutcome>) {
             if self.modifiers != Modifiers::NONE {
                 events.insert(0, Event::ModifiersChanged(self.modifiers));
             }
@@ -841,6 +892,7 @@ mod tests {
             let hide_duplicates = self.hide_duplicates;
             let agents = std::mem::take(&mut self.agents);
             let mut id = egui::Id::NULL;
+            let mut focus = None;
             // As in the app: clicks on the chat's own widgets do not take its keyboard focus away.
             self.ctx.options_mut(|o| {
                 o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never;
@@ -850,15 +902,17 @@ mod tests {
                     .id_salt(7)
                     .hide_duplicates(hide_duplicates)
                     .agents(&agents)
+                    .focus_agent(agent)
                     .show(ui);
                 id = shown.response.id;
+                focus = shown.focus;
                 opened.extend(shown.open_url);
                 redirects.extend(shown.redirect);
             });
             out.textures_delta.clear();
             self.agents = agents;
             self.id = id;
-            out
+            (out, focus)
         }
 
         /// Clicks the empty transcript: the chat takes the keyboard focus.
@@ -1403,12 +1457,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_hub_page_grow_columns_wrap_at_their_real_minimum_widths() {
+    fn page_grow_columns_wrap_at_their_real_minimum_widths() {
         use deck_tsp::stream::{Verb, encode_message};
         let open =
             serde_json::json!({"id":"s:2","mode":"screen","title":"Agents","role":"omp.session"});
-        // agent-hub.ts describeAgents/describeRoster/describeDetail: the body itself grows,
-        // and its roster/detail children grow 3:2 with minima 48ch/34ch.
+        // A wrapping body whose roster/detail children grow 3:2 with minima 48ch/34ch (the shape
+        // omp's agent hub page described before OmpDeck answered the hub itself).
         let page = serde_json::json!({"sf":"s:2","s":1,"ops":[
             ["add","main","s:2",null,{"id":"main","k":"col"}],
             ["add","dock","s:2",null,{"id":"dock","k":"col"}],
@@ -2877,6 +2931,10 @@ mod tests {
             ("/advisor configure", advisor()),
             ("/advisor on", None),
             ("/advisor configure now", None),
+            ("/hub", Some(Redirect::AgentHub { activity: true })),
+            ("/hub now", None),
+            ("/agents", None),
+            ("/jobs", None),
         ];
         for (i, (text, want)) in cases.into_iter().enumerate() {
             let mut h = ready(&format!("rd-arg{i}"), "typed-usage", &[composer_text(text)]);
@@ -3070,6 +3128,81 @@ mod tests {
         assert!(!text_at(&out, "Background jobs").is_empty());
     }
 
+    /// The ops that add omp 18.17.0's recorded picker `name` to the session's layer.
+    fn hub_picker(name: &str) -> serde_json::Value {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("hub-fixtures.json")).expect("hub fixtures");
+        fixtures[name].clone()
+    }
+
+    #[test]
+    fn the_agents_hub_is_caught_on_either_tab_while_omps_agent_definitions_sheet_is_not() {
+        // (recorded picker, redirect, a text it paints when shown)
+        let cases = [
+            (
+                "agents-tab",
+                Some(Redirect::AgentHub { activity: false }),
+                "Filter agents…",
+            ),
+            (
+                "activity-tab",
+                Some(Redirect::AgentHub { activity: true }),
+                "Search activity…",
+            ),
+            ("slash-agents", None, "Search agents…"),
+        ];
+        for (name, want, painted) in cases {
+            let mut h =
+                Harness::redirect_case(&format!("rd-hub-{name}"), "idle", &[hub_picker(name)]);
+            h.focus();
+            let out = h.settle();
+            assert_eq!(
+                h.redirects,
+                want.clone().into_iter().collect::<Vec<_>>(),
+                "{name}"
+            );
+            if want.is_some() {
+                assert!(
+                    text_at(&out, painted).is_empty(),
+                    "{name}: the hub was drawn"
+                );
+                assert!(
+                    escapes(&mut h, 1) >= 1,
+                    "{name}: omp was not asked to close it"
+                );
+                h.frame(vec![]);
+                assert_eq!(h.redirects.len(), 1, "{name}: redirected again");
+            } else {
+                assert!(
+                    !text_at(&out, painted).is_empty(),
+                    "{name}: omp's sheet is omp's"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_huds_agents_segment_opens_ompdecks_dashboard_instead_of_omps_hub() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("hub-fixtures.json")).expect("hub fixtures");
+        let segment = &fixtures["hud-agents-segment"];
+        let mut m = snap::tests::fixture_mirror(usize::MAX);
+        snap::tests::feed_frame(
+            &mut m,
+            &serde_json::json!([["add", segment["id"], "dock", null, segment]]),
+        );
+        let mut s = snap::Snap::default();
+        snap::tests::sync_doc(&mut s, &m);
+        let node = s.get(segment["id"].as_str().expect("id")).expect("segment");
+        let mut loc = ctx::Local::default();
+        let ink = style::test_ink();
+        let cx = ctx::Cx::new(&s, &ink, &mut loc, Instant::now(), true, true);
+        cx.click(node, node.click().expect("the segment's click action"));
+        let (out, _) = cx.into_out();
+        assert_eq!(out.redirect, Some(Redirect::AgentHub { activity: false }));
+        assert!(out.events.is_empty(), "omp never hears of the click");
+    }
+
     #[test]
     fn the_composers_model_and_cost_facts_open_ompdecks_own() {
         let frames = [serde_json::json!([["set", "j.bar/usage", {"text": "$0.42"}]])];
@@ -3085,5 +3218,162 @@ mod tests {
             click_at(&mut h, at);
             assert_eq!(h.redirects, [want], "{text}");
         }
+    }
+
+    #[test]
+    fn jobs_sheet_enriches_only_matching_task_jobs_and_their_facts() {
+        let jobs: serde_json::Value = serde_json::from_str(include_str!("jobs-overlay-task.json"))
+            .expect("task jobs fixture");
+        for matched in [true, false] {
+            let mut h = Harness::redirect_case(
+                if matched {
+                    "jobs-task-known"
+                } else {
+                    "jobs-task-unknown"
+                },
+                "idle",
+                std::slice::from_ref(&jobs),
+            );
+            h.agents = vec![
+                AgentMeta {
+                    id: if matched { "Probe" } else { "Other" }.into(),
+                    model: Some("test/task-model".into()),
+                    thinking: Some("xhigh".into()),
+                    ..AgentMeta::default()
+                },
+                // Even an exact registry-id hit must not enrich a bash job.
+                AgentMeta {
+                    id: "Bash".into(),
+                    model: Some("test/bash-must-not-appear".into()),
+                    thinking: Some("minimal".into()),
+                    ..AgentMeta::default()
+                },
+            ];
+            let out = h.settle();
+            assert!(h.redirects.is_empty(), "/jobs remains omp's overlay");
+            assert!(!text_at(&out, "Background jobs").is_empty());
+            assert_eq!(
+                text_at(&out, "test/task-model").len(),
+                if matched { 2 } else { 0 }
+            );
+            assert_eq!(text_at(&out, "xhigh").len(), if matched { 2 } else { 0 });
+            assert_eq!(!text_at(&out, "Model").is_empty(), matched);
+            assert_eq!(!text_at(&out, "Thinking").is_empty(), matched);
+            assert!(text_at(&out, "test/bash-must-not-appear").is_empty());
+            assert!(text_at(&out, "min").is_empty());
+        }
+    }
+
+    fn focus_row_ops(nested: bool) -> serde_json::Value {
+        // The focus subtree recorded from omp 18.17; add the ancestor case to the
+        // single-level recording using the same text/action shape omp declares.
+        let mut row: serde_json::Value =
+            serde_json::from_str(include_str!("focus-fixtures.json")).expect("focus fixture");
+        if nested {
+            row["c"].as_array_mut().expect("focus children").insert(
+                2,
+                serde_json::json!({
+                    "id": "3.focus/crumb", "k": "text",
+                    "p": {"role": "omp.composer.crumb", "text": "Parent",
+                          "actions": {"click": "focus:Parent"}}
+                }),
+            );
+        }
+        serde_json::json!([["add", "3.focus", "dock", null, row]])
+    }
+
+    fn action_events(typed: &[u8]) -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(typed)
+            .split("\u{1b}_tsp;e")
+            .skip(1)
+            .filter_map(|chunk| {
+                let body = chunk.split("\u{1b}\\").next()?;
+                serde_json::from_str::<serde_json::Value>(&body[body.find('{')?..]).ok()
+            })
+            .filter(|event| event["ev"] == "action")
+            .collect()
+    }
+
+    #[test]
+    fn focus_chip_keeps_the_composer_live_and_routes_exit_and_ancestor_clicks() {
+        let mut h = ready("focus-chip", "idle", &[focus_row_ops(true)]);
+        let out = h.settle();
+        for label in ["Viewing", "Probe", "Parent", "main"] {
+            assert!(centre_of(&out, label).is_some(), "{label} is drawn");
+        }
+        click_at(&mut h, centre_of(&out, "main").expect("exit"));
+        let out = h.settle();
+        click_at(&mut h, centre_of(&out, "Parent").expect("ancestor"));
+        // A normal edit still addresses the editor, not either focus-row node.
+        h.frame(vec![Event::Text("focus-chip-input".into())]);
+        let typed = h.typed(b"focus-chip-input");
+        assert_eq!(
+            action_events(&typed),
+            [
+                serde_json::json!({"ev": "action", "sf": "s:1",
+                                  "id": "3.focus/exit", "act": "focus:Main"}),
+                serde_json::json!({"ev": "action", "sf": "s:1",
+                                  "id": "3.focus/crumb", "act": "focus:Parent"}),
+            ]
+        );
+        let to_editor = edits(&typed)
+            .iter()
+            .any(|event| event["text"] == "focus-chip-input" && event["id"] != "3.focus");
+        assert!(
+            to_editor || plain_input(&typed).contains("focus-chip-input"),
+            "the focus chip leaves the composer addressable"
+        );
+    }
+
+    #[test]
+    fn focus_agent_completes_a_request_and_leaves_idle_frames_and_current_agent_alone() {
+        for (name, rows, agent, expected) in [
+            ("focus-send", vec![], Some("Agent"), Some("focus:Agent")),
+            (
+                "focus-viewed",
+                vec![focus_row_ops(false)],
+                Some("Probe"),
+                None,
+            ),
+            ("focus-none", vec![], None, None),
+        ] {
+            let mut h = ready(name, "idle", &rows);
+            let (_, outcome) = h.frame_focus(vec![], agent);
+            assert_eq!(outcome, agent.map(|_| FocusOutcome::Done));
+            // The caller clears its pending request after Done: subsequent frames
+            // must not repeat the action.
+            let (_, outcome) = h.frame_focus(vec![], None);
+            assert_eq!(outcome, None);
+            barrier(&mut h);
+            let actions = action_events(&std::fs::read(h.dir.join("typed")).expect("typed"));
+            let want: Vec<_> = expected
+                .map(|act| {
+                    serde_json::json!({"ev": "action", "sf": "s:1",
+                                      "id": "j.line/input", "act": act})
+                })
+                .into_iter()
+                .collect();
+            assert_eq!(actions, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn focus_agent_waits_while_omps_fullscreen_page_is_open() {
+        let mut h = Harness::with_later_wire("focus-page", &git_page_wire(false));
+        h.focus();
+        h.settle();
+        h.release_later();
+        let out = show_until(&mut h, "Stage file");
+        assert!(centre_of(&out, "Stage file").is_some(), "page arrived");
+        let (_, outcome) = h.frame_focus(vec![], Some("Agent"));
+        assert_eq!(outcome, None);
+        // An operable page button is a transport barrier after the focus request.
+        click_at(&mut h, centre_of(&out, "Stage file").expect("page button"));
+        let typed = h.typed(b"stage-file");
+        assert_eq!(
+            action_events(&typed),
+            [serde_json::json!({"ev": "action", "sf": "s:2",
+                               "id": "r.main/bar/1/stage-file", "act": "stage-file"})]
+        );
     }
 }

@@ -467,6 +467,7 @@ impl<'a> Cx<'a> {
         let redirect = match name {
             "status.model" => Some(Redirect::ModelPicker),
             "status.cost" => Some(Redirect::Usage { reset: false }),
+            "agents.open" => Some(Redirect::AgentHub { activity: false }),
             _ => None,
         };
         if redirect.is_some() {

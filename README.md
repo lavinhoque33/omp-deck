@@ -160,6 +160,14 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
   tokens, changed files and last reply; expand a card to see its subagents and open their transcripts (running
   subagents are listed first; transcripts render tables, links and image previews like the chat view, and their text
   can be selected and copied). Search and filter by state; click a card to jump to that session.
+  Subagent rows show cost, time, requests, tool calls, tokens, a context bar, the model role (SLOW, SMOL, TASK, …),
+  unread messages and, in the flat view, the agent that spawned them; the subagent header totals them. **Open in chat
+  view** (eye button, row menu, transcript popup) shows a subagent's live conversation in its session's chat tab, the
+  way omp's agent hub does: what you type goes to that subagent, and Esc (or "main") returns to the main session.
+  While a subagent is shown, OmpDeck's own commands (model switch, compact, review Send, …) are held back so they never
+  reach it. The **Activity** tab lists the responses, tool calls, errors, messages and lifecycle events of a session's
+  subagents, filterable by kind, agent or subtree and searchable; Follow keeps it at the newest event, and clicking an
+  event opens the transcript at it.
   For tabs running with live control, **Clean up** stops and deletes every subagent that is not running, **Select**
   lets you tick subagents (Shift+click for a range) and **Delete** them, and each row has a delete button on hover.
   Deleting is permanent: omp stops tracking the agent and its transcript, output and nested agents are removed.
@@ -194,8 +202,9 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
   (Alt+P, `/switch`), usage (`/usage`, `/usage reset`), resuming (`/resume`, `/resume @claude`/`@codex`) and the
   session tree (`/tree`) open OmpDeck's versions instead, which cover everything omp's do: plugins (enable, features,
   settings), advisors (WATCHDOG.yml), model roles and the task-agent model, saved rate-limit resets, resume in place,
-  pins, renames, Claude Code / Codex imports, branch summaries, labels and re-answering an ask. The terminal view keeps
-  omp's own screens.
+  pins, renames, Claude Code / Codex imports, branch summaries, labels and re-answering an ask. omp's agent hub (Alt+A,
+  Ctrl+S, `/hub`, the agents status segment) opens the agents dashboard. omp's background jobs sheet (`/jobs`) stays
+  omp's, with each task job's model and thinking level added. The terminal view keeps omp's own screens.
 
   </details>
 

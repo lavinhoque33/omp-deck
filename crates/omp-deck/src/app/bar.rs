@@ -7,7 +7,7 @@
 //! dialogs and toasts.
 
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -210,6 +210,23 @@ impl App {
         }
     }
 
+    /// The "Viewing subagent …" refusal of tab `uid`, when omp's chat there is on a subagent.
+    /// Reads the tab's TSP document: call it only for a command that was refused.
+    pub(super) fn viewing_refusal_of_tab(&self, uid: u64) -> Option<String> {
+        self.tabs
+            .iter()
+            .find(|t| t.uid == uid)
+            .and_then(Tab::viewing_refusal)
+    }
+
+    /// [`Self::viewing_refusal_of_tab`] for the tab that has `session` open.
+    pub(super) fn viewing_refusal_of_session(&self, session: &Path) -> Option<String> {
+        self.tabs
+            .iter()
+            .find(|t| t.session_path() == Some(session))
+            .and_then(Tab::viewing_refusal)
+    }
+
     /// A command of tab `uid` reached its final delivery state. "Delivered" means the transport
     /// accepted the bytes, not that omp (or the host's PTY) executed anything; "Unobserved" means
     /// they were queued but no acknowledgement was seen before the view closed. Only the waiting UI
@@ -226,9 +243,10 @@ impl App {
             Delivery::Refused(Refusal::Precondition(Requires::Idle)) if !quiet => Some(format!(
                 "{label} needs omp to be idle — try again when it finishes"
             )),
-            Delivery::Refused(Refusal::DialogOpen) if !quiet => {
-                Some("Close omp's open dialog first".to_owned())
-            }
+            Delivery::Refused(Refusal::DialogOpen) if !quiet => Some(
+                self.viewing_refusal_of_tab(uid)
+                    .unwrap_or_else(|| "Close omp's open dialog first".to_owned()),
+            ),
             Delivery::Aborted if !quiet => Some(format!(
                 "{label} cancelled: omp started working — check the composer"
             )),

@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use deck_core::fleet::FleetSession;
 use deck_core::sessions::abbreviate_home;
 
-use crate::agent_model::short_model;
+use crate::agent_model::{Hay, fuzzy, short_model};
 use crate::sidebar::format_age;
 use deck_service::status::TabStatus;
 use deck_service::statusfmt::{
@@ -333,14 +333,22 @@ impl Query {
     }
 }
 
+/// Shortest token that also matches a subagent's id and name fuzzily (characters in order, as
+/// omp's agent hub filters): shorter ones would match nearly everything.
+const FUZZY_MIN: usize = 3;
+
 /// A token hits the title, the project (path or branch), the session id as a prefix, or any
-/// subagent (`agent_hay`: lowercase `id agent model gist task` per subagent).
-pub fn matches(card: &Card, agent_hay: &[String], q: &Query, filter: StatusFilter) -> bool {
+/// subagent: its `id agent model gist task` text, or (from [`FUZZY_MIN`] characters) fuzzily its
+/// `id agent`.
+pub fn matches(card: &Card, agent_hay: &[Hay], q: &Query, filter: StatusFilter) -> bool {
     filter.admits(card.status)
         && q.0.iter().all(|t| {
             card.hay.contains(t.as_str())
                 || card.id_lc.starts_with(t.as_str())
-                || agent_hay.iter().any(|h| h.contains(t.as_str()))
+                || agent_hay.iter().any(|h| {
+                    h.text.contains(t.as_str())
+                        || (t.chars().count() >= FUZZY_MIN && fuzzy(t, &h.name))
+                })
         })
 }
 
@@ -350,7 +358,7 @@ pub fn visible<'a>(
     cards: &[Card],
     q: &Query,
     filter: StatusFilter,
-    agent_hay: impl Fn(&Card) -> &'a [String],
+    agent_hay: impl Fn(&Card) -> &'a [Hay],
 ) -> Vec<usize> {
     let mut out: Vec<usize> = (0..cards.len())
         .filter(|&i| matches(&cards[i], agent_hay(&cards[i]), q, filter))
@@ -611,17 +619,24 @@ mod tests {
     #[test]
     fn search_hits_title_project_id_prefix_and_subagents() {
         let c = card(7, "Fix Login Bug", Status::Idle, Some(1));
-        let none: &[String] = &[];
-        let hit = |q: &str, hay: &[String]| matches(&c, hay, &Query::new(q), StatusFilter::All);
+        let none: &[Hay] = &[];
+        let hit = |q: &str, hay: &[Hay]| matches(&c, hay, &Query::new(q), StatusFilter::All);
         assert!(hit("", none));
         assert!(hit("login", none), "title, case-insensitive");
         assert!(hit("work/proj", none), "project");
         assert!(hit("ABCD7", none), "id prefix");
         assert!(!hit("bcd7", none), "id matches as a prefix only");
         assert!(!hit("refactor", none));
-        let hay = vec!["scout-3 explore the parser\ndetails".to_owned()];
+        let hay = vec![Hay {
+            text: "scout-3 explore the parser\ndetails".to_owned(),
+            name: "scout-3 task".to_owned(),
+        }];
         assert!(hit("parser", &hay), "subagent task");
         assert!(hit("scout-3", &hay), "subagent id");
+        assert!(hit("sc3", &hay), "fuzzy over id and name");
+        assert!(hit("stk", &hay), "fuzzy reaches the agent name too");
+        assert!(!hit("s3", &hay), "a short token is not fuzzy");
+        assert!(!hit("zzz", &hay));
         assert!(
             hit("login parser", &hay),
             "every token needs a hit, anywhere"

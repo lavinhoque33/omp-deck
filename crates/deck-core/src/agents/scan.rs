@@ -58,6 +58,10 @@ struct Facts {
     agent: Option<String>,
     resolved_model: Option<String>,
     model: Option<String>,
+    /// `session_init.modelRole` when present (wins over everything below).
+    init_role: Option<String>,
+    /// Latest known `model_change.role` (junk roles never land here).
+    change_role: Option<String>,
     assistant_model: Option<String>,
     thinking: Option<String>,
     task: String,
@@ -117,6 +121,7 @@ impl AgentState {
 #[derive(Deserialize)]
 struct ModelChange {
     model: Option<String>,
+    role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -131,6 +136,8 @@ struct SessionInit {
     agent: Option<String>,
     #[serde(rename = "resolvedModel")]
     resolved_model: Option<String>,
+    #[serde(rename = "modelRole")]
+    model_role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -253,8 +260,16 @@ impl Facts {
         }
         match kind {
             "model_change" => {
-                if let Some(m) = parse::<ModelChange>(line, kind).and_then(|m| m.model) {
-                    self.model = Some(m);
+                // One parse of a line this arm already parses for `model`; the role rides
+                // along for free. Junk roles (`subagent:*`, `temporary`, `fallback`,
+                // `prewalk`, …) are dropped so the hub badge never shows them.
+                if let Some(change) = parse::<ModelChange>(line, kind) {
+                    if let Some(m) = change.model {
+                        self.model = Some(m);
+                    }
+                    if change.role.as_deref().is_some_and(known_role) {
+                        self.change_role = change.role;
+                    }
                 }
             }
             "thinking_level_change" => {
@@ -270,6 +285,12 @@ impl Facts {
                     }
                     self.agent = init.agent.or(self.agent.take());
                     self.resolved_model = init.resolved_model.or(self.resolved_model.take());
+                    // `session_init.modelRole` wins over any `model_change.role`.
+                    if let Some(role) = init.model_role
+                        && !role.trim().is_empty()
+                    {
+                        self.init_role = Some(role);
+                    }
                 }
             }
             "message" => self.apply_message(line),
@@ -406,6 +427,31 @@ impl Facts {
 fn num(v: Option<f64>) -> u64 {
     v.filter(|v| v.is_finite() && *v > 0.0)
         .map_or(0, |v| v as u64)
+}
+
+/// omp's known model-role keys (`config/model-roles.ts`): only these may back the hub role
+/// badge. Anything else (`subagent:<id>`, `temporary`, `fallback`, `prewalk`, …) is junk the
+/// badge must never show.
+fn known_role(role: &str) -> bool {
+    matches!(
+        role,
+        "default"
+            | "smol"
+            | "slow"
+            | "vision"
+            | "plan"
+            | "commit"
+            | "tiny"
+            | "memory"
+            | "task"
+            | "advisor"
+            | "widget"
+            | "image"
+            | "web"
+            | "speech"
+            | "dictation"
+            | "judge"
+    )
 }
 
 fn args_hint(a: ArgsLite) -> Option<String> {
@@ -674,6 +720,10 @@ fn summarize(facts: &Facts, f: Found, owner_alive: bool) -> AgentSummary {
             .clone()
             .or_else(|| facts.resolved_model.clone())
             .or_else(|| facts.assistant_model.clone()),
+        model_role: facts
+            .init_role
+            .clone()
+            .or_else(|| facts.change_role.clone()),
         thinking: facts.thinking.clone(),
         task_gist: task_gist(&facts.task),
         task: facts.task.clone(),

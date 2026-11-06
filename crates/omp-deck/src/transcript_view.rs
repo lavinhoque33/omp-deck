@@ -713,6 +713,21 @@ impl RowKit<'_> {
     }
 }
 
+/// Where an opened transcript starts: the Activity tab opens an agent at the row it showed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Anchor {
+    /// The tool call with this id.
+    Tool(String),
+    /// The assistant message written at this time.
+    Response(std::time::SystemTime),
+    /// The end (a lifecycle or IRC event, or a row that is not in the list any more).
+    End,
+}
+
+/// Frames a row anchor keeps scrolling to its row: the rows above it are estimates until they
+/// have been drawn, so its offset moves while they are measured.
+const ANCHOR_FRAMES: u8 = 4;
+
 /// Live state of the transcript tab.
 pub struct TranscriptView {
     revision: Option<u64>,
@@ -727,6 +742,10 @@ pub struct TranscriptView {
     open_all: bool,
     pub follow: bool,
     jump: bool,
+    /// An anchor still waiting for the items to arrive.
+    anchor: Option<Anchor>,
+    /// The row being scrolled to, and the frames left to keep doing so.
+    scroll_row: Option<(usize, u8)>,
     md: MdStandalone,
     transcript: PathBuf,
     images: HashMap<String, ImageSlot>,
@@ -748,6 +767,8 @@ impl TranscriptView {
             open_all: false,
             follow,
             jump: follow,
+            anchor: None,
+            scroll_row: None,
             md: MdStandalone::default(),
             transcript: PathBuf::new(),
             images: HashMap::new(),
@@ -771,6 +792,47 @@ impl TranscriptView {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// Opens at `anchor` instead of the end (applied once the items are here).
+    pub fn anchor(&mut self, anchor: Anchor) {
+        self.follow = false;
+        self.jump = false;
+        self.scroll_row = None;
+        self.anchor = Some(anchor);
+    }
+
+    /// The row `anchor` names, if the list has it.
+    fn anchor_row(&self, anchor: &Anchor) -> Option<usize> {
+        self.rows.iter().position(|row| {
+            let item = |i: usize| self.items.get(i);
+            match (anchor, *row) {
+                (Anchor::Tool(id), Row::Tool { call, .. }) => {
+                    matches!(item(call), Some(TranscriptItem::ToolCall { call_id, .. }) if call_id == id)
+                }
+                (Anchor::Tool(id), Row::Single(i)) => {
+                    matches!(item(i), Some(TranscriptItem::ToolResult { call_id, .. }) if call_id == id)
+                }
+                (Anchor::Response(at), Row::Single(i)) => {
+                    matches!(item(i), Some(TranscriptItem::Assistant { at: Some(t), .. }) if t == at)
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// Turns a waiting anchor into a row to scroll to (or the end) once there are rows.
+    fn resolve_anchor(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let Some(anchor) = self.anchor.take() else {
+            return;
+        };
+        match self.anchor_row(&anchor) {
+            Some(row) => self.scroll_row = Some((row, ANCHOR_FRAMES)),
+            None => self.jump_to_end(),
+        }
     }
 
     /// Adopt the watcher's list when its revision moved.
@@ -829,6 +891,10 @@ impl TranscriptView {
         let rows_c = self.rows.clone();
         let rev = self.revision.unwrap_or(0);
         let width = ui.available_width();
+        self.resolve_anchor();
+        let scroll_to = self
+            .scroll_row
+            .and_then(|(row, _)| self.offsets.get(row).copied());
         let TranscriptView {
             rows,
             heights,
@@ -862,62 +928,65 @@ impl TranscriptView {
             images_tx,
             zoomed,
         };
-        let out = ScrollArea::vertical()
+        let mut area = ScrollArea::vertical()
             .id_salt("agent-transcript")
             .auto_shrink([false, false])
-            .stick_to_bottom(*follow)
-            .show_viewport(ui, |ui, viewport| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                let w = ui.available_width();
-                if (w - *view_w).abs() > 1.0 {
-                    *view_w = w;
-                    for (h, row) in heights.iter_mut().zip(rows.iter()) {
-                        *h = estimate(&items, *row, *view_w);
-                    }
+            .stick_to_bottom(*follow);
+        if let Some(y) = scroll_to {
+            area = area.vertical_scroll_offset((y - 6.0).max(0.0));
+        }
+        let out = area.show_viewport(ui, |ui, viewport| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let w = ui.available_width();
+            if (w - *view_w).abs() > 1.0 {
+                *view_w = w;
+                for (h, row) in heights.iter_mut().zip(rows.iter()) {
+                    *h = estimate(&items, *row, *view_w);
                 }
-                offsets.clear();
-                offsets.push(0.0);
-                let mut y = 0.0;
-                for h in heights.iter() {
-                    y += h + GAP;
-                    offsets.push(y);
-                }
-                let total = y;
-                let n = rows.len();
-                let lo = viewport.min.y - OVERSCAN;
-                let hi = viewport.max.y + OVERSCAN;
-                let first = offsets[1..].partition_point(|&o| o <= lo).min(n);
-                let end = offsets[..n].partition_point(|&o| o < hi).max(first);
-                ui.add_space(offsets[first]);
-                for i in first..end {
-                    let row = rows[i];
-                    let h = ui
-                        .scope(|ui| {
-                            let mut links = Vec::new();
-                            Self::draw_row(
-                                &mut kit, ui, &mut burst, &items, i, row, running, &mut links,
-                            );
-                            if opened.is_none() {
-                                opened = links.into_iter().next();
-                            }
-                        })
-                        .response
-                        .rect
-                        .height();
-                    if (h - heights[i]).abs() > 0.5 {
-                        heights[i] = h;
-                        moved = true;
-                    }
-                    ui.add_space(GAP);
-                }
-                ui.add_space((total - offsets[end]).max(0.0));
-                let (marker, _) = ui.allocate_exact_size(vec2(1.0, 1.0), Sense::hover());
-                if *jump {
-                    ui.scroll_to_rect(marker, Some(Align::BOTTOM));
-                    *jump = false;
+            }
+            offsets.clear();
+            offsets.push(0.0);
+            let mut y = 0.0;
+            for h in heights.iter() {
+                y += h + GAP;
+                offsets.push(y);
+            }
+            let total = y;
+            let n = rows.len();
+            let lo = viewport.min.y - OVERSCAN;
+            let hi = viewport.max.y + OVERSCAN;
+            let first = offsets[1..].partition_point(|&o| o <= lo).min(n);
+            let end = offsets[..n].partition_point(|&o| o < hi).max(first);
+            ui.add_space(offsets[first]);
+            for i in first..end {
+                let row = rows[i];
+                let h = ui
+                    .scope(|ui| {
+                        let mut links = Vec::new();
+                        Self::draw_row(
+                            &mut kit, ui, &mut burst, &items, i, row, running, &mut links,
+                        );
+                        if opened.is_none() {
+                            opened = links.into_iter().next();
+                        }
+                    })
+                    .response
+                    .rect
+                    .height();
+                if (h - heights[i]).abs() > 0.5 {
+                    heights[i] = h;
                     moved = true;
                 }
-            });
+                ui.add_space(GAP);
+            }
+            ui.add_space((total - offsets[end]).max(0.0));
+            let (marker, _) = ui.allocate_exact_size(vec2(1.0, 1.0), Sense::hover());
+            if *jump {
+                ui.scroll_to_rect(marker, Some(Align::BOTTOM));
+                *jump = false;
+                moved = true;
+            }
+        });
         if moved {
             ui.ctx().request_repaint();
         }
@@ -934,6 +1003,11 @@ impl TranscriptView {
         });
         if user {
             self.follow = at_end;
+            self.scroll_row = None;
+        } else if let Some((row, frames)) = self.scroll_row {
+            // Keep the row in place while the rows above it settle.
+            self.scroll_row = (frames > 1).then_some((row, frames - 1));
+            ui.ctx().request_repaint();
         }
         let r = burst.finish(ui, egui::Id::unique("transcript-md"));
         if opened.is_none() {

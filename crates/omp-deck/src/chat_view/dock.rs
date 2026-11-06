@@ -133,6 +133,7 @@ pub fn role_node(cx: &Cx, ui: &mut Ui, n: &SNode) -> bool {
         "omp.editor.ask.hidden" => {
             panel(cx, ui, Panel::Ask, &|ui| ask_body(cx, ui, n));
         }
+        "omp.composer.focus" => focus_chip(cx, ui, n),
         "omp.hud.pill" => hud_pill(cx, ui, n),
         "omp.btn" => btn(cx, ui, n),
         "omp.composer.send" => send_button(cx, ui, n),
@@ -577,6 +578,118 @@ fn hud_pill(cx: &Cx, ui: &mut Ui, n: &SNode) {
             };
             ui.horizontal(|ui| cx.with_tx(tx, || render::children(cx, ui, n)));
         });
+}
+
+/// omp's `omp.composer.focus` row: the chat shows a subagent's session, and what is sent goes to
+/// it. A clear accent-outlined chip: "Viewing", the ancestors it was reached through (each
+/// clickable: omp's own `focus:<id>` action), the agent, and at the right the way back (a click
+/// or Esc is omp's `focus:Main`).
+fn focus_chip(cx: &Cx, ui: &mut Ui, n: &SNode) {
+    let ink = cx.ink;
+    let accent = ink.p.accent;
+    let tip = n.str("title").map(|t| text::clean(t).into_owned());
+    let exit = cx.snap.by_role(n, "omp.composer.exit");
+    let outer = egui::Frame::new()
+        .fill(ink.wash(accent))
+        .stroke(Stroke::new(1.0, accent))
+        .corner_radius(egui::CornerRadius::same(9))
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                glyphs::icon(ui, "eye", 15.0, accent, Sense::hover());
+                ui.label(RichText::new("Viewing").font(ink.label(12.0)).color(accent));
+                for crumb in cx.snap.kids(n).filter(|c| c.role() == "omp.composer.crumb") {
+                    let r = ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new(text::node_plain(crumb))
+                                    .font(ink.label(12.0))
+                                    .color(ink.dim())
+                                    .underline(),
+                            )
+                            .sense(Sense::click()),
+                        )
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                    let r = match crumb.str("title") {
+                        Some(t) => r.on_hover_text(text::clean(t).into_owned()),
+                        None => r,
+                    };
+                    if r.clicked()
+                        && let Some(act) = crumb.click()
+                    {
+                        cx.click(crumb, act);
+                    }
+                    ui.label(RichText::new("›").font(ink.label(12.0)).color(ink.faint()));
+                }
+                if let Some(agent) = cx.snap.by_role(n, "omp.composer.agent") {
+                    ui.label(
+                        RichText::new(text::node_plain(agent))
+                            .font(ink.label(13.0))
+                            .strong()
+                            .color(ink.strong()),
+                    );
+                }
+                if let Some(exit) = exit {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        focus_exit(cx, ui, exit);
+                    });
+                }
+            });
+        });
+    if let Some(tip) = tip {
+        outer.response.on_hover_text(tip);
+    }
+}
+
+/// The way back out of [`focus_chip`]: omp's Esc keycap and the label it gives the way ("main"),
+/// a button whose outline pops when hovered.
+fn focus_exit(cx: &Cx, ui: &mut Ui, exit: &SNode) {
+    let ink = cx.ink;
+    let keys: Vec<String> = cx
+        .snap
+        .find(exit, &|k| k.kind == "kbd")
+        .map(|k| {
+            k.arr("keys")
+                .iter()
+                .filter_map(|k| k.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let label = cx
+        .snap
+        .find(exit, &|k| k.kind == "text")
+        .map_or_else(|| "main".to_owned(), text::node_plain);
+    let shown = egui::Frame::new()
+        .fill(ink.chip())
+        .stroke(Stroke::new(1.0, ink.p.stroke))
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(7, 2))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.horizontal(|ui| {
+                render::keycaps(cx, ui, &keys);
+                ui.label(RichText::new(label).font(ink.label(12.0)).color(ink.text()));
+            });
+        });
+    let id = ui.scope_id().with(("focus-exit", &exit.id));
+    let resp = ui
+        .interact(shown.response.rect, id, Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(id.with("h"), resp.hovered(), 0.1);
+    paint::pop(ui.painter(), shown.response.rect, 7, ink, hov);
+    let resp = match exit.str("title") {
+        Some(t) => resp.on_hover_text(text::clean(t).into_owned()),
+        None => resp,
+    };
+    if resp.clicked()
+        && let Some(act) = exit.click()
+    {
+        cx.click(exit, act);
+    }
 }
 
 // ---- editor ---------------------------------------------------------------------------------

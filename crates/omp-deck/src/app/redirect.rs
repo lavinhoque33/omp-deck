@@ -9,6 +9,7 @@ use deck_core::sessions::ProjectGroup;
 use super::App;
 use super::session_manager::ResumeOrigin;
 use crate::chat_view::Redirect;
+use crate::dashboard::DashTab;
 use crate::tabs::TabRole;
 
 /// The project the session manager lists first for a resume from the tab with `session` (its
@@ -60,6 +61,14 @@ impl App {
                 self.open_resume(origin, scope);
             }
             Redirect::Tree => self.open_tree_active(),
+            Redirect::AgentHub { activity } => {
+                let tab = if activity {
+                    DashTab::Activity
+                } else {
+                    DashTab::Agents
+                };
+                self.open_dashboard(true, tab);
+            }
         }
     }
 }

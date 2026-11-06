@@ -10,8 +10,8 @@ use std::time::SystemTime;
 use crate::icons::Icon;
 use crate::icons::{
     ICON_ARROW_DOWN_TO_LINE, ICON_CHEVRON_DOWN, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT,
-    ICON_CHEVRONS_DOWN, ICON_CLIPBOARD_LIST, ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT,
-    ICON_MESSAGES_SQUARE, ICON_NETWORK, ICON_PLAY, ICON_SEND, ICON_SQUARE, ICON_X,
+    ICON_CHEVRONS_DOWN, ICON_CLIPBOARD_LIST, ICON_COPY, ICON_EXTERNAL_LINK, ICON_EYE,
+    ICON_FILE_TEXT, ICON_MESSAGES_SQUARE, ICON_NETWORK, ICON_PLAY, ICON_SEND, ICON_SQUARE, ICON_X,
 };
 use deck_core::agents::{AgentStatus, AgentSummary, TranscriptItem};
 use deck_core::ctl::LiveStatus;
@@ -29,7 +29,7 @@ use crate::agent_output::{MdPane, OutputPane};
 use crate::card;
 use crate::sidebar::format_age;
 use crate::theme::{self, Palette};
-use crate::transcript_view::TranscriptView;
+use crate::transcript_view::{Anchor, TranscriptView};
 use crate::widgets::{DraftButton, DraftKind, Spin, empty_state, icon_text, paint_icon};
 use deck_service::statusfmt::fmt_tokens;
 
@@ -54,6 +54,8 @@ pub enum PopupAction {
     /// Ask to kill this agent (the app confirms first).
     Kill(String),
     Revive(String),
+    /// Open this agent in the session's chat view (omp's own "open transcript").
+    OpenInChat(String),
     Chat {
         agent: String,
         text: String,
@@ -111,6 +113,12 @@ impl PopupState {
         }
     }
 
+    /// Opens the transcript at `anchor` (the Activity tab's row) instead of the end.
+    pub fn at(mut self, anchor: Anchor) -> PopupState {
+        self.transcript.anchor(anchor);
+        self
+    }
+
     /// A newer transcript from the gateway (`fed` = its cache revision).
     pub fn feed(&mut self, fed: u64, revision: u64, items: Vec<TranscriptItem>) {
         self.fed = fed;
@@ -129,6 +137,8 @@ pub struct PopupInput<'a> {
     /// is read-only and offers to open the session.
     pub needs_open: bool,
     pub ctl: &'a CtlView<'a>,
+    /// Why the agent cannot be opened in the chat view (`None`: it can).
+    pub chat_blocked: Option<&'static str>,
 }
 
 /// `(label, value)` tiles under the header.
@@ -365,6 +375,20 @@ fn header_rows(
             if let Some(t) = &a.agent {
                 badge(ui, t, pal.accent);
             }
+            if let Some(card) = view.cards.get(input.index) {
+                if !card.role.is_empty() {
+                    badge(ui, &card.role, crate::badge::Hue::Blue.color(pal))
+                        .on_hover_text("Model role");
+                }
+                if card.unread > 0 {
+                    badge(
+                        ui,
+                        &format!("{} unread", card.unread),
+                        crate::badge::Hue::Amber.color(pal),
+                    )
+                    .on_hover_text("IRC messages the main session has not read");
+                }
+            }
             if a.advisor {
                 badge(ui, "advisor", pal.warn);
             }
@@ -571,6 +595,20 @@ fn ctl_buttons(ui: &mut Ui, input: &PopupInput<'_>, a: &AgentSummary, out: &mut 
     let pal = Palette::of_ui(ui);
     let ctl = input.ctl;
     let live = input.view.cards.get(input.index).and_then(|c| c.live);
+    let chat = DraftButton::new("Open in chat view")
+        .kind(DraftKind::Secondary)
+        .icon(ICON_EYE)
+        .enabled(input.chat_blocked.is_none())
+        .show(ui)
+        .on_hover_text(
+            input
+                .chat_blocked
+                .unwrap_or("Show this agent's session in the chat view (Esc returns)"),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand);
+    if chat.clicked() {
+        out.push(PopupAction::OpenInChat(a.id.clone()));
+    }
     if let Some(kind) = ctl.pending(&a.id).filter(|k| *k != ReqKind::Chat) {
         ui.add(Spin::new(14.0, pal.accent));
         let text = if kind == ReqKind::Kill {
@@ -832,15 +870,16 @@ fn open_session_panel(ui: &mut Ui, out: &mut Vec<PopupAction>) {
         });
 }
 
-fn badge(ui: &mut Ui, text: &str, color: Color32) {
+fn badge(ui: &mut Ui, text: &str, color: Color32) -> egui::Response {
     let g = ui
         .painter()
         .layout_no_wrap(text.to_owned(), crate::theme::font(11.5), color);
-    let (rect, _) = ui.allocate_exact_size(vec2(g.size().x + 16.0, 20.0), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 16.0, 20.0), Sense::hover());
     ui.painter()
         .rect_filled(rect, 10, color.gamma_multiply(0.16));
     ui.painter()
         .galley(rect.center() - g.size() / 2.0, g, color);
+    resp
 }
 
 fn fact_tile(ui: &mut Ui, label: &str, value: &str) {
@@ -1154,6 +1193,7 @@ mod tests {
             advisor: false,
             agent: None,
             model: None,
+            model_role: None,
             thinking: None,
             task_gist: String::new(),
             task: String::new(),

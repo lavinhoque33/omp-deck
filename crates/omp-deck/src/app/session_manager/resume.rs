@@ -62,9 +62,13 @@ pub(super) fn resume_here<'a>(
 }
 
 /// What a request that ends with a typed command reports: `Ok` once omp's terminal took it.
-fn typed_result(r: Result<Reply, String>) -> Result<(), String> {
+/// `viewing` is the tab's "viewing a subagent" refusal text, asked only on a dialog refusal.
+fn typed_result(
+    r: Result<Reply, String>,
+    viewing: impl FnOnce() -> Option<String>,
+) -> Result<(), String> {
     match r? {
-        Reply::Submitted(record) => delivery_result(&record.delivery),
+        Reply::Submitted(record) => delivery_result(&record.delivery, viewing),
         _ => Ok(()),
     }
 }
@@ -263,7 +267,7 @@ impl App {
         let path = file.clone();
         self.gw
             .mutate(Mutation::SessionRename { file, title }, move |app, r| {
-                let r = typed_result(r);
+                let r = typed_result(r, || app.viewing_refusal_of_session(&path));
                 let still = app.sessions.rename.as_ref().is_some_and(|d| d.path == path);
                 match r {
                     Ok(()) => {
@@ -331,7 +335,8 @@ impl App {
             move |app, r| {
                 let r = r.map_err(Failure::from).and_then(|done| match done {
                     Reply::Submitted(record) => {
-                        delivery_result(&record.delivery).map_err(Failure::Other)
+                        delivery_result(&record.delivery, || app.viewing_refusal_of_tab(tab))
+                            .map_err(Failure::Other)
                     }
                     _ => Ok(()),
                 });
@@ -530,8 +535,11 @@ mod tests {
 
     #[test]
     fn a_typed_command_only_succeeds_when_omp_took_it() {
-        assert_eq!(typed_result(Ok(Reply::Unit)), Ok(()));
-        assert_eq!(typed_result(Err("boom".to_owned())), Err("boom".to_owned()));
+        assert_eq!(typed_result(Ok(Reply::Unit), || None), Ok(()));
+        assert_eq!(
+            typed_result(Err("boom".to_owned()), || None),
+            Err("boom".to_owned())
+        );
         assert!(crate::resume_model::Flow::default().is_idle());
     }
 }

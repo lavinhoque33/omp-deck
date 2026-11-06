@@ -85,19 +85,38 @@ impl Counts {
     }
 }
 
-/// Indices into `agents` in display order. Tree mode keeps snapshot order (parent before child,
-/// depth-first) except that at every sibling level the subtrees holding a running agent come
-/// first (stable: the order inside each group is the snapshot's), and hides collapsed subtrees.
-/// Flat mode lists everything: running first, then most recent activity.
-pub fn visible(agents: &[AgentSummary], tree: bool, collapsed: &HashSet<String>) -> Vec<usize> {
+/// Where omp's agent hub puts an agent: running, idle, parked, aborted.
+pub fn hub_rank(status: AgentStatus, live: Option<LiveStatus>) -> u8 {
+    match (status, live) {
+        (AgentStatus::Running, _) => 0,
+        (AgentStatus::Done, Some(LiveStatus::Idle)) => 1,
+        (AgentStatus::Aborted, _) => 3,
+        _ => 2,
+    }
+}
+
+/// Indices into `agents` in display order; `live(i)` = omp's own word for agent `i`. Tree mode
+/// keeps snapshot order (parent before child, depth-first, newest sibling first) except that at
+/// every sibling level the subtrees holding a running agent come first (stable: the order inside
+/// each group is the snapshot's), and hides collapsed subtrees. Flat mode lists everything in
+/// omp's hub order: status (running, idle, parked, aborted), most recent activity, id.
+pub fn visible(
+    agents: &[AgentSummary],
+    live: impl Fn(usize) -> Option<LiveStatus>,
+    tree: bool,
+    collapsed: &HashSet<String>,
+) -> Vec<usize> {
     if !tree {
         let mut out: Vec<usize> = (0..agents.len()).collect();
-        out.sort_by_key(|&i| {
-            let a = &agents[i];
-            (
-                a.status != AgentStatus::Running,
-                std::cmp::Reverse(a.last_activity.or(a.created)),
-            )
+        out.sort_by(|&x, &y| {
+            let (a, b) = (&agents[x], &agents[y]);
+            let key = |i: usize, a: &AgentSummary| {
+                (
+                    hub_rank(a.status, live(i)),
+                    std::cmp::Reverse(a.last_activity.or(a.created)),
+                )
+            };
+            key(x, a).cmp(&key(y, b)).then_with(|| a.id.cmp(&b.id))
         });
         return out;
     }
@@ -313,12 +332,29 @@ pub fn agent_age(a: &AgentSummary, now: SystemTime) -> String {
 
 // ------------------------------------------------------------------ cached view
 
+/// How full an agent's context window is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CtxUse {
+    /// 0 – 1.
+    pub frac: f32,
+    /// `Context 45K / 200K`.
+    pub tip: String,
+}
+
 /// Everything one roster card shows, formatted.
 #[derive(Clone, Debug, Default)]
 pub struct CardView {
     pub short_model: String,
     /// omp's short thinking level (`med`, `xhigh`); empty when unknown or `off`.
     pub thinking: String,
+    /// The model role the agent runs under, uppercased (`TASK`); empty when unknown.
+    pub role: String,
+    /// The agent that spawned it (`None`: the main session).
+    pub parent: Option<String>,
+    /// IRC messages the main session has not read yet (live only).
+    pub unread: u32,
+    /// The context window in use; `None` while the tokens or the model's window are unknown.
+    pub ctx: Option<CtxUse>,
     pub metrics: Vec<Metric>,
     pub age: String,
     pub gist: String,
@@ -326,6 +362,61 @@ pub struct CardView {
     pub children: usize,
     /// omp's own state for this agent while the control link is up (`None`: file inference only).
     pub live: Option<LiveStatus>,
+}
+
+/// What a search token is matched against, per agent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Hay {
+    /// Lowercase `id agent model gist task`.
+    pub text: String,
+    /// Lowercase `id agent`: omp's hub filters fuzzily over id and name.
+    pub name: String,
+}
+
+/// `needle`'s characters appear in `hay` in order (not necessarily adjacent): omp's fuzzy filter.
+pub fn fuzzy(needle: &str, hay: &str) -> bool {
+    let mut it = hay.chars();
+    needle.chars().all(|c| it.any(|h| h == c))
+}
+
+/// The context bar of `a`: its tokens against the window of its model (`windows`: `provider/id`
+/// → tokens). `None` while either is unknown.
+fn ctx_use(a: &AgentSummary, windows: &HashMap<String, u64>) -> Option<CtxUse> {
+    let used = a.context_tokens.filter(|&t| t > 0)?;
+    let model = a.model.as_deref()?;
+    let window = windows
+        .get(crate::omp_settings::split_level(model).0)
+        .copied()
+        .filter(|&w| w > 0)?;
+    Some(CtxUse {
+        frac: (used as f64 / window as f64).clamp(0.0, 1.0) as f32,
+        tip: format!("Context {} / {}", fmt_tokens(used), fmt_tokens(window)),
+    })
+}
+
+/// omp's aggregate over a set of agents (the hub's header subtitle): cost, time worked, requests
+/// and tokens.
+pub fn aggregate(agents: &[AgentSummary], now: SystemTime) -> Vec<Metric> {
+    let (mut cost, mut req, mut tokens) = (0.0, 0u64, 0u64);
+    let mut time = Duration::ZERO;
+    let mut timed = false;
+    for a in agents {
+        cost += a.cost;
+        req += u64::from(a.requests);
+        tokens += a.tokens;
+        if let Some(d) = live_duration(a, now) {
+            time += d;
+            timed = true;
+        }
+    }
+    let m = |kind, text: String| Metric { kind, text };
+    let mut out = vec![m(MetricKind::Cost, fmt_agent_cost(cost))];
+    if timed {
+        out.push(m(MetricKind::Time, fmt_duration(time)));
+    }
+    out.push(m(MetricKind::Requests, format!("{req} req")));
+    out.push(m(MetricKind::Tokens, tokens_text(tokens)));
+    out
 }
 
 /// The file-inferred snapshot with the live registry laid over it: omp knows what is running,
@@ -399,17 +490,34 @@ pub struct AgentsView {
     /// Bumps on every refresh (snapshot, age or running duration).
     pub tick: u64,
     pub cards: Vec<CardView>,
-    /// Lowercase `id agent model gist task` haystack per agent, for the search box.
-    pub search: Vec<String>,
+    /// What the search box matches, per agent.
+    pub search: Vec<Hay>,
+    /// Context window (tokens) per `provider/id`, from omp's model catalogue; refreshed by
+    /// [`AgentsView::set_windows`].
+    windows: HashMap<String, u64>,
+    windows_gen: Option<u64>,
+    windows_dirty: bool,
     /// [`AgentMeta`] per agent, same order as the snapshot: what the chat view borrows to
     /// enrich rows omp's TSP leaves bare. Rebuilt with the cards (not per frame).
     metas: Vec<crate::chat_view::AgentMeta>,
     pub counts: Counts,
     /// `$1.23 · 4.2M tok · 120 req · 340 tools`.
     pub totals: String,
+    /// [`aggregate`] of every agent, refreshed with the cards and every second while one runs.
+    pub aggregate: Vec<Metric>,
 }
 
 impl AgentsView {
+    /// Context windows of omp's model catalogue (`provider/id` → tokens), for the context bars.
+    /// `generation` identifies the catalogue: `build` only runs when it moved.
+    pub fn set_windows(&mut self, generation: u64, build: impl FnOnce() -> HashMap<String, u64>) {
+        if self.windows_gen != Some(generation) {
+            self.windows = build();
+            self.windows_gen = Some(generation);
+            self.windows_dirty = true;
+        }
+    }
+
     pub fn agents(&self) -> &[AgentSummary] {
         self.snap.as_ref().map_or(&[], |s| s.agents.as_slice())
     }
@@ -446,7 +554,7 @@ impl AgentsView {
             (None, None) => true,
             _ => false,
         };
-        let same = base_same && live_same;
+        let same = base_same && live_same && !self.windows_dirty;
         if same && self.bucket == Some(bucket) {
             return false;
         }
@@ -464,6 +572,7 @@ impl AgentsView {
                 (b, _) => b.clone(),
             };
             self.version += 1;
+            self.windows_dirty = false;
             self.rebuild_all(now, base_same);
         }
         if let Some(s) = &self.snap {
@@ -475,6 +584,9 @@ impl AgentsView {
                 if !rebuilt && a.status == AgentStatus::Running {
                     card.metrics = metrics(a, now);
                 }
+            }
+            if rebuilt || self.counts.running > 0 {
+                self.aggregate = aggregate(&s.agents, now);
             }
         }
         self.age_bucket = Some(age_bucket);
@@ -491,6 +603,7 @@ impl AgentsView {
             self.metas.clear();
             self.counts = Counts::default();
             self.totals.clear();
+            self.aggregate.clear();
             return;
         };
         let agents = snap.agents.as_slice();
@@ -500,32 +613,43 @@ impl AgentsView {
                 *children.entry(p).or_default() += 1;
             }
         }
-        let live: HashMap<&str, LiveStatus> = self
+        let live: HashMap<&str, &LiveAgent> = self
             .live
             .as_ref()
-            .map(|l| l.agents.iter().map(|a| (a.id.as_str(), a.status)).collect())
+            .map(|l| l.agents.iter().map(|a| (a.id.as_str(), a)).collect())
             .unwrap_or_default();
         self.cards = agents
             .iter()
-            .map(|a| CardView {
-                short_model: a.model.as_deref().map(short_model).unwrap_or_default(),
-                thinking: agent_thinking(a)
-                    .filter(|t| *t != "off")
-                    .map(|t| thinking_short(t).to_owned())
-                    .unwrap_or_default(),
-                metrics: metrics(a, now),
-                age: String::new(),
-                gist: one_line(&a.task_gist, GIST_CHARS),
-                children: children.get(a.id.as_str()).copied().unwrap_or(0),
-                live: live.get(a.id.as_str()).copied(),
+            .map(|a| {
+                let l = live.get(a.id.as_str());
+                CardView {
+                    short_model: a.model.as_deref().map(short_model).unwrap_or_default(),
+                    thinking: agent_thinking(a)
+                        .filter(|t| *t != "off")
+                        .map(|t| thinking_short(t).to_owned())
+                        .unwrap_or_default(),
+                    role: a
+                        .model_role
+                        .as_deref()
+                        .map(str::to_uppercase)
+                        .unwrap_or_default(),
+                    parent: a.parent_id.clone(),
+                    unread: l.and_then(|l| l.unread).unwrap_or(0),
+                    ctx: ctx_use(a, &self.windows),
+                    metrics: metrics(a, now),
+                    age: String::new(),
+                    gist: one_line(&a.task_gist, GIST_CHARS),
+                    children: children.get(a.id.as_str()).copied().unwrap_or(0),
+                    live: l.map(|l| l.status),
+                }
             })
             .collect();
         self.metas = agents.iter().map(crate::chat_view::AgentMeta::of).collect();
         if !(keep_search && self.search.len() == agents.len()) {
             self.search = agents
                 .iter()
-                .map(|a| {
-                    format!(
+                .map(|a| Hay {
+                    text: format!(
                         "{} {} {} {}\n{}",
                         a.id,
                         a.agent.as_deref().unwrap_or(""),
@@ -533,7 +657,8 @@ impl AgentsView {
                         a.task_gist,
                         a.task
                     )
-                    .to_lowercase()
+                    .to_lowercase(),
+                    name: format!("{} {}", a.id, a.agent.as_deref().unwrap_or("")).to_lowercase(),
                 })
                 .collect();
         }
@@ -571,6 +696,7 @@ mod tests {
             advisor: false,
             agent: Some("task".to_owned()),
             model: Some("anthropic/claude-sonnet-5-5:medium".to_owned()),
+            model_role: None,
             thinking: None,
             task_gist: format!("do {id}"),
             task: String::new(),
@@ -617,13 +743,13 @@ mod tests {
     #[test]
     fn tree_keeps_snapshot_order_and_honours_collapse() {
         let (a, _) = fixture();
-        let all = visible(&a, true, &HashSet::new());
+        let all = visible(&a, |_| None, true, &HashSet::new());
         assert_eq!(
             ids(&a, &all),
             ["Beta", "Beta.Leaf", "Alpha", "Alpha.Kid", "Alpha.Kid.Deep"]
         );
         let collapsed: HashSet<String> = ["Alpha".to_owned()].into();
-        let v = visible(&a, true, &collapsed);
+        let v = visible(&a, |_| None, true, &collapsed);
         assert_eq!(ids(&a, &v), ["Beta", "Beta.Leaf", "Alpha"]);
     }
 
@@ -631,7 +757,7 @@ mod tests {
     fn tree_hides_collapsed_subtrees_only() {
         let (a, _) = fixture();
         let collapsed: HashSet<String> = ["Alpha.Kid".to_owned()].into();
-        let v = visible(&a, true, &collapsed);
+        let v = visible(&a, |_| None, true, &collapsed);
         assert_eq!(ids(&a, &v), ["Beta", "Beta.Leaf", "Alpha", "Alpha.Kid"]);
     }
 
@@ -653,7 +779,7 @@ mod tests {
     #[test]
     fn a_running_child_lifts_its_whole_parent_subtree() {
         let a = mixed();
-        let v = visible(&a, true, &HashSet::new());
+        let v = visible(&a, |_| None, true, &HashSet::new());
         // A (holds A2) and C (runs) lead; inside A the running A2 precedes its quiet sibling;
         // B and D keep their relative order behind them, each parent still before its child.
         assert_eq!(ids(&a, &v), ["A", "A2", "A1", "C", "C1", "B", "B1", "D"]);
@@ -665,7 +791,7 @@ mod tests {
         for x in &mut a {
             x.status = AgentStatus::Done;
         }
-        let v = visible(&a, true, &HashSet::new());
+        let v = visible(&a, |_| None, true, &HashSet::new());
         assert_eq!(v, (0..a.len()).collect::<Vec<_>>());
     }
 
@@ -673,10 +799,10 @@ mod tests {
     fn a_collapsed_subtree_stays_hidden_but_keeps_its_lifted_place() {
         let a = mixed();
         let collapsed: HashSet<String> = ["A".to_owned()].into();
-        let v = visible(&a, true, &collapsed);
+        let v = visible(&a, |_| None, true, &collapsed);
         assert_eq!(ids(&a, &v), ["A", "C", "C1", "B", "B1", "D"]);
         let collapsed: HashSet<String> = ["C".to_owned(), "B".to_owned()].into();
-        let v = visible(&a, true, &collapsed);
+        let v = visible(&a, |_| None, true, &collapsed);
         assert_eq!(ids(&a, &v), ["A", "A2", "A1", "C", "B", "D"]);
     }
 
@@ -690,7 +816,7 @@ mod tests {
             agent("Q.y", Some("Q"), Done, 4),
             agent("Q.y.deep", Some("Q.y"), Running, 5),
         ];
-        let v = visible(&a, true, &HashSet::new());
+        let v = visible(&a, |_| None, true, &HashSet::new());
         assert_eq!(ids(&a, &v), ["Q", "Q.y", "Q.y.deep", "Q.x", "P"]);
     }
 
@@ -710,29 +836,110 @@ mod tests {
         let mut view = AgentsView::default();
         view.update(Some(&base), None, now);
         let quiet = view.version;
-        let first = visible(view.agents(), true, &HashSet::new());
+        let first = visible(view.agents(), |_| None, true, &HashSet::new());
         assert_eq!(first, (0..8).collect::<Vec<_>>());
         // omp reports D running: the version moves (what the rows' cache keys on) and D leads.
         let live = live_of(vec![live_agent("D", LiveStatus::Running, None)]);
         view.update(Some(&base), Some(&live), now);
         assert_ne!(view.version, quiet);
-        let lifted = visible(view.agents(), true, &HashSet::new());
+        let lifted = visible(view.agents(), |_| None, true, &HashSet::new());
         assert_eq!(ids(view.agents(), &lifted)[0], "D");
     }
 
     #[test]
-    fn flat_lists_running_first_then_recent() {
-        let (a, _) = fixture();
-        let v = visible(&a, false, &HashSet::new());
+    fn flat_follows_omps_hub_order() {
+        let (mut a, _) = fixture();
+        // Aborted sinks below everything that merely stopped, whatever its recency.
+        let v = visible(&a, |_| None, false, &HashSet::new());
         assert_eq!(
             ids(&a, &v),
-            ["Beta", "Beta.Leaf", "Alpha.Kid.Deep", "Alpha.Kid", "Alpha"]
+            ["Beta", "Beta.Leaf", "Alpha.Kid", "Alpha", "Alpha.Kid.Deep"]
+        );
+        // Idle (omp says it waits for input) sits between running and parked: Alpha is idle, so
+        // it leads the quiet ones although Beta.Leaf is the more recent.
+        let live = |i: usize| (a[i].id == "Alpha").then_some(LiveStatus::Idle);
+        let v = visible(&a, live, false, &HashSet::new());
+        assert_eq!(
+            ids(&a, &v),
+            ["Beta", "Alpha", "Beta.Leaf", "Alpha.Kid", "Alpha.Kid.Deep"]
+        );
+        // Equal status and activity: by id.
+        for x in &mut a {
+            x.status = AgentStatus::Done;
+            x.last_activity = None;
+            x.created = None;
+        }
+        let v = visible(&a, |_| None, false, &HashSet::new());
+        assert_eq!(
+            ids(&a, &v),
+            ["Alpha", "Alpha.Kid", "Alpha.Kid.Deep", "Beta", "Beta.Leaf"]
         );
         // Collapsing does not apply to the flat list.
         let collapsed: HashSet<String> = ["Alpha".to_owned()].into();
-        assert_eq!(visible(&a, false, &collapsed).len(), 5);
+        assert_eq!(visible(&a, |_| None, false, &collapsed).len(), 5);
     }
 
+    #[test]
+    fn fuzzy_matches_characters_in_order() {
+        assert!(fuzzy("ab34", "ab34.tworowsresearch task"));
+        assert!(fuzzy("trr", "ab34.tworowsresearch task"));
+        assert!(fuzzy("", "anything"));
+        assert!(!fuzzy("rt", "tr"));
+        assert!(!fuzzy("xyz", "ab34.tworowsresearch task"));
+    }
+
+    #[test]
+    fn the_context_bar_needs_tokens_and_the_models_window() {
+        let mut a = agent("X", None, AgentStatus::Done, 1);
+        a.model = Some("anthropic/claude-x:high".to_owned());
+        a.context_tokens = Some(50_000);
+        let windows: HashMap<String, u64> = [("anthropic/claude-x".to_owned(), 200_000)].into();
+        let c = ctx_use(&a, &windows).expect("window known");
+        assert_eq!(c.tip, "Context 50K / 200K");
+        assert!((c.frac - 0.25).abs() < 1e-6);
+        // The window unknown, the tokens unknown, or over the window (clamped).
+        assert_eq!(ctx_use(&a, &HashMap::new()), None);
+        a.context_tokens = None;
+        assert_eq!(ctx_use(&a, &windows), None);
+        a.context_tokens = Some(900_000);
+        assert_eq!(ctx_use(&a, &windows).map(|c| c.frac), Some(1.0));
+    }
+
+    #[test]
+    fn a_new_catalogue_rebuilds_the_cards_once() {
+        let mut a = agent("X", None, AgentStatus::Done, 1);
+        a.model = Some("anthropic/claude-x".to_owned());
+        a.context_tokens = Some(1000);
+        let snap = Arc::new(AgentsSnapshot {
+            agents: vec![a],
+            ..AgentsSnapshot::default()
+        });
+        let mut v = AgentsView::default();
+        let t = SystemTime::UNIX_EPOCH;
+        v.update(Some(&snap), None, t);
+        assert!(v.cards[0].ctx.is_none());
+        v.set_windows(1, || [("anthropic/claude-x".to_owned(), 4000)].into());
+        assert!(v.update(Some(&snap), None, t));
+        assert_eq!(v.cards[0].ctx.as_ref().map(|c| c.frac), Some(0.25));
+        // The same generation does not even ask for the windows again.
+        v.set_windows(1, || unreachable!("generation unchanged"));
+        let version = v.version;
+        v.update(Some(&snap), None, t);
+        assert_eq!(v.version, version);
+    }
+
+    #[test]
+    fn the_aggregate_sums_cost_time_requests_and_tokens() {
+        let mut a = agent("A", None, AgentStatus::Done, 1);
+        let mut b = agent("B", None, AgentStatus::Done, 2);
+        (a.cost, a.requests, a.tokens, a.duration) = (0.5, 3, 1000, Some(Duration::from_secs(30)));
+        (b.cost, b.requests, b.tokens, b.duration) = (0.25, 4, 500, Some(Duration::from_secs(45)));
+        let text: Vec<String> = aggregate(&[a, b], SystemTime::UNIX_EPOCH)
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(text, ["$0.75", "1m 15s", "7 req", "1.5K tok"]);
+    }
     #[test]
     fn parked_agents_form_their_own_bucket() {
         let (a, _) = fixture();
@@ -850,9 +1057,9 @@ mod tests {
         let mut v = AgentsView::default();
         v.update(Some(&snap), None, SystemTime::UNIX_EPOCH);
         assert_eq!(v.search.len(), 1);
-        assert!(v.search[0].contains("frobnicator"));
-        assert!(v.search[0].contains("sonnet"));
-        assert!(v.search[0].starts_with("x "), "id first");
+        assert!(v.search[0].text.contains("frobnicator"));
+        assert!(v.search[0].text.contains("sonnet"));
+        assert!(v.search[0].text.starts_with("x "), "id first");
     }
 
     fn live_agent(id: &str, status: LiveStatus, activity: Option<&str>) -> LiveAgent {
@@ -866,6 +1073,7 @@ mod tests {
             streaming: None,
             session_file: None,
             model: None,
+            unread: None,
         }
     }
 

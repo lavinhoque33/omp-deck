@@ -37,6 +37,11 @@ export default async function ompdeckCtl(api: any) {
     let contextRuntime: any, contextUsage: any;
     try { contextRuntime = await import("@oh-my-pi/pi-coding-agent/session/context-usage-runtime"); } catch (e) { log("context-usage-runtime import failed: " + e); }
     try { contextUsage = await import("@oh-my-pi/pi-tui/status-line/context-usage"); } catch (e) { log("context-usage import failed: " + e); }
+    // Optional: live IRC unread counts (`createAgentHubRuntime({}).irc.unreadCount(id)`). A missing
+    // module (older omp) just leaves `unread` null in snapshots. Cached like the context imports:
+    // constructing the runtime once keeps every snapshot cheap and never throws into omp.
+    let hubRuntime: any = null;
+    try { hubRuntime = (await import("@oh-my-pi/pi-coding-agent/modes/agent-hub-runtime")).createAgentHubRuntime({}); } catch (e) { log("agent-hub-runtime import failed: " + e); }
     if (!AgentLifecycleManager || !AgentRegistry || typeof sessionFileBelongsToRoot !== "function") { log("internal API missing"); return; }
 
     const isMain = (ctx: any) => ctx?.agent?.kind === "main";
@@ -157,6 +162,12 @@ export default async function ompdeckCtl(api: any) {
         schedule();
       };
 
+      const unreadOf = (id: string): number | null => {
+        try {
+          const n = hubRuntime?.irc?.unreadCount?.(id);
+          return typeof n === "number" && Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+        } catch { return null; }
+      };
       const snapshot = () => {
         const root = rootFile();
         let agents: any[] = [];
@@ -169,6 +180,7 @@ export default async function ompdeckCtl(api: any) {
               activity: r.activity ?? null, live: !!r.session, streaming: r.session?.isStreaming ?? null,
               createdAt: r.createdAt, lastActivity: r.lastActivity, sessionFile: r.sessionFile,
               model: r.history?.resolvedModel ?? null,
+              unread: unreadOf(r.id),
             }));
         } catch (e) { log("snapshot failed: " + e); }
         return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache, model: mainModel(), account: mainAccount(), pendingUi: [...pendingUi.values()].map(p => p.summary) };
