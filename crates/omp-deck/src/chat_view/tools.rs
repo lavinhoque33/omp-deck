@@ -1287,7 +1287,9 @@ fn head_left(cx: &Cx, ui: &mut Ui, n: &SNode, lk: Look) {
             .selectable(false)
             .wrap_mode(TextWrapMode::Extend),
     );
-    target(cx, ui, n);
+    if !task_identity(cx, ui, n) {
+        target(cx, ui, n);
+    }
 }
 
 /// The primary argument, styled by `targetKind`.
@@ -1789,29 +1791,6 @@ pub(super) fn thinking_badge(cx: &Cx, ui: &mut Ui, level: &str) {
     );
 }
 
-/// The model chip beside an agent name, as `agent` heads draw it, with the thinking level:
-/// the effort ring while the agent is live, a static text badge once settled.
-fn model_identity(cx: &Cx, ui: &mut Ui, model: &str, thinking: Option<&str>, live: bool) {
-    let ink = cx.ink;
-    let mut job = LayoutJob::default();
-    job.append(
-        &text::clean(model),
-        0.0,
-        Base::new(ink.label(LABEL), ink.dim(), ink).format_plain(),
-    );
-    job.wrap.max_rows = 1;
-    job.wrap.max_width = (ui.available_width() - 16.0).max(20.0);
-    chip(ui, ink, job, ink.chip(), ink.line(), Sense::hover());
-    let level = thinking.map(thinking_level).unwrap_or("");
-    if live {
-        if !level.is_empty() {
-            render::ring(cx, ui, render::effort_fill(level), 11.0, ink.accent_text());
-        }
-    } else {
-        thinking_badge(cx, ui, level);
-    }
-}
-
 /// The [`AgentMeta`] a job tile names: a task job's title is its agent id (omp's
 /// `tileTitle`), with nesting dots rendered as breadcrumbs (`Anna.Bob` → `Anna>Bob`).
 /// Prefers an exact id hit, else the dotted breadcrumb form; `None` without a title.
@@ -1872,11 +1851,18 @@ pub fn job_tile(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let kids: Vec<&SNode> = cx.snap.kids(n).collect();
     let enrich = tile_agent(cx.agents, n, cx.snap)
         .filter(|a| a.model.as_deref().filter(|m| !m.is_empty()).is_some() || a.agent.is_some());
-    match enrich {
-        // The head is all the tile shows (a one-row tile, as omp describes it): the head
-        // keeps its own layout and the identity rides its line, right-aligned.
-        Some(a) if kids.len() == 1 && kids[0].role() == "omp.job.tile.head" => {
-            head_with_identity(cx, ui, n, kids[0], a);
+    match (enrich, kids.split_first()) {
+        // The identity rides the head's line, right-aligned; the rows under the head (omp's
+        // lead/summary line) follow unchanged, with the tile's own spacing.
+        (Some(a), Some((head, rest))) if head.role() == "omp.job.tile.head" => {
+            let gap = render::step(n.str("gap"));
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                ui.spacing_mut().item_spacing.y = gap;
+                head_with_identity(cx, ui, n, head, a);
+                for c in rest {
+                    render::node(cx, ui, c);
+                }
+            });
         }
         _ => render::children(cx, ui, n),
     }
@@ -1890,15 +1876,16 @@ fn head_with_identity(cx: &Cx, ui: &mut Ui, tile: &SNode, head: &SNode, a: &Agen
         .kids(head)
         .filter(|c| !render::blank(cx, c))
         .collect();
-    let live = kids.iter().any(|c| c.kind == "elapsed");
     let mut widths: Vec<f32> = kids
         .iter()
         .map(|c| render::measure_child(cx, ui, ("tile-head", tile.id.as_str(), c.id.as_str()), c))
         .collect();
-    let id_w = render::measure_fragment(ui, ("tile-id", tile.id.as_str()), &|ui| {
-        identity_line(cx, ui, a, live);
-    });
     let total = ui.available_width().max(0.0);
+    // The head's own title and clock keep at least 40 % of the line; the model chip shortens.
+    let id_w = render::measure_fragment(ui, ("tile-id", tile.id.as_str()), &|ui| {
+        identity_line(cx, ui, a);
+    })
+    .min(total * 0.6);
     let gaps = gap * kids.len().max(1) as f32;
     let room = (total - gaps - id_w).max(0.0);
     let fixed: f32 = widths.iter().sum();
@@ -1913,50 +1900,119 @@ fn head_with_identity(cx: &Cx, ui: &mut Ui, tile: &SNode, head: &SNode, a: &Agen
         for (c, w) in kids.iter().zip(widths) {
             render::bounded_child(cx, ui, c, w);
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            identity_line(cx, ui, a, live);
+        let h = ui.min_rect().height().max(ui.spacing().interact_size.y);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.allocate_ui_with_layout(vec2(id_w, h), Layout::left_to_right(Align::Center), |ui| {
+                identity_line(cx, ui, a)
+            });
         });
     });
 }
 
-/// Type badge + model chip + thinking level of a tile's agent, as agent heads draw them.
-pub(super) fn identity_line(cx: &Cx, ui: &mut Ui, a: &AgentMeta, live: bool) {
+/// Type badge + model chip + thinking level of a known agent (wait tiles, the jobs sheet).
+/// The level is a text badge: a tile already shows omp's progress ring beside it.
+pub(super) fn identity_line(cx: &Cx, ui: &mut Ui, a: &AgentMeta) {
+    agent_identity(
+        cx,
+        ui,
+        a.agent.as_deref(),
+        a.model.as_deref(),
+        a.thinking.as_deref(),
+        false,
+    );
+}
+
+/// An agent's type badge, model chip and thinking level, left to right, as agent heads draw them.
+/// The chip shortens so the thinking level always stays on the line.
+fn agent_identity(
+    cx: &Cx,
+    ui: &mut Ui,
+    kind: Option<&str>,
+    model: Option<&str>,
+    thinking: Option<&str>,
+    live: bool,
+) {
     ui.spacing_mut().item_spacing.x = 7.0;
-    if live {
-        if let Some(level) = a
-            .thinking
-            .as_deref()
-            .map(thinking_level)
-            .filter(|l| !l.is_empty())
-        {
-            render::ring(
-                cx,
-                ui,
-                render::effort_fill(level),
-                11.0,
-                cx.ink.accent_text(),
-            );
-        }
-    } else {
-        thinking_badge(
-            cx,
-            ui,
-            a.thinking.as_deref().map(thinking_level).unwrap_or(""),
-        );
-    }
-    let kind = a.agent.as_deref().filter(|k| !k.is_empty());
-    if let Some(model) = a.model.as_deref().filter(|m| !m.is_empty()) {
-        // The type badge after the chip keeps its room: the chip shortens, never the badge.
-        let reserve = kind.map_or(0.0, |k| {
-            render::measure_fragment(ui, ("identity-kind", k), &|ui| {
-                render::badge(cx, ui, k, Some("muted"));
-            }) + ui.spacing().item_spacing.x
-        });
-        model_chip(cx, ui, model, reserve);
-    }
-    if let Some(kind) = kind {
+    if let Some(kind) = kind.filter(|k| !k.is_empty()) {
         render::badge(cx, ui, kind, Some("muted"));
     }
+    let level = thinking.map(thinking_level).unwrap_or("");
+    if let Some(model) = model.filter(|m| !m.is_empty()) {
+        let reserve = if level.is_empty() {
+            0.0
+        } else {
+            render::measure_fragment(ui, ("thinking-mark", level, live), &|ui| {
+                thinking_mark(cx, ui, level, live);
+            }) + ui.spacing().item_spacing.x
+        };
+        model_chip(cx, ui, model, reserve);
+    }
+    thinking_mark(cx, ui, level, live);
+}
+
+/// A thinking level beside a model chip: omp's effort ring plus the level's short name while
+/// the agent is live, a static text badge once settled (the ring alone would read as a
+/// spinner). Empty levels show nothing.
+fn thinking_mark(cx: &Cx, ui: &mut Ui, level: &str, live: bool) {
+    if level.is_empty() {
+        return;
+    }
+    if !live {
+        thinking_badge(cx, ui, level);
+        return;
+    }
+    let ink = cx.ink;
+    ui.spacing_mut().item_spacing.x = 4.0;
+    render::ring(cx, ui, render::effort_fill(level), 11.0, ink.accent_text());
+    if level != "auto" {
+        lab(
+            ui,
+            ink,
+            deck_service::statusfmt::thinking_short(level),
+            11.5,
+            ink.accent_text(),
+        );
+    }
+    ui.spacing_mut().item_spacing.x = 7.0;
+}
+
+/// A `task` card running one agent names it in the head with its type, model and thinking
+/// level, where omp's head only says "1 agent". With several agents the count stays: each
+/// agent card names its own. Returns whether it drew (else the head shows omp's target).
+fn task_identity(cx: &Cx, ui: &mut Ui, n: &SNode) -> bool {
+    if n.role() != "omp.tool.task" {
+        return false;
+    }
+    let mut agents = cx.snap.kids(n).filter(|c| c.kind == "agent");
+    let (Some(a), None) = (agents.next(), agents.next()) else {
+        return false;
+    };
+    let name = a.str("name").map(text::clean).unwrap_or_default();
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    // TSP first; the transcript's facts fill what the agent node does not carry yet.
+    let meta = named_agent(cx.agents, name);
+    let pick = |key: &str, own: fn(&AgentMeta) -> Option<&str>| {
+        a.str(key)
+            .filter(|v| !v.is_empty())
+            .or_else(|| meta.and_then(own))
+    };
+    let kind = pick("agent", |m| m.agent.as_deref());
+    let model = pick("model", |m| m.model.as_deref());
+    let thinking = pick("thinking", |m| m.thinking.as_deref());
+    let ink = cx.ink;
+    lab(ui, ink, name, 12.5, ink.strong());
+    agent_identity(
+        cx,
+        ui,
+        kind,
+        model,
+        thinking,
+        shows_effort(a.str("status").unwrap_or("pending")),
+    );
+    true
 }
 
 /// Shared by wait tiles and the jobs sheet's Model fact; `reserve` = width kept free after it.
@@ -2028,12 +2084,14 @@ fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
             mark(cx, ui, lk, 13.0, false);
             let name = n.str("name").map(text::clean).unwrap_or_default();
             lab(ui, ink, &name, 12.5, ink.strong());
-            if let Some(kind) = n.str("agent").filter(|k| !k.is_empty()) {
-                render::badge(cx, ui, kind, Some("muted"));
-            }
-            if let Some(model) = n.str("model").filter(|m| !m.is_empty()) {
-                model_identity(cx, ui, model, n.str("thinking"), shows_effort(status));
-            }
+            agent_identity(
+                cx,
+                ui,
+                n.str("agent"),
+                n.str("model"),
+                n.str("thinking"),
+                shows_effort(status),
+            );
         },
     );
     if let Some(task) = n.get("task").map(tplain).filter(|t| !t.trim().is_empty()) {

@@ -204,7 +204,9 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
   settings), advisors (WATCHDOG.yml), model roles and the task-agent model, saved rate-limit resets, resume in place,
   pins, renames, Claude Code / Codex imports, branch summaries, labels and re-answering an ask. omp's agent hub (Alt+A,
   Ctrl+S, `/hub`, the agents status segment) opens the agents dashboard. omp's background jobs sheet (`/jobs`) stays
-  omp's, with each task job's model and thinking level added. The terminal view keeps omp's own screens.
+  omp's, with each task job's model and thinking level added; the job rows of `wait` cards show them too, and a Task
+  card running one agent names that agent with its type, model and thinking level in its header. The terminal view
+  keeps omp's own screens.
 
   </details>
 

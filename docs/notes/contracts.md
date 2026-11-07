@@ -4097,7 +4097,15 @@ extracted trees; research `agent://OmpHubJobsFacts`, `agent://DeckHubJobsMap`, `
   (`events::focus`/`viewing`); `agent_ctl::chat_blocked`; `Tab::viewing_refusal()` used by `app/bar.rs` and
   `resume_model`. Deviations: pending focus keyed by session path (a tab-less card opens its tab asynchronously);
   hub sort applies to the flat view (tree view keeps spawn order with running subtrees first).
-- `tools::identity_line` reserves the type badge's width before the model chip, so a jobs-sheet row never clips it.
+- One identity painter, `tools::agent_identity(kind, model, thinking, live)`: type badge, model chip (shortens to keep
+  the level on the line), thinking = effort ring + short level name while live, text badge once settled. Used by agent
+  card heads, `wait` job tiles (`identity_line`, always the text badge: omp's progress ring sits beside it), the jobs
+  sheet, and the head of a `omp.tool.task` card with exactly one `agent` child (`task_identity`: name + identity in
+  place of omp's "1 agent" target; agent node props first, `Cx::agents` facts fill gaps; several agents keep the
+  count). Job tiles get the identity whenever their first child is `omp.job.tile.head` — tiles with omp's
+  `omp.job.tile.lead` row included (0.27.0 enriched head-only tiles only); identity capped at 60 % of the line.
+  Verified live on omp 18.18.0 (task + wait with a lead row) and by `wait_tiles_with_a_lead_line_keep_it_and_gain_their_identity`
+  / `a_one_agent_task_head_names_its_agent_model_and_thinking` (both fail on 0.27.0).
 - Verified live (omp 18.17.0, Xvfb, sandbox `PI_CODING_AGENT_DIR`): Alt+A → dashboard (omp's hub gone); popup "Open
   in chat view" on a nested parked subagent → Viewing chip with the parent crumb; Compact refused with the viewing
   text; Esc → main transcript; `/hub` → Activity (130 events, Errors 4); error row → popup at that failed call; flat

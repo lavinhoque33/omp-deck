@@ -1280,6 +1280,73 @@ mod tests {
     }
 
     #[test]
+    fn wait_tiles_with_a_lead_line_keep_it_and_gain_their_identity() {
+        // omp's tiles of running jobs carry a lead row (the agent's latest summary) under
+        // the head. The identity still rides the head's line, and the lead stays below it.
+        let mut h = Harness::with_frames("wait-lead", &[visual_ops("jobs")]);
+        h.hide_duplicates = true;
+        h.agents = (1..=3)
+            .map(|i| AgentMeta {
+                id: format!("Worker{i}"),
+                agent: Some("task".into()),
+                model: Some("fake/lead-model".into()),
+                thinking: Some("medium".into()),
+            })
+            .collect();
+        show_until(&mut h, "Worker1");
+        for _ in 0..8 {
+            h.frame(vec![]);
+        }
+        let out = h.frame(vec![]);
+        let painted = galleys(&out);
+        let title = centre_of(&out, "Worker1").expect("tile title");
+        let on_title_line = |text: &str| {
+            painted
+                .iter()
+                .any(|(p, s, t)| t == text && (p.y + s.y / 2.0 - title.y).abs() < s.y)
+        };
+        assert!(
+            on_title_line("fake/lead-model"),
+            "model chip on the head's line"
+        );
+        assert!(on_title_line("med"), "thinking level on the head's line");
+        let lead = painted
+            .iter()
+            .find(|g| g.2.starts_with("Worker 1 is implementing"))
+            .expect("the lead row still painted");
+        assert!(lead.0.y > title.y, "the lead stays under the head");
+    }
+
+    #[test]
+    fn a_one_agent_task_head_names_its_agent_model_and_thinking() {
+        // The same capture cut to one agent (`Task · 1 agent`): the collapsed head names the
+        // agent with its type, model and thinking instead of the bare count. The level comes
+        // from the transcript's facts when the agent node carries none.
+        let one = serde_json::json!([
+            ["del", "cap-t.CapTwo"],
+            ["set", "cap-t", {"target": "1 agent"}],
+        ]);
+        let mut h = Harness::with_frames("task-one", &[card_ops("task"), one]);
+        h.hide_duplicates = true;
+        h.agents = vec![AgentMeta {
+            id: "CapOne".into(),
+            agent: Some("task".into()),
+            model: Some("fake/fake-1".into()),
+            thinking: Some("high".into()),
+        }];
+        let out = show_until(&mut h, "CapOne");
+        let task = centre_of(&out, "Task").expect("task head");
+        for want in ["CapOne", "task", "fake/fake-1", "high"] {
+            let at = centre_of(&out, want).unwrap_or_else(|| panic!("{want} painted"));
+            assert!((at.y - task.y).abs() < 8.0, "{want} on the head's line");
+        }
+        assert!(
+            centre_of(&out, "1 agent").is_none(),
+            "the name replaces the count"
+        );
+    }
+
+    #[test]
     fn recorded_task_card_expands_on_click_and_shows_its_agents() {
         // Real omp 18.16.0 capture: a collapsed background `Task · 2 agents` card whose
         // agents carry name/type/model. Clicking the head expands it (a `toggle` event

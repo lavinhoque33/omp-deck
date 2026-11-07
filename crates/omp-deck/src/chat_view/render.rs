@@ -1585,7 +1585,7 @@ pub fn item(cx: &Cx, ui: &mut Ui, n: &SNode, list: Option<&SNode>, selected: boo
                 .layout(Layout::left_to_right(Align::Center)),
         );
         child.set_clip_rect(identity.intersect(ui.clip_rect()));
-        tools::identity_line(cx, &mut child, agent, false);
+        tools::identity_line(cx, &mut child, agent);
     }
     if !disabled {
         let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
