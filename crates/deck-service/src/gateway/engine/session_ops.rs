@@ -42,16 +42,9 @@ impl Engine {
             } => {
                 self.accepted(conn, id, &key);
                 let post = reload.map_or(Post::None, Post::ReloadPlugins);
-                self.job(
-                    key,
-                    "plugin-enable",
-                    false,
-                    false,
-                    post,
-                    move |ctx, _, _| {
-                        jobs::plugin_enable(ctx, &name, enabled, scope, cwd.as_deref())
-                    },
-                );
+                self.job(key, "plugin-enable", None, false, post, move |ctx, _, _| {
+                    jobs::plugin_enable(ctx, &name, enabled, scope, cwd.as_deref())
+                });
             }
             Mutation::PluginFeatures {
                 pkg,
@@ -63,7 +56,7 @@ impl Engine {
                 self.job(
                     key,
                     "plugin-features",
-                    false,
+                    None,
                     false,
                     post,
                     move |ctx, _, _| jobs::plugin_features(ctx, &pkg, &features),
@@ -80,7 +73,7 @@ impl Engine {
                 self.job(
                     key,
                     "plugin-config-set",
-                    false,
+                    None,
                     false,
                     post,
                     move |ctx, _, _| jobs::plugin_config_set(ctx, &pkg, &setting, value.as_ref()),
@@ -99,7 +92,7 @@ impl Engine {
                 self.job(
                     key,
                     "usage-reset-spend",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| {
@@ -122,7 +115,7 @@ impl Engine {
                 self.job(
                     key,
                     "session-pin",
-                    false,
+                    None,
                     false,
                     Post::Refresh,
                     move |ctx, _, _| jobs::session_pin(ctx, &session, pinned),
@@ -146,7 +139,7 @@ impl Engine {
                         self.job(
                             key,
                             "session-rename",
-                            false,
+                            None,
                             false,
                             Post::Refresh,
                             move |ctx, _, _| jobs::session_rename(ctx, &file, &title),
@@ -182,7 +175,7 @@ impl Engine {
                         self.job(
                             key,
                             "session-label",
-                            false,
+                            None,
                             false,
                             Post::None,
                             move |ctx, _, _| {
@@ -201,7 +194,7 @@ impl Engine {
                         self.job(
                             key,
                             "session-label",
-                            false,
+                            None,
                             false,
                             Post::None,
                             move |ctx, _, _| {
@@ -220,7 +213,7 @@ impl Engine {
                 self.job(
                     key,
                     "foreign-import",
-                    false,
+                    None,
                     false,
                     Post::Refresh,
                     move |ctx, _, _| jobs::foreign_import(ctx, source, &foreign, &cwd),
@@ -268,7 +261,7 @@ impl Engine {
                         self.job(
                             key,
                             "advisor-save",
-                            false,
+                            None,
                             false,
                             Post::None,
                             move |ctx, _, _| jobs::advisor_save(ctx, &cwd, scope, &doc),

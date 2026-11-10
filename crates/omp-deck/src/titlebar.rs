@@ -17,6 +17,7 @@ use egui::{
     ViewportCommand, pos2, vec2,
 };
 
+use crate::backup_chip::{self, ChipAction, ChipView};
 use crate::badge::{self, Hue};
 use crate::notify_panel;
 use crate::tabs::{self, TabAction, TabBarInput};
@@ -52,6 +53,9 @@ pub struct BarInput<'a> {
     pub app_update: Option<crate::app_update::PillView<'a>>,
     /// A pairing put away behind a pill (click brings the dialog back).
     pub pairing: Option<PairingPill>,
+    /// The job holding the gateway's backup lane (pill + hover card); built once per gateway
+    /// snapshot.
+    pub backup: Option<&'a ChipView>,
     /// The notification bell (badge + popover).
     pub notifications: crate::notify_panel::PanelInput<'a>,
 }
@@ -88,6 +92,10 @@ pub enum BarAction {
     AppUpdate(crate::app_update::UpdateAction),
     /// The backgrounded pairing's pill was clicked: show its dialog again.
     ShowPairing,
+    /// The backup chip's pill was clicked: open the page of that job.
+    OpenBackupActivity(backup_chip::Page),
+    /// The backup chip's card asked to cancel the job holding the backup lane.
+    CancelBackup,
     /// The notification popover asked for something.
     Inbox(crate::notify_panel::PanelAction),
     Quit,
@@ -190,8 +198,23 @@ fn strip_galley(
     galley
 }
 
+/// What the chip's click / Cancel mean for the app.
+fn chip_action(a: Option<ChipAction>) -> Option<BarAction> {
+    match a? {
+        ChipAction::Open(page) => Some(BarAction::OpenBackupActivity(page)),
+        ChipAction::Cancel => Some(BarAction::CancelBackup),
+    }
+}
+
+/// Width reserved at each end of the title row: the larger of the fixed side and what the
+/// window buttons plus the chip (when shown, `chip_w` wide) need. Both ends use it, so the
+/// title stays window-centred and clear of the chip.
+fn strip_side_w(chip_w: Option<f32>) -> f32 {
+    STRIP_SIDE_W.max(CONTROL_W + chip_w.map_or(0.0, |w| 8.0 + w))
+}
+
 /// The CSD title strip: centered, ellipsized active-tab title; drags / maximizes the window.
-fn title_strip(ui: &mut egui::Ui, input: &BarInput<'_>) {
+fn title_strip(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
     let ctx = ui.ctx().clone();
     let pal = Palette::of_ui(ui);
     egui::Panel::top("titlestrip")
@@ -213,6 +236,8 @@ fn title_strip(ui: &mut egui::Ui, input: &BarInput<'_>) {
                 ctx.send_viewport_cmd(ViewportCommand::Maximized(!input.maximized));
             }
             let strip = &input.strip;
+            let mut action = None;
+            let side = strip_side_w(input.backup.map(|v| backup_chip::width(ui, v)));
             let text = if strip.title.is_empty() {
                 "OmpDeck"
             } else {
@@ -234,9 +259,9 @@ fn title_strip(ui: &mut egui::Ui, input: &BarInput<'_>) {
                 },
             );
 
-            // Right: minimize / maximize-restore / close.
+            // Right: the backup chip, then minimize / maximize-restore / close.
             let right_rect = egui::Rect::from_min_max(
-                pos2(rect.right() - STRIP_SIDE_W, rect.top()),
+                pos2(rect.right() - side, rect.top()),
                 pos2(rect.right() - CONTROL_INSET, rect.bottom()),
             );
             ui.scope_builder(
@@ -259,11 +284,17 @@ fn title_strip(ui: &mut egui::Ui, input: &BarInput<'_>) {
                     if win_button(ui, ICON_MINUS, "Minimize", false).clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
                     }
+                    // The backup chip sits left of Minimize; the drag area above was created
+                    // first, so the chip wins hit-testing.
+                    if let Some(v) = input.backup {
+                        ui.add_space(8.0);
+                        action = chip_action(backup_chip::show(ui, v));
+                    }
                 },
             );
 
             // Center: the active tab's title, centered on the window and clear of both groups.
-            let max_w = (rect.width() - 2.0 * (STRIP_SIDE_W + 8.0)).max(40.0);
+            let max_w = (rect.width() - 2.0 * (side + 8.0)).max(40.0);
             let galley = strip_galley(ui, text, max_w, pal.text_strong);
             let pos = rect.center() - galley.size() / 2.0;
             ui.painter().galley(pos, galley, pal.text_strong);
@@ -288,17 +319,22 @@ fn title_strip(ui: &mut egui::Ui, input: &BarInput<'_>) {
                     },
                 );
             }
-        });
+            action
+        })
+        .inner
 }
 
 /// Draws the bar; returns the action requested this frame.
 pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
     let ctx = ui.ctx().clone();
     let pal = Palette::of_ui(ui);
-    let mut action = None;
-    if input.csd {
-        title_strip(ui, input);
-    }
+    // The strip hosts the chip; native frames have no strip, so the tab row does.
+    let tab_row_chip = input.backup.filter(|_| !input.csd);
+    let mut action = if input.csd {
+        title_strip(ui, input)
+    } else {
+        None
+    };
     egui::Panel::top("titlebar")
         .exact_size(tabs::tab_hit_h())
         .show_separator_line(false)
@@ -347,6 +383,7 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                 + notify_panel::bell_width()
                 + 2.0
                 + badge_w
+                + tab_row_chip.map_or(0.0, |v| 4.0 + backup_chip::width(ui, v))
                 + input
                     .pairing
                     .as_ref()
@@ -384,6 +421,12 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                             (current, latest),
                         );
                         if let Some(a) = update_popover(&badge, o) {
+                            action = Some(a);
+                        }
+                    }
+                    if let Some(v) = tab_row_chip {
+                        ui.add_space(4.0);
+                        if let Some(a) = chip_action(backup_chip::show(ui, v)) {
                             action = Some(a);
                         }
                     }
@@ -745,7 +788,6 @@ fn pill(
     icon: crate::icons::Icon,
     tone: Option<egui::Color32>,
 ) -> egui::Response {
-    let pal = Palette::of_ui(ui);
     let galley = badge_galley(ui, label);
     let (rect, resp) = ui.allocate_exact_size(
         vec2(badge_width(&galley), theme::dens(24.0, 28.0)),
@@ -754,8 +796,38 @@ fn pill(
     let hov = ui
         .ctx()
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+    let fg = pill_chrome(ui, rect, hov, tone);
     let p = ui.painter();
-    let (fg, label_fg) = if theme::flat() {
+    paint_icon(
+        p,
+        pos2(rect.left() + 10.0 + 8.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        16.0,
+        fg,
+    );
+    p.galley(
+        pos2(
+            rect.left() + 10.0 + 16.0 + 6.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        fg,
+    );
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Paints a pill's background (accent gradient and glow; flat themes: accent outline) and returns
+/// the colour its content (glyph, text) is drawn in. `hov` is the hover animation, 0..=1.
+pub(crate) fn pill_chrome(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    hov: f32,
+    tone: Option<egui::Color32>,
+) -> egui::Color32 {
+    let pal = Palette::of_ui(ui);
+    let p = ui.painter();
+    if theme::flat() {
         // Flat chip: the one deliberate accent in the bar.
         let accent = tone.unwrap_or(pal.accent);
         p.rect(
@@ -765,7 +837,7 @@ fn pill(
             Stroke::new(1.0, accent.gamma_multiply(0.55 + 0.35 * hov)),
             StrokeKind::Inside,
         );
-        (accent, accent)
+        accent
     } else {
         let (a, b) = tone.map_or((pal.accent_a, pal.accent_b), |t| {
             (t, theme::mix(t, egui::Color32::BLACK, 0.25))
@@ -784,25 +856,8 @@ fn pill(
             Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.18 + 0.25 * hov)),
             StrokeKind::Inside,
         );
-        (egui::Color32::WHITE, egui::Color32::WHITE)
-    };
-    paint_icon(
-        p,
-        pos2(rect.left() + 10.0 + 8.0, rect.center().y),
-        egui::Align2::CENTER_CENTER,
-        icon,
-        16.0,
-        fg,
-    );
-    p.galley(
-        pos2(
-            rect.left() + 10.0 + 16.0 + 6.0,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        label_fg,
-    );
-    resp.on_hover_cursor(CursorIcon::PointingHand)
+        egui::Color32::WHITE
+    }
 }
 
 fn badge_galley(ui: &egui::Ui, label: &str) -> std::sync::Arc<egui::Galley> {
@@ -1141,7 +1196,11 @@ mod tests {
 
     /// Every text and glyph of the tab row (logo, tab icons and titles, ✕, the update badge, the
     /// bell, settings and menu buttons) is vertically centred on the row, in every density.
-    fn assert_row_centered(style: deck_core::config::UiStyle, density: deck_core::config::Density) {
+    fn assert_row_centered(
+        style: deck_core::config::UiStyle,
+        density: deck_core::config::Density,
+        csd: bool,
+    ) {
         use std::collections::{HashMap, HashSet};
         let ctx = Context::default();
         crate::ui_fonts::install(&ctx, crate::ui_fonts::UiFonts::none());
@@ -1156,6 +1215,26 @@ mod tests {
         let finishing = std::collections::HashMap::new();
         let parkable = HashSet::new();
         let state = UpdateState::default();
+        let chip = ChipView::new(
+            &deck_service::gateway::protocol::LaneJob {
+                label: "Backing up /srv/proj".to_owned(),
+                kind: deck_service::gateway::protocol::LaneKind::ProjectBackup {
+                    project: "/srv/proj".into(),
+                },
+                origin: deck_service::gateway::protocol::LaneOrigin::Desktop,
+                started_unix_ms: 0,
+                progress: Some(deck_service::gateway::protocol::Progress {
+                    stage: "Uploading".to_owned(),
+                    done: 1,
+                    total: Some(3),
+                }),
+                pass: None,
+                cancellable: true,
+                cancelling: false,
+            },
+            "Google Drive",
+            false,
+        );
         let input = BarInput {
             tabs: TabBarInput {
                 tabs: &tabs,
@@ -1186,14 +1265,14 @@ mod tests {
                 shown: &[],
                 dashboard: false,
             },
-            csd: false,
+            csd,
             maximized: false,
             settings_active: true,
             can_reopen: false,
             font_size: 13.0,
             theme: Theme::Dark,
             dark_only: None,
-            native_decorations: true,
+            native_decorations: !csd,
             strip: StripInput {
                 title: "",
                 cwd: None,
@@ -1207,6 +1286,7 @@ mod tests {
             }),
             app_update: None,
             pairing: None,
+            backup: Some(&chip),
             notifications: notify_panel::PanelInput {
                 entries: &[],
                 badge: None,
@@ -1222,7 +1302,9 @@ mod tests {
             ..Default::default()
         };
         theme::apply(&ctx, style, density, font, true);
-        let row_mid = tabs::tab_hit_h() / 2.0;
+        // CSD: the title strip is the top STRIP_H, the tab row follows it.
+        let strip_h = if csd { STRIP_H } else { 0.0 };
+        let row_mid = strip_h + tabs::tab_hit_h() / 2.0;
         let mut shapes = Vec::new();
         for _ in 0..3 {
             let mut out = ctx.run_ui(raw.clone(), |ui| {
@@ -1232,32 +1314,61 @@ mod tests {
             shapes = out.shapes;
         }
         let mut texts = 0;
+        let mut chip_texts = Vec::new();
         for cs in &shapes {
             if let egui::Shape::Text(t) = &cs.shape {
-                let y = t.galley.rect.translate(t.pos.to_vec2()).center().y;
-                let off = y - row_mid;
+                let r = t.galley.rect.translate(t.pos.to_vec2());
+                let mid = if r.center().y < strip_h {
+                    STRIP_H / 2.0
+                } else {
+                    row_mid
+                };
+                let off = r.center().y - mid;
                 assert!(
                     off.abs() <= 0.5,
-                    "{style:?}/{density:?}: {:?} off by {off}",
+                    "{style:?}/{density:?}/csd={csd}: {:?} off by {off}",
                     t.galley.text()
                 );
+                if matches!(t.galley.text(), "proj" | "33%") {
+                    chip_texts.push(r);
+                }
                 texts += 1;
             }
         }
         // Logo glyph + name, 2 × (icon, title), the active ✕, badge icon + label, bell,
-        // gear, menu.
+        // gear, menu (+ the strip's title and window buttons in CSD).
         assert!(
             texts >= 11,
-            "{style:?}/{density:?}: row painted {texts} texts"
+            "{style:?}/{density:?}/csd={csd}: row painted {texts} texts"
         );
+        // The chip's label and percent sit in the strip (CSD) or the tab row (native), and in
+        // the strip they end left of the window buttons.
+        assert_eq!(chip_texts.len(), 2, "{style:?}/{density:?}/csd={csd}");
+        for r in chip_texts {
+            assert_eq!(
+                r.center().y < strip_h,
+                csd,
+                "{style:?}/{density:?}/csd={csd}"
+            );
+            if csd {
+                assert!(
+                    r.right() <= 1200.0 - CONTROL_W,
+                    "chip overlaps the window buttons"
+                );
+            }
+        }
     }
 
+    /// The backup chip is centred on the 40 px title strip with a CSD window, and on the tab row
+    /// (its fallback) with native frames; never both, and clear of the window buttons.
     #[test]
-    fn tab_row_content_is_vertically_centered() {
+    fn tab_row_and_strip_content_is_vertically_centered() {
         use deck_core::config::{Density, UiStyle};
-        for style in UiStyle::ALL {
-            for density in [Density::Compact, Density::Comfortable] {
-                assert_row_centered(style, density);
+        for csd in [false, true] {
+            for style in UiStyle::ALL {
+                for density in [Density::Compact, Density::Comfortable] {
+                    assert_row_centered(style, density, csd);
+                }
             }
         }
     }

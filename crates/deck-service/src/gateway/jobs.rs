@@ -118,6 +118,13 @@ impl Handles {
             .map(|(o, _)| o.clone())
     }
 
+    /// The folder project restore `handle` writes into.
+    pub fn project_restore_target(&self, handle: u64) -> Option<PathBuf> {
+        lock(&self.project_restores)
+            .get(&handle)
+            .map(|(_, p)| p.plan.target.clone())
+    }
+
     /// The local copies project restore `handle` overwrites under `conflicts`: `(session id,
     /// local session file)` of every backed-up session whose choice is
     /// [`backup::ConflictChoice::Overwrite`] and that is not in `excluded` (left out of the
@@ -1247,7 +1254,7 @@ pub fn server_forget(ctx: &JobCtx) -> Result<Done, GatewayError> {
         .map_err(failed)
 }
 
-fn progress_of(p: backup::Progress) -> Progress {
+pub(crate) fn progress_of(p: backup::Progress) -> Progress {
     Progress {
         stage: format!("{:?}", p.stage),
         done: p.done,

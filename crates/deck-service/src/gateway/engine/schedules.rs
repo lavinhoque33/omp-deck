@@ -4,7 +4,8 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use deck_core::backup::{self, Destination, LastBackup, MemoryBank, OmpDir, Parts, ProjectSizes};
@@ -12,11 +13,13 @@ use deck_core::omp::UpdateStatus;
 use deck_core::selfupdate::{self, InstallKind, Release};
 use deck_core::usage::UsageSnapshot;
 
+use super::lane::{BackupLane, Cancelled};
+use super::mutate::Reporter;
 use super::{Engine, Sched};
 use crate::gateway::GATEWAY_VERSION;
 use crate::gateway::protocol::{
-    AppUpdateView, BackupView, GatewayError, OmpUpdateView, Progress, ServerView, UpdatePhase,
-    UsageView,
+    AppUpdateView, BackupView, GatewayError, LaneJob, LaneKind, LaneOrigin, OmpUpdateView,
+    Progress, ServerView, UpdatePhase, UsageView,
 };
 
 /// First usage fetch after start (or after omp turned up).
@@ -29,8 +32,6 @@ const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 const BACKUP_FIRST: Duration = Duration::from_secs(45);
 /// First automatic project pass after the destination was set up (or turning it on).
 const PROJECT_FIRST: Duration = Duration::from_secs(2 * 60);
-/// The backup lane label of automatic work.
-const AUTO_LANE: &str = "automatic backup";
 
 /// What the destinations' local records say (read on a worker).
 pub(crate) struct Accounts {
@@ -78,6 +79,8 @@ pub(super) struct Schedules {
     next_project: Option<Instant>,
     project_period: Option<Duration>,
     pass: VecDeque<PathBuf>,
+    /// Folders the running pass started with (`pass` holds those not started yet).
+    pass_total: u32,
 }
 
 impl Schedules {
@@ -116,6 +119,39 @@ impl Schedules {
             next_project: None,
             project_period: None,
             pass: VecDeque::new(),
+            pass_total: 0,
+        }
+    }
+
+    /// Starts an automatic project pass over `folders`.
+    fn start_pass(&mut self, folders: VecDeque<PathBuf>) {
+        self.pass_total = u32::try_from(folders.len()).unwrap_or(u32::MAX);
+        self.pass = folders;
+    }
+
+    /// The next folder of the running pass with its 1-based index and the pass's size.
+    fn next_in_pass(&mut self) -> Option<(PathBuf, u32, u32)> {
+        let path = self.pass.pop_front()?;
+        let left = u32::try_from(self.pass.len()).unwrap_or(u32::MAX);
+        Some((path, self.pass_total.saturating_sub(left), self.pass_total))
+    }
+
+    /// Drops the folders of the running automatic project pass not started yet.
+    fn drop_pass(&mut self) {
+        self.pass.clear();
+    }
+
+    /// [`crate::gateway::protocol::Mutation::CancelBackupJob`]: asks `lane`'s job to stop; an
+    /// automatic folder also drops the rest of its pass (the next pass comes on the next
+    /// interval). `false`: nothing cancellable holds the lane.
+    pub(super) fn cancel_lane(&mut self, lane: &mut BackupLane) -> bool {
+        match lane.cancel() {
+            None => false,
+            Some(Cancelled::Request) => true,
+            Some(Cancelled::Automatic) => {
+                self.drop_pass();
+                true
+            }
         }
     }
 
@@ -293,7 +329,7 @@ impl Engine {
                 Destination::Drive => drive.and_then(|(_, l)| l.clone()),
                 Destination::Server => server.and_then(|(_, l)| l.clone()),
             },
-            busy: self.backup_lane.clone(),
+            busy: self.backup_lane.job().cloned(),
             last_error: s.backup_error.clone(),
             last_auto_unix_ms: s.last_auto,
         }
@@ -427,10 +463,15 @@ impl Engine {
         {
             if now < at {
                 next.push(at);
-            } else if self.backup_lane.is_none() {
+            } else if self.backup_lane.is_free() {
                 self.sched.next_backup = Some(now + period);
-                self.backup_lane = Some(AUTO_LANE.to_owned());
-                self.dirty.backup = true;
+                self.claim_auto(
+                    "Automatic settings backup".to_owned(),
+                    LaneKind::ConfigBackup,
+                    None,
+                    false,
+                    Arc::new(AtomicBool::new(false)),
+                );
                 let destination = self.cfg.backup_destination;
                 let service = self.service.with_destination(destination);
                 self.spawn_worker("backup-auto", move || {
@@ -450,19 +491,20 @@ impl Engine {
             if now >= at {
                 self.sched.next_project = Some(now + period);
                 if self.sched.pass.is_empty() {
-                    self.sched.pass = self
+                    let folders = self
                         .cfg
                         .project_sync
                         .iter()
                         .filter(|r| parts_of(r).any())
                         .map(|r| r.path.clone())
                         .collect();
+                    self.sched.start_pass(folders);
                 }
             } else {
                 next.push(at);
             }
         }
-        if self.backup_lane.is_none() {
+        if self.backup_lane.is_free() {
             self.next_project_backup();
         }
         if let Some(at) = next.into_iter().min() {
@@ -527,7 +569,7 @@ impl Engine {
             return;
         }
         let service = self.service.with_destination(self.cfg.backup_destination);
-        while let Some(path) = self.sched.pass.pop_front() {
+        while let Some((path, index, total)) = self.sched.next_in_pass() {
             // The row may have been removed or turned off since the pass started.
             let Some(row) = self
                 .cfg
@@ -540,8 +582,20 @@ impl Engine {
             let want = parts_of(row);
             let excluded = row.excluded_sessions.clone();
             let root = self.root.clone();
-            self.backup_lane = Some(AUTO_LANE.to_owned());
-            self.dirty.backup = true;
+            let cancel = Arc::new(AtomicBool::new(false));
+            self.claim_auto(
+                format!(
+                    "Automatic backup of {}",
+                    deck_core::sessions::abbreviate_home(&path)
+                ),
+                LaneKind::ProjectBackup {
+                    project: path.clone(),
+                },
+                Some((index, total)),
+                true,
+                cancel.clone(),
+            );
+            let reporter = Reporter::new(self.tx.clone(), None);
             self.spawn_worker("project-auto", move || {
                 let result = backup::measure(&root, &path)
                     .map_err(|e| e.to_string())
@@ -556,13 +610,20 @@ impl Engine {
                             );
                             return Ok(());
                         }
-                        let cancel = AtomicBool::new(false);
                         service
-                            .backup_project(&root, &path, parts, &excluded, false, &cancel, &|_| {})
+                            .backup_project(&root, &path, parts, &excluded, false, &cancel, &|p| {
+                                reporter.report(crate::gateway::jobs::progress_of(p));
+                            })
                             .map(drop)
                             .map_err(|e| e.to_string())
                     });
-                Sched::ProjectAuto { path, result }.into()
+                let cancelled = cancel.load(Ordering::Relaxed);
+                Sched::ProjectAuto {
+                    path,
+                    result,
+                    cancelled,
+                }
+                .into()
             });
             return;
         }
@@ -718,20 +779,135 @@ impl Engine {
                 }
                 self.load_accounts();
             }
-            Sched::ProjectAuto { path, result } => {
+            Sched::ProjectAuto {
+                path,
+                result,
+                cancelled,
+            } => {
                 self.release_auto_lane();
-                if let Err(e) = result {
-                    log::warn!("automatic project backup of {} failed: {e}", path.display());
+                // Only logged: the destination's `last_error` is the automatic config backup's,
+                // and a cancelled folder is no failure.
+                match result {
+                    Err(_) if cancelled => {
+                        log::info!("automatic project backup of {} cancelled", path.display());
+                    }
+                    Err(e) => {
+                        log::warn!("automatic project backup of {} failed: {e}", path.display());
+                    }
+                    Ok(()) => {}
                 }
                 self.waker.now();
+            }
+            Sched::AutoProgress(progress) => {
+                if self.backup_lane.progress(None, progress) {
+                    self.dirty.backup = true;
+                }
             }
         }
     }
 
+    /// Puts automatic work on the backup lane.
+    fn claim_auto(
+        &mut self,
+        label: String,
+        kind: LaneKind,
+        pass: Option<(u32, u32)>,
+        cancellable: bool,
+        cancel: Arc<AtomicBool>,
+    ) {
+        let job = LaneJob {
+            label,
+            kind,
+            origin: LaneOrigin::Automatic,
+            started_unix_ms: crate::gateway::unix_ms(),
+            progress: None,
+            pass,
+            cancellable,
+            cancelling: false,
+        };
+        self.claim_lane(job, cancel, None);
+    }
+
     fn release_auto_lane(&mut self) {
-        if self.backup_lane.as_deref() == Some(AUTO_LANE) {
-            self.backup_lane = None;
-        }
+        self.backup_lane.release(None);
         self.dirty.backup = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn auto_folder(project: &Path, pass: (u32, u32)) -> LaneJob {
+        LaneJob {
+            label: "Automatic backup of ~/b".to_owned(),
+            kind: LaneKind::ProjectBackup {
+                project: project.to_path_buf(),
+            },
+            origin: LaneOrigin::Automatic,
+            started_unix_ms: 1,
+            progress: None,
+            pass: Some(pass),
+            cancellable: true,
+            cancelling: false,
+        }
+    }
+
+    #[test]
+    fn pass_folders_are_numbered_against_the_pass_they_started_in() {
+        let mut s = Schedules::new(Instant::now(), false);
+        s.start_pass(["/p/a", "/p/b", "/p/c"].map(PathBuf::from).into());
+        let taken: Vec<(u32, u32)> = std::iter::from_fn(|| s.next_in_pass())
+            .map(|(_, i, n)| (i, n))
+            .collect();
+        assert_eq!(taken, [(1, 3), (2, 3), (3, 3)]);
+    }
+
+    #[test]
+    fn cancelling_an_automatic_folder_stops_it_and_drops_the_rest_of_its_pass() {
+        let mut s = Schedules::new(Instant::now(), false);
+        s.start_pass(["/p/a", "/p/b", "/p/c"].map(PathBuf::from).into());
+        s.next_in_pass();
+        let (path, index, total) = s.next_in_pass().expect("second folder");
+        // The flag handed to the folder's backup.
+        let seen_by_backup = Arc::new(AtomicBool::new(false));
+        let mut lane = BackupLane::default();
+        lane.claim(
+            auto_folder(&path, (index, total)),
+            seen_by_backup.clone(),
+            None,
+        );
+
+        assert!(s.cancel_lane(&mut lane));
+        assert!(seen_by_backup.load(Ordering::Relaxed));
+        let shown = lane.job().expect("held until the folder ends");
+        assert!(shown.cancelling);
+        assert_eq!(shown.pass, Some((2, 3)));
+        // `/p/c` is not started: the next pass comes on the next interval.
+        assert_eq!(s.next_in_pass(), None);
+        assert!(lane.release(None));
+    }
+
+    #[test]
+    fn the_automatic_settings_backup_cannot_be_cancelled() {
+        let mut s = Schedules::new(Instant::now(), false);
+        s.start_pass(["/p/a"].map(PathBuf::from).into());
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut lane = BackupLane::default();
+        lane.claim(
+            LaneJob {
+                kind: LaneKind::ConfigBackup,
+                cancellable: false,
+                pass: None,
+                ..auto_folder(Path::new("/p/a"), (1, 1))
+            },
+            flag.clone(),
+            None,
+        );
+        assert!(!s.cancel_lane(&mut lane));
+        assert!(!flag.load(Ordering::Relaxed));
+        // A refused cancel leaves the pass alone.
+        assert!(s.next_in_pass().is_some());
     }
 }

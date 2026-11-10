@@ -11,6 +11,7 @@
 mod deferred;
 mod device;
 mod interest;
+mod lane;
 mod model_route;
 mod mutate;
 mod notify;
@@ -228,7 +229,11 @@ pub(crate) enum Sched {
     ProjectAuto {
         path: PathBuf,
         result: Result<(), String>,
+        /// The folder was cancelled ([`super::protocol::Mutation::CancelBackupJob`]).
+        cancelled: bool,
     },
+    /// Throttled progress of the running automatic project folder.
+    AutoProgress(Progress),
 }
 
 impl From<Sched> for Fin {
@@ -359,8 +364,6 @@ struct JobState {
     label: &'static str,
     progress: Option<Progress>,
     cancel: Option<Arc<AtomicBool>>,
-    /// Holds the one-at-a-time backup lane.
-    lane: bool,
     post: mutate::Post,
 }
 
@@ -422,7 +425,7 @@ pub(crate) struct Engine {
 
     sess: sessions::Sessions,
     jobs: HashMap<RequestKey, JobState>,
-    backup_lane: Option<String>,
+    backup_lane: lane::BackupLane,
     mode_queue: VecDeque<(RequestKey, GatewayMode)>,
     mode_busy: bool,
     mode_failed: Option<String>,
@@ -562,7 +565,7 @@ impl Engine {
             next_seq: 0,
             sess: sessions::Sessions::new(manifest),
             jobs: HashMap::new(),
-            backup_lane: None,
+            backup_lane: lane::BackupLane::default(),
             mode_queue: VecDeque::new(),
             mode_busy: false,
             mode_failed: None,
@@ -1067,7 +1070,7 @@ impl Engine {
             && !self.sess.closing()
             && self.sess.busy_controllers() == 0
             && self.sess.direct_programs() == 0
-            && self.backup_lane.is_none()
+            && self.backup_lane.is_free()
             && !self.mode_busy
             && self.mode_queue.is_empty()
     }

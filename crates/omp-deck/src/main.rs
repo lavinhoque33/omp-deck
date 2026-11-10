@@ -12,6 +12,7 @@ mod agent_output;
 mod agent_popup;
 mod app;
 mod app_update;
+mod backup_chip;
 mod backup_view;
 mod badge;
 mod card;

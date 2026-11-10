@@ -666,6 +666,12 @@ a project (or a session, under **Backup**) in the sidebar → **Back up to <dest
 **Back up to Google Drive…** or **Back up to sftp://host…**) for a one-off backup, optionally adding the
 folder to the table.
 
+While any backup, restore or backup delete runs (started here, from the phone, or by a schedule), a pill in the
+title bar shows its folder, a progress bar and the percentage. Hover it for the details (what, destination,
+stage, amount, folder N of M for automatic passes, who started it, elapsed time) and **Cancel job**; click it to
+open the matching Settings page. The command palette has **Backup: Cancel running job** too. A cancelled backup
+uploads nothing and is not recorded as a failure.
+
 **Restore…** (on the Sync page, or **Restore from <destination>…** in the sidebar menu, which restores
 into that project's folder) lists project backups by project and machine, newest first, with older
 versions selectable. Pick the folder to restore into (it is created if missing) and **.omp folder**,

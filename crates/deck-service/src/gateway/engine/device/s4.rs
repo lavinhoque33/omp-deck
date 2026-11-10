@@ -1509,7 +1509,7 @@ impl Engine {
                             .as_ref()
                             .and_then(|b| u64::try_from(b.unix.saturating_mul(1000)).ok()),
                         interval: views::sync_interval(self.cfg.drive_backup_interval),
-                        busy: v.busy.as_deref().map(|b| canon.scrub(b)),
+                        busy: v.busy.as_ref().map(|b| canon.scrub(&b.label)),
                         error: v.last_error.as_deref().map(|e| match v.destination {
                             Destination::Server => views::server_failure(e),
                             Destination::Drive => canon.scrub(e),
@@ -1538,7 +1538,7 @@ impl Engine {
                             .and_then(|p| u64::try_from(p.last.unix.saturating_mul(1000)).ok()),
                     })
                     .collect();
-                let busy = self.backup_view().busy.map(|b| canon.scrub(&b));
+                let busy = self.backup_view().busy.map(|b| canon.scrub(&b.label));
                 let interval = views::sync_interval(self.cfg.project_sync_interval);
                 fit_feed(feed, &rows, |rows, truncated| FeedValue::Sync {
                     rows,

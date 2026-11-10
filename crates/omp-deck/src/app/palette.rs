@@ -1162,6 +1162,15 @@ impl App {
             ICON_CLOUD,
             project_backup_why,
         );
+        if self.backup_job_cancellable() {
+            add(
+                "backup.cancel",
+                "Backup: Cancel running job",
+                None,
+                ICON_X,
+                None,
+            );
+        }
 
         // Mobile access (the same gate as the settings button).
         let pair_why: Why = pair_block(
@@ -1503,6 +1512,7 @@ impl App {
             "backup.manage" => self.apply_backup_action(BackupAction::OpenManager),
             "sync.restore" => self.apply_sync_action(SyncAction::OpenRestore),
             "sync.manage" => self.apply_sync_action(SyncAction::OpenManager),
+            "backup.cancel" => self.cancel_backup_job(),
             "app.refresh" => self.refresh_sessions(),
             "app.quit" => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             other => log::warn!("unknown palette command {other}"),

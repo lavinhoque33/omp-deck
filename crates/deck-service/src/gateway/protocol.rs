@@ -821,11 +821,64 @@ pub struct BackupView {
     pub server: Option<ServerView>,
     /// The active destination's last upload from this machine.
     pub last_backup: Option<LastBackup>,
-    /// A backup-lane job is running (only one at a time, any destination).
-    pub busy: Option<String>,
+    /// The job holding the backup lane (only one at a time, any destination).
+    pub busy: Option<LaneJob>,
     /// The last automatic backup's failure at the active destination.
     pub last_error: Option<String>,
     pub last_auto_unix_ms: Option<u64>,
+}
+
+/// The job holding the backup lane, whoever started it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneJob {
+    /// Human, e.g. "Backing up ~/proj", "Automatic settings backup".
+    pub label: String,
+    pub kind: LaneKind,
+    pub origin: LaneOrigin,
+    /// When the lane was claimed.
+    pub started_unix_ms: u64,
+    /// The latest report (same stages as [`Progress`]); `None` = indeterminate.
+    pub progress: Option<Progress>,
+    /// Automatic project passes: (1-based folder index, folders in this pass).
+    pub pass: Option<(u32, u32)>,
+    /// [`Mutation::CancelBackupJob`] would stop it.
+    pub cancellable: bool,
+    /// A cancel was asked and the job has not ended yet.
+    pub cancelling: bool,
+}
+
+/// What a backup-lane job does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaneKind {
+    /// [`Mutation::Backup`] and the automatic settings backup.
+    ConfigBackup,
+    /// [`Mutation::PrepareRestore`] and [`Mutation::ApplyRestore`].
+    ConfigRestore,
+    ConfigDelete {
+        count: usize,
+    },
+    /// [`Mutation::ProjectBackup`] and automatic project folders.
+    ProjectBackup {
+        project: PathBuf,
+    },
+    /// [`Mutation::ProjectPrepareRestore`] and [`Mutation::ProjectApplyRestore`].
+    ProjectRestore {
+        target: PathBuf,
+    },
+    ProjectDelete {
+        count: usize,
+    },
+    /// Drive sign-in finish / sign-out, server connect / forget, connect on desktop.
+    Account,
+}
+
+/// Who started a backup-lane job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaneOrigin {
+    Automatic,
+    Desktop,
+    /// The paired device's name.
+    Device(String),
 }
 
 /// [`Topic::Mobile`]: everything the desktop shows about mobile access. Never carries a secret
@@ -1265,6 +1318,8 @@ pub enum Mutation {
     InboxTest,
     /// Cancel a running job.
     CancelJob(RequestKey),
+    /// Cancel the job holding the backup lane, whoever started it (inline result).
+    CancelBackupJob,
     /// Fetch usage now (through omp's report cache, like omp's own `/usage`).
     UsageRefresh,
     /// Check omp for an update now.
@@ -1562,6 +1617,7 @@ impl Mutation {
             Mutation::InboxClear => "inbox-clear",
             Mutation::InboxTest => "inbox-test",
             Mutation::CancelJob(_) => "cancel-job",
+            Mutation::CancelBackupJob => "cancel-backup-job",
             Mutation::UsageRefresh => "usage-refresh",
             Mutation::OmpUpdateCheck => "omp-update-check",
             Mutation::RefreshSessions => "refresh-sessions",
@@ -1633,6 +1689,7 @@ impl Mutation {
                 | Mutation::InboxDismiss(_)
                 | Mutation::InboxClear
                 | Mutation::CancelJob(_)
+                | Mutation::CancelBackupJob
                 | Mutation::RefreshSessions
                 | Mutation::DriveLoginCancel(_)
                 | Mutation::DiscardRestore(_)

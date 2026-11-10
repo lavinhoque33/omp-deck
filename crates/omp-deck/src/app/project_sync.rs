@@ -173,24 +173,11 @@ impl SyncUi {
 
 /// The progress line of a gateway progress report.
 fn prog_view(p: &Progress) -> ProgView {
-    let label = match p.stage.as_str() {
-        "Scanning" => "Scanning",
-        "Packing" => "Packing",
-        "Uploading" => "Uploading",
-        "Downloading" => "Downloading",
-        "Verifying" => "Verifying",
-        "RestoringOmp" => "Restoring .omp",
-        "RestoringSessions" => "Restoring sessions",
-        "RestoringMemory" => "Restoring memory",
-        other => other,
-    };
-    let fraction = p
-        .total
-        .filter(|t| *t > 0)
-        .map(|t| (p.done as f64 / t as f64) as f32);
+    let label = crate::backup_chip::stage_label(&p.stage);
+    let fraction = crate::backup_chip::fraction(p);
     ProgView {
         label: match fraction {
-            Some(f) => format!("{label} {}%", (f.clamp(0.0, 1.0) * 100.0) as u32),
+            Some(f) => format!("{label} {}%", crate::backup_chip::percent(f)),
             None => format!("{label}…"),
         },
         fraction,
@@ -855,6 +842,11 @@ impl App {
                         format!("{name} is unchanged since its last backup"),
                     );
                 }
+            }
+            // The user stopped it (title-bar chip, palette, dialog): not a failure of the folder.
+            Err(msg) if is_cancelled(&msg) => {
+                self.toasts
+                    .info(&self.ctx, format!("Backup of {name} cancelled"));
             }
             Err(msg) => {
                 self.sync.errors.insert(path, msg.clone());

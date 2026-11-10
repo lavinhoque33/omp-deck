@@ -3262,7 +3262,8 @@ deleted).
 - Protocol (`PROTOCOL` stays 1; the 0.20.0 gateway version makes a newer GUI replace an older gateway):
   - `Topic::Drive`/`TopicValue::Drive(DriveView)` → `Topic::Backup`/`TopicValue::Backup(BackupView)`;
     `StateCache.backup` (always on). `BackupView { destination, drive_available, drive_signed_in, drive_email,
-    server: Option<ServerView>, last_backup /* active destination */, busy /* lane label */, last_error
+    server: Option<ServerView>, last_backup /* active destination */, busy /* LaneJob since 0.27.3: see "Backup
+    activity chip" */, last_error
     /* automatic backup at the active destination */, last_auto_unix_ms }`, `linked()`, `place()`.
   - `ServerView { protocol, host, port /* effective */, user /* None = anonymous */, key_path, folder, pinned:
     bool, label }` = `ServerView::of(&ServerAccount)`: never the password or passphrase.
@@ -4195,3 +4196,67 @@ max_length, rows}}`.
   `fieldError` messages for instant feedback; Submit (valid only) and Cancel; `answerLabel` for forms; an error from
   the gateway (omp's own check) shown on the card.
 - `e2e/live/spec.ts` ask step uses the form card.
+
+## Backup activity chip in the title bar (user, 2026-11-10)
+
+User: "when i click backup to … from the right click of a project folder and start a sync, or when i start a sync
+from settings, there is no progress bar visible, only at the end it says finished … we should show one, and it
+shouldn't be blocking, it should be a chip/card on the top bar (title bar) that'll show the percentage bar etc, and
+hover will show more details (and possibly ability to cancel the action)".
+
+Decision: the chip shows **whatever job holds the gateway's backup lane** (this window's, another window's, the
+phone's, or an automatic pass), because the gateway owns the lane; the window's own `SyncUi.job` stays for dialogs.
+
+### Protocol (`deck_service::gateway::protocol`)
+- `BackupView.busy: Option<String>` becomes `busy: Option<LaneJob>`:
+  ```rust
+  pub struct LaneJob {                 // Clone, Debug, PartialEq, Eq, Serialize, Deserialize
+      pub label: String,               // human, e.g. "Backing up ~/proj", "Automatic settings backup"
+      pub kind: LaneKind,
+      pub origin: LaneOrigin,
+      pub started_unix_ms: u64,        // when the lane was claimed
+      pub progress: Option<Progress>,  // latest report (same stage strings as today); None = indeterminate
+      /// Automatic project passes: (1-based folder index, folders in this pass).
+      pub pass: Option<(u32, u32)>,
+      pub cancellable: bool,           // Mutation::CancelBackupJob would stop it
+      pub cancelling: bool,            // a cancel was asked and the job has not ended yet
+  }
+  pub enum LaneKind {                  // Clone, Debug, PartialEq, Eq, Serialize, Deserialize
+      ConfigBackup,                    // Mutation::Backup and the automatic settings backup
+      ConfigRestore,                   // PrepareRestore + ApplyRestore
+      ConfigDelete { count: usize },   // DeleteBackup(s)
+      ProjectBackup { project: PathBuf },
+      ProjectRestore { target: PathBuf },       // ProjectPrepareRestore + ProjectApplyRestore
+      ProjectDelete { count: usize },           // ProjectDeleteBackup(s)
+      Account,                          // Drive sign-in finish / sign-out, server connect / forget, connect on desktop
+  }
+  pub enum LaneOrigin { Automatic, Desktop, Device(String) } // Device = the paired device's name
+  ```
+- `Mutation::CancelBackupJob` (no payload): cancels the job holding the lane, whoever started it. Refused
+  `"no backup job is running"` / `"this job cannot be cancelled"`. Inline result (`Done::Unit`-style like other
+  inline mutations). Not a device op (no phone route in this step).
+- Cancellable: `ProjectBackup`, `ProjectPrepareRestore`, `ProjectApplyRestore` (as today) **and automatic project
+  folders** (they get a real cancel flag). Cancelling an automatic project folder also drops the rest of that pass
+  (next pass on the next interval); a cancelled automatic folder is logged, never stored as `last_error`. The
+  automatic settings backup and account/delete jobs stay non-cancellable.
+- Progress: lane jobs' `Fin::Progress` (already throttled by `Reporter`) also updates `LaneJob.progress` and marks the
+  Backup topic dirty; automatic project folders report progress the same way (throttled the same).
+- The phone's s4 view keeps a string: `busy = LaneJob.label` (scrubbed as today); api vectors unchanged.
+- The precheck refusal keeps naming the job: "Another backup job is running ({label}); try again."
+
+### Desktop (`omp-deck`)
+- Pill in the **title strip** (the CSD row with the logo, centred tab title and window buttons), immediately left of
+  Minimize; the centred title keeps a symmetric side reserve so it never overlaps the pill (user correction: it first
+  landed in the tab row). With native decorations there is no title strip, so the pill sits in the tab row's right
+  group. Shown while `backup_view().busy` is `Some`: kind icon (upload for backup,
+  download for restore, trash for delete, user for account), short label (folder basename / "Settings"), a slim
+  progress bar (determinate when `progress.total > 0`, else an animated indeterminate sweep that repaints only while
+  shown), and the percent. Bounded width; elided label; "Cancelling…" while `cancelling`.
+- Hover: an interactive card (`card.rs` chrome: icon tile header + gradient rule, "▸ KEY" rows with badges): what +
+  folder (full `~` path), destination (Google Drive / server), stage with percent, amount (bytes as human sizes for
+  byte stages; items for Scanning), folder N of M (automatic pass), started by (Automatic / This desktop / phone
+  name), elapsed, and a danger **Cancel** DraftButton when `cancellable` (else a muted "Can't be cancelled"). The
+  pointer can move onto the card to press Cancel.
+- Click on the pill opens Settings → Project sync for project kinds, Settings → OmpDeck → Backup for config/account.
+- Palette: "Backup: Cancel running job" while a cancellable lane job runs (same gated path as the card).
+- Results are still reported by the existing toasts / Sync page; the pill simply disappears when the lane frees.

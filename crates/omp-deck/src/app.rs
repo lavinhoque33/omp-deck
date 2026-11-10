@@ -1761,6 +1761,7 @@ impl App {
     // ---------------------------------------------------------------- panels
 
     fn show_bar(&mut self, ui: &mut egui::Ui, maximized: bool) {
+        self.refresh_backup_chip();
         let active = self.tabs.get(self.active);
         let groups = self.groups();
         let inbox = self.gw.inbox();
@@ -1833,6 +1834,7 @@ impl App {
             }),
             app_update: self.app_update_bar(),
             pairing: self.pairing_pill(),
+            backup: self.backup_chip(),
             notifications: crate::notify_panel::PanelInput {
                 entries: inbox.as_deref().map_or(&[][..], |v| v.entries.as_slice()),
                 badge: inbox.as_deref().and_then(|v| v.badge.as_deref()),
@@ -1865,6 +1867,8 @@ impl App {
             BarAction::AppUpdate(a) => self.apply_app_update_action(a),
             BarAction::Inbox(a) => self.apply_inbox_action(a),
             BarAction::ShowPairing => self.mobile.restore(),
+            BarAction::OpenBackupActivity(page) => self.open_backup_activity(page),
+            BarAction::CancelBackup => self.cancel_backup_job(),
         }
     }
 

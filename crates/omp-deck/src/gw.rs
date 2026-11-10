@@ -387,6 +387,12 @@ impl Gw {
         self.mutate_unit(Mutation::CancelJob(key), done);
     }
 
+    /// Asks the gateway to stop whatever job holds the backup lane, whoever started it
+    /// (`done` gets its refusal: no job running / the job cannot be cancelled).
+    pub fn cancel_backup_job(&mut self, done: impl FnOnce(&mut App, Result<(), String>) + 'static) {
+        self.mutate_unit(Mutation::CancelBackupJob, done);
+    }
+
     // ------------------------------------------------------------------ per frame
 
     /// Completed requests and the events the app interprets itself.

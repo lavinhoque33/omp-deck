@@ -18,6 +18,7 @@ use deck_service::gateway::protocol::{
 };
 
 use super::{App, PendingConfirm, human_size};
+use crate::backup_chip::ChipView;
 use crate::backup_view::{
     self, BackupAction, BackupCard, BackupManager, Busy, DriveAccount, HostGroup, ManagedBackup,
     ManagerAction, ManagerList, ManagerStep, RestoreList, RestorePick, RestoreRow, ServerForm,
@@ -82,6 +83,14 @@ pub(super) struct BackupUi {
     picker: Option<RestorePicker>,
     manager: Option<Manager>,
     deletion: Option<Deletion>,
+    chip: ChipCache,
+}
+
+/// The title-bar chip's view, derived from `source` (the backup record it was built from).
+#[derive(Default)]
+struct ChipCache {
+    source: Option<Arc<BackupView>>,
+    view: Option<ChipView>,
 }
 
 impl BackupUi {
@@ -92,6 +101,7 @@ impl BackupUi {
             picker: None,
             manager: None,
             deletion: None,
+            chip: ChipCache::default(),
         }
     }
 
@@ -151,6 +161,65 @@ fn place_of(destination: Destination, view: Option<&BackupView>) -> String {
         (Destination::Drive, _) => "Google Drive".to_owned(),
         (Destination::Server, Some(s)) => s.label.clone(),
         (Destination::Server, None) => "your server".to_owned(),
+    }
+}
+
+impl App {
+    /// Rebuilds the title-bar chip's view when the gateway's backup record changed (compared by
+    /// identity: the record is replaced, never mutated); a no-op on every other frame.
+    pub(super) fn refresh_backup_chip(&mut self) {
+        let view = self.backup_view();
+        let cache = &mut self.backup.chip;
+        let same = match (&cache.source, &view) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        cache.view = view.as_deref().and_then(|v| {
+            let place = place_of(v.destination, Some(v));
+            v.busy
+                .as_ref()
+                .map(|job| ChipView::new(job, &place, v.destination == Destination::Server))
+        });
+        cache.source = view;
+    }
+
+    /// The job holding the backup lane, as the title bar shows it (see
+    /// [`App::refresh_backup_chip`]).
+    pub(super) fn backup_chip(&self) -> Option<&ChipView> {
+        self.backup.chip.view.as_ref()
+    }
+
+    /// The lane job can be stopped and no stop was asked yet: the card's Cancel and the palette
+    /// entry are offered exactly then.
+    pub(super) fn backup_job_cancellable(&self) -> bool {
+        self.backup_chip().is_some_and(ChipView::can_cancel)
+    }
+
+    /// Asks the gateway to stop whatever job holds the backup lane (this window's, another
+    /// window's, the phone's or an automatic pass); its refusal is shown.
+    pub(super) fn cancel_backup_job(&mut self) {
+        self.gw.cancel_backup_job(|app, r| {
+            if let Err(e) = r {
+                app.toasts.error(&app.ctx, e);
+            }
+        });
+    }
+
+    /// The chip's pill was clicked: the settings page of the job.
+    pub(super) fn open_backup_activity(&mut self, page: crate::backup_chip::Page) {
+        match page {
+            crate::backup_chip::Page::ProjectSync => {
+                self.open_settings();
+                self.settings.show_sync();
+            }
+            crate::backup_chip::Page::ConfigBackup => {
+                self.open_settings_page(crate::settings_page::OmpDeckPage::Backup);
+            }
+        }
     }
 }
 

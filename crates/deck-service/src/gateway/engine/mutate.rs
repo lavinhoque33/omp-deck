@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::deferred::{ResumePlan, resume_plan};
+use super::lane::NOT_CANCELLABLE;
 use super::sessions::{LaunchJob, Owner};
 use super::{Engine, Fin, JobState, Msg, Sched, lock};
 use crate::controller::{
@@ -17,8 +18,8 @@ use crate::gateway::desktop;
 use crate::gateway::jobs::{self, JobCtx};
 use crate::gateway::journal::Admission;
 use crate::gateway::protocol::{
-    Accepted, Answer, Done, GatewayError, LaunchSpec, Mutation, Outcome, Progress, Role,
-    ServerEvent, SessionRole, Tool, UpdatePhase,
+    Accepted, Answer, Done, GatewayError, LaneJob, LaneKind, LaneOrigin, LaunchSpec, Mutation,
+    Outcome, Progress, Role, ServerEvent, SessionRole, Tool, UpdatePhase,
 };
 use crate::settings::{Field, SettingsError, Snapshot};
 use deck_core::backup::Destination;
@@ -42,15 +43,24 @@ pub(super) enum Post {
     ReloadPlugins(SessionTarget),
 }
 
-/// Throttled progress reports of a worker job.
-struct Reporter {
+/// Throttled progress reports of a worker job (`key`), or of the running automatic project
+/// folder (`None`).
+pub(super) struct Reporter {
     tx: std::sync::mpsc::Sender<Msg>,
-    key: RequestKey,
+    key: Option<RequestKey>,
     last: Mutex<Option<Instant>>,
 }
 
 impl Reporter {
-    fn report(&self, progress: Progress) {
+    pub(super) fn new(tx: std::sync::mpsc::Sender<Msg>, key: Option<RequestKey>) -> Reporter {
+        Reporter {
+            tx,
+            key,
+            last: Mutex::new(None),
+        }
+    }
+
+    pub(super) fn report(&self, progress: Progress) {
         let now = Instant::now();
         {
             let mut last = lock(&self.last);
@@ -61,15 +71,25 @@ impl Reporter {
             }
             *last = Some(now);
         }
-        let _ = self.tx.send(Msg::Fin(Box::new(Fin::Progress {
-            key: self.key.clone(),
-            progress,
-        })));
+        let fin = match &self.key {
+            Some(key) => Fin::Progress {
+                key: key.clone(),
+                progress,
+            },
+            None => Sched::AutoProgress(progress).into(),
+        };
+        send(&self.tx, fin);
     }
 }
 
 pub(super) fn send(tx: &std::sync::mpsc::Sender<Msg>, fin: Fin) {
     let _ = tx.send(Msg::Fin(Box::new(fin)));
+}
+
+/// What a request job holding the backup lane does ([`Engine::lane_claim`]).
+pub(super) struct LaneClaim {
+    kind: LaneKind,
+    label: String,
 }
 
 /// Mutations that hold the backup lane.
@@ -224,10 +244,11 @@ impl Engine {
             self.sess.find(&t.key).map(|i| &self.sess.managed[i])
         };
         if uses_lane(op)
-            && let Some(busy) = &self.backup_lane
+            && let Some(busy) = self.backup_lane.job()
         {
             return Some(GatewayError::Refused(format!(
-                "Another backup job is running ({busy}); try again."
+                "Another backup job is running ({}); try again.",
+                busy.label
             )));
         }
         if super::remote::is_mobile(op) {
@@ -388,9 +409,10 @@ impl Engine {
             }
             Mutation::CancelJob(k) => match self.jobs.get(k) {
                 None => Some(GatewayError::NoSuchJob),
-                Some(j) if j.cancel.is_none() => refused("this job cannot be cancelled"),
+                Some(j) if j.cancel.is_none() => refused(NOT_CANCELLABLE),
                 Some(_) => None,
             },
+            Mutation::CancelBackupJob => self.backup_lane.cancel_refusal().and_then(refused),
             _ => None,
         }
     }
@@ -417,7 +439,6 @@ impl Engine {
                 label,
                 progress: None,
                 cancel: None,
-                lane: false,
                 post,
             },
         );
@@ -429,7 +450,7 @@ impl Engine {
         &mut self,
         key: RequestKey,
         label: &'static str,
-        lane: bool,
+        lane: Option<LaneClaim>,
         cancellable: bool,
         post: Post,
         f: F,
@@ -439,9 +460,22 @@ impl Engine {
             + 'static,
     {
         let cancel = Arc::new(AtomicBool::new(false));
-        if lane {
-            self.backup_lane = Some(label.to_owned());
-            self.dirty.backup = true;
+        if let Some(claim) = lane {
+            let origin = self.lane_origin(&key.client);
+            self.claim_lane(
+                LaneJob {
+                    label: claim.label,
+                    kind: claim.kind,
+                    origin,
+                    started_unix_ms: crate::gateway::unix_ms(),
+                    progress: None,
+                    pass: None,
+                    cancellable,
+                    cancelling: false,
+                },
+                cancel.clone(),
+                Some(key.clone()),
+            );
         }
         self.jobs.insert(
             key.clone(),
@@ -449,7 +483,6 @@ impl Engine {
                 label,
                 progress: None,
                 cancel: cancellable.then(|| cancel.clone()),
-                lane,
                 post,
             },
         );
@@ -457,11 +490,7 @@ impl Engine {
         let ctx = self.job_ctx();
         let tx = self.tx.clone();
         self.spawn_worker(label, move || {
-            let reporter = Reporter {
-                tx,
-                key: key.clone(),
-                last: Mutex::new(None),
-            };
+            let reporter = Reporter::new(tx, Some(key.clone()));
             let result = f(&ctx, &cancel, &|p| reporter.report(p));
             Fin::Mutation {
                 key,
@@ -498,8 +527,7 @@ impl Engine {
         let mut result = result.map(Into::into);
         let mut cancelled = false;
         if let Some(s) = state {
-            if s.lane {
-                self.backup_lane = None;
+            if self.backup_lane.release(Some(&key)) {
                 self.dirty.backup = true;
             }
             cancelled = s.cancel.is_some_and(|c| c.load(Ordering::Relaxed));
@@ -540,6 +568,9 @@ impl Engine {
             return;
         };
         j.progress = Some(progress.clone());
+        if self.backup_lane.progress(Some(&key), progress.clone()) {
+            self.dirty.backup = true;
+        }
         if matches!(j.post, Post::AppView) {
             self.sched.download_progress(&progress);
             self.dirty.app = true;
@@ -549,6 +580,102 @@ impl Engine {
             &key.client.clone(),
             &ServerEvent::Progress { key, progress },
         );
+    }
+
+    // ---- backup lane ----------------------------------------------------------------------
+
+    /// Puts `job` on the backup lane (free: lane jobs are prechecked against it).
+    pub(super) fn claim_lane(
+        &mut self,
+        job: LaneJob,
+        cancel: Arc<AtomicBool>,
+        key: Option<RequestKey>,
+    ) {
+        self.backup_lane.claim(job, cancel, key);
+        self.dirty.backup = true;
+    }
+
+    /// Who started a request job of `client`.
+    fn lane_origin(&self, client: &str) -> LaneOrigin {
+        if !super::remote::is_device_id(client) {
+            return LaneOrigin::Desktop;
+        }
+        let name = self
+            .mobile
+            .registry()
+            .and_then(|r| r.get(client))
+            .map_or_else(|| "Paired device".to_owned(), |d| d.name.clone());
+        LaneOrigin::Device(name)
+    }
+
+    /// What lane mutation `op` does (`None`: it does not use the lane).
+    fn lane_claim(&self, op: &Mutation) -> Option<LaneClaim> {
+        let home = |p: &std::path::Path| deck_core::sessions::abbreviate_home(p);
+        let deleting = |count: usize| match count {
+            1 => "Deleting a backup".to_owned(),
+            n => format!("Deleting {n} backups"),
+        };
+        let (kind, label) = match op {
+            Mutation::DriveLoginFinish(_) => {
+                (LaneKind::Account, "Signing in to Google Drive".to_owned())
+            }
+            Mutation::DriveSignOut => (LaneKind::Account, "Signing out of Google Drive".to_owned()),
+            Mutation::BackupConnectOnDesktop => (
+                LaneKind::Account,
+                "Connecting Google Drive on the desktop".to_owned(),
+            ),
+            Mutation::ServerConnect { .. } => (
+                LaneKind::Account,
+                "Connecting to the backup server".to_owned(),
+            ),
+            Mutation::ServerForget => {
+                (LaneKind::Account, "Forgetting the backup server".to_owned())
+            }
+            Mutation::Backup { .. } => (LaneKind::ConfigBackup, "Backing up settings".to_owned()),
+            Mutation::PrepareRestore(_) => (
+                LaneKind::ConfigRestore,
+                "Preparing settings restore".to_owned(),
+            ),
+            Mutation::ApplyRestore(_) => (LaneKind::ConfigRestore, "Restoring settings".to_owned()),
+            Mutation::DeleteBackup(_) => (LaneKind::ConfigDelete { count: 1 }, deleting(1)),
+            Mutation::DeleteBackups(v) => {
+                (LaneKind::ConfigDelete { count: v.len() }, deleting(v.len()))
+            }
+            Mutation::ProjectDeleteBackup(_) => (LaneKind::ProjectDelete { count: 1 }, deleting(1)),
+            Mutation::ProjectDeleteBackups(v) => (
+                LaneKind::ProjectDelete { count: v.len() },
+                deleting(v.len()),
+            ),
+            Mutation::ProjectBackup { project, .. } => (
+                LaneKind::ProjectBackup {
+                    project: project.clone(),
+                },
+                format!("Backing up {}", home(project)),
+            ),
+            Mutation::ProjectPrepareRestore { target, .. } => (
+                LaneKind::ProjectRestore {
+                    target: target.clone(),
+                },
+                format!("Preparing restore into {}", home(target)),
+            ),
+            Mutation::ProjectApplyRestore { handle, .. } => {
+                match self.handles.project_restore_target(*handle) {
+                    Some(target) => {
+                        let label = format!("Restoring into {}", home(&target));
+                        (LaneKind::ProjectRestore { target }, label)
+                    }
+                    // Gone: the job answers that itself.
+                    None => (
+                        LaneKind::ProjectRestore {
+                            target: PathBuf::new(),
+                        },
+                        "Restoring a project".to_owned(),
+                    ),
+                }
+            }
+            _ => return None,
+        };
+        Some(LaneClaim { kind, label })
     }
 
     /// A settings edit is committed (or refused) before its mutation is answered: a CAS
@@ -581,6 +708,7 @@ impl Engine {
         // Targets were validated before admission; the controller still exists (nothing ran
         // in between on this thread).
         let index = op.target().and_then(|t| self.sess.find(&t.key));
+        let lane = self.lane_claim(&op);
         match op {
             Mutation::Launch(spec) => {
                 self.track(&key, "launch", Post::None);
@@ -629,7 +757,7 @@ impl Engine {
                 self.job(
                     key,
                     "kill-names",
-                    false,
+                    None,
                     false,
                     Post::Refresh,
                     move |ctx, _, _| jobs::kill_names(&ctx.backends, &names, wait),
@@ -678,25 +806,15 @@ impl Engine {
             Mutation::ForkAt { file, entry_id } => {
                 let running = self.ctl_holder(&file);
                 self.accepted(conn, id, &key);
-                self.job(
-                    key,
-                    "fork",
-                    false,
-                    false,
-                    Post::Refresh,
-                    move |ctx, _, _| jobs::fork_at(ctx, &file, &entry_id, running.as_deref()),
-                );
+                self.job(key, "fork", None, false, Post::Refresh, move |ctx, _, _| {
+                    jobs::fork_at(ctx, &file, &entry_id, running.as_deref())
+                });
             }
             Mutation::Copy { file, dest_cwd } => {
                 self.accepted(conn, id, &key);
-                self.job(
-                    key,
-                    "copy",
-                    false,
-                    false,
-                    Post::Refresh,
-                    move |ctx, _, _| jobs::copy_session(ctx, &file, &dest_cwd),
-                );
+                self.job(key, "copy", None, false, Post::Refresh, move |ctx, _, _| {
+                    jobs::copy_session(ctx, &file, &dest_cwd)
+                });
             }
             Mutation::Move {
                 file,
@@ -704,21 +822,16 @@ impl Engine {
                 stop,
             } => {
                 self.accepted(conn, id, &key);
-                self.job(
-                    key,
-                    "move",
-                    false,
-                    false,
-                    Post::Refresh,
-                    move |ctx, _, _| jobs::move_session(ctx, &file, &dest_cwd, &stop),
-                );
+                self.job(key, "move", None, false, Post::Refresh, move |ctx, _, _| {
+                    jobs::move_session(ctx, &file, &dest_cwd, &stop)
+                });
             }
             Mutation::Delete { targets, stop } => {
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
                     "delete",
-                    false,
+                    None,
                     false,
                     Post::Refresh,
                     move |ctx, _, _| jobs::delete_sessions(ctx, &targets, &stop),
@@ -729,7 +842,7 @@ impl Engine {
                 self.job(
                     key,
                     "export-html",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::export_html(ctx, &file, &dest),
@@ -746,21 +859,21 @@ impl Engine {
             Mutation::Stage { root, files } => {
                 self.accepted(conn, id, &key);
                 let post = Post::Changes(root.clone());
-                self.job(key, "git-stage", false, false, post, move |_, _, _| {
+                self.job(key, "git-stage", None, false, post, move |_, _, _| {
                     jobs::stage(&root, &files)
                 });
             }
             Mutation::Unstage { root, files } => {
                 self.accepted(conn, id, &key);
                 let post = Post::Changes(root.clone());
-                self.job(key, "git-unstage", false, false, post, move |_, _, _| {
+                self.job(key, "git-unstage", None, false, post, move |_, _, _| {
                     jobs::unstage(&root, &files)
                 });
             }
             Mutation::Discard { root, files } => {
                 self.accepted(conn, id, &key);
                 let post = Post::Changes(root.clone());
-                self.job(key, "git-discard", false, false, post, move |_, _, _| {
+                self.job(key, "git-discard", None, false, post, move |_, _, _| {
                     jobs::discard(&root, &files)
                 });
             }
@@ -770,7 +883,7 @@ impl Engine {
                 self.job(
                     key,
                     "git-delete-untracked",
-                    false,
+                    None,
                     false,
                     post,
                     move |_, _, _| jobs::delete_untracked(&root, &files),
@@ -786,7 +899,7 @@ impl Engine {
                 self.job(
                     key,
                     "worktree-create",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::worktree_create(ctx, &repo, &branch, &base_ref, &dest),
@@ -814,7 +927,7 @@ impl Engine {
                 self.job(
                     key,
                     "worktree-remove",
-                    false,
+                    None,
                     false,
                     Post::Refresh,
                     move |ctx, _, _| jobs::worktree_remove(ctx, &worktree, &base, how, &names),
@@ -825,7 +938,7 @@ impl Engine {
                 self.job(
                     key,
                     "worktree-add-existing",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::worktree_add_existing(ctx, &repo, &branch, &dest),
@@ -836,7 +949,7 @@ impl Engine {
                 self.job(
                     key,
                     "git-switch",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |_, _, _| jobs::switch_branch(&dir, &branch),
@@ -847,7 +960,7 @@ impl Engine {
                 self.job(
                     key,
                     "relocate-sessions",
-                    false,
+                    None,
                     false,
                     Post::Refresh,
                     move |ctx, _, _| jobs::relocate_sessions(ctx, &files, &dest),
@@ -858,21 +971,16 @@ impl Engine {
                 value,
             } => {
                 self.accepted(conn, id, &key);
-                self.job(
-                    key,
-                    "omp-set",
-                    false,
-                    false,
-                    Post::None,
-                    move |ctx, _, _| jobs::omp_set(ctx, &setting, &value),
-                );
+                self.job(key, "omp-set", None, false, Post::None, move |ctx, _, _| {
+                    jobs::omp_set(ctx, &setting, &value)
+                });
             }
             Mutation::OmpReset { key: setting } => {
                 self.accepted(conn, id, &key);
                 self.job(
                     key,
                     "omp-reset",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::omp_reset(ctx, &setting),
@@ -883,7 +991,7 @@ impl Engine {
                 self.job(
                     key,
                     "account-policies",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::account_policies(ctx, &provider, &policies),
@@ -898,7 +1006,7 @@ impl Engine {
                 self.job(
                     key,
                     "agent-edit",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::agent_edit(ctx, &path, &revision, &edit),
@@ -909,7 +1017,7 @@ impl Engine {
                 self.job(
                     key,
                     "agent-create",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::agent_create(ctx, &dir, &agent),
@@ -920,7 +1028,7 @@ impl Engine {
                 self.job(
                     key,
                     "agent-customize",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::agent_customize(ctx, &dir, &name),
@@ -931,7 +1039,7 @@ impl Engine {
                 self.job(
                     key,
                     "agent-delete",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::agent_delete(ctx, &path, &revision),
@@ -1003,7 +1111,7 @@ impl Engine {
                 self.job(
                     key,
                     "drive-login",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::drive_login_begin(ctx),
@@ -1014,7 +1122,7 @@ impl Engine {
                 self.job(
                     key,
                     "drive-login-finish",
-                    true,
+                    lane,
                     false,
                     Post::Accounts,
                     move |ctx, _, _| jobs::drive_login_finish(ctx, handle),
@@ -1030,7 +1138,7 @@ impl Engine {
                 self.job(
                     key,
                     "drive-sign-out",
-                    true,
+                    lane,
                     false,
                     Post::Accounts,
                     move |ctx, _, _| jobs::drive_sign_out(ctx),
@@ -1041,7 +1149,7 @@ impl Engine {
                 self.job(
                     key,
                     "backup",
-                    true,
+                    lane,
                     false,
                     Post::Accounts,
                     move |ctx, _, _| jobs::backup(ctx, force),
@@ -1053,7 +1161,7 @@ impl Engine {
                 self.job(
                     key,
                     "prepare-restore",
-                    true,
+                    lane,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::prepare_restore(ctx, &client, &file),
@@ -1065,7 +1173,7 @@ impl Engine {
                 self.job(
                     key,
                     "restore",
-                    true,
+                    lane,
                     false,
                     Post::Refresh,
                     move |ctx, _, _| jobs::apply_restore(ctx, &client, handle),
@@ -1076,7 +1184,7 @@ impl Engine {
                 self.job(
                     key,
                     "delete-backup",
-                    true,
+                    lane,
                     false,
                     Post::Accounts,
                     move |ctx, _, _| jobs::delete_backup(ctx, &file),
@@ -1087,7 +1195,7 @@ impl Engine {
                 self.job(
                     key,
                     "delete-backups",
-                    true,
+                    lane,
                     false,
                     Post::Accounts,
                     move |ctx, _, _| jobs::delete_backups(ctx, &files),
@@ -1106,7 +1214,7 @@ impl Engine {
                 self.job(
                     key,
                     "server-connect",
-                    true,
+                    lane,
                     false,
                     Post::Accounts,
                     move |ctx, _, _| jobs::server_connect(ctx, config, keep_secret),
@@ -1117,7 +1225,7 @@ impl Engine {
                 self.job(
                     key,
                     "server-forget",
-                    true,
+                    lane,
                     false,
                     Post::Accounts,
                     move |ctx, _, _| jobs::server_forget(ctx),
@@ -1133,7 +1241,7 @@ impl Engine {
                 self.job(
                     key,
                     "project-backup",
-                    true,
+                    lane,
                     true,
                     Post::None,
                     move |ctx, cancel, progress| {
@@ -1148,7 +1256,7 @@ impl Engine {
                 self.job(
                     key,
                     "project-delete-backup",
-                    true,
+                    lane,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::project_delete_backup(ctx, &backup),
@@ -1159,7 +1267,7 @@ impl Engine {
                 self.job(
                     key,
                     "project-delete-backups",
-                    true,
+                    lane,
                     false,
                     Post::None,
                     move |ctx, _, _| jobs::project_delete_backups(ctx, &backups),
@@ -1177,7 +1285,7 @@ impl Engine {
                 self.job(
                     key,
                     "project-prepare-restore",
-                    true,
+                    lane,
                     true,
                     Post::None,
                     move |ctx, cancel, progress| {
@@ -1207,7 +1315,7 @@ impl Engine {
                 self.job(
                     key,
                     "project-restore",
-                    true,
+                    lane,
                     true,
                     Post::Refresh,
                     move |ctx, cancel, progress| {
@@ -1242,7 +1350,7 @@ impl Engine {
                 self.job(
                     key,
                     "app-update-check",
-                    false,
+                    None,
                     false,
                     Post::AppView,
                     move |_, _, _| {
@@ -1268,7 +1376,7 @@ impl Engine {
                 self.job(
                     key,
                     "app-update-download",
-                    false,
+                    None,
                     true,
                     Post::AppView,
                     move |_, cancel, progress| {
@@ -1291,7 +1399,7 @@ impl Engine {
                 self.job(
                     key,
                     "app-update-apply",
-                    false,
+                    None,
                     false,
                     Post::AppView,
                     move |_, _, _| {
@@ -1351,6 +1459,15 @@ impl Engine {
                     .and_then(|j| j.cancel.as_ref())
                     .map(|c| c.store(true, Ordering::Relaxed))
                     .is_some();
+                if applied && self.backup_lane.mark_cancelling(&target) {
+                    self.dirty.backup = true;
+                }
+                self.accepted(conn, id, &key);
+                self.inline_result(key, applied, "that job already ended");
+            }
+            Mutation::CancelBackupJob => {
+                let applied = self.sched.cancel_lane(&mut self.backup_lane);
+                self.dirty.backup |= applied;
                 self.accepted(conn, id, &key);
                 self.inline_result(key, applied, "that job already ended");
             }
@@ -1367,7 +1484,7 @@ impl Engine {
                 self.job(
                     key,
                     "usage-refresh",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| {
@@ -1389,7 +1506,7 @@ impl Engine {
                 self.job(
                     key,
                     "omp-update-check",
-                    false,
+                    None,
                     false,
                     Post::None,
                     move |ctx, _, _| {
@@ -1501,7 +1618,7 @@ impl Engine {
                 self.job(
                     key,
                     "backup-connect-on-desktop",
-                    true,
+                    lane,
                     false,
                     Post::Accounts,
                     move |ctx, _, _| {
