@@ -71,7 +71,7 @@ is sent as a `rows` node (pre-rendered ANSI lines at `cols`), so nothing is lost
 - Pointer: `toggle`, `select`, `activate`, `action {act,value?,mods?}`, `change`; a node's `actions` prop maps
   gestures (click, dblclick, menu) to action names. View: `ack`, `resize`, `theme`, `motion`, `visible`, `error`,
   `gone`. Scrolling/hover/folding/copy are terminal-local.
-- Observed in omp-studio: approvals = list + buttons (`activate` / `action approve`); ask = `activate`; model picker
+- Observed in omp-studio: approvals = list + buttons (`activate` / `action approve`); ask (≤ 18.17) = `activate`; model picker
   = `action status.model` then `activate`; thinking = `action thinking.cycle`; `/` menu = overlay at the caret;
   omp's global shortcuts need raw key bytes (⇧Tab `ESC [ Z`, ⌥P `ESC p`).
 - `--resume` makes omp re-send the whole conversation as nodes (per-turn usage footers not replayed since 18.12.4).
@@ -129,3 +129,24 @@ hello/ack harness and replays them through a fake omp.
   - agent: a non-blank body (omp describes it folded or not).
 - A head click still toggles a collapsible node without a chevron (a tool's declared click action wins), so renderers
   that show more unfolded without saying so (`find`'s extra ranges) stay reachable.
+
+## The ask form (omp 18.18+, `packages/tui/src/html-form/dialog.ts` `#describeForm`/`handleNativeEvent`)
+- omp 18.18's `ask` tool takes one `html` `<form>` and draws `HtmlFormDialog` in the dock:
+  `col omp.editor.ask` > `row omp.ask.head` (`tabs omp.ask.questions`, one tab `t<N>` per question + `review`) >
+  `list omp.ask.options` > `col omp.ask.form` > `section`/`col omp.ask.section` > `col omp.ask.field` > (`text
+  omp.ask.label` | context nodes: table, code, bullets | `list omp.ask.options` of `item omp.ask.option` (radio,
+  also `<select>`) / `item omp.ask.check` (checkbox), checked = tone `accent`, Other = item `…/other` | `text
+  omp.ask.well[.multi]` (an unfocused text field, `lines` = rows) | the live `input`), then `row omp.actions`.
+  Hidden: `row` with `omp.ask.summary` (Tern grows it) + Cancel/Show. Review tab: kv rows + notice.
+- The outer `omp.ask.options` list holds a `col`, not items: `render.rs::list()` draws non-item children as nodes
+  (Tern does) — drawing them as row labels was the "ask shows no options" bug. That list scrolls, capped at half the
+  chat height (Tern: 60vh), so the action bar stays in view.
+- Events: `select {id: inner list, item: full item id}` picks a radio, **toggles** a checkbox, or (Other) focuses the
+  Other input; `activate` does not toggle. Tabs: `select` on the tabs node, item `t<N>`/`review` (the tabs node
+  carries `actions.click: select`, which must not become a node-wide click). Wells: `action edit:<field index>`;
+  omp answers with a live `input` node and the surface `focus` on it; typing = raw keys. Buttons: `action`
+  `next`/`submit`/`cancel`/`hide`/`show`.
+- Fixture `crates/omp-deck/src/chat_view/ask-form.json` (recorded from omp 18.18.6, ids prefixed `q`): cases
+  `initial`, `check_go`, `name_typed`, `other_typed`, `review`, `hidden`.
+- The phone answers it through the ctl extension's `formDialog` wrap, not TSP (`docs/notes/mobile-pwa.md`
+  "HTML-form ask").

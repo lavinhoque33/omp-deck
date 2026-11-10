@@ -42,6 +42,15 @@ export default async function ompdeckCtl(api: any) {
     // constructing the runtime once keeps every snapshot cheap and never throws into omp.
     let hubRuntime: any = null;
     try { hubRuntime = (await import("@oh-my-pi/pi-coding-agent/modes/agent-hub-runtime")).createAgentHubRuntime({}); } catch (e) { log("agent-hub-runtime import failed: " + e); }
+    // Optional (omp >= 18.18): the HTML-form ask. Literal specifiers; without them a formDialog request gets no pending entry (the TUI dialog still runs).
+    let formLib: any;
+    try {
+      const parse = await import("@oh-my-pi/pi-tui/html-form/parse");
+      const data = await import("@oh-my-pi/pi-tui/html-form/data");
+      if (["parseHtmlForm", "spansText"].every(k => typeof (parse as any)[k] === "function")
+        && ["fieldQuestions", "defaultFormData", "choiceValue", "textValue", "fieldError"].every(k => typeof (data as any)[k] === "function")) formLib = { ...parse, ...data };
+      else log("html-form API missing");
+    } catch (e) { log("html-form import failed: " + e); }
     if (!AgentLifecycleManager || !AgentRegistry || typeof sessionFileBelongsToRoot !== "function") { log("internal API missing"); return; }
 
     const isMain = (ctx: any) => ctx?.agent?.kind === "main";
@@ -193,13 +202,79 @@ export default async function ompdeckCtl(api: any) {
       };
       const schedule = () => { if (pending) return; pending = setTimeout(() => { pending = undefined; push(snapshot()); }, 50); };
 
-      // ---- structured UI requests: omp's dialogs (ask, approvals, select/confirm/input/editor) raced against a remote answer ----
+      // ---- structured UI requests: omp's dialogs (ask, approvals, select/confirm/input/editor, formDialog) raced against a remote answer ----
       // `ctx.ui` is one object shared by the TUI and the tools, so wrapping its members in place sees every request. The original (TUI) call
       // and the remote answer race; the loser is aborted through the merged signal, so a phone answer closes the TUI dialog.
       // Internal omp API: a member that is not a function is skipped and `uiHook` stays false (the gateway then lists no requests).
-      const uiState = (G.__ompdeckUi ??= { pending: new Map<number, { summary: any; resolve: (v: any) => void }>(), seq: 0, hook: false, onChange: () => {} });
-      const pendingUi: Map<number, { summary: any; resolve: (v: any) => void }> = uiState.pending;
+      // `formDialog` (omp >= 18.18, the html `ask`) is optional: when absent it is neither wrapped nor counted.
+      type PendingEntry = { summary: any; resolve: (v: any) => void; form?: any };
+      const uiState = (G.__ompdeckUi ??= { pending: new Map<number, PendingEntry>(), seq: 0, hook: false, onChange: () => {} });
+      const pendingUi: Map<number, PendingEntry> = uiState.pending;
       uiState.onChange = schedule;
+      // formDialog(html, opts): the parsed form stays with the entry (option values and validation never leave the extension).
+      const FORM_CAPS = { sections: 20, blocks: 60, fields: 40, options: 100, items: 50, rows: 50, cols: 10 };
+      const summarizeForm = (a: any[]): { summary: any; form: any } => {
+        if (!formLib) throw new Error("html-form API unavailable");
+        if (typeof a[0] !== "string") throw new Error("formDialog html is not a string");
+        const form = formLib.parseHtmlForm(a[0]);
+        const questions: Map<any, string> = formLib.fieldQuestions(form);
+        const o = a[1];
+        const timeoutMs = typeof o?.timeout === "number" && Number.isFinite(o.timeout) && o.timeout > 0 ? Math.round(o.timeout) : undefined;
+        const spans = (l: any) => (Array.isArray(l) ? l : []).map((s: any) => s.style ? { text: str(s.text) ?? "", style: s.style } : { text: str(s.text) ?? "" });
+        const fields = form.fields.slice(0, FORM_CAPS.fields);
+        const index = new Map<any, number>(fields.map((f: any, i: number) => [f, i]));
+        const block = (b: any): any => {
+          switch (b.kind) {
+            case "text": return { kind: "text", spans: spans(b.spans), heading: !!b.heading };
+            case "list": return { kind: "list", items: b.items.slice(0, FORM_CAPS.items).map(spans), ordered: !!b.ordered };
+            case "pre": return { kind: "pre", text: str(b.text) ?? "" };
+            case "table": return { kind: "table", rows: b.rows.slice(0, FORM_CAPS.rows).map((r: any) => r.slice(0, FORM_CAPS.cols).map(spans)), headerRows: b.headerRows };
+            case "image": case "svg": return { kind: "image", alt: str(b.alt) ?? "" };
+            case "field": return index.has(b.field) ? { kind: "field", field: index.get(b.field) } : undefined;
+            default: return undefined;
+          }
+        };
+        const field = (f: any): any => {
+          const base = { kind: f.kind, name: str(f.name) ?? "", question: str(questions.get(f)) ?? "", label: spans(f.label), required: !!f.required };
+          if (f.kind === "choice") {
+            return { ...base, multi: !!f.multi, select: !!f.select, other: !!f.other,
+              options: f.options.slice(0, FORM_CAPS.options).map((x: any) => ({ label: spans(x.label), checked: !!x.checked, disabled: !!x.disabled })) };
+          }
+          return { ...base, type: str(f.type) ?? "text", multiline: !!f.multiline, value: str(f.value) ?? "", placeholder: str(f.placeholder) ?? "",
+            min: f.min, max: f.max, pattern: str(f.pattern), minLength: f.minLength, maxLength: f.maxLength, rows: f.rows };
+        };
+        const sections = form.sections.slice(0, FORM_CAPS.sections).map((s: any) => ({
+          title: spans(s.title), blocks: s.blocks.slice(0, FORM_CAPS.blocks).map(block).filter((b: any) => b),
+        }));
+        return { summary: { kind: "form", title: "Ask", timeoutMs, form: { sections, fields: fields.map(field) } }, form };
+      };
+      // A phone answer `{fields:[{checked,other}|{text}]}` -> omp's `{data}`, validated with omp's own `fieldError`.
+      const formAnswer = (form: any, listed: number, value: any): { ok: true; value: any } | { ok: false; error: string } => {
+        const bad = { ok: false as const, error: "bad form answer" };
+        if (!formLib || !Array.isArray(value?.fields) || value.fields.length !== listed) return bad;
+        const questions: Map<any, string> = formLib.fieldQuestions(form);
+        const data: Record<string, any> = formLib.defaultFormData(form);
+        for (let i = 0; i < listed; i++) {
+          const f = form.fields[i], a = value.fields[i];
+          let v: any;
+          if (f.kind === "choice") {
+            if (!Array.isArray(a?.checked) || !a.checked.every((n: any) => Number.isInteger(n) && n >= 0)) return bad;
+            if (a.other !== undefined && a.other !== null && typeof a.other !== "string") return bad;
+            v = formLib.choiceValue(f, new Set<number>(a.checked), a.other ?? undefined);
+          } else {
+            if (typeof a?.text !== "string") return bad;
+            v = formLib.textValue(f, a.text);
+          }
+          if (!f.name) continue;
+          if (v === undefined) delete data[f.name]; else data[f.name] = v;
+        }
+        for (const f of form.fields) {
+          if (!f.name) continue;
+          const err = formLib.fieldError(f, data[f.name]);
+          if (err) return { ok: false, error: `${questions.get(f) ?? f.name}: ${err}` };
+        }
+        return { ok: true, value: { data } };
+      };
       const str = (v: any, max = 16384): string | undefined => typeof v === "string" ? (v.length > max ? v.slice(0, max) : v) : undefined;
       const opt = (o: any) => {
         const label = str(typeof o === "string" ? o : o?.label); if (label === undefined) return undefined;
@@ -241,7 +316,9 @@ export default async function ompdeckCtl(api: any) {
         ui[MARK] = true;
         const sigAt: Record<string, number> = { select: 2, confirm: 2, input: 2, editor: 2, askDialog: 1, approve: 1 };
         let wrapped = 0;
-        for (const [m, at] of Object.entries(sigAt)) {
+        const members = Object.entries(sigAt);
+        if (typeof ui.formDialog === "function") members.push(["formDialog", 1]); // optional: never counted in `wrapped`
+        for (const [m, at] of members) {
           const orig = ui[m];
           if (typeof orig !== "function") { log(`ui.${m} is not a function: not hooked`); continue; }
           ui[m] = (...args: any[]) => {
@@ -252,11 +329,14 @@ export default async function ompdeckCtl(api: any) {
             o.signal = o.signal ? AbortSignal.any([o.signal, ac.signal]) : ac.signal;
             call[at] = o;
             const { promise: remoteP, resolve: remote } = Promise.withResolvers<any>();
-            try { pendingUi.set(id, { summary: { id, ...summarize(m, args) }, resolve: remote }); } catch (e) { log("ui summarize failed: " + e); }
+            try {
+              if (m === "formDialog") { const f = summarizeForm(args); pendingUi.set(id, { summary: { id, ...f.summary }, resolve: remote, form: f.form }); }
+              else pendingUi.set(id, { summary: { id, ...summarize(m, args) }, resolve: remote });
+            } catch (e) { log("ui summarize failed: " + e); }
             uiState.onChange();
             return Promise.race([new Promise<any>(r => r(orig.apply(ui, call))), remoteP]).finally(() => { pendingUi.delete(id); ac.abort(); uiState.onChange(); });
           };
-          wrapped++;
+          if (m !== "formDialog") wrapped++;
         }
         // A partial wrap would hide the requests of the skipped members, so only a complete one reports a hook.
         uiState.hook = wrapped === Object.keys(sigAt).length;
@@ -333,7 +413,9 @@ export default async function ompdeckCtl(api: any) {
         const toolSession = { cwd: sm.getCwd(), hasUI: true, settings: sess.settings, getSessionFile: () => sm.getSessionFile() ?? null, getSessionSpawns: () => null, getPlanModeState: () => sess.getPlanModeState?.() };
         let answer: any;
         try {
-          answer = await new AskTool(toolSession).execute("tree-reanswer", { questions: probe.reopenAsk.questions }, undefined, undefined, sess.buildAskReanswerContext(mainCtx.ui));
+          // omp >= 18.18 recovers the html form; older omp the question list.
+          const params = typeof probe.reopenAsk.html === "string" ? { html: probe.reopenAsk.html } : { questions: probe.reopenAsk.questions };
+          answer = await new AskTool(toolSession).execute("tree-reanswer", params, undefined, undefined, sess.buildAskReanswerContext(mainCtx.ui));
         } catch (e: any) {
           if (e instanceof ToolAbortError) return { ok: false, error: "cancelled" };
           throw e;
@@ -618,6 +700,12 @@ export default async function ompdeckCtl(api: any) {
           if (typeof cmd.root !== "string" || !want || cmd.root !== want) return { ok: false, error: "session changed" };
           const p = pendingUi.get(Number(cmd.id));
           if (!p) return { ok: false, error: "no such request" };
+          if (p.form && cmd.value !== null && cmd.value !== undefined) {
+            const r = formAnswer(p.form, p.summary.form.fields.length, cmd.value);
+            if (!r.ok) return { ok: false, error: r.error }; // stays pending: the phone corrects and resubmits
+            p.resolve(r.value);
+            return { ok: true };
+          }
           p.resolve(cmd.value ?? undefined); // null = cancel, as a local Esc
           return { ok: true };
         }

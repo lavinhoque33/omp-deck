@@ -402,14 +402,14 @@ async function steps(live: LiveRun, stack: Stack, page: Page): Promise<void> {
   await live.shot('05-prompt-reply');
   live.note('prompt', `transcript shows “${reply}”`);
 
-  // -- ask --
+  // -- ask (omp 18.18: one HTML form, `<p>Pick a color?</p>` over radios red/blue named `color`) --
   seen = (await live.requests(0)).count;
   await live.send('ASK-MARK choose one');
-  const card = page.locator('.ui-card', { hasText: 'Pick a color?' });
+  const card = page.locator('.ui-card.kind-form', { hasText: 'Pick a color?' });
   await card.waitFor({ timeout: SLOW });
   await live.shot('06-ask-card');
-  await card.locator('button.option', { hasText: 'blue' }).click();
-  await card.getByRole('button', { name: /Submit answers/ }).click();
+  await card.getByRole('radio', { name: 'blue' }).click();
+  await card.getByRole('button', { name: /Submit/ }).click();
   await card.waitFor({ state: 'detached' });
   const asked = await live.modelRequest(seen, 'the ask result', (request) => request.last_user.includes('ASK-MARK') && request.messages.some((m) => m.role === 'tool'));
   const toolText = asked.messages.filter((m) => m.role === 'tool').map((m) => m.text).join(' ');
@@ -418,7 +418,7 @@ async function steps(live: LiveRun, stack: Stack, page: Page): Promise<void> {
   assert(askReply.includes('blue'), `the transcript's ask reply: ${askReply}`);
   await live.idle();
   await live.shot('07-ask-answered');
-  live.note('ask', `answered “blue” on the approval card; model got tool result “${toolText.slice(0, 80)}”; transcript shows “${askReply.slice(0, 100)}”`);
+  live.note('ask', `answered “blue” on the form card; model got tool result “${toolText.slice(0, 80)}”; transcript shows “${askReply.slice(0, 100)}”`);
 
   // -- steer --
   seen = (await live.requests(0)).count;
@@ -511,6 +511,8 @@ async function steps(live: LiveRun, stack: Stack, page: Page): Promise<void> {
   await page.locator('.sheet').waitFor({ state: 'detached' });
 
   // -- terminal: a line typed in Input mode reaches omp as keystrokes (Enter submits it) --
+  // The session runs in TSP (chat) mode, so omp draws its UI as APC frames the phone's
+  // terminal drops: the reply shows in the transcript, and the terminal never prints frame JSON.
   seen = (await live.requests(0)).count;
   await page.getByRole('button', { name: 'Terminal' }).click();
   const term = page.locator('.term');
@@ -521,9 +523,16 @@ async function steps(live: LiveRun, stack: Stack, page: Page): Promise<void> {
   await input.fill('TERM-TYPED from the phone');
   await input.press('Enter');
   const typed = await live.modelRequest(seen, 'the typed line', (request) => request.tools && request.last_user.includes('TERM-TYPED'), STEP);
-  await term.getByText(/LIVE-REPLY to: TERM-TYPED from the phone/).first().waitFor({ timeout: STEP });
+  await page.getByRole('button', { name: 'Back' }).click();
+  await live.transcript(/LIVE-REPLY to: TERM-TYPED from the phone/, STEP);
+  // Attach again after the reply: the snapshot replay and the live output both pass the filter.
+  await page.getByRole('button', { name: 'Terminal' }).click();
+  await term.locator('.xterm').waitFor();
+  await Bun.sleep(1000);
+  const screen = await term.locator('.xterm-rows').innerText();
+  assert(!/"role":"omp\.|\[\["add"/.test(screen), `the terminal printed TSP frame text: ${screen.slice(0, 200)}`);
   await live.shot('12-terminal-typed');
-  live.note('terminal', `Input mode; the typed line reached omp (model request #${typed.index}) and its reply rendered in the phone’s terminal`);
+  live.note('terminal', `Input mode; the typed line reached omp (model request #${typed.index}), its reply is in the transcript, and the terminal shows no TSP frame text`);
 
   // -- console, page errors, CSP --
   const finalPushes = await live.ctl<Pushed[]>('/pushes');

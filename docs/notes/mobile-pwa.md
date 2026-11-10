@@ -279,6 +279,14 @@ Device wire (`api`):
   `answered { applied: false }` when the request is gone (the terminal won).
 - Subagent prompts: whether they reach the main UI context is not verified yet. The P4 gate checks it; if they don't,
   they are answered in the subagent's own session terminal or shown as attention.
+- **HTML-form ask (omp 18.18+)**: the `ask` tool calls `ctx.ui.formDialog(html)`; the extension also wraps that member
+  (optional: absent on older omp, not counted for `ui_hook`), parses the form with omp's own `parseHtmlForm` and lists
+  `kind: form` with `form {sections, fields}`. Devices get it only when their hello announces feature `form`
+  (`UiRequestView.form`, `UiAnswer::Form { fields: [choice {checked, other} | text {text}] }`; vectors
+  `api-form.json`). The gateway checks shape/indices; omp's `fieldError` (required, numbers, pattern, …) runs in the
+  extension and a failure comes back as the answer's error with the request still pending. The transcript's `ask`
+  tool card renders both arg shapes (`questions` ≤ 18.17, `html` from upstream v18.18.6's collab-web renderer).
+  Contract: `docs/notes/contracts.md` "omp 18.18 HTML-form `ask` on the phone".
 
 The terminal path (attach `input`/`control`) keeps working for every kind.
 
@@ -527,7 +535,11 @@ A browser allows one `PushSubscription` per service-worker registration, bound t
     - context meter and breakdown; copy last response; export HTML download.
   - **Terminal:** xterm 6 as a renderer only (DOM renderer on phones, WebGL only on desktop browsers); our own input
     field, touch scroll and selection; a key bar (Esc, Tab, Ctrl, arrows, Enter, Ctrl+C); Observe/Input/Control modes;
-    `geometry_owned` handling; no terminal query replies and OSC 52 ignored (R4).
+    `geometry_owned` handling; no terminal query replies and OSC 52 ignored (R4). APC strings (`ESC _ … ESC \`,
+    omp's TSP frames, kitty graphics) are dropped before xterm (`src/app/apc.ts`, stateful across chunks): xterm
+    has no APC-state transition for non-ASCII, logged a parsing error per character and then printed the rest of
+    the frame JSON as text. A chat-view (TSP) session's terminal is therefore mostly blank: omp draws its UI only
+    as TSP frames there.
   - **Agents:** dashboard cards with a distinct subagent accordion, subagent transcript, kill/revive/chat.
   - **Session tree:** filters, search, fork-at, go here.
   - **Projects and git:**

@@ -4111,3 +4111,87 @@ extracted trees; research `agent://OmpHubJobsFacts`, `agent://DeckHubJobsMap`, `
   text; Esc → main transcript; `/hub` → Activity (130 events, Errors 4); error row → popup at that failed call; flat
   view `↳ BackendFoundation` chips; jobs sheet row + detail show `opencode-go/deepseek-v4.1-flash` / `low` / `task`.
   The ctx bar is hidden for subagents whose model is not in the catalogue (logged-out provider), by design.
+
+## omp 18.18 HTML-form `ask` on the phone (user, 2026-11-10: "yes, fix the phone side too")
+
+omp 18.18's `ask` tool takes one `html` `<form>` and calls `ctx.ui.formDialog(html, opts)` (falls back to per-field
+`select`/`input` only when that member is absent). `ompdeck-ctl.ts` did not wrap it, so the phone never saw an ask.
+Facts: `docs/notes/tsp.md` "The ask form"; omp source `packages/tui/src/html-form/{parse,data}.ts`,
+`coding-agent/src/tools/ask.ts`, `modes/controllers/extension-ui-controller.ts` `showFormDialog`.
+
+### Extension (`crates/deck-core/assets/ompdeck-ctl.ts`)
+- Wrap `formDialog` (options at arg 1) beside the six existing members with the same race/abort pattern. It is
+  optional: absent (omp < 18.18) ⇒ not wrapped and `uiState.hook` is still decided by the six existing members only.
+- Parse with omp's own `parseHtmlForm` (`@oh-my-pi/pi-tui/html-form/parse`) and use `fieldQuestions`,
+  `defaultFormData`, `choiceValue`, `textValue`, `fieldError` (`@oh-my-pi/pi-tui/html-form/data`), imported
+  dynamically; an import/parse failure ⇒ no pending entry (the TUI dialog still works), logged.
+- Pending entry: `{id, kind:"form", title:"Ask", timeoutMs?, form:{sections, fields}}` (camelCase, `str()` 16 KiB cut):
+  - `sections[] = {title: Span[], blocks: Block[]}`; `Span = {text, style?: "code"|"strong"|"em"}`;
+    `Block` tagged `kind`: `text {spans, heading}`, `list {items: Span[][], ordered}`, `pre {text}`,
+    `table {rows: Span[][][], headerRows}`, `image {alt}` (img and svg), `field {field: <index into fields>}`.
+  - `fields[]` tagged `kind`: `choice {name, question, label, multi, select, other, required, options:
+    [{label: Span[], checked, disabled}]}` (option `value`s stay in the extension); `text {name, question, label,
+    type, multiline, value, placeholder, required, min?, max?, pattern?, minLength?, maxLength?, rows}`.
+  - Caps: 20 sections, 60 blocks per section, 40 fields, 100 options per field, 50 list items / table rows,
+    10 table columns. `field` blocks past the field cap are dropped.
+- Answer value (`answer_ui.value`) for a form: `{"fields":[<one per listed field, in order>]}`, each
+  `{"checked":[u32],"other":string|null}` (choice) or `{"text":string}` (text); `null` = cancel as before. The
+  extension builds the data from `defaultFormData(form)` (hidden inputs and unlisted fields keep their defaults),
+  sets/deletes each answered named field with `choiceValue(field, Set(checked), other ?? undefined)` /
+  `textValue(field, text)`, then checks every named field with `fieldError`: the first error replies
+  `{ok:false, error:"<question>: <message>"}` and leaves the request pending; else it resolves `{data}`
+  (`ExtensionFormDialogResult`). A malformed value (wrong count/kind) replies `{ok:false, error:"bad form answer"}`.
+- `reanswerAsk` (tree "re-answer ask"): omp 18.18's `reopenAsk` carries `{toolCallId, html}`; execute the AskTool
+  with `{html}` when present, else the old `{questions}`.
+
+### deck-core (`ctl.rs`, done by the orchestrator)
+`PendingUiKind::Form`; `PendingUi.form: Option<UiForm>`; `UiForm {sections: Vec<UiFormSection>, fields:
+Vec<UiFormField>}`, `UiFormSection {title: Vec<UiSpan>, blocks: Vec<UiFormBlock>}`, `UiSpan {text, style:
+Option<String>}`, `UiFormBlock {Text{spans,heading}, List{items,ordered}, Pre{text}, Table{rows,header_rows},
+Image{alt}, Field{field: u32}, Other}` (`#[serde(other)]`), `UiFormField {Choice{name, question, label, multi,
+select, other, required, options: Vec<UiFormOption{label, checked, disabled}>}, Text{name, question, label,
+input_type ("type"), multiline, value, placeholder, required, min/max: Option<f64>, pattern, min_length,
+max_length, rows}}`.
+
+### Device protocol (`deck-remote::api`, additive, new feature)
+- `FEATURE_FORM = "form"`. The gateway's `Welcome.features` lists `s4` and `form`; it lists a `form` request in
+  `LiveSession.pending_ui` only to a device whose hello announced `form` (others see nothing, as before).
+- `UiKind::Form`. `UiRequestView.form: Option<UiFormView>` with `#[serde(default, skip_serializing_if =
+  "Option::is_none")]` so every existing message (api-v1.json, api-s4.json) stays byte-identical.
+- `UiFormView {sections: Vec<UiFormSectionView>, fields: Vec<UiFormFieldView>}`; `UiFormSectionView {title:
+  Vec<UiSpan>, blocks: Vec<UiFormBlock>}`; `UiSpan {text, style: Option<SpanStyle>}`, `SpanStyle {Code, Strong, Em}`
+  (unknown ctl styles ⇒ `None`); `UiFormBlock` tagged `kind`: `text {spans, heading}`, `list {items, ordered}`,
+  `pre {text}`, `table {rows, header_rows}`, `image {alt}`, `field {index}`; `UiFormFieldView` tagged `kind`:
+  `choice {name, question, label, multi, select, other, required, options: Vec<UiFormOption {label, checked,
+  disabled}>}`, `text {name, question, label, input_type, multiline, value, placeholder, required, min:
+  Option<String>, max: Option<String>, pattern, min_length: Option<u32>, max_length: Option<u32>, rows}`.
+  `min`/`max` are the number as decimal text (JS `String(n)`; Rust: shortest round-trip `f64` display) because
+  `LiveSession` derives `Eq`.
+- Device caps (gateway applies): strings `MAX_UI_TEXT`, options `MAX_UI_OPTIONS`, `MAX_FORM_FIELDS = 40`,
+  `MAX_FORM_SECTIONS = 20`, `MAX_FORM_BLOCKS = 60` per section, list items/table rows 50, table columns 10,
+  `MAX_FORM_SPANS = 64` per span list. `field` blocks pointing past the listed fields are dropped.
+- `UiAnswer::Form { fields: Vec<UiFormAnswer> }`; `UiFormAnswer` tagged `type`: `choice { checked: Vec<u32>,
+  other: Option<String> }`, `text { text: String }` (deny_unknown_fields, missing optional accepted).
+- Vectors: new generated `crates/deck-remote/tests/vectors/api-form.json` (same layout as api-s4.json), pinned in
+  `tests/wire_freeze.rs`, mirrored by `pwa/test/api-form-vectors.test.ts`. api-v1.json / api-s4.json unchanged.
+
+### Gateway (`deck-service`)
+- `views::ui_request` maps `PendingUiKind::Form` + `form` with the caps; `live_sessions` filters `Form` requests
+  for devices without `form`.
+- `ui_answer::UiAnswer::Form { fields: Vec<FormAnswer> }`, `FormAnswer {Choice{checked, other}, Text{text}}`;
+  `value_for` checks: kind form; answer count == listed field count; each answer's kind == its field's; checked
+  indices exist, are unique and not disabled; a non-multi field ≤ 1 checked; `other` only when the field has
+  `other`; then emits the extension's value above. Required/pattern/number checks stay omp's (`fieldError`) and come
+  back as the ctl error (`Failed`).
+- Live gates move to the html ask (omp 18.18 rejects `questions`): `remote_device_live.rs`, `pwa_live_stack.rs`,
+  and any other live test that scripts `ask` with `questions`.
+
+### PWA (`pwa/`)
+- `remote/api.ts` mirrors the types/decoders/encoders and `FEATURE_FORM`; the hello announces `s4` and `form`.
+- `PendingUi.tsx` `FormEditor` + pure logic in `pending.ts`: sections (title), blocks (spans with code/strong/em,
+  lists, pre, tables, image alt), fields in place: radio/checkbox rows with the free-text Other (radio: Other is
+  exclusive with the options), single `<select>` as a native select, text inputs typed by `input_type`
+  (`number`/`email`/`url`/text) and textareas with `rows`; required marker; client checks mirroring omp's
+  `fieldError` messages for instant feedback; Submit (valid only) and Cancel; `answerLabel` for forms; an error from
+  the gateway (omp's own check) shown on the card.
+- `e2e/live/spec.ts` ask step uses the form card.

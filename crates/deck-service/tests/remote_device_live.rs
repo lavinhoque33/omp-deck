@@ -1,8 +1,8 @@
 //! The slice-4 interactive paths end to end with a real omp driven by a scripted model
 //! ([`support::fake_model`]), through the real relay and Noise device path:
-//! - a structured UI request (`ask`) answered from the device, an approval denied from the
-//!   device, and an approval answered in the terminal first (the device's later answer is
-//!   `applied: false`);
+//! - a structured UI request (omp 18.18's HTML-form `ask`) answered from the device, an
+//!   approval denied from the device, and an approval answered in the terminal first (the
+//!   device's later answer is `applied: false`);
 //! - a steer and a follow-up composed while omp is busy, told apart by where omp delivers them;
 //! - a compose with an image attachment reaching the model, and the transcript image fetched back
 //!   byte for byte;
@@ -24,8 +24,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use deck_remote::api::{
     self, Activity, ApiError, ApproveDecision, DoneView, Event, Feed, FeedValue, Item, LiveRef,
-    LiveSession, Op, OutcomeView, Record, ReplyResult, Resp, UiAnswer, UiAskAnswer, UiKind,
-    UiRequestView, ViewMode,
+    LiveSession, Op, OutcomeView, Record, ReplyResult, Resp, UiAnswer, UiFormAnswer,
+    UiFormFieldView, UiKind, UiRequestView, ViewMode,
 };
 use deck_service::gateway::client::Link;
 use deck_service::gateway::protocol::{Mutation, Permissions, RelayLink, SecretText};
@@ -106,6 +106,12 @@ const ID_AFTER_TURN: Duration = Duration::from_secs(12);
 const STEER_STREAM: Duration = Duration::from_secs(8);
 /// How long a model request or a turn may take.
 const TURN: Duration = Duration::from_secs(60);
+/// The `ask` form the model sends (omp 18.18 takes one HTML `<form>`).
+const ASK_FORM: &str = concat!(
+    r#"<form><p>Pick a color?</p>"#,
+    r#"<label><input type="radio" name="color" value="red"> red</label>"#,
+    r#"<label><input type="radio" name="color" value="blue"> blue</label></form>"#,
+);
 
 // ---- the scripted model -------------------------------------------------------------------------
 
@@ -122,14 +128,7 @@ fn script(notes: PathBuf) -> impl FnMut(&Value) -> Reply + Send + 'static {
             .iter()
             .any(|m| fm::role(m) == "tool");
         if fresh && user.contains("ASK-MARK") {
-            return Reply::tool_call(
-                "ask",
-                &json!({ "questions": [{
-                    "id": "q1",
-                    "question": "Pick a color?",
-                    "options": [{ "label": "red" }, { "label": "blue" }],
-                }]}),
-            );
+            return Reply::tool_call("ask", &json!({ "html": ASK_FORM }));
         }
         if fresh && user.contains("DENY-MARK") {
             return Reply::tool_call("bash", &json!({ "command": "echo deny-run" }));
@@ -571,7 +570,12 @@ fn interactive_paths_with_a_real_omp() {
     };
     let project = api::project_id(sb.proj().to_string_lossy().as_bytes());
 
-    let mut a = Device::connect(&relay, &phone, "Phone", true);
+    let mut a = Device::connect_with(
+        &relay,
+        &phone,
+        "Phone",
+        &[api::FEATURE_S4, api::FEATURE_FORM],
+    );
     let mut seq = a.welcome.next_seq;
 
     // -- a session in the project, idle under live control --
@@ -851,24 +855,38 @@ fn interactive_paths_with_a_real_omp() {
         Vec::new(),
         api::ComposeMode::Send,
     );
-    let ask = w.pending(&mut a, UiKind::Ask);
+    let ask = w.pending(&mut a, UiKind::Form);
     eprintln!("(a) pending ask: {ask:?}");
-    assert_eq!(ask.questions.len(), 1);
-    let q = &ask.questions[0];
-    assert_eq!(q.id, "q1");
-    assert_eq!(q.question, "Pick a color?");
-    let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
+    let form = ask.form.as_ref().expect("the form");
+    assert_eq!(form.fields.len(), 1);
+    let UiFormFieldView::Choice {
+        name,
+        question,
+        multi,
+        options,
+        ..
+    } = &form.fields[0]
+    else {
+        panic!("not a choice field: {:?}", form.fields[0]);
+    };
+    assert_eq!(name, "color");
+    assert_eq!(question, "Pick a color?");
+    assert!(!multi);
+    let labels: Vec<String> = options
+        .iter()
+        .map(|o| o.label.iter().map(|s| s.text.as_str()).collect::<String>())
+        .map(|l| l.trim().to_owned())
+        .collect();
     assert_eq!(labels, ["red", "blue"]);
     assert!(answer_ui(
         &mut a,
         &mut w,
         &mut seq,
         &ask.request,
-        UiAnswer::Ask {
-            answers: vec![UiAskAnswer {
-                id: "q1".into(),
-                selected: vec![1],
-                custom: None,
+        UiAnswer::Form {
+            fields: vec![UiFormAnswer::Choice {
+                checked: vec![1],
+                other: None,
             }],
         },
     ));

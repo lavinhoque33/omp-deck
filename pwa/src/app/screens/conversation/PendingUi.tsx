@@ -1,24 +1,34 @@
 // omp's pending UI requests as inline cards at the bottom of the conversation: one editor per kind
-// (select, confirm, input, editor, ask, approve), each answering with `answer_ui`; a countdown
-// when the request has a timeout; and an "answered on desktop" card when it leaves unanswered.
+// (select, confirm, input, editor, ask, approve, form), each answering with `answer_ui`; a
+// countdown when the request has a timeout; and an "answered on desktop" card when it leaves
+// unanswered.
 
-import { type ReactNode, useState } from 'react';
+import { Fragment, type ReactNode, useState } from 'react';
 import type { api } from '../../../remote/index.ts';
-import { perform } from '../../ui/format.ts';
+import { describeResult, perform } from '../../ui/format.ts';
 import { useCan, useClient, useNow } from '../../ui/hooks.ts';
 import {
   type AskDraft,
+  type FormDraft,
   type GoneRequest,
   answerLabel,
   approveChoices,
   askAnswer,
   askAnswered,
   countdown,
+  formAnswer,
+  formFieldError,
   initialAskDraft,
+  initialFormDrafts,
+  otherChosen,
+  pickFormOption,
+  pickFormOther,
   remainingMs,
   selectAnswer,
+  setFormOther,
   textAnswer,
   toggleAsk,
+  toggleFormOption,
 } from './pending.ts';
 
 const KIND_HEADER: Record<api.UiKind, string> = {
@@ -28,10 +38,11 @@ const KIND_HEADER: Record<api.UiKind, string> = {
   editor: 'TEXT REQUIRED',
   ask: 'QUESTIONS FROM OMP',
   approve: 'APPROVAL REQUIRED',
+  form: 'QUESTIONS FROM OMP',
 };
 
 /** The fixed titles omp's ctl extension gives these kinds; the header already says as much. */
-const CTL_TITLE: Partial<Record<api.UiKind, string>> = { ask: 'Ask', approve: 'Approval' };
+const CTL_TITLE: Partial<Record<api.UiKind, string>> = { ask: 'Ask', approve: 'Approval', form: 'Ask' };
 
 export function PendingUiCard({
   live,
@@ -49,13 +60,18 @@ export function PendingUiCard({
   const client = useClient();
   const can = useCan();
   const [busy, setBusy] = useState(false);
+  /** Why the last answer did not apply (omp's own form check, a refusal), shown on the card. */
+  const [error, setError] = useState<string | null>(null);
   const allowed = can({ op: 'answer_ui', live, request: request.request, value: { type: 'cancel' } }) && !busy;
 
   const answer = async (value: api.UiAnswer) => {
     setBusy(true);
+    setError(null);
     onAnswered(request, null, true);
     const view = await perform(client, { op: 'answer_ui', live, request: request.request, value }, answerLabel(request, value));
     setBusy(false);
+    if (view?.outcome?.state === 'failed') setError(view.outcome.message);
+    else if (view !== null && view.status !== 'done') setError(describeResult(view)?.text ?? null);
     const result = view?.outcome?.state === 'done' ? view.outcome.result : null;
     onAnswered(request, result?.type === 'answered' ? result.applied : null, false);
   };
@@ -70,9 +86,14 @@ export function PendingUiCard({
         {request.title.length > 0 && request.title !== CTL_TITLE[request.kind] && <p className="ui-title">{request.title}</p>}
         {request.message !== null && request.kind !== 'input' && <p className="ui-message">{request.message}</p>}
         <Editor request={request} allowed={allowed} onAnswer={(value) => void answer(value)} />
+        {error !== null && (
+          <p className="notice error ui-error" role="alert">
+            {error}
+          </p>
+        )}
         <div className="ui-foot">
           <button type="button" className="button ghost" disabled={!allowed} onClick={() => void answer({ type: 'cancel' })}>
-            Dismiss
+            {request.kind === 'form' ? 'Cancel' : 'Dismiss'}
           </button>
           {busy && (
             <span className="muted small">
@@ -125,6 +146,8 @@ function Editor({
       return <AskEditor request={request} allowed={allowed} onAnswer={onAnswer} />;
     case 'approve':
       return request.approve === null ? null : <ApproveEditor view={request.approve} allowed={allowed} onAnswer={onAnswer} />;
+    case 'form':
+      return request.form === undefined ? null : <FormEditor form={request.form} allowed={allowed} onAnswer={onAnswer} />;
   }
 }
 
@@ -331,6 +354,318 @@ function ApproveEditor({
         ))}
       </div>
     </>
+  );
+}
+
+/** Inline text of a form: `code`/`strong`/`em` runs, `\n` as a line break. */
+function Spans({ spans }: { spans: readonly api.UiSpan[] }): ReactNode {
+  return spans.map((span, index) => {
+    const lines = span.text.split('\n');
+    const text = lines.map((line, at) => (
+      <Fragment key={at}>
+        {at > 0 && <br />}
+        {line}
+      </Fragment>
+    ));
+    switch (span.style) {
+      case 'code':
+        return <code key={index}>{text}</code>;
+      case 'strong':
+        return <strong key={index}>{text}</strong>;
+      case 'em':
+        return <em key={index}>{text}</em>;
+      default:
+        return <Fragment key={index}>{text}</Fragment>;
+    }
+  });
+}
+
+/**
+ * omp's HTML form (18.18 `ask`): its sections (a titled one boxed like an `ask` question), their
+ * context blocks and the fields in place; Submit only once every field passes omp's checks.
+ */
+function FormEditor({
+  form,
+  allowed,
+  onAnswer,
+}: {
+  form: api.UiFormView;
+  allowed: boolean;
+  onAnswer: (value: api.UiAnswer) => void;
+}): ReactNode {
+  const [drafts, setDrafts] = useState<readonly FormDraft[]>(() => initialFormDrafts(form));
+  // Errors show once a field was changed or Submit tried, not on a form just opened.
+  const [touched, setTouched] = useState<ReadonlySet<number>>(() => new Set());
+  const update = (index: number, draft: FormDraft) => {
+    setDrafts(drafts.map((entry, at) => (at === index ? draft : entry)));
+    if (!touched.has(index)) setTouched(new Set(touched).add(index));
+  };
+  const value = formAnswer(form, drafts);
+  const failing = form.fields.filter((field, index) => formFieldError(field, drafts[index]) !== null).length;
+  const placed = new Set(form.sections.flatMap((section) => section.blocks.flatMap((block) => (block.kind === 'field' ? [block.index] : []))));
+
+  const field = (index: number): ReactNode => {
+    const view = form.fields[index];
+    const draft = drafts[index];
+    if (view === undefined || draft === undefined) return null;
+    return (
+      <FormField
+        key={`f${index}`}
+        field={view}
+        draft={draft}
+        error={touched.has(index) ? formFieldError(view, draft) : null}
+        allowed={allowed}
+        onChange={(next) => update(index, next)}
+      />
+    );
+  };
+
+  const block = (entry: api.UiFormBlock, index: number): ReactNode => {
+    switch (entry.kind) {
+      case 'text':
+        return (
+          <p key={index} className={entry.heading ? 'ui-form-heading' : 'ui-form-text'}>
+            <Spans spans={entry.spans} />
+          </p>
+        );
+      case 'list': {
+        const items = entry.items.map((item, at) => (
+          <li key={at}>
+            <Spans spans={item} />
+          </li>
+        ));
+        return entry.ordered ? (
+          <ol key={index} className="ui-form-list">
+            {items}
+          </ol>
+        ) : (
+          <ul key={index} className="ui-form-list">
+            {items}
+          </ul>
+        );
+      }
+      case 'pre':
+        return <pre key={index}>{entry.text}</pre>;
+      case 'table':
+        return (
+          <div key={index} className="ui-form-table">
+            <table>
+              <tbody>
+                {entry.rows.map((row, at) => (
+                  <tr key={at}>
+                    {row.map((cell, column) =>
+                      at < entry.header_rows ? (
+                        <th key={column}>
+                          <Spans spans={cell} />
+                        </th>
+                      ) : (
+                        <td key={column}>
+                          <Spans spans={cell} />
+                        </td>
+                      ),
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      case 'image':
+        return (
+          <p key={index} className="muted small ui-form-image">
+            [image{entry.alt.length > 0 ? `: ${entry.alt}` : ''}]
+          </p>
+        );
+      case 'field':
+        return field(entry.index);
+    }
+  };
+
+  return (
+    <form
+      className="ui-form"
+      noValidate
+      onSubmit={(event) => {
+        event.preventDefault();
+        setTouched(new Set(form.fields.keys()));
+        if (allowed && value !== null) onAnswer(value);
+      }}
+    >
+      {form.sections.map((section, index) =>
+        section.title.length > 0 ? (
+          <fieldset key={index} className="ui-question ui-form-section">
+            <legend>
+              <span className="ui-form-legend">
+                <Spans spans={section.title} />
+              </span>
+            </legend>
+            {section.blocks.map(block)}
+          </fieldset>
+        ) : (
+          <div key={index} className="ui-form-section">
+            {section.blocks.map(block)}
+          </div>
+        ),
+      )}
+      {form.fields.map((_, index) => (placed.has(index) ? null : field(index)))}
+      <div className="buttons">
+        <button type="submit" className="button primary" disabled={!allowed || value === null}>
+          ✓ Submit
+        </button>
+        {failing > 0 && (
+          <span className="chip warn">
+            {failing} {failing === 1 ? 'field needs' : 'fields need'} an answer
+          </span>
+        )}
+      </div>
+    </form>
+  );
+}
+
+/** `<input type>`s drawn as such (their phone keyboards); anything else is plain text. */
+const INPUT_TYPES: Record<string, true> = { number: true, email: true, url: true };
+
+function FormField({
+  field,
+  draft,
+  error,
+  allowed,
+  onChange,
+}: {
+  field: api.UiFormFieldView;
+  draft: FormDraft;
+  error: string | null;
+  allowed: boolean;
+  onChange: (draft: FormDraft) => void;
+}): ReactNode {
+  const label = field.label.length > 0 && (
+    <span className="ui-form-label">
+      <Spans spans={field.label} />
+    </span>
+  );
+  const head = (label !== false || field.required) && (
+    <div className="ui-form-field-head">
+      {label}
+      {field.required && (
+        <span className="ui-required" title="Required" aria-label="required">
+          *
+        </span>
+      )}
+    </div>
+  );
+  const question = field.question.length > 0 ? field.question : field.name;
+  let control: ReactNode;
+  if (field.kind === 'text' && draft.kind === 'text') {
+    control = field.multiline ? (
+      <textarea
+        className="input ui-form-input"
+        rows={Math.max(2, field.rows)}
+        value={draft.text}
+        placeholder={field.placeholder}
+        disabled={!allowed}
+        aria-label={question}
+        aria-invalid={error !== null}
+        onChange={(event) => onChange({ kind: 'text', text: event.target.value })}
+      />
+    ) : (
+      <input
+        className="input ui-form-input"
+        type={INPUT_TYPES[field.input_type] === true ? field.input_type : 'text'}
+        inputMode={field.input_type === 'number' ? 'decimal' : undefined}
+        value={draft.text}
+        placeholder={field.placeholder}
+        disabled={!allowed}
+        aria-label={question}
+        aria-invalid={error !== null}
+        onChange={(event) => onChange({ kind: 'text', text: event.target.value })}
+      />
+    );
+  } else if (field.kind === 'choice' && draft.kind === 'choice' && field.select && !field.multi) {
+    control = (
+      <select
+        className="input ui-form-input"
+        value={draft.checked[0] === undefined ? '' : String(draft.checked[0])}
+        disabled={!allowed}
+        aria-label={question}
+        aria-invalid={error !== null}
+        onChange={(event) => onChange(pickFormOption(field, draft, event.target.value === '' ? null : Number(event.target.value)))}
+      >
+        <option value="">—</option>
+        {field.options.map((option, index) => (
+          <option key={index} value={String(index)} disabled={option.disabled}>
+            {option.label.map((span) => span.text).join('')}
+          </option>
+        ))}
+      </select>
+    );
+  } else if (field.kind === 'choice' && draft.kind === 'choice') {
+    const role = field.multi ? 'checkbox' : 'radio';
+    const otherOn = field.multi ? otherChosen(field, draft) : draft.otherPicked && draft.checked.length === 0;
+    control = (
+      <>
+        <div className="option-list ui-options" role={field.multi ? 'group' : 'radiogroup'} aria-label={question}>
+          {field.options.map((option, index) => {
+            const on = draft.checked.includes(index);
+            return (
+              <button
+                key={index}
+                type="button"
+                className="option"
+                role={role}
+                aria-checked={on}
+                aria-pressed={on}
+                disabled={!allowed || option.disabled}
+                onClick={() => onChange(toggleFormOption(field, draft, index))}
+              >
+                <span className={`mark${field.multi ? ' square' : ''}`} aria-hidden="true">
+                  {on ? (field.multi ? '✓' : '●') : ''}
+                </span>
+                <span className="grow">
+                  <Spans spans={option.label} />
+                </span>
+              </button>
+            );
+          })}
+          {field.other && !field.multi && (
+            <button
+              type="button"
+              className="option"
+              role="radio"
+              aria-checked={otherOn}
+              aria-pressed={otherOn}
+              disabled={!allowed}
+              onClick={() => onChange(pickFormOther(field, draft))}
+            >
+              <span className="mark" aria-hidden="true">
+                {otherOn ? '●' : ''}
+              </span>
+              <span className="grow">Other</span>
+            </button>
+          )}
+        </div>
+        {field.other && (
+          <input
+            className="input ui-custom"
+            placeholder={field.multi ? 'Other (type your own)' : 'Type your own answer'}
+            value={draft.other}
+            disabled={!allowed}
+            aria-label={`Other answer to: ${question}`}
+            onChange={(event) => onChange(setFormOther(field, draft, event.target.value))}
+          />
+        )}
+      </>
+    );
+  }
+  return (
+    <div className={`ui-form-field${error !== null ? ' invalid' : ''}`}>
+      {head}
+      {control}
+      {error !== null && (
+        <p className="ui-form-error" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
 

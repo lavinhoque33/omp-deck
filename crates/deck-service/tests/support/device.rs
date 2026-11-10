@@ -401,18 +401,14 @@ pub fn admit(relay: &Relay, token: &relay::Token) -> Ws {
     }
 }
 
-/// `s4`: the device announces slice 4 ([`api::FEATURE_S4`]).
-pub fn hello(name: &str, s4: bool) -> DeviceHello {
+/// A hello announcing `features` (e.g. [`api::FEATURE_S4`], [`api::FEATURE_FORM`]).
+pub fn hello(name: &str, features: &[&str]) -> DeviceHello {
     DeviceHello {
         name: name.into(),
         platform: "test".into(),
         ts: now_ms(),
         api: 1,
-        features: if s4 {
-            vec![api::FEATURE_S4.to_owned()]
-        } else {
-            Vec::new()
-        },
+        features: features.iter().map(|f| (*f).to_owned()).collect(),
     }
 }
 
@@ -471,7 +467,7 @@ pub fn pair(client: &GatewayClient, relay: &Relay, name: &str, permissions: Perm
         Mode::Pairing { psk: &invite.psk },
         &key,
         &invite.gateway_public,
-        &hello(name, true),
+        &hello(name, &[api::FEATURE_S4]),
     )
     .expect("pairing msg1");
     ws.send(Message::binary(msg1)).expect("send msg1");
@@ -518,11 +514,19 @@ pub struct Device {
 }
 
 impl Device {
-    /// An IK reconnect of `p`; its first record must be `WELCOME`.
+    /// An IK reconnect of `p`; its first record must be `WELCOME`. `s4`: the device announces
+    /// slice 4 ([`api::FEATURE_S4`]).
     pub fn connect(relay: &Relay, p: &Paired, name: &str, s4: bool) -> Device {
+        let features: &[&str] = if s4 { &[api::FEATURE_S4] } else { &[] };
+        Device::connect_with(relay, p, name, features)
+    }
+
+    /// [`Device::connect`] announcing exactly `features`.
+    pub fn connect_with(relay: &Relay, p: &Paired, name: &str, features: &[&str]) -> Device {
         let mut ws = admit(relay, &p.token);
-        let (init, msg1) = Initiator::start(Mode::Reconnect, &p.key, &p.gateway, &hello(name, s4))
-            .expect("reconnect msg1");
+        let (init, msg1) =
+            Initiator::start(Mode::Reconnect, &p.key, &p.gateway, &hello(name, features))
+                .expect("reconnect msg1");
         ws.send(Message::binary(msg1)).expect("send msg1");
         let msg2 = read_blocking(&mut ws).expect("reconnect message 2");
         let (mut noise, w) = init.finish(&msg2).expect("reconnect msg2");

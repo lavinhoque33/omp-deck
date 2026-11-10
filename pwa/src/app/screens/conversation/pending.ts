@@ -83,7 +83,9 @@ export function approveChoices(
 
 /** A label for the answer (the journaled request's label). */
 export function answerLabel(request: api.UiRequestView, answer: api.UiAnswer): string {
-  const title = request.title.length > 0 ? request.title : request.kind;
+  // A form's title is omp's fixed "Ask"; its first question says what is being answered.
+  const question = request.kind === 'form' ? request.form?.fields[0]?.question.trim() : undefined;
+  const title = question !== undefined && question.length > 0 ? question : request.title.length > 0 ? request.title : request.kind;
   switch (answer.type) {
     case 'cancel':
       return `Dismiss “${title}”`;
@@ -94,6 +96,146 @@ export function answerLabel(request: api.UiRequestView, answer: api.UiAnswer): s
     default:
       return `Answer “${title}”`;
   }
+}
+
+// ---- HTML forms (omp 18.18 `ask`) -------------------------------------------------------------
+
+type ChoiceField = Extract<api.UiFormFieldView, { kind: 'choice' }>;
+type TextField = Extract<api.UiFormFieldView, { kind: 'text' }>;
+
+/**
+ * One field's draft in a form editor. A choice's `otherPicked` is a radio group's Other row
+ * being the pick (no option checked); a checkbox group's Other counts whenever it has text.
+ */
+export type FormDraft =
+  | { kind: 'choice'; checked: readonly number[]; other: string; otherPicked: boolean }
+  | { kind: 'text'; text: string };
+
+/**
+ * The starting drafts of a form, one per field: checked options (enabled ones only; of several
+ * checked radios the last wins, as in a browser) and prefilled text.
+ */
+export function initialFormDrafts(form: api.UiFormView): FormDraft[] {
+  return form.fields.map((field): FormDraft => {
+    if (field.kind === 'text') return { kind: 'text', text: field.value };
+    const checked = field.options.flatMap((option, index) => (option.checked && !option.disabled ? [index] : []));
+    return { kind: 'choice', checked: field.multi ? checked : checked.slice(-1), other: '', otherPicked: false };
+  });
+}
+
+/** Taps option `index`: a radio picks it (Other set aside), a checkbox toggles it. */
+export function toggleFormOption(field: api.UiFormFieldView, draft: FormDraft, index: number): FormDraft {
+  if (field.kind !== 'choice' || draft.kind !== 'choice') return draft;
+  const option = field.options[index];
+  if (option === undefined || option.disabled) return draft;
+  if (!field.multi) return { ...draft, checked: [index], otherPicked: false };
+  const checked = draft.checked.includes(index)
+    ? draft.checked.filter((entry) => entry !== index)
+    : [...draft.checked, index].sort((a, b) => a - b);
+  return { ...draft, checked };
+}
+
+/** Picks a dropdown's option (`null`: none). */
+export function pickFormOption(field: api.UiFormFieldView, draft: FormDraft, index: number | null): FormDraft {
+  if (field.kind !== 'choice' || draft.kind !== 'choice') return draft;
+  if (index === null) return { ...draft, checked: [], otherPicked: false };
+  return toggleFormOption(field, draft, index);
+}
+
+/** Taps a radio group's Other row: it becomes the pick, the checked option is cleared. */
+export function pickFormOther(field: api.UiFormFieldView, draft: FormDraft): FormDraft {
+  if (field.kind !== 'choice' || draft.kind !== 'choice' || !field.other || field.multi) return draft;
+  return { ...draft, checked: [], otherPicked: true };
+}
+
+/** Types the Other text; in a radio group typing makes Other the pick (as omp's dialog does). */
+export function setFormOther(field: api.UiFormFieldView, draft: FormDraft, other: string): FormDraft {
+  if (field.kind !== 'choice' || draft.kind !== 'choice' || !field.other) return draft;
+  if (field.multi) return { ...draft, other };
+  return { ...draft, other, checked: [], otherPicked: true };
+}
+
+/** Whether a choice draft's Other answer counts (omp's `#otherChosen` with blank text as none). */
+export function otherChosen(field: ChoiceField, draft: Extract<FormDraft, { kind: 'choice' }>): boolean {
+  if (!field.other || draft.other.trim() === '') return false;
+  return field.multi || draft.checked.length === 0;
+}
+
+/** A text field's text as omp's `textValue` then `String()` see it (numbers normalized). */
+function textOf(field: TextField, text: string): string {
+  if ((field.input_type === 'number' || field.input_type === 'range') && text.trim() !== '') {
+    const number = Number(text);
+    if (Number.isFinite(number)) return String(number);
+  }
+  return text;
+}
+
+/** `^(?:pattern)$` as HTML matches `pattern`, or undefined for an invalid one (ignored, as omp does). */
+function compilePattern(pattern: string): RegExp | undefined {
+  try {
+    return new RegExp(`^(?:${pattern})$`, 'v');
+  } catch {
+    return undefined;
+  }
+}
+
+function isUrl(text: string): boolean {
+  try {
+    new URL(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Why a field's draft is not acceptable, or null: omp's `fieldError` (same messages), so the
+ * card flags what omp would refuse. Unnamed fields submit nothing and are never checked.
+ */
+export function formFieldError(field: api.UiFormFieldView, draft: FormDraft | undefined): string | null {
+  if (field.name === '') return null;
+  if (field.kind === 'choice') {
+    if (!field.required) return null;
+    const choice = draft?.kind === 'choice' ? draft : undefined;
+    const picked = choice !== undefined && (choice.checked.some((index) => field.options[index]?.disabled === false) || otherChosen(field, choice));
+    if (picked) return null;
+    // omp's `isArrayChoice`: a checkbox group or multi-select answers a list.
+    return field.multi && field.options.length > 1 ? 'Select at least one' : 'Required';
+  }
+  const text = textOf(field, draft?.kind === 'text' ? draft.text : '');
+  if (text.trim() === '') return field.required ? 'Required' : null;
+  if (field.input_type === 'number' || field.input_type === 'range') {
+    const number = Number(text);
+    if (!Number.isFinite(number)) return 'Enter a number';
+    if (field.min !== null && number < Number(field.min)) return `Must be at least ${field.min}`;
+    if (field.max !== null && number > Number(field.max)) return `Must be at most ${field.max}`;
+  }
+  if (field.min_length !== null && text.length < field.min_length) return `Needs at least ${field.min_length} characters`;
+  if (field.max_length !== null && text.length > field.max_length) return `At most ${field.max_length} characters`;
+  if (field.input_type === 'email' && !/^[^\s@]+@[^\s@]+$/.test(text)) return 'Enter an email address';
+  if (field.input_type === 'url' && !isUrl(text)) return 'Enter a full URL';
+  if (field.pattern !== null && field.pattern !== '' && compilePattern(field.pattern)?.test(text) === false) {
+    return `Must match ${field.pattern.length > 40 ? `${field.pattern.slice(0, 39)}…` : field.pattern}`;
+  }
+  return null;
+}
+
+/** The `form` answer, one entry per field in order; null while a field fails {@link formFieldError}. */
+export function formAnswer(form: api.UiFormView, drafts: readonly FormDraft[]): Extract<api.UiAnswer, { type: 'form' }> | null {
+  const fields: api.UiFormAnswer[] = [];
+  for (const [index, field] of form.fields.entries()) {
+    const draft = drafts[index];
+    if (formFieldError(field, draft) !== null) return null;
+    if (field.kind === 'text') {
+      fields.push({ type: 'text', text: draft?.kind === 'text' ? draft.text : field.value });
+      continue;
+    }
+    const choice = draft?.kind === 'choice' ? draft : { kind: 'choice' as const, checked: [], other: '', otherPicked: false };
+    const checked = choice.checked.filter((option) => field.options[option]?.disabled === false);
+    if (!field.multi && checked.length > 1) return null;
+    fields.push({ type: 'choice', checked, other: otherChosen(field, choice) ? choice.other : null });
+  }
+  return { type: 'form', fields };
 }
 
 // ---- timeout countdown ----------------------------------------------------------------------

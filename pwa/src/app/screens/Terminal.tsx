@@ -1,6 +1,7 @@
 // A live session's terminal: xterm 6 as a renderer only (DOM renderer), fed by the view's
 // snapshot and output. Input comes from our own field and key bar, never from xterm, so terminal
-// queries are never answered; OSC 52 (clipboard) is swallowed. Observe/Input/Control modes; in
+// queries are never answered; OSC 52 (clipboard) is swallowed, APC strings (omp's TSP frames)
+// are dropped before xterm. Observe/Input/Control modes; in
 // Control the phone owns the terminal size (`geometry_owned` falls back to Input).
 
 import { FitAddon } from '@xterm/addon-fit';
@@ -9,6 +10,7 @@ import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 import type { api } from '../../remote/index.ts';
+import { ApcStripper } from '../apc.ts';
 import { ClientError, type TermView } from '../client.ts';
 import { useNav } from '../nav.ts';
 import { shortModel, statusLabel } from '../ui/format.ts';
@@ -141,18 +143,21 @@ export function TerminalScreen({ liveKey, title }: { liveKey: string; title: str
     if (term === null || live === null || !online) return;
     let cancelled = false;
     let snapshotting = false;
+    // omp's TSP frames and other APC strings: xterm draws none of them (see apc.ts).
+    let apc = new ApcStripper();
     setEnded(null);
     const sink = {
       snapshot(bytes: Uint8Array, last: boolean) {
         if (!snapshotting) {
           term.reset();
+          apc = new ApcStripper();
           snapshotting = true;
         }
-        term.write(bytes);
+        term.write(apc.filter(bytes));
         if (last) snapshotting = false;
       },
       output(bytes: Uint8Array) {
-        term.write(bytes);
+        term.write(apc.filter(bytes));
       },
       resize(cols: number, rows: number) {
         setSize({ cols, rows });

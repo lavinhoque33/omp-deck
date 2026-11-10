@@ -25,7 +25,7 @@ import type { Dialer, Link, LinkClose, PairingResult, PairingStage } from './lin
 import { decideRetry, type Stop } from './retry.ts';
 
 /** Optional features this app announces in `DeviceHello.features`. */
-export const DEVICE_FEATURES: readonly string[] = [api.FEATURE_S4];
+export const DEVICE_FEATURES: readonly string[] = [api.FEATURE_S4, api.FEATURE_FORM];
 
 /** Feeds of protocol v1; every other feed needs a gateway announcing `s4`. */
 const V1_FEEDS: Partial<Record<api.Feed['feed'], true>> = {

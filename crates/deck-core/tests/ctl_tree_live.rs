@@ -357,39 +357,53 @@ fn labels_advisors_and_the_task_model_apply_to_the_running_session() {
     );
 }
 
-/// The ask the tab currently shows: `(surface, option list id)`.
-fn ask_dock(live: &Live) -> Option<(String, String)> {
+/// The ask the tab currently shows: `(surface, option list id, action bar id)`. omp 18.18's
+/// form ask: the question's options are the `omp.ask.options` list keyed `f<field>` (the outer
+/// one of that role, keyed `body<tab>`, is the form's scroller).
+fn ask_dock(live: &Live) -> Option<(String, String, String)> {
     let doc = live.peek();
-    let list = support::nodes(&doc)
-        .into_iter()
-        .find(|(_, k, p)| k == "list" && p["role"] == "omp.ask.options")?;
+    let nodes = support::nodes(&doc);
+    let list = nodes.iter().find(|(id, k, p)| {
+        k == "list"
+            && p["role"] == "omp.ask.options"
+            && id
+                .rsplit('/')
+                .next()
+                .is_some_and(|key| key.starts_with('f'))
+    })?;
+    let actions = nodes
+        .iter()
+        .find(|(_, k, p)| k == "row" && p["role"] == "omp.actions")?;
     let sf = doc["surfaces"]
         .as_array()?
         .iter()
         .find(|s| s["open"] == true)?["id"]
         .as_str()?;
-    Some((sf.to_owned(), list.0))
+    Some((sf.to_owned(), list.0.clone(), actions.0.clone()))
 }
 
-/// Answers the shown ask: picks option `index` (a pick submits it, like the Enter key), or
-/// skips the dialog (`None`, its "Skip" button).
+/// Answers the shown ask: picks option `index` and submits, or cancels the dialog (`None`).
 fn answer_ask(live: &Live, index: Option<usize>) {
-    let (sf, list) = wait_for("omp's ask dialog in the tab", TURN, || ask_dock(live));
-    let event = match index {
-        Some(i) => Event::Select {
-            sf,
-            id: list.clone(),
-            item: format!("{list}/option:{i}"),
-        },
-        None => Event::Action {
-            sf,
-            id: format!("{}.actions/cancel", list.trim_end_matches(".q0")),
-            act: "cancel".to_owned(),
-            value: None,
-            mods: None,
-        },
+    let (sf, list, actions) = wait_for("omp's ask dialog in the tab", TURN, || ask_dock(live));
+    let action = |act: &str| Event::Action {
+        sf: sf.clone(),
+        id: format!("{actions}/{act}"),
+        act: act.to_owned(),
+        value: None,
+        mods: None,
     };
-    live.events(&[event]);
+    let events = match index {
+        Some(i) => vec![
+            Event::Select {
+                sf: sf.clone(),
+                id: list.clone(),
+                item: format!("{list}/o{i}"),
+            },
+            action("submit"),
+        ],
+        None => vec![action("cancel")],
+    };
+    live.events(&events);
 }
 
 /// The model sees the ask's answer as a tool result and echoes it.
@@ -404,7 +418,9 @@ fn ask_script(request: &Value) -> Reply {
     if prompt_of(request) == "ASKME" {
         return Reply::tool_call(
             "ask",
-            &json!({"questions":[{"id":"q1","question":"Pick one","options":[{"label":"alpha"},{"label":"beta"}]}]}),
+            &json!({"html": "<form><p>Pick one</p>\
+                <label><input type=\"radio\" name=\"pick\" value=\"alpha\"> alpha</label>\
+                <label><input type=\"radio\" name=\"pick\" value=\"beta\"> beta</label></form>"}),
         );
     }
     Reply::text("unscripted")

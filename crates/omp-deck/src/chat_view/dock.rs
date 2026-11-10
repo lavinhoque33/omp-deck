@@ -134,6 +134,7 @@ pub fn role_node(cx: &Cx, ui: &mut Ui, n: &SNode) -> bool {
             panel(cx, ui, Panel::Ask, &|ui| ask_body(cx, ui, n));
         }
         "omp.composer.focus" => focus_chip(cx, ui, n),
+        "omp.ask.well" | "omp.ask.well.multi" => ask_well(cx, ui, n),
         "omp.hud.pill" => hud_pill(cx, ui, n),
         "omp.btn" => btn(cx, ui, n),
         "omp.composer.send" => send_button(cx, ui, n),
@@ -694,9 +695,91 @@ fn focus_exit(cx: &Cx, ui: &mut Ui, exit: &SNode) {
 
 // ---- editor ---------------------------------------------------------------------------------
 
-/// Read-only `editor`/`input` nodes outside the composer (ask notes, hook inputs, previews).
-pub fn editor_readonly(cx: &Cx, ui: &mut Ui, n: &SNode) {
-    editor_box(cx, ui, n);
+/// `editor`/`input` nodes outside the composer (hook inputs, previews, and an ask form's live
+/// field: omp describes the focused text field as its editor, so the caret shows there).
+pub fn editor_node(cx: &Cx, ui: &mut Ui, n: &SNode) {
+    if in_ask(cx, n) {
+        let rect = ask_box(cx, ui, true, |ui| {
+            editor_box(cx, ui, n);
+        })
+        .rect;
+        // omp makes this the live field (the Other row, a clicked well): bring it into the
+        // form's scroller once, as a focused option row does.
+        let live = cx.snap.focus.as_deref() == Some(n.id.as_str());
+        let key = ui.scope_id().with(("ask-live", n.id.as_str()));
+        if !ui.is_sizing_pass() && ui.data(|d| d.get_temp::<bool>(key)) != Some(live) {
+            ui.data_mut(|d| d.insert_temp(key, live));
+            if live {
+                ui.scroll_to_rect(rect, None);
+            }
+        }
+    } else {
+        editor_box(cx, ui, n);
+    }
+}
+
+/// `n` lies inside an ask/approval dialog of the dock.
+fn in_ask(cx: &Cx, n: &SNode) -> bool {
+    let mut cur = n;
+    while let Some(p) = cx.snap.parent_of(&cur.id) {
+        if p.role().starts_with("omp.editor.ask") {
+            return true;
+        }
+        cur = p;
+    }
+    false
+}
+
+/// The input frame of an ask form's text field: accented while it is the live field.
+fn ask_box(cx: &Cx, ui: &mut Ui, live: bool, body: impl FnOnce(&mut Ui)) -> Response {
+    let ink = cx.ink;
+    egui::Frame::new()
+        .fill(ink.chip())
+        .stroke(Stroke::new(
+            1.0,
+            if live { ink.p.accent } else { ink.p.stroke },
+        ))
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            body(ui);
+        })
+        .response
+}
+
+/// A text field of an ask form that is not the live one (`omp.ask.well`, `.multi`): its value or
+/// placeholder in an input frame; a click (`actions.click` = `edit:<field>`) makes omp focus it.
+fn ask_well(cx: &Cx, ui: &mut Ui, n: &SNode) {
+    let ink = cx.ink;
+    let line = PROSE * PROSE_LINE;
+    let lines = n.num("lines").map_or(1.0, |l| l.max(1.0)) as f32;
+    let resp = ask_box(cx, ui, false, |ui| {
+        let w = ui.available_width();
+        let mut base = Base::new(ink.prose(PROSE), ink.strong(), ink);
+        base.line_height = Some(line);
+        let mut job = text::node_job(ink, n, &base, None);
+        if n.str("wrap") == Some("none") {
+            job.wrap = egui::text::TextWrapping::truncate_at_width(w);
+        } else {
+            job.wrap.max_width = w;
+        }
+        let galley = ui.painter().layout_job(job);
+        let h = galley.size().y.max(lines * line);
+        let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+        ui.painter().galley(rect.min, galley, ink.strong());
+    });
+    let id = ui.scope_id().with(("ask-well", &n.id));
+    let click = ui.interact(resp.rect, id, Sense::click());
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(id.with("h"), click.hovered(), 0.1);
+    paint::pop(ui.painter(), resp.rect, 5, ink, hov);
+    if click.on_hover_cursor(CursorIcon::Text).clicked()
+        && let Some(act) = n.click()
+    {
+        cx.click(n, act);
+    }
 }
 
 /// Builds the editor's text job: text with `decor` ranges and the `ghost`, else the placeholder.

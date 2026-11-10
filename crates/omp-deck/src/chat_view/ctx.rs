@@ -75,6 +75,8 @@ pub struct Cx<'a> {
     /// carry its model, while omp's own TUI badges it. Borrowed per frame from the app's
     /// already-refreshed agent data: no file or socket reads happen here.
     pub agents: &'a [AgentMeta],
+    /// Height of the chat's rect: what caps the scrolling body of omp's ask form.
+    pub view_h: f32,
 }
 
 /// The identity of one subagent, as the agents dashboard resolved it (transcript plus the
@@ -328,6 +330,7 @@ impl<'a> Cx<'a> {
             hide_duplicates: false,
             hidden: None,
             agents: &[],
+            view_h: f32::INFINITY,
         }
     }
 

@@ -467,6 +467,7 @@ impl<'a> ChatView<'a> {
         cx.hide_duplicates = hide_duplicates && !paged;
         cx.hidden = hidden;
         cx.agents = agents;
+        cx.view_h = rect.height();
         if paged {
             page::show(&cx, ui, rect, id);
         } else {
@@ -1689,6 +1690,11 @@ mod tests {
 
     /// The `edit` events the child received, in order (`ESC _ tsp;e … ESC \`).
     fn edits(typed: &[u8]) -> Vec<serde_json::Value> {
+        sent(typed, "edit")
+    }
+
+    /// The TSP events named `ev` the child received, in order.
+    fn sent(typed: &[u8], ev: &str) -> Vec<serde_json::Value> {
         let text = String::from_utf8_lossy(typed);
         text.split("\u{1b}_tsp;e")
             .skip(1)
@@ -1696,7 +1702,7 @@ mod tests {
                 let body = chunk.split("\u{1b}\\").next()?;
                 serde_json::from_str::<serde_json::Value>(&body[body.find('{')?..]).ok()
             })
-            .filter(|e| e["ev"] == "edit")
+            .filter(|e| e["ev"] == ev)
             .collect()
     }
 
@@ -3441,6 +3447,135 @@ mod tests {
             action_events(&typed),
             [serde_json::json!({"ev": "action", "sf": "s:2",
                                "id": "r.main/bar/1/stage-file", "act": "stage-file"})]
+        );
+    }
+
+    /// The dock showing case `case` of `ask-form.json`: omp 18.18.6's `ask` form, recorded.
+    fn ask_form(name: &str, case: &str) -> Harness {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("ask-form.json")).expect("ask form fixture");
+        let case = &fixture["cases"][case];
+        let node = &case["node"];
+        let mut ops = vec![serde_json::json!(["add", node["id"], "dock", null, node])];
+        if !case["focus"].is_null() {
+            ops.push(serde_json::json!(["focus", case["focus"]]));
+        }
+        Harness::with_frames(name, &[serde_json::Value::Array(ops)])
+    }
+
+    /// Since omp 18.18 an ask is an HTML form: the shown tab sits in one `omp.ask.options` list
+    /// as a column of sections and fields, each choice field with its own option list. The list
+    /// drew every child as a row label, so the whole form was one blank row: no options at all.
+    #[test]
+    fn every_answer_and_the_context_of_an_ask_form_are_painted_and_a_click_picks_one() {
+        let mut h = ask_form("ask-form-radio", "initial");
+        let pg = "Postgres: shared across instances, needs ops";
+        let out = show_until(&mut h, pg);
+        let painted: Vec<String> = galleys(&out).into_iter().map(|g| g.2).collect();
+        for want in [
+            "Pick the storage setup for the service. Context below.",
+            "ENGINE",
+            "a server",
+            "DATABASE_URL=sqlite://data.db",
+            "• Backups nightly",
+            "Database",
+            "SQLite: one file, no new service, simplest operations by far for a single box deployment",
+            pg,
+            "MySQL (not supported)",
+            "Other…",
+            "Cancel",
+            "Next",
+        ] {
+            assert!(painted.iter().any(|p| p == want), "{want:?} in {painted:?}");
+        }
+        // A disabled answer is not offered: only the Postgres click reaches omp.
+        click_at(
+            &mut h,
+            centre_of(&out, "MySQL (not supported)").expect("MySQL row"),
+        );
+        click_at(&mut h, centre_of(&out, pg).expect("Postgres row"));
+        let picked = sent(&h.typed(b"f0/o1"), "select");
+        assert_eq!(
+            picked,
+            [
+                serde_json::json!({"ev": "select", "sf": "s:1", "id": "qv.body0/0/s1/0/f0",
+                "item": "qv.body0/0/s1/0/f0/o1"})
+            ]
+        );
+    }
+
+    /// omp toggles a checkbox on `select` only; the focused row is the list's `selected`, which
+    /// for other lists turns a click into `activate` (unchecking Go did nothing).
+    #[test]
+    fn clicking_the_focused_checkbox_of_an_ask_form_toggles_it() {
+        let mut h = ask_form("ask-form-check", "check_go");
+        let out = show_until(&mut h, "Go");
+        click_at(&mut h, centre_of(&out, "Go").expect("Go row"));
+        let typed = h.typed(b"f1/o1");
+        assert_eq!(
+            sent(&typed, "select"),
+            [
+                serde_json::json!({"ev": "select", "sf": "s:1", "id": "qv.body1/0/s2/0/f1",
+                "item": "qv.body1/0/s2/0/f1/o1"})
+            ]
+        );
+        assert!(sent(&typed, "activate").is_empty());
+    }
+
+    /// The live field is omp's `input` (its text shows); another field is a well whose click
+    /// asks omp to focus it.
+    #[test]
+    fn an_ask_forms_text_fields_show_their_values_and_a_click_moves_omps_focus() {
+        let mut h = ask_form("ask-form-text", "name_typed");
+        let out = show_until(&mut h, "svc");
+        for want in ["Pool size", "4", "Anything else", "Submit"] {
+            assert!(centre_of(&out, want).is_some(), "{want:?} is painted");
+        }
+        click_at(&mut h, centre_of(&out, "4").expect("pool size well"));
+        assert_eq!(
+            sent(&h.typed(b"edit:3"), "action"),
+            [
+                serde_json::json!({"ev": "action", "sf": "s:1", "id": "qv.body2/0/s3/1/1",
+                "act": "edit:3"})
+            ]
+        );
+    }
+
+    /// The question tabs carry `actions.click: select`; a click on one must reach omp as a
+    /// `select` of that tab, not of the whole strip (omp ignores that: tabs never switched).
+    #[test]
+    fn clicking_an_ask_forms_question_tab_selects_that_tab() {
+        let mut h = ask_form("ask-form-tabs", "initial");
+        let out = show_until(&mut h, "Review");
+        click_at(&mut h, centre_of(&out, "Review").expect("Review tab"));
+        assert_eq!(
+            sent(&h.typed(b"review"), "select"),
+            [
+                serde_json::json!({"ev": "select", "sf": "s:1", "id": "qv.head/tabs",
+                "item": "review"})
+            ]
+        );
+    }
+
+    /// A table column is as wide as its widest cell when the row fits: egui's grid kept a
+    /// column as narrow as its head, so the ask form's "SQLite" broke into "SQLit / e".
+    #[test]
+    fn a_table_cell_wider_than_its_head_stays_on_one_line() {
+        let mut h = ask_form("ask-form-table", "initial");
+        show_until(&mut h, "a server");
+        let out = h.settle();
+        let at = |text: &str| {
+            galleys(&out)
+                .into_iter()
+                .find(|g| g.2 == text)
+                .unwrap_or_else(|| panic!("{text} is painted"))
+        };
+        let (head, sqlite, none) = (at("ENGINE"), at("SQLite"), at("none"));
+        assert!(sqlite.1.x > head.1.x, "the cell is wider than its head");
+        assert_eq!(sqlite.1.y, none.1.y, "one line, as its neighbour");
+        assert!(
+            none.0.x > sqlite.0.x + sqlite.1.x,
+            "the next column starts after it"
         );
     }
 }

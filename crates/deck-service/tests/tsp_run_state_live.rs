@@ -52,14 +52,15 @@ fn script() -> impl FnMut(&Value) -> Reply + Send + 'static {
                 .iter()
                 .any(|m| fm::role(m) == "tool");
             return if fresh {
+                // omp 18.18's `ask` takes one HTML `<form>`.
                 Reply::tool_call(
                     "ask",
-                    &json!({"questions": [{
-                        "id": "storage",
-                        "question": "Which database?",
-                        "options": [{"label": "SQLite"}, {"label": "Postgres"}],
-                        "recommended": 0,
-                    }]}),
+                    &json!({"html": concat!(
+                        r#"<form><p>Which database?</p>"#,
+                        r#"<label><input type="radio" name="storage" value="sqlite"> SQLite</label>"#,
+                        r#"<label><input type="radio" name="storage" value="postgres"> Postgres</label>"#,
+                        "</form>",
+                    )}),
                 )
             } else {
                 Reply::text(ASKED_REPLY)
@@ -304,7 +305,10 @@ fn omp_run_state_drives_activity_under_tsp() {
         Some(RunPhase::Blocked { .. })
     ));
 
-    // Answering (Enter takes the recommended option) resumes the turn and finishes it.
+    // Answering resumes the turn and finishes it: Enter picks the first option and moves to
+    // Submit, the next Enter submits.
+    ctl.terminal().write(b"\r");
+    std::thread::sleep(Duration::from_millis(300));
     ctl.terminal().write(b"\r");
     wait_for("the model to see the answer", TURN, || {
         model

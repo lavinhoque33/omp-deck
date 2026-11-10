@@ -1,0 +1,1675 @@
+{
+ "recorded": "omp 18.18.6 (TSP via omp-deck-host, scripted model): the `ask` tool's HTML form in the dock, ids prefixed with `q`. `focus` is the surface's focus then.",
+ "form": "<form>\n<p>Pick the <b>storage</b> setup for the service. Context below.</p>\n<table><tr><th>Engine</th><th>Ops</th></tr><tr><td>SQLite</td><td>none</td></tr><tr><td>Postgres</td><td>a server</td></tr></table>\n<pre>DATABASE_URL=sqlite://data.db</pre>\n<ul><li>Backups nightly</li><li>Read replicas optional</li></ul>\n<fieldset><legend>Database</legend>\n<label><input type=\"radio\" name=\"db\" value=\"sqlite\" checked> SQLite: one file, no new service, simplest operations by far for a single box deployment</label>\n<label><input type=\"radio\" name=\"db\" value=\"pg\"> Postgres: shared across instances, needs ops</label>\n<label><input type=\"radio\" name=\"db\" value=\"mysql\" disabled> MySQL (not supported)</label>\n</fieldset>\n<fieldset><legend>Languages</legend>\n<label><input type=\"checkbox\" name=\"lang\" value=\"rust\" checked> Rust</label>\n<label><input type=\"checkbox\" name=\"lang\" value=\"go\"> Go</label>\n</fieldset>\n<fieldset><legend>Details</legend>\n<label>Region <select name=\"region\"><option value=\"eu\">Europe</option><option value=\"us\" selected>United States</option><option value=\"ap\">Asia Pacific</option></select></label>\n<label>Pool size <input type=\"number\" name=\"pool\" value=\"4\" min=\"1\" max=\"64\"></label>\n<label>Project name <input type=\"text\" name=\"pname\" placeholder=\"my-service\" required></label>\n<label>Notes <textarea name=\"notes\" placeholder=\"Anything else\"></textarea></label>\n</fieldset>\n</form>",
+ "cases": {
+  "initial": {
+   "focus": null,
+   "node": {
+    "c": [
+     {
+      "c": [
+       {
+        "id": "qv.head/tabs",
+        "k": "tabs",
+        "p": {
+         "actions": {
+          "click": "select"
+         },
+         "active": "t0",
+         "items": [
+          {
+           "id": "t0",
+           "label": [
+            {
+             "t": "Database"
+            }
+           ]
+          },
+          {
+           "id": "t1",
+           "label": [
+            {
+             "t": "Languages"
+            }
+           ]
+          },
+          {
+           "id": "t2",
+           "label": [
+            {
+             "t": "Details"
+            }
+           ]
+          },
+          {
+           "id": "review",
+           "label": [
+            {
+             "t": "Review"
+            }
+           ]
+          }
+         ],
+         "role": "omp.ask.questions",
+         "title": "Previous/next question  ←/→"
+        }
+       }
+      ],
+      "id": "qv.head",
+      "k": "row",
+      "p": {
+       "align": "center",
+       "role": "omp.ask.head"
+      }
+     },
+     {
+      "c": [
+       {
+        "c": [
+         {
+          "c": [
+           {
+            "id": "qv.body0/0/s0/0",
+            "k": "text",
+            "p": {
+             "role": "omp.ask.text",
+             "spans": [
+              {
+               "t": "Pick the "
+              },
+              {
+               "s": "strong",
+               "t": "storage"
+              },
+              {
+               "t": " setup for the service. Context below."
+              }
+             ],
+             "wrap": "word"
+            }
+           },
+           {
+            "id": "qv.body0/0/s0/1",
+            "k": "table",
+            "p": {
+             "cols": [
+              {
+               "head": [
+                {
+                 "t": "Engine"
+                }
+               ],
+               "id": "c0"
+              },
+              {
+               "head": [
+                {
+                 "t": "Ops"
+                }
+               ],
+               "id": "c1"
+              }
+             ],
+             "role": "omp.ask.table",
+             "rows": [
+              {
+               "cells": {
+                "c0": [
+                 {
+                  "t": "SQLite"
+                 }
+                ],
+                "c1": [
+                 {
+                  "t": "none"
+                 }
+                ]
+               },
+               "id": "r0"
+              },
+              {
+               "cells": {
+                "c0": [
+                 {
+                  "t": "Postgres"
+                 }
+                ],
+                "c1": [
+                 {
+                  "t": "a server"
+                 }
+                ]
+               },
+               "id": "r1"
+              }
+             ]
+            }
+           },
+           {
+            "id": "qv.body0/0/s0/2",
+            "k": "code",
+            "p": {
+             "role": "omp.ask.pre",
+             "text": "DATABASE_URL=sqlite://data.db"
+            }
+           },
+           {
+            "c": [
+             {
+              "id": "qv.body0/0/s0/3/0",
+              "k": "text",
+              "p": {
+               "role": "omp.ask.text",
+               "spans": [
+                {
+                 "s": "muted",
+                 "t": "•"
+                },
+                {
+                 "t": " "
+                },
+                {
+                 "t": "Backups nightly"
+                }
+               ],
+               "wrap": "word"
+              }
+             },
+             {
+              "id": "qv.body0/0/s0/3/1",
+              "k": "text",
+              "p": {
+               "role": "omp.ask.text",
+               "spans": [
+                {
+                 "s": "muted",
+                 "t": "•"
+                },
+                {
+                 "t": " "
+                },
+                {
+                 "t": "Read replicas optional"
+                }
+               ],
+               "wrap": "word"
+              }
+             }
+            ],
+            "id": "qv.body0/0/s0/3",
+            "k": "col",
+            "p": {
+             "gap": "xs",
+             "role": "omp.ask.bullets"
+            }
+           }
+          ],
+          "id": "qv.body0/0/s0",
+          "k": "col",
+          "p": {
+           "gap": "md",
+           "role": "omp.ask.section"
+          }
+         },
+         {
+          "c": [
+           {
+            "c": [
+             {
+              "c": [
+               {
+                "id": "qv.body0/0/s1/0/f0/o0",
+                "k": "item",
+                "p": {
+                 "label": [
+                  {
+                   "t": "SQLite: one file, no new service, simplest operations by far for a single box deployment"
+                  }
+                 ],
+                 "role": "omp.ask.option",
+                 "tone": "accent"
+                }
+               },
+               {
+                "id": "qv.body0/0/s1/0/f0/o1",
+                "k": "item",
+                "p": {
+                 "label": [
+                  {
+                   "t": "Postgres: shared across instances, needs ops"
+                  }
+                 ],
+                 "role": "omp.ask.option"
+                }
+               },
+               {
+                "id": "qv.body0/0/s1/0/f0/o2",
+                "k": "item",
+                "p": {
+                 "disabled": true,
+                 "label": [
+                  {
+                   "t": "MySQL (not supported)"
+                  }
+                 ],
+                 "role": "omp.ask.option"
+                }
+               },
+               {
+                "id": "qv.body0/0/s1/0/f0/other",
+                "k": "item",
+                "p": {
+                 "label": [
+                  {
+                   "t": "Other…"
+                  }
+                 ],
+                 "role": "omp.ask.option"
+                }
+               }
+              ],
+              "id": "qv.body0/0/s1/0/f0",
+              "k": "list",
+              "p": {
+               "role": "omp.ask.options",
+               "selected": "qv.body0/0/s1/0/f0/o0"
+              }
+             }
+            ],
+            "id": "qv.body0/0/s1/0",
+            "k": "col",
+            "p": {
+             "gap": "xs",
+             "role": "omp.ask.field"
+            }
+           }
+          ],
+          "id": "qv.body0/0/s1",
+          "k": "section",
+          "p": {
+           "head": [
+            {
+             "t": "Database"
+            }
+           ],
+           "role": "omp.ask.section"
+          }
+         }
+        ],
+        "id": "qv.body0/0",
+        "k": "col",
+        "p": {
+         "gap": "lg",
+         "role": "omp.ask.form"
+        }
+       }
+      ],
+      "id": "qv.body0",
+      "k": "list",
+      "p": {
+       "role": "omp.ask.options"
+      }
+     },
+     {
+      "c": [
+       {
+        "id": "qv.actions/hide",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "hide"
+         },
+         "keys": [
+          "alt",
+          "h"
+         ],
+         "role": "omp.btn",
+         "text": "Hide",
+         "title": "Hide  Alt+H"
+        }
+       },
+       {
+        "id": "qv.actions/1",
+        "k": "spacer",
+        "p": {
+         "grow": 1
+        }
+       },
+       {
+        "id": "qv.actions/cancel",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "cancel"
+         },
+         "keys": [
+          "escape"
+         ],
+         "role": "omp.btn",
+         "text": "Cancel",
+         "title": "Cancel  esc"
+        }
+       },
+       {
+        "id": "qv.actions/next",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "next"
+         },
+         "role": "omp.btn",
+         "text": "Next",
+         "title": "Next",
+         "tone": "accent",
+         "variant": "primary"
+        }
+       }
+      ],
+      "id": "qv.actions",
+      "k": "row",
+      "p": {
+       "align": "center",
+       "gap": "sm",
+       "role": "omp.actions"
+      }
+     }
+    ],
+    "id": "qv",
+    "k": "col",
+    "p": {
+     "gap": "md",
+     "role": "omp.editor.ask"
+    }
+   }
+  },
+  "check_go": {
+   "focus": null,
+   "node": {
+    "c": [
+     {
+      "c": [
+       {
+        "id": "qv.head/tabs",
+        "k": "tabs",
+        "p": {
+         "actions": {
+          "click": "select"
+         },
+         "active": "t1",
+         "items": [
+          {
+           "id": "t0",
+           "label": [
+            {
+             "s": "success",
+             "t": "✓ "
+            },
+            {
+             "t": "Database"
+            }
+           ]
+          },
+          {
+           "id": "t1",
+           "label": [
+            {
+             "t": "Languages"
+            }
+           ]
+          },
+          {
+           "id": "t2",
+           "label": [
+            {
+             "t": "Details"
+            }
+           ]
+          },
+          {
+           "id": "review",
+           "label": [
+            {
+             "t": "Review"
+            }
+           ]
+          }
+         ],
+         "role": "omp.ask.questions",
+         "title": "Previous/next question  ←/→"
+        }
+       }
+      ],
+      "id": "qv.head",
+      "k": "row",
+      "p": {
+       "align": "center",
+       "role": "omp.ask.head"
+      }
+     },
+     {
+      "c": [
+       {
+        "c": [
+         {
+          "c": [
+           {
+            "c": [
+             {
+              "c": [
+               {
+                "id": "qv.body1/0/s2/0/f1/o0",
+                "k": "item",
+                "p": {
+                 "icon": "check",
+                 "label": [
+                  {
+                   "t": "Rust"
+                  }
+                 ],
+                 "role": "omp.ask.check",
+                 "tone": "accent"
+                }
+               },
+               {
+                "id": "qv.body1/0/s2/0/f1/o1",
+                "k": "item",
+                "p": {
+                 "icon": "check",
+                 "label": [
+                  {
+                   "t": "Go"
+                  }
+                 ],
+                 "role": "omp.ask.check",
+                 "tone": "accent"
+                }
+               },
+               {
+                "id": "qv.body1/0/s2/0/f1/other",
+                "k": "item",
+                "p": {
+                 "label": [
+                  {
+                   "t": "Other…"
+                  }
+                 ],
+                 "role": "omp.ask.check"
+                }
+               }
+              ],
+              "id": "qv.body1/0/s2/0/f1",
+              "k": "list",
+              "p": {
+               "role": "omp.ask.options",
+               "selected": "qv.body1/0/s2/0/f1/o1"
+              }
+             }
+            ],
+            "id": "qv.body1/0/s2/0",
+            "k": "col",
+            "p": {
+             "gap": "xs",
+             "role": "omp.ask.field"
+            }
+           }
+          ],
+          "id": "qv.body1/0/s2",
+          "k": "section",
+          "p": {
+           "head": [
+            {
+             "t": "Languages"
+            }
+           ],
+           "role": "omp.ask.section"
+          }
+         }
+        ],
+        "id": "qv.body1/0",
+        "k": "col",
+        "p": {
+         "gap": "lg",
+         "role": "omp.ask.form"
+        }
+       }
+      ],
+      "id": "qv.body1",
+      "k": "list",
+      "p": {
+       "role": "omp.ask.options"
+      }
+     },
+     {
+      "c": [
+       {
+        "id": "qv.actions/hide",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "hide"
+         },
+         "keys": [
+          "alt",
+          "h"
+         ],
+         "role": "omp.btn",
+         "text": "Hide",
+         "title": "Hide  Alt+H"
+        }
+       },
+       {
+        "id": "qv.actions/1",
+        "k": "spacer",
+        "p": {
+         "grow": 1
+        }
+       },
+       {
+        "id": "qv.actions/cancel",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "cancel"
+         },
+         "keys": [
+          "escape"
+         ],
+         "role": "omp.btn",
+         "text": "Cancel",
+         "title": "Cancel  esc"
+        }
+       },
+       {
+        "id": "qv.actions/next",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "next"
+         },
+         "role": "omp.btn",
+         "text": "Next",
+         "title": "Next",
+         "tone": "accent",
+         "variant": "primary"
+        }
+       }
+      ],
+      "id": "qv.actions",
+      "k": "row",
+      "p": {
+       "align": "center",
+       "gap": "sm",
+       "role": "omp.actions"
+      }
+     }
+    ],
+    "id": "qv",
+    "k": "col",
+    "p": {
+     "gap": "md",
+     "role": "omp.editor.ask"
+    }
+   }
+  },
+  "name_typed": {
+   "focus": "qx",
+   "node": {
+    "c": [
+     {
+      "c": [
+       {
+        "id": "qv.head/tabs",
+        "k": "tabs",
+        "p": {
+         "actions": {
+          "click": "select"
+         },
+         "active": "t2",
+         "items": [
+          {
+           "id": "t0",
+           "label": [
+            {
+             "s": "success",
+             "t": "✓ "
+            },
+            {
+             "t": "Database"
+            }
+           ]
+          },
+          {
+           "id": "t1",
+           "label": [
+            {
+             "s": "success",
+             "t": "✓ "
+            },
+            {
+             "t": "Languages"
+            }
+           ]
+          },
+          {
+           "id": "t2",
+           "label": [
+            {
+             "t": "Details"
+            }
+           ]
+          },
+          {
+           "id": "review",
+           "label": [
+            {
+             "t": "Review"
+            }
+           ]
+          }
+         ],
+         "role": "omp.ask.questions",
+         "title": "Previous/next question  ←/→"
+        }
+       }
+      ],
+      "id": "qv.head",
+      "k": "row",
+      "p": {
+       "align": "center",
+       "role": "omp.ask.head"
+      }
+     },
+     {
+      "c": [
+       {
+        "c": [
+         {
+          "c": [
+           {
+            "c": [
+             {
+              "id": "qv.body2/0/s3/0/0",
+              "k": "text",
+              "p": {
+               "role": "omp.ask.label",
+               "spans": [
+                {
+                 "t": "Region"
+                }
+               ],
+               "wrap": "word"
+              }
+             },
+             {
+              "c": [
+               {
+                "id": "qv.body2/0/s3/0/f2/o0",
+                "k": "item",
+                "p": {
+                 "label": [
+                  {
+                   "t": "Europe"
+                  }
+                 ],
+                 "role": "omp.ask.option"
+                }
+               },
+               {
+                "id": "qv.body2/0/s3/0/f2/o1",
+                "k": "item",
+                "p": {
+                 "label": [
+                  {
+                   "t": "United States"
+                  }
+                 ],
+                 "role": "omp.ask.option",
+                 "tone": "accent"
+                }
+               },
+               {
+                "id": "qv.body2/0/s3/0/f2/o2",
+                "k": "item",
+                "p": {
+                 "label": [
+                  {
+                   "t": "Asia Pacific"
+                  }
+                 ],
+                 "role": "omp.ask.option"
+                }
+               }
+              ],
+              "id": "qv.body2/0/s3/0/f2",
+              "k": "list",
+              "p": {
+               "role": "omp.ask.options"
+              }
+             }
+            ],
+            "id": "qv.body2/0/s3/0",
+            "k": "col",
+            "p": {
+             "gap": "xs",
+             "role": "omp.ask.field"
+            }
+           },
+           {
+            "c": [
+             {
+              "id": "qv.body2/0/s3/1/0",
+              "k": "text",
+              "p": {
+               "role": "omp.ask.label",
+               "spans": [
+                {
+                 "t": "Pool size"
+                }
+               ],
+               "wrap": "word"
+              }
+             },
+             {
+              "id": "qv.body2/0/s3/1/1",
+              "k": "text",
+              "p": {
+               "actions": {
+                "click": "edit:3"
+               },
+               "lines": 1,
+               "role": "omp.ask.well",
+               "spans": [
+                {
+                 "t": "4"
+                }
+               ],
+               "truncate": "end",
+               "wrap": "none"
+              }
+             }
+            ],
+            "id": "qv.body2/0/s3/1",
+            "k": "col",
+            "p": {
+             "gap": "xs",
+             "role": "omp.ask.field"
+            }
+           },
+           {
+            "c": [
+             {
+              "id": "qv.body2/0/s3/2/0",
+              "k": "text",
+              "p": {
+               "role": "omp.ask.label",
+               "spans": [
+                {
+                 "t": "Project name"
+                },
+                {
+                 "s": "error",
+                 "t": " *"
+                }
+               ],
+               "wrap": "word"
+              }
+             },
+             {
+              "id": "qx",
+              "k": "input",
+              "p": {
+               "cursor": 3,
+               "placeholder": "my-service",
+               "sendable": false,
+               "text": "svc"
+              }
+             }
+            ],
+            "id": "qv.body2/0/s3/2",
+            "k": "col",
+            "p": {
+             "gap": "xs",
+             "role": "omp.ask.field"
+            }
+           },
+           {
+            "c": [
+             {
+              "id": "qv.body2/0/s3/3/0",
+              "k": "text",
+              "p": {
+               "role": "omp.ask.label",
+               "spans": [
+                {
+                 "t": "Notes"
+                }
+               ],
+               "wrap": "word"
+              }
+             },
+             {
+              "id": "qv.body2/0/s3/3/1",
+              "k": "text",
+              "p": {
+               "actions": {
+                "click": "edit:5"
+               },
+               "lines": 4,
+               "role": "omp.ask.well.multi",
+               "spans": [
+                {
+                 "s": "dim",
+                 "t": "Anything else"
+                }
+               ],
+               "wrap": "word"
+              }
+             }
+            ],
+            "id": "qv.body2/0/s3/3",
+            "k": "col",
+            "p": {
+             "gap": "xs",
+             "role": "omp.ask.field"
+            }
+           }
+          ],
+          "id": "qv.body2/0/s3",
+          "k": "section",
+          "p": {
+           "head": [
+            {
+             "t": "Details"
+            }
+           ],
+           "role": "omp.ask.section"
+          }
+         }
+        ],
+        "id": "qv.body2/0",
+        "k": "col",
+        "p": {
+         "gap": "lg",
+         "role": "omp.ask.form"
+        }
+       }
+      ],
+      "id": "qv.body2",
+      "k": "list",
+      "p": {
+       "role": "omp.ask.options"
+      }
+     },
+     {
+      "c": [
+       {
+        "id": "qv.actions/hide",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "hide"
+         },
+         "keys": [
+          "alt",
+          "h"
+         ],
+         "role": "omp.btn",
+         "text": "Hide",
+         "title": "Hide  Alt+H"
+        }
+       },
+       {
+        "id": "qv.actions/1",
+        "k": "spacer",
+        "p": {
+         "grow": 1
+        }
+       },
+       {
+        "id": "qv.actions/cancel",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "cancel"
+         },
+         "keys": [
+          "escape"
+         ],
+         "role": "omp.btn",
+         "text": "Cancel",
+         "title": "Cancel  esc"
+        }
+       },
+       {
+        "id": "qv.actions/next",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "next"
+         },
+         "role": "omp.btn",
+         "text": "Next",
+         "title": "Next"
+        }
+       },
+       {
+        "id": "qv.actions/submit",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "submit"
+         },
+         "role": "omp.btn",
+         "text": "Submit",
+         "title": "Submit",
+         "tone": "accent",
+         "variant": "primary"
+        }
+       }
+      ],
+      "id": "qv.actions",
+      "k": "row",
+      "p": {
+       "align": "center",
+       "gap": "sm",
+       "role": "omp.actions"
+      }
+     }
+    ],
+    "id": "qv",
+    "k": "col",
+    "p": {
+     "gap": "md",
+     "role": "omp.editor.ask"
+    }
+   }
+  },
+  "other_typed": {
+   "focus": "qw",
+   "node": {
+    "c": [
+     {
+      "c": [
+       {
+        "id": "qv.head/tabs",
+        "k": "tabs",
+        "p": {
+         "actions": {
+          "click": "select"
+         },
+         "active": "t0",
+         "items": [
+          {
+           "id": "t0",
+           "label": [
+            {
+             "t": "Database"
+            }
+           ]
+          },
+          {
+           "id": "t1",
+           "label": [
+            {
+             "t": "Languages"
+            }
+           ]
+          },
+          {
+           "id": "t2",
+           "label": [
+            {
+             "t": "Details"
+            }
+           ]
+          },
+          {
+           "id": "review",
+           "label": [
+            {
+             "t": "Review"
+            }
+           ]
+          }
+         ],
+         "role": "omp.ask.questions",
+         "title": "Previous/next question  ←/→"
+        }
+       }
+      ],
+      "id": "qv.head",
+      "k": "row",
+      "p": {
+       "align": "center",
+       "role": "omp.ask.head"
+      }
+     },
+     {
+      "c": [
+       {
+        "c": [
+         {
+          "c": [
+           {
+            "id": "qv.body0/0/s0/0",
+            "k": "text",
+            "p": {
+             "role": "omp.ask.text",
+             "spans": [
+              {
+               "t": "Pick the "
+              },
+              {
+               "s": "strong",
+               "t": "storage"
+              },
+              {
+               "t": " setup for the service. Context below."
+              }
+             ],
+             "wrap": "word"
+            }
+           },
+           {
+            "id": "qv.body0/0/s0/1",
+            "k": "table",
+            "p": {
+             "cols": [
+              {
+               "head": [
+                {
+                 "t": "Engine"
+                }
+               ],
+               "id": "c0"
+              },
+              {
+               "head": [
+                {
+                 "t": "Ops"
+                }
+               ],
+               "id": "c1"
+              }
+             ],
+             "role": "omp.ask.table",
+             "rows": [
+              {
+               "cells": {
+                "c0": [
+                 {
+                  "t": "SQLite"
+                 }
+                ],
+                "c1": [
+                 {
+                  "t": "none"
+                 }
+                ]
+               },
+               "id": "r0"
+              },
+              {
+               "cells": {
+                "c0": [
+                 {
+                  "t": "Postgres"
+                 }
+                ],
+                "c1": [
+                 {
+                  "t": "a server"
+                 }
+                ]
+               },
+               "id": "r1"
+              }
+             ]
+            }
+           },
+           {
+            "id": "qv.body0/0/s0/2",
+            "k": "code",
+            "p": {
+             "role": "omp.ask.pre",
+             "text": "DATABASE_URL=sqlite://data.db"
+            }
+           },
+           {
+            "c": [
+             {
+              "id": "qv.body0/0/s0/3/0",
+              "k": "text",
+              "p": {
+               "role": "omp.ask.text",
+               "spans": [
+                {
+                 "s": "muted",
+                 "t": "•"
+                },
+                {
+                 "t": " "
+                },
+                {
+                 "t": "Backups nightly"
+                }
+               ],
+               "wrap": "word"
+              }
+             },
+             {
+              "id": "qv.body0/0/s0/3/1",
+              "k": "text",
+              "p": {
+               "role": "omp.ask.text",
+               "spans": [
+                {
+                 "s": "muted",
+                 "t": "•"
+                },
+                {
+                 "t": " "
+                },
+                {
+                 "t": "Read replicas optional"
+                }
+               ],
+               "wrap": "word"
+              }
+             }
+            ],
+            "id": "qv.body0/0/s0/3",
+            "k": "col",
+            "p": {
+             "gap": "xs",
+             "role": "omp.ask.bullets"
+            }
+           }
+          ],
+          "id": "qv.body0/0/s0",
+          "k": "col",
+          "p": {
+           "gap": "md",
+           "role": "omp.ask.section"
+          }
+         },
+         {
+          "c": [
+           {
+            "c": [
+             {
+              "c": [
+               {
+                "id": "qv.body0/0/s1/0/f0/o0",
+                "k": "item",
+                "p": {
+                 "label": [
+                  {
+                   "t": "SQLite: one file, no new service, simplest operations by far for a single box deployment"
+                  }
+                 ],
+                 "role": "omp.ask.option"
+                }
+               },
+               {
+                "id": "qv.body0/0/s1/0/f0/o1",
+                "k": "item",
+                "p": {
+                 "label": [
+                  {
+                   "t": "Postgres: shared across instances, needs ops"
+                  }
+                 ],
+                 "role": "omp.ask.option"
+                }
+               },
+               {
+                "id": "qv.body0/0/s1/0/f0/o2",
+                "k": "item",
+                "p": {
+                 "disabled": true,
+                 "label": [
+                  {
+                   "t": "MySQL (not supported)"
+                  }
+                 ],
+                 "role": "omp.ask.option"
+                }
+               },
+               {
+                "id": "qv.body0/0/s1/0/f0/other",
+                "k": "item",
+                "p": {
+                 "label": [
+                  {
+                   "s": "muted",
+                   "t": "Other: "
+                  },
+                  {
+                   "t": "CockroachDB"
+                  }
+                 ],
+                 "role": "omp.ask.option",
+                 "tone": "accent"
+                }
+               }
+              ],
+              "id": "qv.body0/0/s1/0/f0",
+              "k": "list",
+              "p": {
+               "role": "omp.ask.options",
+               "selected": "qv.body0/0/s1/0/f0/other"
+              }
+             },
+             {
+              "id": "qw",
+              "k": "input",
+              "p": {
+               "cursor": 11,
+               "placeholder": "type your own",
+               "sendable": false,
+               "text": "CockroachDB"
+              }
+             }
+            ],
+            "id": "qv.body0/0/s1/0",
+            "k": "col",
+            "p": {
+             "gap": "xs",
+             "role": "omp.ask.field"
+            }
+           }
+          ],
+          "id": "qv.body0/0/s1",
+          "k": "section",
+          "p": {
+           "head": [
+            {
+             "t": "Database"
+            }
+           ],
+           "role": "omp.ask.section"
+          }
+         }
+        ],
+        "id": "qv.body0/0",
+        "k": "col",
+        "p": {
+         "gap": "lg",
+         "role": "omp.ask.form"
+        }
+       }
+      ],
+      "id": "qv.body0",
+      "k": "list",
+      "p": {
+       "role": "omp.ask.options"
+      }
+     },
+     {
+      "c": [
+       {
+        "id": "qv.actions/hide",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "hide"
+         },
+         "keys": [
+          "alt",
+          "h"
+         ],
+         "role": "omp.btn",
+         "text": "Hide",
+         "title": "Hide  Alt+H"
+        }
+       },
+       {
+        "id": "qv.actions/1",
+        "k": "spacer",
+        "p": {
+         "grow": 1
+        }
+       },
+       {
+        "id": "qv.actions/cancel",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "cancel"
+         },
+         "keys": [
+          "escape"
+         ],
+         "role": "omp.btn",
+         "text": "Cancel",
+         "title": "Cancel  esc"
+        }
+       },
+       {
+        "id": "qv.actions/next",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "next"
+         },
+         "role": "omp.btn",
+         "text": "Next",
+         "title": "Next",
+         "tone": "accent",
+         "variant": "primary"
+        }
+       }
+      ],
+      "id": "qv.actions",
+      "k": "row",
+      "p": {
+       "align": "center",
+       "gap": "sm",
+       "role": "omp.actions"
+      }
+     }
+    ],
+    "id": "qv",
+    "k": "col",
+    "p": {
+     "gap": "md",
+     "role": "omp.editor.ask"
+    }
+   }
+  },
+  "review": {
+   "focus": null,
+   "node": {
+    "c": [
+     {
+      "c": [
+       {
+        "id": "qv.head/tabs",
+        "k": "tabs",
+        "p": {
+         "actions": {
+          "click": "select"
+         },
+         "active": "review",
+         "items": [
+          {
+           "id": "t0",
+           "label": [
+            {
+             "s": "success",
+             "t": "✓ "
+            },
+            {
+             "t": "Database"
+            }
+           ]
+          },
+          {
+           "id": "t1",
+           "label": [
+            {
+             "s": "success",
+             "t": "✓ "
+            },
+            {
+             "t": "Languages"
+            }
+           ]
+          },
+          {
+           "id": "t2",
+           "label": [
+            {
+             "s": "success",
+             "t": "✓ "
+            },
+            {
+             "t": "Details"
+            }
+           ]
+          },
+          {
+           "id": "review",
+           "label": [
+            {
+             "t": "Review"
+            }
+           ]
+          }
+         ],
+         "role": "omp.ask.questions",
+         "title": "Previous/next question  ←/→"
+        }
+       }
+      ],
+      "id": "qv.head",
+      "k": "row",
+      "p": {
+       "align": "center",
+       "role": "omp.ask.head"
+      }
+     },
+     {
+      "id": "qv.1",
+      "k": "text",
+      "p": {
+       "role": "omp.ask.notice",
+       "spans": [
+        {
+         "t": "All set · Submit sends these answers"
+        }
+       ],
+       "wrap": "word"
+      }
+     },
+     {
+      "id": "qv.review",
+      "k": "kv",
+      "p": {
+       "items": [
+        {
+         "k": "Database",
+         "v": [
+          {
+           "t": "Other: CockroachDB"
+          }
+         ]
+        },
+        {
+         "k": "Languages",
+         "v": [
+          {
+           "t": "Rust"
+          }
+         ]
+        },
+        {
+         "k": "Region",
+         "v": [
+          {
+           "t": "United States"
+          }
+         ]
+        },
+        {
+         "k": "Pool size",
+         "v": [
+          {
+           "t": "4"
+          }
+         ]
+        },
+        {
+         "k": "Project name",
+         "v": [
+          {
+           "t": "svc"
+          }
+         ]
+        },
+        {
+         "k": "Notes",
+         "v": [
+          {
+           "s": "dim",
+           "t": "—"
+          }
+         ]
+        }
+       ],
+       "role": "omp.ask.answers"
+      }
+     },
+     {
+      "c": [
+       {
+        "id": "qv.actions/hide",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "hide"
+         },
+         "keys": [
+          "alt",
+          "h"
+         ],
+         "role": "omp.btn",
+         "text": "Hide",
+         "title": "Hide  Alt+H"
+        }
+       },
+       {
+        "id": "qv.actions/1",
+        "k": "spacer",
+        "p": {
+         "grow": 1
+        }
+       },
+       {
+        "id": "qv.actions/cancel",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "cancel"
+         },
+         "keys": [
+          "escape"
+         ],
+         "role": "omp.btn",
+         "text": "Cancel",
+         "title": "Cancel  esc"
+        }
+       },
+       {
+        "id": "qv.actions/submit",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "submit"
+         },
+         "keys": [
+          "enter"
+         ],
+         "role": "omp.btn",
+         "text": "Submit",
+         "title": "Submit  ⏎",
+         "tone": "accent",
+         "variant": "primary"
+        }
+       }
+      ],
+      "id": "qv.actions",
+      "k": "row",
+      "p": {
+       "align": "center",
+       "gap": "sm",
+       "role": "omp.actions"
+      }
+     }
+    ],
+    "id": "qv",
+    "k": "col",
+    "p": {
+     "gap": "md",
+     "role": "omp.editor.ask"
+    }
+   }
+  },
+  "hidden": {
+   "focus": null,
+   "node": {
+    "c": [
+     {
+      "c": [
+       {
+        "id": "qv.actions/0",
+        "k": "text",
+        "p": {
+         "role": "omp.ask.summary",
+         "spans": [
+          {
+           "s": "muted",
+           "t": "Question  "
+          },
+          {
+           "t": "Project name (+5 more)"
+          }
+         ],
+         "truncate": "end"
+        }
+       },
+       {
+        "id": "qv.actions/cancel",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "cancel"
+         },
+         "keys": [
+          "escape"
+         ],
+         "role": "omp.btn",
+         "text": "Cancel",
+         "title": "Cancel  esc"
+        }
+       },
+       {
+        "id": "qv.actions/show",
+        "k": "button",
+        "p": {
+         "actions": {
+          "click": "show"
+         },
+         "keys": [
+          "alt",
+          "h"
+         ],
+         "role": "omp.btn",
+         "text": "Show",
+         "title": "Show  Alt+H",
+         "tone": "accent",
+         "variant": "primary"
+        }
+       }
+      ],
+      "id": "qv.actions",
+      "k": "row",
+      "p": {
+       "align": "center",
+       "gap": "sm",
+       "role": "omp.actions"
+      }
+     }
+    ],
+    "id": "qv",
+    "k": "col",
+    "p": {
+     "gap": "md",
+     "role": "omp.editor.ask.hidden"
+    }
+   }
+  }
+ },
+ "answer": "User answers:\n{\n  \"db\": \"CockroachDB\",\n  \"lang\": [\n    \"rust\"\n  ],\n  \"region\": \"us\",\n  \"pool\": 4,\n  \"pname\": \"svc\",\n  \"notes\": \"\"\n}"
+}

@@ -77,12 +77,17 @@ pub fn node(cx: &Cx, ui: &mut Ui, n: &SNode) {
 }
 
 /// Wraps `add` so a node with `actions.click` is a button: hover pop, hand cursor, tooltip, event.
+/// Kinds with their own gestures are left alone: a fold's `toggle`, and a list's or tabs'
+/// `select`/`activate`, which belong to the row or tab under the pointer (a wrapper would take
+/// the click and address it to the whole node, which omp ignores).
 fn with_click(cx: &Cx, ui: &mut Ui, n: &SNode, add: impl FnOnce(&mut Ui)) {
     let click = n.click();
-    let own = matches!(
+    let own = (matches!(
         n.kind.as_str(),
         "tool" | "agent" | "item" | "tabs" | "list" | "editor" | "picker" | "section" | "card"
-    ) && n.click().is_none_or(|c| c == "toggle");
+    ) && click.is_none_or(|c| c == "toggle"))
+        || (matches!(n.kind.as_str(), "tabs" | "list" | "picker")
+            && click.is_some_and(|c| matches!(c, "select" | "activate")));
     let (Some(act), false) = (click, own) else {
         add(ui);
         return;
@@ -153,7 +158,7 @@ fn kind(cx: &Cx, ui: &mut Ui, n: &SNode) {
         "image" => image(cx, ui, n),
         "status" => status(cx, ui, n),
         "seg" => seg(cx, ui, n),
-        "editor" | "input" => dock::editor_readonly(cx, ui, n),
+        "editor" | "input" => dock::editor_node(cx, ui, n),
         "overlay" | "picker" => layer::inline(cx, ui, n),
         // A toast's node is gone a frame after it arrives; the document's toast ring is what is
         // drawn over the chat (`layer::overlays`), so the node itself shows nothing.
@@ -498,7 +503,9 @@ fn wrapped(cx: &Cx, ui: &mut Ui, n: &SNode, kids: &[&SNode], gap: f32, align: Al
 
 /// The flex-grow factor of a child of a wrapped row (0: it keeps its basis).
 fn grow_of(c: &SNode) -> f32 {
-    if c.kind == "spacer" && c.flag("grow") {
+    // A grow spacer; and omp's ask summary, which Tern's stylesheet grows so the hidden ask's
+    // Cancel and Show (and a countdown's buttons) end-align.
+    if (c.kind == "spacer" && c.flag("grow")) || c.role() == "omp.ask.summary" {
         return 1.0;
     }
     c.num("grow").filter(|g| *g > 0.0).unwrap_or(0.0) as f32
@@ -1455,13 +1462,34 @@ fn list(cx: &Cx, ui: &mut Ui, n: &SNode) {
         }
         return;
     }
-    let max = n.num("max").map(|m| m as usize);
+    // A list may hold any node, not only rows: omp's ask form puts the whole tab (sections,
+    // fields, their own option lists) in one `omp.ask.options` list so it scrolls on its own.
     let body = |ui: &mut Ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
         for it in &items {
-            item(cx, ui, it, Some(n), selected == Some(it.id.as_str()));
+            match (it.kind.as_str(), it.role()) {
+                ("item", "omp.ask.option" | "omp.ask.check") => {
+                    ask_option(cx, ui, it, n, selected == Some(it.id.as_str()));
+                }
+                ("item", _) => item(cx, ui, it, Some(n), selected == Some(it.id.as_str())),
+                _ => node(cx, ui, it),
+            }
         }
     };
+    // omp caps the ask card (Tern: 60vh) and scrolls this list, so the action bar stays in view.
+    if n.role() == "omp.ask.options" && items.iter().any(|c| c.kind != "item") {
+        egui::ScrollArea::vertical()
+            .id_salt(("list", &n.id))
+            .max_height((cx.view_h * 0.5).max(160.0))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                // Rows end before the scroll bar, which floats over the right edge.
+                ui.set_max_width(ui.available_width() - 12.0);
+                body(ui);
+            });
+        return;
+    }
+    let max = n.num("max").map(|m| m as usize);
     match max {
         Some(m) if items.len() > m => {
             egui::ScrollArea::vertical()
@@ -1470,6 +1498,94 @@ fn list(cx: &Cx, ui: &mut Ui, n: &SNode) {
                 .show(ui, body);
         }
         _ => body(ui),
+    }
+}
+
+/// One answer of an ask form's choice field: a radio (`omp.ask.option`) or checkbox
+/// (`omp.ask.check`) row, checked when omp tones it `accent`, its label wrapped. `focused` is
+/// the list's `selected`, omp's keyboard focus. A click always `select`s: omp picks a radio,
+/// toggles a checkbox, or starts typing the "Other…" answer (an `activate` would not toggle).
+fn ask_option(cx: &Cx, ui: &mut Ui, n: &SNode, list: &SNode, focused: bool) {
+    let ink = cx.ink;
+    let checked = n.tone() == Some("accent");
+    let disabled = n.flag("disabled");
+    let check = n.role() == "omp.ask.check";
+    let w = ui.available_width();
+    let (pad_x, pad_y, mark) = (8.0, 5.0, 14.0);
+    let text_x = pad_x + mark + 9.0;
+    let color = if disabled {
+        ink.faint()
+    } else if checked {
+        ink.strong()
+    } else {
+        ink.text()
+    };
+    let mut base = Base::new(ink.prose(13.5), color, ink);
+    base.line_height = Some(19.0);
+    let mut job = n
+        .get("label")
+        .map(|v| cell_job(cx, v, &base))
+        .unwrap_or_default();
+    job.wrap.max_width = (w - text_x - pad_x).max(40.0);
+    let galley = ui.painter().layout_job(job);
+    let h = (galley.size().y + 2.0 * pad_y).max(28.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+    let id = ui.scope_id().with(("ask-option", n.id.as_str()));
+    let resp = ui.interact(
+        rect,
+        id,
+        if disabled {
+            Sense::hover()
+        } else {
+            Sense::click()
+        },
+    );
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(id.with("h"), resp.hovered() && !disabled, 0.08);
+    let p = ui.painter();
+    if focused && !disabled {
+        p.rect(
+            rect,
+            CornerRadius::same(4),
+            ink.wash(ink.p.accent),
+            Stroke::new(1.0, ink.edge(ink.p.accent)),
+            StrokeKind::Inside,
+        );
+    } else if hov > 0.0 {
+        p.rect_filled(rect, 4.0, ink.p.hover_bg.gamma_multiply(hov));
+        paint::pop(p, rect, 4, ink, hov);
+    }
+    // The mark sits on the first line of the label.
+    let c = pos2(rect.left() + pad_x + mark / 2.0, rect.top() + pad_y + 9.5);
+    let edge = if disabled {
+        ink.faint()
+    } else if checked || focused {
+        ink.p.accent
+    } else {
+        ink.dim()
+    };
+    if check {
+        let r = Rect::from_center_size(c, vec2(mark, mark));
+        if checked {
+            p.rect_filled(r, 3.0, ink.p.accent);
+            glyphs::paint(p, "check", c, 11.0, ink.p.bg);
+        } else {
+            p.rect_stroke(r, 3.0, Stroke::new(1.3, edge), StrokeKind::Inside);
+        }
+    } else {
+        p.circle_stroke(c, mark / 2.0 - 0.6, Stroke::new(1.3, edge));
+        if checked {
+            p.circle_filled(c, mark / 2.0 - 3.6, ink.p.accent);
+        }
+    }
+    p.galley(
+        pos2(rect.left() + text_x, rect.top() + pad_y),
+        galley,
+        color,
+    );
+    if !disabled && resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+        cx.send(super::events::select(cx.sf(), &list.id, &n.id));
     }
 }
 
@@ -1606,13 +1722,23 @@ fn tabs(cx: &Cx, ui: &mut Ui, n: &SNode) {
             let Some(id) = t.get("id").and_then(Value::as_str) else {
                 continue;
             };
-            let label = t.get("label").map(text::prop_value).unwrap_or_default();
             let is = active.as_deref() == Some(id);
-            let g = ui.painter().layout_no_wrap(
-                label,
-                ink.label(12.0),
-                if is { ink.strong() } else { ink.dim() },
-            );
+            // Spans keep their styles: an ask form marks an answered question with a green ✓.
+            let job = t
+                .get("label")
+                .map(|v| {
+                    cell_job(
+                        cx,
+                        v,
+                        &Base::new(
+                            ink.label(12.0),
+                            if is { ink.strong() } else { ink.dim() },
+                            ink,
+                        ),
+                    )
+                })
+                .unwrap_or_default();
+            let g = ui.painter().layout_job(job);
             let size = vec2(g.size().x + 26.0, 26.0);
             let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
             let resp = ui.interact(rect, ui.scope_id().with(("tab", &n.id, id)), Sense::click());
@@ -1745,40 +1871,75 @@ fn table(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let ink = cx.ink;
     let head_base = Base::new(ink.label(LABEL), ink.dim(), ink);
     let cell_base = Base::new(ink.mono(0.95), ink.text(), ink);
-    let cols: Vec<(&str, &str, bool)> = n
+    // A head is a string or spans (omp's ask form tables send spans).
+    let cols: Vec<(&str, String, bool)> = n
         .arr("cols")
         .iter()
         .filter_map(|c| {
             Some((
                 c.get("id")?.as_str()?,
-                c.get("head").and_then(Value::as_str).unwrap_or_default(),
+                c.get("head").map(text::prop_value).unwrap_or_default(),
                 c.get("align").and_then(Value::as_str) == Some("end"),
             ))
         })
         .collect();
+    let rows = n.arr("rows");
+    let cell = |row: &Value, id: &str| {
+        row.get("cells")
+            .and_then(|c| c.get(id))
+            .map(|v| cell_job(cx, v, &cell_base))
+            .unwrap_or_default()
+    };
+    // Column widths from the cells' unwrapped widths, shrunk in proportion only when the row
+    // does not fit: a grid left to size itself keeps a wrapping cell as narrow as its head.
+    let gap = 20.0;
+    let widths: Vec<f32> = {
+        let p = ui.painter();
+        let natural: Vec<f32> = cols
+            .iter()
+            .map(|(id, head, _)| {
+                let head_w = p
+                    .layout_no_wrap(head.to_uppercase(), head_base.font.clone(), ink.dim())
+                    .size()
+                    .x;
+                rows.iter()
+                    .map(|r| p.layout_job(cell(r, id)).size().x)
+                    .fold(head_w, f32::max)
+                    .ceil()
+            })
+            .collect();
+        let total: f32 = natural.iter().sum();
+        let room = ui.available_width() - gap * cols.len().saturating_sub(1) as f32;
+        let scale = if total > room && total > 0.0 {
+            (room / total).max(0.0)
+        } else {
+            1.0
+        };
+        natural.iter().map(|w| (w * scale).max(32.0)).collect()
+    };
     let grid = |ui: &mut Ui| {
         egui::Grid::new(ui.scope_id().with(("table", &n.id)))
             .num_columns(cols.len().max(1))
-            .spacing(vec2(20.0, 5.0))
+            .spacing(vec2(gap, 5.0))
             .striped(false)
             .show(ui, |ui| {
-                for (_, head, _) in &cols {
+                for ((_, head, _), w) in cols.iter().zip(&widths) {
                     let mut job = LayoutJob::default();
                     job.append(&head.to_uppercase(), 0.0, head_base.format_plain());
-                    ui.add(egui::Label::new(job).selectable(false));
+                    ui.scope(|ui| {
+                        ui.set_width(*w);
+                        ui.add(egui::Label::new(job).selectable(false));
+                    });
                 }
                 ui.end_row();
-                for row in n.arr("rows") {
-                    let cells = row.get("cells");
-                    for (c, (id, _, end)) in cols.iter().enumerate() {
-                        let job = cells
-                            .and_then(|c| c.get(*id))
-                            .map(|v| cell_job(cx, v, &cell_base))
-                            .unwrap_or_default();
+                for row in rows {
+                    for (c, ((id, _, end), w)) in cols.iter().zip(&widths).enumerate() {
+                        let job = cell(row, id);
                         let sep = if c == 0 { Sep::Line } else { Sep::Tab };
                         ui.with_layout(
                             Layout::top_down(if *end { Align::Max } else { Align::Min }),
                             |ui| {
+                                ui.set_width(*w);
                                 if job.is_empty() {
                                     ui.add(egui::Label::new(job).selectable(false));
                                 } else {

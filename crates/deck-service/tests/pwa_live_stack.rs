@@ -86,13 +86,14 @@ fn script(notes: PathBuf) -> impl FnMut(&Value) -> Reply + Send + 'static {
             .map(fm::text)
             .collect();
         if tools.is_empty() && user.contains("ASK-MARK") {
+            // omp 18.18's `ask` takes one HTML `<form>`.
             return Reply::tool_call(
                 "ask",
-                &json!({ "questions": [{
-                    "id": "q1",
-                    "question": "Pick a color?",
-                    "options": [{ "label": "red" }, { "label": "blue" }],
-                }]}),
+                &json!({ "html": concat!(
+                    r#"<form><p>Pick a color?</p>"#,
+                    r#"<label><input type="radio" name="color" value="red"> red</label>"#,
+                    r#"<label><input type="radio" name="color" value="blue"> blue</label></form>"#,
+                )}),
             );
         }
         if tools.is_empty() && user.contains("STEER-MARK") {

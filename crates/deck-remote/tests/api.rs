@@ -2,7 +2,8 @@
 //! The device application protocol against `tests/vectors/api-v1.json`, which the PWA tests read
 //! too: record bytes both ways, and one canonical JSON text per message variant (decode equals
 //! the Rust value, encode equals the text). The slice-4 additions are in `api_s4` against
-//! `tests/vectors/api-s4.json`; variant coverage spans both files.
+//! `tests/vectors/api-s4.json`, the HTML-form additions in `api_form` against
+//! `tests/vectors/api-form.json`; variant coverage spans all three files.
 //!
 //! Rewrite after an intentional protocol change:
 //! `OMPDECK_WRITE_VECTORS=1 cargo test -p deck-remote --test api`
@@ -12,7 +13,9 @@ use std::collections::BTreeSet;
 use deck_remote::api::*;
 use serde_json::{Value, json};
 
+mod api_form;
 mod api_s4;
+use api_form as form;
 use api_s4 as s4;
 
 const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/api-v1.json");
@@ -1863,7 +1866,11 @@ fn unknown_tags_and_enum_values_anywhere_in_an_op_are_unsupported() {
         }
     }
     let mut unsupported = BTreeSet::new();
-    for (case, request) in requests().into_iter().chain(s4::requests()) {
+    for (case, request) in requests()
+        .into_iter()
+        .chain(s4::requests())
+        .chain(form::requests())
+    {
         let value = serde_json::to_value(&request).unwrap();
         let mut paths = Vec::new();
         strings(&value["op"], "/op".into(), &mut paths);
@@ -1961,7 +1968,8 @@ plain!(ContinueWhere: Worktree, Main, SwitchBack);
 plain!(UpdateKind: Omp, Plugins, Stable, Canary);
 plain!(AppUpdateStep: Download, Apply);
 plain!(ConflictResolution: Keep, Overwrite, Both);
-plain!(UiKind: Select, Confirm, Input, Editor, Ask, Approve);
+plain!(UiKind: Select, Confirm, Input, Editor, Ask, Approve, Form);
+plain!(SpanStyle: Code, Strong, Em);
 plain!(MuxBackend: Tmux, Host);
 plain!(AgentStatus: Running, Done, Failed, Aborted, Interrupted, Parked);
 plain!(SyncInterval: Off, TenMinutes, ThirtyMinutes, Hourly, SixHours, Daily);
@@ -1986,7 +1994,63 @@ variants!(UiAnswer, Some("type"), {
     UiAnswer::Approve { .. } => UiAnswer::Approve {
         decision: ApproveDecision::Once {},
     },
+    UiAnswer::Form { .. } => UiAnswer::Form { fields: vec![] },
     UiAnswer::Cancel {} => UiAnswer::Cancel {},
+});
+
+variants!(UiFormAnswer, Some("type"), {
+    UiFormAnswer::Choice { .. } => UiFormAnswer::Choice {
+        checked: vec![],
+        other: None,
+    },
+    UiFormAnswer::Text { .. } => UiFormAnswer::Text { text: e() },
+});
+
+variants!(UiFormBlock, Some("kind"), {
+    UiFormBlock::Text { .. } => UiFormBlock::Text {
+        spans: vec![],
+        heading: false,
+    },
+    UiFormBlock::List { .. } => UiFormBlock::List {
+        items: vec![],
+        ordered: false,
+    },
+    UiFormBlock::Pre { .. } => UiFormBlock::Pre { text: e() },
+    UiFormBlock::Table { .. } => UiFormBlock::Table {
+        rows: vec![],
+        header_rows: 0,
+    },
+    UiFormBlock::Image { .. } => UiFormBlock::Image { alt: e() },
+    UiFormBlock::Field { .. } => UiFormBlock::Field { index: 0 },
+});
+
+variants!(UiFormFieldView, Some("kind"), {
+    UiFormFieldView::Choice { .. } => UiFormFieldView::Choice {
+        name: e(),
+        question: e(),
+        label: vec![],
+        multi: false,
+        select: false,
+        other: false,
+        required: false,
+        options: vec![],
+    },
+    UiFormFieldView::Text { .. } => UiFormFieldView::Text {
+        name: e(),
+        question: e(),
+        label: vec![],
+        input_type: e(),
+        multiline: false,
+        value: e(),
+        placeholder: e(),
+        required: false,
+        min: None,
+        max: None,
+        pattern: None,
+        min_length: None,
+        max_length: None,
+        rows: 1,
+    },
 });
 
 variants!(ApproveDecision, Some("type"), {
@@ -2739,8 +2803,14 @@ impl Seen {
             }
             Op::AnswerUi { value, .. } => {
                 self.add(value);
-                if let UiAnswer::Approve { decision } = value {
-                    self.add(decision);
+                match value {
+                    UiAnswer::Approve { decision } => self.add(decision),
+                    UiAnswer::Form { fields } => {
+                        for f in fields {
+                            self.add(f);
+                        }
+                    }
+                    _ => {}
                 }
             }
             Op::WorktreeContinue { r#where, .. } => self.add(r#where),
@@ -2840,6 +2910,9 @@ impl Seen {
                     }
                     for u in &s.pending_ui {
                         self.add(&u.kind);
+                        if let Some(f) = &u.form {
+                            self.form(f);
+                        }
                     }
                 }
             }
@@ -2889,19 +2962,49 @@ impl Seen {
             _ => {}
         }
     }
+
+    fn spans(&mut self, spans: &[UiSpan]) {
+        for style in spans.iter().filter_map(|s| s.style) {
+            self.add(&style);
+        }
+    }
+
+    fn form(&mut self, f: &UiFormView) {
+        for sec in &f.sections {
+            self.spans(&sec.title);
+            for b in &sec.blocks {
+                self.add(b);
+                match b {
+                    UiFormBlock::Text { spans, .. } => self.spans(spans),
+                    UiFormBlock::List { items, .. } => items.iter().for_each(|i| self.spans(i)),
+                    UiFormBlock::Table { rows, .. } => {
+                        rows.iter().flatten().for_each(|c| self.spans(c));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for field in &f.fields {
+            self.add(field);
+        }
+    }
 }
 
-/// Per type, every variant (tag or string) appears in `api-v1.json` or `api-s4.json`.
+/// Per type, every variant (tag or string) appears in `api-v1.json`, `api-s4.json` or
+/// `api-form.json`.
 #[test]
 fn the_vectors_cover_every_variant() {
     let file: Value = serde_json::from_str(&std::fs::read_to_string(PATH).unwrap()).unwrap();
     let s4_file: Value = serde_json::from_str(&std::fs::read_to_string(s4::PATH).unwrap()).unwrap();
+    let form_file: Value =
+        serde_json::from_str(&std::fs::read_to_string(form::PATH).unwrap()).unwrap();
     let mut seen = Seen::default();
     for m in file["messages"]
         .as_array()
         .unwrap()
         .iter()
         .chain(s4_file["messages"].as_array().unwrap())
+        .chain(form_file["messages"].as_array().unwrap())
     {
         let text = m["json"].as_str().unwrap();
         match m["type"].as_str().unwrap() {
@@ -2953,6 +3056,10 @@ fn the_vectors_cover_every_variant() {
     assert_eq!(seen.covered::<UiAnswer>(), UiAnswer::NAMES);
     assert_eq!(seen.covered::<ApproveDecision>(), ApproveDecision::NAMES);
     seen.covered::<UiKind>();
+    assert_eq!(seen.covered::<UiFormAnswer>(), UiFormAnswer::NAMES);
+    seen.covered::<UiFormBlock>();
+    seen.covered::<UiFormFieldView>();
+    seen.covered::<SpanStyle>();
     seen.covered::<MuxBackend>();
     seen.covered::<AgentStatus>();
     seen.covered::<SyncInterval>();
@@ -2963,7 +3070,11 @@ fn the_vectors_cover_every_variant() {
     seen.covered::<SettingKind>();
     seen.covered::<RestorePlanView>();
     seen.covered::<BackupKind>();
-    for (_, r) in requests().into_iter().chain(s4::requests()) {
+    for (_, r) in requests()
+        .into_iter()
+        .chain(s4::requests())
+        .chain(form::requests())
+    {
         assert_eq!(serde_json::to_value(&r.op).unwrap()["op"], r.op.name());
     }
 

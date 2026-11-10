@@ -153,6 +153,11 @@ impl DeviceConn {
         self.features.contains(api::FEATURE_S4)
     }
 
+    /// The device renders and answers HTML forms ([`api::FEATURE_FORM`]).
+    fn form(&self) -> bool {
+        self.features.contains(api::FEATURE_FORM)
+    }
+
     /// `topic` has a new revision: the feeds projected from it are recomputed.
     pub(super) fn topic_changed(&mut self, topic: &Topic) {
         let mut follow = false;
@@ -931,7 +936,7 @@ impl Engine {
             permissions: api_permissions(permissions),
             next_seq,
             limits: api::Limits::default(),
-            features: vec![api::FEATURE_S4.to_owned()],
+            features: vec![api::FEATURE_S4.to_owned(), api::FEATURE_FORM.to_owned()],
             push_key: self.notify.push.public_key(),
         });
         let conn = next_id();
@@ -1082,6 +1087,7 @@ impl Engine {
             return;
         };
         let lowered = d.permissions.control && !perms.control;
+        let form = d.form();
         d.permissions = perms;
         let now = std::time::Instant::now();
         d.transfers.expire(now);
@@ -1111,7 +1117,7 @@ impl Engine {
         let interest = resubscribe.then(|| self.device_interest(&feeds));
         for (feed, st) in &mut feeds {
             if st.dirty {
-                self.refresh_feed(&device, feed, st, &out);
+                self.refresh_feed(&device, form, feed, st, &out);
             }
         }
         let mut resubscribed = false;
@@ -1214,7 +1220,9 @@ impl Engine {
         (subs, fleet)
     }
 
-    fn live_sessions(&self, device: &str) -> Vec<api::LiveSession> {
+    /// The live sessions as `device` sees them; `form`: it announced [`api::FEATURE_FORM`] (else
+    /// form requests are not listed).
+    fn live_sessions(&self, device: &str, form: bool) -> Vec<api::LiveSession> {
         let groups = self.groups();
         self.controller_infos()
             .iter()
@@ -1229,20 +1237,22 @@ impl Engine {
                 if let Some(link) = m.live.as_ref().filter(|l| l.client.ui_hook())
                     && let Some(snap) = link.client.latest()
                 {
-                    s.pending_ui = snap
-                        .pending_ui
-                        .iter()
-                        .take(api::MAX_PENDING_UI)
-                        .map(views::ui_request)
-                        .collect();
+                    s.pending_ui = views::pending_ui(&snap.pending_ui, form);
                 }
                 s
             })
             .collect()
     }
 
-    /// Recomputes one feed and queues it when it changed.
-    fn refresh_feed(&self, device: &str, feed: &Feed, st: &mut FeedState, out: &DeviceOut) {
+    /// Recomputes one feed and queues it when it changed; `form` as in [`Self::live_sessions`].
+    fn refresh_feed(
+        &self,
+        device: &str,
+        form: bool,
+        feed: &Feed,
+        st: &mut FeedState,
+        out: &DeviceOut,
+    ) {
         let body = match feed {
             Feed::Projects {} => {
                 let list = projects(&self.groups(), &self.devices.canon);
@@ -1265,7 +1275,7 @@ impl Engine {
                 })
             }
             Feed::Live {} => {
-                let list = self.live_sessions(device);
+                let list = self.live_sessions(device, form);
                 fit_feed(feed, &list, |sessions, truncated| FeedValue::Live {
                     sessions,
                     truncated,

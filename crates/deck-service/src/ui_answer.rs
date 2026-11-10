@@ -2,7 +2,7 @@
 //! extension hands the dialog function ([`deck_core::ctl::CtlCommand::AnswerUi`]). Every client
 //! answers through the same translation, validated against the request it answers.
 
-use deck_core::ctl::{PendingUi, PendingUiKind, UiOption};
+use deck_core::ctl::{PendingUi, PendingUiKind, UiFormField, UiOption};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -22,8 +22,23 @@ pub enum UiAnswer {
     Ask { answers: Vec<AskAnswer> },
     /// `approve`.
     Approve { decision: ApproveDecision },
+    /// `form`: one answer per listed field, in order.
+    Form { fields: Vec<FormAnswer> },
     /// Any kind: dismiss it (omp sees a cancel).
     Cancel,
+}
+
+/// The answer to one field of a `form` dialog, of the field's kind.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FormAnswer {
+    /// A choice field: the checked option indices and the free-text "Other" (only when the
+    /// field offers it).
+    Choice {
+        checked: Vec<u32>,
+        other: Option<String>,
+    },
+    /// A text field.
+    Text { text: String },
 }
 
 /// The answer to one question of an `ask` dialog: the selected option indices and an optional
@@ -68,6 +83,16 @@ pub enum AnswerError {
     NoSessionGrant,
     #[error("grant {0} does not exist")]
     NoSuchGrant(u32),
+    #[error("the form takes {0} answers")]
+    FieldCount(usize),
+    #[error("answer {0} does not fit its field")]
+    FieldKind(usize),
+    #[error("option {0} is checked twice")]
+    DuplicateOption(u32),
+    #[error("option {0} is disabled")]
+    DisabledOption(u32),
+    #[error("question {0:?} has no own answer")]
+    NoOther(String),
 }
 
 fn kind_name(kind: PendingUiKind) -> &'static str {
@@ -78,6 +103,7 @@ fn kind_name(kind: PendingUiKind) -> &'static str {
         PendingUiKind::Editor => "editor",
         PendingUiKind::Ask => "ask",
         PendingUiKind::Approve => "approve",
+        PendingUiKind::Form => "form",
     }
 }
 
@@ -91,7 +117,8 @@ fn label(options: &[UiOption], index: u32) -> Result<&str, AnswerError> {
 
 /// The dialog function's own result for `answer` to `ui`: a label (`select`), a bool (`confirm`),
 /// text (`input`/`editor`), omp's `{kind:"submit",results:[…]}` (`ask`), `"once"` / `"session"` /
-/// `"deny"` / `{grant,always}` (`approve`), or `null` (cancel).
+/// `"deny"` / `{grant,always}` (`approve`), the extension's `{fields:[…]}` (`form`), or `null`
+/// (cancel).
 pub fn value_for(ui: &PendingUi, answer: &UiAnswer) -> Result<Value, AnswerError> {
     let wrong = || AnswerError::WrongKind(kind_name(ui.kind));
     match (ui.kind, answer) {
@@ -106,6 +133,9 @@ pub fn value_for(ui: &PendingUi, answer: &UiAnswer) -> Result<Value, AnswerError
         (PendingUiKind::Confirm, UiAnswer::Confirm { yes }) => Ok(json!(yes)),
         (PendingUiKind::Input | PendingUiKind::Editor, UiAnswer::Text { text }) => Ok(json!(text)),
         (PendingUiKind::Ask, UiAnswer::Ask { answers }) => ask_value(ui, answers),
+        (PendingUiKind::Form, UiAnswer::Form { fields }) => {
+            form_value(&ui.form.as_ref().ok_or_else(wrong)?.fields, fields)
+        }
         (PendingUiKind::Approve, UiAnswer::Approve { decision }) => {
             let approve = ui.approve.as_ref().ok_or_else(wrong)?;
             match decision {
@@ -166,9 +196,58 @@ fn ask_value(ui: &PendingUi, answers: &[AskAnswer]) -> Result<Value, AnswerError
     Ok(json!({"kind": "submit", "results": results}))
 }
 
+/// The extension's form answer: `{"fields":[…]}`, one `{"checked":[…],"other":…}` or
+/// `{"text":…}` per listed field. Only the shape is checked here; omp's own `fieldError`
+/// (required, pattern, number bounds) runs in the extension.
+fn form_value(fields: &[UiFormField], answers: &[FormAnswer]) -> Result<Value, AnswerError> {
+    if answers.len() != fields.len() {
+        return Err(AnswerError::FieldCount(fields.len()));
+    }
+    let mut out = Vec::with_capacity(fields.len());
+    for (i, (field, answer)) in fields.iter().zip(answers).enumerate() {
+        match (field, answer) {
+            (
+                UiFormField::Choice {
+                    name,
+                    multi,
+                    other: offers_other,
+                    options,
+                    ..
+                },
+                FormAnswer::Choice { checked, other },
+            ) => {
+                for (j, index) in checked.iter().enumerate() {
+                    let option = usize::try_from(*index)
+                        .ok()
+                        .and_then(|k| options.get(k))
+                        .ok_or(AnswerError::NoSuchOption(*index))?;
+                    if checked[..j].contains(index) {
+                        return Err(AnswerError::DuplicateOption(*index));
+                    }
+                    if option.disabled {
+                        return Err(AnswerError::DisabledOption(*index));
+                    }
+                }
+                if !multi && checked.len() > 1 {
+                    return Err(AnswerError::SingleChoice(name.clone()));
+                }
+                if other.is_some() && !offers_other {
+                    return Err(AnswerError::NoOther(name.clone()));
+                }
+                out.push(json!({"checked": checked, "other": other}));
+            }
+            (UiFormField::Text { .. }, FormAnswer::Text { text }) => {
+                out.push(json!({"text": text}))
+            }
+            _ => return Err(AnswerError::FieldKind(i)),
+        }
+    }
+    Ok(json!({"fields": out}))
+}
+
 #[cfg(test)]
 mod tests {
-    use deck_core::ctl::{UiApprove, UiGrant, UiQuestion};
+    use deck_core::ctl::{UiApprove, UiForm, UiFormOption, UiGrant, UiQuestion};
 
     use super::*;
 
@@ -194,6 +273,7 @@ mod tests {
             prefill: None,
             questions: Vec::new(),
             approve: None,
+            form: None,
             timeout_ms: None,
         }
     }
@@ -248,6 +328,71 @@ mod tests {
         }
     }
 
+    fn choice(name: &str, multi: bool, other: bool) -> UiFormField {
+        let option = |disabled| UiFormOption {
+            label: Vec::new(),
+            checked: false,
+            disabled,
+        };
+        UiFormField::Choice {
+            name: name.to_owned(),
+            question: format!("{name}?"),
+            label: Vec::new(),
+            multi,
+            select: false,
+            other,
+            required: false,
+            options: vec![option(false), option(false), option(true)],
+        }
+    }
+
+    fn text_field(name: &str) -> UiFormField {
+        UiFormField::Text {
+            name: name.to_owned(),
+            question: format!("{name}?"),
+            label: Vec::new(),
+            input_type: "number".to_owned(),
+            multiline: false,
+            value: String::new(),
+            placeholder: String::new(),
+            required: true,
+            min: Some(0.0),
+            max: Some(5.0),
+            pattern: None,
+            min_length: None,
+            max_length: None,
+            rows: 1,
+        }
+    }
+
+    /// A radio group with Other, a checkbox group without, a number input.
+    fn form() -> PendingUi {
+        PendingUi {
+            form: Some(UiForm {
+                sections: Vec::new(),
+                fields: vec![
+                    choice("color", false, true),
+                    choice("extras", true, false),
+                    text_field("retries"),
+                ],
+            }),
+            ..ui(PendingUiKind::Form)
+        }
+    }
+
+    fn picked(checked: &[u32], other: Option<&str>) -> FormAnswer {
+        FormAnswer::Choice {
+            checked: checked.to_vec(),
+            other: other.map(str::to_owned),
+        }
+    }
+
+    fn typed(text: &str) -> FormAnswer {
+        FormAnswer::Text {
+            text: text.to_owned(),
+        }
+    }
+
     #[test]
     fn cancel_fits_every_kind() {
         for kind in [
@@ -257,6 +402,7 @@ mod tests {
             PendingUiKind::Editor,
             PendingUiKind::Ask,
             PendingUiKind::Approve,
+            PendingUiKind::Form,
         ] {
             assert_eq!(value_for(&ui(kind), &UiAnswer::Cancel), Ok(Value::Null));
         }
@@ -415,6 +561,102 @@ mod tests {
         assert_eq!(
             decide(&ui(PendingUiKind::Approve), ApproveDecision::Once),
             Err(AnswerError::WrongKind("approve"))
+        );
+    }
+
+    #[test]
+    fn a_form_answers_with_one_entry_per_field_in_order() {
+        let v = value_for(
+            &form(),
+            &UiAnswer::Form {
+                fields: vec![picked(&[1], None), picked(&[0, 1], None), typed("3")],
+            },
+        );
+        assert_eq!(
+            v,
+            Ok(json!({"fields": [
+                {"checked": [1], "other": null},
+                {"checked": [0, 1], "other": null},
+                {"text": "3"},
+            ]}))
+        );
+        // Nothing checked plus an own answer; omp's `fieldError` judges `required` and bounds.
+        let v = value_for(
+            &form(),
+            &UiAnswer::Form {
+                fields: vec![picked(&[], Some("teal")), picked(&[], None), typed("99")],
+            },
+        );
+        assert_eq!(
+            v,
+            Ok(json!({"fields": [
+                {"checked": [], "other": "teal"},
+                {"checked": [], "other": null},
+                {"text": "99"},
+            ]}))
+        );
+    }
+
+    #[test]
+    fn a_form_refuses_answers_that_do_not_fit() {
+        let answer = |fields| value_for(&form(), &UiAnswer::Form { fields });
+        let ok = || vec![picked(&[0], None), picked(&[], None), typed("1")];
+        let with = |i: usize, a: FormAnswer| {
+            let mut fields = ok();
+            fields[i] = a;
+            fields
+        };
+        assert!(answer(ok()).is_ok());
+        assert_eq!(answer(ok()[..2].to_vec()), Err(AnswerError::FieldCount(3)));
+        let mut long = ok();
+        long.push(typed("x"));
+        assert_eq!(answer(long), Err(AnswerError::FieldCount(3)));
+        assert_eq!(
+            answer(with(0, typed("red"))),
+            Err(AnswerError::FieldKind(0))
+        );
+        assert_eq!(
+            answer(with(2, picked(&[0], None))),
+            Err(AnswerError::FieldKind(2))
+        );
+        assert_eq!(
+            answer(with(1, picked(&[3], None))),
+            Err(AnswerError::NoSuchOption(3))
+        );
+        assert_eq!(
+            answer(with(1, picked(&[0, 0], None))),
+            Err(AnswerError::DuplicateOption(0))
+        );
+        assert_eq!(
+            answer(with(1, picked(&[2], None))),
+            Err(AnswerError::DisabledOption(2))
+        );
+        assert_eq!(
+            answer(with(0, picked(&[0, 1], None))),
+            Err(AnswerError::SingleChoice("color".into()))
+        );
+        // Several are fine in a checkbox group.
+        assert!(answer(with(1, picked(&[0, 1], None))).is_ok());
+        assert_eq!(
+            answer(with(1, picked(&[], Some("own")))),
+            Err(AnswerError::NoOther("extras".into()))
+        );
+        // A form answer fits only a form, and a form only a form answer (or cancel).
+        assert_eq!(
+            value_for(&ask(), &UiAnswer::Form { fields: ok() }),
+            Err(AnswerError::WrongKind("ask"))
+        );
+        assert_eq!(
+            value_for(&form(), &UiAnswer::Text { text: "x".into() }),
+            Err(AnswerError::WrongKind("form"))
+        );
+        // Without its parsed form the dialog cannot be answered as one.
+        assert_eq!(
+            value_for(
+                &ui(PendingUiKind::Form),
+                &UiAnswer::Form { fields: Vec::new() }
+            ),
+            Err(AnswerError::WrongKind("form"))
         );
     }
 }

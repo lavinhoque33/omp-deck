@@ -24,6 +24,13 @@
 //! byte-identically (`tests/vectors/api-v1.json`), and a reader takes a missing one as empty.
 //! The slice-4 vectors are `tests/vectors/api-s4.json`.
 //!
+//! **HTML forms** (omp 18.18's `ask`, `docs/notes/contracts.md` "omp 18.18 HTML-form `ask` on
+//! the phone"): gated by [`FEATURE_FORM`] the same way. The gateway lists a [`UiKind::Form`]
+//! request in [`LiveSession::pending_ui`] only to a device that announced it, with
+//! [`UiRequestView::form`] (omitted when absent, like the additive fields above) capped by the
+//! `MAX_FORM_*` bounds; the device answers it with [`UiAnswer::Form`]. The vectors are
+//! `tests/vectors/api-form.json`.
+//!
 //! A request that is well-formed JSON with a numeric `id` but names an op, feed, session
 //! action type, tagged request value or enum value this gateway does not know (for example
 //! [`ViewMode`], [`DiffSide`], [`CompactMode`], [`ComposeMode`], [`UiAnswer`]) is answered
@@ -161,6 +168,21 @@ pub const MAX_PENDING_UI: usize = 8;
 pub const MAX_UI_TEXT: usize = 4 * 1024;
 /// Entries of each option list of a [`UiRequestView`] at most.
 pub const MAX_UI_OPTIONS: usize = 50;
+/// The HTML-form feature name ([`UiKind::Form`], [`UiAnswer::Form`]; [`Welcome::features`],
+/// `DeviceHello.features`).
+pub const FEATURE_FORM: &str = "form";
+/// Fields of a [`UiFormView`] at most.
+pub const MAX_FORM_FIELDS: usize = 40;
+/// Sections of a [`UiFormView`] at most.
+pub const MAX_FORM_SECTIONS: usize = 20;
+/// Blocks of one [`UiFormSectionView`] at most.
+pub const MAX_FORM_BLOCKS: usize = 60;
+/// Items of a [`UiFormBlock::List`] and rows of a [`UiFormBlock::Table`] at most.
+pub const MAX_FORM_ITEMS: usize = 50;
+/// Cells of one [`UiFormBlock::Table`] row at most.
+pub const MAX_FORM_COLUMNS: usize = 10;
+/// Spans of one span list (a title, label, text, list item or table cell) at most.
+pub const MAX_FORM_SPANS: usize = 64;
 /// Dir tokens a device holds at most (its oldest are forgotten first).
 pub const MAX_DIR_TOKENS: usize = 4096;
 /// [`TreeNode::text`] characters at most.
@@ -716,14 +738,20 @@ fn names_unknown(op: &serde_json::Value) -> bool {
         "answer_ui" => {
             let value = op.get("value");
             let kind = value.and_then(|v| v.get("type"));
-            unknown(kind, UiAnswer::NAMES)
-                || (kind.and_then(Value::as_str) == Some("approve")
-                    && unknown(
-                        value
-                            .and_then(|v| v.get("decision"))
-                            .and_then(|d| d.get("type")),
-                        ApproveDecision::NAMES,
-                    ))
+            match kind.and_then(Value::as_str) {
+                Some("approve") => unknown(
+                    value
+                        .and_then(|v| v.get("decision"))
+                        .and_then(|d| d.get("type")),
+                    ApproveDecision::NAMES,
+                ),
+                Some("form") => each(
+                    value.and_then(|v| v.get("fields")),
+                    "type",
+                    UiFormAnswer::NAMES,
+                ),
+                _ => unknown(kind, UiAnswer::NAMES),
+            }
         }
         "worktree_continue" => unknown(op.get("where"), ContinueWhere::NAMES),
         "open_on_desktop" => unknown(op.get("split"), Split::NAMES),
@@ -1004,6 +1032,8 @@ pub enum UiAnswer {
     Ask { answers: Vec<UiAskAnswer> },
     /// `approve`.
     Approve { decision: ApproveDecision },
+    /// `form` ([`FEATURE_FORM`]): one answer per [`UiFormView::fields`] entry, in order.
+    Form { fields: Vec<UiFormAnswer> },
     /// Any kind: dismiss it (omp sees a cancel).
     Cancel {},
 }
@@ -1011,8 +1041,28 @@ pub enum UiAnswer {
 impl UiAnswer {
     /// Every `type` tag.
     pub const NAMES: &'static [&'static str] = &[
-        "choice", "choices", "text", "confirm", "ask", "approve", "cancel",
+        "choice", "choices", "text", "confirm", "ask", "approve", "form", "cancel",
     ];
+}
+
+/// The answer to one [`UiFormFieldView`] (tag `type`, the field's kind).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UiFormAnswer {
+    /// [`UiFormFieldView::Choice`]: the checked option indices and the free-text "Other" (only
+    /// when the field offers it).
+    Choice {
+        checked: Vec<u32>,
+        #[serde(default)]
+        other: Option<String>,
+    },
+    /// [`UiFormFieldView::Text`]: the field's text.
+    Text { text: String },
+}
+
+impl UiFormAnswer {
+    /// Every `type` tag.
+    pub const NAMES: &'static [&'static str] = &["choice", "text"];
 }
 
 /// The answer to one [`UiQuestion`]: the selected option indices and an optional own text.
@@ -2458,6 +2508,8 @@ pub enum UiKind {
     Ask,
     /// A tool approval: `approve`.
     Approve,
+    /// omp 18.18's HTML-form `ask`: `form` ([`FEATURE_FORM`]).
+    Form,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2511,6 +2563,117 @@ pub struct UiRequestView {
     pub prefill: Option<String>,
     pub questions: Vec<UiQuestion>,
     pub approve: Option<ApproveView>,
+    /// [`UiKind::Form`]; omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<UiFormView>,
+}
+
+/// omp's parsed HTML form (`parseHtmlForm`), capped by the `MAX_FORM_*` bounds; strings at most
+/// [`MAX_UI_TEXT`] bytes, option lists at most [`MAX_UI_OPTIONS`] entries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiFormView {
+    /// At most [`MAX_FORM_SECTIONS`].
+    pub sections: Vec<UiFormSectionView>,
+    /// In document order, at most [`MAX_FORM_FIELDS`]; [`UiFormBlock::Field`] and
+    /// [`UiAnswer::Form`] refer to an index here.
+    pub fields: Vec<UiFormFieldView>,
+}
+
+/// A `<fieldset>` (titled by its legend) or loose content between fieldsets (untitled).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiFormSectionView {
+    pub title: Vec<UiSpan>,
+    /// In document order, at most [`MAX_FORM_BLOCKS`].
+    pub blocks: Vec<UiFormBlock>,
+}
+
+/// A run of inline text; `\n` inside `text` is a hard line break.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiSpan {
+    pub text: String,
+    /// `None`: plain.
+    pub style: Option<SpanStyle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanStyle {
+    Code,
+    Strong,
+    Em,
+}
+
+/// One unit of a form section (tag `kind`). Span lists hold at most [`MAX_FORM_SPANS`] spans.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiFormBlock {
+    /// A paragraph, or a heading.
+    Text { spans: Vec<UiSpan>, heading: bool },
+    /// At most [`MAX_FORM_ITEMS`] items.
+    List {
+        items: Vec<Vec<UiSpan>>,
+        ordered: bool,
+    },
+    /// Preformatted text.
+    Pre { text: String },
+    /// Rows (at most [`MAX_FORM_ITEMS`]) of cells (at most [`MAX_FORM_COLUMNS`]) of spans; the
+    /// first `header_rows` rows are headers.
+    Table {
+        rows: Vec<Vec<Vec<UiSpan>>>,
+        header_rows: u32,
+    },
+    /// An `<img>` or inline `<svg>`: only its alt text.
+    Image { alt: String },
+    /// The field [`UiFormView::fields`]`[index]`, in place.
+    Field { index: u32 },
+}
+
+/// One answerable control of a form (tag `kind`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiFormFieldView {
+    /// A radio group (`multi: false`), checkbox group (`multi: true`) or `<select>` (`select`);
+    /// `other`: omp adds a free-text "Other" answer. At most [`MAX_UI_OPTIONS`] options.
+    Choice {
+        name: String,
+        /// The question this field answers, one line.
+        question: String,
+        label: Vec<UiSpan>,
+        multi: bool,
+        select: bool,
+        other: bool,
+        required: bool,
+        options: Vec<UiFormOption>,
+    },
+    /// A single-line `<input>` or a `<textarea>` (`multiline`).
+    Text {
+        name: String,
+        question: String,
+        label: Vec<UiSpan>,
+        /// The `<input type>` (`text`, `number`, `email`, `url`, …); `textarea` for textareas.
+        input_type: String,
+        multiline: bool,
+        /// The prefilled text.
+        value: String,
+        placeholder: String,
+        required: bool,
+        /// The number bound as decimal text (shortest round-trip form).
+        min: Option<String>,
+        max: Option<String>,
+        pattern: Option<String>,
+        min_length: Option<u32>,
+        max_length: Option<u32>,
+        /// Visible rows (1 for inputs).
+        rows: u32,
+    },
+}
+
+/// One answer of a [`UiFormFieldView::Choice`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiFormOption {
+    pub label: Vec<UiSpan>,
+    pub checked: bool,
+    pub disabled: bool,
 }
 
 /// One sub-folder of a [`Resp::Dir`] listing.

@@ -1174,7 +1174,7 @@ pub fn device() -> FeedValue {
     }
 }
 
-fn ui(request: &str, kind: UiKind) -> UiRequestView {
+pub fn ui(request: &str, kind: UiKind) -> UiRequestView {
     UiRequestView {
         request: s(request),
         kind,
@@ -1187,6 +1187,7 @@ fn ui(request: &str, kind: UiKind) -> UiRequestView {
         prefill: None,
         questions: vec![],
         approve: None,
+        form: None,
     }
 }
 

@@ -1760,7 +1760,7 @@ impl Engine {
             } => {
                 let target = self.live_target(&live)?;
                 let project = self
-                    .live_sessions(&key.client)
+                    .live_sessions(&key.client, false)
                     .into_iter()
                     .find(|s| s.live.key == live.key)
                     .and_then(|s| s.project)

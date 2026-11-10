@@ -4,8 +4,9 @@
 // enums are internally tagged (`op`, `feed`, `type`, `state`, `code`, `reason`), snake_case,
 // struct variants only; `None` is `null`, except the fields slice 4 added to R5 types
 // (`Welcome.push_key`, `SessionSummary.stub`, `LiveSession.pending_ui`, `images`/`args_value`/
-// `details` of transcript items), which are absent when empty and optional here. A device uses
-// the slice-4 ops and feeds only when `Welcome.features` lists {@link FEATURE_S4}.
+// `details` of transcript items) and `UiRequestView.form`, which are absent when empty and
+// optional here. A device uses the slice-4 ops and feeds only when `Welcome.features` lists
+// {@link FEATURE_S4}; it gets `form` requests only after announcing {@link FEATURE_FORM}.
 //
 // Gateway → device JSON (`Welcome`, `Reply`, `Event`, `TermEnd`) is validated at runtime:
 // unknown fields are ignored, wrong types and unknown variants refused, except that an unknown
@@ -57,6 +58,8 @@ export const MAX_DIFF_TEXT = 768 * 1024;
 
 /** The slice-4 feature name (`Welcome.features`, `DeviceHello.features`). */
 export const FEATURE_S4 = 's4';
+/** omp 18.18's HTML-form `ask` (`UiKind` `form`): listed to a device that announced it. */
+export const FEATURE_FORM = 'form';
 /** `last_reply` text bytes at most, then `truncated`. */
 export const MAX_LAST_REPLY = 256 * 1024;
 /** Raw bytes of one download/upload chunk at most (sent as base64). */
@@ -91,6 +94,14 @@ export const MAX_PENDING_UI = 8;
 export const MAX_UI_TEXT = 4 * 1024;
 /** Entries of each option list of a UI request at most. */
 export const MAX_UI_OPTIONS = 50;
+/** `UiFormView.fields` at most. */
+export const MAX_FORM_FIELDS = 40;
+/** `UiFormView.sections` at most. */
+export const MAX_FORM_SECTIONS = 20;
+/** Blocks of one form section at most. */
+export const MAX_FORM_BLOCKS = 60;
+/** Spans of one span list of a form at most. */
+export const MAX_FORM_SPANS = 64;
 /** Dir tokens a device holds at most. */
 export const MAX_DIR_TOKENS = 4096;
 /** `TreeNode.text` characters at most. */
@@ -195,6 +206,11 @@ export interface UiAskAnswer {
   custom?: string | null;
 }
 
+/** The answer to one field of a form, in `UiFormView.fields` order (tag `type`). */
+export type UiFormAnswer =
+  | { type: 'choice'; checked: number[]; other?: string | null }
+  | { type: 'text'; text: string };
+
 /** An answer to a pending UI request (tag `type`). */
 export type UiAnswer =
   | { type: 'choice'; index: number }
@@ -202,6 +218,7 @@ export type UiAnswer =
   | { type: 'text'; text: string }
   | { type: 'confirm'; yes: boolean }
   | { type: 'ask'; answers: UiAskAnswer[] }
+  | { type: 'form'; fields: UiFormAnswer[] }
   | { type: 'approve'; decision: ApproveDecision }
   | { type: 'cancel' };
 
@@ -680,7 +697,76 @@ export interface ImageRef {
   bytes: number;
 }
 
-export type UiKind = 'select' | 'confirm' | 'input' | 'editor' | 'ask' | 'approve';
+export type UiKind = 'select' | 'confirm' | 'input' | 'editor' | 'ask' | 'approve' | 'form';
+
+export type SpanStyle = 'code' | 'strong' | 'em';
+
+/** A run of inline text of a form; `\n` inside `text` is a hard line break. */
+export interface UiSpan {
+  text: string;
+  style: SpanStyle | null;
+}
+
+/** One unit of a form section, in document order (tag `kind`). */
+export type UiFormBlock =
+  | { kind: 'text'; spans: UiSpan[]; heading: boolean }
+  | { kind: 'list'; items: UiSpan[][]; ordered: boolean }
+  | { kind: 'pre'; text: string }
+  | { kind: 'table'; rows: UiSpan[][][]; header_rows: number }
+  | { kind: 'image'; alt: string }
+  /** The field at `index` of `UiFormView.fields`. */
+  | { kind: 'field'; index: number };
+
+/** A `<fieldset>` (titled by its legend) or loose content between fieldsets (untitled). */
+export interface UiFormSectionView {
+  title: UiSpan[];
+  blocks: UiFormBlock[];
+}
+
+export interface UiFormOption {
+  label: UiSpan[];
+  checked: boolean;
+  disabled: boolean;
+}
+
+/** One answerable control of a form (tag `kind`). */
+export type UiFormFieldView =
+  | {
+      kind: 'choice';
+      name: string;
+      question: string;
+      label: UiSpan[];
+      multi: boolean;
+      select: boolean;
+      other: boolean;
+      required: boolean;
+      options: UiFormOption[];
+    }
+  | {
+      kind: 'text';
+      name: string;
+      question: string;
+      label: UiSpan[];
+      /** The `<input type>` (`text`, `number`, `email`, `url`, …); `textarea` for textareas. */
+      input_type: string;
+      multiline: boolean;
+      value: string;
+      placeholder: string;
+      required: boolean;
+      /** Numbers as decimal text. */
+      min: string | null;
+      max: string | null;
+      pattern: string | null;
+      min_length: number | null;
+      max_length: number | null;
+      rows: number;
+    };
+
+/** omp's parsed HTML form of a `form` request. */
+export interface UiFormView {
+  sections: UiFormSectionView[];
+  fields: UiFormFieldView[];
+}
 
 export interface UiOption {
   label: string;
@@ -723,6 +809,8 @@ export interface UiRequestView {
   prefill: string | null;
   questions: UiQuestion[];
   approve: ApproveView | null;
+  /** Kind `form` only (absent otherwise). */
+  form?: UiFormView;
 }
 
 /** Tag `type`. */
@@ -1614,9 +1702,58 @@ const pushPrefs = struct<PushPrefs>({ turn_finished: bool, attention: bool, ende
 const treeFilter = oneOf<TreeFilter>(['conversation', 'default', 'all', 'labeled']);
 const imageRef = struct<ImageRef>({ blob: str, mime: str, bytes: u64 });
 const uiOption = struct<UiOption>({ label: str, description: nullable(str) });
+const uiSpan = struct<UiSpan>({ text: str, style: nullable(oneOf<SpanStyle>(['code', 'strong', 'em'])) });
+const uiSpans = list(uiSpan);
+const uiFormView = struct<UiFormView>({
+  sections: list(
+    struct<UiFormSectionView>({
+      title: uiSpans,
+      blocks: list(
+        tagged<UiFormBlock, 'kind'>('kind', {
+          text: { spans: uiSpans, heading: bool },
+          list: { items: list(uiSpans), ordered: bool },
+          pre: { text: str },
+          table: { rows: list(list(uiSpans)), header_rows: u32 },
+          image: { alt: str },
+          field: { index: u32 },
+        }),
+      ),
+    }),
+  ),
+  fields: list(
+    tagged<UiFormFieldView, 'kind'>('kind', {
+      choice: {
+        name: str,
+        question: str,
+        label: uiSpans,
+        multi: bool,
+        select: bool,
+        other: bool,
+        required: bool,
+        options: list(struct<UiFormOption>({ label: uiSpans, checked: bool, disabled: bool })),
+      },
+      text: {
+        name: str,
+        question: str,
+        label: uiSpans,
+        input_type: str,
+        multiline: bool,
+        value: str,
+        placeholder: str,
+        required: bool,
+        min: nullable(str),
+        max: nullable(str),
+        pattern: nullable(str),
+        min_length: nullable(u32),
+        max_length: nullable(u32),
+        rows: u32,
+      },
+    }),
+  ),
+});
 const uiRequestView = struct<UiRequestView>({
   request: str,
-  kind: oneOf<UiKind>(['select', 'confirm', 'input', 'editor', 'ask', 'approve']),
+  kind: oneOf<UiKind>(['select', 'confirm', 'input', 'editor', 'ask', 'approve', 'form']),
   title: str,
   message: nullable(str),
   timeout_ms: nullable(u64),
@@ -1642,6 +1779,7 @@ const uiRequestView = struct<UiRequestView>({
       grants: list(struct<ApproveGrant>({ scope: str, label: str, always_label: str })),
     }),
   ),
+  form: optional(uiFormView),
 });
 const runningView = struct<RunningView>({
   id: str,
@@ -2243,6 +2381,14 @@ const uiAnswer = tagged<UiAnswer, 'type'>('type', {
   text: { text: str },
   confirm: { yes: bool },
   ask: { answers: list(struct<UiAskAnswer>({ id: str, selected: list(u32), custom: nullable(str) })) },
+  form: {
+    fields: list(
+      tagged<UiFormAnswer, 'type'>('type', {
+        choice: { checked: list(u32), other: nullable(str) },
+        text: { text: str },
+      }),
+    ),
+  },
   approve: { decision: approveDecision },
   cancel: {},
 });

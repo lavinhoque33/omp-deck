@@ -275,6 +275,8 @@ pub enum PendingUiKind {
     Editor,
     Ask,
     Approve,
+    /// omp 18.18's HTML form `ask` ([`PendingUi::form`]).
+    Form,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, serde::Serialize)]
@@ -350,9 +352,156 @@ pub struct PendingUi {
     /// `approve`.
     #[serde(default)]
     pub approve: Option<UiApprove>,
+    /// `form`: omp 18.18's HTML form `ask` (`ctx.ui.formDialog`), parsed by omp's own
+    /// `parseHtmlForm` in the extension.
+    #[serde(default)]
+    pub form: Option<UiForm>,
     /// omp answers by itself (default option) after this long.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+}
+
+/// A run of inline text of a form; `\n` inside `text` is a hard line break.
+#[derive(Clone, Debug, PartialEq, Deserialize, serde::Serialize)]
+pub struct UiSpan {
+    pub text: String,
+    /// `code`, `strong` or `em` (omp's `FormSpanStyle`); anything else is plain.
+    #[serde(default)]
+    pub style: Option<String>,
+}
+
+/// omp's `HtmlForm` as the extension lists it (capped: 20 sections, 60 blocks each, 40 fields,
+/// 100 options per field, 16 KiB per string).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
+pub struct UiForm {
+    #[serde(default)]
+    pub sections: Vec<UiFormSection>,
+    /// In document order; a [`UiFormBlock::Field`] and an answer refer to an index here.
+    #[serde(default)]
+    pub fields: Vec<UiFormField>,
+}
+
+/// A `<fieldset>` (titled by its legend) or loose content between fieldsets (untitled).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
+pub struct UiFormSection {
+    #[serde(default)]
+    pub title: Vec<UiSpan>,
+    #[serde(default)]
+    pub blocks: Vec<UiFormBlock>,
+}
+
+/// One unit of a section, in document order.
+#[derive(Clone, Debug, PartialEq, Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum UiFormBlock {
+    Text {
+        #[serde(default)]
+        spans: Vec<UiSpan>,
+        #[serde(default)]
+        heading: bool,
+    },
+    List {
+        #[serde(default)]
+        items: Vec<Vec<UiSpan>>,
+        #[serde(default)]
+        ordered: bool,
+    },
+    Pre {
+        #[serde(default)]
+        text: String,
+    },
+    Table {
+        /// Rows of cells of spans.
+        #[serde(default)]
+        rows: Vec<Vec<Vec<UiSpan>>>,
+        #[serde(default, rename = "headerRows")]
+        header_rows: u32,
+    },
+    /// An `<img>` or inline `<svg>`: only its alt text travels.
+    Image {
+        #[serde(default)]
+        alt: String,
+    },
+    /// The field at this index of [`UiForm::fields`].
+    Field { field: u32 },
+    /// A block kind this build does not know (dropped by readers).
+    #[serde(other)]
+    Other,
+}
+
+/// One answerable control of a form.
+#[derive(Clone, Debug, PartialEq, Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum UiFormField {
+    /// A radio group (`multi: false`), checkbox group (`multi: true`) or `<select>`.
+    #[serde(rename_all = "camelCase")]
+    Choice {
+        #[serde(default)]
+        name: String,
+        /// omp's `fieldQuestions`: the question this field answers, one line.
+        #[serde(default)]
+        question: String,
+        #[serde(default)]
+        label: Vec<UiSpan>,
+        #[serde(default)]
+        multi: bool,
+        /// From a `<select>` (a single one draws as a dropdown).
+        #[serde(default)]
+        select: bool,
+        /// omp adds a free-text "Other" answer.
+        #[serde(default)]
+        other: bool,
+        #[serde(default)]
+        required: bool,
+        #[serde(default)]
+        options: Vec<UiFormOption>,
+    },
+    /// A single-line `<input>` or a `<textarea>` (`multiline`).
+    #[serde(rename_all = "camelCase")]
+    Text {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        question: String,
+        #[serde(default)]
+        label: Vec<UiSpan>,
+        /// The `<input type>` (`text`, `number`, `email`, `url`, …); `textarea` for textareas.
+        #[serde(default, rename = "type")]
+        input_type: String,
+        #[serde(default)]
+        multiline: bool,
+        /// The prefilled text.
+        #[serde(default)]
+        value: String,
+        #[serde(default)]
+        placeholder: String,
+        #[serde(default)]
+        required: bool,
+        #[serde(default)]
+        min: Option<f64>,
+        #[serde(default)]
+        max: Option<f64>,
+        #[serde(default)]
+        pattern: Option<String>,
+        #[serde(default)]
+        min_length: Option<u32>,
+        #[serde(default)]
+        max_length: Option<u32>,
+        /// Visible rows (1 for inputs).
+        #[serde(default)]
+        rows: u32,
+    },
+}
+
+/// One answer of a [`UiFormField::Choice`] (its value stays in the extension).
+#[derive(Clone, Debug, PartialEq, Deserialize, serde::Serialize)]
+pub struct UiFormOption {
+    #[serde(default)]
+    pub label: Vec<UiSpan>,
+    #[serde(default)]
+    pub checked: bool,
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// An omp session's OAuth account for one provider, and the provider's stored accounts it can be

@@ -132,6 +132,17 @@ pub(super) fn blob_name(blob: &str, mime: &str) -> String {
 
 // ---- pending UI ---------------------------------------------------------------------------------
 
+/// The requests of `pending` a device is shown: [`PendingUiKind::Form`] only when it announced
+/// [`api::FEATURE_FORM`] (`form`), at most [`api::MAX_PENDING_UI`].
+pub(super) fn pending_ui(pending: &[PendingUi], form: bool) -> Vec<api::UiRequestView> {
+    pending
+        .iter()
+        .filter(|u| form || u.kind != PendingUiKind::Form)
+        .take(api::MAX_PENDING_UI)
+        .map(ui_request)
+        .collect()
+}
+
 pub(super) fn ui_request(u: &PendingUi) -> api::UiRequestView {
     let t = |s: &str| cut(s, api::MAX_UI_TEXT);
     let options = |list: &[deck_core::ctl::UiOption]| -> Vec<api::UiOption> {
@@ -152,6 +163,7 @@ pub(super) fn ui_request(u: &PendingUi) -> api::UiRequestView {
             PendingUiKind::Editor => api::UiKind::Editor,
             PendingUiKind::Ask => api::UiKind::Ask,
             PendingUiKind::Approve => api::UiKind::Approve,
+            PendingUiKind::Form => api::UiKind::Form,
         },
         title: t(&u.title),
         message: u.message.as_deref().map(t),
@@ -188,6 +200,154 @@ pub(super) fn ui_request(u: &PendingUi) -> api::UiRequestView {
                 })
                 .collect(),
         }),
+        form: u.form.as_ref().map(ui_form),
+    }
+}
+
+/// A span list of a form, capped ([`api::MAX_FORM_SPANS`], [`api::MAX_UI_TEXT`]); an unknown
+/// style is plain.
+fn spans(list: &[deck_core::ctl::UiSpan]) -> Vec<api::UiSpan> {
+    list.iter()
+        .take(api::MAX_FORM_SPANS)
+        .map(|s| api::UiSpan {
+            text: cut(&s.text, api::MAX_UI_TEXT),
+            style: match s.style.as_deref() {
+                Some("code") => Some(api::SpanStyle::Code),
+                Some("strong") => Some(api::SpanStyle::Strong),
+                Some("em") => Some(api::SpanStyle::Em),
+                _ => None,
+            },
+        })
+        .collect()
+}
+
+/// A number bound as decimal text (shortest round-trip form); `None` when not finite.
+fn number(v: Option<f64>) -> Option<String> {
+    finite_opt(v).map(|n| n.to_string())
+}
+
+/// omp's parsed form in device terms, capped by the `MAX_FORM_*` bounds; blocks of a kind this
+/// build does not know and field blocks past the listed fields are dropped.
+fn ui_form(f: &deck_core::ctl::UiForm) -> api::UiFormView {
+    use deck_core::ctl::{UiFormBlock as B, UiFormField as F};
+    let t = |s: &str| cut(s, api::MAX_UI_TEXT);
+    let fields: Vec<api::UiFormFieldView> = f
+        .fields
+        .iter()
+        .take(api::MAX_FORM_FIELDS)
+        .map(|field| match field {
+            F::Choice {
+                name,
+                question,
+                label,
+                multi,
+                select,
+                other,
+                required,
+                options,
+            } => api::UiFormFieldView::Choice {
+                name: t(name),
+                question: t(question),
+                label: spans(label),
+                multi: *multi,
+                select: *select,
+                other: *other,
+                required: *required,
+                options: options
+                    .iter()
+                    .take(api::MAX_UI_OPTIONS)
+                    .map(|o| api::UiFormOption {
+                        label: spans(&o.label),
+                        checked: o.checked,
+                        disabled: o.disabled,
+                    })
+                    .collect(),
+            },
+            F::Text {
+                name,
+                question,
+                label,
+                input_type,
+                multiline,
+                value,
+                placeholder,
+                required,
+                min,
+                max,
+                pattern,
+                min_length,
+                max_length,
+                rows,
+            } => api::UiFormFieldView::Text {
+                name: t(name),
+                question: t(question),
+                label: spans(label),
+                input_type: t(input_type),
+                multiline: *multiline,
+                value: t(value),
+                placeholder: t(placeholder),
+                required: *required,
+                min: number(*min),
+                max: number(*max),
+                pattern: pattern.as_deref().map(t),
+                min_length: *min_length,
+                max_length: *max_length,
+                rows: *rows,
+            },
+        })
+        .collect();
+    let listed = fields.len();
+    let block = |b: &B| -> Option<api::UiFormBlock> {
+        Some(match b {
+            B::Text { spans: s, heading } => api::UiFormBlock::Text {
+                spans: spans(s),
+                heading: *heading,
+            },
+            B::List { items, ordered } => api::UiFormBlock::List {
+                items: items
+                    .iter()
+                    .take(api::MAX_FORM_ITEMS)
+                    .map(|i| spans(i))
+                    .collect(),
+                ordered: *ordered,
+            },
+            B::Pre { text } => api::UiFormBlock::Pre { text: t(text) },
+            B::Table { rows, header_rows } => api::UiFormBlock::Table {
+                rows: rows
+                    .iter()
+                    .take(api::MAX_FORM_ITEMS)
+                    .map(|r| {
+                        r.iter()
+                            .take(api::MAX_FORM_COLUMNS)
+                            .map(|c| spans(c))
+                            .collect()
+                    })
+                    .collect(),
+                header_rows: *header_rows,
+            },
+            B::Image { alt } => api::UiFormBlock::Image { alt: t(alt) },
+            B::Field { field } if usize::try_from(*field).is_ok_and(|i| i < listed) => {
+                api::UiFormBlock::Field { index: *field }
+            }
+            B::Field { .. } | B::Other => return None,
+        })
+    };
+    api::UiFormView {
+        sections: f
+            .sections
+            .iter()
+            .take(api::MAX_FORM_SECTIONS)
+            .map(|s| api::UiFormSectionView {
+                title: spans(&s.title),
+                blocks: s
+                    .blocks
+                    .iter()
+                    .filter_map(block)
+                    .take(api::MAX_FORM_BLOCKS)
+                    .collect(),
+            })
+            .collect(),
+        fields,
     }
 }
 
@@ -201,7 +361,7 @@ pub(super) fn ui_request_id(request: &str) -> Option<u64> {
 }
 
 pub(super) fn ui_answer(a: api::UiAnswer) -> crate::ui_answer::UiAnswer {
-    use crate::ui_answer::{ApproveDecision as D, AskAnswer, UiAnswer as U};
+    use crate::ui_answer::{ApproveDecision as D, AskAnswer, FormAnswer, UiAnswer as U};
     match a {
         api::UiAnswer::Choice { index } => U::Choice { index },
         api::UiAnswer::Choices { indices } => U::Choices { indices },
@@ -224,6 +384,17 @@ pub(super) fn ui_answer(a: api::UiAnswer) -> crate::ui_answer::UiAnswer {
                 api::ApproveDecision::Deny {} => D::Deny,
                 api::ApproveDecision::Grant { index, always } => D::Grant { index, always },
             },
+        },
+        api::UiAnswer::Form { fields } => U::Form {
+            fields: fields
+                .into_iter()
+                .map(|f| match f {
+                    api::UiFormAnswer::Choice { checked, other } => {
+                        FormAnswer::Choice { checked, other }
+                    }
+                    api::UiFormAnswer::Text { text } => FormAnswer::Text { text },
+                })
+                .collect(),
         },
         api::UiAnswer::Cancel {} => U::Cancel,
     }
@@ -799,6 +970,7 @@ mod tests {
             prefill: None,
             questions: Vec::new(),
             approve: None,
+            form: None,
             timeout_ms: Some(5000),
         };
         let v = ui_request(&ui);
@@ -807,6 +979,176 @@ mod tests {
         assert!(v.title.len() <= api::MAX_UI_TEXT);
         assert_eq!(v.options.len(), api::MAX_UI_OPTIONS);
         assert_eq!(v.initial, Some(1));
+    }
+
+    fn form_ui(id: u64) -> PendingUi {
+        use deck_core::ctl::{
+            UiForm, UiFormBlock, UiFormField, UiFormOption, UiFormSection, UiSpan,
+        };
+        let long = "y".repeat(api::MAX_UI_TEXT * 2);
+        let span = |text: &str, style: Option<&str>| UiSpan {
+            text: text.to_owned(),
+            style: style.map(str::to_owned),
+        };
+        let text_field = UiFormField::Text {
+            name: "n".to_owned(),
+            question: "n?".to_owned(),
+            label: Vec::new(),
+            input_type: "number".to_owned(),
+            multiline: false,
+            value: long.clone(),
+            placeholder: String::new(),
+            required: false,
+            min: Some(-0.5),
+            max: Some(3.0),
+            pattern: None,
+            min_length: None,
+            max_length: Some(8),
+            rows: 1,
+        };
+        let mut fields = vec![UiFormField::Choice {
+            name: "color".to_owned(),
+            question: "Pick a color?".to_owned(),
+            label: vec![span("Pick", Some("strong"))],
+            multi: false,
+            select: false,
+            other: true,
+            required: true,
+            options: (0..80)
+                .map(|i| UiFormOption {
+                    label: vec![span(&format!("o{i}"), None)],
+                    checked: i == 1,
+                    disabled: false,
+                })
+                .collect(),
+        }];
+        fields.extend(std::iter::repeat_n(text_field, 59));
+        let mut blocks = vec![
+            UiFormBlock::Other,
+            UiFormBlock::Text {
+                spans: (0..100)
+                    .map(|i| {
+                        span(
+                            &long,
+                            [Some("code"), Some("em"), Some("blink"), None][i % 4],
+                        )
+                    })
+                    .collect(),
+                heading: true,
+            },
+            UiFormBlock::Table {
+                rows: vec![vec![vec![span("c", None)]; 20]; 70],
+                header_rows: 1,
+            },
+            UiFormBlock::Field { field: 0 },
+            // Past the listed fields.
+            UiFormBlock::Field { field: 45 },
+        ];
+        blocks.extend((0..80).map(|_| UiFormBlock::Pre { text: long.clone() }));
+        PendingUi {
+            id,
+            kind: PendingUiKind::Form,
+            title: "Ask".to_owned(),
+            message: None,
+            options: Vec::new(),
+            multi: false,
+            initial: None,
+            prefill: None,
+            questions: Vec::new(),
+            approve: None,
+            form: Some(UiForm {
+                sections: (0..30)
+                    .map(|_| UiFormSection {
+                        title: vec![span("Section", None)],
+                        blocks: blocks.clone(),
+                    })
+                    .collect(),
+                fields,
+            }),
+            timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_form_is_mapped_within_the_device_caps() {
+        let v = ui_request(&form_ui(4));
+        assert_eq!(v.kind, api::UiKind::Form);
+        let f = v.form.expect("form");
+        assert_eq!(f.sections.len(), api::MAX_FORM_SECTIONS);
+        assert_eq!(f.fields.len(), api::MAX_FORM_FIELDS);
+        let blocks = &f.sections[0].blocks;
+        assert_eq!(blocks.len(), api::MAX_FORM_BLOCKS);
+        // The unknown block and the dangling field block are gone, the in-range one stays.
+        let api::UiFormBlock::Text { spans, heading } = &blocks[0] else {
+            panic!("{:?}", blocks[0]);
+        };
+        assert!(heading);
+        assert_eq!(spans.len(), api::MAX_FORM_SPANS);
+        assert!(spans.iter().all(|s| s.text.len() <= api::MAX_UI_TEXT));
+        let styles: Vec<_> = spans.iter().take(4).map(|s| s.style).collect();
+        assert_eq!(
+            styles,
+            [
+                Some(api::SpanStyle::Code),
+                Some(api::SpanStyle::Em),
+                None,
+                None
+            ]
+        );
+        let api::UiFormBlock::Table { rows, header_rows } = &blocks[1] else {
+            panic!("{:?}", blocks[1]);
+        };
+        assert_eq!(*header_rows, 1);
+        assert_eq!(rows.len(), api::MAX_FORM_ITEMS);
+        assert_eq!(rows[0].len(), api::MAX_FORM_COLUMNS);
+        assert_eq!(blocks[2], api::UiFormBlock::Field { index: 0 });
+        assert!(matches!(blocks[3], api::UiFormBlock::Pre { .. }));
+        let api::UiFormFieldView::Choice { options, label, .. } = &f.fields[0] else {
+            panic!("{:?}", f.fields[0]);
+        };
+        assert_eq!(options.len(), api::MAX_UI_OPTIONS);
+        assert!(options[1].checked);
+        assert_eq!(label[0].style, Some(api::SpanStyle::Strong));
+        let api::UiFormFieldView::Text {
+            min, max, value, ..
+        } = &f.fields[1]
+        else {
+            panic!("{:?}", f.fields[1]);
+        };
+        assert_eq!((min.as_deref(), max.as_deref()), (Some("-0.5"), Some("3")));
+        assert!(value.len() <= api::MAX_UI_TEXT);
+    }
+
+    #[test]
+    fn a_form_is_listed_only_to_a_form_device() {
+        let select = PendingUi {
+            id: 3,
+            kind: PendingUiKind::Select,
+            title: "t".to_owned(),
+            message: None,
+            options: Vec::new(),
+            multi: false,
+            initial: None,
+            prefill: None,
+            questions: Vec::new(),
+            approve: None,
+            form: None,
+            timeout_ms: None,
+        };
+        let pending = [form_ui(4), select];
+        let ids = |form| -> Vec<String> {
+            pending_ui(&pending, form)
+                .into_iter()
+                .map(|u| u.request)
+                .collect()
+        };
+        assert_eq!(ids(true), ["u-4", "u-3"]);
+        assert_eq!(ids(false), ["u-3"]);
+        // An older device's view carries no form at all.
+        let text = serde_json::to_string(&pending_ui(&pending, false)).expect("json");
+        assert!(!text.contains("form"), "{text}");
+        let many: Vec<PendingUi> = (0..20).map(form_ui).collect();
+        assert_eq!(pending_ui(&many, true).len(), api::MAX_PENDING_UI);
     }
 
     #[test]

@@ -131,7 +131,10 @@ fn slice4_device_ops_through_the_relay() {
     drop(old);
 
     let mut a = Device::connect(&relay, &phone, "Phone", true);
-    assert_eq!(a.welcome.features, vec![api::FEATURE_S4.to_owned()]);
+    assert_eq!(
+        a.welcome.features,
+        vec![api::FEATURE_S4.to_owned(), api::FEATURE_FORM.to_owned()]
+    );
     assert!(!a.welcome.push_key.is_empty(), "no push key in the welcome");
     let mut seq = a.welcome.next_seq;
 
