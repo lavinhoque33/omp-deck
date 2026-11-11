@@ -40,22 +40,6 @@ jobs:
       - name: Install system dependencies
         run: |
           printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt
-          # Temporary runner DNS diagnosis; no environment values or credentials are printed.
-          ls -l /etc/resolv.conf
-          for host in archive.ubuntu.com mirrors.edge.kernel.org; do
-            if timeout 10 getent ahostsv4 "$host"; then
-              echo "$host: runner IPv4 DNS OK"
-            else
-              echo "$host: runner IPv4 DNS FAILED"
-            fi
-            if sudo -u _apt timeout 10 getent ahostsv4 "$host"; then
-              echo "$host: apt-user IPv4 DNS OK"
-            else
-              echo "$host: apt-user IPv4 DNS FAILED"
-            fi
-          done
-          curl --fail --silent --show-error --head --connect-timeout 10 --max-time 30 \
-            https://mirrors.edge.kernel.org/ubuntu/dists/jammy/InRelease
           sudo apt-get --error-on=any update
           sudo apt-get install -y --no-install-recommends \
             tmux pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev \
