@@ -3,8 +3,13 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  # Dry run from any branch: builds, tests and packages every asset, publishes nothing.
+  # Dry run; Linux-only recovery reuses already-verified, identical-source platform artifacts.
   workflow_dispatch:
+    inputs:
+      linux_only:
+        description: Build only Linux artifacts for same-source release recovery
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -34,9 +39,24 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          # Avoid the runner image's regional Azure mirror and its DNS dependency.
-          printf '%s\n' 'https://archive.ubuntu.com/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt
-          sudo apt-get update
+          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt
+          # Temporary runner DNS diagnosis; no environment values or credentials are printed.
+          ls -l /etc/resolv.conf
+          for host in archive.ubuntu.com mirrors.edge.kernel.org; do
+            if timeout 10 getent ahostsv4 "$host"; then
+              echo "$host: runner IPv4 DNS OK"
+            else
+              echo "$host: runner IPv4 DNS FAILED"
+            fi
+            if sudo -u _apt timeout 10 getent ahostsv4 "$host"; then
+              echo "$host: apt-user IPv4 DNS OK"
+            else
+              echo "$host: apt-user IPv4 DNS FAILED"
+            fi
+          done
+          curl --fail --silent --show-error --head --connect-timeout 10 --max-time 30 \
+            https://mirrors.edge.kernel.org/ubuntu/dists/jammy/InRelease
+          sudo apt-get --error-on=any update
           sudo apt-get install -y --no-install-recommends \
             tmux pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev \
             libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
@@ -121,6 +141,7 @@ jobs:
             dist/omp-deck-*.rpm.sha256
 
   android:
+    if: github.event_name != 'workflow_dispatch' || !inputs.linux_only
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -195,6 +216,7 @@ jobs:
 
   windows:
     name: windows-${{ matrix.arch }}
+    if: github.event_name != 'workflow_dispatch' || !inputs.linux_only
     runs-on: ${{ matrix.runner }}
     # The arm64 runner/build is best effort: a failure there must not block the release.
     continue-on-error: ${{ matrix.experimental }}
