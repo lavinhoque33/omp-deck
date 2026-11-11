@@ -4,7 +4,7 @@ members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/d
 
 [workspace.package]
 edition = "2024"
-version = "0.28.1"
+version = "0.28.2"
 license = "MIT OR Apache-2.0"
 publish = false
 description = "Desktop wrapper for the omp coding-agent TUI: session sidebar, tabs, embedded terminal backed by tmux or its own session host (Linux, Windows)"
@@ -38,7 +38,7 @@ thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
 tempfile = "3"
-rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 tar = { version = "0.4", default-features = false }
 flate2 = "1"

@@ -42,6 +42,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Security audit
+        run: cargo deny check advisories
 
       - name: Test
         run: cargo test --workspace --release
@@ -60,7 +65,7 @@ jobs:
 
       - name: Relay archive (relay binary + phone app)
         run: |
-          (cd pwa && bun install --frozen-lockfile && bun run build)
+          (cd pwa && bun install --frozen-lockfile && bun audit && bun run build)
           stage="omp-deck-relay-${VERSION}-x86_64-linux"
           mkdir -p "dist/$stage"
           install -m 0755 target/release/omp-deck-relay "dist/$stage/"

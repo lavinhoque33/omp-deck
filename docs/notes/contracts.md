@@ -4298,7 +4298,7 @@ phone's, or an automatic pass), because the gateway owns the lane; the window's 
   project must be shown as setup required, never treated as delivered notifications.
 - `api-android.json` is a separate pinned shared vector; existing v1/s4/form vector bytes stay unchanged.
 
-### Android APK updates and release assets (0.28.1)
+### Android APK updates and release assets (0.28.2)
 
 - The native updater checks this repository's fixed GitHub latest-release endpoint on launch and every six
   hours while foreground; automatic checks are toggleable, manual checks always available. The APK has its own
@@ -4322,3 +4322,5 @@ phone's, or an automatic pass), because the gateway owns the lane; the window's 
   repository secrets, never source or artifacts. The signing fingerprint is pinned. APK + sidecar join
   `SHA256SUMS`; a draft becomes public only after all release assets upload. Firebase sender credentials never
   enter CI.
+- Rust and PWA dependency audits also gate publication. Bundled SQLite uses patched `libsqlite3-sys` 0.39+
+  through `rusqlite` 0.41 (RUSTSEC-2026-0459); the advisory is fixed, not ignored.
