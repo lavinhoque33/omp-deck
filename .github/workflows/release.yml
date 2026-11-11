@@ -34,6 +34,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          # Avoid the runner image's regional Azure mirror and its DNS dependency.
+          printf '%s\n' 'https://archive.ubuntu.com/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             tmux pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev \

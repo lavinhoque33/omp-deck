@@ -1782,6 +1782,10 @@ Facts + user decisions: `docs/notes/wave14.md`. New workspace deps (root `Cargo.
   an update from an older GUI. A same-version bundle may be downloaded to align that GUI, but downloads
   older than the running gateway are refused. The phone's Updates feed still offers only releases newer
   than the gateway, so it never advertises a same-version reinstall or downgrade.
+- Linux CI/release package setup uses the canonical HTTPS Ubuntu archive instead of the hosted runner's
+  regional Azure mirror. A workflow-only repair after tagging may build unchanged application sources
+  through the dry-run workflow; the version tag stays immutable and manual publication waits for every
+  normal platform gate and the complete checksummed payload set.
 - `changes`: binary diffs have empty text; untracked directories share one byte budget; `discard` skips untracked,
   unchanged and intent-to-add entries; `stage` on a conflicted file marks it resolved; unstaging a staged rename also
   unstages its source; `delete_untracked` accepts only `Would remove` lines for the requested path and refuses when
