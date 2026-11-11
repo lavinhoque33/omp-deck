@@ -20,7 +20,7 @@ import type { Bytes } from '../remote/bytes.ts';
 import { LEGACY_PUSH_KEY_URL, PUSH_CHANGED_MESSAGE, PUSH_STATE_CACHE, desktopScope, pushKeyUrl, pushLabelUrl, pushLabels } from '../push.ts';
 import { hasS4 } from './client.ts';
 import { nativeHost } from './native.ts';
-import { NativePushController, appMarkers } from './native-push.ts';
+import { NativePushController, appMarkers, type NativePushClient } from './native-push.ts';
 import { useClient, useClientState, useDesktops, useDesktopsState } from './ui/hooks.ts';
 
 export type PushSupport =
@@ -434,7 +434,7 @@ function isStandalone(): boolean {
 }
 
 /** The app's push controller for `client` (one per desktop: the client is bound to it). */
-export function pushController(client: PushClientLike, desktop: PushDesktop): PushControllerLike {
+export function pushController(client: NativePushClient, desktop: PushDesktop): PushControllerLike {
   let controller = controllers.get(client);
   if (controller === undefined) {
     const host = nativeHost();

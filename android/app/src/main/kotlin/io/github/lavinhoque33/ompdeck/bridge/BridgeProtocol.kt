@@ -51,6 +51,7 @@ object BridgeProtocol {
     const val MAX_LABEL_CHARS = 128
     const val MAX_LABELS = 64
     const val MAX_FILE_NAME_CHARS = 120
+    const val MAX_CONFIG_CHARS = 48 * 1024
 
     private val ID = Regex("[A-Za-z0-9_.:-]{1,$MAX_ID_CHARS}")
     private val DESKTOP = Regex("[0-9a-f]{64}")
@@ -96,6 +97,17 @@ object BridgeProtocol {
         val enabled = params.opt("auto_check")
         if (params.length() != 1 || enabled !is Boolean) throw BridgeException("bad_params")
         return enabled
+    }
+
+    /** `pushEnable {config?: string}`: the desktop's public google-services.json, used only by a phone with no Firebase configuration. */
+    fun enableParams(params: JSONObject): String? {
+        val keys = params.keys().asSequence().toList()
+        if (keys.isEmpty()) return null
+        val config = params.opt("config")
+        if (keys != listOf("config") || config !is String || config.isBlank() || config.length > MAX_CONFIG_CHARS) {
+            throw BridgeException("bad_params")
+        }
+        return config
     }
 
     fun desktopParam(params: JSONObject): String {

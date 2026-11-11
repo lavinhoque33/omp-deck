@@ -28,7 +28,7 @@ export interface NativeInfo {
 
 export interface NativePushState {
   permission: NativePermission;
-  /** Firebase is set up on this phone (a `google-services.json` was imported). */
+  /** Firebase is set up on this phone. */
   configured: boolean;
   /** The current FCM registration token, once Firebase has issued one. */
   token: string | null;
@@ -71,7 +71,8 @@ export interface SaveFileParams {
 export interface NativeCalls {
   info: { params: Record<string, never>; result: NativeInfo };
   pushState: { params: Record<string, never>; result: NativePushState };
-  pushEnable: { params: Record<string, never>; result: NativePushState };
+  /** `config`: the desktop's public google-services.json, consumed only while Firebase is not set up on this phone. */
+  pushEnable: { params: { config?: string }; result: NativePushState };
   pushSubscription: { params: { desktop: string; label: string }; result: NativeSubscription };
   pushForget: { params: { desktop: string }; result: null };
   pushLabels: { params: { labels: Record<string, string> }; result: null };
@@ -213,6 +214,20 @@ function checkNoParams(params: Record<string, never>): void {
   if (Object.keys(params).length > 0) throw new NativeError('invalid', 'this call takes no parameters');
 }
 
+/** Far above any sanitized single-client google-services.json; bounds what crosses the bridge. */
+export const MAX_FIREBASE_CONFIG_CHARS = 48 * 1024;
+
+function checkPushEnable(params: { config?: string }): void {
+  for (const key of Object.keys(params)) {
+    if (key !== 'config') throw new NativeError('invalid', `pushEnable takes no ${key}`);
+  }
+  const config: unknown = params.config;
+  if (config === undefined) return;
+  if (typeof config !== 'string' || config.trim().length === 0 || config.length > MAX_FIREBASE_CONFIG_CHARS) {
+    throw new NativeError('invalid', 'the Firebase config is not a non-empty string of a sane size');
+  }
+}
+
 function checkDesktop(desktop: unknown): asserts desktop is string {
   if (!isDesktopId(desktop)) throw new NativeError('invalid', 'the desktop is not a 64-digit lowercase hex id');
 }
@@ -240,8 +255,8 @@ const TOKEN_MS = 45_000;
 const METHODS: { readonly [K in NativeMethod]: MethodSpec<K> } = {
   info: { timeoutMs: QUICK_MS, check: checkNoParams, decode: decodeInfo },
   pushState: { timeoutMs: QUICK_MS, check: checkNoParams, decode: decodePushState },
-  // The permission prompt and the google-services.json picker are the user's: no deadline.
-  pushEnable: { timeoutMs: null, check: checkNoParams, decode: decodePushState },
+  // The notification permission prompt is the user's: no deadline.
+  pushEnable: { timeoutMs: null, check: checkPushEnable, decode: decodePushState },
   pushSubscription: {
     timeoutMs: TOKEN_MS,
     check: (params) => {

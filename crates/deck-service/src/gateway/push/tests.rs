@@ -367,7 +367,7 @@ fn subscription_storage_keeps_prefs_and_is_deleted_with_the_device() {
         unsubscribe(&mut reg, "nope"),
         Err(PushError::NoDevice)
     ));
-    assert!(!state_view(reg.get("d-1").unwrap()).subscribed);
+    assert!(!state_view(reg.get("d-1").unwrap(), None).subscribed);
     subscribe_ua(&mut reg, "d-1", "http://127.0.0.1:9/a", &ua);
     set_prefs(&mut reg, "d-1", prefs).unwrap();
     let since = reg.get("d-1").unwrap().push.as_ref().unwrap().since_unix_ms;
@@ -375,7 +375,7 @@ fn subscription_storage_keeps_prefs_and_is_deleted_with_the_device() {
     // A browser refresh resubscribes: same endpoint keeps `since`, prefs stay either way.
     subscribe_ua(&mut reg, "d-1", "http://127.0.0.1:9/a", &ua);
     subscribe_ua(&mut reg, "d-1", "http://127.0.0.1:9/b", &ua);
-    let view = state_view(reg.get("d-1").unwrap());
+    let view = state_view(reg.get("d-1").unwrap(), None);
     assert!(view.subscribed);
     assert_eq!(view.prefs, prefs);
     let reloaded = Registry::load(&dir.path().join("devices.json")).unwrap();
@@ -837,23 +837,25 @@ fn an_android_registration_keeps_prefs_across_refresh_and_transport_and_goes_wit
     );
     let d = reg.get("d-1").unwrap();
     assert!(d.push.is_none() && d.has_push() && d.view(false).push);
-    assert!(state_view(d).subscribed);
+    assert!(state_view(d, None).subscribed);
     set_prefs(&mut reg, "d-1", prefs).unwrap();
-    let since = state_view(reg.get("d-1").unwrap()).since_unix_ms.unwrap();
+    let since = state_view(reg.get("d-1").unwrap(), None)
+        .since_unix_ms
+        .unwrap();
     assert!(since > 0);
     // The same registration again changes nothing (nothing to purge); a refreshed token keeps
     // the prefs; so does a new key.
     assert!(!android(&mut reg, "d-1", "token-1"));
-    assert_eq!(state_view(reg.get("d-1").unwrap()).prefs, prefs);
+    assert_eq!(state_view(reg.get("d-1").unwrap(), None).prefs, prefs);
     assert_eq!(
-        state_view(reg.get("d-1").unwrap()).since_unix_ms,
+        state_view(reg.get("d-1").unwrap(), None).since_unix_ms,
         Some(since)
     );
     assert!(android(&mut reg, "d-1", "token-2"));
-    assert_eq!(state_view(reg.get("d-1").unwrap()).prefs, prefs);
+    assert_eq!(state_view(reg.get("d-1").unwrap(), None).prefs, prefs);
     let rekeyed = check_android("token-2", &b64(&[9; 32]), DESKTOP, DESKTOP, true).unwrap();
     assert!(subscribe_android(&mut reg, "d-1", rekeyed).unwrap());
-    assert_eq!(state_view(reg.get("d-1").unwrap()).prefs, prefs);
+    assert_eq!(state_view(reg.get("d-1").unwrap(), None).prefs, prefs);
 
     // It survives a restart, key included, in the one registry file.
     let reloaded = Registry::load(&path).unwrap();
@@ -880,11 +882,11 @@ fn an_android_registration_keeps_prefs_across_refresh_and_transport_and_goes_wit
     );
     let d = reg.get("d-1").unwrap();
     assert!(d.android_push.is_none() && d.push.is_some());
-    assert_eq!(state_view(d).prefs, prefs);
+    assert_eq!(state_view(d, None).prefs, prefs);
     assert!(android(&mut reg, "d-1", "token-3"));
     let d = reg.get("d-1").unwrap();
     assert!(d.push.is_none() && d.android_push.is_some());
-    assert_eq!(state_view(d).prefs, prefs);
+    assert_eq!(state_view(d, None).prefs, prefs);
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(
         !text.contains("127.0.0.1:9") && text.contains("token-3"),
@@ -1127,4 +1129,89 @@ fn the_secrets_dir_service_account_turns_android_push_on() {
     )
     .unwrap();
     assert!(Push::open(&secrets, Arc::new(|| {})).android_configured());
+}
+
+#[test]
+fn startup_public_android_options_are_cached_and_never_change_device_registrations() {
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = dir.path().join("secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::write(
+        secrets.join(fcm::CREDENTIALS_FILE),
+        serde_json::json!({
+            "type": "service_account",
+            "project_id": google::PROJECT,
+            "client_email": "gateway@ompdeck-test.iam.gserviceaccount.com",
+            "private_key": include_str!("fcm/test-rsa-key.pem"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let public = serde_json::json!({
+        "project_info": {
+            "project_id": google::PROJECT,
+            "project_number": "123456789012",
+        },
+        "client": [{
+            "client_info": {
+                "mobilesdk_app_id": "1:123456789012:android:0123456789abcdef",
+                "android_client_info": {"package_name": "io.github.lavinhoque33.ompdeck"},
+            },
+            "api_key": [{"current_key": "AIzaSyA-0123456789abcdefghijklmnopqrstuv"}],
+        }],
+    });
+    let mut source = public.clone();
+    source["private_key"] = "MUST NOT LEAVE DESKTOP".into();
+    source["account_path"] = "/private/credentials/fcm-service-account.json".into();
+    std::fs::write(secrets.join(android_config::FILE), source.to_string()).unwrap();
+    let push = Push::open(&secrets, Arc::new(|| {}));
+    assert!(push.android_configured());
+    let mut reg = registry(dir.path(), &["d-1", "d-2", "d-3"]);
+    let empty = state_view(reg.get("d-1").unwrap(), push.android_config());
+    assert!(!empty.subscribed);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(empty.android_config.as_deref().unwrap())
+            .unwrap(),
+        public
+    );
+    // Configuration is startup-only: subsequent feeds do not reread a changed/deleted file.
+    std::fs::remove_file(secrets.join(android_config::FILE)).unwrap();
+    assert_eq!(
+        state_view(reg.get("d-1").unwrap(), push.android_config()),
+        empty
+    );
+    assert!(android(&mut reg, "d-1", "existing-token"));
+    let prefs = PushPrefs {
+        attention: false,
+        show_titles: true,
+        ..PushPrefs::default()
+    };
+    set_prefs(&mut reg, "d-1", prefs).unwrap();
+    let ua = Ua::new();
+    subscribe_ua(&mut reg, "d-2", "http://127.0.0.1:9/browser", &ua);
+    set_prefs(&mut reg, "d-2", prefs).unwrap();
+    let stored = std::fs::read(dir.path().join("devices.json")).unwrap();
+    for id in ["d-1", "d-2", "d-3"] {
+        let device = reg.get(id).unwrap();
+        let before = state_view(device, None);
+        let offered = state_view(device, push.android_config());
+        assert_eq!(offered.subscribed, before.subscribed);
+        assert_eq!(offered.prefs, before.prefs);
+        assert_eq!(offered.since_unix_ms, before.since_unix_ms);
+        assert_eq!(offered.android_config, empty.android_config);
+        let encoded = serde_json::to_string(&offered).unwrap();
+        assert!(!encoded.contains("existing-token"));
+        assert!(!encoded.contains("private_key"));
+        assert!(!encoded.contains("/private/"));
+    }
+    assert_eq!(
+        std::fs::read(dir.path().join("devices.json")).unwrap(),
+        stored
+    );
+    let stored = String::from_utf8(stored).unwrap();
+    assert!(!stored.contains("android_config"));
+    assert!(!stored.contains("mobilesdk_app_id"));
+    let push = push.with_fcm(None);
+    assert!(!push.android_configured());
+    assert!(push.android_config().is_none());
 }

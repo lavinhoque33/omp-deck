@@ -51,7 +51,6 @@ import io.github.lavinhoque33.ompdeck.bridge.ParsedRequest
 import io.github.lavinhoque33.ompdeck.bridge.SaveWriter
 import io.github.lavinhoque33.ompdeck.push.Base64Url
 import io.github.lavinhoque33.ompdeck.push.ConfigException
-import io.github.lavinhoque33.ompdeck.push.GoogleServices
 import io.github.lavinhoque33.ompdeck.push.OpenRequest
 import io.github.lavinhoque33.ompdeck.push.Presence
 import io.github.lavinhoque33.ompdeck.push.PushEvents
@@ -131,8 +130,6 @@ class MainActivity : ComponentActivity() {
             callback.onReceiveValue(null)
         }
     }
-
-    private val importPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> onConfigPicked(uri) }
 
     private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         val next = permissionNext
@@ -524,7 +521,7 @@ class MainActivity : ComponentActivity() {
                 sendEvent("update", updater.snapshot())
             }
             BridgeMethod.PUSH_STATE -> background(reply) { pushState().also { kickTokenFetch() } }
-            BridgeMethod.PUSH_ENABLE -> pushEnable(reply)
+            BridgeMethod.PUSH_ENABLE -> pushEnable(BridgeProtocol.enableParams(params), reply)
             BridgeMethod.PUSH_SUBSCRIPTION -> {
                 val subscription = BridgeProtocol.subscriptionParams(params)
                 background(reply) { pushSubscription(subscription) }
@@ -675,21 +672,44 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // pushEnable: [import config] -> [notification permission] -> [token] -> state. Every step ends in finishEnable.
+    // pushEnable: [import desktop config, only when unconfigured] -> [notification permission] -> [token] -> state.
 
-    private fun pushEnable(reply: Reply) {
+    private fun pushEnable(config: String?, reply: Reply) {
         if (enableReply != null) {
             reply.fail("busy")
             return
         }
         enableReply = reply
         io.execute {
-            val configured = try {
-                runtime.isConfigured()
-            } catch (_: Exception) {
-                false
+            try {
+                if (!runtime.isConfigured()) {
+                    if (config == null) {
+                        failEnable("desktop_setup_required")
+                        return@execute
+                    }
+                    try {
+                        runtime.importConfig(config)
+                    } catch (_: ConfigException) {
+                        failEnable("invalid_config")
+                        return@execute
+                    } catch (_: BridgeException) {
+                        // Configured by a concurrent call: carry on with what is there.
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "config import failed: ${e.javaClass.simpleName}")
+                failEnable("internal_error")
+                return@execute
             }
-            runOnMain { if (configured) continueEnable() else askImport() }
+            runOnMain { continueEnable() }
+        }
+    }
+
+    private fun failEnable(error: String) {
+        runOnMain {
+            val reply = enableReply ?: return@runOnMain
+            enableReply = null
+            reply.fail(error)
         }
     }
 
@@ -698,71 +718,6 @@ class MainActivity : ComponentActivity() {
         enableReply = null
         background(reply) { pushState() }
         checkPushChanged()
-    }
-
-    private fun askImport() {
-        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle(R.string.push_setup_title)
-            .setMessage(getString(R.string.push_setup_message, packageName))
-            .setPositiveButton(R.string.push_setup_import) { _, _ -> launchImportPicker() }
-            .setNegativeButton(R.string.push_setup_cancel) { _, _ -> finishEnable() }
-            .setOnCancelListener { finishEnable() }
-            .show()
-    }
-
-    private fun launchImportPicker() {
-        try {
-            importPicker.launch(arrayOf("*/*"))
-        } catch (_: ActivityNotFoundException) {
-            showImportError(getString(R.string.save_unavailable))
-        }
-    }
-
-    private fun onConfigPicked(uri: Uri?) {
-        if (uri == null) {
-            finishEnable()
-            return
-        }
-        io.execute {
-            try {
-                val text = readBounded(uri, GoogleServices.MAX_BYTES)
-                runtime.importConfig(text)
-                runOnMain { continueEnable() }
-            } catch (e: ConfigException) {
-                runOnMain { showImportError(e.message ?: "") }
-            } catch (e: BridgeException) {
-                // Already configured (a race with another import): carry on with what is there.
-                runOnMain { continueEnable() }
-            } catch (e: Exception) {
-                Log.w(TAG, "config import failed: ${e.javaClass.simpleName}")
-                runOnMain { showImportError(getString(R.string.save_unavailable)) }
-            }
-        }
-    }
-
-    private fun readBounded(uri: Uri, max: Int): String {
-        val stream = contentResolver.openInputStream(uri) ?: throw ConfigException("The file could not be opened.")
-        stream.use {
-            val buffer = java.io.ByteArrayOutputStream()
-            val chunk = ByteArray(8192)
-            while (true) {
-                val n = it.read(chunk)
-                if (n < 0) break
-                if (buffer.size() + n > max) throw ConfigException("The file is too large to be a google-services.json.")
-                buffer.write(chunk, 0, n)
-            }
-            return String(buffer.toByteArray(), Charsets.UTF_8)
-        }
-    }
-
-    private fun showImportError(message: String) {
-        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle(R.string.push_setup_error_title)
-            .setMessage(message)
-            .setPositiveButton(R.string.push_setup_retry) { _, _ -> askImport() }
-            .setNegativeButton(R.string.push_setup_cancel) { _, _ -> finishEnable() }
-            .setOnCancelListener { finishEnable() }
-            .show()
     }
 
     private fun continueEnable() {
@@ -831,7 +786,7 @@ class MainActivity : ComponentActivity() {
                     } catch (e: Exception) {
                         Log.w(TAG, "reset failed: ${e.javaClass.simpleName}")
                     }
-                    runOnMain { askImport() }
+                    runOnMain { finishEnable() }
                 }
             }
             .setNegativeButton(R.string.push_setup_cancel) { _, _ -> finishEnable() }

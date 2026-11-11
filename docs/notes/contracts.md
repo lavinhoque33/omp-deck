@@ -4293,9 +4293,18 @@ phone's, or an automatic pass), because the gateway owns the lane; the window's 
   existing bounded declarative notification payload plus encrypted `expires_unix_ms`. Native verifies expiry,
   rejects replay/malformed messages, suppresses only the visible desktop, and adds the desktop id to navigation.
   Google sees delivery metadata and opaque desktop ids, not notification content or session paths.
-- Firebase Android configuration is imported at runtime; builds contain no fake project. A Firebase project
-  and matching client/server configuration are external prerequisites for actual Google delivery. A missing
-  project must be shown as setup required, never treated as delivered notifications.
+- Firebase Android configuration is provisioned at runtime from the paired desktop, never compiled into
+  the APK. Put the public `google-services.json` once beside the gateway's `fcm-service-account.json`
+  (or name it with `OMP_DECK_FCM_ANDROID_CONFIG`); the gateway reads it once at startup, validates the
+  OmpDeck package/project against its configured sender and exposes only a normalized public Android
+  client in optional `PushStateView.android_config`. Raw files, private keys and local paths never
+  cross the device protocol. Absent/invalid/mismatched client setup is reported on the desktop side.
+- A new phone's **Push notifications** tap uses that encrypted device-feed configuration in
+  `pushEnable {config?: string}` before Android's permission prompt. No phone-side JSON picker.
+  Already-configured phones keep their configuration, registrations and per-desktop keys; automatic
+  provisioning never resets or replaces them. Permission is still requested only from a user tap.
+  A Firebase project and matching client/server configuration remain external prerequisites;
+  missing setup is never treated as successful notification delivery.
 - `api-android.json` is a separate pinned shared vector; existing v1/s4/form vector bytes stay unchanged.
 
 ### Android APK updates and release assets (0.28.2)

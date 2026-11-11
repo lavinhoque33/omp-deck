@@ -16,6 +16,7 @@
 //! verification against a local receiver only. `OMP_DECK_PUSH_CONTACT` sets the VAPID `sub`
 //! (an e-mail address or `mailto:`/`https:` URL; default: the PWA's origin).
 
+mod android_config;
 pub mod fcm;
 pub mod queue;
 pub mod sender;
@@ -48,6 +49,8 @@ pub const KEY_FILE: &str = "push.key";
 pub const TEST_LOOPBACK_ENV: &str = "OMP_DECK_PUSH_TEST_LOOPBACK";
 /// The VAPID contact (`sub`).
 pub const CONTACT_ENV: &str = "OMP_DECK_PUSH_CONTACT";
+/// Public Android Firebase client file override, retained by supervised gateway restarts.
+pub(super) const ANDROID_CONFIG_ENV: &str = android_config::ENV;
 /// Largest payload sent (the protocol's limit is 3993 bytes of plaintext).
 pub const MAX_PAYLOAD: usize = 1024;
 /// A session title in a push is cut to this many characters.
@@ -404,18 +407,16 @@ pub fn set_prefs(registry: &mut Registry, id: &str, prefs: PushPrefs) -> Result<
 }
 
 /// The device feed's push state.
-pub fn state_view(device: &Device) -> PushStateView {
-    match current(device) {
-        Some((prefs, since)) => PushStateView {
-            subscribed: true,
-            prefs,
-            since_unix_ms: Some(since),
-        },
-        None => PushStateView {
-            subscribed: false,
-            prefs: PushPrefs::default(),
-            since_unix_ms: None,
-        },
+pub fn state_view(device: &Device, android_config: Option<&str>) -> PushStateView {
+    let (subscribed, prefs, since_unix_ms) = match current(device) {
+        Some((prefs, since)) => (true, prefs, Some(since)),
+        None => (false, PushPrefs::default(), None),
+    };
+    PushStateView {
+        subscribed,
+        prefs,
+        since_unix_ms,
+        android_config: android_config.map(str::to_owned),
     }
 }
 
@@ -584,6 +585,7 @@ pub struct Push {
     sender: Option<sender::Sender>,
     gone: Arc<Mutex<Vec<Gone>>>,
     fcm: Option<Arc<fcm::Config>>,
+    android_config: Option<String>,
     android: Option<fcm::Sender>,
     android_gone: Arc<Mutex<Vec<fcm::Gone>>>,
     wake: Wake,
@@ -604,8 +606,8 @@ fn contact_from(text: &str) -> Option<String> {
 
 impl Push {
     /// Loads (or creates) `push.key` in the secrets `dir`, and reads the FCM service account
-    /// ([`fcm::load`]) if there is one. Without the key Web Push is off, without the account
-    /// Android push is (logged); the gateway runs on.
+    /// ([`fcm::load`]) and public Android client options once. Missing client options only
+    /// disable automatic phone setup; sender readiness and existing registrations are unchanged.
     pub fn open(dir: &Path, wake: Wake) -> Push {
         let key = crate::gateway::secret_dir(dir)
             .map_err(|e| format!("protecting {}: {e}", dir.display()))
@@ -620,7 +622,11 @@ impl Push {
             }
             parsed
         });
-        Push::with_key(key, Policy::from_env(), contact, wake).with_fcm(fcm::load(dir))
+        let fcm = fcm::load(dir);
+        let android_config = android_config::load(dir, fcm.as_ref());
+        let mut push = Push::with_key(key, Policy::from_env(), contact, wake).with_fcm(fcm);
+        push.android_config = android_config;
+        push
     }
 
     pub fn with_key(
@@ -636,6 +642,7 @@ impl Push {
             sender: None,
             gone: Arc::new(Mutex::new(Vec::new())),
             fcm: None,
+            android_config: None,
             android: None,
             android_gone: Arc::new(Mutex::new(Vec::new())),
             wake,
@@ -644,6 +651,8 @@ impl Push {
 
     /// Android push goes through `fcm` (`None`: it is unavailable).
     pub fn with_fcm(mut self, fcm: Option<fcm::Config>) -> Push {
+        // Replacing the sender must never leave public options for the previous project.
+        self.android_config = None;
         self.fcm = fcm.map(Arc::new);
         self
     }
@@ -658,6 +667,11 @@ impl Push {
     /// Whether this gateway can send to Android apps (`FEATURE_ANDROID_PUSH`).
     pub fn android_configured(&self) -> bool {
         self.fcm.is_some()
+    }
+
+    /// Startup-validated, public Firebase options for the authenticated self-device feed.
+    pub fn android_config(&self) -> Option<&str> {
+        self.android_config.as_deref()
     }
 
     /// Queues the push of `offer` to every subscribed device that wants its kind and is not

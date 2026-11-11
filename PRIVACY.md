@@ -68,10 +68,12 @@ directly to Google; Google can see delivery metadata, an FCM registration token 
 not the notification title, body or session destination. The phone decrypts and validates messages before
 displaying them. Session traffic does not go through Firebase.
 
-On Android, the imported `google-services.json` is client configuration, not a service-account credential.
-Native push keys and that configuration are encrypted with Android Keystore; pairing data and keys are
-excluded from Android backups. The Firebase service-account private key stays on the desktop, outside the APK,
-and is used only to authorize FCM sends. Do not put it in the app or share it with the phone.
+On Android, the paired desktop supplies the public Firebase Android client configuration over the existing
+encrypted connection when you enable push. It validates the project and selects only the OmpDeck Android
+client; it does not forward raw files, private keys or local paths. Native push keys and client configuration
+are encrypted with Android Keystore; pairing data and keys are excluded from Android backups. The Firebase
+service-account private key stays on the desktop, outside the APK, and is used only to authorize FCM sends.
+Do not put it in the app or share it with the phone.
 
 Notifications require permission and can be disabled per desktop/event in the companion or in Android's
 app settings. The desktop you are currently viewing while connected is suppressed. Google Play Services is

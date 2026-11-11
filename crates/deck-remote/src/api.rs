@@ -3013,6 +3013,11 @@ pub struct PushStateView {
     pub subscribed: bool,
     pub prefs: PushPrefs,
     pub since_unix_ms: Option<u64>,
+    /// Sanitized public google-services.json for this gateway's FCM project. Only the selected
+    /// OmpDeck Android client is included; never a service account, private key or source path.
+    /// Additive: absent on older gateways or when desktop-side client setup is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android_config: Option<String>,
 }
 
 /// The gateway's lifetime mode.

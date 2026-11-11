@@ -780,8 +780,10 @@ Google's push service, and reconnects.
 [GitHub Releases](https://github.com/lavinhoque33/omp-deck/releases/latest) (Android 8+; Google Play Services
 for native notifications). The UI ships in the APK, so UI updates require an APK update. Paste the desktop's pairing
 link into the app; browser pairings stay separate. Native notifications use your Firebase project and encrypted FCM
-data messages. It checks for APK updates in-app and downloads verified upgrades on request; Android confirms the
-installation. Build, signing and Firebase setup: [docs/android.md](docs/android.md).
+data messages. Configure Firebase once on the desktop; newly paired phones receive the public client settings
+automatically when you turn on notifications, with no JSON file to copy to each phone. It checks for APK updates
+in-app and downloads verified upgrades on request; Android confirms the installation.
+Build, signing and Firebase setup: [docs/android.md](docs/android.md).
 
 **Browser/PWA:** add the app to the home screen: tap **Install** on its banner where offered (Chrome, Edge,
 Opera, Samsung Internet), otherwise follow the browser-menu hint. Pair and install from the same browser.

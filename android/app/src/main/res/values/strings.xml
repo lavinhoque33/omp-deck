@@ -9,14 +9,9 @@
     <string name="webview_unsupported_title">Update Android System WebView</string>
     <string name="webview_unsupported_message">OmpDeck needs a newer Android System WebView (or Chrome) to run. Update it in Google Play, then reopen OmpDeck.</string>
 
-    <string name="push_setup_title">Set up Android push</string>
-    <string name="push_setup_message">Notifications are delivered through Firebase Cloud Messaging, using a Firebase project you own. This app ships with none.\n\n1. In the Firebase console, create a project and add an Android app with the package name %1$s.\n2. Download its google-services.json.\n3. Import it here.\n\nThe file stays on this phone (encrypted) and is only used to register with your Firebase project. Notification content is end-to-end encrypted between your desktop and this phone.</string>
-    <string name="push_setup_import">Import google-services.json</string>
     <string name="push_setup_cancel">Not now</string>
-    <string name="push_setup_retry">Choose another file</string>
-    <string name="push_setup_error_title">That file cannot be used</string>
     <string name="push_token_failed_title">Firebase could not register this phone</string>
-    <string name="push_token_failed_message">The imported Firebase configuration did not produce a notification token (wrong project, no network or no Google Play services). You can remove it and import a different google-services.json.</string>
+    <string name="push_token_failed_message">The Firebase configuration from your desktop did not produce a notification token (wrong project, no network or no Google Play services). You can remove it from this phone; the next setup fetches it from your desktop again.</string>
     <string name="push_token_failed_reset">Remove configuration</string>
     <string name="push_denied_title">Notifications are blocked</string>
     <string name="push_denied_message">Allow notifications for OmpDeck in the system settings to get desktop alerts on this phone.</string>

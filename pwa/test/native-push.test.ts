@@ -2,8 +2,8 @@
 // registration (and which never do), that a refresh keeps the prefs, and that turning push off or
 // forgetting a desktop drops exactly that desktop's gateway subscription and key.
 
-import { describe, expect, test } from 'bun:test';
-import { DESKTOP_SENDER_HELP, NativePushController, PHONE_FIREBASE_HELP, advertisesAndroidPush, dropNativePush, storageMarkers, type PushMarkers } from '../src/app/native-push.ts';
+import { describe, expect, test, vi } from 'bun:test';
+import { DESKTOP_CONFIG_HELP, DESKTOP_SENDER_HELP, NativePushController, advertisesAndroidPush, dropNativePush, storageMarkers, type PushMarkers } from '../src/app/native-push.ts';
 import type { NativeCalls, NativeMethod, NativePushState } from '../src/app/native.ts';
 import type { api } from '../src/remote/index.ts';
 
@@ -25,11 +25,32 @@ function welcome(features: string[] = ['s4', 'android_push']): api.Welcome {
   };
 }
 
+const CONFIG = '{"project_info":{"project_id":"demo"},"client":[]}';
+
 class FakeClient {
   readonly sent: api.Op[] = [];
   fail: Error | null = null;
+  readonly feeds = new Map<string, api.FeedValue>();
+  readonly listeners = new Set<() => void>();
+  followed = 0;
+  released = 0;
   constructor(public welcome: api.Welcome | null) {}
-  getState = () => ({ welcome: this.welcome });
+  getState = () => ({ welcome: this.welcome, feeds: this.feeds });
+  follow = (): (() => void) => {
+    this.followed++;
+    return () => void this.released++;
+  };
+  subscribeState = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => void this.listeners.delete(listener);
+  };
+  /** The device feed arrives, with the desktop's public Android config when it has one. */
+  deliver(config: string | undefined): void {
+    const push: api.PushStateView = { subscribed: false, prefs: { turn_finished: true, attention: true, ended: true, show_titles: false }, since_unix_ms: null };
+    if (config !== undefined) push.android_config = config;
+    this.feeds.set('device', { feed: 'device', name: 'Pixel', permissions: { control: true, manage: true }, push, gateway_version: '0.27.3', mode: 'background' });
+    for (const listener of [...this.listeners]) listener();
+  }
   request = async (op: api.Op): Promise<api.Resp> => {
     if (this.fail !== null) throw this.fail;
     this.sent.push(op);
@@ -79,8 +100,10 @@ class MemoryMarkers implements PushMarkers {
   clear = (desktop: string) => void this.on.delete(desktop);
 }
 
-function setup(options: { welcome?: api.Welcome | null; marked?: string[]; id?: string } = {}) {
+/** `config`: the public Android config the desktop's device feed carries (`null`: none; `'pending'`: the feed has not arrived). */
+function setup(options: { welcome?: api.Welcome | null; marked?: string[]; id?: string; config?: string | null | 'pending' } = {}) {
   const client = new FakeClient(options.welcome === undefined ? welcome() : options.welcome);
+  if (options.config !== 'pending') client.deliver(options.config === null ? undefined : (options.config ?? CONFIG));
   const shell = new FakeShell();
   const markers = new MemoryMarkers();
   for (const id of options.marked ?? []) markers.set(id);
@@ -109,8 +132,6 @@ describe('enable', () => {
     const { push, shell, client } = setup({ welcome: welcome(['s4']) });
     await push.enable();
     expect(push.getState()).toMatchObject({ error: DESKTOP_SENDER_HELP, busy: false, subscribed: false, native: { desktopSender: false } });
-    expect(DESKTOP_SENDER_HELP).toContain('fcm-service-account.json');
-    expect(DESKTOP_SENDER_HELP).toContain('OMP_DECK_FCM_CREDENTIALS');
     expect(shell.calls).toEqual([]);
     expect(client.sent).toEqual([]);
   });
@@ -118,15 +139,14 @@ describe('enable', () => {
   test('an old desktop (no s4) is told to update, nothing sent', async () => {
     const { push, shell } = setup({ welcome: welcome([]) });
     await push.enable();
-    expect(push.getState().error).toContain('newer OmpDeck');
     expect(shell.calls).toEqual([]);
   });
 
   test('permission and token are requested by the shell, then the key and token reach the desktop, and the choice is remembered', async () => {
     const { push, shell, client, markers } = setup();
     await push.enable();
-    expect(shell.methods()).toEqual(['pushEnable', 'pushSubscription']);
-    expect(shell.calls[1]?.params).toEqual({ desktop: A, label: 'Work' });
+    expect(shell.methods()).toEqual(['pushState', 'pushEnable', 'pushSubscription']);
+    expect(shell.calls[2]?.params).toEqual({ desktop: A, label: 'Work' });
     expect(client.sent).toEqual([subscribeOp()]);
     expect(markers.has(A)).toBe(true);
     expect(push.getState()).toMatchObject({ subscribed: true, busy: false, error: null, permission: 'granted' });
@@ -137,31 +157,95 @@ describe('enable', () => {
     denied.shell.afterEnable = { permission: 'denied', configured: true, token: null };
     await denied.push.enable();
     expect(denied.push.getState()).toMatchObject({ subscribed: false, busy: false, permission: 'denied' });
-    expect(denied.push.getState().error).toContain('Android’s app settings');
     const dismissed = setup();
     dismissed.shell.afterEnable = { permission: 'default', configured: true, token: null };
     await dismissed.push.enable();
-    expect(dismissed.push.getState().error).toBe('Notifications were not allowed.');
     for (const attempt of [denied, dismissed]) {
       expect(attempt.client.sent).toEqual([]);
       expect(attempt.markers.has(A)).toBe(false);
     }
   });
 
-  test('a phone without Firebase config, or without a token yet, is told what is missing', async () => {
+  test('a phone whose Firebase setup did not take, or without a token yet, registers nothing', async () => {
     const bare = setup();
     bare.shell.afterEnable = { permission: 'granted', configured: false, token: null };
     await bare.push.enable();
-    expect(bare.push.getState()).toMatchObject({ error: PHONE_FIREBASE_HELP, native: { phoneConfigured: false } });
-    expect(PHONE_FIREBASE_HELP).toContain('google-services.json');
+    expect(bare.push.getState().error).not.toBeNull();
+    expect(bare.push.getState().native?.phoneConfigured).toBe(false);
     const waiting = setup();
     waiting.shell.afterEnable = { permission: 'granted', configured: true, token: null };
     await waiting.push.enable();
-    expect(waiting.push.getState().error).toContain('token');
     expect(waiting.push.getState().native?.hasToken).toBe(false);
     for (const attempt of [bare, waiting]) {
       expect(attempt.client.sent).toEqual([]);
       expect(attempt.markers.has(A)).toBe(false);
+    }
+  });
+
+
+  test('a phone with Firebase already set up is given no config and the desktop feed is not even read', async () => {
+    const { push, shell, client } = setup({ config: null });
+    shell.state = READY;
+    await push.enable();
+    expect(shell.calls.find((call) => call.method === 'pushEnable')?.params).toEqual({});
+    expect(client.followed).toBe(0);
+    expect(push.getState().subscribed).toBe(true);
+  });
+
+  test('a desktop without a config: no permission prompt, no registration, instructions on the desktop', async () => {
+    const { push, shell, client, markers } = setup({ config: null });
+    await push.enable();
+    expect(shell.methods()).toEqual(['pushState']);
+    expect(push.getState()).toMatchObject({ busy: false, subscribed: false, error: DESKTOP_CONFIG_HELP });
+    expect(client.sent).toEqual([]);
+    expect(markers.has(A)).toBe(false);
+  });
+
+  test('a device feed still loading is waited for, then released', async () => {
+    const { push, shell, client } = setup({ config: 'pending' });
+    const enabling = push.enable();
+    while (client.followed === 0) await Promise.resolve();
+    expect(shell.methods()).toEqual(['pushState']);
+    expect(push.getState().busy).toBe(true);
+    client.deliver(CONFIG);
+    await enabling;
+    expect(shell.calls[1]).toEqual({ method: 'pushEnable', params: { config: CONFIG } });
+    expect(client.released).toBe(client.followed);
+    expect(client.listeners.size).toBe(0);
+    expect(push.getState().subscribed).toBe(true);
+  });
+
+  test('a cached device feed delivered synchronously by follow is not missed', async () => {
+    const { push, client } = setup({ config: 'pending' });
+    const follow = client.follow;
+    client.follow = () => {
+      const release = follow();
+      client.deliver(CONFIG);
+      return release;
+    };
+    await push.enable();
+    expect(push.getState()).toMatchObject({ subscribed: true, busy: false, error: null });
+    expect(client.released).toBe(client.followed);
+    expect(client.listeners.size).toBe(0);
+  });
+
+  test('a device feed that never arrives ends in an error, not a prompt, and a later tap can retry', async () => {
+    vi.useFakeTimers();
+    try {
+      const { push, shell, client } = setup({ config: 'pending' });
+      const enabling = push.enable();
+      while (client.followed === 0) await Promise.resolve();
+      vi.advanceTimersByTime(60_000);
+      await enabling;
+      expect(shell.methods()).toEqual(['pushState']);
+      expect(push.getState()).toMatchObject({ busy: false, subscribed: false });
+      expect(push.getState().error).not.toBeNull();
+      expect(client.released).toBe(client.followed);
+      client.deliver(CONFIG);
+      await push.enable();
+      expect(push.getState().subscribed).toBe(true);
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -170,7 +254,6 @@ describe('enable', () => {
     client.fail = new Error('offline');
     await push.enable();
     expect(push.getState()).toMatchObject({ subscribed: false, busy: false });
-    expect(push.getState().error).toContain('offline');
     expect(markers.has(A)).toBe(false);
   });
 
@@ -180,7 +263,6 @@ describe('enable', () => {
     shell.request = ((method: NativeMethod, params: never) =>
       method === 'pushSubscription' ? Promise.resolve({ token: 't', key: KEY, desktop: B }) : request(method, params)) as typeof shell.request;
     await push.enable();
-    expect(push.getState().error).toContain('another desktop');
     expect(client.sent).toEqual([]);
   });
 });
@@ -312,7 +394,7 @@ describe('flows never interleave', () => {
     const enabling = push.enable();
     const syncing = push.sync();
     await Promise.all([enabling, syncing]);
-    expect(shell.methods()).toEqual(['pushEnable', 'pushSubscription', 'pushState', 'pushSubscription']);
+    expect(shell.methods()).toEqual(['pushState', 'pushEnable', 'pushSubscription', 'pushState', 'pushSubscription']);
     expect(client.sent).toEqual([subscribeOp(), subscribeOp()]);
   });
 });

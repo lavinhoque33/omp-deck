@@ -15,14 +15,24 @@
 
 import type { api } from '../remote/index.ts';
 import type { PushClientLike, PushControllerLike, PushState } from './push-client.ts';
-import { hasS4 } from './client.ts';
+import { feedKey, hasS4 } from './client.ts';
 import type { NativeHost, NativePushState } from './native.ts';
 import { FEATURE_ANDROID_PUSH } from '../remote/api.ts';
 
 export const DESKTOP_SENDER_HELP =
   'This desktop cannot send Android notifications yet: Firebase Cloud Messaging is not set up there. On the desktop, put your Firebase project’s service-account JSON in OmpDeck’s secrets folder as fcm-service-account.json (or point OMP_DECK_FCM_CREDENTIALS at it), restart OmpDeck, then turn push on again.';
-export const PHONE_FIREBASE_HELP =
-  'Firebase is not set up on this phone. Turn push on and choose your Firebase project’s google-services.json (Android app io.github.lavinhoque33.ompdeck) when Android asks.';
+export const DESKTOP_CONFIG_HELP =
+  'This desktop has no Android app configuration to give this phone. On the desktop, put your Firebase project’s google-services.json (Android app io.github.lavinhoque33.ompdeck) in OmpDeck’s secrets folder (or point OMP_DECK_FCM_ANDROID_CONFIG at it), then restart the OmpDeck gateway (update OmpDeck on the desktop if it is older) and turn push on again.';
+
+/** How long a tap waits for the desktop's device feed when it has not arrived yet. */
+const FEED_WAIT_MS = 10_000;
+
+/** What the native controller needs of the app's client: requests, the welcome, and the device feed. */
+export interface NativePushClient extends PushClientLike {
+  getState(): { welcome: api.Welcome | null; feeds: ReadonlyMap<string, api.FeedValue> };
+  follow(feed: api.Feed): (() => void) | null;
+  subscribeState(listener: () => void): () => void;
+}
 
 /** What the native controller reads of the shell (`NativeHost.request`; a seam for tests). */
 export type NativePushHost = Pick<NativeHost, 'request'>;
@@ -84,7 +94,8 @@ export function advertisesAndroidPush(welcome: api.Welcome | null): boolean {
 
 /** Native push for one desktop (see the module comment). */
 export class NativePushController implements PushControllerLike {
-  readonly #client: PushClientLike;
+  readonly #client: NativePushClient;
+  readonly #feedWaitMs: number;
   readonly #host: NativePushHost;
   readonly #desktop: NativePushDesktop;
   readonly #markers: PushMarkers;
@@ -95,7 +106,8 @@ export class NativePushController implements PushControllerLike {
   #chain: Promise<unknown> = Promise.resolve();
   #state: PushState;
 
-  constructor(client: PushClientLike, host: NativePushHost, desktop: NativePushDesktop, markers: PushMarkers) {
+  constructor(client: NativePushClient, host: NativePushHost, desktop: NativePushDesktop, markers: PushMarkers, feedWaitMs: number = FEED_WAIT_MS) {
+    this.#feedWaitMs = feedWaitMs;
     this.#client = client;
     this.#host = host;
     this.#desktop = desktop;
@@ -186,6 +198,41 @@ export class NativePushController implements PushControllerLike {
     });
   }
 
+  /**
+   * The desktop's public google-services.json from its device feed. The feed may still be loading
+   * (a fresh connection): it is followed for the wait and released. `null`: the desktop has none.
+   */
+  async #desktopConfig(): Promise<string | null> {
+    const read = (): api.PushStateView | null => {
+      const value = this.#client.getState().feeds.get(feedKey({ feed: 'device' }));
+      return value?.feed === 'device' ? value.push : null;
+    };
+    let push = read();
+    if (push === null) {
+      const release = this.#client.follow({ feed: 'device' });
+      if (release === null) throw new Error('the app cannot follow another feed to read the desktop’s setup');
+      try {
+        const { promise, resolve, reject } = Promise.withResolvers<api.PushStateView>();
+        const timer = setTimeout(() => reject(new Error('the desktop has not sent its notification setup yet; check the connection and try again')), this.#feedWaitMs);
+        const stop = this.#client.subscribeState(() => {
+          const now = read();
+          if (now !== null) resolve(now);
+        });
+        const available = read();
+        if (available !== null) resolve(available);
+        try {
+          push = await promise;
+        } finally {
+          clearTimeout(timer);
+          stop();
+        }
+      } finally {
+        release();
+      }
+    }
+    return push.android_config ?? null;
+  }
+
   enable(): Promise<void> {
     // Queued behind any running sync: flows never interleave.
     return this.#run(async () => {
@@ -200,8 +247,19 @@ export class NativePushController implements PushControllerLike {
       }
       this.#set({ busy: true, error: null });
       try {
-        // The permission prompt and the google-services.json picker run inside this call.
-        const state = await this.#host.request('pushEnable', {});
+        // A phone with Firebase already set up is never given (or reset to) a config.
+        const current = await this.#read();
+        let params: { config?: string } = {};
+        if (!current.configured) {
+          const config = await this.#desktopConfig();
+          if (config === null) {
+            this.#set({ busy: false, error: DESKTOP_CONFIG_HELP });
+            return;
+          }
+          params = { config };
+        }
+        // The notification permission prompt runs inside this call.
+        const state = await this.#host.request('pushEnable', params);
         this.#native = state;
         if (state.permission !== 'granted') {
           this.#set({
@@ -211,7 +269,7 @@ export class NativePushController implements PushControllerLike {
           return;
         }
         if (!state.configured) {
-          this.#set({ busy: false, error: PHONE_FIREBASE_HELP });
+          this.#set({ busy: false, error: 'Android did not accept the desktop’s Firebase setup. Update OmpDeck on the desktop and try again.' });
           return;
         }
         if (state.token === null) {

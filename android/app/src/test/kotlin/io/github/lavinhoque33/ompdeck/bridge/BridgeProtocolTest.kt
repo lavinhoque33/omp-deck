@@ -130,6 +130,19 @@ class BridgeProtocolTest {
     }
 
     @Test
+    fun enableParamsAcceptOnlyABoundedConfigString() {
+        assertNull(BridgeProtocol.enableParams(JSONObject("{}")))
+        assertEquals("{\"a\":1}", BridgeProtocol.enableParams(JSONObject().put("config", "{\"a\":1}")))
+        assertEquals("bad_params", failure { BridgeProtocol.enableParams(JSONObject("""{"config":null}""")) })
+        assertEquals("bad_params", failure { BridgeProtocol.enableParams(JSONObject("""{"config":{"a":1}}""")) })
+        assertEquals("bad_params", failure { BridgeProtocol.enableParams(JSONObject("""{"config":"  "}""")) })
+        assertEquals("bad_params", failure { BridgeProtocol.enableParams(JSONObject("""{"config":"{}","extra":1}""")) })
+        assertEquals("bad_params", failure { BridgeProtocol.enableParams(JSONObject("""{"other":"{}"}""")) })
+        val big = "x".repeat(BridgeProtocol.MAX_CONFIG_CHARS + 1)
+        assertEquals("bad_params", failure { BridgeProtocol.enableParams(JSONObject().put("config", big)) })
+    }
+
+    @Test
     fun saveFileNamesAndMimeTypesAreSanitized() {
         fun save(name: String, mime: String) = BridgeProtocol.saveParams(JSONObject().put("name", name).put("mime", mime).put("data", ""))
         assertEquals("report.txt", save("report.txt", "text/plain").name)

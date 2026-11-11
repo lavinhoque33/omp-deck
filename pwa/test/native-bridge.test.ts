@@ -4,6 +4,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import {
+  MAX_FIREBASE_CONFIG_CHARS,
   MAX_SAVE_BYTES,
   NativeError,
   type NativeClock,
@@ -204,6 +205,17 @@ describe('params are checked before anything is posted', () => {
       { desktop: A, visible: true },
     ]);
     await invalid(host.request('setPresence', { desktop: A, visible: 'yes' as unknown as boolean }), new FakeShell());
+  });
+
+  test('pushEnable takes nothing or one bounded Firebase config string, never anything else', async () => {
+    const { shell, host } = setup();
+    await invalid(host.request('pushEnable', { config: '  \n' }), shell);
+    await invalid(host.request('pushEnable', { config: 'x'.repeat(MAX_FIREBASE_CONFIG_CHARS + 1) }), shell);
+    await invalid(host.request('pushEnable', { config: 7 as unknown as string }), shell);
+    await invalid(host.request('pushEnable', { path: '/x' } as never), shell);
+    void host.request('pushEnable', {});
+    void host.request('pushEnable', { config: '{"client":[]}' });
+    expect(shell.sent.map((entry) => entry.params)).toEqual([{}, { config: '{"client":[]}' }]);
   });
 
   test('saveFile needs a name and standard base64 within the size limit', async () => {

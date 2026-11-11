@@ -7,7 +7,7 @@ import { usePush } from '../../push-client.ts';
 import { useNav } from '../../nav.ts';
 import { useFeed, useOnline } from '../../ui/hooks.ts';
 import { Card, KeyValues, NeedsS4 } from '../../ui/kit.tsx';
-import { DESKTOP_SENDER_HELP, PHONE_FIREBASE_HELP } from '../../native-push.ts';
+import { DESKTOP_CONFIG_HELP, DESKTOP_SENDER_HELP } from '../../native-push.ts';
 import { SectionScreen, ToggleRow } from './common.tsx';
 import { when } from './logic.ts';
 
@@ -64,9 +64,9 @@ function NotificationsBody(): ReactNode {
           </span>
         </div>
       )}
-      {push.native !== null && push.native.desktopSender && !push.native.phoneConfigured && (
+      {push.native !== null && push.native.desktopSender && !push.native.phoneConfigured && state !== null && state.android_config === undefined && push.error !== DESKTOP_CONFIG_HELP && (
         <div className="banner warn" role="note">
-          <span className="grow">{PHONE_FIREBASE_HELP}</span>
+          <span className="grow">{DESKTOP_CONFIG_HELP}</span>
         </div>
       )}
       {blocked && (
@@ -92,7 +92,7 @@ function NotificationsBody(): ReactNode {
               ? 'This phone is notified while the app is closed or in the background.'
               : push.native === null
                 ? 'Asks for permission when you turn it on. Nothing is pushed while the app is open on screen.'
-                : 'Asks for notification permission, and for your Firebase google-services.json the first time. Nothing is pushed while the app is open on screen.'
+                : 'Asks for notification permission when you turn it on; this phone gets its Firebase setup from your desktop. Nothing is pushed while the app is open on screen.'
           }
           on={on}
           disabled={!canToggle}

@@ -1188,6 +1188,8 @@ export interface PushStateView {
   subscribed: boolean;
   prefs: PushPrefs;
   since_unix_ms: number | null;
+  /** The desktop's public Android google-services.json (sanitized); absent when it has none. */
+  android_config?: string;
 }
 
 export type GatewayMode = 'off' | 'while_open' | 'background';
@@ -1950,7 +1952,7 @@ const appUpdateView = struct<AppUpdateView>({
     failed: { message: str },
   }),
 });
-const pushStateView = struct<PushStateView>({ subscribed: bool, prefs: pushPrefs, since_unix_ms: nullable(u64) });
+const pushStateView = struct<PushStateView>({ subscribed: bool, prefs: pushPrefs, since_unix_ms: nullable(u64), android_config: optional(str) });
 const gatewayMode = oneOf<GatewayMode>(['off', 'while_open', 'background']);
 const treeNode = struct<TreeNode>({
   id: str,

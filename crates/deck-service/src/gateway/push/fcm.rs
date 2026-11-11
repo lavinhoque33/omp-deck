@@ -237,6 +237,11 @@ impl Config {
         }
     }
 
+    /// The validated private sender's Firebase project, used to match public Android options.
+    pub(super) fn project(&self) -> &str {
+        self.credentials.project()
+    }
+
     #[cfg(test)]
     pub(crate) fn with_endpoints(credentials: Credentials, endpoints: Endpoints) -> Config {
         Config {

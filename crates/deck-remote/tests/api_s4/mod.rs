@@ -1168,6 +1168,7 @@ pub fn device() -> FeedValue {
             subscribed: true,
             prefs: PushPrefs::default(),
             since_unix_ms: Some(AT),
+            android_config: None,
         },
         gateway_version: s("0.9.0"),
         mode: GatewayMode::Background,

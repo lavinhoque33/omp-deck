@@ -20,6 +20,7 @@ import {
   MAX_TRANSFER_CHUNK_B64,
   MAX_TREE_LIMIT,
   type Op,
+  type PushStateView,
   opAllowed,
   opClass,
   opJournaled,
@@ -204,6 +205,24 @@ describe('slice-4 gateway messages validate', () => {
         reset: true,
       },
     });
+  });
+
+  test('the device feed carries the desktop’s Android config only when present; absent stays absent, and an unknown sibling is ignored', () => {
+    const device = (extra: string): PushStateView => {
+      const event = decodeEvent(
+        utf8(
+          '{"type":"feed","feed":{"feed":"device"},"value":{"feed":"device","name":"n","permissions":{"control":true,"manage":true},' +
+            `"push":{"subscribed":false,"prefs":{"turn_finished":true,"attention":true,"ended":true,"show_titles":false},"since_unix_ms":null${extra}},` +
+            '"gateway_version":"1","mode":"background"}}',
+        ),
+      );
+      if (event.type !== 'feed' || event.value.feed !== 'device') throw new Error('not a device feed');
+      return event.value.push;
+    };
+    expect(device('')).not.toHaveProperty('android_config');
+    expect(device(',"android_config":"{\\"client\\":[]}"').android_config).toBe('{"client":[]}');
+    expect(device(',"future_field":7')).not.toHaveProperty('future_field');
+    expect(() => device(',"android_config":7')).toThrow(ApiDecodeError);
   });
 
   test('malformed slice-4 values are refused', () => {

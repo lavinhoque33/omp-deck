@@ -1605,7 +1605,7 @@ impl Engine {
                     value: FeedValue::Device {
                         name: d.name.clone(),
                         permissions: super::api_permissions(d.permissions),
-                        push: push::state_view(d),
+                        push: push::state_view(d, self.notify.push.android_config()),
                         gateway_version: crate::gateway::GATEWAY_VERSION.to_owned(),
                         mode: views::gateway_mode(self.cfg.gateway_mode),
                     },
