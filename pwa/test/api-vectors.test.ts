@@ -82,6 +82,9 @@ const androidRequests: string[] = (
 ).messages
   .filter((m) => m.type === 'request')
   .map((m) => m.json);
+const modelVectors: Pick<ApiVectors, 'messages' | 'rejected_requests'> = JSON.parse(
+  readFileSync(new URL('../../crates/deck-remote/tests/vectors/api-models.json', import.meta.url), 'utf8'),
+);
 
 function toRecord(v: VectorRecord): AppRecord {
   const json = utf8(v.json ?? '');
@@ -145,7 +148,7 @@ describe('records', () => {
 });
 
 function messages(type: ApiVectors['messages'][number]['type']): ApiVectors['messages'] {
-  return vectors.messages.filter((m) => m.type === type);
+  return [...vectors.messages, ...modelVectors.messages].filter((m) => m.type === type);
 }
 
 describe('requests encode canonically', () => {
@@ -163,10 +166,18 @@ describe('requests encode canonically', () => {
     });
   }
 
-  test('every op is covered (with api-s4.json and api-android.json)', () => {
+  test('every op is covered by the shared vectors', () => {
     const parsed: Request[] = [...requests.map((m) => m.json), ...s4Requests, ...androidRequests].map((json) => JSON.parse(json));
     const covered = new Set(parsed.map((request) => request.op.op));
-    expect([...covered].sort()).toEqual([...OP_NAMES].sort());
+    expect([...covered].sort()).toEqual(OP_NAMES.slice().sort());
+  });
+
+  test('model preference writes require Control permission', () => {
+    for (const vector of modelVectors.messages.filter((m) => m.type === 'request')) {
+      const request: Request = JSON.parse(vector.json);
+      expect(opClass(request.op)).toBe('control');
+      expect(opAllowed(request.op, { control: false, manage: false })).toBe(false);
+    }
   });
 
   test('absent optionals are written as null, fields in Rust order', () => {

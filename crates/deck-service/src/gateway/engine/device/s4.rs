@@ -263,6 +263,8 @@ pub(super) fn s4_op(op: &Op) -> bool {
             | Op::DeleteSessions { .. }
             | Op::CopySession { .. }
             | Op::MoveSession { .. }
+            | Op::ModelFavorite { .. }
+            | Op::ModelProvider { .. }
     )
 }
 

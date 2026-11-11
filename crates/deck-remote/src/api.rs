@@ -187,6 +187,8 @@ pub const MAX_FORM_COLUMNS: usize = 10;
 pub const MAX_FORM_SPANS: usize = 64;
 /// Dir tokens a device holds at most (its oldest are forgotten first).
 pub const MAX_DIR_TOKENS: usize = 4096;
+/// [`Op::ModelFavorite`] selector and [`Op::ModelProvider`] provider: `1..=MAX_MODEL_PREF` bytes.
+pub const MAX_MODEL_PREF: usize = 512;
 /// [`TreeNode::text`] characters at most.
 pub const TREE_TEXT_CHARS: usize = 200;
 
@@ -1458,6 +1460,21 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         excluded: Vec<String>,
     },
+    // ---- model picker preferences ----
+    /// Sets the explicit desired favorite state of the model `selector` in the shared desktop
+    /// preferences (idempotent; not a toggle); the result shows in the `favorites` of the next [`Resp::Models`].
+    ModelFavorite {
+        selector: String,
+        favorite: bool,
+    },
+    /// Sets the shared provider filter of the model picker (`None`: all providers).
+    ModelProvider {
+        provider: Option<String>,
+    },
+}
+
+fn model_pref_ok(text: &str) -> bool {
+    (1..=MAX_MODEL_PREF).contains(&text.len())
 }
 
 impl Op {
@@ -1549,6 +1566,8 @@ impl Op {
         "sync_delete",
         "sync_restore_prepare",
         "sync_restore_apply",
+        "model_favorite",
+        "model_provider",
     ];
 
     pub fn name(&self) -> &'static str {
@@ -1639,6 +1658,8 @@ impl Op {
             Op::SyncDelete { .. } => "sync_delete",
             Op::SyncRestorePrepare { .. } => "sync_restore_prepare",
             Op::SyncRestoreApply { .. } => "sync_restore_apply",
+            Op::ModelFavorite { .. } => "model_favorite",
+            Op::ModelProvider { .. } => "model_provider",
         }
     }
 
@@ -1711,7 +1732,9 @@ impl Op {
             | Op::BackupRun {}
             | Op::SyncBackup { .. }
             | Op::OpenOnDesktop { .. }
-            | Op::CloseOnDesktop { .. } => Class::Control,
+            | Op::CloseOnDesktop { .. }
+            | Op::ModelFavorite { .. }
+            | Op::ModelProvider { .. } => Class::Control,
             Op::DeleteSessions { .. }
             | Op::CopySession { .. }
             | Op::MoveSession { .. }
@@ -1752,8 +1775,9 @@ impl Op {
 
     /// The parameter bounds (answered `bad_request` when broken): [`Feed::check`] of a
     /// subscription, [`Op::Tree`] `limit` `1..=`[`MAX_TREE_LIMIT`], [`Op::UsageActivity`]
-    /// `days` `1..=`[`MAX_ACTIVITY_DAYS`] and [`Op::UploadChunk`] `data` at most
-    /// [`MAX_TRANSFER_CHUNK_B64`] characters.
+    /// `days` `1..=`[`MAX_ACTIVITY_DAYS`], [`Op::UploadChunk`] `data` at most
+    /// [`MAX_TRANSFER_CHUNK_B64`] characters, and the [`Op::ModelFavorite`] selector and
+    /// [`Op::ModelProvider`] provider (when present) `1..=`[`MAX_MODEL_PREF`] bytes.
     pub fn check(&self) -> Result<(), String> {
         match self {
             Op::Subscribe { feed } | Op::Unsubscribe { feed } => feed.check(),
@@ -1766,6 +1790,14 @@ impl Op {
             Op::UploadChunk { data, .. } if data.len() > MAX_TRANSFER_CHUNK_B64 => Err(format!(
                 "an upload chunk carries at most {MAX_TRANSFER_CHUNK} bytes"
             )),
+            Op::ModelFavorite { selector, .. } if !model_pref_ok(selector) => {
+                Err(format!("a model selector is 1..={MAX_MODEL_PREF} bytes"))
+            }
+            Op::ModelProvider {
+                provider: Some(provider),
+            } if !model_pref_ok(provider) => {
+                Err(format!("a model provider is 1..={MAX_MODEL_PREF} bytes"))
+            }
             _ => Ok(()),
         }
     }
@@ -2345,9 +2377,18 @@ pub enum Resp {
         outcome: OutcomeView,
     },
     /// `truncated` when the catalogue did not fit one message.
+    ///
+    /// `favorites` (omitted when empty): the shared favorite selectors in starring order, kept
+    /// even when no model matches (the picker shows those as unavailable); `provider`
+    /// (omitted when absent): the shared provider filter, `None` = all providers. `models` are
+    /// grouped by case-insensitive provider, each group in `deck_core::model_order::order`.
     Models {
         models: Vec<Model>,
         truncated: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        favorites: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     Diff {
         diff: Diff,

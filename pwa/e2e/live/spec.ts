@@ -32,6 +32,7 @@ interface Message {
 
 interface ModelRequest {
   index: number;
+  model: string;
   tools: boolean;
   last_user: string;
   images: string[];
@@ -320,6 +321,7 @@ export async function runLive(stack: Stack): Promise<LiveRun> {
 }
 
 async function steps(live: LiveRun, stack: Stack, page: Page): Promise<void> {
+  const modelsOnly = process.argv.includes('--models');
   // -- pair --
   await page.goto(stack.link);
   await page.getByRole('button', { name: 'Pair this phone' }).waitFor();
@@ -361,28 +363,30 @@ async function steps(live: LiveRun, stack: Stack, page: Page): Promise<void> {
   await live.shot('03-sessions');
   live.note('sessions', `project ${stack.project} listed with its seeded session “Seeded”`);
 
-  // -- push: enable (real push service first, then the stubbed one) --
-  await notificationsScreen(page);
-  const probe = await probeRealPush(page);
-  if (probe.ok) {
-    // The real push service answered: the desktop must accept its endpoint (SSRF guard).
+  if (!modelsOnly) {
+    // -- push: enable (real push service first, then the stubbed one) --
+    await notificationsScreen(page);
+    const probe = await probeRealPush(page);
+    if (probe.ok) {
+      // The real push service answered: the desktop must accept its endpoint (SSRF guard).
+      await setPush(page, true);
+      await live.devicePush(phoneFingerprint, true);
+      live.note('push (real)', `pushManager.subscribe → ${new URL(probe.endpoint).host}; the desktop accepted it`);
+      await setPush(page, false);
+    } else {
+      live.note('push (real)', `headless Chromium cannot subscribe to the real push service (${probe.error}); stubbing PushManager`);
+    }
+    const subscription = await live.ctl<Subscription>('/push-subscription');
+    await stubPush(page, subscription);
     await setPush(page, true);
     await live.devicePush(phoneFingerprint, true);
-    live.note('push (real)', `pushManager.subscribe → ${new URL(probe.endpoint).host}; the desktop accepted it`);
-    await setPush(page, false);
-  } else {
-    live.note('push (real)', `headless Chromium cannot subscribe to the real push service (${probe.error}); stubbing PushManager`);
-  }
-  const subscription = await live.ctl<Subscription>('/push-subscription');
-  await stubPush(page, subscription);
-  await setPush(page, true);
-  await live.devicePush(phoneFingerprint, true);
-  await live.shot('04-push-on');
-  live.note('push (subscribe)', `stubbed subscription to ${subscription.endpoint} sent; the desktop reports the device subscribed`);
+    await live.shot('04-push-on');
+    live.note('push (subscribe)', `stubbed subscription to ${subscription.endpoint} sent; the desktop reports the device subscribed`);
 
+    await page.getByRole('button', { name: 'Back' }).click();
+    await page.getByRole('navigation', { name: 'Main' }).getByRole('button', { name: /Sessions/ }).click();
+  }
   // -- prompt: a new session in the fixture project --
-  await page.getByRole('button', { name: 'Back' }).click();
-  await page.getByRole('navigation', { name: 'Main' }).getByRole('button', { name: /Sessions/ }).click();
   await page.getByRole('button', { name: `New session in ${stack.project}` }).click();
   // While omp starts the composer offers Insert only; Send appears once omp is idle.
   const sawStarting = await page
@@ -394,6 +398,109 @@ async function steps(live: LiveRun, stack: Stack, page: Page): Promise<void> {
     );
   if (sawStarting) await live.shot('05a-starting');
   await live.idle();
+  const modelCard = page.getByRole('button', { name: 'Model and effort' });
+  await modelCard.filter({ hasText: 'fake-1' }).waitFor({ timeout: STEP });
+  assert((await live.requests(0)).count === 0, 'the initial model must be known before the first prompt');
+  live.note('initial model', 'fake-1 shown before any model request, without a desktop view');
+
+  const switchModel = async (name: string, id: string): Promise<void> => {
+    await modelCard.click();
+    await page.locator('.option-list[aria-busy="false"]').waitFor();
+    await page.locator('[role="group"][aria-label="fake"] button.option', { hasText: name }).click();
+    await page.locator('.sheet').waitFor({ state: 'detached' });
+    await modelCard.filter({ hasText: id }).waitFor({ timeout: STEP });
+  };
+  await switchModel('Fake Two', 'fake-2');
+  live.note('mobile-only switch', 'model card updated to fake-2 before the first prompt');
+
+  // -- picker: provider dropdown, groups, order, shared favorites --
+  interface Prefs {
+    favorites: string[];
+    provider: string | null;
+  }
+  const prefs = (): Promise<Prefs> => live.ctl<Prefs>('/model-preferences');
+  const setPrefs = (next: Prefs): Promise<Prefs> => live.ctl<Prefs>('/model-preferences', { method: 'POST', body: JSON.stringify(next) });
+  const sheet = page.getByRole('dialog');
+  const names = (scope: string): Promise<string[]> =>
+    sheet.locator(`${scope} button.option`).evaluateAll((rows) => rows.map((row) => (row.querySelector('.grow')?.firstChild?.textContent ?? '').trim()));
+  const eventually = async (what: string, f: () => Promise<boolean>): Promise<void> => {
+    const end = Date.now() + STEP;
+    while (!(await f())) {
+      assert(Date.now() < end, `timed out: ${what}`);
+      await page.waitForTimeout(100);
+    }
+  };
+  const openPicker = async (): Promise<void> => {
+    await modelCard.click();
+    await sheet.getByLabel('Provider').waitFor();
+    await sheet.getByText('Loading models…').waitFor({ state: 'detached' });
+    await sheet.locator('.option-list[aria-busy="false"]').waitFor();
+  };
+  const closePicker = async (): Promise<void> => {
+    await page.keyboard.press('Escape');
+    await sheet.waitFor({ state: 'detached' });
+  };
+  await setPrefs({ favorites: [], provider: null });
+  const requestsBefore = (await live.requests(0)).count;
+  await openPicker();
+  const provider = sheet.getByLabel('Provider');
+  assert(
+    JSON.stringify(await provider.locator('option').allTextContents()) === JSON.stringify(['All providers (4)', 'fake (3)', 'other (1)']),
+    'provider dropdown lists All providers and each provider with its count',
+  );
+  assert(JSON.stringify(await names('[role="group"][aria-label="fake"]')) === JSON.stringify(['Fake Ten', 'Fake Two', 'Fake One']), 'fake group is newest first');
+  assert(JSON.stringify(await names('[role="group"][aria-label="other"]')) === JSON.stringify(['Other One']), 'other group');
+  await live.shot('05a-model-picker');
+
+  // Starring never switches the model or closes the sheet; favorites lead in starring order.
+  await sheet.getByRole('button', { name: 'Star Other One', exact: true }).click();
+  await sheet.getByRole('button', { name: 'Unstar Other One', exact: true }).first().waitFor({ timeout: STEP });
+  await sheet.getByRole('button', { name: 'Star Fake One', exact: true }).click();
+  await eventually('favorites in starring order', async () => JSON.stringify(await names('[role="group"][aria-label="Favorites"]')) === JSON.stringify(['Other One', 'Fake One']));
+  assert(await sheet.isVisible(), 'starring keeps the sheet open');
+  assert(JSON.stringify((await prefs()).favorites) === JSON.stringify(['other/other-1', 'fake/fake-1']), 'stars reached the shared desktop settings in order');
+  assert((await live.requests(0)).count === requestsBefore, 'starring made no model request');
+  await modelCard.filter({ hasText: 'fake-2' }).waitFor({ timeout: STEP });
+  // A favorite no longer in the catalog stays visible, disabled, and can be unstarred.
+  await closePicker();
+  await setPrefs({ favorites: ['other/other-1', 'gone/missing-model', 'fake/fake-1'], provider: null });
+  await openPicker();
+  assert(
+    JSON.stringify(await names('[role="group"][aria-label="Favorites"]')) === JSON.stringify(['Other One', 'gone/missing-model', 'Fake One']),
+    'desktop-side favorites appear on reopen in order, the missing one included',
+  );
+  const missing = sheet.locator('[role="group"][aria-label="Favorites"] button.option', { hasText: 'Not available now' });
+  assert(await missing.isDisabled(), 'an unavailable favorite cannot be selected');
+  await sheet.getByRole('button', { name: 'Unstar gone/missing-model', exact: true }).click();
+  await eventually('unavailable favorite removed', async () => (await prefs()).favorites.join(',') === 'other/other-1,fake/fake-1');
+  // Provider filter: saved on the desktop, search ANDs words, unknown provider reads as All.
+  await provider.selectOption('other');
+  await eventually('provider saved', async () => (await prefs()).provider === 'other');
+  await sheet.locator('[role="group"][aria-label="fake"]').waitFor({ state: 'detached' });
+  await closePicker();
+  await openPicker();
+  assert((await provider.inputValue()) === 'other', 'the provider filter persists across reopening');
+  await closePicker();
+  await setPrefs({ favorites: ['other/other-1', 'fake/fake-1'], provider: 'vanished' });
+  await openPicker();
+  assert((await provider.inputValue()) === '', 'an unknown saved provider shows All providers');
+  await sheet.getByPlaceholder('Filter models').fill('fake ten');
+  await eventually('search narrows', async () => JSON.stringify(await names('[role="group"][aria-label="fake"]')) === JSON.stringify(['Fake Ten']));
+  await sheet.getByPlaceholder('Filter models').fill('');
+  await closePicker();
+  await setPrefs({ favorites: [], provider: null });
+  assert((await live.requests(0)).count === requestsBefore, 'no preference step made a model request');
+  live.note('model picker', 'provider list/groups/newest-first order, stars (incl. unavailable), shared persistence and no accidental switch verified');
+  await switchModel('Fake One', 'fake-1');
+  await switchModel('Fake Two', 'fake-2');
+  await live.ctl('/desktop-view', { method: 'POST', body: 'true' });
+  await page.getByText('Desktop has control', { exact: true }).waitFor();
+  await switchModel('Fake One', 'fake-1');
+  await switchModel('Fake Two', 'fake-2');
+  await live.ctl('/desktop-view', { method: 'POST', body: 'true' });
+  await modelCard.filter({ hasText: 'fake-2' }).waitFor({ timeout: STEP });
+  await live.shot('05b-model-desktop-open');
+  live.note('desktop-open switch', 'real controlling desktop frontend attached; phone model card followed both changes');
   live.note('new session', `${sawStarting ? 'composer showed “omp is starting…” (Insert only), then ' : ''}Send once omp was idle`);
   let seen = (await live.requests(0)).count;
   await live.send('PROMPT-MARK hello from the phone');
@@ -401,6 +508,15 @@ async function steps(live: LiveRun, stack: Stack, page: Page): Promise<void> {
   await live.idle();
   await live.shot('05-prompt-reply');
   live.note('prompt', `transcript shows “${reply}”`);
+  const switched = await live.modelRequest(seen, 'the selected model', (request) => request.tools && request.last_user.includes('PROMPT-MARK'));
+  assert(switched.model === 'fake-2', `model selection did not apply: request used ${switched.model}`);
+  live.note('model applied', `omp sent the prompt to ${switched.model}, not just a changed label`);
+  await live.ctl('/desktop-view', { method: 'POST', body: 'false' });
+  if (modelsOnly) {
+    assert(live.csp.length === 0, `CSP violations: ${live.csp.join(' | ')}`);
+    assert(live.errors.length === 0, `console/page errors: ${live.errors.join(' | ')}`);
+    return;
+  }
 
   // -- ask (omp 18.18: one HTML form, `<p>Pick a color?</p>` over radios red/blue named `color`) --
   seen = (await live.requests(0)).count;

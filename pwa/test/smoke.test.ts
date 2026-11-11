@@ -171,6 +171,26 @@ describe('smoke gateway', () => {
     expect(results.sort()).toEqual((['answered', 'deleted', 'killed', 'restore_plan', 'restore_plan', 'session', 'submitted'] as const).toSorted());
   });
 
+  test('model preferences are explicit desired state, kept in starring order, and read back with the catalog', async () => {
+    const { recorder, send } = setup();
+    const ops: api.Op[] = [
+      { op: 'model_favorite', selector: 'openai/gpt-5.1', favorite: true },
+      { op: 'model_favorite', selector: 'google/gemini-3-pro', favorite: true },
+      { op: 'model_favorite', selector: 'openai/gpt-5.1', favorite: true },
+      { op: 'model_favorite', selector: 'gone/missing', favorite: false },
+      { op: 'model_provider', provider: 'google' },
+    ];
+    ops.forEach((op, index) => send(op, 200 + index));
+    await recorder.until(() => recorder.events.filter((event) => event.type === 'outcome').length >= ops.length);
+    const models = send({ op: 'models' });
+    await recorder.until(() => recorder.replies.some((reply) => reply.id === models));
+    const reply = recorder.reply(models);
+    if (!('ok' in reply) || reply.ok.type !== 'models') throw new Error('no models');
+    expect(reply.ok.favorites).toEqual(['openai/gpt-5.1', 'google/gemini-3-pro']);
+    expect(reply.ok.provider).toBe('google');
+    expect(reply.ok.models.map((model) => model.provider)).toEqual(['anthropic', 'anthropic', 'anthropic', 'google', 'openai']);
+  });
+
   test('an old desktop refuses s4 ops as unsupported', async () => {
     const { recorder, send } = setup(false);
     const id = send({ op: 'omp_settings' });

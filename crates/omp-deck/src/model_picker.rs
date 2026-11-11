@@ -291,7 +291,7 @@ fn role_hits(roles: &[RoleEntry], words: &[String], provider: Option<&str>) -> V
 }
 
 /// Favorites first (in the order they were starred), then provider groups alphabetical with the
-/// newest model first ([`crate::model_order`]). `provider` limits the list to one provider.
+/// newest model first ([`deck_core::model_order`]). `provider` limits the list to one provider.
 /// Favorites obey the provider filter and the search; groups without a match are omitted.
 pub fn build_rows(
     models: &[ModelInfo],
@@ -365,7 +365,7 @@ pub fn build_rows_with_roles(
             .iter()
             .map(|&i| (models[i].id.as_str(), models[i].name.as_str()))
             .collect();
-        let shown: Vec<usize> = crate::model_order::order(&pairs)
+        let shown: Vec<usize> = deck_core::model_order::order(&pairs)
             .into_iter()
             .map(|k| members[k])
             .filter(|&i| matches_words(&models[i], &words))

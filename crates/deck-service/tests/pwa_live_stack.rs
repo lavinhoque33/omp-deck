@@ -44,7 +44,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use deck_remote::relay::RoomKey;
 use deck_service::gateway::client::Link;
 use deck_service::gateway::protocol::{
-    Done, Mutation, PairingState, Permissions, RelayLink, SecretText,
+    Done, ModelFactsView, Mutation, PairingState, Permissions, RelayLink, SecretText, ViewRole,
 };
 use serde_json::{Value, json};
 use support::device::{OMP_CONFIG, Relay, STEP, Sandbox, run, wait_for, wait_mobile};
@@ -159,6 +159,7 @@ fn request_summary(index: usize, req: &Value) -> Value {
         .collect();
     json!({
         "index": index,
+        "model": req["model"],
         "tools": fm::has_tools(req),
         "last_user": fm::last_user_text(req),
         "images": fm::last_user(req).map(fm::images).unwrap_or_default(),
@@ -327,10 +328,26 @@ type ApproveAsk = (String, mpsc::Sender<Result<(), String>>);
 /// A relay restart asked for; answered once the relay serves again.
 type RestartAsk = mpsc::Sender<()>;
 
+/// Opens/closes a real GUI frontend, without launching egui; also reports its old model facts.
+type DesktopAsk = (bool, mpsc::Sender<Result<(), String>>);
+
+#[derive(serde::Deserialize)]
+struct ModelPreferencesEdit {
+    favorites: Vec<String>,
+    provider: Option<String>,
+}
+
+type ModelPreferencesAsk = (
+    Option<ModelPreferencesEdit>,
+    mpsc::Sender<Result<Value, String>>,
+);
+
 struct Control {
     published: Arc<Mutex<Published>>,
     approve: mpsc::Sender<ApproveAsk>,
     restart: mpsc::Sender<RestartAsk>,
+    desktop: mpsc::Sender<DesktopAsk>,
+    model_preferences: mpsc::Sender<ModelPreferencesAsk>,
     model: Arc<FakeModel>,
     png: Vec<u8>,
     ua: Ua,
@@ -387,6 +404,47 @@ impl Control {
                 }
                 match rx.recv_timeout(STEP) {
                     Ok(()) => json(json!({ "restarted": true })),
+                    Err(_) => ("504 Gateway Timeout", "text/plain", b"no answer".to_vec()),
+                }
+            }
+            ("POST", "/desktop-view") => {
+                let (tx, rx) = mpsc::channel();
+                let open = body == b"true";
+                if self.desktop.send((open, tx)).is_err() {
+                    return (
+                        "503 Service Unavailable",
+                        "text/plain",
+                        b"stopping".to_vec(),
+                    );
+                }
+                match rx.recv_timeout(STEP) {
+                    Ok(Ok(())) => json(json!({ "open": open })),
+                    Ok(Err(e)) => ("409 Conflict", "text/plain", e.into_bytes()),
+                    Err(_) => ("504 Gateway Timeout", "text/plain", b"no answer".to_vec()),
+                }
+            }
+            ("GET" | "POST", "/model-preferences") => {
+                let edit = if method == "POST" {
+                    match serde_json::from_slice(&body) {
+                        Ok(edit) => Some(edit),
+                        Err(e) => {
+                            return ("400 Bad Request", "text/plain", e.to_string().into_bytes());
+                        }
+                    }
+                } else {
+                    None
+                };
+                let (tx, rx) = mpsc::channel();
+                if self.model_preferences.send((edit, tx)).is_err() {
+                    return (
+                        "503 Service Unavailable",
+                        "text/plain",
+                        b"stopping".to_vec(),
+                    );
+                }
+                match rx.recv_timeout(STEP * 2) {
+                    Ok(Ok(prefs)) => json(prefs),
+                    Ok(Err(e)) => ("409 Conflict", "text/plain", e.into_bytes()),
                     Err(_) => ("504 Gateway Timeout", "text/plain", b"no answer".to_vec()),
                 }
             }
@@ -505,7 +563,20 @@ fn pwa_live_stack() {
     let notes = sb.proj().join("notes.txt");
     std::fs::write(&notes, "steer target\n").expect("notes");
     let model = Arc::new(FakeModel::start(script(notes)));
-    std::fs::write(sb.agent().join("models.yml"), model.models_yml()).expect("models.yml");
+    let other = model
+        .models_yml()
+        .replace("  fake:", "  other:")
+        .replace("fake-1", "other-1")
+        .replace("Fake One", "Other One");
+    let models = format!(
+        "{}      - id: fake-2\n        name: Fake Two\n        contextWindow: 200000\n        \
+         maxTokens: 4096\n        input: [text, image]\n      - id: fake-10\n        \
+         name: Fake Ten\n        contextWindow: 200000\n        \
+         maxTokens: 4096\n        input: [text, image]\n{}",
+        model.models_yml(),
+        other.trim_start_matches("providers:\n"),
+    );
+    std::fs::write(sb.agent().join("models.yml"), models).expect("models.yml");
     let pushes = Arc::new(Mutex::new(Vec::new()));
     let push_port = push_receiver(pushes.clone());
     // A fixed port keeps one app origin across runs (`bun run phone`: the phone's Chrome keeps
@@ -557,10 +628,15 @@ fn pwa_live_stack() {
     let published = Arc::new(Mutex::new(Published::default()));
     let (approve, asks) = mpsc::channel::<ApproveAsk>();
     let (restart, restarts) = mpsc::channel::<RestartAsk>();
+    let (desktop, desktop_asks) = mpsc::channel::<DesktopAsk>();
+    let (model_preferences, model_preference_asks) = mpsc::channel::<ModelPreferencesAsk>();
+    let mut desktop_view: Option<Box<dyn deck_term::FrontendTx>> = None;
     let control = Control {
         published: published.clone(),
         approve,
         restart,
+        desktop,
+        model_preferences,
         model: model.clone(),
         png: gradient_png(PNG_SIDE),
         ua: Ua::new(),
@@ -640,6 +716,69 @@ fn pwa_live_stack() {
                 .map(|_| ()),
             };
             eprintln!("pwa live stack: approval {result:?}");
+            let _ = answer.send(result);
+        }
+        while let Ok((open, answer)) = desktop_asks.try_recv() {
+            let result = if open {
+                match client
+                    .state()
+                    .controllers
+                    .get()
+                    .and_then(|cs| cs.first().cloned())
+                {
+                    Some(c) => {
+                        if desktop_view.is_none() {
+                            let (mut rx, tx) = client
+                                .frontend(c.target.clone(), ViewRole::Controlling)
+                                .split();
+                            std::thread::spawn(move || {
+                                while let Ok(event) = rx.recv() {
+                                    if matches!(event, deck_term::RemoteEvent::Closed) {
+                                        break;
+                                    }
+                                }
+                            });
+                            desktop_view = Some(tx);
+                        }
+                        client.observe_model(
+                            c.target,
+                            ModelFactsView {
+                                model: Some(fm::MODEL.to_owned()),
+                                shown: Some(fm::MODEL.to_owned()),
+                                ..ModelFactsView::default()
+                            },
+                        );
+                        Ok(())
+                    }
+                    None => Err("no session to open on desktop".to_owned()),
+                }
+            } else {
+                desktop_view = None;
+                Ok(())
+            };
+            let _ = answer.send(result);
+        }
+        while let Ok((edit, answer)) = model_preference_asks.try_recv() {
+            let result = (|| {
+                let base = client.settings().snapshot().ok_or("settings not ready")?;
+                let snapshot = if let Some(edit) = edit {
+                    let mut config = (*base.config).clone();
+                    config.favorite_models = edit.favorites;
+                    config.model_provider_filter = edit.provider;
+                    client
+                        .settings()
+                        .submit(deck_service::settings::Edit::between(base.config, &config))
+                        .wait(STEP)
+                        .ok_or("settings commit timed out")?
+                        .map_err(|e| e.to_string())?
+                } else {
+                    base
+                };
+                Ok(json!({
+                    "favorites": snapshot.config.favorite_models,
+                    "provider": snapshot.config.model_provider_filter,
+                }))
+            })();
             let _ = answer.send(result);
         }
         while let Ok(answer) = restarts.try_recv() {

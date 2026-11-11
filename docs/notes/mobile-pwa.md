@@ -714,6 +714,21 @@ PWA (`pwa/`):
 
     A send before omp is idle would be refused (`Precondition`). A refusal or failure stays visible in the hint while
     the text is kept for a retry.
+  - Model state comes from the gateway's live-control snapshot, including before a fresh session
+    saves its first message. Desktop-reported model facts are only a fallback when live reporting
+    is unavailable; a stale desktop observation cannot replace omp's current live model.
+  - The model picker matches desktop provider filtering (All + counts), Favorites and provider groups.
+    Stars/provider choice use the same persisted desktop settings. Unavailable favorites stay visible
+    and can be unstarred; independent star buttons never select a model. Both clients use
+    `deck_core::model_order` for newest-first order. Opening refreshes shared preferences; controls
+    wait for refreshed state before editing it.
+  - Sessions has a collapsible **Running** section directly below search and above project groups.
+    Managed sessions (desktop-attached first), fresh sessions without a saved id, and other live
+    backends appear once; exited controllers are excluded. Rows show status, model and folder, share
+    the search filter, and open the conversation/tool terminal. A bounded scrolling list keeps the
+    projects reachable. Saved rows retain their session actions; Manage opens the existing RAM/kill
+    screen (also used for unmapped processes). With older gateways, the live feed alone supplies rows.
+    The section hides when empty and during history bulk-selection mode.
   - The terminal's line input is enabled only once a view is attached in a typing mode, so lines typed during a
     re-attach are never dropped. It is labelled "Line to send to the terminal", distinct from xterm's own "Terminal
     input".
@@ -726,6 +741,10 @@ PWA (`pwa/`):
   - the WebSocket under the CSP;
   - real FCM `pushManager.subscribe`, accepted by the SSRF guard;
   - a new session (Starting → Send);
+  - initial model before any prompt, mobile-only model switch, and switches with a real controlling
+    desktop frontend attached; the next completion request must name the selected model;
+  - model-picker provider counts/groups, exact newest-first order, shared favorites in starring order,
+    unavailable-favorite removal, persisted provider filtering and desktop-side changes on reopen;
   - prompt; ask answered on the phone; steer mid-turn;
   - an image attachment byte-identical at the model;
   - one decrypted push for a backgrounded turn;
@@ -733,6 +752,9 @@ PWA (`pwa/`):
   - 0 console errors and 0 CSP violations.
 
   The launcher's `/live` endpoint reports controller state when a step stalls.
+  `bun run live --models` runs just pairing, session creation, these model checks and the first
+  prompt (no push/attachment/terminal scenarios). Screenshots include the updated model card with
+  “Desktop has control”; the scripted provider records the actual request's model.
 
 ## Steps and gates
 

@@ -175,6 +175,38 @@ select.input.slim {
 }
 
 /* ---- Sessions: rows with an actions button, worktrees nested under their repository ---- */
+.running-section {
+  margin: 0 0 18px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.running-section .running-title {
+  margin: 0 0 8px;
+  border-bottom: 1px solid var(--border);
+}
+.running-title .name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  border-bottom: 2px solid var(--accent);
+}
+.running-title .count {
+  margin-left: auto;
+}
+.running-session-list {
+  max-height: min(38dvh, 340px);
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  padding: 2px 3px 4px;
+}
+.running-session-list .row-main {
+  min-height: 64px;
+}
+.running-project {
+  font-family: var(--mono);
+}
+
 .session.row-with-actions {
   padding: 0;
   gap: 0;

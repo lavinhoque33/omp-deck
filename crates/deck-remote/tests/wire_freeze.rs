@@ -19,6 +19,10 @@ const PINNED: &[(&str, &str)] = &[
         "698b04f4778364de272ce68b5e9b18b0c0c2caa0d48f25e429a8d1acee117337",
     ),
     (
+        "api-models.json",
+        "d16806c7cff85a2bf34210283151e4e1cb7e7525a3896f555b7829b75e041478",
+    ),
+    (
         "api-s4.json",
         "c2f61bf6eb1c7113b250fd891f81ff86f992e54df551c097d8ebeae47ebe1047",
     ),

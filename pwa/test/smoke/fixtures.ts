@@ -934,8 +934,8 @@ export function models(): api.Model[] {
     model('anthropic', 'claude-opus-4-5', 'Claude Opus 4.5', ['low', 'medium', 'high', 'max'], 200_000, 5, 25),
     model('anthropic', 'claude-sonnet-4-5', 'Claude Sonnet 4.5', ['low', 'medium', 'high'], 1_000_000, 3, 15),
     model('anthropic', 'claude-haiku-4-5', 'Claude Haiku 4.5', [], 200_000, 1, 5),
-    model('openai', 'gpt-5.1', 'GPT-5.1', ['minimal', 'low', 'medium', 'high'], 400_000, 1.25, 10),
     model('google', 'gemini-3-pro', 'Gemini 3 Pro', ['low', 'high'], 1_000_000, 2, 12),
+    model('openai', 'gpt-5.1', 'GPT-5.1', ['minimal', 'low', 'medium', 'high'], 400_000, 1.25, 10),
   ];
 }
 

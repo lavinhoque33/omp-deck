@@ -1,5 +1,8 @@
 # Findings: model release dates and a "newest" sort key for OmpDeck
 
+Implementation: `crates/deck-core/src/model_order.rs`. The desktop picker and gateway's mobile
+catalog both call this same function; mobile filters the ordered catalog without sorting it again.
+
 **Q1: There is no release date and no "newest" catalog order that omp exposes.** The closest things are an implicit sort in omp's own picker and a hidden `identity.revision` field. Neither is a date.
 
 ## Q1 evidence

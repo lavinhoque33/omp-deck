@@ -735,19 +735,29 @@ impl Engine {
 
     fn run_observe(&mut self, i: usize, now: Instant) {
         let m = &mut self.sess.managed[i];
-        let Some(f) = m.model.as_ref() else {
-            return;
-        };
-        let progress = m.ctl.observe_model(
-            now,
+        // omp's in-memory state is authoritative, including before the first saved message.
+        // GUI observations remain the fallback for sessions without live model reporting.
+        let live = m.live.as_ref().and_then(|l| l.client.latest());
+        let facts = if let Some(model) = live.as_ref().and_then(|s| s.model.as_ref()) {
+            ModelFacts {
+                model: Some(&model.selector),
+                thinking: Some(&model.thinking),
+                configured: model.thinking_configured.as_deref(),
+                shown: Some(&model.selector),
+                shown_is_default: false,
+            }
+        } else if let Some(f) = m.model.as_ref() {
             ModelFacts {
                 model: f.model.as_deref(),
                 thinking: f.thinking.as_deref(),
                 configured: f.configured.as_deref(),
                 shown: f.shown.as_deref(),
                 shown_is_default: f.shown_is_default,
-            },
-        );
+            }
+        } else {
+            ModelFacts::default()
+        };
+        let progress = m.ctl.observe_model(now, facts);
         m.model_at = progress.wake_in.map(|d| now + d);
         let target = m.ctl.target().clone();
         if let Some(d) = progress.wake_in {
@@ -1320,6 +1330,9 @@ impl Engine {
             self.dirty.controllers = true;
         }
         for key in changed {
+            if let Some(i) = self.sess.find(&key) {
+                self.run_observe(i, now);
+            }
             self.changed(crate::gateway::protocol::Topic::Live(key));
             self.dirty.controllers = true;
         }

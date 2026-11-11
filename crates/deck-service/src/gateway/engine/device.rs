@@ -844,8 +844,8 @@ fn item_hash(t: &TranscriptItem) -> u64 {
     hash_of(&serde_json::to_vec(t).unwrap_or_default())
 }
 
-fn models(list: &[deck_core::omp::ModelInfo]) -> Vec<api::Model> {
-    list.iter()
+fn models<'a>(list: impl IntoIterator<Item = &'a deck_core::omp::ModelInfo>) -> Vec<api::Model> {
+    list.into_iter()
         .map(|m| api::Model {
             selector: m.selector.clone(),
             provider: m.provider.clone(),
@@ -862,11 +862,44 @@ fn models(list: &[deck_core::omp::ModelInfo]) -> Vec<api::Model> {
         .collect()
 }
 
-/// The models reply holding as many models as fit one record.
-fn models_reply(list: &[deck_core::omp::ModelInfo]) -> ReplyResult {
-    views::fit_reply(&models(list), |models, truncated| Resp::Models {
-        models,
-        truncated,
+/// Whole provider catalogs, providers alphabetical (case-insensitive) and each catalog newest
+/// first, exactly as the desktop picker lists them. Ordering happens before any truncation.
+fn ordered_models(list: &[deck_core::omp::ModelInfo]) -> Vec<&deck_core::omp::ModelInfo> {
+    let mut groups: Vec<(&str, Vec<&deck_core::omp::ModelInfo>)> = Vec::new();
+    for m in list {
+        match groups.iter_mut().find(|(p, _)| *p == m.provider) {
+            Some((_, v)) => v.push(m),
+            None => groups.push((m.provider.as_str(), vec![m])),
+        }
+    }
+    groups.sort_by_key(|(p, _)| p.to_lowercase());
+    let mut out = Vec::with_capacity(list.len());
+    for (_, members) in groups {
+        let pairs: Vec<(&str, &str)> = members
+            .iter()
+            .map(|m| (m.id.as_str(), m.name.as_str()))
+            .collect();
+        out.extend(
+            deck_core::model_order::order(&pairs)
+                .into_iter()
+                .map(|k| members[k]),
+        );
+    }
+    out
+}
+
+/// The models reply holding as many models as fit one record, with the shared preferences.
+fn models_reply(
+    list: &[deck_core::omp::ModelInfo],
+    cfg: &deck_core::config::AppConfig,
+) -> ReplyResult {
+    views::fit_reply(&models(ordered_models(list)), |models, truncated| {
+        Resp::Models {
+            models,
+            truncated,
+            favorites: cfg.favorite_models.clone(),
+            provider: cfg.model_provider_filter.clone(),
+        }
     })
 }
 
@@ -1959,6 +1992,36 @@ impl Engine {
                     stop: self.holders(&[s.path.as_path()]),
                 }
             }
+            Op::ModelFavorite { selector, favorite } => {
+                if !(1..=api::MAX_MODEL_PREF).contains(&selector.len()) {
+                    return Err(bad("not a model selector"));
+                }
+                let snap = self.settings.snapshot();
+                let mut c = (*snap.config).clone();
+                // The desired state, not a toggle: a repeat changes nothing, and the other
+                // favorites (available or not) keep their starring order.
+                let at = c.favorite_models.iter().position(|s| *s == selector);
+                match (favorite, at) {
+                    (true, None) => c.favorite_models.push(selector),
+                    (false, Some(i)) => {
+                        c.favorite_models.remove(i);
+                    }
+                    _ => {}
+                }
+                Mutation::Settings(crate::settings::Edit::between(snap.config.clone(), &c))
+            }
+            Op::ModelProvider { provider } => {
+                let snap = self.settings.snapshot();
+                let mut c = (*snap.config).clone();
+                if provider
+                    .as_ref()
+                    .is_some_and(|p| !(1..=api::MAX_MODEL_PREF).contains(&p.len()))
+                {
+                    return Err(bad("not a model provider"));
+                }
+                c.model_provider_filter = provider;
+                Mutation::Settings(crate::settings::Edit::between(snap.config.clone(), &c))
+            }
             Op::Subscribe { .. }
             | Op::Unsubscribe { .. }
             | Op::Outcome { .. }
@@ -2044,7 +2107,7 @@ impl Engine {
             Ok(Answer::Outcome(o)) => ReplyResult::Ok(Resp::Outcome {
                 outcome: self.outcome_view(&o, None, d.s4()),
             }),
-            Ok(Answer::Models(list)) => models_reply(&list),
+            Ok(Answer::Models(list)) => models_reply(&list, &self.settings.snapshot().config),
             Ok(Answer::Diff(d)) => ReplyResult::Ok(Resp::Diff { diff: diff(&d) }),
             Ok(_) => ReplyResult::Ok(Resp::Unit {}),
             Err(e) => ReplyResult::Err(api_error(&self.devices.canon, &e)),
@@ -2086,6 +2149,40 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model(provider: &str, id: &str, cost: Option<f64>) -> deck_core::omp::ModelInfo {
+        deck_core::omp::ModelInfo {
+            selector: format!("{provider}/{id}"),
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            name: id.to_owned(),
+            cost_input: cost,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn model_catalogs_are_grouped_by_provider_and_ordered_like_the_desktop() {
+        let list = vec![
+            model("beta", "m-1", Some(f64::NAN)),
+            model("Alpha", "a-1", None),
+            model("beta", "m-2", Some(2.0)),
+            model("alpha", "z-9", None),
+            model("Alpha", "a-2", None),
+        ];
+        let sorted = models(ordered_models(&list));
+        let selectors: Vec<&str> = sorted.iter().map(|m| m.selector.as_str()).collect();
+        assert_eq!(
+            selectors,
+            [
+                "Alpha/a-2",
+                "Alpha/a-1",
+                "alpha/z-9",
+                "beta/m-2",
+                "beta/m-1"
+            ]
+        );
+    }
 
     fn entry(id: &str, cwd: &str, ms: u64) -> SessionEntry {
         SessionEntry {

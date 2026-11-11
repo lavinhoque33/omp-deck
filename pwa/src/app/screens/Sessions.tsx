@@ -11,7 +11,7 @@ import { age, perform, shortModel, statusLabel, succeeded } from '../ui/format.t
 import { useCan, useClient, useClientState, useFeed, useNow } from '../ui/hooks.ts';
 import { ConfirmSheet, ConnectionPill, Empty, InstallHint, NativeUpdateBanner, Sheet, StaleBanner, UpdateBanner, useS4 } from '../ui/kit.tsx';
 import { doneResult } from './fleet/common.ts';
-import { type WorktreeLink, nestWorktrees, plural } from './fleet/logic.ts';
+import { type WorktreeLink, nestWorktrees, plural, runningRows } from './fleet/logic.ts';
 import { ProjectPicker, SessionActionsSheet } from './fleet/SessionActions.tsx';
 import '../../styles/fleet.css';
 
@@ -251,6 +251,7 @@ export function SessionsScreen({ standalone }: { standalone: boolean }): ReactNo
           />
           <span className="key">/</span>
         </label>
+        {!selecting && <RunningSection live={liveFeed?.sessions} needle={needle} s4={s4} onActions={setRowActions} />}
         {projectsFeed === undefined ? (
           <Empty title="Loading projects…">The desktop sends its session list once connected.</Empty>
         ) : projects.length === 0 ? (
@@ -365,6 +366,77 @@ export function SessionsScreen({ standalone }: { standalone: boolean }): ReactNo
         />
       )}
     </div>
+  );
+}
+
+function RunningSection({
+  live,
+  needle,
+  s4,
+  onActions,
+}: {
+  live: readonly api.LiveSession[] | undefined;
+  needle: string;
+  s4: boolean;
+  onActions: (row: RowActions) => void;
+}): ReactNode {
+  const nav = useNav();
+  const feed = useFeed(s4 ? { feed: 'running' } : null, 'running');
+  const [expanded, setExpanded] = useState(true);
+  const rows = useMemo(() => runningRows(live ?? [], feed?.sessions ?? []), [live, feed]);
+  const visible = rows.filter((row) =>
+    [row.title, row.display, row.session, row.live?.model, row.live?.live.key]
+      .some((value) => value?.toLowerCase().includes(needle)),
+  );
+  if (rows.length === 0) return null;
+  return (
+    <section className="running-section" aria-label="Running sessions">
+      <div className="project-title running-title">
+        <button type="button" className="name" aria-expanded={expanded} aria-controls="running-session-list" onClick={() => setExpanded(!expanded)}>
+          <span aria-hidden="true">{expanded ? '⌄' : '›'}</span> Running
+          <span className="count">{needle.length > 0 ? `${visible.length}/${rows.length}` : rows.length}</span>
+        </button>
+        {s4 && (
+          <button type="button" className="row-btn" aria-label="Manage running sessions" title="Processes and RAM" onClick={() => nav.push({ kind: 'running' })}>
+            ⋯
+          </button>
+        )}
+      </div>
+      {expanded && (
+        <div className="running-session-list" id="running-session-list">
+          {visible.map((row) => (
+            <div key={row.key} className={`session row-with-actions${row.live?.status.state === 'attention' ? ' attention' : ''}${row.live?.busy || row.live?.status.state === 'busy' ? ' active' : ''}`}>
+              <button
+                type="button"
+                className="row-main"
+                onClick={() => {
+                  if (row.live?.kind === 'tool') nav.push({ kind: 'terminal', liveKey: row.live.live.key, title: row.title });
+                  else if (row.live !== null || row.session !== null) nav.push({ kind: 'conversation', session: row.session, liveKey: row.live?.live.key ?? null, title: row.title });
+                  else nav.push({ kind: 'running' });
+                }}
+              >
+                {row.live === null ? <span className="dot" aria-label="Running" /> : <Indicator live={row.live} />}
+                <span className="copy">
+                  <b>{row.title}</b>
+                  <small>{row.live === null ? `Running · ${row.session === null ? 'Process details' : 'Open session'}` : `${shortModel(row.live.model)} · ${statusLabel(row.live)}`}</small>
+                  <small className="running-project">{row.display}</small>
+                </span>
+                {row.live?.desktop_controlled && <span className="chip small" title="Open on desktop" aria-label="Open on desktop">▣</span>}
+              </button>
+              {row.session !== null && (
+                <button type="button" className="row-btn more-btn" aria-label={`Actions for ${row.title}`} onClick={() => {
+                  if (row.session !== null) onActions({ session: row.session, title: row.title, display: row.display });
+                }}>
+                  ⋯
+                </button>
+              )}
+            </div>
+          ))}
+          {visible.length === 0 && <p className="muted small">No matching running sessions.</p>}
+          {feed?.truncated && <p className="muted small">Only part of the running list was sent.</p>}
+        </div>
+      )}
+    </section>
   );
 }
 

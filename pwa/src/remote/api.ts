@@ -83,6 +83,8 @@ export const MAX_UPLOAD_FILE = 20 * 1024 * 1024;
 export const MAX_UPLOAD_TOTAL = 200 * 1024 * 1024;
 /** `tree` `limit` range: 1..=this. */
 export const MAX_TREE_LIMIT = 2000;
+/** Op `model_favorite` selector and `model_provider` provider: 1..=MAX_MODEL_PREF UTF-8 bytes. */
+export const MAX_MODEL_PREF = 512;
 /** `usage_activity` `days` range: 1..=this. */
 export const MAX_ACTIVITY_DAYS = 371;
 /** `inventory` feed `limit` range: 1..=this. */
@@ -354,7 +356,10 @@ export type Op =
   | { op: 'sync_remove'; project: string }
   | { op: 'sync_delete'; ids: string[] }
   | { op: 'sync_restore_prepare'; backup: string; target: RestoreTarget; parts: SyncParts }
-  | { op: 'sync_restore_apply'; handle: number; conflicts: ConflictChoice[]; excluded?: string[] };
+  | { op: 'sync_restore_apply'; handle: number; conflicts: ConflictChoice[]; excluded?: string[] }
+  // additive v1 (no feature gate): shared model-picker preferences, desired state not a toggle
+  | { op: 'model_favorite'; selector: string; favorite: boolean }
+  | { op: 'model_provider'; provider?: string | null };
 
 export type OpName = Op['op'];
 
@@ -453,6 +458,8 @@ const OP_CLASS: { readonly [K in OpName]: Class } = {
   sync_delete: 'manage',
   sync_restore_prepare: 'manage',
   sync_restore_apply: 'manage',
+  model_favorite: 'control',
+  model_provider: 'control',
 };
 
 /** Every op tag, in Rust `Op::NAMES` order. */
@@ -540,6 +547,15 @@ function checkOp(op: Op): string | null {
       return op.limit >= 1 && op.limit <= MAX_TREE_LIMIT ? null : `tree limit must be 1..=${MAX_TREE_LIMIT}`;
     case 'usage_activity':
       return op.days >= 1 && op.days <= MAX_ACTIVITY_DAYS ? null : `activity days must be 1..=${MAX_ACTIVITY_DAYS}`;
+    case 'model_favorite': {
+      const bytes = new TextEncoder().encode(op.selector).length;
+      return bytes >= 1 && bytes <= MAX_MODEL_PREF ? null : `a model selector is 1..=${MAX_MODEL_PREF} bytes`;
+    }
+    case 'model_provider': {
+      if (op.provider === null || op.provider === undefined) return null;
+      const bytes = new TextEncoder().encode(op.provider).length;
+      return bytes >= 1 && bytes <= MAX_MODEL_PREF ? null : `a model provider is 1..=${MAX_MODEL_PREF} bytes`;
+    }
     case 'upload_chunk':
       return op.data.length <= MAX_TRANSFER_CHUNK_B64
         ? null
@@ -1426,7 +1442,7 @@ export type Resp =
   | { type: 'pong' }
   | { type: 'accepted'; seq: number; duplicate: boolean }
   | { type: 'outcome'; outcome: OutcomeView }
-  | { type: 'models'; models: Model[]; truncated: boolean }
+  | { type: 'models'; models: Model[]; truncated: boolean; favorites?: string[]; provider?: string | null }
   | { type: 'diff'; diff: Diff }
   | { type: 'attached'; view: number; mode: ViewMode }
   // slice 4
@@ -2289,7 +2305,12 @@ const resp = tagged<Resp, 'type'>('type', {
   pong: {},
   accepted: { seq: u64, duplicate: bool },
   outcome: { outcome: outcomeView },
-  models: { models: list(model), truncated: bool },
+  models: {
+    models: list(model),
+    truncated: bool,
+    favorites: optional(list(str)),
+    provider: optional(nullable(str)),
+  },
   diff: { diff },
   attached: { view: u32, mode: viewMode },
   text: { text: str, truncated: bool },
@@ -2488,6 +2509,8 @@ const opV = tagged<Op, 'op'>('op', {
   sync_delete: { ids: files },
   sync_restore_prepare: { backup: str, target: restoreTarget, parts: syncParts },
   sync_restore_apply: { handle: u64, conflicts: list(conflictChoice), excluded: optional(files) },
+  model_favorite: { selector: str, favorite: bool },
+  model_provider: { provider: nullable(str) },
 });
 const requestV = struct<Request>({ id: u64, seq: nullable(u64), op: opV });
 

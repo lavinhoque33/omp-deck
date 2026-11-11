@@ -70,6 +70,8 @@ const V1_OPS: Partial<Record<api.OpName, true>> = {
   move_session: true,
   discard: true,
   delete_untracked: true,
+  model_favorite: true,
+  model_provider: true,
 };
 
 /** Whether `feed` is a slice-4 feed. */
@@ -245,7 +247,7 @@ export interface ClientState {
   /** Open requests first, then the recently finished ones (newest first). */
   requests: readonly RequestView[];
   confirms: readonly ConfirmView[];
-  models: { models: api.Model[]; truncated: boolean } | null;
+  models: { models: api.Model[]; truncated: boolean; favorites: string[]; provider: string | null } | null;
   notices: readonly Notice[];
 }
 
@@ -429,6 +431,7 @@ export class Client {
   #stopped = false;
   #retryTimer: number | null = null;
   #rateLimitedSince: number | null = null;
+  #modelsLoad = 0;
 
   #builder: api.RequestBuilder | null = null;
   #ack = new AckPolicy();
@@ -1270,8 +1273,15 @@ export class Client {
   /** The model list (cached per gateway epoch). */
   async loadModels(force = false): Promise<void> {
     if (!force && this.#state.models !== null) return;
+    // Only the newest load applies: an older reply (a refresh started before a preference write)
+    // must never overwrite what a later one already read.
+    const load = ++this.#modelsLoad;
     const resp = await this.request({ op: 'models' });
-    if (resp.type === 'models') this.#set({ models: { models: resp.models, truncated: resp.truncated } });
+    if (resp.type === 'models' && load === this.#modelsLoad) {
+      this.#set({
+        models: { models: resp.models, truncated: resp.truncated, favorites: resp.favorites ?? [], provider: resp.provider ?? null },
+      });
+    }
   }
 
   // ---- terminal views ---------------------------------------------------------------------------

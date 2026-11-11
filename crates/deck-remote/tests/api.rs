@@ -3,7 +3,8 @@
 //! too: record bytes both ways, and one canonical JSON text per message variant (decode equals
 //! the Rust value, encode equals the text). The slice-4 additions are in `api_s4` against
 //! `tests/vectors/api-s4.json`, the HTML-form additions in `api_form` against
-//! `tests/vectors/api-form.json`; variant coverage spans all three files.
+//! `tests/vectors/api-form.json`, the model-picker preferences in `api_models` against
+//! `tests/vectors/api-models.json`; variant coverage spans all four files.
 //!
 //! Rewrite after an intentional protocol change:
 //! `OMPDECK_WRITE_VECTORS=1 cargo test -p deck-remote --test api`
@@ -15,8 +16,10 @@ use serde_json::{Value, json};
 
 mod api_android;
 mod api_form;
+mod api_models;
 mod api_s4;
 use api_form as form;
+use api_models as models;
 use api_s4 as s4;
 
 const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/api-v1.json");
@@ -682,6 +685,8 @@ fn replies() -> Vec<(&'static str, Reply)> {
                         cost_output: Some(15.5),
                     }],
                     truncated: false,
+                    favorites: vec![],
+                    provider: None,
                 },
             ),
         ),
@@ -2345,6 +2350,11 @@ variants!(Op, Some("op"), {
         conflicts: vec![],
         excluded: vec![],
     },
+    Op::ModelFavorite { .. } => Op::ModelFavorite {
+        selector: e(),
+        favorite: true,
+    },
+    Op::ModelProvider { .. } => Op::ModelProvider { provider: None },
 });
 
 fn e() -> String {
@@ -2556,6 +2566,8 @@ variants!(Resp, Some("type"), {
     Resp::Models { .. } => Resp::Models {
         models: vec![],
         truncated: false,
+        favorites: vec![],
+        provider: None,
     },
     Resp::Diff { .. } => Resp::Diff {
         diff: Diff {
@@ -3006,6 +3018,8 @@ fn the_vectors_cover_every_variant() {
         serde_json::from_str(&std::fs::read_to_string(form::PATH).unwrap()).unwrap();
     let android_file: Value =
         serde_json::from_str(include_str!("vectors/api-android.json")).unwrap();
+    let models_file: Value =
+        serde_json::from_str(&std::fs::read_to_string(models::PATH).unwrap()).unwrap();
     let mut seen = Seen::default();
     for m in file["messages"]
         .as_array()
@@ -3014,6 +3028,7 @@ fn the_vectors_cover_every_variant() {
         .chain(s4_file["messages"].as_array().unwrap())
         .chain(form_file["messages"].as_array().unwrap())
         .chain(android_file["messages"].as_array().unwrap())
+        .chain(models_file["messages"].as_array().unwrap())
     {
         let text = m["json"].as_str().unwrap();
         match m["type"].as_str().unwrap() {

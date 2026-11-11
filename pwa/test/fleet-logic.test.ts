@@ -15,6 +15,7 @@ import {
   nestWorktrees,
   pushCrumb,
   searchTree,
+  runningRows,
   selectionTotals,
   uptime,
 } from '../src/app/screens/fleet/logic.ts';
@@ -174,6 +175,37 @@ describe('inventory', () => {
 });
 
 describe('running', () => {
+  const process = (id: string, patch: Partial<api.RunningView> = {}): api.RunningView => ({
+    id, sessions: [], project: null, display: null, title: null, backend: 'host',
+    started_unix_ms: null, pid: null, memory_bytes: null, processes: null, live: null,
+    ...patch,
+  });
+
+  test('the top section merges backend and managed sessions without duplicates or exited rows', () => {
+    const saved = live({ title: 'Saved', session: 'saved' });
+    const fresh = live({ live: { key: 'fresh', generation: 1 }, session: null, title: 'Fresh', desktop_controlled: true });
+    const ended = live({ live: { key: 'ended', generation: 1 }, status: { state: 'exited', clean: true } });
+    const rows = runningRows([saved, fresh, ended], [
+      process('saved-process', { sessions: ['saved'] }),
+      process('fresh-process', { live: fresh.live }),
+      process('ended-process', { live: ended.live }),
+      process('unmanaged', { sessions: ['other'], title: 'Detached', started_unix_ms: 2 }),
+      process('unmapped', { started_unix_ms: 1 }),
+    ]);
+    expect(rows.map((row) => [row.key, row.session])).toEqual([
+      ['fresh', null], ['k', 'saved'], ['unmanaged', 'other'], ['unmapped', null],
+    ]);
+    expect(rows[0]?.live?.desktop_controlled).toBe(true);
+    expect(rows[2]?.title).toBe('Detached');
+    expect(rows[3]?.title).toBe('Unmapped process');
+  });
+
+  test('fresh and direct sessions stay available without backend discovery', () => {
+    const fresh = live({ session: null });
+    expect(runningRows([fresh], [])[0]).toMatchObject({ key: 'k', live: fresh, session: null });
+    expect(runningRows([live({ status: { state: 'exited', clean: false } })], [])).toEqual([]);
+  });
+
   test('memoryFreed', () => {
     const run = (memory: number | null): api.RunningView => ({
       id: 'r',

@@ -11,6 +11,7 @@ pub mod fleet;
 pub mod folders;
 pub(crate) mod git;
 pub mod inventory;
+pub mod model_order;
 pub mod mux;
 pub mod omp;
 pub mod pins;

@@ -355,8 +355,6 @@ mod tests {
             (OPENCODE_GO, "hy4-preview", "hy3"),
             (OPENCODE_GO, "muse-spark-1.3-contributor", "omen-alpha"),
         ];
-        // The note announces 38 rows; its table actually lists 39 (14 + 3 + 14 + 8).
-        assert_eq!(table.len(), 39);
         for (ids, a, b) in table {
             assert!(pos(ids, a) < pos(ids, b), "{a} should sort before {b}");
         }

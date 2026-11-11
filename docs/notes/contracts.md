@@ -4343,3 +4343,44 @@ phone's, or an automatic pass), because the gateway owns the lane; the window's 
   enter CI.
 - Rust and PWA dependency audits also gate publication. Bundled SQLite uses patched `libsqlite3-sys` 0.39+
   through `rusqlite` 0.41 (RUSTSEC-2026-0459); the advisory is fixed, not ignored.
+
+## Mobile model-selector parity (user, 2026-11-11)
+
+- Phone model picker: All providers + provider counts, provider groups, Favorites first in starring
+  order, independent star buttons, and the desktop's newest-first ordering. Search ANDs whitespace-
+  separated words case-insensitively over provider/id/name; search never reranks a provider subset.
+- `deck_core::model_order::order(&[(&str, &str)]) -> Vec<usize>` is the single ordering implementation
+  used by the desktop picker and gateway device catalog. Provider ids remain distinct/case-sensitive;
+  groups sort alphabetically ignoring case. An unavailable saved provider displays as All providers.
+- Shared `AppConfig.favorite_models` / `model_provider_filter` are read and committed through the
+  gateway's `SettingsService`, not phone-local storage. Unavailable favorites remain visible (disabled
+  selection, enabled unstar); favorites also remain in their ordinary provider group, as on desktop.
+- Additive v1 Control/journaled operations: `model_favorite {selector, favorite: bool}` sets the desired
+  state idempotently; `model_provider {provider?: string|null}` chooses a provider or All. Strings are
+  1–512 UTF-8 bytes when present. Existing permission checks and settings field-conflict handling apply.
+- `models` replies add optional `favorites` (omitted empty) and `provider` (omitted absent); old replies
+  decode with empty defaults. New operations need no feature gate; old gateways answer unsupported.
+  `api-models.json` extends the shared Rust/TS vectors; earlier vector files stay byte-identical.
+- Opening the picker refreshes both catalog and preferences. Preference controls wait for that refresh
+  and serialize writes; older catalog requests cannot replace newer results. Starring/filtering never
+  switches a model or closes the picker; model/effort selection keeps its existing command routes.
+- Verification: `bun run live --models` covers real relay/gateway/omp, provider groups/order, phone↔desktop
+  preferences, unavailable favorites, and an actual completion using the chosen model. Isolated
+  `remote_device_model_preferences` covers desired-state writes, persistence and View-only refusal.
+
+## Mobile Running section (user, 2026-11-11)
+
+- Mobile Sessions puts **Running** after search, before project groups, never in a bottom dock.
+  Collapsible, count-bearing, height-bounded with its own scroll; existing theme/row styling applies.
+- Merge `live` controllers and the existing s4 `running` backend feed without duplicating a controller's
+  backend. Exclude exited controllers even while backend discovery catches up. Desktop-controlled
+  sessions precede other controllers; detached backends follow newest-started first. No protocol changes.
+- Fresh controllers navigate with `liveKey` even before a persisted session id exists; tools open their
+  terminal, saved sessions open their conversation and retain the shared session-actions sheet.
+  Unmapped/unattachable processes open the existing Running manager rather than an invalid conversation.
+- Search filters the section alongside history. Empty Running is hidden; bulk-selection mode keeps the
+  existing history selection surface. The existing Running manager retains process RAM and confirmed kills.
+- Proof: mobile browser exercises placement, status/exited exclusion, search, collapse, opening chat,
+  session actions, process-manager navigation and history bulk selection. Fleet logic tests cover merged
+  discovery, exited/stale rows, desktop-first order and fresh/direct controllers without backend discovery.
+

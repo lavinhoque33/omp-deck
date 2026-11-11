@@ -32,7 +32,6 @@ mod folder_scope;
 mod gw;
 mod icons;
 mod mobile_view;
-mod model_order;
 mod model_picker;
 mod notify;
 mod notify_panel;

@@ -62,6 +62,9 @@ export class SmokeGateway {
 
   nextSeq = 100;
   readonly outcomes = new Map<number, api.OutcomeView>();
+  /** Shared model-picker preferences (the desktop's favorites, in starring order, and provider filter). */
+  modelFavorites: string[] = [];
+  modelProvider: string | null = null;
   readonly pendingUi = new Map<string, api.UiRequestView | null>(fx.LIVE.map((spec) => [spec.session, spec.ui]));
   readonly activity = new Map<string, fx.LiveSpec['state']>(fx.LIVE.map((spec) => [spec.session, spec.state]));
   readonly extraItems = new Map<string, api.Item[]>();
@@ -352,7 +355,7 @@ export class SmokeConnection {
       case 'outcome':
         return { ok: { type: 'outcome', outcome: gw.outcomes.get(op.seq) ?? { state: 'unknown' } } };
       case 'models':
-        return { ok: { type: 'models', models: fx.models(), truncated: false } };
+        return { ok: { type: 'models', models: fx.models(), truncated: false, favorites: gw.modelFavorites, provider: gw.modelProvider } };
       case 'diff':
         return { ok: { type: 'diff', diff: fx.diff() } };
       case 'attach': {
@@ -625,6 +628,14 @@ export class SmokeConnection {
         gw.changed('live');
         return unit;
       }
+      case 'model_favorite':
+        gw.modelFavorites = op.favorite
+          ? gw.modelFavorites.includes(op.selector) ? gw.modelFavorites : [...gw.modelFavorites, op.selector]
+          : gw.modelFavorites.filter((selector) => selector !== op.selector);
+        return unit;
+      case 'model_provider':
+        gw.modelProvider = op.provider ?? null;
+        return unit;
       default:
         return unit;
     }

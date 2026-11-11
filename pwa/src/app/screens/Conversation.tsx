@@ -9,12 +9,13 @@ import { ClientError, type ConfirmView } from '../client.ts';
 import { useNav } from '../nav.ts';
 import { downloadAndSave, isAbort } from '../transfer.ts';
 import { adaptTranscript } from '../transcript/adapter.ts';
-import { perform, shortModel, statusLabel, succeeded, tokens } from '../ui/format.ts';
+import { perform, shortModel, statusLabel, succeeded } from '../ui/format.ts';
 import { useCan, useClient, useClientState, useFeed, useNow, useTranscript } from '../ui/hooks.ts';
 import { ConfirmSheet, Empty, Sheet, StaleBanner, useS4 } from '../ui/kit.tsx';
 import '../../styles/convo.css';
 import { Composer } from './conversation/Composer.tsx';
 import { ContextSheet } from './conversation/ContextSheet.tsx';
+import { ModelSheet } from './conversation/ModelSheet.tsx';
 import { GoneCard, PendingUiCard } from './conversation/PendingUi.tsx';
 import { EMPTY_TRACKER, GONE_MS, dismissGone, noteAnswer, noteSending, trackPending } from './conversation/pending.ts';
 import { TranscriptList } from './Transcript.tsx';
@@ -702,104 +703,6 @@ function ActionSheet({
             </button>
           </div>
         </>
-      )}
-    </Sheet>
-  );
-}
-
-function ModelSheet({
-  live,
-  current,
-  effort,
-  onClose,
-}: {
-  live: api.LiveSession;
-  current: api.Model | null;
-  effort: string | null;
-  onClose: () => void;
-}): ReactNode {
-  const client = useClient();
-  const can = useCan();
-  const models = useClientState((state) => state.models);
-  const [filter, setFilter] = useState('');
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    client.loadModels(true).catch((error: unknown) => client.notify(error instanceof Error ? error.message : String(error), 'error'));
-  }, [client]);
-  const run = async (op: api.Op, label: string) => {
-    setBusy(true);
-    const view = await perform(client, op, label);
-    setBusy(false);
-    if (succeeded(view)) onClose();
-  };
-  const needle = filter.trim().toLowerCase();
-  const list = (models?.models ?? []).filter(
-    (model) => needle.length === 0 || `${model.name} ${model.selector}`.toLowerCase().includes(needle),
-  );
-  const canSwitch = can({ op: 'switch_model', live: live.live, selector: '' }) && !busy;
-  const pending = live.pending_switch;
-  return (
-    <Sheet title="Model and effort" icon="◇" onClose={onClose}>
-      {pending !== null && (
-        <div className="banner">
-          <span className="busy" />
-          <span className="grow">
-            Switching to {pending.selector ?? 'a model'}
-            {pending.level !== null ? ` · ${pending.level}` : ''}…
-          </span>
-        </div>
-      )}
-      {current !== null && current.thinking.length > 0 && (
-        <label className="field">
-          <span>Effort</span>
-          <div className="line wrap">
-            {current.thinking.map((level) => (
-              <button
-                key={level}
-                type="button"
-                className="chip"
-                aria-pressed={effort === level}
-                disabled={!canSwitch}
-                onClick={() => void run({ op: 'set_effort', live: live.live, level }, `Effort ${level}`)}
-              >
-                {level}
-              </button>
-            ))}
-          </div>
-        </label>
-      )}
-      <input className="input" placeholder="Filter models" value={filter} onChange={(event) => setFilter(event.target.value)} style={{ marginBottom: 10 }} />
-      {models === null ? (
-        <p className="muted small">Loading models…</p>
-      ) : (
-        <div className="option-list">
-          {list.map((model) => (
-            <button
-              key={model.selector}
-              type="button"
-              className="option"
-              aria-pressed={current?.selector === model.selector}
-              disabled={!canSwitch}
-              onClick={() =>
-                void run(
-                  { op: 'switch_model', live: live.live, selector: model.selector, level: effort !== null && model.thinking.includes(effort) ? effort : null },
-                  `Switch to ${model.name}`,
-                )
-              }
-            >
-              <span className="grow">
-                {model.name}
-                <small>
-                  {model.provider}
-                  {model.context_window !== null ? ` · ${tokens(model.context_window)} ctx` : ''}
-                  {model.thinking.length > 0 ? ` · ${model.thinking.length} effort levels` : ''}
-                </small>
-              </span>
-              {current?.selector === model.selector && <span className="chip accent">current</span>}
-            </button>
-          ))}
-          {models.truncated && <p className="muted small">The list was cut; filter to find others.</p>}
-        </div>
       )}
     </Sheet>
   );

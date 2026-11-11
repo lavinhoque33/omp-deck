@@ -187,6 +187,50 @@ export function forksOf(entries: readonly api.InventoryView[], id: string): api.
 
 // ---- running ---------------------------------------------------------------------------------------
 
+export interface RunningRow {
+  key: string;
+  live: api.LiveSession | null;
+  session: string | null;
+  title: string;
+  display: string;
+}
+
+/** Managed sessions first (desktop views first), then other live backend processes. */
+export function runningRows(live: readonly api.LiveSession[], running: readonly api.RunningView[]): RunningRow[] {
+  const byKey = new Map(live.map((entry) => [entry.live.key, entry]));
+  const represented = new Set<string>();
+  const rows: RunningRow[] = [];
+  for (const entry of live) {
+    if (entry.status.state === 'exited') continue;
+    const process = running.find((process) =>
+      process.live?.key === entry.live.key ||
+      (process.live === null && entry.session !== null && process.sessions.includes(entry.session)),
+    );
+    if (process !== undefined) represented.add(process.id);
+    rows.push({
+      key: entry.live.key,
+      live: entry,
+      session: entry.session,
+      title: entry.title ?? (entry.label || 'New session'),
+      display: entry.display,
+    });
+  }
+  rows.sort((a, b) => Number(b.live?.desktop_controlled) - Number(a.live?.desktop_controlled));
+  const remaining = running
+    .filter((entry) => !represented.has(entry.id) && (entry.live === null || byKey.get(entry.live.key)?.status.state !== 'exited'))
+    .sort((a, b) => (b.started_unix_ms ?? 0) - (a.started_unix_ms ?? 0) || a.id.localeCompare(b.id));
+  for (const entry of remaining) {
+    rows.push({
+      key: entry.id,
+      live: null,
+      session: entry.sessions[0] ?? null,
+      title: entry.title ?? (entry.sessions.length > 0 ? 'Running session' : 'Unmapped process'),
+      display: entry.display ?? 'No working folder',
+    });
+  }
+  return rows;
+}
+
 /** A running mux session no session file maps to (a bare tool, or omp before its first save). */
 export function isUnmapped(entry: api.RunningView): boolean {
   return entry.sessions.length === 0;
