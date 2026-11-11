@@ -897,6 +897,11 @@ pub(super) fn apply_allowed(install: &deck_core::selfupdate::InstallKind) -> boo
 pub(super) fn app_update(v: &protocol::AppUpdateView, canon: &Canon) -> api::AppUpdateView {
     use deck_core::selfupdate::InstallKind as K;
     use protocol::UpdatePhase as P;
+    // Phones update the gateway, while desktop clients compare their own executable version.
+    let latest = v
+        .latest
+        .as_ref()
+        .filter(|release| deck_core::selfupdate::is_newer(&release.version, &v.current));
     api::AppUpdateView {
         install: match &v.install {
             K::UserDir { .. } => api::InstallKind::UserDir,
@@ -909,9 +914,9 @@ pub(super) fn app_update(v: &protocol::AppUpdateView, canon: &Canon) -> api::App
         },
         apply_allowed: apply_allowed(&v.install),
         current: v.current.clone(),
-        latest: v.latest.as_ref().map(|r| r.version.clone()),
-        page_url: v.latest.as_ref().map(|r| r.page_url.clone()),
-        asset: v.asset.clone(),
+        latest: latest.map(|r| r.version.clone()),
+        page_url: latest.map(|r| r.page_url.clone()),
+        asset: latest.and(v.asset.as_ref()).cloned(),
         checked_unix_ms: v.checked_unix_ms,
         phase: match &v.phase {
             P::Idle => api::UpdatePhase::Idle {},
@@ -932,6 +937,35 @@ pub(super) fn app_update(v: &protocol::AppUpdateView, canon: &Canon) -> api::App
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phone_update_offers_compare_against_the_gateway() {
+        use deck_core::selfupdate::{InstallKind, Release};
+
+        for (version, offered) in [("0.99.0", false), ("1.0.0", false), ("1.1.0", true)] {
+            let view = protocol::AppUpdateView {
+                install: InstallKind::WindowsDir {
+                    dir: "install".into(),
+                },
+                current: "1.0.0".to_owned(),
+                latest: Some(Release {
+                    version: version.to_owned(),
+                    tag: format!("v{version}"),
+                    page_url: "https://example.invalid/release".to_owned(),
+                }),
+                asset: Some("release.zip".to_owned()),
+                checked_unix_ms: Some(1),
+                phase: protocol::UpdatePhase::Idle,
+            };
+            let shown = app_update(&view, &Canon::default());
+            assert_eq!(shown.latest.as_deref(), offered.then_some(version));
+            assert_eq!(shown.asset.as_deref(), offered.then_some("release.zip"));
+            assert_eq!(
+                shown.page_url.as_deref(),
+                offered.then_some("https://example.invalid/release")
+            );
+        }
+    }
 
     #[test]
     fn running_ids_are_opaque_and_per_epoch() {

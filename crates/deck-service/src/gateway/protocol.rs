@@ -799,8 +799,9 @@ pub enum UpdatePhase {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppUpdateView {
     pub install: InstallKind,
+    /// The gateway's version; a desktop client compares releases against its own version.
     pub current: String,
-    /// A newer release (and its asset for this install) when one was found.
+    /// The latest published release, even when it is not newer than the gateway.
     pub latest: Option<Release>,
     pub asset: Option<String>,
     pub checked_unix_ms: Option<u64>,

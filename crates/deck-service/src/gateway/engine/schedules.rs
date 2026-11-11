@@ -204,6 +204,28 @@ impl Schedules {
         }
     }
 
+    fn finish_app_check(&mut self, result: Result<Release, String>) {
+        self.app_checked = Some(crate::gateway::unix_ms());
+        match result {
+            Ok(release) => {
+                // A desktop may be older than its gateway; let each client compare its version.
+                self.asset = self
+                    .install
+                    .as_ref()
+                    .and_then(|kind| selfupdate::asset_for(kind, &release.version));
+                self.latest = Some(release);
+                if matches!(self.phase, UpdatePhase::Checking | UpdatePhase::Failed(_)) {
+                    self.phase = UpdatePhase::Idle;
+                }
+            }
+            Err(error) => {
+                if matches!(self.phase, UpdatePhase::Checking) {
+                    self.phase = UpdatePhase::Failed(error);
+                }
+            }
+        }
+    }
+
     pub(super) fn begin_omp_check(&mut self) {
         self.omp_checking = true;
     }
@@ -225,8 +247,15 @@ impl Schedules {
         if self.downloading || self.applying {
             return refused("an update is already being installed".to_owned());
         }
-        if self.latest.is_none() {
-            return refused("no newer release was found".to_owned());
+        match &self.latest {
+            None => return refused("no release was found".to_owned()),
+            Some(release) if selfupdate::is_newer(GATEWAY_VERSION, &release.version) => {
+                return refused(
+                    "the running gateway is newer than this release; refusing to downgrade it"
+                        .to_owned(),
+                );
+            }
+            Some(_) => {}
         }
         if self.asset.is_none() {
             return refused("the release has nothing for this installation".to_owned());
@@ -651,30 +680,7 @@ impl Engine {
                 self.dirty.app = true;
             }
             Sched::AppChecked(r) => {
-                self.sched.app_checked = Some(crate::gateway::unix_ms());
-                let s = &mut self.sched;
-                match r {
-                    Ok(release) => {
-                        if selfupdate::is_newer(&release.version, GATEWAY_VERSION) {
-                            s.asset = s
-                                .install
-                                .as_ref()
-                                .and_then(|k| selfupdate::asset_for(k, &release.version));
-                            s.latest = Some(release);
-                        } else {
-                            s.latest = None;
-                            s.asset = None;
-                        }
-                        if matches!(s.phase, UpdatePhase::Checking | UpdatePhase::Failed(_)) {
-                            s.phase = UpdatePhase::Idle;
-                        }
-                    }
-                    Err(e) => {
-                        if matches!(s.phase, UpdatePhase::Checking) {
-                            s.phase = UpdatePhase::Failed(e);
-                        }
-                    }
-                }
+                self.sched.finish_app_check(r);
                 self.dirty.app = true;
             }
             Sched::AppDownloaded(r) => {
@@ -838,6 +844,53 @@ impl Engine {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    fn update_release(version: &str) -> Release {
+        Release {
+            version: version.to_owned(),
+            tag: format!("v{version}"),
+            page_url: format!("https://example.invalid/releases/tag/v{version}"),
+        }
+    }
+
+    #[test]
+    fn a_gateway_can_offer_its_own_release_to_an_older_desktop() {
+        let mut s = Schedules::new(Instant::now(), false);
+        s.install = Some(InstallKind::WindowsDir {
+            dir: PathBuf::from("install"),
+        });
+        s.begin_app_check();
+        s.finish_app_check(Ok(update_release(GATEWAY_VERSION)));
+
+        let offered = s
+            .app_view()
+            .latest
+            .expect("older desktops need the release");
+        assert!(selfupdate::is_newer(&offered.version, "0.0.0"));
+        let (download, _) = s
+            .download_plan()
+            .expect("same-version bundle repairs the desktop");
+        assert_eq!(download.version, GATEWAY_VERSION);
+    }
+
+    #[test]
+    fn advertising_a_release_does_not_allow_downgrading_the_gateway() {
+        let mut s = Schedules::new(Instant::now(), false);
+        s.install = Some(InstallKind::WindowsDir {
+            dir: PathBuf::from("install"),
+        });
+        s.finish_app_check(Ok(update_release("0.0.0")));
+
+        assert_eq!(
+            s.app_view().latest.map(|r| r.version).as_deref(),
+            Some("0.0.0")
+        );
+        assert!(matches!(
+            s.download_refusal(),
+            Some(GatewayError::Refused(_))
+        ));
+        assert!(s.download_plan().is_none());
+    }
 
     fn auto_folder(project: &Path, pass: (u32, u32)) -> LaneJob {
         LaneJob {

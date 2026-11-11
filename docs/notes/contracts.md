@@ -1777,6 +1777,11 @@ Facts + user decisions: `docs/notes/wave14.md`. New workspace deps (root `Cargo.
   Update button; a window close during download cancels and waits, during apply defers ("Finishing the OmpDeck
   update…") and then closes without relaunching; a successful Update and restart flushes `state.json` before
   spawning the successor (observed ~30 ms after the flush, the old GUI exits ~90 ms later).
+- Gateway update snapshots retain the latest published release independently of the gateway's version.
+  Each desktop compares it with its own running GUI version: upgrading only the gateway must not hide
+  an update from an older GUI. A same-version bundle may be downloaded to align that GUI, but downloads
+  older than the running gateway are refused. The phone's Updates feed still offers only releases newer
+  than the gateway, so it never advertises a same-version reinstall or downgrade.
 - `changes`: binary diffs have empty text; untracked directories share one byte budget; `discard` skips untracked,
   unchanged and intent-to-add entries; `stage` on a conflicted file marks it resolved; unstaging a staged rename also
   unstages its source; `delete_untracked` accepts only `Would remove` lines for the requested path and refuses when
