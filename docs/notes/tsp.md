@@ -148,5 +148,11 @@ hello/ack harness and replays them through a fake omp.
   `next`/`submit`/`cancel`/`hide`/`show`.
 - Fixture `crates/omp-deck/src/chat_view/ask-form.json` (recorded from omp 18.18.6, ids prefixed `q`): cases
   `initial`, `check_go`, `name_typed`, `other_typed`, `review`, `hidden`.
+- Completed answers render as a previewed `omp.tool.ask` tool containing a section and answer rows. Measure that
+  body invisibly with its normal layout, not an egui sizing pass: sizing removes cross-axis centering and makes
+  the preview clip shorter than the rendered answer. Copy collection discards the probe's text runs.
+  `ask-answer.json` captures a completed response; the clipping regression checks the full answer and following
+  reply at wide and narrow pane widths. Native Xvfb smoke on omp 18.18.7 also shows the subsequent eval result and
+  final reply in full.
 - The phone answers it through the ctl extension's `formDialog` wrap, not TSP (`docs/notes/mobile-pwa.md`
   "HTML-form ask").

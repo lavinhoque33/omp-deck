@@ -1,0 +1,74 @@
+{
+  "recorded": "omp native TSP, resuming a deterministic HTML-form ask journal with one completed answer.",
+  "node": {
+    "id": "5",
+    "k": "tool",
+    "p": {
+      "role": "omp.tool.ask",
+      "key": "ask1",
+      "name": "ask",
+      "title": "Ask",
+      "target": "May I create the project and accept these terms on your behalf?",
+      "targetKind": "text",
+      "status": "done",
+      "frame": "card",
+      "collapsible": true,
+      "collapsed": true,
+      "preview": {
+        "lines": 10
+      }
+    },
+    "c": [
+      {
+        "id": "5.0",
+        "k": "section",
+        "c": [
+          {
+            "id": "5.0/0",
+            "k": "text",
+            "p": {
+              "wrap": "word",
+              "spans": [
+                {
+                  "t": "May I create the project and accept these terms on your behalf?"
+                }
+              ]
+            }
+          },
+          {
+            "id": "5.0/1",
+            "k": "row",
+            "p": {
+              "gap": "sm",
+              "align": "baseline",
+              "role": "omp.tool.answer"
+            },
+            "c": [
+              {
+                "id": "5.0/1/0",
+                "k": "icon",
+                "p": {
+                  "name": "check",
+                  "tone": "success"
+                }
+              },
+              {
+                "id": "5.0/1/1",
+                "k": "text",
+                "p": {
+                  "wrap": "word",
+                  "spans": [
+                    {
+                      "t": "Yes — create the Firebase project and configure FCM",
+                      "s": "toolOutput"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

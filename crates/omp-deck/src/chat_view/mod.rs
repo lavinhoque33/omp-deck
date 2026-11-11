@@ -3450,6 +3450,69 @@ mod tests {
         );
     }
 
+    /// Completed HTML-form ask, captured from omp's native renderer.
+    fn ask_answer_ops() -> serde_json::Value {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("ask-answer.json")).expect("answer fixture");
+        let mut ops: Vec<serde_json::Value> =
+            ["1", "n", "o", "q", "s", "u", "v", "x", "z", "10", "11"]
+                .into_iter()
+                .map(|id| serde_json::json!(["del", id]))
+                .collect();
+        let node = &fixture["node"];
+        ops.push(serde_json::json!(["add", node["id"], "main", null, node]));
+        ops.push(serde_json::json!(["add", "after-answer", "main", null, {
+            "id": "after-answer", "k": "md",
+            "p": {"role": "omp.assistant", "text":
+                "The selected answer is recorded. This following reply must remain visible in full."}
+        }]));
+        serde_json::Value::Array(ops)
+    }
+
+    #[test]
+    fn a_completed_ask_answer_and_the_following_reply_are_not_clipped() {
+        fn fully_visible(shape: &Shape, clip: Rect, want: &str) -> bool {
+            match shape {
+                Shape::Text(t) if t.galley.text() == want => {
+                    let bounds = Rect::from_min_size(t.pos, t.galley.size());
+                    assert!(
+                        clip.expand(0.5).contains_rect(bounds),
+                        "{want:?} is clipped: {bounds:?} outside {clip:?}"
+                    );
+                    true
+                }
+                Shape::Vec(v) => {
+                    let mut found = false;
+                    for s in v {
+                        found |= fully_visible(s, clip, want);
+                    }
+                    found
+                }
+                _ => false,
+            }
+        }
+        for width in [900.0, 360.0] {
+            let mut h = Harness::with_frames(&format!("ask-answer-{width}"), &[ask_answer_ops()]);
+            h.width = width;
+            show_until(
+                &mut h,
+                "Yes — create the Firebase project and configure FCM",
+            );
+            let out = h.settle();
+            for text in [
+                "May I create the project and accept these terms on your behalf?",
+                "Yes — create the Firebase project and configure FCM",
+                "The selected answer is recorded. This following reply must remain visible in full.",
+            ] {
+                let mut painted = false;
+                for s in &out.shapes {
+                    painted |= fully_visible(&s.shape, s.clip_rect, text);
+                }
+                assert!(painted, "{text:?} was not painted at width {width}");
+            }
+        }
+    }
+
     /// The dock showing case `case` of `ask-form.json`: omp 18.18.6's `ask` form, recorded.
     fn ask_form(name: &str, case: &str) -> Harness {
         let fixture: serde_json::Value =

@@ -1648,9 +1648,10 @@ fn measure_body(cx: &Cx, ui: &mut Ui, n: &SNode, w: f32, tx: &Tx, folded: bool) 
         UiBuilder::new()
             .id_salt("tool-measure")
             .max_rect(rect)
+            // Sizing passes remove cross-axis centering. A preview needs the real layout's
+            // height, including the vertical offsets inside section and answer rows.
             .layout(Layout::top_down(Align::Min))
-            .invisible()
-            .sizing_pass(),
+            .invisible(),
     );
     probe.set_width(w);
     // A tool nested in this body measures its own body meanwhile: keep ours around it.
@@ -1660,7 +1661,11 @@ fn measure_body(cx: &Cx, ui: &mut Ui, n: &SNode, w: f32, tx: &Tx, folded: bool) 
             l.fold_probe.replace((n.id.clone(), false)),
         )
     });
-    body_children(cx, &mut probe, n, tx);
+    if cx.collecting() {
+        cx.discarding(|| body_children(cx, &mut probe, n, tx));
+    } else {
+        body_children(cx, &mut probe, n, tx);
+    }
     let (grids, fold_cut) = cx.loc(|l| {
         (
             std::mem::replace(&mut l.row_grids, grids_out).unwrap_or_default(),
