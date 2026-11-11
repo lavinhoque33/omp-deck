@@ -4298,7 +4298,7 @@ phone's, or an automatic pass), because the gateway owns the lane; the window's 
   project must be shown as setup required, never treated as delivered notifications.
 - `api-android.json` is a separate pinned shared vector; existing v1/s4/form vector bytes stay unchanged.
 
-### Android APK updates and release assets (0.28.0)
+### Android APK updates and release assets (0.28.1)
 
 - The native updater checks this repository's fixed GitHub latest-release endpoint on launch and every six
   hours while foreground; automatic checks are toggleable, manual checks always available. The APK has its own
