@@ -709,6 +709,35 @@ button:focus-visible,
   margin-top: 3px;
 }
 
+/* The Android update strip above a pushed screen: part of the column, never over the screen. */
+.update-host {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+.update-host > .screen {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+}
+.update-host.has-update > .screen > .top {
+  padding-top: 14px;
+}
+.update-host.has-update > :is(.chat, .terminal, .fleet) > .top {
+  padding-top: 9px;
+}
+.update-strip {
+  flex: none;
+  padding: calc(8px + env(safe-area-inset-top)) 12px 0;
+  background: var(--bg);
+}
+.update-strip:empty {
+  display: none;
+}
+.update-strip .banner {
+  margin-bottom: 8px;
+}
+
 /* ---- form fields ---- */
 .field {
   display: block;

@@ -134,6 +134,8 @@ pub const MAX_DIFF_TEXT: usize = 768 * 1024;
 
 /// The slice-4 feature name ([`Welcome::features`], `DeviceHello.features`).
 pub const FEATURE_S4: &str = "s4";
+/// Native Android encrypted FCM subscriptions; advertised only by a configured sender.
+pub const FEATURE_ANDROID_PUSH: &str = "android_push";
 /// [`Op::LastReply`]: bytes of the reply text at most, then `truncated`.
 pub const MAX_LAST_REPLY: usize = 256 * 1024;
 /// Raw bytes of one [`Resp::Chunk`] / [`Op::UploadChunk`] at most (sent as base64).
@@ -1268,6 +1270,13 @@ pub enum Op {
         p256dh: String,
         auth: String,
     },
+    /// Native Android FCM token and per-desktop AES-256-GCM key (base64url).
+    /// Sent only when the gateway advertises [`FEATURE_ANDROID_PUSH`].
+    PushAndroidSubscribe {
+        token: String,
+        key: String,
+        desktop: String,
+    },
     PushUnsubscribe {},
     PushPrefs {
         prefs: PushPrefs,
@@ -1497,6 +1506,7 @@ impl Op {
         "sync_backups",
         "presence",
         "push_subscribe",
+        "push_android_subscribe",
         "push_unsubscribe",
         "push_prefs",
         "device_rename",
@@ -1586,6 +1596,7 @@ impl Op {
             Op::SyncBackups { .. } => "sync_backups",
             Op::Presence { .. } => "presence",
             Op::PushSubscribe { .. } => "push_subscribe",
+            Op::PushAndroidSubscribe { .. } => "push_android_subscribe",
             Op::PushUnsubscribe {} => "push_unsubscribe",
             Op::PushPrefs { .. } => "push_prefs",
             Op::DeviceRename { .. } => "device_rename",
@@ -1674,6 +1685,7 @@ impl Op {
             | Op::SyncBackups { .. }
             | Op::Presence { .. }
             | Op::PushSubscribe { .. }
+            | Op::PushAndroidSubscribe { .. }
             | Op::PushUnsubscribe {}
             | Op::PushPrefs { .. }
             | Op::DeviceRename { .. }

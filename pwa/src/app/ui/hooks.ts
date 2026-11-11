@@ -2,6 +2,7 @@
 
 import { createContext, useContext, useEffect, useState, useSyncExternalStore } from 'react';
 import type { api } from '../../remote/index.ts';
+import { type NativeUpdateController, type NativeUpdateView, nativeUpdates } from '../native-update.ts';
 import { type Client, type ClientState, type TranscriptState, feedKey } from '../client.ts';
 import type { Desktops, DesktopsState } from '../desktops.ts';
 
@@ -114,4 +115,17 @@ export function useProjectDisplay(project: string, placeholder: string): { text:
   const found = feed?.projects.find((entry) => entry.id === project);
   if (found !== undefined) return { text: found.display, resolved: true };
   return { text: placeholder.length > 0 ? placeholder : 'Project', resolved: false };
+}
+
+const NO_UPDATE_VIEW = null;
+const noSubscription = (): (() => void) => () => undefined;
+
+/**
+ * The Android app's own update (`null` in a browser, which has none): the shell's last state and
+ * the actions. It follows the shell only while a component uses it, and needs no desktop.
+ */
+export function useNativeUpdate(): { view: NativeUpdateView; controller: NativeUpdateController } | null {
+  const controller = nativeUpdates();
+  const view = useSyncExternalStore(controller?.subscribe ?? noSubscription, controller?.get ?? (() => NO_UPDATE_VIEW));
+  return controller === null || view === null ? null : { view, controller };
 }

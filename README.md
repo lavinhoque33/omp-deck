@@ -444,6 +444,11 @@ irm https://raw.githubusercontent.com/lavinhoque33/omp-deck/main/packaging/insta
 Release assets come with `.sha256` files and a combined `SHA256SUMS`. Linux binaries are built on
 Ubuntu 22.04 (glibc 2.35 or newer).
 
+**Android:** download the signed `OmpDeck-<version>.apk` from the
+[latest release](https://github.com/lavinhoque33/omp-deck/releases/latest), then open it on the phone to install
+or upgrade. Android 8+ is required; native notifications also need Google Play Services and your Firebase setup.
+See [the Android setup guide](docs/android.md). Existing app pairings survive upgrades.
+
 **From source** (Rust stable, 2024 edition; on Debian/Ubuntu you need
 `pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev`):
 
@@ -750,8 +755,8 @@ uncommitted changes), plus **Switch main checkout back to …**. Unpushed work i
 
 ## Mobile companion
 
-The shipped phone app is a web app (PWA) that talks to OmpDeck on your desktop through a **relay you host yourself**;
-see the [phone screenshots above](#phone-companion).
+The phone companion is available as a browser app (PWA) and a bundled **Android APK**. Both use the same screens
+and talk to your desktop through a **relay you host yourself**; see the [phone screenshots above](#phone-companion).
 The relay only forwards end-to-end encrypted frames (Noise); it never sees your sessions, keys or content,
 and there is no public relay.
 
@@ -771,11 +776,18 @@ Google's push service, and reconnects.
    Clicking elsewhere in OmpDeck (or Esc) only hides the pairing dialog: a **Pairing** pill in the title bar brings
    it back until the pairing ends. Only **Cancel** / **Deny** end it.
 
-On the phone, add the app to the home screen: tap **Install** on the app's banner where the browser offers it
-(Chrome, Edge, Opera, Samsung Internet), otherwise follow the banner's hint to the browser's own menu entry. The
-pairing is stored per browser, so pair and install from the same one. Push notifications (turn finished, needs
-input, session ended) need an HTTPS relay; they are skipped while the app is open on the phone. Google Drive sign-in
-and other desktop-only steps are handed to the desktop ("Sign in on the desktop").
+**Android APK:** install the signed `OmpDeck-<version>.apk` from
+[GitHub Releases](https://github.com/lavinhoque33/omp-deck/releases/latest) (Android 8+; Google Play Services
+for native notifications). The UI ships in the APK, so UI updates require an APK update. Paste the desktop's pairing
+link into the app; browser pairings stay separate. Native notifications use your Firebase project and encrypted FCM
+data messages. It checks for APK updates in-app and downloads verified upgrades on request; Android confirms the
+installation. Build, signing and Firebase setup: [docs/android.md](docs/android.md).
+
+**Browser/PWA:** add the app to the home screen: tap **Install** on its banner where offered (Chrome, Edge,
+Opera, Samsung Internet), otherwise follow the browser-menu hint. Pair and install from the same browser.
+Browser Web Push needs an HTTPS relay. Both clients skip notifications for the desktop currently visible and
+connected on the phone; other paired desktops retain their own notification preferences.
+Google Drive sign-in and other desktop-only steps are handed to the desktop ("Sign in on the desktop").
 
 ## Uninstall
 
@@ -790,8 +802,8 @@ and other desktop-only steps are handed to the desktop ("Sign in on the desktop"
 
 ## Development
 
-The Rust workspace includes the native desktop, persistent session host, shared service, gateway and relay;
-the shipped phone PWA lives in `pwa/`.
+The Rust workspace includes the native desktop, persistent session host, shared service, gateway and relay.
+The phone UI lives in `pwa/`; `android/` bundles it in the native Android shell.
 
 <details><summary>Build commands, architecture, mobile protocol and release checks</summary>
 

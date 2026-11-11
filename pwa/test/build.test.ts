@@ -105,3 +105,57 @@ describe('test-only code stays out of dist', () => {
     expect(html).not.toContain('boot.js');
   });
 });
+
+describe('android bundle', () => {
+  let androidDir: string;
+  let android: BuildResult;
+
+  const all = (dir: string): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => (entry.isDirectory() ? all(join(dir, entry.name)) : [join(dir, entry.name)]));
+
+  beforeAll(async () => {
+    androidDir = mkdtempSync(join(tmpdir(), 'ompdeck-pwa-android-'));
+    android = await build({ android: true, outdir: androidDir });
+  }, 120_000);
+
+  afterAll(() => {
+    rmSync(androidDir, { recursive: true, force: true });
+  });
+
+  test('ships no service worker, manifest, icons or compressed siblings: the shell serves the files as they are', () => {
+    expect(android.precache).toEqual([]);
+    const names = all(androidDir).map((path) => path.slice(androidDir.length + 1));
+    for (const name of names) {
+      expect(name).not.toMatch(/\.(gz|br|map|png|webmanifest)$/);
+      expect(name).not.toBe('sw.js');
+    }
+    expect(names).toContain('index.html');
+  });
+
+  test('every URL is relative, so the bundle works under any asset path prefix', () => {
+    const html = readFileSync(join(androidDir, 'index.html'), 'utf8');
+    const urls = [...html.matchAll(/(?:src|href)="([^"]+)"/g)].map((match) => match[1] ?? '');
+    expect(urls.some((url) => url.endsWith('.js'))).toBe(true);
+    expect(urls.some((url) => url.endsWith('.css'))).toBe(true);
+    for (const url of urls) {
+      expect(url).not.toMatch(/^(\/|https?:)/);
+      expect(existsSync(join(androidDir, url))).toBe(true);
+    }
+  });
+
+  test('CSS names its fonts next to itself, and every font exists there', () => {
+    const assets = join(androidDir, 'assets');
+    const css = readdirSync(assets).filter((name) => name.endsWith('.css'));
+    expect(css.length).toBeGreaterThan(0);
+    let fonts = 0;
+    for (const name of css) {
+      const text = readFileSync(join(assets, name), 'utf8');
+      expect(text).not.toMatch(/url\(\s*["']?\//);
+      for (const match of text.matchAll(/url\(\s*["']?(\.\/[^"')]+\.ttf)["']?\s*\)/g)) {
+        fonts++;
+        expect(existsSync(join(assets, match[1] ?? ''))).toBe(true);
+      }
+    }
+    expect(fonts).toBe(5);
+  });
+});

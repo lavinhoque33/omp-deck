@@ -225,6 +225,23 @@ impl Mobile {
         self.parts.as_mut().ok().map(|p| &mut p.registry)
     }
 
+    /// This gateway's desktop id as the phones know it: the lowercase hex of its static key
+    /// (`None`: mobile access is unavailable).
+    pub(super) fn desktop_id(&self) -> Option<String> {
+        use std::fmt::Write as _;
+        let parts = self.parts.as_ref().ok()?;
+        Some(
+            parts
+                .identity
+                .public()
+                .iter()
+                .fold(String::with_capacity(64), |mut hex, b| {
+                    let _ = write!(hex, "{b:02x}");
+                    hex
+                }),
+        )
+    }
+
     /// The PWA's origin, served by the configured relay.
     pub(super) fn pwa_origin(&self) -> Option<String> {
         self.relay.as_ref().map(|r| r.url.pwa_origin())
@@ -782,6 +799,7 @@ impl Engine {
                         created_unix_ms: now,
                         last_seen_unix_ms: now,
                         push: None,
+                        android_push: None,
                     })
                     .map_err(failed)?;
                 w.approve(at, now);

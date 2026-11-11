@@ -136,3 +136,26 @@ export function cancelUpdate(): void {
   stopWatching();
   set({ pending: false });
 }
+
+/**
+ * The Android app serves its bundled assets itself: no service worker may stand between the app and
+ * them (it could only ever serve a stale copy), so leftovers are unregistered and every cache is
+ * cleared. Best effort; the app never registers one, so there is normally nothing to find.
+ */
+export async function retireServiceWorkers(
+  container: Pick<ServiceWorkerContainer, 'getRegistrations'> | undefined,
+  storage: Pick<CacheStorage, 'keys' | 'delete'> | undefined,
+): Promise<void> {
+  try {
+    const registrations = (await container?.getRegistrations()) ?? [];
+    await Promise.all(registrations.map((registration) => registration.unregister()));
+  } catch {
+    // Nothing to retire that could be reached.
+  }
+  try {
+    const names = (await storage?.keys()) ?? [];
+    await Promise.all(names.map((name) => storage?.delete(name)));
+  } catch {
+    // Same.
+  }
+}

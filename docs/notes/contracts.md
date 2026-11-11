@@ -4260,3 +4260,65 @@ phone's, or an automatic pass), because the gateway owns the lane; the window's 
 - Click on the pill opens Settings → Project sync for project kinds, Settings → OmpDeck → Backup for config/account.
 - Palette: "Backup: Cancel running job" while a cancellable lane job runs (same gated path as the card).
 - Results are still reported by the existing toasts / Sync page; the pill simply disappears when the lane frees.
+
+## Android companion wrapper and encrypted FCM (user, 2026-11-10)
+
+- Android is a WebView wrapper of the existing React companion, not a Kotlin UI rewrite. The UI is bundled in
+  the APK at `https://appassets.androidplatform.net/index.html`; existing browser/PWA support stays.
+  Native UI updates require an APK update; the self-hosted encrypted relay and gateway remain the session route.
+- Package: `io.github.lavinhoque33.ompdeck`. The privileged bridge exists only for the bundled origin's main frame
+  through AndroidX WebKit's origin-scoped web messaging. External pages open outside that WebView. No cleartext,
+  broad file permissions, unrestricted JavaScript interfaces, Android backup of pairings, or release debugging.
+- Bridge requests are JSON `{id, method, params}` and replies `{id, result}` or `{id, error}` through
+  `OmpDeckAndroid.postMessage`/`onmessage`. Async events are `{event, detail}`. Methods cover `info`, `pushState`,
+  `pushEnable`, `pushSubscription`, `pushForget`, `pushLabels`, `setPresence`, `saveFile`, `finish` and the APK
+  update methods below; events cover `push_changed`, `visibility`, `open`, `back` and `update`. Notification
+  permission/config import and APK installation require a user tap.
+  Native lifecycle visibility gates gateway presence even when WebView document visibility does not change.
+- `pushSubscription {desktop, label}` returns `{token, key, desktop}`: current FCM token and per-desktop random
+  32-byte AES key as unpadded base64url, protected at rest by Android Keystore. Desktop ids are 64 lowercase hex
+  gateway public-key ids. Disabling/forgetting one desktop removes only its key and pending notifications.
+- Additive `FEATURE_ANDROID_PUSH = "android_push"` and View/nonjournaled `Op::PushAndroidSubscribe {token, key,
+  desktop}` (`push_android_subscribe`); advertised in Welcome only when a valid FCM sender is configured.
+  Existing `push_unsubscribe`, `push_prefs`, device subscription state and canonical notification policy apply
+  to either transport. Browser and native registrations are mutually exclusive per paired device; refresh
+  retains preferences. `Device.android_push` is optional and absent in old registry files.
+- FCM HTTP v1 is sent directly by the gateway using a local service account
+  (`OMP_DECK_FCM_CREDENTIALS` or `fcm-service-account.json` in its secrets directory). Only fixed Google OAuth/FCM
+  endpoints are used; account-supplied URLs are not trusted. Credentials never go in the APK, device protocol
+  or relay. Sender work is bounded/off-thread, with cached OAuth authorization. Only UNREGISTERED invalidates
+  an exact unchanged native registration; configuration/auth errors do not silently erase a subscription.
+- FCM data: `{v:"1", desktop, nonce, ciphertext}`. Nonce: random 12 bytes; AES-256-GCM ciphertext includes its
+  16-byte tag, both base64url. AAD: UTF-8 `ompdeck-android-push-v1:` followed by desktop id. Plaintext is the
+  existing bounded declarative notification payload plus encrypted `expires_unix_ms`. Native verifies expiry,
+  rejects replay/malformed messages, suppresses only the visible desktop, and adds the desktop id to navigation.
+  Google sees delivery metadata and opaque desktop ids, not notification content or session paths.
+- Firebase Android configuration is imported at runtime; builds contain no fake project. A Firebase project
+  and matching client/server configuration are external prerequisites for actual Google delivery. A missing
+  project must be shown as setup required, never treated as delivered notifications.
+- `api-android.json` is a separate pinned shared vector; existing v1/s4/form vector bytes stay unchanged.
+
+### Android APK updates and release assets (0.28.0)
+
+- The native updater checks this repository's fixed GitHub latest-release endpoint on launch and every six
+  hours while foreground; automatic checks are toggleable, manual checks always available. The APK has its own
+  update banner and Settings card, independent of a paired/online desktop or Manage permission. Browser/PWA
+  service-worker updates stay unchanged.
+- Bridge methods `updateState`, `updateCheck`, `updateInstall` take empty params; `updateConfigure` takes
+  `{auto_check: boolean}`. Replies and the `update` event contain:
+  `{current, latest?, phase, downloaded, total?, checked_unix_ms?, auto_check, error?}`. Optional values are
+  JSON null; `phase` is `idle | checking | available | downloading | ready | installing | error`.
+  Calls return immediately and async changes arrive as events. `ready` can carry installer cancellation,
+  permission-denial or launch-failure feedback in `error`; UI displays it regardless of phase and allows retry.
+- `updateInstall` is an explicit user action. Only newer `OmpDeck-<version>.apk` assets with the published
+  `.apk.sha256`, expected package/version and installed signing certificate may reach Android's installer.
+  HTTPS redirects are restricted to GitHub's API/release hosts; response sizes, redirects and timeouts are bounded.
+  Downloads/cache are private; the non-exported `.updates` FileProvider grants read-only access to verified APKs.
+  Android's unknown-source permission and installation confirmation remain mandatory; no silent installation,
+  arbitrary URL/path bridge arguments, or release debugging. Backgrounding revokes automatic installer consent;
+  cancellation keeps a verified download retryable.
+- Tagged releases require successful Linux, Windows x64 and signed Android jobs. Version comes from the
+  workspace (`major*1000000 + minor*1000 + patch` Android code); signing secrets stay in encrypted GitHub Actions
+  repository secrets, never source or artifacts. The signing fingerprint is pinned. APK + sidecar join
+  `SHA256SUMS`; a draft becomes public only after all release assets upload. Firebase sender credentials never
+  enter CI.

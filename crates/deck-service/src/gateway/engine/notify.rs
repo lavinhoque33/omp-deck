@@ -134,23 +134,25 @@ impl Engine {
         let Some(registry) = self.mobile.registry() else {
             return;
         };
-        if registry.devices().iter().all(|d| d.push.is_none()) {
+        if registry.devices().iter().all(|d| !d.has_push()) {
             return;
         }
         let present: HashSet<String> = registry
             .devices()
             .iter()
-            .filter(|d| d.push.is_some() && self.device_visible(&d.id))
+            .filter(|d| d.has_push() && self.device_visible(&d.id))
             .map(|d| d.id.clone())
             .collect();
         let opens = self.push_opens(target);
         let fallback = target.key.to_string();
+        let desktop = self.mobile.desktop_id().unwrap_or_default();
         let offer = push::Offer {
             kind,
             title,
             opens: opens.as_ref(),
             fallback: &fallback,
             origin: &origin,
+            desktop: &desktop,
         };
         let Some(registry) = self.mobile.registry() else {
             return;
@@ -160,12 +162,25 @@ impl Engine {
             .offer(registry.devices(), |id| present.contains(id), &offer);
     }
 
-    /// Deletes the subscriptions the push services reported gone (404/410).
+    /// Deletes the subscriptions the push services reported gone: Web Push 404/410, FCM
+    /// UNREGISTERED. Each names the exact subscription; a device that subscribed anew since
+    /// keeps its new one.
     fn forget_gone_pushes(&mut self) {
         let gone = self.notify.push.take_gone();
+        let gone_android = self.notify.push.take_gone_android();
         let Some(registry) = self.mobile.registry_mut() else {
             return;
         };
+        for g in gone_android {
+            match push::forget_android(registry, &g) {
+                Ok(true) => self.dirty.mobile = true,
+                Ok(false) => {}
+                Err(e) => log::warn!(
+                    "cannot delete the unregistered Android registration of {}: {e}",
+                    g.device
+                ),
+            }
+        }
         for g in gone {
             match push::forget(registry, &g) {
                 Ok(true) => self.dirty.mobile = true,

@@ -19,6 +19,8 @@ import { api, fromBase64Url, toBase64Url } from '../remote/index.ts';
 import type { Bytes } from '../remote/bytes.ts';
 import { LEGACY_PUSH_KEY_URL, PUSH_CHANGED_MESSAGE, PUSH_STATE_CACHE, desktopScope, pushKeyUrl, pushLabelUrl, pushLabels } from '../push.ts';
 import { hasS4 } from './client.ts';
+import { nativeHost } from './native.ts';
+import { NativePushController, appMarkers } from './native-push.ts';
 import { useClient, useClientState, useDesktops, useDesktopsState } from './ui/hooks.ts';
 
 export type PushSupport =
@@ -54,6 +56,16 @@ export interface PushClientLike {
   getState(): { welcome: api.Welcome | null };
 }
 
+/** What the Android app still needs before native push can work (null in a browser). */
+export interface NativePushStatus {
+  /** Firebase is set up on this phone (a `google-services.json` was imported). */
+  phoneConfigured: boolean;
+  /** Firebase has issued this phone a token. */
+  hasToken: boolean;
+  /** The desktop advertises `android_push`: its FCM sender is configured. */
+  desktopSender: boolean;
+}
+
 export interface PushState {
   support: PushSupport;
   permission: PushPermission;
@@ -61,6 +73,18 @@ export interface PushState {
   subscribed: boolean;
   busy: boolean;
   error: string | null;
+  /** Set only in the Android app: its push setup status. */
+  native: NativePushStatus | null;
+}
+
+/** What `usePush` drives: the browser's Web Push controller, or the Android app's native one. */
+export interface PushControllerLike {
+  subscribe(listener: () => void): () => void;
+  getState(): PushState;
+  sync(): Promise<void>;
+  enable(): Promise<void>;
+  disable(): Promise<void>;
+  setPrefs(prefs: api.PushPrefs): Promise<void>;
 }
 
 export interface PushControl extends PushState {
@@ -107,7 +131,7 @@ function message(error: unknown): string {
 }
 
 /** Holds the push state for `usePush` and runs its flows. */
-export class PushController {
+export class PushController implements PushControllerLike {
   readonly #client: PushClientLike;
   readonly #env: PushEnv;
   readonly #listeners = new Set<() => void>();
@@ -116,7 +140,7 @@ export class PushController {
   constructor(client: PushClientLike, env: PushEnv) {
     this.#client = client;
     this.#env = env;
-    this.#state = { support: env.support, permission: env.permission(), subscribed: false, busy: false, error: null };
+    this.#state = { support: env.support, permission: env.permission(), subscribed: false, busy: false, error: null, native: null };
   }
 
   readonly subscribe = (listener: () => void): (() => void) => {
@@ -248,6 +272,8 @@ export class PushController {
 export interface PushDesktop {
   /** The desktop's id: names its service worker registration (`/d/<id>/`). */
   id: string;
+  /** The label the switcher shows for it (the Android app names its notifications with it). */
+  label(): string;
   /** Whether this desktop is the one whose version 1 subscription may still be on the root registration. */
   isLegacy(): boolean;
   /** Records that the version 1 subscription is gone. */
@@ -401,17 +427,19 @@ export function watchPushLabels(desktops: { getState(): { desktops: readonly { i
   return desktops.subscribe(sync);
 }
 
-const controllers = new WeakMap<object, PushController>();
+const controllers = new WeakMap<object, PushControllerLike>();
 
 function isStandalone(): boolean {
   return window.matchMedia('(display-mode: standalone)').matches || (navigator as Navigator & { standalone?: boolean }).standalone === true;
 }
 
 /** The app's push controller for `client` (one per desktop: the client is bound to it). */
-export function pushController(client: PushClientLike, desktop: PushDesktop): PushController {
+export function pushController(client: PushClientLike, desktop: PushDesktop): PushControllerLike {
   let controller = controllers.get(client);
   if (controller === undefined) {
-    controller = new PushController(client, browserPushEnv(isStandalone(), desktop));
+    const host = nativeHost();
+    controller =
+      host === null ? new PushController(client, browserPushEnv(isStandalone(), desktop)) : new NativePushController(client, host, desktop, appMarkers());
     controllers.set(client, controller);
   }
   return controller;
@@ -425,6 +453,7 @@ function useActivePushDesktop(): PushDesktop {
     if (id === null) throw new Error('push without an active desktop');
     return {
       id,
+      label: () => desktops.getState().desktops.find((entry) => entry.id === id)?.gateway ?? 'OmpDeck',
       isLegacy: () => desktops.getState().legacyPush === id,
       legacyDone: () => desktops.clearLegacyPush(),
     };
@@ -459,6 +488,9 @@ export function usePushSync(): void {
     if (welcome !== null) void controller.sync();
   }, [controller, welcome]);
   useEffect(() => {
+    // The Android app has no service worker; its shell reports a changed token, Firebase setup or permission.
+    const host = nativeHost();
+    if (host !== null) return host.on('push_changed', () => void controller.sync());
     const container: ServiceWorkerContainer | undefined = navigator.serviceWorker;
     if (container === undefined) return;
     const onMessage = (event: MessageEvent<unknown>) => {

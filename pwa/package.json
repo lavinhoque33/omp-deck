@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "bun run build.ts",
+    "build:android": "bun run build.ts --android",
     "dev": "bun run build.ts --dev",
     "e2e": "bun e2e/run.ts",
     "live": "bun e2e/live/run.ts",

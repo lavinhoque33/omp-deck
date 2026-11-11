@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar glyph: Android draws only the alpha channel. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <path
+        android:pathData="M178,128 H358 A28,28 0 0 1 386,156 V268 A28,28 0 0 1 358,296 H178 A28,28 0 0 1 150,268 V156 A28,28 0 0 1 178,128 Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="26" />
+    <path
+        android:pathData="M162,176 H342 A28,28 0 0 1 370,204 V316 A28,28 0 0 1 342,344 H162 A28,28 0 0 1 134,316 V204 A28,28 0 0 1 162,176 Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="26" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M146,224 H326 A28,28 0 0 1 354,252 V364 A28,28 0 0 1 326,392 H146 A28,28 0 0 1 118,364 V252 A28,28 0 0 1 146,224 Z" />
+</vector>

@@ -7,7 +7,7 @@ import { api } from '../../remote/index.ts';
 import type { ToolRenderHost } from '../../vendor/omp-collab/tool-render/index.ts';
 import { ClientError, type ConfirmView } from '../client.ts';
 import { useNav } from '../nav.ts';
-import { downloadAndSave } from '../transfer.ts';
+import { downloadAndSave, isAbort } from '../transfer.ts';
 import { adaptTranscript } from '../transcript/adapter.ts';
 import { perform, shortModel, statusLabel, succeeded, tokens } from '../ui/format.ts';
 import { useCan, useClient, useClientState, useFeed, useNow, useTranscript } from '../ui/hooks.ts';
@@ -410,7 +410,8 @@ function ActionSheet({
       client.notify('Exported the session as HTML.');
       onClose();
     } catch (error) {
-      client.notify(`Export failed: ${errorText(error)}`, 'error');
+      // Dismissing Android's save dialog is the user's choice, not a failed export.
+      if (!isAbort(error)) client.notify(`Export failed: ${errorText(error)}`, 'error');
     } finally {
       setBusy(false);
       setExportProgress(null);

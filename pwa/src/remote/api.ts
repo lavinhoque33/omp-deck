@@ -60,6 +60,11 @@ export const MAX_DIFF_TEXT = 768 * 1024;
 export const FEATURE_S4 = 's4';
 /** omp 18.18's HTML-form `ask` (`UiKind` `form`): listed to a device that announced it. */
 export const FEATURE_FORM = 'form';
+/**
+ * Native Android encrypted FCM push (`push_android_subscribe`): the gateway lists it in
+ * `Welcome.features` only while its FCM sender is configured. Gateway → device only; a device never announces it.
+ */
+export const FEATURE_ANDROID_PUSH = 'android_push';
 /** `last_reply` text bytes at most, then `truncated`. */
 export const MAX_LAST_REPLY = 256 * 1024;
 /** Raw bytes of one download/upload chunk at most (sent as base64). */
@@ -305,6 +310,7 @@ export type Op =
   | { op: 'sync_backups'; project?: string | null }
   | { op: 'presence'; visible: boolean }
   | { op: 'push_subscribe'; endpoint: string; p256dh: string; auth: string }
+  | { op: 'push_android_subscribe'; token: string; key: string; desktop: string }
   | { op: 'push_unsubscribe' }
   | { op: 'push_prefs'; prefs: PushPrefs }
   | { op: 'device_rename'; name: string }
@@ -404,6 +410,7 @@ const OP_CLASS: { readonly [K in OpName]: Class } = {
   sync_backups: 'view',
   presence: 'view',
   push_subscribe: 'view',
+  push_android_subscribe: 'view',
   push_unsubscribe: 'view',
   push_prefs: 'view',
   device_rename: 'view',
@@ -2436,6 +2443,7 @@ const opV = tagged<Op, 'op'>('op', {
   sync_backups: { project: nullable(str) },
   presence: { visible: bool },
   push_subscribe: { endpoint: str, p256dh: str, auth: str },
+  push_android_subscribe: { token: str, key: str, desktop: str },
   push_unsubscribe: {},
   push_prefs: { prefs: pushPrefs },
   device_rename: { name: str },

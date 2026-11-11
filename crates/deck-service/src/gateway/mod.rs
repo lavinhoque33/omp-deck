@@ -226,6 +226,8 @@ pub const STARTUP_ENV: &[&str] = &[
     "OMP_DECK_HOST_NS",
     "OMP_DECK_HOST_EXE",
     GATEWAY_EXE_ENV,
+    // The path of the FCM service account file, not its contents.
+    push::fcm::CREDENTIALS_ENV,
 ];
 
 /// A program plus its leading arguments. AppImage: the stable image file and `--gateway` (its

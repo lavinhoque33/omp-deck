@@ -709,6 +709,38 @@ impl Engine {
                 });
                 Ok(None)
             }
+            Op::PushAndroidSubscribe {
+                token,
+                key,
+                desktop,
+            } => {
+                // Nothing to look up: checked here, no network, then stored.
+                let own = self
+                    .mobile
+                    .desktop_id()
+                    .ok_or_else(|| bad("mobile access is off"))?;
+                let sub = push::check_android(
+                    &token,
+                    &key,
+                    &desktop,
+                    &own,
+                    self.notify.push.android_configured(),
+                )
+                .map_err(|e| push_error(&e))?;
+                let reg = self
+                    .mobile
+                    .registry_mut()
+                    .ok_or_else(|| bad("mobile access is off"))?;
+                let changed =
+                    push::subscribe_android(reg, device, sub).map_err(|e| push_error(&e))?;
+                if changed {
+                    // A refreshed token or key, or another transport: pushes still queued for
+                    // the old registration are not sent.
+                    self.notify.push.purge(device);
+                    self.dirty.mobile = true;
+                }
+                Ok(Some(Resp::Unit {}))
+            }
             Op::PushUnsubscribe {} => {
                 let reg = self
                     .mobile
@@ -1007,7 +1039,13 @@ impl Engine {
                     (Ok(sub), Some(device)) => match self.mobile.registry_mut() {
                         None => Err(bad("mobile access is off")),
                         Some(reg) => push::subscribe(reg, &device, sub)
-                            .map(|()| Resp::Unit {})
+                            .map(|replaced_android| {
+                                if replaced_android {
+                                    // The Android registration it replaced is not pushed to.
+                                    self.notify.push.purge(&device);
+                                }
+                                Resp::Unit {}
+                            })
                             .map_err(|e| push_error(&e)),
                     },
                 };

@@ -6,8 +6,9 @@ import { type SettingsSection, useNav } from '../nav.ts';
 import { DEFAULT_THEME, THEMES, type ThemeId } from '../theme.ts';
 import { age } from '../ui/format.ts';
 import { useClient, useClientState, useDesktops, useDesktopsState, useFeed, useNow } from '../ui/hooks.ts';
-import { Card, ConnectionPill, InstallHint, KeyValues, UpdateBanner, useS4 } from '../ui/kit.tsx';
+import { Card, ConnectionPill, InstallHint, KeyValues, NativeUpdateBanner, UpdateBanner, useS4 } from '../ui/kit.tsx';
 import '../../styles/settings.css';
+import { AndroidUpdateCard } from './settings/AndroidUpdate.tsx';
 import { MODE_LABEL, percent, remainingTone, backupDestinationLabel } from './settings/logic.ts';
 
 export function SettingsScreen({
@@ -53,6 +54,7 @@ export function SettingsScreen({
       </header>
       <div className="body">
         <UpdateBanner />
+        <NativeUpdateBanner />
         <InstallHint standalone={standalone} />
 
         <Card title="Appearance" aside={<span className="count">6 themes</span>}>
@@ -75,6 +77,8 @@ export function SettingsScreen({
             ))}
           </div>
         </Card>
+
+        <AndroidUpdateCard />
 
         {!s4 && welcome !== null && (
           <div className="banner warn" role="note">

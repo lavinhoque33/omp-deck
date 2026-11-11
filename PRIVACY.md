@@ -1,7 +1,7 @@
 # OmpDeck privacy policy
 
-OmpDeck is a desktop app that runs entirely on your computer. It has no servers and collects no
-analytics or telemetry.
+OmpDeck runs on your computer and, optionally, your phone. The companion uses a relay you host yourself;
+OmpDeck operates no public relay and collects no analytics or telemetry.
 
 ## Google Drive backup
 
@@ -55,6 +55,35 @@ choose, and touches nothing else on the server. Only one destination is active a
 - **Remove server** deletes `backup-server.json` and `project-sync-server.json` (the record of the last
   project backups on the server) from your computer. It deletes nothing on the server; the backup files stay
   there until you delete them (OmpDeck's **Manage backups…** dialogs delete individual backups).
+
+## Phone companion and notifications
+
+The browser app and Android wrapper connect to your desktop through your self-hosted relay using end-to-end
+encrypted Noise sessions. The relay sees connection metadata and encrypted traffic, not session content or keys.
+Pairings are stored separately per desktop. Revoke a device in OmpDeck to remove its access.
+
+Browser Web Push is encrypted for the browser's push service. The Android app instead uses Firebase Cloud
+Messaging (FCM) in a Firebase project you configure. The desktop sends AES-256-GCM-encrypted data messages
+directly to Google; Google can see delivery metadata, an FCM registration token and an opaque desktop id, but
+not the notification title, body or session destination. The phone decrypts and validates messages before
+displaying them. Session traffic does not go through Firebase.
+
+On Android, the imported `google-services.json` is client configuration, not a service-account credential.
+Native push keys and that configuration are encrypted with Android Keystore; pairing data and keys are
+excluded from Android backups. The Firebase service-account private key stays on the desktop, outside the APK,
+and is used only to authorize FCM sends. Do not put it in the app or share it with the phone.
+
+Notifications require permission and can be disabled per desktop/event in the companion or in Android's
+app settings. The desktop you are currently viewing while connected is suppressed. Google Play Services is
+required for native FCM. See [Android setup](docs/android.md) for configuration and credential removal.
+
+## Android app update checks
+
+By default the Android app contacts this project's GitHub Releases API on launch and every six hours while
+open. Automatic checks can be disabled in Settings; manual checks remain available. GitHub receives ordinary
+request metadata such as your IP address, but no session content, pairing keys or Firebase credentials.
+The APK is downloaded from GitHub only when you choose to update. Downloads are verified before Android asks
+you to approve installation; OmpDeck cannot silently install an update.
 
 ## Contact
 

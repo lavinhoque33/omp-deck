@@ -21,6 +21,8 @@ const LOOPBACK: Policy = Policy {
     allow_loopback: true,
 };
 const ORIGIN: &str = "https://relay.example";
+/// A desktop id: the lowercase hex of a gateway key.
+const DESKTOP: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
 fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
@@ -157,6 +159,7 @@ fn device(id: &str, key: u8) -> Device {
         created_unix_ms: 1,
         last_seen_unix_ms: 1,
         push: None,
+        android_push: None,
     }
 }
 
@@ -188,6 +191,7 @@ fn offer<'a>(kind: MobileKind, opens: &'a Opens) -> Offer<'a> {
         opens: Some(opens),
         fallback: "tmux:x",
         origin: ORIGIN,
+        desktop: DESKTOP,
     }
 }
 
@@ -486,6 +490,7 @@ fn apply(push: &mut Push, reg: &Registry, present: &[&str], effects: Vec<Effect>
                     opens: Some(&Opens::Session(session.to_owned())),
                     fallback: &fallback,
                     origin: ORIGIN,
+                    desktop: DESKTOP,
                 },
             );
         }
@@ -719,4 +724,407 @@ fn server_errors_and_rate_limits_are_retried_at_most_three_times() {
         rx.next();
     }
     rx.quiet(Duration::from_millis(800));
+}
+
+// ---- native Android registrations ----------------------------------------------------------------
+
+use super::fcm::tests as google;
+
+/// device `id` registers `token` natively (under the shared test key); whether that changed it.
+fn android(reg: &mut Registry, id: &str, token: &str) -> bool {
+    let sub = check_android(token, &b64(&google::KEY), DESKTOP, DESKTOP, true).unwrap();
+    subscribe_android(reg, id, sub).unwrap()
+}
+
+fn android_push(server: &google::Server) -> Push {
+    push().with_fcm(Some(server.config()))
+}
+
+#[test]
+fn android_registrations_are_validated_without_the_network() {
+    let key = b64(&google::KEY);
+    let check = |token: &str, key: &str, desktop: &str, configured| {
+        check_android(token, key, desktop, DESKTOP, configured)
+    };
+    assert!(check("tok", &key, DESKTOP, true).is_ok());
+    // No FCM account: the gateway says so, whatever else is true.
+    assert!(matches!(
+        check("tok", &key, DESKTOP, false),
+        Err(PushError::AndroidUnsupported)
+    ));
+    // Another desktop's registration, and a desktop id that is not 64 lowercase hex digits.
+    assert!(matches!(
+        check("tok", &key, &"ff".repeat(32), true),
+        Err(PushError::WrongDesktop)
+    ));
+    for bad in [
+        DESKTOP.to_uppercase(),
+        DESKTOP[..62].to_owned(),
+        String::new(),
+        format!("{}g", &DESKTOP[..63]),
+    ] {
+        assert!(matches!(
+            check("tok", &key, &bad, true),
+            Err(PushError::Invalid(_))
+        ));
+    }
+    // A key is exactly 32 bytes of base64url.
+    for bad in [
+        String::new(),
+        "AAAA".to_owned(),
+        b64(&[1; 31]),
+        b64(&[1; 33]),
+        "!!!".to_owned(),
+        "A".repeat(500),
+    ] {
+        assert!(matches!(
+            check("tok", &bad, DESKTOP, true),
+            Err(PushError::Invalid(_))
+        ));
+    }
+    // A token is bounded visible ASCII.
+    for bad in [
+        String::new(),
+        "a b".to_owned(),
+        "a\"b".to_owned(),
+        "x".repeat(5000),
+        "tök".to_owned(),
+    ] {
+        assert!(matches!(
+            check(&bad, &key, DESKTOP, true),
+            Err(PushError::Invalid(_))
+        ));
+    }
+    // Stored in the canonical form, never printed.
+    let a = check("tok", &format!("{key}="), DESKTOP, true).unwrap();
+    assert_eq!(a.key, key);
+    let shown = format!("{a:?}");
+    assert!(!shown.contains("tok") && !shown.contains(&key), "{shown}");
+}
+
+#[test]
+fn an_android_registration_keeps_prefs_across_refresh_and_transport_and_goes_with_the_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("devices.json");
+    let mut reg = registry(dir.path(), &["d-1"]);
+    let prefs = PushPrefs {
+        attention: false,
+        show_titles: true,
+        ..PushPrefs::default()
+    };
+    // A device without a push subscription is stored exactly as before this feature.
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("android_push")
+    );
+    assert!(matches!(
+        set_prefs(&mut reg, "d-1", prefs),
+        Err(PushError::NotSubscribed)
+    ));
+    assert!(matches!(
+        subscribe_android(
+            &mut reg,
+            "nope",
+            check_android("t", &b64(&google::KEY), DESKTOP, DESKTOP, true).unwrap()
+        ),
+        Err(PushError::NoDevice)
+    ));
+
+    assert!(
+        android(&mut reg, "d-1", "token-1"),
+        "a first registration is a change"
+    );
+    let d = reg.get("d-1").unwrap();
+    assert!(d.push.is_none() && d.has_push() && d.view(false).push);
+    assert!(state_view(d).subscribed);
+    set_prefs(&mut reg, "d-1", prefs).unwrap();
+    let since = state_view(reg.get("d-1").unwrap()).since_unix_ms.unwrap();
+    assert!(since > 0);
+    // The same registration again changes nothing (nothing to purge); a refreshed token keeps
+    // the prefs; so does a new key.
+    assert!(!android(&mut reg, "d-1", "token-1"));
+    assert_eq!(state_view(reg.get("d-1").unwrap()).prefs, prefs);
+    assert_eq!(
+        state_view(reg.get("d-1").unwrap()).since_unix_ms,
+        Some(since)
+    );
+    assert!(android(&mut reg, "d-1", "token-2"));
+    assert_eq!(state_view(reg.get("d-1").unwrap()).prefs, prefs);
+    let rekeyed = check_android("token-2", &b64(&[9; 32]), DESKTOP, DESKTOP, true).unwrap();
+    assert!(subscribe_android(&mut reg, "d-1", rekeyed).unwrap());
+    assert_eq!(state_view(reg.get("d-1").unwrap()).prefs, prefs);
+
+    // It survives a restart, key included, in the one registry file.
+    let reloaded = Registry::load(&path).unwrap();
+    let a = reloaded.get("d-1").unwrap().android_push.clone().unwrap();
+    assert_eq!(
+        (a.token.as_str(), a.key, a.prefs),
+        ("token-2", b64(&[9; 32]), prefs)
+    );
+    let device_debug = format!("{:?}", reloaded.get("d-1").unwrap());
+    assert!(!device_debug.contains("token-2"), "{device_debug}");
+
+    // The transports exclude each other, and the prefs follow the device across them.
+    let ua = Ua::new();
+    let sub = check_with(
+        "http://127.0.0.1:9/a",
+        &ua.p256dh(),
+        &b64(&ua.auth),
+        LOOPBACK,
+    )
+    .unwrap();
+    assert!(
+        subscribe(&mut reg, "d-1", sub).unwrap(),
+        "it replaced an Android registration"
+    );
+    let d = reg.get("d-1").unwrap();
+    assert!(d.android_push.is_none() && d.push.is_some());
+    assert_eq!(state_view(d).prefs, prefs);
+    assert!(android(&mut reg, "d-1", "token-3"));
+    let d = reg.get("d-1").unwrap();
+    assert!(d.push.is_none() && d.android_push.is_some());
+    assert_eq!(state_view(d).prefs, prefs);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("127.0.0.1:9") && text.contains("token-3"),
+        "{text}"
+    );
+    // A browser registering over a browser reports nothing replaced.
+    let sub = check_with(
+        "http://127.0.0.1:9/a",
+        &ua.p256dh(),
+        &b64(&ua.auth),
+        LOOPBACK,
+    )
+    .unwrap();
+    assert!(subscribe(&mut reg, "d-1", sub.clone()).unwrap());
+    assert!(!subscribe(&mut reg, "d-1", sub).unwrap());
+
+    // Unsubscribing clears whichever transport; the file is as it was for a browser-less device.
+    assert!(android(&mut reg, "d-1", "token-4"));
+    unsubscribe(&mut reg, "d-1").unwrap();
+    assert!(!reg.get("d-1").unwrap().has_push());
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("android_push")
+    );
+    // Revoke and unpair remove the record: nothing of the registration stays on disk.
+    assert!(android(&mut reg, "d-1", "token-5"));
+    reg.remove("d-1").unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("token-5") && !text.contains(&b64(&google::KEY)),
+        "{text}"
+    );
+}
+
+#[test]
+fn android_push_follows_the_same_gates_as_web_push_and_is_sealed() {
+    let server = google::Server::google(|_, _| google::Reply::ok());
+    let web = Receiver::start(&[201]);
+    let ua = Ua::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = registry(
+        dir.path(),
+        &["d-want", "d-off", "d-here", "d-titles", "d-web", "d-none"],
+    );
+    for id in ["d-want", "d-off", "d-here", "d-titles"] {
+        android(&mut reg, id, &format!("tok-{id}"));
+    }
+    subscribe_ua(&mut reg, "d-web", &web.endpoint("web"), &ua);
+    set_prefs(
+        &mut reg,
+        "d-off",
+        PushPrefs {
+            attention: false,
+            ..PushPrefs::default()
+        },
+    )
+    .unwrap();
+    set_prefs(
+        &mut reg,
+        "d-titles",
+        PushPrefs {
+            show_titles: true,
+            ..PushPrefs::default()
+        },
+    )
+    .unwrap();
+    // Without an FCM account a gateway cannot send to Android apps.
+    assert!(!push().android_configured());
+    let mut push = android_push(&server);
+    assert!(push.android_configured());
+
+    push.offer(
+        reg.devices(),
+        |id| id == "d-here",
+        &offer(MobileKind::Attention, &Opens::Session("sess-9".to_owned())),
+    );
+    // d-off turned attention off, d-here is looking at the app, d-none has no subscription.
+    let mut got: Vec<google::Request> = (0..2).map(|_| server.next_message()).collect();
+    got.sort_by_key(|r| r.json()["message"]["token"].as_str().unwrap().to_owned());
+    assert_eq!(got[0].json()["message"]["token"], "tok-d-titles");
+    assert_eq!(got[1].json()["message"]["token"], "tok-d-want");
+    let plain = |r: &google::Request| -> serde_json::Value {
+        json(&google::open(&google::KEY, DESKTOP, &r.json()["message"]["data"]).unwrap())
+    };
+    let titled = plain(&got[0]);
+    assert_eq!(
+        titled["notification"]["body"],
+        "fix the parser needs your attention"
+    );
+    let generic = plain(&got[1]);
+    assert_eq!(
+        generic["notification"]["body"],
+        "A session needs your attention"
+    );
+    for p in [&titled, &generic] {
+        assert_eq!(p["web_push"], 8030);
+        assert_eq!(
+            p["notification"]["navigate"],
+            "https://relay.example/#s=sess-9"
+        );
+        assert_eq!(p["notification"]["tag"], topic("sess-9"));
+        let expires = p["expires_unix_ms"].as_u64().unwrap();
+        let ttl = u64::try_from(fcm::TTL.as_millis()).unwrap();
+        assert!(
+            (now_ms() + ttl - 5_000..=now_ms() + ttl).contains(&expires),
+            "{expires}"
+        );
+    }
+    // The browser device got its Web Push, once; Google saw nothing of it.
+    assert_eq!(web.next().path, "/push/web");
+    web.quiet(Duration::from_millis(300));
+    server.quiet(Duration::from_millis(300));
+
+    // A kind the device turned off sends nothing; the others still go.
+    push.offer(
+        reg.devices(),
+        |_| false,
+        &offer(MobileKind::Ended, &Opens::Session("sess-9".to_owned())),
+    );
+    let mut tokens: Vec<String> = (0..4)
+        .map(|_| {
+            server.next_message().json()["message"]["token"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    tokens.sort();
+    assert_eq!(
+        tokens,
+        ["tok-d-here", "tok-d-off", "tok-d-titles", "tok-d-want"]
+    );
+}
+
+#[test]
+fn a_canonical_event_reaches_fcm_once_and_a_gateway_without_an_account_sends_nothing() {
+    let server = google::Server::google(|_, _| google::Reply::ok());
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = registry(dir.path(), &["d-1"]);
+    android(&mut reg, "d-1", "tok-1");
+    let key = SessionTarget {
+        epoch: ServiceEpoch::current(),
+        key: SessionKey::tmux("omp-deck", "p1"),
+        generation: 1,
+    };
+    let mut center = NotificationCenter::new(Arc::new(|| {}));
+    let effects = one_finished_turn(&mut center, &key);
+
+    // No FCM account on this gateway: the registration is kept, nothing is sent.
+    let mut unconfigured = push();
+    apply(&mut unconfigured, &reg, &[], effects.clone(), "sess-1");
+    server.quiet(Duration::from_millis(300));
+    assert!(reg.get("d-1").unwrap().android_push.is_some());
+
+    let mut push = android_push(&server);
+    apply(&mut push, &reg, &[], effects, "sess-1");
+    let got = server.next_message();
+    assert_eq!(got.path, "/v1/projects/ompdeck-test/messages:send");
+    let body = got.json();
+    assert_eq!(body["message"]["android"]["ttl"], "3600s");
+    let plain = json(&google::open(&google::KEY, DESKTOP, &body["message"]["data"]).unwrap());
+    assert_eq!(plain["notification"]["body"], "A session finished");
+    assert_eq!(
+        plain["notification"]["navigate"],
+        "https://relay.example/#s=sess-1"
+    );
+    // One canonical event, one push.
+    server.quiet(Duration::from_millis(500));
+}
+
+#[test]
+fn an_unregistered_token_is_deleted_exactly_and_never_a_newer_one() {
+    let server =
+        google::Server::google(|_, _| google::Reply::fcm_error(404, "NOT_FOUND", "UNREGISTERED"));
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = registry(dir.path(), &["d-1"]);
+    android(&mut reg, "d-1", "dead-token");
+    let mut push = android_push(&server);
+    push.offer(
+        reg.devices(),
+        |_| false,
+        &offer(MobileKind::TurnFinished, &Opens::Session("s".to_owned())),
+    );
+    server.next_message();
+    let gone = (0..250)
+        .find_map(|_| {
+            let g = push.take_gone_android();
+            if g.is_empty() {
+                std::thread::sleep(Duration::from_millis(20));
+                None
+            } else {
+                Some(g)
+            }
+        })
+        .expect("the UNREGISTERED is reported");
+    assert_eq!(gone.len(), 1);
+    assert_eq!(
+        (gone[0].device.as_str(), gone[0].token.as_str()),
+        ("d-1", "dead-token")
+    );
+    // Not retried, and reported once.
+    server.quiet(Duration::from_millis(300));
+    assert!(push.take_gone_android().is_empty());
+
+    // The phone registered a refreshed token or a new key meanwhile: that one stays.
+    assert!(android(&mut reg, "d-1", "new-token"));
+    assert!(!forget_android(&mut reg, &gone[0]).unwrap());
+    let rekeyed = check_android("dead-token", &b64(&[9; 32]), DESKTOP, DESKTOP, true).unwrap();
+    subscribe_android(&mut reg, "d-1", rekeyed).unwrap();
+    assert!(!forget_android(&mut reg, &gone[0]).unwrap());
+    assert!(reg.get("d-1").unwrap().android_push.is_some());
+    // The exact registration is deleted, and the deletion is durable. A browser subscription is
+    // never touched by it.
+    assert!(android(&mut reg, "d-1", "dead-token"));
+    assert!(forget_android(&mut reg, &gone[0]).unwrap());
+    assert!(!reg.get("d-1").unwrap().has_push());
+    let reloaded = Registry::load(&dir.path().join("devices.json")).unwrap();
+    assert!(!reloaded.get("d-1").unwrap().has_push());
+    let ua = Ua::new();
+    subscribe_ua(&mut reg, "d-1", "http://127.0.0.1:9/a", &ua);
+    assert!(!forget_android(&mut reg, &gone[0]).unwrap());
+    assert!(reg.get("d-1").unwrap().push.is_some());
+}
+
+#[test]
+fn the_secrets_dir_service_account_turns_android_push_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = dir.path().join("secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::write(
+        secrets.join(fcm::CREDENTIALS_FILE),
+        serde_json::json!({
+            "type": "service_account",
+            "project_id": google::PROJECT,
+            "client_email": "gateway@ompdeck-test.iam.gserviceaccount.com",
+            "private_key": include_str!("fcm/test-rsa-key.pem"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert!(Push::open(&secrets, Arc::new(|| {})).android_configured());
 }

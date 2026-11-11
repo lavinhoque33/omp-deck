@@ -8,6 +8,7 @@ import { inspectInvite } from '../desktops.ts';
 import { inviteFromText } from '../nav.ts';
 import { useClientState, useDesktops, useDesktopsState } from '../ui/hooks.ts';
 import { Card, InstallHint, KeyValues } from '../ui/kit.tsx';
+import { AndroidUpdateCard } from './settings/AndroidUpdate.tsx';
 
 function defaultName(): string {
   const ua = navigator.userAgent;
@@ -118,6 +119,7 @@ function PairingForm({ invite, onInvite, standalone }: { invite: string | null; 
           </p>
         </div>
         <InstallHint standalone={standalone} />
+        <AndroidUpdateCard />
         {known !== undefined && (
           <div className="banner warn">
             <span>⚠</span>

@@ -9,7 +9,7 @@ import { feedKey } from '../client.ts';
 import { useNav } from '../nav.ts';
 import { age, perform, shortModel, statusLabel, succeeded } from '../ui/format.ts';
 import { useCan, useClient, useClientState, useFeed, useNow } from '../ui/hooks.ts';
-import { ConfirmSheet, ConnectionPill, Empty, InstallHint, Sheet, StaleBanner, UpdateBanner, useS4 } from '../ui/kit.tsx';
+import { ConfirmSheet, ConnectionPill, Empty, InstallHint, NativeUpdateBanner, Sheet, StaleBanner, UpdateBanner, useS4 } from '../ui/kit.tsx';
 import { doneResult } from './fleet/common.ts';
 import { type WorktreeLink, nestWorktrees, plural } from './fleet/logic.ts';
 import { ProjectPicker, SessionActionsSheet } from './fleet/SessionActions.tsx';
@@ -237,6 +237,7 @@ export function SessionsScreen({ standalone }: { standalone: boolean }): ReactNo
       </header>
       <div className="body">
         <UpdateBanner />
+        <NativeUpdateBanner />
         <StaleBanner />
         <InstallHint standalone={standalone} />
         <label className="search">

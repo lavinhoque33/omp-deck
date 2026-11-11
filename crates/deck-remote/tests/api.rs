@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use deck_remote::api::*;
 use serde_json::{Value, json};
 
+mod api_android;
 mod api_form;
 mod api_s4;
 use api_form as form;
@@ -2221,6 +2222,11 @@ variants!(Op, Some("op"), {
         p256dh: e(),
         auth: e(),
     },
+    Op::PushAndroidSubscribe { .. } => Op::PushAndroidSubscribe {
+        token: e(),
+        key: e(),
+        desktop: e(),
+    },
     Op::PushUnsubscribe {} => Op::PushUnsubscribe {},
     Op::PushPrefs { .. } => Op::PushPrefs {
         prefs: PushPrefs::default(),
@@ -2998,6 +3004,8 @@ fn the_vectors_cover_every_variant() {
     let s4_file: Value = serde_json::from_str(&std::fs::read_to_string(s4::PATH).unwrap()).unwrap();
     let form_file: Value =
         serde_json::from_str(&std::fs::read_to_string(form::PATH).unwrap()).unwrap();
+    let android_file: Value =
+        serde_json::from_str(include_str!("vectors/api-android.json")).unwrap();
     let mut seen = Seen::default();
     for m in file["messages"]
         .as_array()
@@ -3005,6 +3013,7 @@ fn the_vectors_cover_every_variant() {
         .iter()
         .chain(s4_file["messages"].as_array().unwrap())
         .chain(form_file["messages"].as_array().unwrap())
+        .chain(android_file["messages"].as_array().unwrap())
     {
         let text = m["json"].as_str().unwrap();
         match m["type"].as_str().unwrap() {

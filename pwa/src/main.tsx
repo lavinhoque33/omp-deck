@@ -12,8 +12,11 @@ import { dialRelay, pairWithInvite } from './app/link.ts';
 import { type Link, inviteFromHash, linkFromHash } from './app/nav.ts';
 import { type ThemeId, applyTheme, loadTheme, saveTheme } from './app/theme.ts';
 import { DesktopsContext } from './app/ui/hooks.ts';
-import { askOthersToReload, registerServiceWorker } from './app/update.ts';
+import { askOthersToReload, registerServiceWorker, retireServiceWorkers } from './app/update.ts';
 import { watchInstall } from './app/install.ts';
+import { nativeHost } from './app/native.ts';
+import { OpenRouter, PresenceSource, pressBack, watchNativeLabels, watchNativePresence } from './app/native-app.ts';
+import { appMarkers, dropNativePush } from './app/native-push.ts';
 import './styles/app.css';
 import './styles/themes.css';
 
@@ -42,8 +45,11 @@ function isStandalone(): boolean {
   );
 }
 
-// Before anything async: Chromium may fire `beforeinstallprompt` right after load.
-watchInstall(window);
+// The Android app (null in a browser): its shell is injected before this script runs.
+const native = nativeHost();
+// Before anything async: Chromium may fire `beforeinstallprompt` right after load. The Android app is
+// installed already: there is nothing to offer.
+if (native === null) watchInstall(window);
 
 // The invite and deep link are read once and removed from the URL at once (the invite is a
 // secret; it must not stay in history or be bookmarked).
@@ -60,6 +66,17 @@ if (rootElement === null) throw new Error('index.html lacks #root');
 const root = createRoot(rootElement);
 
 let deepLink: ((link: Link) => void) | null = null;
+let backHandler: (() => boolean) | null = null;
+// The Android app: notification taps wait for the app to be ready, visibility comes from the Activity.
+const openRouter = new OpenRouter(location.href);
+const presence = new PresenceSource(document.visibilityState === 'visible');
+if (native !== null) {
+  native.on('open', (detail) => openRouter.open(detail.url));
+  native.on('visibility', (detail) => presence.setNative(detail.visible));
+  native.on('back', () => pressBack(backHandler, () => void native.request('finish', {}).catch(() => undefined)));
+  // Listeners first: the shell holds its events back until this first call.
+  native.handshake().catch((error: unknown) => console.error('The Android app did not answer its handshake', error));
+}
 const openDeepLink = (url: string) => {
   const link = linkFromHash(new URL(url, location.href).hash);
   if (link !== null) deepLink?.(link);
@@ -90,6 +107,10 @@ function Root({ desktops }: { desktops: Desktops }) {
   }, []);
   const onDeepLink = useCallback((open: (link: Link) => void) => {
     deepLink = open;
+    openRouter.attach(open);
+  }, []);
+  const onBack = useCallback((back: (() => boolean) | null) => {
+    backHandler = back;
   }, []);
   const onInviteLink = useCallback((open: (invite: string) => void) => {
     inviteLink = open;
@@ -101,8 +122,9 @@ function Root({ desktops }: { desktops: Desktops }) {
         initialLink={initialLink}
         theme={current}
         onTheme={onTheme}
-        standalone={isStandalone()}
+        standalone={isStandalone() || native !== null}
         onDeepLink={onDeepLink}
+        onBack={onBack}
         onInviteLink={onInviteLink}
       />
     </DesktopsContext.Provider>
@@ -141,14 +163,16 @@ function Updating() {
 }
 
 async function boot(): Promise<void> {
-  // First: the worker reloads the windows that block the key store's upgrade (below).
-  registerServiceWorker({ navigate: openDeepLink });
+  // First: the worker reloads the windows that block the key store's upgrade (below). The Android app
+  // runs bundled assets and registers no worker: it clears any leftover one so none can serve stale assets.
+  if (native === null) registerServiceWorker({ navigate: openDeepLink });
+  else void retireServiceWorkers(navigator.serviceWorker, typeof caches === 'undefined' ? undefined : caches);
   let store: KeyStore;
   try {
     store = await KeyStore.open(indexedDB, {
       onBlocked: () => {
         root.render(<Updating />);
-        void askOthersToReload().catch(() => undefined);
+        if (native === null) void askOthersToReload().catch(() => undefined);
       },
       // A later upgrade by another window: let it through, and come back as the new version.
       onVersionChange: () => location.reload(),
@@ -171,10 +195,10 @@ async function boot(): Promise<void> {
         platform: platform(),
         persistStorage: () => navigator.storage?.persist?.() ?? Promise.resolve(false),
         // This desktop's subscription and registration only; the migrated desktop also takes the version 1 root one.
-        dropPush: () => dropBrowserPush(id, desktops.getState().legacyPush === id),
+        dropPush: () => (native === null ? dropBrowserPush(id, desktops.getState().legacyPush === id) : dropNativePush(native, appMarkers(), id)),
       });
       // The desktop skips push notifications while this phone is visible and connected.
-      client.setVisible(document.visibilityState === 'visible');
+      client.setVisible(presence.get());
       return client;
     },
   });
@@ -183,17 +207,25 @@ async function boot(): Promise<void> {
       <Root desktops={desktops} />
     </StrictMode>,
   );
-  // The worker names the desktop on each notification while several are paired.
-  watchPushLabels(desktops);
+  if (native === null) {
+    // The worker names the desktop on each notification while several are paired.
+    watchPushLabels(desktops);
+  } else {
+    // The shell names notifications by desktop, and mutes only the desktop that is really on screen.
+    watchNativeLabels(native, desktops);
+    watchNativePresence(native, desktops, presence);
+  }
   window.addEventListener('online', () => desktops.getState().client?.wake());
-  document.addEventListener('visibilitychange', () => {
-    const visible = document.visibilityState === 'visible';
+  document.addEventListener('visibilitychange', () => presence.setDocument(document.visibilityState === 'visible'));
+  presence.subscribe(() => {
     const client = desktops.getState().client;
-    client?.setVisible(visible);
-    if (visible) client?.wake();
+    client?.setVisible(presence.get());
+    if (presence.get()) client?.wake();
   });
   try {
     await desktops.load(initialLink?.desktop ?? null);
+    // Notification taps that arrived while the pairings were being read can now name their desktop.
+    openRouter.ready();
   } catch (error) {
     root.render(<Fatal message={`Could not read this phone’s pairings: ${error instanceof Error ? error.message : String(error)}`} />);
   }

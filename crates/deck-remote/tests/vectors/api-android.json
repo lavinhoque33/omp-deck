@@ -1,0 +1,12 @@
+{
+  "description": "Additive native Android FCM subscription, sent only when Welcome.features includes android_push. The key and token are synthetic test values. Existing protocol v1 and s4 vectors remain unchanged.",
+  "protocol": 1,
+  "features": ["s4", "android_push"],
+  "messages": [
+    {
+      "case": "native Android push subscription",
+      "type": "request",
+      "json": "{\"id\":401,\"seq\":null,\"op\":{\"op\":\"push_android_subscribe\",\"token\":\"test-fcm-registration-token\",\"key\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"desktop\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}}"
+    }
+  ]
+}

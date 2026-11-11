@@ -7,6 +7,7 @@ import { usePush } from '../../push-client.ts';
 import { useNav } from '../../nav.ts';
 import { useFeed, useOnline } from '../../ui/hooks.ts';
 import { Card, KeyValues, NeedsS4 } from '../../ui/kit.tsx';
+import { DESKTOP_SENDER_HELP, PHONE_FIREBASE_HELP } from '../../native-push.ts';
 import { SectionScreen, ToggleRow } from './common.tsx';
 import { when } from './logic.ts';
 
@@ -32,7 +33,9 @@ function NotificationsBody(): ReactNode {
   // On when this browser holds a subscription the desktop also knows.
   const on = push.subscribed && state?.subscribed === true;
   const blocked = push.permission === 'denied';
-  const canToggle = online && !push.busy && push.support === 'supported' && !blocked;
+  // The Android app can switch push off anywhere, but on only where the desktop's FCM sender is set up.
+  const senderReady = push.native === null || push.native.desktopSender || on;
+  const canToggle = online && !push.busy && push.support === 'supported' && !blocked && senderReady;
 
   const setPref = (key: keyof api.PushPrefs, value: boolean) => {
     void push.setPrefs({ ...prefs, [key]: value });
@@ -54,10 +57,24 @@ function NotificationsBody(): ReactNode {
           <span className="grow">This browser cannot receive Web Push notifications. Try Chrome, Edge, Firefox or Safari 16.4+.</span>
         </div>
       )}
+      {push.native !== null && !push.native.desktopSender && (
+        <div className="banner warn" role="note">
+          <span className="grow">
+            <b>Firebase is not set up on this desktop.</b> {DESKTOP_SENDER_HELP}
+          </span>
+        </div>
+      )}
+      {push.native !== null && push.native.desktopSender && !push.native.phoneConfigured && (
+        <div className="banner warn" role="note">
+          <span className="grow">{PHONE_FIREBASE_HELP}</span>
+        </div>
+      )}
       {blocked && (
         <div className="banner danger" role="note">
           <span className="grow">
-            Notifications are blocked for this site. Allow them in the browser’s site settings, then turn push on here.
+            {push.native === null
+              ? 'Notifications are blocked for this site. Allow them in the browser’s site settings, then turn push on here.'
+              : 'Notifications are blocked for OmpDeck. Allow them in Android’s app settings, then turn push on here.'}
           </span>
         </div>
       )}
@@ -73,7 +90,9 @@ function NotificationsBody(): ReactNode {
           hint={
             on
               ? 'This phone is notified while the app is closed or in the background.'
-              : 'Asks for permission when you turn it on. Nothing is pushed while the app is open on screen.'
+              : push.native === null
+                ? 'Asks for permission when you turn it on. Nothing is pushed while the app is open on screen.'
+                : 'Asks for notification permission, and for your Firebase google-services.json the first time. Nothing is pushed while the app is open on screen.'
           }
           on={on}
           disabled={!canToggle}
@@ -114,8 +133,11 @@ function NotificationsBody(): ReactNode {
           title="Show session titles"
           hint={
             <>
-              <span className="privacy">Privacy</span> Titles pass through Apple’s, Google’s or Mozilla’s push service
-              (encrypted) and show on the lock screen. Off: “A session finished”.
+              <span className="privacy">Privacy</span>{' '}
+              {push.native === null
+                ? 'Titles pass through Apple’s, Google’s or Mozilla’s push service (encrypted) and show on the lock screen.'
+                : 'Titles reach this phone encrypted end to end through Google’s Firebase Cloud Messaging (Google sees delivery times, never the titles) and show on the lock screen.'}{' '}
+              Off: “A session finished”.
             </>
           }
           on={prefs.show_titles}

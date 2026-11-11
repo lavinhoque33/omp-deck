@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::RemoteError;
 use crate::gateway::protocol::{DeviceView, Permissions};
-use crate::gateway::push::PushSub;
+use crate::gateway::push::{AndroidPush, PushSub};
 
 pub const FILE: &str = "devices.json";
 const VERSION: u32 = 1;
@@ -38,9 +38,18 @@ pub struct Device {
     /// revoke and unpair, and is cleared when the push service reports it gone.
     #[serde(default)]
     pub push: Option<PushSub>,
+    /// Its native Android (FCM) registration: the other transport of the one push subscription,
+    /// never present together with `push`. Absent in older files and for browsers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android_push: Option<AndroidPush>,
 }
 
 impl Device {
+    /// Whether it has a push subscription of either transport.
+    pub fn has_push(&self) -> bool {
+        self.push.is_some() || self.android_push.is_some()
+    }
+
     pub fn view(&self, online: bool) -> DeviceView {
         DeviceView {
             id: self.id.clone(),
@@ -51,7 +60,7 @@ impl Device {
             created_unix_ms: self.created_unix_ms,
             last_seen_unix_ms: self.last_seen_unix_ms,
             online,
-            push: self.push.is_some(),
+            push: self.has_push(),
         }
     }
 }
@@ -205,6 +214,7 @@ mod tests {
             created_unix_ms: 1,
             last_seen_unix_ms: 1,
             push: None,
+            android_push: None,
         }
     }
 

@@ -2,11 +2,12 @@
 // rows, the connection pill with the desktop switcher, toasts, the bottom nav and the app banners.
 
 import { type ReactNode, createContext, useContext, useEffect, useId, useSyncExternalStore } from 'react';
+import { ACTION_LABEL, downloadFraction, updateOffer } from '../native-update.ts';
 import { applyUpdate, cancelUpdate, updates } from '../update.ts';
 import { install, installHelp, promptInstall } from '../install.ts';
 import type { Tab } from '../nav.ts';
 import { hasS4 } from '../client.ts';
-import { useClient, useClientState, useDesktops, useDesktopsState, useNow } from './hooks.ts';
+import { useClient, useClientState, useDesktops, useDesktopsState, useNativeUpdate, useNow } from './hooks.ts';
 
 // ---- sheets ---------------------------------------------------------------------------------------
 
@@ -378,6 +379,8 @@ const TABS: readonly (readonly [Tab, string, string])[] = [
 ];
 
 export function BottomNav({ tab, badge, onSelect }: { tab: Tab; badge: string | null; onSelect: (tab: Tab) => void }): ReactNode {
+  const update = useNativeUpdate();
+  const updateOn = updateOffer(update?.view.state ?? null) !== null;
   return (
     <nav className="nav" aria-label="Main">
       {TABS.map(([id, label, glyph]) => (
@@ -391,6 +394,7 @@ export function BottomNav({ tab, badge, onSelect }: { tab: Tab; badge: string | 
           <i aria-hidden="true">{glyph}</i>
           {label}
           {id === 'inbox' && badge !== null && <span className="badge">{badge}</span>}
+          {id === 'settings' && updateOn && <span className="badge" role="img" aria-label="Android update available">1</span>}
         </button>
       ))}
     </nav>
@@ -466,6 +470,60 @@ export function UpdateBanner(): ReactNode {
       <button type="button" className="button primary" onClick={() => applyUpdate(openRequests, false)}>
         Reload
       </button>
+    </div>
+  );
+}
+
+/**
+ * The Android app's own update, in the app (never in a browser): the version on offer and the one
+ * action the shell allows. Installing is the user's tap; a check or download never opens the installer.
+ */
+export function NativeUpdateBanner(): ReactNode {
+  const update = useNativeUpdate();
+  if (update === null) return null;
+  const { view, controller } = update;
+  const offer = updateOffer(view.state);
+  if (offer === null || view.state === null) return null;
+  const { phase } = view.state;
+  const fraction = downloadFraction(view.state);
+  const failure = view.failure ?? view.state.error;
+  const failed = phase === 'error' || failure !== null;
+  const text = failed
+    ? `The OmpDeck ${offer.latest} update did not finish${failure === null ? '.' : `: ${failure}`}`
+    : phase === 'downloading'
+      ? `Downloading OmpDeck ${offer.latest}${fraction === null ? '…' : ` · ${Math.round(fraction * 100)}%`}`
+      : phase === 'ready'
+        ? `OmpDeck ${offer.latest} is downloaded and verified.`
+        : phase === 'installing'
+          ? `Android is installing OmpDeck ${offer.latest}. Confirm in its installer.`
+          : `OmpDeck ${offer.latest} is available for this phone.`;
+  return (
+    <div className={`banner${failed ? ' warn' : ''}`} role={failed ? 'alert' : 'status'}>
+      {offer.action === null ? <span className="busy" /> : <span aria-hidden="true">⤓</span>}
+      <span className="grow">{text}</span>
+      {offer.action !== null && (
+        <button type="button" className="button primary" disabled={view.busy} onClick={() => void controller.install()}>
+          {ACTION_LABEL[offer.action]}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Pushed screens (chat, terminal, sections) in the Android app: a strip above the screen, in the
+ * layout flow, so it never overlays a header, the composer or the terminal. Browsers get the
+ * screen unchanged.
+ */
+export function NativeUpdateHost({ children }: { children: ReactNode }): ReactNode {
+  const native = useNativeUpdate();
+  if (native === null) return children;
+  return (
+    <div className={`update-host${updateOffer(native.view.state) === null ? '' : ' has-update'}`}>
+      <div className="update-strip">
+        <NativeUpdateBanner />
+      </div>
+      {children}
     </div>
   );
 }

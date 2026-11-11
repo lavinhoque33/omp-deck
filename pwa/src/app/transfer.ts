@@ -12,6 +12,7 @@ import { api } from '../remote/index.ts';
 import { MAX_FRAGMENT_DATA } from '../remote/protocol.ts';
 import { TAG_LEN } from '../remote/noise.ts';
 import { ClientError } from './client.ts';
+import { MAX_SAVE_BYTES, type NativeHost, NativeError, nativeHost } from './native.ts';
 
 /** What transfers need from the client. */
 export interface TransferClient {
@@ -26,6 +27,8 @@ export interface TransferOptions {
   signal?: AbortSignal;
   /** Uploads only: the clock and sleep the pacer uses (tests). */
   pacing?: PacingClock;
+  /** Saves only: the Android shell (default: the page's, if any); null forces the browser's `<a download>`. */
+  host?: Pick<NativeHost, 'request'> | null;
 }
 
 /** Time source of an {@link UploadPacer}. */
@@ -258,14 +261,43 @@ export function saveBlob(blob: Blob, name: string): void {
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
-/** {@link download}, then {@link saveBlob}. */
+/**
+ * The mime type handed to Android's save dialog: the desktop's when it is a well-formed `type/subtype`,
+ * else opaque bytes. (The file is only written to a place the user picked; nothing here renders it.)
+ */
+export function saveMime(mime: string): string {
+  const clean = mime.trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/.test(clean) ? clean : 'application/octet-stream';
+}
+
+/**
+ * Android: saves through the shell's document picker, the only way to save from a WebView (an
+ * `<a download>` on an object URL goes nowhere there). The user dismissing the picker is a cancelled
+ * transfer (`AbortError`), not a failure.
+ */
+export async function saveNative(host: Pick<NativeHost, 'request'>, file: Downloaded): Promise<void> {
+  if (file.blob.size > MAX_SAVE_BYTES) {
+    throw new ClientError('invalid', `${file.name} is larger than ${MAX_SAVE_BYTES / (1024 * 1024)} MiB, the most the Android app can save.`);
+  }
+  const data = toBase64(new Uint8Array(await file.blob.arrayBuffer()));
+  try {
+    await host.request('saveFile', { name: sanitizeFileName(file.name), mime: saveMime(file.mime), data });
+  } catch (error) {
+    if (error instanceof NativeError && error.kind === 'cancelled') throw aborted();
+    throw error;
+  }
+}
+
+/** {@link download}, then saved: through the Android shell inside the app, as {@link saveBlob} in a browser. */
 export async function downloadAndSave(
   client: TransferClient,
   op: Extract<api.Op, { op: 'blob' | 'export' }>,
   options: TransferOptions = {},
 ): Promise<Downloaded> {
   const file = await download(client, op, options);
-  saveBlob(file.blob, file.name);
+  const host = options.host === undefined ? nativeHost() : options.host;
+  if (host === null) saveBlob(file.blob, file.name);
+  else await saveNative(host, file);
   return file;
 }
 

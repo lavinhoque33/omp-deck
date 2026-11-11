@@ -50,7 +50,7 @@ function files(dir: string): string[] {
 }
 
 /** Fonts go to dist/assets/ under a content hash and stay external (CSS would inline them as `data:`, which the CSP's `font-src 'self'` refuses). */
-function fontPlugin(outdir: string): Bun.BunPlugin {
+function fontPlugin(outdir: string, bundled: boolean): Bun.BunPlugin {
   return {
     name: 'hashed-fonts',
     setup(build) {
@@ -61,7 +61,8 @@ function fontPlugin(outdir: string): Bun.BunPlugin {
         const name = `${basename(source, ext)}-${hash(bytes)}${ext}`;
         mkdirSync(join(outdir, 'assets'), { recursive: true });
         writeFileSync(join(outdir, 'assets', name), bytes);
-        return { path: `/assets/${name}`, external: true };
+        // The Android bundle is served from a path prefix the build does not know: CSS names its fonts relative to itself (both live in assets/).
+        return { path: bundled ? `./${name}` : `/assets/${name}`, external: true };
       });
     },
   };
@@ -73,7 +74,11 @@ function check(result: Bun.BuildOutput, what: string): void {
   throw new Error(`${what} build failed`);
 }
 
-export async function build({ outdir = join(ROOT, 'dist'), minify = true }: { outdir?: string; minify?: boolean } = {}): Promise<BuildResult> {
+export async function build({
+  android = false,
+  outdir = join(ROOT, android ? 'dist-android' : 'dist'),
+  minify = true,
+}: { android?: boolean; outdir?: string; minify?: boolean } = {}): Promise<BuildResult> {
   rmSync(outdir, { recursive: true, force: true });
   mkdirSync(outdir, { recursive: true });
 
@@ -86,9 +91,16 @@ export async function build({ outdir = join(ROOT, 'dist'), minify = true }: { ou
     sourcemap: 'none',
     naming: { entry: '[name].[ext]', chunk: 'assets/[name]-[hash].[ext]', asset: 'assets/[name]-[hash].[ext]' },
     define: { 'process.env.NODE_ENV': JSON.stringify(minify ? 'production' : 'development') },
-    plugins: [fontPlugin(outdir)],
+    plugins: [fontPlugin(outdir, android)],
   });
   check(app, 'app');
+
+  if (android) {
+    // The APK bundles these files as its own assets: no service worker, manifest, icons or compressed
+    // siblings (the shell serves the files as they are), and every URL is relative to its file.
+    const bytes = readFileSync(join(outdir, 'index.html'));
+    return { outdir, precache: [], version: hash(bytes) };
+  }
 
   // The head links Bun would try to bundle are added after the build.
   const indexPath = join(outdir, 'index.html');
@@ -173,6 +185,10 @@ async function dev(): Promise<void> {
 if (import.meta.main) {
   if (process.argv.includes('--dev')) {
     await dev();
+  } else if (process.argv.includes('--android')) {
+    // The Android app's bundle (`pwa/dist-android`, copied into the APK's assets/www).
+    const result = await build({ android: true });
+    console.log(`built the Android bundle into ${relative(process.cwd(), result.outdir) || '.'} (version ${result.version})`);
   } else {
     const result = await build();
     console.log(`built ${result.precache.length} precached files into ${relative(process.cwd(), result.outdir) || '.'} (version ${result.version})`);

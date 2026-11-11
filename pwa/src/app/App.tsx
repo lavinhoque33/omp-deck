@@ -35,7 +35,7 @@ import { WorktreesScreen } from './screens/fleet/Worktrees.tsx';
 import { SettingsSectionScreen } from './screens/settings/index.tsx';
 import type { ThemeId } from './theme.ts';
 import { ClientContext, useClientState, useDesktops, useDesktopsState, useFeed } from './ui/hooks.ts';
-import { BottomNav, DesktopSheet, SwitcherContext, Toasts } from './ui/kit.tsx';
+import { BottomNav, DesktopSheet, NativeUpdateHost, SwitcherContext, Toasts } from './ui/kit.tsx';
 import { usePushSync } from './push-client.ts';
 
 export interface AppProps {
@@ -50,6 +50,8 @@ export interface AppProps {
   onDeepLink: (open: (link: Link) => void) => void;
   /** Registers the handler for a `#pair=` link opened while the app runs (the hash is already stripped). */
   onInviteLink: (open: (invite: string) => void) => void;
+  /** Registers the handler for the Android app's Back: true when the app stepped back itself, false when only the Activity can close. */
+  onBack: (back: (() => boolean) | null) => void;
 }
 
 function Splash(): ReactNode {
@@ -75,10 +77,33 @@ export function App(props: AppProps): ReactNode {
     shellLink.current = open;
   }, []);
   const onStarted = useCallback(() => setPending(null), []);
-  const { onInviteLink, onDeepLink } = props;
+  const { onInviteLink, onDeepLink, onBack } = props;
   useEffect(() => {
     onInviteLink(setInvite);
   }, [onInviteLink]);
+
+  // The Android app's Back: the pairing screens step back as their own buttons do; otherwise the shell's own back.
+  const shellBack = useRef<(() => boolean) | null>(null);
+  const onShellBack = useCallback((back: (() => boolean) | null) => {
+    shellBack.current = back;
+  }, []);
+  useEffect(() => {
+    onBack(() => {
+      const now = desktops.getState();
+      if (invite !== null || now.attempt !== null || now.adding || now.desktops.length === 0) {
+        if (now.attempt !== null) {
+          desktops.dismissPairing();
+          return true;
+        }
+        if (now.desktops.length === 0) return false;
+        setInvite(null);
+        desktops.cancelAdd();
+        return true;
+      }
+      return shellBack.current?.() ?? false;
+    });
+    return () => onBack(null);
+  }, [onBack, desktops, invite]);
 
   useEffect(() => {
     onDeepLink((link) => {
@@ -116,7 +141,7 @@ export function App(props: AppProps): ReactNode {
   const route = pending !== null && (pending.desktop === null || pending.desktop === state.activeId) ? pending.route : null;
   return (
     <ClientContext.Provider value={state.client} key={state.activeId}>
-      <DesktopHost {...props} initialRoute={route} onShellLink={onShellLink} onStarted={onStarted} />
+      <DesktopHost {...props} initialRoute={route} onShellLink={onShellLink} onShellBack={onShellBack} onStarted={onStarted} />
     </ClientContext.Provider>
   );
 }
@@ -139,10 +164,11 @@ function DesktopHost(props: ShellProps): ReactNode {
 type ShellProps = Pick<AppProps, 'theme' | 'onTheme' | 'standalone'> & {
   initialRoute: Route | null;
   onShellLink: (open: ((route: Route) => void) | null) => void;
+  onShellBack: (back: (() => boolean) | null) => void;
   onStarted: () => void;
 };
 
-function Shell({ initialRoute, theme, onTheme, standalone, onShellLink, onStarted }: ShellProps): ReactNode {
+function Shell({ initialRoute, theme, onTheme, standalone, onShellLink, onShellBack, onStarted }: ShellProps): ReactNode {
   // A link wins; a reload (hash already stripped) resumes from the route the history entry holds.
   const desktop = useDesktopsState((state) => state.activeId);
   const [start] = useState(() => startRoute(initialRoute, history.state, desktop));
@@ -216,6 +242,23 @@ function Shell({ initialRoute, theme, onTheme, standalone, onShellLink, onStarte
   );
   const nav = useMemo<Nav>(() => ({ tab, stack, setTab, push, replace, pop }), [tab, stack, setTab, push, replace, pop]);
 
+  // The Android app's Back: a sheet closes, then the pushed screen pops (as the browser's back does).
+  // Nothing left to close or pop: the Activity may finish.
+  const switcherOpen = useRef(switcher);
+  switcherOpen.current = switcher;
+  useEffect(() => {
+    onShellBack(() => {
+      if (switcherOpen.current) {
+        setSwitcher(false);
+        return true;
+      }
+      if (depth.current === 0) return false;
+      pop();
+      return true;
+    });
+    return () => onShellBack(null);
+  }, [onShellBack, pop]);
+
   useEffect(() => {
     onShellLink((route) => {
       setTabState(route.tab);
@@ -242,7 +285,9 @@ function Shell({ initialRoute, theme, onTheme, standalone, onShellLink, onStarte
             <BottomNav tab={tab} badge={inbox?.inbox.badge ?? null} onSelect={setTab} />
           </>
         ) : (
-          <PushedScreen key={`${stack.length}:${JSON.stringify(top)}`} screen={top} />
+          <NativeUpdateHost>
+            <PushedScreen key={`${stack.length}:${JSON.stringify(top)}`} screen={top} />
+          </NativeUpdateHost>
         )}
         {switcher && <DesktopSheet onClose={() => setSwitcher(false)} />}
         <Toasts />

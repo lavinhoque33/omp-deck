@@ -412,6 +412,7 @@ export class SmokeConnection {
       case 'presence':
         return unit;
       case 'push_subscribe':
+      case 'push_android_subscribe':
         gw.push = { ...gw.push, subscribed: true, since_unix_ms: gw.now() };
         gw.changed('device');
         return unit;

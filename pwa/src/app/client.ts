@@ -577,7 +577,7 @@ export class Client {
       this.#deps.clock.clearTimer(timer);
     }
     await this.#deps.dropPush?.().catch((error: unknown) => {
-      this.notify(`Could not remove this browser's push subscription: ${error instanceof Error ? error.message : String(error)}`, 'warn');
+      this.notify(`Could not remove this phone's push subscription: ${error instanceof Error ? error.message : String(error)}`, 'warn');
     });
   }
 

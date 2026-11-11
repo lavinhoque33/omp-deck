@@ -75,6 +75,13 @@ const s4Requests: string[] = (
 ).messages
   .filter((m) => m.type === 'request')
   .map((m) => m.json);
+const androidRequests: string[] = (
+  JSON.parse(
+    readFileSync(new URL('../../crates/deck-remote/tests/vectors/api-android.json', import.meta.url), 'utf8'),
+  ) as Pick<ApiVectors, 'messages'>
+).messages
+  .filter((m) => m.type === 'request')
+  .map((m) => m.json);
 
 function toRecord(v: VectorRecord): AppRecord {
   const json = utf8(v.json ?? '');
@@ -156,8 +163,8 @@ describe('requests encode canonically', () => {
     });
   }
 
-  test('every op is covered (with api-s4.json)', () => {
-    const parsed: Request[] = [...requests.map((m) => m.json), ...s4Requests].map((json) => JSON.parse(json));
+  test('every op is covered (with api-s4.json and api-android.json)', () => {
+    const parsed: Request[] = [...requests.map((m) => m.json), ...s4Requests, ...androidRequests].map((json) => JSON.parse(json));
     const covered = new Set(parsed.map((request) => request.op.op));
     expect([...covered].sort()).toEqual([...OP_NAMES].sort());
   });

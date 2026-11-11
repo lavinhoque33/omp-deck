@@ -927,6 +927,12 @@ impl Engine {
         let out = DeviceOut::new(wake, self.waker.callback());
         let next_seq = self.journal.next_seq(id);
         let protocol = negotiated_protocol(api);
+        let mut offered = vec![api::FEATURE_S4.to_owned(), api::FEATURE_FORM.to_owned()];
+        if self.notify.push.android_configured() {
+            // Only with a valid FCM service account: a phone must not offer a registration the
+            // gateway cannot deliver.
+            offered.push(api::FEATURE_ANDROID_PUSH.to_owned());
+        }
         out.welcome(&api::Welcome {
             protocol,
             gateway_version: GATEWAY_VERSION.to_owned(),
@@ -936,7 +942,7 @@ impl Engine {
             permissions: api_permissions(permissions),
             next_seq,
             limits: api::Limits::default(),
-            features: vec![api::FEATURE_S4.to_owned(), api::FEATURE_FORM.to_owned()],
+            features: offered,
             push_key: self.notify.push.public_key(),
         });
         let conn = next_id();

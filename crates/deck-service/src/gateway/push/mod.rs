@@ -8,10 +8,16 @@
 //! now. The payload is the declarative Web Push JSON, generic unless the device opted into
 //! titles. A subscription the push service reports gone (404/410) is deleted.
 //!
+//! A phone running the Android app subscribes natively instead ([`AndroidPush`], `Device.android_push`):
+//! an FCM token and the per-desktop AES key it made. The two transports are mutually exclusive on
+//! one device and share its prefs; the notification is sealed and sent through FCM by [`fcm`].
+//!
 //! Test override: `OMP_DECK_PUSH_TEST_LOOPBACK=1` admits `http://` and loopback endpoints, for
 //! verification against a local receiver only. `OMP_DECK_PUSH_CONTACT` sets the VAPID `sub`
 //! (an e-mail address or `mailto:`/`https:` URL; default: the PWA's origin).
 
+pub mod fcm;
+pub mod queue;
 pub mod sender;
 pub mod ssrf;
 pub mod vapid;
@@ -29,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use ureq::http::Uri;
 use web_push_native::{Auth, p256};
+use zeroize::Zeroizing;
 
 use crate::gateway::remote::RemoteError;
 use crate::gateway::remote::registry::{Device, Registry};
@@ -49,6 +56,8 @@ pub const TITLE_CHARS: usize = 80;
 pub const TTL: Duration = Duration::from_secs(3600);
 const MAX_ENDPOINT: usize = 2048;
 const MAX_KEY_TEXT: usize = 256;
+/// The longest FCM registration token accepted (they are about 160 characters).
+const MAX_FCM_TOKEN: usize = 4096;
 
 /// One device's Web Push subscription, as stored in `devices.json` (keys base64url).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +67,27 @@ pub struct PushSub {
     pub auth: String,
     pub prefs: PushPrefs,
     pub since_unix_ms: u64,
+}
+
+/// One device's native Android (FCM) registration, as stored in `devices.json`. The key is the
+/// secret the phone shares with this gateway for this desktop: never logged, never sent back.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AndroidPush {
+    /// The FCM registration token.
+    pub token: String,
+    /// The AES-256-GCM key, base64url (unpadded, canonical).
+    pub key: String,
+    pub prefs: PushPrefs,
+    pub since_unix_ms: u64,
+}
+
+impl std::fmt::Debug for AndroidPush {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AndroidPush")
+            .field("prefs", &self.prefs)
+            .field("since_unix_ms", &self.since_unix_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why a push operation was refused.
@@ -73,6 +103,12 @@ pub enum PushError {
     NotSubscribed,
     #[error("no such device")]
     NoDevice,
+    /// This gateway has no FCM service account, so it cannot push to an Android app.
+    #[error("this gateway is not set up to send Android push notifications")]
+    AndroidUnsupported,
+    /// The registration names another desktop than this gateway.
+    #[error("that registration is for another desktop")]
+    WrongDesktop,
     /// `devices.json` could not be written.
     #[error(transparent)]
     Store(#[from] RemoteError),
@@ -217,30 +253,133 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Stores `sub` (from [`check_subscription`]) as device `id`'s subscription. A device that
-/// resubscribes keeps its prefs; its `since` stays while the endpoint is the same.
-pub fn subscribe(registry: &mut Registry, id: &str, sub: PushSub) -> Result<(), PushError> {
-    let old = registry.get(id).ok_or(PushError::NoDevice)?.push.clone();
-    let mut sub = sub;
-    if let Some(old) = old {
-        sub.prefs = old.prefs;
-        sub.since_unix_ms = if old.endpoint == sub.endpoint {
-            old.since_unix_ms
-        } else {
-            now_ms()
-        };
-    } else {
-        sub.since_unix_ms = now_ms();
+/// A device's push prefs and `since`, whichever transport it has.
+fn current(device: &Device) -> Option<(PushPrefs, u64)> {
+    match (&device.push, &device.android_push) {
+        (Some(s), _) => Some((s.prefs, s.since_unix_ms)),
+        (None, Some(a)) => Some((a.prefs, a.since_unix_ms)),
+        (None, None) => None,
     }
-    registry.update(id, |d| d.push = Some(sub))?;
-    Ok(())
 }
 
-/// Deletes device `id`'s subscription (none: nothing to do).
+/// Stores `sub` (from [`check_subscription`]) as device `id`'s subscription, replacing a native
+/// Android registration if it had one (the transports are exclusive). A device that resubscribes
+/// keeps its prefs, whichever transport it had; its `since` stays while the endpoint is the same.
+/// Returns whether an Android registration was replaced: pushes queued for it must be purged.
+pub fn subscribe(registry: &mut Registry, id: &str, sub: PushSub) -> Result<bool, PushError> {
+    let device = registry.get(id).ok_or(PushError::NoDevice)?;
+    let replaced_android = device.android_push.is_some();
+    let mut sub = sub;
+    sub.since_unix_ms = now_ms();
+    if let Some((prefs, since)) = current(device) {
+        sub.prefs = prefs;
+        if device
+            .push
+            .as_ref()
+            .is_some_and(|old| old.endpoint == sub.endpoint)
+        {
+            sub.since_unix_ms = since;
+        }
+    }
+    registry.update(id, |d| {
+        d.push = Some(sub);
+        d.android_push = None;
+    })?;
+    Ok(replaced_android)
+}
+
+/// Validates the native registration a device sent: no network access. `desktop` is the id of
+/// this gateway (the lowercase hex of its static key); `sender_configured` whether it can send
+/// through FCM at all. Its prefs are the defaults; [`subscribe_android`] keeps a device's own.
+pub fn check_android(
+    token: &str,
+    key: &str,
+    desktop: &str,
+    own_desktop: &str,
+    sender_configured: bool,
+) -> Result<AndroidPush, PushError> {
+    if !sender_configured {
+        return Err(PushError::AndroidUnsupported);
+    }
+    let bad = |why: &str| PushError::Invalid(format!("android registration: {why}"));
+    if desktop.len() != 64
+        || !desktop
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(bad("the desktop id is not 64 lowercase hex digits"));
+    }
+    if desktop != own_desktop {
+        return Err(PushError::WrongDesktop);
+    }
+    if token.is_empty()
+        || token.len() > MAX_FCM_TOKEN
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+    {
+        return Err(bad("the token is not an FCM registration token"));
+    }
+    let raw = parse_key(key).ok_or_else(|| bad("the key is not 32 bytes of base64url"))?;
+    Ok(AndroidPush {
+        token: token.to_owned(),
+        key: URL_SAFE_NO_PAD.encode(*raw),
+        prefs: PushPrefs::default(),
+        since_unix_ms: 0,
+    })
+}
+
+/// The AES key of `text` (base64url, 32 bytes).
+fn parse_key(text: &str) -> Option<Zeroizing<[u8; 32]>> {
+    if text.len() > MAX_KEY_TEXT {
+        return None;
+    }
+    let bytes = Zeroizing::new(B64.decode(text).ok()?);
+    let key: [u8; 32] = bytes.as_slice().try_into().ok()?;
+    Some(Zeroizing::new(key))
+}
+
+/// Stores `reg` (from [`check_android`]) as device `id`'s subscription, replacing a Web Push
+/// subscription if it had one. A device that registers anew keeps its prefs, whichever transport
+/// it had; its `since` stays while the token is the same. Returns whether the stored
+/// registration changed (a refreshed token, a new key, another transport): pushes still queued
+/// for the old one must be purged.
+pub fn subscribe_android(
+    registry: &mut Registry,
+    id: &str,
+    reg: AndroidPush,
+) -> Result<bool, PushError> {
+    let device = registry.get(id).ok_or(PushError::NoDevice)?;
+    let mut reg = reg;
+    reg.since_unix_ms = now_ms();
+    if let Some((prefs, since)) = current(device) {
+        reg.prefs = prefs;
+        if device
+            .android_push
+            .as_ref()
+            .is_some_and(|old| old.token == reg.token)
+        {
+            reg.since_unix_ms = since;
+        }
+    }
+    let unchanged = device.push.is_none() && device.android_push.as_ref() == Some(&reg);
+    if !unchanged {
+        registry.update(id, |d| {
+            d.android_push = Some(reg);
+            d.push = None;
+        })?;
+    }
+    Ok(!unchanged)
+}
+
+/// Deletes device `id`'s subscription of either transport (none: nothing to do).
 pub fn unsubscribe(registry: &mut Registry, id: &str) -> Result<(), PushError> {
     let device = registry.get(id).ok_or(PushError::NoDevice)?;
-    if device.push.is_some() {
-        registry.update(id, |d| d.push = None)?;
+    if device.has_push() {
+        registry.update(id, |d| {
+            d.push = None;
+            d.android_push = None;
+        })?;
     }
     Ok(())
 }
@@ -248,13 +387,15 @@ pub fn unsubscribe(registry: &mut Registry, id: &str) -> Result<(), PushError> {
 /// Sets which events device `id` is pushed.
 pub fn set_prefs(registry: &mut Registry, id: &str, prefs: PushPrefs) -> Result<(), PushError> {
     let device = registry.get(id).ok_or(PushError::NoDevice)?;
-    match &device.push {
+    match current(device) {
         None => Err(PushError::NotSubscribed),
-        Some(s) if s.prefs == prefs => Ok(()),
+        Some((p, _)) if p == prefs => Ok(()),
         Some(_) => {
             registry.update(id, |d| {
                 if let Some(s) = &mut d.push {
                     s.prefs = prefs;
+                } else if let Some(a) = &mut d.android_push {
+                    a.prefs = prefs;
                 }
             })?;
             Ok(())
@@ -264,11 +405,11 @@ pub fn set_prefs(registry: &mut Registry, id: &str, prefs: PushPrefs) -> Result<
 
 /// The device feed's push state.
 pub fn state_view(device: &Device) -> PushStateView {
-    match &device.push {
-        Some(s) => PushStateView {
+    match current(device) {
+        Some((prefs, since)) => PushStateView {
             subscribed: true,
-            prefs: s.prefs,
-            since_unix_ms: Some(s.since_unix_ms),
+            prefs,
+            since_unix_ms: Some(since),
         },
         None => PushStateView {
             subscribed: false,
@@ -294,6 +435,19 @@ pub fn forget(registry: &mut Registry, gone: &Gone) -> Result<bool, PushError> {
         .is_some_and(|s| s.endpoint == gone.endpoint);
     if current {
         registry.update(&gone.device, |d| d.push = None)?;
+    }
+    Ok(current)
+}
+
+/// Deletes the Android registration [`fcm::Gone`] names: exactly that token under that key,
+/// never one the phone registered since. Returns whether one was deleted.
+pub fn forget_android(registry: &mut Registry, gone: &fcm::Gone) -> Result<bool, PushError> {
+    let current = registry
+        .get(&gone.device)
+        .and_then(|d| d.android_push.as_ref())
+        .is_some_and(|a| a.token == gone.token && a.key == gone.key);
+    if current {
+        registry.update(&gone.device, |d| d.android_push = None)?;
     }
     Ok(current)
 }
@@ -414,17 +568,24 @@ pub struct Offer<'a> {
     pub fallback: &'a str,
     /// The PWA's origin (the relay's).
     pub origin: &'a str,
+    /// This desktop's id (the lowercase hex of the gateway's static key): what an Android
+    /// notification is bound to. Empty: mobile access is unavailable, no Android push is sent.
+    pub desktop: &'a str,
 }
 
 // ---- engine handle ------------------------------------------------------------------------------
 
-/// The engine's push state: the VAPID key and the sender (started at the first push).
+/// The engine's push state: the VAPID key and its sender, and the FCM account and its sender
+/// (each started at the first push to its kind of device).
 pub struct Push {
     key: Option<Arc<VapidKey>>,
     policy: Policy,
     contact: Option<String>,
     sender: Option<sender::Sender>,
     gone: Arc<Mutex<Vec<Gone>>>,
+    fcm: Option<Arc<fcm::Config>>,
+    android: Option<fcm::Sender>,
+    android_gone: Arc<Mutex<Vec<fcm::Gone>>>,
     wake: Wake,
 }
 
@@ -442,8 +603,9 @@ fn contact_from(text: &str) -> Option<String> {
 }
 
 impl Push {
-    /// Loads (or creates) `push.key` in the secrets `dir`. Without it push is off (logged); the
-    /// gateway runs on.
+    /// Loads (or creates) `push.key` in the secrets `dir`, and reads the FCM service account
+    /// ([`fcm::load`]) if there is one. Without the key Web Push is off, without the account
+    /// Android push is (logged); the gateway runs on.
     pub fn open(dir: &Path, wake: Wake) -> Push {
         let key = crate::gateway::secret_dir(dir)
             .map_err(|e| format!("protecting {}: {e}", dir.display()))
@@ -458,7 +620,7 @@ impl Push {
             }
             parsed
         });
-        Push::with_key(key, Policy::from_env(), contact, wake)
+        Push::with_key(key, Policy::from_env(), contact, wake).with_fcm(fcm::load(dir))
     }
 
     pub fn with_key(
@@ -473,8 +635,17 @@ impl Push {
             contact,
             sender: None,
             gone: Arc::new(Mutex::new(Vec::new())),
+            fcm: None,
+            android: None,
+            android_gone: Arc::new(Mutex::new(Vec::new())),
             wake,
         }
+    }
+
+    /// Android push goes through `fcm` (`None`: it is unavailable).
+    pub fn with_fcm(mut self, fcm: Option<fcm::Config>) -> Push {
+        self.fcm = fcm.map(Arc::new);
+        self
     }
 
     /// `Welcome.push_key` (empty: push is unavailable).
@@ -484,67 +655,137 @@ impl Push {
             .map_or_else(String::new, |k| k.public_key().to_owned())
     }
 
+    /// Whether this gateway can send to Android apps (`FEATURE_ANDROID_PUSH`).
+    pub fn android_configured(&self) -> bool {
+        self.fcm.is_some()
+    }
+
     /// Queues the push of `offer` to every subscribed device that wants its kind and is not
     /// `present` (a live connection reports the app visible).
     pub fn offer(&mut self, devices: &[Device], present: impl Fn(&str) -> bool, offer: &Offer<'_>) {
-        let Some(key) = &self.key else {
-            return;
-        };
         let topic = topic(offer.opens.map_or(offer.fallback, Opens::seed));
-        let contact = self
-            .contact
-            .clone()
-            .unwrap_or_else(|| offer.origin.to_owned());
         for d in devices {
-            let Some(sub) = &d.push else {
-                continue;
+            let (prefs, android) = match (&d.push, &d.android_push) {
+                (Some(s), _) => (s.prefs, None),
+                (None, Some(a)) => (a.prefs, Some(a)),
+                (None, None) => continue,
             };
-            if !wants(&sub.prefs, offer.kind) || present(&d.id) {
+            if !wants(&prefs, offer.kind) || present(&d.id) {
                 continue;
             }
-            let title = sub.prefs.show_titles.then_some(offer.title);
+            let title = prefs.show_titles.then_some(offer.title);
             let Some(payload) = payload(offer.kind, title, offer.origin, offer.opens, &topic)
             else {
                 log::warn!("push to {}: the payload does not fit", d.id);
                 continue;
             };
-            if self.sender.is_none() {
-                let gone = self.gone.clone();
-                let wake = self.wake.clone();
-                let report = move |g: Gone| {
-                    lock(&gone).push(g);
-                    wake();
-                };
-                match sender::Sender::start(key.clone(), self.policy, Arc::new(report)) {
-                    Ok(s) => self.sender = Some(s),
-                    Err(e) => {
-                        log::error!("cannot start the push sender: {e}");
-                        return;
-                    }
-                }
-            }
-            if let Some(s) = &self.sender {
-                s.send(sender::Job {
-                    device: d.id.clone(),
-                    endpoint: sub.endpoint.clone(),
-                    p256dh: sub.p256dh.clone(),
-                    auth: sub.auth.clone(),
-                    payload,
-                    urgency: if offer.kind == MobileKind::Attention {
-                        "high"
-                    } else {
-                        "normal"
-                    },
-                    topic: topic.clone(),
-                    contact: contact.clone(),
-                });
+            match (&d.push, android) {
+                (Some(sub), _) => self.offer_web(d, sub, payload, &topic, offer),
+                (None, Some(a)) => self.offer_android(d, a, &payload, offer),
+                (None, None) => {}
             }
         }
     }
 
-    /// Drops the pushes still queued for device `id` (revoked or unsubscribed).
+    fn offer_web(
+        &mut self,
+        d: &Device,
+        sub: &PushSub,
+        payload: Vec<u8>,
+        topic: &str,
+        offer: &Offer<'_>,
+    ) {
+        let Some(key) = &self.key else {
+            return;
+        };
+        let contact = self
+            .contact
+            .clone()
+            .unwrap_or_else(|| offer.origin.to_owned());
+        if self.sender.is_none() {
+            let gone = self.gone.clone();
+            let wake = self.wake.clone();
+            let report = move |g: Gone| {
+                lock(&gone).push(g);
+                wake();
+            };
+            match sender::Sender::start(key.clone(), self.policy, Arc::new(report)) {
+                Ok(s) => self.sender = Some(s),
+                Err(e) => {
+                    log::error!("cannot start the push sender: {e}");
+                    return;
+                }
+            }
+        }
+        if let Some(s) = &self.sender {
+            s.send(sender::Job {
+                device: d.id.clone(),
+                endpoint: sub.endpoint.clone(),
+                p256dh: sub.p256dh.clone(),
+                auth: sub.auth.clone(),
+                payload,
+                urgency: if offer.kind == MobileKind::Attention {
+                    "high"
+                } else {
+                    "normal"
+                },
+                topic: topic.to_owned(),
+                contact,
+            });
+        }
+    }
+
+    fn offer_android(&mut self, d: &Device, reg: &AndroidPush, payload: &[u8], offer: &Offer<'_>) {
+        let Some(config) = &self.fcm else {
+            return;
+        };
+        if offer.desktop.is_empty() {
+            return;
+        }
+        let Some(key) = parse_key(&reg.key) else {
+            log::warn!("push to {}: its stored Android key is unusable", d.id);
+            return;
+        };
+        let expires_unix_ms =
+            now_ms().saturating_add(u64::try_from(fcm::TTL.as_millis()).unwrap_or(u64::MAX));
+        let Some(plaintext) = fcm::plaintext(payload, expires_unix_ms) else {
+            log::warn!("push to {}: the payload does not fit", d.id);
+            return;
+        };
+        if self.android.is_none() {
+            let gone = self.android_gone.clone();
+            let wake = self.wake.clone();
+            let report = move |g: fcm::Gone| {
+                lock(&gone).push(g);
+                wake();
+            };
+            match fcm::Sender::start(config.clone(), Arc::new(report)) {
+                Ok(s) => self.android = Some(s),
+                Err(e) => {
+                    log::error!("cannot start the Android push sender: {e}");
+                    return;
+                }
+            }
+        }
+        if let Some(s) = &self.android {
+            s.send(fcm::Job {
+                device: d.id.clone(),
+                token: reg.token.clone(),
+                key,
+                desktop: offer.desktop.to_owned(),
+                plaintext,
+                expires_unix_ms,
+            });
+        }
+    }
+
+    /// Drops the pushes still queued for device `id` (revoked, unsubscribed or registered
+    /// anew), of either transport; one in flight is not retried.
     pub fn purge(&self, id: &str) {
         if let Some(s) = &self.sender {
+            s.purge(id);
+        }
+        if let Some(s) = &self.android {
             s.purge(id);
         }
     }
@@ -552,6 +793,11 @@ impl Push {
     /// Subscriptions the push services reported gone since the last call.
     pub fn take_gone(&self) -> Vec<Gone> {
         std::mem::take(&mut *lock(&self.gone))
+    }
+
+    /// Android registrations FCM reported unregistered since the last call.
+    pub fn take_gone_android(&self) -> Vec<fcm::Gone> {
+        std::mem::take(&mut *lock(&self.android_gone))
     }
 }
 
