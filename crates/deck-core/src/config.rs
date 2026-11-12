@@ -123,6 +123,9 @@ pub struct AppConfig {
     pub parked_branches: Vec<ParkedBranch>,
     /// Desktop notification settings.
     pub notify: NotifyConfig,
+    /// Agent-facing OmpDeck tools enabled for sessions started or restarted afterwards.
+    #[serde(default)]
+    pub agent_tools: AgentTools,
     /// Look for new OmpDeck releases at startup and every 6 h.
     pub check_app_updates: bool,
     /// Version the user chose to skip ("Skip this version").
@@ -198,6 +201,57 @@ impl GatewayMode {
 /// Most palette commands remembered in [`AppConfig::palette_recent`].
 pub const MAX_PALETTE_RECENT: usize = 20;
 
+/// Tools offered to the main agent of newly launched OmpDeck sessions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentTools {
+    pub open_session: bool,
+    pub notify: bool,
+    pub show_changes: bool,
+    pub request_review: bool,
+    pub sessions: bool,
+    pub send_prompt: bool,
+    pub wait_session: bool,
+}
+
+impl Default for AgentTools {
+    fn default() -> Self {
+        Self {
+            open_session: true,
+            notify: true,
+            show_changes: true,
+            request_review: true,
+            sessions: true,
+            send_prompt: true,
+            wait_session: true,
+        }
+    }
+}
+
+impl AgentTools {
+    /// Enabled short names in protocol order; absent when every tool is disabled.
+    pub fn env_value(&self) -> Option<String> {
+        let mut value = String::new();
+        for (enabled, name) in [
+            (self.open_session, "open_session"),
+            (self.notify, "notify"),
+            (self.show_changes, "show_changes"),
+            (self.request_review, "request_review"),
+            (self.sessions, "sessions"),
+            (self.send_prompt, "send_prompt"),
+            (self.wait_session, "wait_session"),
+        ] {
+            if enabled {
+                if !value.is_empty() {
+                    value.push(',');
+                }
+                value.push_str(name);
+            }
+        }
+        (!value.is_empty()).then_some(value)
+    }
+}
+
 /// Which events raise a desktop notification.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -211,6 +265,8 @@ pub struct NotifyConfig {
     pub attention: bool,
     /// A tab's process exited.
     pub exited: bool,
+    /// An agent posted a message with `ompdeck_notify`.
+    pub agent_messages: bool,
     /// `false` also notifies for background tabs while the window has focus.
     pub only_when_unfocused: bool,
     /// The in-app inbox (title-bar bell) also records events for the tab being looked at.
@@ -226,6 +282,7 @@ impl Default for NotifyConfig {
             turn_finished: true,
             attention: true,
             exited: true,
+            agent_messages: true,
             only_when_unfocused: true,
             while_viewing: true,
             sound: true,
@@ -282,6 +339,7 @@ impl Default for AppConfig {
             session_backend: BackendChoice::default(),
             worktree_bases: BTreeMap::new(),
             notify: NotifyConfig::default(),
+            agent_tools: AgentTools::default(),
             check_app_updates: true,
             skipped_app_version: None,
             palette_recent: Vec::new(),
@@ -1211,6 +1269,32 @@ mod tests {
         assert!(json.contains(r#""while_viewing":false"#), "{json}");
         let back: AppConfig = serde_json::from_str(&json).unwrap();
         assert!(!back.notify.while_viewing);
+    }
+
+    #[test]
+    fn agent_settings_migrate_and_preserve_disabled_tools() {
+        let old = load_str(r#"{"notify":{"desktop":false}}"#);
+        assert!(old.notify.agent_messages);
+        assert_eq!(
+            old.agent_tools.env_value().as_deref(),
+            Some(
+                "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session"
+            )
+        );
+        let partial = load_str(r#"{"agent_tools":{"notify":false}}"#);
+        assert_eq!(
+            partial.agent_tools.env_value().as_deref(),
+            Some("open_session,show_changes,request_review,sessions,send_prompt,wait_session")
+        );
+        let disabled = load_str(
+            r#"{"notify":{"agent_messages":false},"agent_tools":{"open_session":false,"notify":false,"show_changes":false,"request_review":false,"sessions":false,"send_prompt":false,"wait_session":false}}"#,
+        );
+        assert_eq!(disabled.agent_tools.env_value(), None);
+        assert!(!disabled.notify.agent_messages);
+        let back: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert_eq!(back.agent_tools, disabled.agent_tools);
+        assert!(!back.notify.agent_messages);
     }
 
     fn load_str(json: &str) -> AppConfig {

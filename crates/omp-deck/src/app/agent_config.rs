@@ -130,6 +130,7 @@ impl App {
                 self.cfg.model_provider_filter = provider;
                 self.dirty = true;
             }
+            AgentsAction::Login(provider) => self.open_login(provider),
             AgentsAction::OpenFile(path) => self.open_path(path),
             AgentsAction::OpenFolder(dir) => self.open_folder(dir),
             AgentsAction::CopyPath(path) => self.copy_text(&path, "path"),

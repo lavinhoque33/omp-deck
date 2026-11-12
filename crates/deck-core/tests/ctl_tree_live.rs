@@ -52,7 +52,16 @@ fn turn(live: &Live, prompt: &str) {
     let want = message_ids(&live.entries(), "assistant").len() + 1;
     live.send(prompt);
     wait_for("the reply", TURN, || {
-        (message_ids(&live.entries(), "assistant").len() >= want && live.main_idle()).then_some(())
+        let entries = live.entries();
+        let leaf = entries.iter().rev().find_map(|e| e["id"].as_str());
+        // A fast scripted reply can finish before ctl's debounced busy snapshot. Do not
+        // mistake the pre-turn idle snapshot for the completed turn's state.
+        (message_ids(&entries, "assistant").len() >= want
+            && live
+                .client()
+                .latest()
+                .is_some_and(|s| s.main_idle == Some(true) && s.leaf.as_deref() == leaf))
+        .then_some(())
     });
 }
 

@@ -425,6 +425,26 @@ fn changes_are_refetched_coalesced_and_a_resync_refetches_everything() {
             .iter()
             .any(|e| matches!(e, ClientEvent::Resync))
     );
+    let replay = request(&mut s, &mut asm).expect("server overflow review replay");
+    assert!(matches!(replay.body, Request::AgentReviewsResync));
+    reply(&mut s, replay.id, &Ok(Answer::Done));
+
+    // The GUI's own queue can overflow even when the transport queue did not.
+    for revision in 0..=MAX_EVENTS as u64 {
+        client.shared().push_event(ClientEvent::Changed {
+            topic: Topic::Notifications,
+            revision,
+        });
+    }
+    assert!(
+        client
+            .events()
+            .iter()
+            .any(|e| matches!(e, ClientEvent::Resync))
+    );
+    let replay = request(&mut s, &mut asm).expect("client overflow review replay");
+    assert!(matches!(replay.body, Request::AgentReviewsResync));
+    reply(&mut s, replay.id, &Ok(Answer::Done));
 }
 
 /// Accepts the next frontend connection (control links of the client are turned away).

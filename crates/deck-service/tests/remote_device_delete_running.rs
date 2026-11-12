@@ -195,7 +195,19 @@ fn deleting_a_running_session_from_a_device_stops_it_first() {
             mode: api::ComposeMode::Send,
         }
     )));
-    a.outcome(&mut [], send, TURN);
+    let compose_outcome = a.outcome(&mut [], send, TURN);
+    assert!(
+        matches!(
+            compose_outcome,
+            OutcomeView::Done {
+                result: DoneView::Submitted {
+                    delivery: api::DeliveryView::Delivered {},
+                    ..
+                }
+            }
+        ),
+        "compose must reach omp: {compose_outcome:?}"
+    );
     // The turn ends and omp rewrites the file with its title.
     w.until(&mut a, "the turn to finish", |w| {
         w.idle() && w.latest.as_ref().is_some_and(|s| s.title.is_some())

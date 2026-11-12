@@ -32,6 +32,13 @@ pub(super) enum Post {
     /// The tab takes the strip position next to its former neighbours (a restart, a moved
     /// session).
     Anchor(Anchor),
+    /// A session an agent opened (`ompdeck_open_session`): the launch's end answers tool
+    /// request `request` of session `opener`, with `text` on success.
+    Agent {
+        request: u64,
+        opener: SessionTarget,
+        text: String,
+    },
 }
 
 /// Whether the finished tab becomes the active one.
@@ -281,20 +288,43 @@ impl App {
     }
 
     /// The gateway answered a launch: attach a view and place the tab, or say why not.
-    fn on_spawned(&mut self, req: SpawnReq, claim: Option<u64>, result: Result<Done, String>) {
+    fn on_spawned(&mut self, mut req: SpawnReq, claim: Option<u64>, result: Result<Done, String>) {
         self.spawn.finish();
-        match result {
-            Ok(Done::Session(target, view)) => self.finish_spawn(req, claim, target, view),
+        let agent = match std::mem::replace(&mut req.post, Post::None) {
+            Post::Agent {
+                request,
+                opener,
+                text,
+            } => Some((request, opener, text)),
+            other => {
+                req.post = other;
+                None
+            }
+        };
+        let outcome = match result {
+            Ok(Done::Session(target, view)) => {
+                let opened = target.clone();
+                self.finish_spawn(req, claim, target, view);
+                Ok(opened)
+            }
             Ok(other) => {
                 log::error!("launch answered with {other:?}");
                 self.toasts.error(
                     &self.ctx,
                     format!("Could not open “{}”: unexpected answer", req.title),
                 );
+                Err("OmpDeck could not open the session: unexpected answer".to_owned())
             }
             Err(e) => {
                 self.toasts
                     .error(&self.ctx, format!("Could not open “{}”: {e}", req.title));
+                Err(format!("OmpDeck could not open the session: {e}"))
+            }
+        };
+        if let Some((request, opener, text)) = agent {
+            match outcome {
+                Ok(target) => self.agent_tool_done(request, &opener, true, text, Some(target)),
+                Err(why) => self.agent_tool_done(request, &opener, false, why, None),
             }
         }
         self.pump_spawns();
@@ -390,7 +420,7 @@ impl App {
         }
         self.dirty = true;
         match post {
-            Post::None | Post::Anchor(_) => {}
+            Post::None | Post::Anchor(_) | Post::Agent { .. } => {}
             Post::Restore { active, index } => {
                 self.restore_uids.insert(index, uid);
                 if active {

@@ -18,7 +18,8 @@ use crate::icons::{
 use crate::icons::{ICON_FILE_PEN_LINE, ICON_PUZZLE};
 use crate::mobile_view::{self, MobileAction, MobileInput};
 use deck_core::config::{
-    Density, GatewayMode, MAX_UI_SCALE, MIN_UI_SCALE, Theme, UiFont, UiFontKind, UiStyle,
+    AgentTools, Density, GatewayMode, MAX_UI_SCALE, MIN_UI_SCALE, Theme, UiFont, UiFontKind,
+    UiStyle,
 };
 use deck_core::mux::BackendChoice;
 use deck_core::omp::{Setting, SettingsCatalog};
@@ -375,6 +376,8 @@ pub struct SettingsInput<'a> {
     pub separated_panels: bool,
     pub ui_font: UiFont,
     pub native_decorations: bool,
+    /// Which OmpDeck tools omp agents get (Settings → General → Agent tools).
+    pub agent_tools: &'a AgentTools,
     pub omp_found: bool,
     pub omp_version: Option<&'a str>,
     pub check_updates: bool,
@@ -413,6 +416,8 @@ pub enum SettingsAction {
     SeparatedPanels(bool),
     UiFont(UiFont),
     NativeDecorations(bool),
+    /// The whole "Agent tools" group after one toggle changed.
+    AgentTools(AgentTools),
     SetCheckUpdates(bool),
     CheckUpdates,
     /// Load (or reload) omp's settings catalog on a worker.
@@ -1535,7 +1540,74 @@ fn general_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Setti
         );
     });
 
+    agent_tools_card(ui, input.agent_tools, actions);
+
     mobile_card(ui, input, actions);
+}
+
+/// The OmpDeck tools omp agents may call; read when a session starts.
+fn agent_tools_card(ui: &mut Ui, tools: &AgentTools, actions: &mut Vec<SettingsAction>) {
+    let pal = Palette::of_ui(ui);
+    card(ui, "Agent tools", |ui| {
+        ui.label(
+            RichText::new(
+                "Tools the main agent of a session OmpDeck started can call. Applies to sessions started or restarted afterwards.",
+            )
+            .small()
+            .color(pal.weak),
+        );
+        ui.add_space(10.0);
+        type Field = fn(&mut AgentTools) -> &mut bool;
+        let rows: [(&str, &str, Field); 7] = [
+            (
+                "Open sessions",
+                "Start a parallel omp session in a new tab or split, optionally with a prompt",
+                |t| &mut t.open_session,
+            ),
+            (
+                "Notifications",
+                "Post a message to the bell (and a desktop pop-up) when it needs you",
+                |t| &mut t.notify,
+            ),
+            (
+                "Show changes",
+                "Open the Changes panel on its session, optionally at one file",
+                |t| &mut t.show_changes,
+            ),
+            (
+                "Request review",
+                "Ask you to review its changes in the Changes panel and wait for your comments",
+                |t| &mut t.request_review,
+            ),
+            (
+                "List sessions",
+                "See the open sessions: title, folder, status, model and last reply",
+                |t| &mut t.sessions,
+            ),
+            (
+                "Send prompts to sessions it opened",
+                "Lets the agent send follow-up prompts to parallel sessions it started",
+                |t| &mut t.send_prompt,
+            ),
+            (
+                "Wait for a session's reply",
+                "Lets the agent wait for a parallel session's turn and read its final reply",
+                |t| &mut t.wait_session,
+            ),
+        ];
+        for (i, (title, sub, field)) in rows.into_iter().enumerate() {
+            if i > 0 {
+                ui.add_space(4.0);
+            }
+            setting_row(ui, title, sub, |ui| {
+                let mut next = tools.clone();
+                let on = field(&mut next);
+                if toggle(ui, on).changed() {
+                    actions.push(SettingsAction::AgentTools(next));
+                }
+            });
+        }
+    });
 }
 
 /// What the Mobile access card shows: the gateway's own record of its lifetime mode.

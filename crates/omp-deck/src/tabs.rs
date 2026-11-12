@@ -492,6 +492,22 @@ pub fn omp_argv(session_path: Option<&Path>) -> Vec<String> {
     argv
 }
 
+/// A new session an agent opened (`ompdeck_open_session`): `omp [--model M] [-- prompt]`. The
+/// prompt is one argv element after `--` (omp's positional message), never typed into the
+/// terminal, so dashes, quotes and newlines in it stay literal.
+pub fn agent_omp_argv(model: Option<&str>, prompt: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["omp".to_owned()];
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        argv.push("--model".to_owned());
+        argv.push(m.to_owned());
+    }
+    if let Some(p) = prompt.filter(|p| !p.trim().is_empty()) {
+        argv.push("--".to_owned());
+        argv.push(p.to_owned());
+    }
+    argv
+}
+
 /// Active index after removing tab `removed` from a list that had `len_before` tabs.
 pub fn active_after_close(active: usize, removed: usize, len_before: usize) -> usize {
     let len = len_before.saturating_sub(1);
@@ -517,6 +533,8 @@ pub struct TabBarInput<'a> {
     pub modal_open: bool,
     /// The tabs shown in the panes of a split (empty when not split): marked in the strip.
     pub shown: &'a [Option<u64>],
+    /// Tabs whose agent waits for a review the user has not answered: a badge in the strip.
+    pub reviews: &'a [u64],
     /// The agents dashboard covers the terminals: no tab counts as seen.
     pub dashboard: bool,
 }
@@ -530,6 +548,8 @@ pub fn tab_hit_h() -> f32 {
 const PILL_INSET_Y: f32 = 5.0;
 const MAX_TEXT_W: f32 = 170.0;
 const CLOSE_W: f32 = 20.0;
+/// Room for the "review requested" badge after a tab's title.
+const REVIEW_BADGE_W: f32 = 22.0;
 const ICON_W: f32 = 16.0;
 
 /// Draws the tab strip (horizontal, scrollable); returns the requested action (at most one per frame).
@@ -613,7 +633,10 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     let pill_h = tab_hit_h() - 2.0 * PILL_INSET_Y;
     // Content stays upright between the slanted edges: the slant widens the padding at both ends.
     let slant = skin::tab_slant(pill_h);
-    let width = slant + 12.0 + ICON_W + 8.0 + galley.size().x + 6.0 + CLOSE_W + 6.0 + slant;
+    let review = input.reviews.contains(&tab.uid);
+    let badge_w = if review { REVIEW_BADGE_W } else { 0.0 };
+    let width =
+        slant + 12.0 + ICON_W + 8.0 + galley.size().x + badge_w + 6.0 + CLOSE_W + 6.0 + slant;
     let (rect, resp) = ui.allocate_exact_size(vec2(width, tab_hit_h()), Sense::click());
     if input.scroll_to_active && active {
         ui.scroll_to_rect(rect.expand2(vec2(12.0, 0.0)), None);
@@ -655,14 +678,34 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
             let (icon, col) = tab.kind_icon(pal, sel);
             paint_icon(p, ic, Align2::CENTER_CENTER, icon, 16.0, col);
         }
+        let text_x = inner.left() + 12.0 + ICON_W + 8.0;
+        let text_w = galley.size().x;
         p.galley(
-            pos2(
-                inner.left() + 12.0 + ICON_W + 8.0,
-                inner.center().y - galley.size().y / 2.0,
-            ),
+            pos2(text_x, inner.center().y - galley.size().y / 2.0),
             galley,
             text_color,
         );
+        // The agent waits for a review: a warm review glyph after the title, centred on the row.
+        if review {
+            let c = pos2(
+                text_x + text_w + 4.0 + (REVIEW_BADGE_W - 4.0) / 2.0,
+                inner.center().y,
+            );
+            p.circle(
+                c,
+                (REVIEW_BADGE_W - 4.0) / 2.0,
+                theme::mix(pal.panel, pal.warn, 0.22),
+                Stroke::new(1.0, pal.warn.gamma_multiply(0.8)),
+            );
+            paint_icon(
+                p,
+                c,
+                Align2::CENTER_CENTER,
+                ICON_MESSAGES_SQUARE,
+                11.0,
+                pal.warn,
+            );
+        }
         // Close ✕: visible on hover and for the active tab.
         let vis = hov.max(sel * 0.8);
         if vis > 0.01 {
@@ -751,6 +794,17 @@ pub fn hover_card(resp: &egui::Response, pal: &Palette, tab: &Tab, title: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_prompt_is_one_argv_element_after_the_separator() {
+        let prompt = "--resume /x; fix \"it\"\n-- then -m test";
+        assert_eq!(
+            agent_omp_argv(Some("anthropic/claude sonnet"), Some(prompt)),
+            ["omp", "--model", "anthropic/claude sonnet", "--", prompt]
+        );
+        assert_eq!(agent_omp_argv(None, Some("  ")), ["omp"]);
+        assert_eq!(agent_omp_argv(Some(" "), None), ["omp"]);
+    }
 
     #[test]
     fn an_anchor_survives_a_tab_closing_in_front_of_it() {

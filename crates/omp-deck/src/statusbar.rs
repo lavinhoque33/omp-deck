@@ -11,8 +11,9 @@ use crate::icons::{
     ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_BRAIN, ICON_CHART_PIE, ICON_CHEVRON_DOWN,
     ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_STOP, ICON_COPY, ICON_CPU, ICON_DOWNLOAD,
     ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_FOLDER_GIT_2, ICON_GAUGE, ICON_GIT_BRANCH,
-    ICON_GIT_FORK, ICON_GIT_MERGE, ICON_HANDSHAKE, ICON_HISTORY, ICON_LIST_TREE, ICON_MAP,
-    ICON_NETWORK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE, ICON_VIBRATE,
+    ICON_GIT_FORK, ICON_GIT_MERGE, ICON_HANDSHAKE, ICON_HISTORY, ICON_KEY_ROUND, ICON_LIST_TREE,
+    ICON_LOG_IN, ICON_MAP, ICON_NETWORK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE,
+    ICON_VIBRATE,
 };
 use deck_core::ctl::{ContextBreakdown, LiveAccount, LiveModel};
 use deck_core::omp::ModelInfo;
@@ -27,13 +28,13 @@ use crate::agent_model::Counts;
 use crate::badge::{self, Badge, Hue};
 use crate::cost_tip::{self, CostTip};
 use crate::ctx_tip::{self, CtxTip};
-use crate::usage_state::{CardView, Chip, PillKind, QuotaPill, Summary};
+use crate::usage_state::{CardView, Chip, CredentialIssue, PillKind, QuotaPill, Summary};
 use crate::usage_view;
 use crate::{card, tips};
 use deck_core::usage::LimitStatus;
 
 use crate::model_picker::{
-    self, ModelsCache, PickerAction, PickerInput, PickerState, SessionExtras,
+    self, LoadState, ModelsCache, PickerAction, PickerInput, PickerState, SessionExtras,
 };
 use crate::theme::{self, Palette};
 use crate::widgets::{icon_text, menu_item, paint_icon};
@@ -170,6 +171,11 @@ pub struct BarView {
     ctx_jsonl: (Option<u64>, Option<u64>),
     /// Quota summary behind the usage chip; `None` hides the chip.
     usage: Option<Arc<Summary>>,
+    /// Credentials omp cannot use and "nothing logged in" (key badge, "Log in" chip).
+    login_hint: LoginHint,
+    /// What `login_hint` was built from: summary address, catalog generation and readiness, the
+    /// model selector.
+    hint_key: (usize, u64, bool, Option<String>),
 
     pub tokens_in: String,
     pub tokens_out: String,
@@ -250,6 +256,40 @@ impl BarView {
         };
         if !same {
             self.usage = summary.cloned();
+            self.rev += 1;
+        }
+    }
+
+    /// Rebuilds the login hint when the usage summary, the catalog or the model changed (call
+    /// after [`BarView::update`]); a changed hint changes the usage segment, so it bumps `rev`.
+    pub fn set_login_hint(&mut self, catalog: &ModelsCache) {
+        let summary = self.usage.as_ref().map_or(0, |u| Arc::as_ptr(u) as usize);
+        let ready = catalog.state == LoadState::Ready;
+        let key = &self.hint_key;
+        if key.0 == summary
+            && key.1 == catalog.generation
+            && key.2 == ready
+            && key.3 == self.model_selector
+        {
+            return;
+        }
+        self.hint_key = (
+            summary,
+            catalog.generation,
+            ready,
+            self.model_selector.clone(),
+        );
+        let issues = self
+            .usage
+            .as_deref()
+            .map_or(&[][..], |u| u.issues.as_slice());
+        let hint = login_hint(
+            issues,
+            ready.then(|| catalog.all()),
+            self.model_selector.as_deref(),
+        );
+        if hint != self.login_hint {
+            self.login_hint = hint;
             self.rev += 1;
         }
     }
@@ -484,6 +524,57 @@ fn context_tooltip(tokens: Option<u64>, window: Option<u64>, pct: Option<f64>) -
     }
 }
 
+/// The status bar's login hint: what keeps omp from a provider, each with the provider the login
+/// wizard is preselected to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoginHint {
+    pub problems: Vec<LoginProblem>,
+    /// The catalog is loaded and empty: no provider is logged in.
+    pub nothing_logged_in: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginProblem {
+    /// The login or store id the wizard is preselected to.
+    pub provider: String,
+    pub title: String,
+    pub detail: String,
+}
+
+/// The login hint from omp's disabled credentials and, with the catalog loaded (`models`), the
+/// selected model's provider when the catalog has no model of it.
+pub fn login_hint(
+    issues: &[CredentialIssue],
+    models: Option<&[ModelInfo]>,
+    selector: Option<&str>,
+) -> LoginHint {
+    let mut problems: Vec<LoginProblem> = issues
+        .iter()
+        .filter(|i| i.disabled)
+        .map(|i| LoginProblem {
+            provider: i.provider.clone(),
+            title: format!("{} · {}", i.name, i.who),
+            detail: i.reason.clone(),
+        })
+        .collect();
+    let nothing_logged_in = models.is_some_and(<[ModelInfo]>::is_empty);
+    if let Some(models) = models.filter(|m| !m.is_empty())
+        && let Some((provider, _)) = selector.and_then(|s| s.split_once('/'))
+        && !models.iter().any(|m| m.provider == provider)
+        && !problems.iter().any(|p| p.provider == provider)
+    {
+        problems.push(LoginProblem {
+            provider: provider.to_owned(),
+            title: deck_core::usage::provider_display_name(provider),
+            detail: "This tab's model is unavailable: omp has no login for its provider".to_owned(),
+        });
+    }
+    LoginHint {
+        problems,
+        nothing_logged_in,
+    }
+}
+
 // ------------------------------------------------------------------ actions out
 
 #[derive(Debug, PartialEq, Eq)]
@@ -502,6 +593,8 @@ pub enum BarAction {
     OpenTree,
     OpenUsage,
     ToggleChanges,
+    /// Open the login wizard (preselected to a provider).
+    Login(Option<String>),
 }
 
 pub struct BarInput<'a> {
@@ -798,7 +891,11 @@ fn info_row(
         Seg::Git => v.git.is_some(),
         Seg::Cost => v.show_cost,
         Seg::Tokens => v.show_tokens,
-        Seg::Usage => v.usage.as_ref().is_some_and(|u| u.chip.is_some()),
+        Seg::Usage => {
+            v.usage.as_ref().is_some_and(|u| u.chip.is_some())
+                || v.login_hint.nothing_logged_in
+                || !v.login_hint.problems.is_empty()
+        }
         Seg::Ctx | Seg::Path => true,
     });
     // The model chip has one width in every session, but never takes over the bar: it yields
@@ -917,21 +1014,154 @@ fn segment(ui: &mut Ui, ink: &Ink, v: &BarView, seg: Seg, path: &str, out: &mut 
             });
             cost_tip::hover(&r, &v.cost_tip);
         }
-        Seg::Usage => {
-            if let Some(u) = &v.usage
-                && let Some(c) = &u.chip
-            {
-                let r = chip(ui, ink, "usage", Sense::click(), Tone::Plain, |ui| {
-                    usage_chip_content(ui, pal, v, c);
-                });
-                let r = r.on_hover_cursor(CursorIcon::PointingHand);
-                usage_view::hover(&r, u, v.account.as_ref());
-                if r.clicked() {
-                    out.push(BarAction::OpenUsage);
-                }
+        Seg::Usage => usage_segment(ui, ink, v, out),
+    }
+}
+
+/// The usage chip with the login hint: a "Log in" chip when nothing is logged in; else the quota
+/// chip with an amber key badge (its own hover card and click, on top of the chip) while omp
+/// cannot use a credential, or the key badge alone without a quota chip.
+fn usage_segment(ui: &mut Ui, ink: &Ink, v: &BarView, out: &mut Vec<BarAction>) {
+    let pal = ink.p;
+    let hint = &v.login_hint;
+    let amber = Hue::Amber.color(pal);
+    let first = || hint.problems.first().map(|p| p.provider.clone());
+    if hint.nothing_logged_in {
+        let r = chip(ui, ink, "login", Sense::click(), Tone::Accent, |ui| {
+            ui.label(icon_text(ICON_KEY_ROUND, ICON_PX, amber));
+            ui.add(text("Log in", TEXT_PX, pal.text));
+        });
+        let r = r.on_hover_cursor(CursorIcon::PointingHand);
+        login_hover(&r, hint, out);
+        if r.clicked() {
+            out.push(BarAction::Login(None));
+        }
+        return;
+    }
+    if let Some(u) = &v.usage
+        && let Some(c) = &u.chip
+    {
+        let mut key = None;
+        let r = chip(ui, ink, "usage", Sense::click(), Tone::Plain, |ui| {
+            usage_chip_content(ui, pal, v, c);
+            if !hint.problems.is_empty() {
+                key = Some(key_badge(ui, amber, hint.problems.len()));
+            }
+        });
+        let r = r.on_hover_cursor(CursorIcon::PointingHand);
+        // Registered after the chip, so it is on top: the chip's hover and click stop at it.
+        let key = key.map(|rect| {
+            ui.interact(rect, r.id.with("login-key"), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand)
+        });
+        usage_view::hover(&r, u, v.account.as_ref());
+        if r.clicked() {
+            out.push(BarAction::OpenUsage);
+        }
+        if let Some(k) = key {
+            if k.hovered() {
+                ui.painter().rect_stroke(
+                    k.rect.expand(1.5),
+                    theme::ui_rad((k.rect.height() / 2.0) as u8 + 1),
+                    Stroke::new(1.5, amber),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            login_hover(&k, hint, out);
+            if k.clicked() {
+                out.push(BarAction::Login(first()));
             }
         }
+        return;
     }
+    if !hint.problems.is_empty() {
+        let r = chip(ui, ink, "login-key", Sense::click(), Tone::Alert, |ui| {
+            key_badge(ui, amber, hint.problems.len());
+        });
+        let r = r.on_hover_cursor(CursorIcon::PointingHand);
+        login_hover(&r, hint, out);
+        if r.clicked() {
+            out.push(BarAction::Login(first()));
+        }
+    }
+}
+
+/// The amber key badge (with the problem count past one); returns its rect.
+fn key_badge(ui: &mut Ui, amber: Color32, n: usize) -> Rect {
+    let count = if n > 1 { n.to_string() } else { String::new() };
+    let b = Badge::single(ui.painter(), Some(ICON_KEY_ROUND), &count, amber, 10.5);
+    b.show(ui).rect
+}
+
+/// The login hint's card: each problem with "Log in…" (the wizard preselected to its provider),
+/// or the invitation to log in when nothing is.
+fn login_hover(resp: &Response, hint: &LoginHint, out: &mut Vec<BarAction>) {
+    let title = if hint.nothing_logged_in {
+        "Nothing logged in"
+    } else {
+        "Login needed"
+    };
+    card::hover(
+        resp,
+        300.0,
+        false,
+        &card::Header::new(ICON_KEY_ROUND, title),
+        |_| {},
+        |ui| {
+            let pal = Palette::of_ui(ui);
+            ui.spacing_mut().item_spacing.y = 6.0;
+            if hint.nothing_logged_in {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("omp has no provider to talk to: log in to one to start.")
+                            .small()
+                            .color(pal.text),
+                    )
+                    .wrap(),
+                );
+                if login_button(ui) {
+                    out.push(BarAction::Login(None));
+                }
+                return;
+            }
+            for (i, p) in hint.problems.iter().enumerate() {
+                ui.push_id(i, |ui| {
+                    egui::Sides::new().shrink_left().show(
+                        ui,
+                        |ui| {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.label(theme::strong(&p.title).color(pal.text_strong));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&p.detail)
+                                            .small()
+                                            .color(Hue::Amber.color(pal)),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        },
+                        |ui| {
+                            if login_button(ui) {
+                                out.push(BarAction::Login(Some(p.provider.clone())));
+                            }
+                        },
+                    );
+                });
+            }
+        },
+    );
+}
+
+fn login_button(ui: &mut Ui) -> bool {
+    let pal = Palette::of_ui(ui);
+    ui.add(egui::Button::new((
+        icon_text(ICON_LOG_IN, 14.0, pal.glyph),
+        RichText::new("Log in…").small(),
+    )))
+    .on_hover_cursor(CursorIcon::PointingHand)
+    .clicked()
 }
 
 /// The selected model's provider card and the page the usage chip shows

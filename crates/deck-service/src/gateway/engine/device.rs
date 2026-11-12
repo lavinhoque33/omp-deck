@@ -1333,6 +1333,8 @@ impl Engine {
                                 message: message.as_deref().map(|m| self.devices.canon.scrub(m)),
                             },
                             InboxKind::Attention => api::InboxKind::Attention {},
+                            // Agent messages reuse the frozen phone attention representation.
+                            InboxKind::AgentMessage { .. } => api::InboxKind::Attention {},
                             InboxKind::Exited { code } => api::InboxKind::Exited { code: *code },
                         },
                         title: e.title.clone(),

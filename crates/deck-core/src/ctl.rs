@@ -36,6 +36,9 @@ pub use windows::{ctl_dir, prepare_ctl_dir, prune_ctl_dirs};
 /// `OMPDECK_CTL_PIPE` (Windows) is set.
 pub const EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-ctl.ts");
 
+/// Comma-separated short names of agent tools enabled at session launch.
+pub const OMPDECK_TOOLS_ENV: &str = "OMPDECK_TOOLS";
+
 /// The session-delete extension (see [`crate::omp::Omp::delete_sessions`]): inert unless
 /// `OMPDECK_DEL_TARGETS` and `OMPDECK_DEL_OUT` are set.
 pub const DELETE_EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-del.ts");
@@ -43,6 +46,9 @@ pub const DELETE_EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-del.ts
 /// The session-store helper (see [`crate::omp::Omp::set_pinned`] and friends): inert unless
 /// `OMPDECK_SESS_REQ` and `OMPDECK_SESS_OUT` are set.
 pub const SESS_EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-sess.ts");
+
+/// Provider login/list/logout helper: inert unless all `OMPDECK_AUTH_*` variables are set.
+pub const AUTH_EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-auth.ts");
 
 /// `WATCHDOG.yml` load/save/discovery (omp's `advisor/config` is not importable from an
 /// extension, so it is ported), imported by both the control and the session helper extensions
@@ -53,6 +59,7 @@ const EXTENSION_FILE: &str = "ompdeck-ctl.ts";
 const DELETE_EXTENSION_FILE: &str = "ompdeck-del.ts";
 const SESS_EXTENSION_FILE: &str = "ompdeck-sess.ts";
 const ADVISOR_MODULE_FILE: &str = "ompdeck-advisor.ts";
+const AUTH_EXTENSION_FILE: &str = "ompdeck-auth.ts";
 /// Longest accepted protocol line; longer ones are dropped.
 const MAX_LINE: usize = 8 * 1024 * 1024;
 const PROTOCOL_VERSION: u32 = 1;
@@ -79,6 +86,11 @@ pub fn install_delete_extension(dir: &Path) -> io::Result<PathBuf> {
 pub fn install_sess_extension(dir: &Path) -> io::Result<PathBuf> {
     install_asset(dir, ADVISOR_MODULE_FILE, ADVISOR_MODULE_SOURCE)?;
     install_asset(dir, SESS_EXTENSION_FILE, SESS_EXTENSION_SOURCE)
+}
+
+/// [`install_extension`] for the provider-authentication helper, with the same hardening.
+pub fn install_auth_extension(dir: &Path) -> io::Result<PathBuf> {
+    install_asset(dir, AUTH_EXTENSION_FILE, AUTH_EXTENSION_SOURCE)
 }
 
 fn install_asset(dir: &Path, file: &str, source: &str) -> io::Result<PathBuf> {
@@ -570,6 +582,26 @@ pub struct ContextBreakdown {
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CtlCommand {
+    /// Select pushed feeds for this connection. Remembered and re-sent after reconnect.
+    Subscribe {
+        snapshots: bool,
+        tools: bool,
+    },
+    /// Complete an extension tool request. `details`, when present, must be a JSON object.
+    ToolResult {
+        id: u64,
+        ok: bool,
+        text: String,
+        details: Option<serde_json::Value>,
+    },
+    /// Inject a main-session custom message at the next step boundary, or start a turn if idle.
+    /// Accepted only on a connection subscribed to tools; optional `details` must be an object.
+    Deliver {
+        root: PathBuf,
+        title: String,
+        text: String,
+        details: Option<serde_json::Value>,
+    },
     Kill {
         id: String,
         root: PathBuf,
@@ -661,6 +693,10 @@ pub enum CtlCommand {
         value: serde_json::Value,
         root: PathBuf,
     },
+    /// Refresh the provider's online catalog after another omp logged in or out.
+    RefreshProvider {
+        provider: String,
+    },
     /// Pin the main session to the stored OAuth account `credential` of `provider`, the provider
     /// of its current model (`None`: unpin, omp picks again). Refused while streaming, and when
     /// `root` (if given) or the model's provider no longer match.
@@ -732,6 +768,9 @@ impl DeleteOutcome {
 pub struct CtlReply {
     pub ok: bool,
     pub error: Option<String>,
+    /// Machine-readable refusal, e.g. `root_mismatch` when the conversation changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     /// `ForkAt`: the new session file.
     pub new_file: Option<PathBuf>,
     /// `Navigate`: the leaf after the move.
@@ -744,6 +783,23 @@ pub struct CtlReply {
     pub message: Option<String>,
 }
 
+/// An agent's request for OmpDeck, attributed to its session file at execution time.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolRequest {
+    pub id: u64,
+    /// Short name, without the `ompdeck_` prefix.
+    pub name: String,
+    pub args: serde_json::Value,
+    pub root: Option<PathBuf>,
+}
+
+/// Ordered tool pushes from the extension; cancellation refers to the request's id.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ToolEvent {
+    Request(ToolRequest),
+    Cancel(u64),
+}
+
 // ---- wire format -------------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -754,15 +810,30 @@ enum WireMsg {
         v: u32,
         #[serde(default)]
         ui_hook: bool,
+        #[serde(default)]
+        features: Vec<String>,
+        #[serde(default)]
+        tools: Vec<String>,
     },
     #[serde(rename = "agents")]
     Agents(Box<WireSnapshot>),
+    #[serde(rename = "tool")]
+    Tool {
+        id: u64,
+        name: String,
+        args: serde_json::Value,
+        root: Option<PathBuf>,
+    },
+    #[serde(rename = "tool_cancel")]
+    ToolCancel { id: u64 },
     #[serde(rename = "reply")]
     Reply {
         rid: u64,
         ok: bool,
         #[serde(default)]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
         #[serde(default, rename = "newFile")]
         new_file: Option<PathBuf>,
         #[serde(default)]
@@ -1055,6 +1126,33 @@ impl From<WireSnapshot> for LiveSnapshot {
 
 fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
     let v = match cmd {
+        CtlCommand::Subscribe { snapshots, tools } => {
+            serde_json::json!({"rid": rid, "t": "subscribe", "snapshots": snapshots, "tools": tools})
+        }
+        CtlCommand::ToolResult {
+            id,
+            ok,
+            text,
+            details,
+        } => {
+            let mut value = serde_json::json!({"rid": rid, "t": "tool_result", "id": id, "ok": ok, "text": text});
+            if let Some(details) = details {
+                value["details"] = details.clone();
+            }
+            value
+        }
+        CtlCommand::Deliver {
+            root,
+            title,
+            text,
+            details,
+        } => {
+            let mut value = serde_json::json!({"rid": rid, "t": "deliver", "root": root, "title": title, "text": text});
+            if let Some(details) = details {
+                value["details"] = details.clone();
+            }
+            value
+        }
         CtlCommand::Kill { id, root } => {
             serde_json::json!({"rid": rid, "t": "kill", "id": id, "root": root})
         }
@@ -1108,6 +1206,9 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
         CtlCommand::SetEffort { level } => {
             serde_json::json!({"rid": rid, "t": "set_effort", "level": level})
         }
+        CtlCommand::RefreshProvider { provider } => {
+            serde_json::json!({"rid": rid, "t": "refresh_provider", "provider": provider})
+        }
         CtlCommand::PinAccount {
             root,
             provider,
@@ -1135,6 +1236,21 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
 
 // ---- client ------------------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
+struct Subscription {
+    snapshots: bool,
+    tools: bool,
+}
+
+impl Default for Subscription {
+    fn default() -> Self {
+        Self {
+            snapshots: true,
+            tools: false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Shared {
     connected: AtomicBool,
@@ -1143,6 +1259,10 @@ struct Shared {
     next_id: AtomicU64,
     latest: Mutex<Option<Arc<LiveSnapshot>>>,
     replies: Mutex<Vec<(u64, CtlReply)>>,
+    features: Mutex<Vec<String>>,
+    tools: Mutex<Vec<String>>,
+    tool_requests: Mutex<Vec<ToolEvent>>,
+    subscription: Mutex<Subscription>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1205,6 +1325,21 @@ impl CtlClient {
         self.shared.ui_hook.load(Ordering::Acquire)
     }
 
+    /// Features advertised by the connected extension; empty while offline.
+    pub fn features(&self) -> Vec<String> {
+        lock(&self.shared.features).clone()
+    }
+
+    /// Registered full tool names advertised by the extension; empty while offline.
+    pub fn tools(&self) -> Vec<String> {
+        lock(&self.shared.tools).clone()
+    }
+
+    /// Drain tool requests/cancellations in arrival order.
+    pub fn take_tool_requests(&self) -> Vec<ToolEvent> {
+        std::mem::take(&mut *lock(&self.shared.tool_requests))
+    }
+
     /// `None` until the first snapshot and after a disconnect.
     pub fn latest(&self) -> Option<Arc<LiveSnapshot>> {
         lock(&self.shared.latest).clone()
@@ -1213,6 +1348,12 @@ impl CtlClient {
     /// Queued; the reply arrives via [`take_replies`](Self::take_replies) (and `on_update` fires).
     /// Not connected → the reply is `ok: false`. Returns the request id.
     pub fn send(&self, cmd: CtlCommand) -> u64 {
+        if let CtlCommand::Subscribe { snapshots, tools } = &cmd {
+            *lock(&self.shared.subscription) = Subscription {
+                snapshots: *snapshots,
+                tools: *tools,
+            };
+        }
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         if self.commands.send((id, cmd)).is_err() {
             lock(&self.shared.replies).push((id, failure("control client stopped")));
@@ -1300,6 +1441,9 @@ impl Worker {
     /// Connection ended: drop the snapshot, fail unanswered requests, tell the UI.
     fn reset(&mut self) {
         self.shared.ui_hook.store(false, Ordering::Release);
+        lock(&self.shared.features).clear();
+        lock(&self.shared.tools).clear();
+        lock(&self.shared.tool_requests).clear();
         let was_connected = self.shared.connected.swap(false, Ordering::AcqRel);
         let had_snapshot = lock(&self.shared.latest).take().is_some();
         let mut changed = was_connected || had_snapshot;
@@ -1340,8 +1484,20 @@ impl Worker {
             match stream.read(&mut chunk) {
                 Ok(0) => return Exit::Disconnected,
                 Ok(n) => {
+                    let had_hello = hello;
                     if !self.feed(&chunk[..n], &mut buf, &mut discarding, &mut hello) {
                         return Exit::Disconnected;
+                    }
+                    if hello && !had_hello {
+                        let desired = *lock(&self.shared.subscription);
+                        let subscribe = CtlCommand::Subscribe {
+                            snapshots: desired.snapshots,
+                            tools: desired.tools,
+                        };
+                        // rid 0 is reserved for this internal subscription; its reply is ignored.
+                        if stream.write_all(&encode(0, &subscribe)).is_err() {
+                            return Exit::Disconnected;
+                        }
                     }
                 }
                 Err(e)
@@ -1415,12 +1571,19 @@ impl Worker {
             }
         };
         match msg {
-            WireMsg::Hello { v, ui_hook } => {
+            WireMsg::Hello {
+                v,
+                ui_hook,
+                features,
+                tools,
+            } => {
                 if v != PROTOCOL_VERSION {
                     log::warn!("ctl: unsupported protocol version {v}");
                     return false;
                 }
                 self.shared.ui_hook.store(ui_hook, Ordering::Release);
+                *lock(&self.shared.features) = features;
+                *lock(&self.shared.tools) = tools;
                 *hello = true;
                 if !self.shared.connected.swap(true, Ordering::AcqRel) {
                     (self.on_update)();
@@ -1442,10 +1605,30 @@ impl Worker {
                 }
             }
             WireMsg::Agents(_) => {}
+            WireMsg::Tool {
+                id,
+                name,
+                args,
+                root,
+            } if *hello => {
+                lock(&self.shared.tool_requests).push(ToolEvent::Request(ToolRequest {
+                    id,
+                    name,
+                    args,
+                    root,
+                }));
+                (self.on_update)();
+            }
+            WireMsg::ToolCancel { id } if *hello => {
+                lock(&self.shared.tool_requests).push(ToolEvent::Cancel(id));
+                (self.on_update)();
+            }
+            WireMsg::Tool { .. } | WireMsg::ToolCancel { .. } => {}
             WireMsg::Reply {
                 rid,
                 ok,
                 error,
+                code,
                 new_file,
                 leaf,
                 value,
@@ -1455,6 +1638,7 @@ impl Worker {
                     let reply = CtlReply {
                         ok,
                         error,
+                        code,
                         new_file,
                         leaf,
                         value,
@@ -1473,6 +1657,134 @@ impl Worker {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reconnect_does_not_expose_tool_events_from_the_dropped_connection() {
+        let shared = Arc::new(Shared::default());
+        let (commands, receiver) = mpsc::channel();
+        let client = CtlClient {
+            shared: Arc::clone(&shared),
+            commands,
+            thread: None,
+        };
+        let mut worker = Worker {
+            shared,
+            commands: receiver,
+            dir: PathBuf::new(),
+            key_file: PathBuf::new(),
+            on_update: Box::new(|| {}),
+            pending: HashSet::new(),
+        };
+        let mut hello = false;
+        assert!(worker.line(
+            br#"{"t":"hello","v":1,"features":["tools"],"tools":["ompdeck_wait_session"]}"#,
+            &mut hello
+        ));
+        assert_eq!(client.tools(), ["ompdeck_wait_session"]);
+        assert!(worker.line(
+            br#"{"t":"tool","id":1,"name":"notify","args":{"title":"old"},"root":null}"#,
+            &mut hello,
+        ));
+        assert!(worker.line(br#"{"t":"tool_cancel","id":1}"#, &mut hello));
+        assert_eq!(lock(&worker.shared.tool_requests).len(), 2);
+
+        worker.reset();
+        assert!(!client.connected());
+        assert!(client.tools().is_empty());
+        assert!(client.take_tool_requests().is_empty());
+        hello = false;
+        assert!(worker.line(br#"{"t":"hello","v":1,"features":["tools"]}"#, &mut hello));
+        assert!(
+            client.tools().is_empty(),
+            "older extensions have no tool names"
+        );
+        assert!(worker.line(
+            br#"{"t":"tool","id":2,"name":"sessions","args":{},"root":null}"#,
+            &mut hello,
+        ));
+        assert_eq!(
+            client.take_tool_requests(),
+            [ToolEvent::Request(ToolRequest {
+                id: 2,
+                name: "sessions".into(),
+                args: serde_json::json!({}),
+                root: None,
+            })],
+        );
+    }
+
+    #[test]
+    fn tool_protocol_has_exact_wire_shapes() {
+        for (command, expected) in [
+            (
+                CtlCommand::Subscribe {
+                    snapshots: false,
+                    tools: true,
+                },
+                serde_json::json!({"rid":7,"t":"subscribe","snapshots":false,"tools":true}),
+            ),
+            (
+                CtlCommand::ToolResult {
+                    id: 12,
+                    ok: true,
+                    text: "Posted".into(),
+                    details: None,
+                },
+                serde_json::json!({"rid":7,"t":"tool_result","id":12,"ok":true,"text":"Posted"}),
+            ),
+            (
+                CtlCommand::ToolResult {
+                    id: 12,
+                    ok: false,
+                    text: "Refused".into(),
+                    details: Some(serde_json::json!({"why":"closed"})),
+                },
+                serde_json::json!({"rid":7,"t":"tool_result","id":12,"ok":false,"text":"Refused","details":{"why":"closed"}}),
+            ),
+            (
+                CtlCommand::Deliver {
+                    root: "/s/opener.jsonl".into(),
+                    title: "Background wait: child".into(),
+                    text: "Finished".into(),
+                    details: None,
+                },
+                serde_json::json!({"rid":7,"t":"deliver","root":"/s/opener.jsonl","title":"Background wait: child","text":"Finished"}),
+            ),
+            (
+                CtlCommand::Deliver {
+                    root: "/s/opener.jsonl".into(),
+                    title: "Child".into(),
+                    text: "Reply".into(),
+                    details: Some(serde_json::json!({"session":"s-1234abcd"})),
+                },
+                serde_json::json!({"rid":7,"t":"deliver","root":"/s/opener.jsonl","title":"Child","text":"Reply","details":{"session":"s-1234abcd"}}),
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&encode(7, &command)).unwrap(),
+                expected
+            );
+            assert_eq!(
+                serde_json::from_value::<CtlCommand>(serde_json::to_value(&command).unwrap())
+                    .unwrap(),
+                command
+            );
+        }
+        let request: WireMsg = serde_json::from_str(r#"{"t":"tool","id":12,"name":"notify","args":{"title":"Done"},"root":"/s/main.jsonl"}"#).unwrap();
+        assert!(
+            matches!(request, WireMsg::Tool { id:12, name, args, root } if name == "notify" && args == serde_json::json!({"title":"Done"}) && root == Some(PathBuf::from("/s/main.jsonl")))
+        );
+        let request: WireMsg =
+            serde_json::from_str(r#"{"t":"tool","id":13,"name":"sessions","args":{},"root":null}"#)
+                .unwrap();
+        assert!(matches!(request, WireMsg::Tool { root: None, .. }));
+        let cancel: WireMsg = serde_json::from_str(r#"{"t":"tool_cancel","id":12}"#).unwrap();
+        assert!(matches!(cancel, WireMsg::ToolCancel { id: 12 }));
+        let hello: WireMsg = serde_json::from_str(
+            r#"{"t":"hello","v":1,"features":["tools"],"tools":["ompdeck_notify"]}"#,
+        )
+        .unwrap();
+        assert!(matches!(hello, WireMsg::Hello { features, .. } if features == ["tools"]));
+    }
     #[test]
     fn switch_and_effort_commands_round_trip_and_encode() {
         for cmd in [
@@ -1508,6 +1820,16 @@ mod tests {
         assert_eq!(
             (v["t"].as_str(), v["level"].as_str()),
             (Some("set_effort"), Some("off"))
+        );
+        let line = encode(
+            9,
+            &CtlCommand::RefreshProvider {
+                provider: "zai".into(),
+            },
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({"rid": 9, "t": "refresh_provider", "provider": "zai"})
         );
     }
 

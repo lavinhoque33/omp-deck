@@ -74,6 +74,12 @@ impl Sound {
             Kind::Attention => Sound::Attention,
             Kind::Error(_) => Sound::Error,
             Kind::Exited { .. } => Sound::Ended,
+            Kind::AgentMessage { level, .. } => match level.as_str() {
+                "error" => Sound::Error,
+                "warning" => Sound::Attention,
+                "success" => Sound::Finished,
+                _ => Sound::Test,
+            },
         }
     }
 
@@ -110,7 +116,7 @@ pub enum Effect {
     Mobile {
         target: SessionTarget,
         kind: MobileKind,
-        /// The session's label.
+        /// The session's label; agent messages append `: <message title>`.
         title: String,
     },
 }
@@ -123,6 +129,8 @@ pub enum MobileKind {
     Attention,
     /// The session's process ended.
     Ended,
+    /// An explicit agent message (uses the phone's attention preference).
+    AgentMessage,
 }
 
 impl MobileKind {
@@ -131,6 +139,7 @@ impl MobileKind {
             Kind::Finished | Kind::Error(_) => MobileKind::TurnFinished,
             Kind::Attention => MobileKind::Attention,
             Kind::Exited { .. } => MobileKind::Ended,
+            Kind::AgentMessage { .. } => MobileKind::AgentMessage,
         }
     }
 }
@@ -148,6 +157,7 @@ struct Known {
     session: Option<PathBuf>,
     title: String,
     project: String,
+    visible: bool,
 }
 
 /// A finished turn's verdict from the worker; `kind` is `None` for a turn the user stopped.
@@ -161,6 +171,9 @@ pub struct NotificationCenter {
     inbox: Inbox<SessionTarget>,
     /// The live targets.
     known: HashMap<SessionTarget, Known>,
+    /// Policy and focus from the most recent observation tick.
+    cfg: NotifyConfig,
+    window_focused: bool,
     classified: Receiver<Classified>,
     classified_tx: Sender<Classified>,
     wake: Wake,
@@ -173,6 +186,8 @@ impl NotificationCenter {
             tracker: Tracker::default(),
             inbox: Inbox::default(),
             known: HashMap::new(),
+            cfg: NotifyConfig::default(),
+            window_focused: false,
             classified,
             classified_tx,
             wake,
@@ -193,6 +208,8 @@ impl NotificationCenter {
         window_focused: bool,
         cfg: &NotifyConfig,
     ) -> Ticked {
+        self.cfg.clone_from(cfg);
+        self.window_focused = window_focused;
         let mut out = Ticked::default();
         let visible: Vec<SessionTarget> = sessions
             .iter()
@@ -280,6 +297,7 @@ impl NotificationCenter {
     fn remember(&mut self, o: &Observation<'_>) {
         match self.known.get_mut(o.target) {
             Some(k) => {
+                k.visible = o.visible;
                 if k.session.as_deref() != o.session {
                     k.session = o.session.map(Path::to_path_buf);
                 }
@@ -297,6 +315,7 @@ impl NotificationCenter {
                         session: o.session.map(Path::to_path_buf),
                         title: o.title.to_owned(),
                         project: o.project.to_owned(),
+                        visible: o.visible,
                     },
                 );
             }
@@ -386,6 +405,53 @@ impl NotificationCenter {
                 sound,
             });
         }
+    }
+
+    /// Posts an explicit main-agent message using the last tick's policy and observation.
+    /// Unknown (including stale-generation) targets produce no effects. Rate limiting and
+    /// argument validation belong to the gateway tool router.
+    pub fn agent_message(
+        &mut self,
+        target: SessionTarget,
+        title: String,
+        body: Option<String>,
+        level: String,
+    ) -> Vec<Effect> {
+        if !self.cfg.agent_messages {
+            return Vec::new();
+        }
+        let Some(known) = self.known.get(&target) else {
+            return Vec::new();
+        };
+        let looking = self.window_focused && known.visible;
+        let kind = Kind::AgentMessage { title, body, level };
+        let Kind::AgentMessage { title, body, .. } = &kind else {
+            unreachable!()
+        };
+        let mut effects = vec![Effect::Mobile {
+            target: target.clone(),
+            kind: MobileKind::AgentMessage,
+            title: format!("{}: {title}", known.title),
+        }];
+        if tracker::desktop_wanted(&self.cfg, self.window_focused) {
+            self.tracker.shown(target.clone(), looking);
+            effects.push(Effect::Show {
+                target: target.clone(),
+                title: title.clone(),
+                body: body.clone().unwrap_or_default(),
+                sound: self.cfg.sound.then(|| Sound::of(&kind)),
+            });
+        }
+        if !looking || self.cfg.while_viewing {
+            let title = title.clone();
+            let entry = Entry::new(target, kind, &title, &known.project, SystemTime::now());
+            self.inbox.record(if looking {
+                entry.while_looking()
+            } else {
+                entry
+            });
+        }
+        effects
     }
 
     /// The user opened the session from its inbox entry (the client then shows the session, if
@@ -881,6 +947,123 @@ mod tests {
             );
         }
         assert!(mobile(&effects).is_empty(), "{effects:?}");
+    }
+
+    #[test]
+    fn agent_message_toggle_silences_every_channel() {
+        let key = target(SessionKey::host("omp-deck", "agent-off"), 1);
+        let mut c = center();
+        let cfg = NotifyConfig {
+            agent_messages: false,
+            only_when_unfocused: false,
+            ..NotifyConfig::default()
+        };
+        c.tick(
+            Instant::now(),
+            &[obs(&key, TabStatus::Idle, None, false)],
+            false,
+            &cfg,
+        );
+        let effects = c.agent_message(
+            key,
+            "Blocked".into(),
+            Some("Choose a path".into()),
+            "error".into(),
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(c.inbox().entries().is_empty());
+    }
+
+    #[test]
+    fn agent_messages_preserve_content_and_follow_focus_sound_and_viewing_policy() {
+        let key = target(SessionKey::host("omp-deck", "agent-message"), 1);
+        let mut c = center();
+        let mut cfg = NotifyConfig::default();
+        c.tick(
+            Instant::now(),
+            &[obs(&key, TabStatus::Idle, None, true)],
+            true,
+            &cfg,
+        );
+        let effects = c.agent_message(
+            key.clone(),
+            "Decision".into(),
+            Some("Pick one".into()),
+            "warning".into(),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::Mobile {
+                target: key.clone(),
+                kind: MobileKind::AgentMessage,
+                title: "fix bug: Decision".into(),
+            }]
+        );
+        let entry = &c.inbox().entries()[0];
+        assert_eq!(entry.title, "Decision");
+        assert_eq!(entry.body, "Pick one");
+        assert!(!entry.armed);
+        assert!(entry.kind.is_warn());
+        // Staying in view does not consume an entry recorded while looking.
+        c.tick(
+            Instant::now(),
+            &[obs(&key, TabStatus::Idle, None, true)],
+            true,
+            &cfg,
+        );
+        assert_eq!(c.inbox().entries().len(), 1);
+        c.clear_all();
+        cfg.while_viewing = false;
+        cfg.only_when_unfocused = false;
+        cfg.sound = false;
+        c.tick(
+            Instant::now(),
+            &[obs(&key, TabStatus::Idle, None, true)],
+            true,
+            &cfg,
+        );
+        let effects = c.agent_message(key.clone(), "Done".into(), None, "success".into());
+        assert!(c.inbox().entries().is_empty());
+        assert!(effects.iter().any(|e| matches!(e, Effect::Show { title, body, sound: None, .. } if title == "Done" && body.is_empty())));
+        assert_eq!(mobile(&effects), [(key.clone(), MobileKind::AgentMessage)]);
+        cfg.sound = true;
+        c.tick(
+            Instant::now(),
+            &[obs(&key, TabStatus::Idle, None, false)],
+            false,
+            &cfg,
+        );
+        let effects = c.agent_message(key.clone(), "Failed".into(), None, "error".into());
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Show {
+                sound: Some(Sound::Error),
+                ..
+            }
+        )));
+        assert!(c.inbox().entries()[0].armed);
+        cfg.desktop = false;
+        c.tick(
+            Instant::now(),
+            &[obs(&key, TabStatus::Idle, None, false)],
+            false,
+            &cfg,
+        );
+        let effects = c.agent_message(key.clone(), "Still here".into(), None, "info".into());
+        assert_eq!(mobile(&effects), [(key.clone(), MobileKind::AgentMessage)]);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Show { .. } | Effect::Bell(_)))
+        );
+        let stale = SessionTarget {
+            generation: key.generation + 1,
+            ..key
+        };
+        assert!(
+            c.agent_message(stale, "Stale".into(), None, "info".into())
+                .is_empty()
+        );
     }
 
     #[test]

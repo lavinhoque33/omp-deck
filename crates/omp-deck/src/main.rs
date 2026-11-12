@@ -31,6 +31,7 @@ mod file_drop;
 mod folder_scope;
 mod gw;
 mod icons;
+mod login_view;
 mod mobile_view;
 mod model_picker;
 mod notify;

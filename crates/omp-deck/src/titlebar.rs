@@ -4,9 +4,9 @@
 
 use crate::icons::{
     ICON_APP_WINDOW, ICON_ARROW_LEFT_RIGHT, ICON_COPY, ICON_DOWNLOAD, ICON_GLOBE, ICON_HISTORY,
-    ICON_KEY_ROUND, ICON_LOG_OUT, ICON_MENU, ICON_MINUS, ICON_MOON, ICON_PLUS, ICON_PUZZLE,
-    ICON_REFRESH_CW, ICON_ROCKET, ICON_ROTATE_CCW, ICON_SETTINGS, ICON_SQUARE, ICON_SUN,
-    ICON_TERMINAL, ICON_X,
+    ICON_KEY_ROUND, ICON_LOG_IN, ICON_LOG_OUT, ICON_MENU, ICON_MINUS, ICON_MOON, ICON_PLUS,
+    ICON_PUZZLE, ICON_REFRESH_CW, ICON_ROCKET, ICON_ROTATE_CCW, ICON_SETTINGS, ICON_SQUARE,
+    ICON_SUN, ICON_TERMINAL, ICON_X,
 };
 use deck_core::config::Theme;
 use deck_core::omp::UpdateKind;
@@ -98,6 +98,10 @@ pub enum BarAction {
     CancelBackup,
     /// The notification popover asked for something.
     Inbox(crate::notify_panel::PanelAction),
+    /// Open the provider login wizard.
+    Login,
+    /// Open Usage → Accounts.
+    Accounts,
     Quit,
 }
 
@@ -959,6 +963,15 @@ fn omp_submenu(ui: &mut egui::Ui, o: &OmpBar<'_>, action: &mut Option<BarAction>
             ui.add_space(2.0);
             ui.separator();
             update_actions(ui, o, action);
+            ui.separator();
+            if menu_item(ui, ICON_LOG_IN, "Log in to provider…", None, true, false).clicked() {
+                *action = Some(BarAction::Login);
+                ui.close();
+            }
+            if menu_item(ui, ICON_KEY_ROUND, "Accounts…", None, true, false).clicked() {
+                *action = Some(BarAction::Accounts);
+                ui.close();
+            }
         },
     );
 }
@@ -1241,6 +1254,7 @@ mod tests {
                 labels: &labels,
                 active: 0,
                 scroll_to_active: false,
+                reviews: &[],
                 menu: crate::sidebar::MenuEnv {
                     groups: &[],
                     omp_available: true,
@@ -1289,6 +1303,7 @@ mod tests {
             backup: Some(&chip),
             notifications: notify_panel::PanelInput {
                 entries: &[],
+                reviews: &[],
                 badge: None,
                 warn: false,
                 now: std::time::SystemTime::UNIX_EPOCH,

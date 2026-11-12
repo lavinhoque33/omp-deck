@@ -37,6 +37,7 @@ pub(super) enum Post {
     Changes(PathBuf),
     /// Reload the destinations' records (sign-in, server, backups).
     Accounts,
+    OmpAccounts(String),
     /// The result is the app-update state after the job.
     AppView,
     /// A plugin change succeeded: type `/reload-plugins` into this session once it is idle.
@@ -154,6 +155,20 @@ impl Engine {
                 Err(GatewayError::StaleEpoch {
                     current: self.epoch,
                 }),
+            );
+            return;
+        }
+        if matches!(
+            op,
+            Mutation::AgentToolDone { .. } | Mutation::AgentReviewReply { .. }
+        ) && !c.is(Role::Gui)
+        {
+            self.reply(
+                conn,
+                id,
+                Err(GatewayError::Refused(
+                    "Only a GUI can answer an agent request".to_owned(),
+                )),
             );
             return;
         }
@@ -398,6 +413,10 @@ impl Engine {
             Mutation::RunTool(Tool::Update(_)) | Mutation::OmpUpdateCheck if self.omp.is_none() => {
                 refused("omp was not found")
             }
+            Mutation::OmpLogin { .. } => self.auth.login_refusal(self.omp.is_some()),
+            Mutation::OmpLogout { .. } | Mutation::OmpAccountsRefresh if self.omp.is_none() => {
+                refused("omp was not found")
+            }
             Mutation::UsageRefresh | Mutation::UsageResetSpend { .. } if self.omp.is_none() => {
                 refused("omp was not found")
             }
@@ -539,6 +558,12 @@ impl Engine {
                 }
                 Post::Changes(root) => self.refresh_changes(&root),
                 Post::Accounts => self.load_accounts(),
+                Post::OmpAccounts(store) => {
+                    self.load_omp_accounts();
+                    if result.is_ok() {
+                        self.omp_auth_changed(&store);
+                    }
+                }
                 Post::AppView => {
                     if let Ok(done) = &mut result {
                         **done = Done::AppUpdate(self.sched.app_view());
@@ -723,6 +748,7 @@ impl Engine {
                     restore: false,
                     tool: None,
                     confine,
+                    agent_child: None,
                 });
                 self.pump_launches();
             }
@@ -1069,6 +1095,7 @@ impl Engine {
                     restore: false,
                     tool: Some(tool),
                     confine: None,
+                    agent_child: None,
                 });
                 self.pump_launches();
             }
@@ -1471,6 +1498,48 @@ impl Engine {
                 self.accepted(conn, id, &key);
                 self.inline_result(key, applied, "that job already ended");
             }
+            Mutation::OmpLogin { provider } => {
+                self.accepted(conn, id, &key);
+                match self.start_omp_login(provider) {
+                    Ok(job) => {
+                        self.finish_journal(&key, Outcome::Done(Box::new(Done::OmpLogin { job })))
+                    }
+                    Err(error) => self.finish_journal(&key, Outcome::Failed(error.to_string())),
+                }
+            }
+            Mutation::OmpLoginCancel { job } => {
+                self.cancel_omp_login(job);
+                self.accepted(conn, id, &key);
+                self.finish_journal(&key, Outcome::Done(Box::new(Done::Unit)));
+            }
+            Mutation::OmpAccountsRefresh => {
+                self.load_omp_accounts();
+                self.accepted(conn, id, &key);
+                self.finish_journal(&key, Outcome::Done(Box::new(Done::Unit)));
+            }
+            Mutation::OmpLogout {
+                provider,
+                credential_id,
+            } => {
+                let store = self.auth.store(&provider);
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "omp-logout",
+                    None,
+                    false,
+                    Post::OmpAccounts(store),
+                    move |ctx, _, _| {
+                        let omp = ctx
+                            .omp
+                            .as_ref()
+                            .ok_or_else(|| GatewayError::Refused("omp was not found".into()))?;
+                        omp.logout(&provider, credential_id)
+                            .map(Done::OmpLogout)
+                            .map_err(|e| GatewayError::Failed(e.to_string()))
+                    },
+                );
+            }
             Mutation::UsageRefresh => {
                 self.accepted(conn, id, &key);
                 if self.sched.usage_fetching() {
@@ -1522,6 +1591,26 @@ impl Engine {
                         out
                     },
                 );
+            }
+            Mutation::AgentToolDone {
+                request,
+                target,
+                ok,
+                text,
+                opened,
+            } => {
+                self.accepted(conn, id, &key);
+                self.agent_tool_done(request, &target, ok, text, opened);
+                self.job_finished(key, Ok(Done::Unit));
+            }
+            Mutation::AgentReviewReply {
+                request,
+                target,
+                reply,
+            } => {
+                self.accepted(conn, id, &key);
+                self.agent_review_reply(request, &target, reply);
+                self.job_finished(key, Ok(Done::Unit));
             }
             Mutation::Review {
                 target,
@@ -1813,14 +1902,21 @@ impl Engine {
     }
 
     /// Sends `ev` to the focused (else the most recent) GUI; `false` without one.
-    fn to_desktop(&self, ev: &ServerEvent) -> bool {
-        let gui = self
-            .conns
-            .values()
-            .filter(|c| c.is(Role::Gui))
-            .max_by_key(|c| (c.state.focused, c.seq))
-            .and_then(|c| c.local());
-        gui.inspect(|out| out.event(ev)).is_some()
+    pub(super) fn to_desktop(&self, ev: &ServerEvent) -> bool {
+        self.desktop_conn()
+            .and_then(|id| self.conns.get(&id))
+            .and_then(|c| c.local())
+            .inspect(|out| out.event(ev))
+            .is_some()
+    }
+
+    /// The same designated window for desktop activation and first review delivery.
+    pub(super) fn desktop_conn(&self) -> Option<u64> {
+        self.conns
+            .iter()
+            .filter(|(_, c)| c.is(Role::Gui) && c.local().is_some())
+            .max_by_key(|(_, c)| (c.state.focused, c.seq))
+            .map(|(&id, _)| id)
     }
 
     /// Starts the desktop app with `extra` arguments (no window is open).
@@ -1884,7 +1980,7 @@ impl Engine {
 }
 
 /// Worker: the review prompt of `comments` on `root`'s current diff.
-fn build_review(
+pub(super) fn build_review(
     root: &std::path::Path,
     comments: &[crate::gateway::protocol::ReviewItem],
     general: Option<&str>,

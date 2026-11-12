@@ -333,6 +333,8 @@ pub struct Summary {
     pub accounts: Vec<AccountGroup>,
     /// The Accounts page: providers signed in with several API keys (no order or pin).
     pub keys: Vec<KeyGroup>,
+    /// Stored credentials omp cannot use or measure, disabled ones first.
+    pub issues: Vec<CredentialIssue>,
 }
 
 /// One provider's OAuth accounts in the order omp prefers them (`auth.accountPolicies`).
@@ -673,12 +675,81 @@ impl Summary {
             warning: no_data_warning(snap),
             accounts: AccountGroup::build(snap, now_ms),
             keys: KeyGroup::build(snap, &provider_cards),
+            issues: CredentialIssue::build(snap),
         }
     }
 
     /// The card of `provider` (omp's provider id).
     pub fn card_of(&self, provider: &str) -> Option<&CardView> {
         self.cards.iter().find(|c| c.provider == provider)
+    }
+}
+
+/// A stored credential omp cannot use or measure (`disabledCredentials`, `accountsWithoutUsage`):
+/// merged into Usage → Accounts and, when disabled, the status bar's login hint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialIssue {
+    /// omp's provider (store) id.
+    pub provider: String,
+    pub name: String,
+    pub who: String,
+    pub reason: String,
+    /// omp disabled the credential (expired, revoked): logging in again fixes it.
+    pub disabled: bool,
+    /// `oauth` or `api_key` as omp reports it.
+    pub kind: Option<String>,
+    /// What names the credential: its label, email and account id (empty: an identity-less
+    /// key).
+    pub ids: Vec<String>,
+}
+
+impl CredentialIssue {
+    fn build(snap: &UsageSnapshot) -> Vec<CredentialIssue> {
+        let issue = |a: &UnavailableAccount, disabled| CredentialIssue {
+            provider: a.provider.clone(),
+            name: provider_display_name(&a.provider),
+            who: who_of(a).to_owned(),
+            reason: reason_of(a).to_owned(),
+            disabled,
+            kind: a.kind.clone(),
+            ids: [&a.label, &a.email, &a.account_id]
+                .into_iter()
+                .filter_map(|o| o.as_deref())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        };
+        snap.disabled_credentials
+            .iter()
+            .filter(|a| !a.provider.is_empty())
+            .map(|a| issue(a, true))
+            .chain(
+                snap.accounts_without_usage
+                    .iter()
+                    .filter(|a| !a.provider.is_empty())
+                    .map(|a| issue(a, false)),
+            )
+            .collect()
+    }
+
+    /// Whether this issue is about the stored account of `store` labelled `label` (omp's
+    /// logout listing: an email, `API key #id`, …) of kind `kind`. Usage names an account by
+    /// email, account id or a label that may add the organization (`email (org)`); a key usage
+    /// names nothing matches the store's API key when it is the only one (`lone_key`).
+    pub fn matches(&self, store: &str, label: &str, kind: &str, lone_key: bool) -> bool {
+        if self.provider != store {
+            return false;
+        }
+        if self.ids.is_empty() {
+            return lone_key && kind == "api_key" && self.kind.as_deref() != Some("oauth");
+        }
+        let qualified = |long: &str, short: &str| {
+            long.strip_prefix(short)
+                .is_some_and(|rest| rest.starts_with(" ("))
+        };
+        self.ids
+            .iter()
+            .any(|id| id == label || qualified(id, label) || qualified(label, id))
     }
 }
 
@@ -1540,5 +1611,26 @@ mod tests {
         assert_eq!(v.models[0].tokens, "1.5M");
         assert_eq!(v.models[1].provider, "Codex");
         assert!((v.models[1].share - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn credential_issues_match_stored_accounts_by_identity() {
+        let s = snap(
+            r#"{"generatedAt":1,"reports":[],
+              "disabledCredentials":[{"provider":"anthropic","label":"a@x.test (Acme)",
+                "email":"a@x.test","type":"oauth","reason":"expired"}],
+              "accountsWithoutUsage":[{"provider":"vllm","type":"api_key"}]}"#,
+        );
+        let issues = CredentialIssue::build(&s);
+        let (oauth, key) = (&issues[0], &issues[1]);
+        assert!(oauth.disabled && !key.disabled);
+        // omp's logout listing names the account by email; usage adds the organization.
+        assert!(oauth.matches("anthropic", "a@x.test", "oauth", false));
+        assert!(!oauth.matches("anthropic", "b@x.test", "oauth", false));
+        assert!(!oauth.matches("openai", "a@x.test", "oauth", false));
+        // A key usage names nothing: the store's only API key.
+        assert!(key.matches("vllm", "API key #3", "api_key", true));
+        assert!(!key.matches("vllm", "API key #3", "api_key", false));
+        assert!(!key.matches("vllm", "a@x.test", "oauth", true));
     }
 }

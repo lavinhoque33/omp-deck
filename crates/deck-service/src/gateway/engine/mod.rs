@@ -8,6 +8,8 @@
 //! workers talk to it only through [`Msg`]; nothing that blocks on the network, git, omp or a
 //! backend runs here (workers report back with [`Fin`]).
 
+mod agent_tools;
+mod auth;
 mod deferred;
 mod device;
 mod interest;
@@ -134,6 +136,12 @@ pub(crate) enum ViewOp {
 
 /// A worker's result.
 pub(crate) enum Fin {
+    Auth(auth::AuthFin),
+    AgentChildren(agent_tools::children::WorkerResult),
+    AgentTool {
+        request: u64,
+        result: Result<String, String>,
+    },
     /// A journaled job ended.
     Mutation {
         key: RequestKey,
@@ -440,6 +448,8 @@ pub(crate) struct Engine {
     notify: notify::Notify,
     sched: schedules::Schedules,
     interest: interest::Interest,
+    auth: auth::Auth,
+    agent_tools: agent_tools::AgentTools,
     mobile: remote::Mobile,
     /// Device-protocol state shared by every device session.
     devices: device::Devices,
@@ -578,6 +588,8 @@ impl Engine {
             notify,
             sched: schedules::Schedules::new(now, omp_found),
             interest: interest::Interest::default(),
+            auth: auth::Auth::default(),
+            agent_tools: agent_tools::AgentTools::default(),
             mobile,
             devices: device::Devices::default(),
             worktree: worktree::Worktrees::default(),
@@ -672,6 +684,7 @@ impl Engine {
         self.step_worktrees(now);
         self.step_notifications(now);
         self.step_schedules(now);
+        self.step_auth(now);
         self.step_lifetime(now);
         self.step_mobile(now);
         self.publish();
@@ -716,6 +729,12 @@ impl Engine {
 
     fn on_fin(&mut self, fin: Fin) {
         match fin {
+            Fin::Auth(fin) => self.on_auth_fin(fin),
+            Fin::AgentChildren(result) => self.on_child_worker(result),
+            Fin::AgentTool { request, result } => match result {
+                Ok(text) => self.finish_agent_tool(request, true, text),
+                Err(text) => self.finish_agent_tool(request, false, text),
+            },
             Fin::Mutation { key, result } => self.job_finished(key, result),
             Fin::Worktree(fin) => self.on_worktree_fin(*fin),
             Fin::Progress { key, progress } => self.job_progress(key, progress),
@@ -824,6 +843,7 @@ impl Engine {
                 agents_seq: 0,
             },
         );
+        self.resend_agent_reviews(conn);
         self.dirty.gateway = true;
         Ok(self.welcome())
     }
@@ -898,7 +918,10 @@ impl Engine {
             }
             Request::Subscribe(topic) => {
                 if let Some(c) = self.conns.get_mut(&conn) {
-                    c.subs.insert(topic);
+                    c.subs.insert(topic.clone());
+                }
+                if topic == Topic::OmpAccounts {
+                    self.ensure_omp_accounts();
                 }
                 self.reply(conn, id, Ok(Answer::Done));
             }
@@ -910,6 +933,10 @@ impl Engine {
             }
             Request::Query(q) => self.on_query(conn, id, q),
             Request::Mutate { key, epoch, op } => self.on_mutate(conn, id, key, epoch, *op, None),
+            Request::OmpLoginAnswer { job, seq, value } => {
+                self.login_answer(job, seq, value);
+                self.reply(conn, id, Ok(Answer::Done));
+            }
             Request::Outcome(key) => {
                 // Only a client's own requests: another client's keys are refused whether or
                 // not they exist (no probing of foreign requests).
@@ -927,6 +954,10 @@ impl Engine {
                     }
                 };
                 self.reply(conn, id, reply);
+            }
+            Request::AgentReviewsResync => {
+                self.resend_agent_reviews(conn);
+                self.reply(conn, id, Ok(Answer::Done));
             }
             Request::Flush => {
                 let settings = self.settings.clone();
@@ -1071,6 +1102,7 @@ impl Engine {
             && self.sess.busy_controllers() == 0
             && self.sess.direct_programs() == 0
             && self.backup_lane.is_free()
+            && !self.auth.running()
             && !self.mode_busy
             && self.mode_queue.is_empty()
     }
@@ -1232,6 +1264,7 @@ impl Engine {
     /// keep running (their clients detach); the manifest lets the next owner re-attach them.
     fn shutdown(mut self) -> i32 {
         self.stopping = true;
+        self.stop_agent_tools();
         self.stop_mobile();
         for (_, v) in self.views.drain() {
             v.side
@@ -1386,6 +1419,7 @@ impl Engine {
                     .zip(self.status.latest().map(|s| (*s).clone())),
             )),
             Topic::Usage => TopicValue::Usage(self.sched.usage_view()),
+            Topic::OmpAccounts => TopicValue::OmpAccounts(self.auth.view.clone()),
             Topic::AppUpdate => TopicValue::AppUpdate(self.sched.app_view()),
             Topic::Backup => TopicValue::Backup(self.backup_view()),
             Topic::OmpUpdate => TopicValue::OmpUpdate(self.sched.omp_view()),

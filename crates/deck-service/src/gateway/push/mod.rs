@@ -465,7 +465,7 @@ pub fn topic(seed: &str) -> String {
 fn wants(prefs: &PushPrefs, kind: MobileKind) -> bool {
     match kind {
         MobileKind::TurnFinished => prefs.turn_finished,
-        MobileKind::Attention => prefs.attention,
+        MobileKind::Attention | MobileKind::AgentMessage => prefs.attention,
         MobileKind::Ended => prefs.ended,
     }
 }
@@ -480,11 +480,13 @@ fn body(kind: MobileKind, title: Option<&str>) -> String {
         (MobileKind::TurnFinished, None) => "A session finished".to_owned(),
         (MobileKind::Attention, None) => "A session needs your attention".to_owned(),
         (MobileKind::Ended, None) => "A session ended".to_owned(),
+        (MobileKind::AgentMessage, None) => "An agent sent you a message".to_owned(),
         (MobileKind::TurnFinished, Some(t)) => format!("{} finished", cut(t, TITLE_CHARS)),
         (MobileKind::Attention, Some(t)) => {
             format!("{} needs your attention", cut(t, TITLE_CHARS))
         }
         (MobileKind::Ended, Some(t)) => format!("{} ended", cut(t, TITLE_CHARS)),
+        (MobileKind::AgentMessage, Some(t)) => cut(t, TITLE_CHARS).to_owned(),
     }
 }
 
@@ -561,7 +563,7 @@ pub fn payload(
 #[derive(Clone, Copy, Debug)]
 pub struct Offer<'a> {
     pub kind: MobileKind,
-    /// The session's label.
+    /// The session's label; agent messages append `: <message title>`.
     pub title: &'a str,
     /// What the notification opens (`None`: the app opens at its start page).
     pub opens: Option<&'a Opens>,
@@ -738,7 +740,7 @@ impl Push {
                 p256dh: sub.p256dh.clone(),
                 auth: sub.auth.clone(),
                 payload,
-                urgency: if offer.kind == MobileKind::Attention {
+                urgency: if matches!(offer.kind, MobileKind::Attention | MobileKind::AgentMessage) {
                     "high"
                 } else {
                     "normal"

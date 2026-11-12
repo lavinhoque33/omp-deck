@@ -935,6 +935,9 @@ fn model_row(
             PickerAction::ToggleFavorite(s) => {
                 actions.push(AdvisorAction::Models(AgentsAction::ToggleFavorite(s)));
             }
+            PickerAction::Login(p) => {
+                actions.push(AdvisorAction::Models(AgentsAction::Login(p)));
+            }
             PickerAction::SetProvider(p) => {
                 actions.push(AdvisorAction::Models(AgentsAction::ModelProvider(p)));
             }

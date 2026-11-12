@@ -250,6 +250,22 @@ impl App {
         self.open_session(entry);
     }
 
+    /// Reserve a new pane beside the pane of tab `uid` for the launch of backend session
+    /// `mux_name` (a session an agent opened next to its own): the new tab takes exactly that
+    /// pane (see [`PaneClaim`]).
+    pub(super) fn reserve_split_beside(&mut self, uid: u64, side: Side, mux_name: String) {
+        self.reconcile_panes();
+        if self.split.focus_uid(uid) {
+            self.follow_pane_focus();
+        }
+        let ticket = self.split.reserve_split(side);
+        self.pane_claims.push(PaneClaim {
+            session_path: None,
+            mux_name: Some(mux_name),
+            ticket,
+        });
+    }
+
     /// The pane reserved for the launch that produced a tab with this identity, if any.
     pub(super) fn take_pane_claim(
         &mut self,

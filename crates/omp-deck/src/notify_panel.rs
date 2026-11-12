@@ -11,8 +11,8 @@ use egui::{
 
 use crate::badge::{self, Hue};
 use crate::icons::{
-    ICON_BELL, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_POWER, ICON_SETTINGS,
-    ICON_X, Icon,
+    ICON_BELL, ICON_BOT, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_MESSAGES_SQUARE,
+    ICON_POWER, ICON_SETTINGS, ICON_X, Icon,
 };
 use crate::sidebar::format_age;
 use crate::theme::{self, Palette};
@@ -37,18 +37,39 @@ pub enum PanelAction {
     /// Activate the tab, raise the window, drop the entry.
     Open(SessionTarget),
     Dismiss(SessionTarget),
+    /// Show the pending agent review request `request` (its tab and the Changes panel).
+    OpenReview(u64),
     /// Close the popover and open Settings → OmpDeck → Notifications.
     Settings,
     ClearAll,
 }
 
+/// A pending agent review request, kept by this window (the gateway's inbox has no entry for
+/// it): shown above the inbox entries until it is answered or cancelled.
+pub struct ReviewNote {
+    pub request: u64,
+    /// Kind `AgentMessage` with the title "Review requested" and the agent's summary as body.
+    pub entry: InboxEntry,
+}
+
 pub struct PanelInput<'a> {
     pub entries: &'a [InboxEntry],
+    pub reviews: &'a [ReviewNote],
     /// Badge text; `None` while the inbox is empty.
     pub badge: Option<&'a str>,
     /// An entry needs the user (error / attention): the badge uses the warn colour.
     pub warn: bool,
     pub now: SystemTime,
+}
+
+/// The bell's badge text for `n` entries: `1`–`9`, then `9+` (the gateway inbox's rule).
+pub fn badge_text(n: usize) -> Option<&'static str> {
+    const DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    match n {
+        0 => None,
+        1..=9 => Some(DIGITS[n - 1]),
+        _ => Some("9+"),
+    }
 }
 
 /// The popover's id in egui's popup memory (for opening it from the palette).
@@ -139,8 +160,9 @@ fn popover(ui: &mut Ui, input: &PanelInput<'_>) -> Option<PanelAction> {
                 .size(14.5)
                 .color(pal.text_strong),
         );
-        if !input.entries.is_empty() {
-            badge::show(ui, None, &input.entries.len().to_string(), Hue::Amber, 11.0);
+        let count = input.entries.len() + input.reviews.len();
+        if count > 0 {
+            badge::show(ui, None, &count.to_string(), Hue::Amber, 11.0);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(PAD - 2.0);
@@ -165,7 +187,7 @@ fn popover(ui: &mut Ui, input: &PanelInput<'_>) -> Option<PanelAction> {
         ui.cursor().top(),
         Color32::TRANSPARENT,
     );
-    if input.entries.is_empty() {
+    if input.entries.is_empty() && input.reviews.is_empty() {
         ui.add_space(14.0);
         ui.vertical_centered(|ui| {
             ui.label(icon_text(ICON_CIRCLE_CHECK, 26.0, pal.ok));
@@ -190,16 +212,45 @@ fn popover(ui: &mut Ui, input: &PanelInput<'_>) -> Option<PanelAction> {
                 font: theme::ui_font(),
             };
             let id = popup_id().with("rows");
-            let mut cache: RowCache = ui.ctx().data_mut(|d| d.remove_temp(id)).unwrap_or_default();
-            if cache.key != Some(key) {
-                cache.rows.clear();
-                cache.key = Some(key);
-            }
+            let mut cache: RowCache<SessionTarget> =
+                ui.ctx().data_mut(|d| d.remove_temp(id)).unwrap_or_default();
+            let review_id = popup_id().with("review-rows");
+            // Keyed by request: one session may wait on several reviews.
+            let mut reviews: RowCache<u64> = ui
+                .ctx()
+                .data_mut(|d| d.remove_temp(review_id))
+                .unwrap_or_default();
+            cache.fit(key);
+            reviews.fit(key);
             cache
                 .rows
                 .retain(|uid, _| input.entries.iter().any(|e| e.target == *uid));
+            reviews
+                .rows
+                .retain(|request, _| input.reviews.iter().any(|r| r.request == *request));
             let spacing = ui.spacing().item_spacing.y;
             let mut y = 0.0_f32;
+            // Pending review requests first (few; they stay until answered, so no ✕).
+            for note in input.reviews {
+                refresh_row(
+                    ui,
+                    &mut reviews,
+                    note.request,
+                    &note.entry,
+                    input.now,
+                    pal,
+                    text_w,
+                );
+                let Some(cached) = reviews.rows.get(&note.request) else {
+                    continue;
+                };
+                y += cached.height + spacing;
+                let rid = Id::unique(("notify-review-row", note.request));
+                if row(ui, &note.entry, cached, pal, Some(rid)).is_some() {
+                    action = Some(PanelAction::OpenReview(note.request));
+                    ui.close();
+                }
+            }
             for entry in input.entries {
                 let known = cache
                     .rows
@@ -213,17 +264,28 @@ fn popover(ui: &mut Ui, input: &PanelInput<'_>) -> Option<PanelAction> {
                     y += guess + spacing;
                     continue;
                 }
-                refresh_row(ui, &mut cache, entry, input.now, pal, text_w);
+                refresh_row(
+                    ui,
+                    &mut cache,
+                    entry.target.clone(),
+                    entry,
+                    input.now,
+                    pal,
+                    text_w,
+                );
                 let Some(cached) = cache.rows.get(&entry.target) else {
                     continue;
                 };
                 y += cached.height + spacing;
-                if let Some(a) = row(ui, entry, cached, pal) {
+                if let Some(a) = row(ui, entry, cached, pal, None) {
                     action = Some(a);
                     ui.close();
                 }
             }
-            ui.ctx().data_mut(|d| d.insert_temp(id, cache));
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(id, cache);
+                d.insert_temp(review_id, reviews);
+            });
         });
     action
 }
@@ -235,6 +297,15 @@ fn kind_icon(kind: &Kind, pal: &Palette) -> (Icon, egui::Color32) {
         Kind::Attention => (ICON_CIRCLE_ALERT, pal.warn),
         Kind::Exited { code: Some(0) } => (ICON_POWER, pal.weak),
         Kind::Exited { .. } => (ICON_POWER, pal.danger),
+        Kind::AgentMessage { level, .. } => (
+            ICON_BOT,
+            match level.as_str() {
+                "success" => pal.ok,
+                "warning" => pal.warn,
+                "error" => pal.danger,
+                _ => pal.accent,
+            },
+        ),
     }
 }
 
@@ -277,10 +348,29 @@ struct CachedRow {
     height: f32,
 }
 
-#[derive(Clone, Default)]
-struct RowCache {
+#[derive(Clone)]
+struct RowCache<K> {
     key: Option<LayoutKey>,
-    rows: HashMap<SessionTarget, CachedRow>,
+    rows: HashMap<K, CachedRow>,
+}
+
+impl<K> Default for RowCache<K> {
+    fn default() -> Self {
+        RowCache {
+            key: None,
+            rows: HashMap::new(),
+        }
+    }
+}
+
+impl<K> RowCache<K> {
+    /// Drops every layout made for another width, scale, palette or font.
+    fn fit(&mut self, key: LayoutKey) {
+        if self.key != Some(key) {
+            self.rows.clear();
+            self.key = Some(key);
+        }
+    }
 }
 
 fn age_minutes(now: SystemTime, at: SystemTime) -> u64 {
@@ -311,18 +401,19 @@ fn row_height(title: &Galley, sub: &Galley, body: &Galley) -> f32 {
     2.0 * PAD + title.size().y + sub.size().y + body.size().y + 4.0
 }
 
-/// Brings `cache.rows[e.tab]` up to date for `e`: a full layout for a new revision, only the
+/// Brings `cache.rows[row_key]` up to date for `e`: a full layout for a new revision, only the
 /// sub line when just the age's minute moved on.
-fn refresh_row(
+fn refresh_row<K: std::hash::Hash + Eq>(
     ui: &Ui,
-    cache: &mut RowCache,
+    cache: &mut RowCache<K>,
+    row_key: K,
     e: &InboxEntry,
     now: SystemTime,
     pal: &Palette,
     text_w: f32,
 ) {
     let minutes = age_minutes(now, entry_time(e));
-    if let Some(c) = cache.rows.get_mut(&e.target)
+    if let Some(c) = cache.rows.get_mut(&row_key)
         && c.entry == *e
     {
         if c.age_minutes != minutes {
@@ -347,7 +438,7 @@ fn refresh_row(
     );
     let height = row_height(&title, &sub, &body);
     cache.rows.insert(
-        e.target.clone(),
+        row_key,
         CachedRow {
             entry: e.clone(),
             age_minutes: minutes,
@@ -359,22 +450,39 @@ fn refresh_row(
     );
 }
 
-/// One entry: kind icon, bold tab title, `project · age`, the body; a ✕ while hovered.
-fn row(ui: &mut Ui, e: &InboxEntry, c: &CachedRow, pal: &Palette) -> Option<PanelAction> {
+/// One entry: kind icon, bold tab title, `project · age`, the body; a ✕ while hovered. A
+/// review row (`review`: the id of a pending agent review request's row) has the review icon
+/// and no ✕: it leaves when the review is answered.
+fn row(
+    ui: &mut Ui,
+    e: &InboxEntry,
+    c: &CachedRow,
+    pal: &Palette,
+    review: Option<Id>,
+) -> Option<PanelAction> {
     let width = ui.available_width();
-    let (icon, tint) = kind_icon(&e.kind, pal);
+    let (icon, tint) = if review.is_some() {
+        (ICON_MESSAGES_SQUARE, pal.warn)
+    } else {
+        kind_icon(&e.kind, pal)
+    };
     let (title, sub, body) = (c.title.clone(), c.sub.clone(), c.body.clone());
     let height = c.height;
     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
-    let resp = ui.interact(rect, Id::unique(("notify-row", &e.target)), Sense::click());
+    let row_id = review.unwrap_or_else(|| Id::unique(("notify-row", &e.target)));
+    let resp = ui.interact(rect, row_id, Sense::click());
     let x_rect = Rect::from_min_size(
         pos2(rect.right() - PAD - 18.0, rect.top() + PAD - 2.0),
         vec2(20.0, 20.0),
     );
     let x = ui.interact(
         x_rect,
-        Id::unique(("notify-row-x", &e.target)),
-        Sense::click(),
+        row_id.with("x"),
+        if review.is_some() {
+            Sense::hover()
+        } else {
+            Sense::click()
+        },
     );
     let hovered = resp.hovered() || x.hovered();
     let hov = ui
@@ -409,7 +517,7 @@ fn row(ui: &mut Ui, e: &InboxEntry, c: &CachedRow, pal: &Palette) -> Option<Pane
     p.galley(pos2(left, y), sub, pal.weak);
     y += sub_h + 4.0;
     p.galley(pos2(left, y), body, pal.text);
-    if hov > 0.01 {
+    if hov > 0.01 && review.is_none() {
         if x.hovered() {
             p.rect_filled(x_rect, 5, theme::hover_fill(pal));
         }

@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::icons::Icon;
 use crate::icons::{
-    ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_UP, ICON_CIRCLE_ALERT, ICON_REFRESH_CW,
-    ICON_SEARCH, ICON_STAR, ICON_UNDO_2,
+    ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_UP, ICON_CIRCLE_ALERT, ICON_LOG_IN,
+    ICON_REFRESH_CW, ICON_SEARCH, ICON_STAR, ICON_UNDO_2,
 };
 use deck_core::omp::{ModelInfo, Pricing, SettingsCatalog};
 use egui::{
@@ -656,6 +656,8 @@ pub enum PickerAction {
     ToggleFavorite(String),
     /// Limit the list to one provider (`None` = all providers).
     SetProvider(Option<String>),
+    /// Open the login wizard, preselected to a provider (`None`: the provider list).
+    Login(Option<String>),
 }
 
 impl PickerAction {
@@ -869,6 +871,7 @@ fn provider_options(
         }
     };
     let mut choice: Option<Option<String>> = None;
+    let mut login = false;
     egui::Frame::new()
         .fill(ink.card())
         .stroke(Stroke::new(1.0, ink.line()))
@@ -891,8 +894,15 @@ fn provider_options(
                             choice = Some(Some(name.clone()));
                         }
                     }
+                    if option_row(ui, ink, "+ Add provider…", false) {
+                        login = true;
+                    }
                 });
         });
+    if login {
+        state.provider_open = false;
+        actions.push(PickerAction::Login(None));
+    }
     if let Some(c) = choice {
         state.provider_open = false;
         if c.as_deref() != selected {
@@ -1470,10 +1480,16 @@ fn body(
                         continue;
                     }
                     Row::UnavailableFavorite(favorite) => {
-                        if let Some(selector) = input.favorites.get(*favorite)
-                            && unavailable_row(ui, ink, selector)
-                        {
-                            actions.push(PickerAction::ToggleFavorite(selector.clone()));
+                        if let Some(selector) = input.favorites.get(*favorite) {
+                            match unavailable_row(ui, ink, selector) {
+                                Unavailable::Star => {
+                                    actions.push(PickerAction::ToggleFavorite(selector.clone()));
+                                }
+                                Unavailable::Login => actions.push(PickerAction::Login(
+                                    selector.split_once('/').map(|(p, _)| p.to_owned()),
+                                )),
+                                Unavailable::None => {}
+                            }
                         }
                         continue;
                     }
@@ -1944,24 +1960,42 @@ fn model_row(
     }
 }
 
-/// Saved favorites outlive credentials and catalog changes. Only the star is interactive:
-/// an unavailable model must never send a switch command.
-fn unavailable_row(ui: &mut Ui, ink: &Ink, selector: &str) -> bool {
+/// What was clicked on an [`unavailable_row`].
+enum Unavailable {
+    None,
+    Star,
+    Login,
+}
+
+/// Saved favorites outlive credentials and catalog changes. Only the star and, on hover, "Log in"
+/// (the wizard, preselected to the favorite's provider) are interactive: an unavailable model
+/// must never send a switch command.
+fn unavailable_row(ui: &mut Ui, ink: &Ink, selector: &str) -> Unavailable {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
     let star_rect = egui::Rect::from_min_max(
         pos2(rect.right() - STAR_W, rect.top()),
         pos2(rect.right() - 2.0, rect.bottom()),
+    );
+    let login_rect = egui::Rect::from_center_size(
+        pos2(star_rect.left() - 16.0, rect.center().y),
+        vec2(28.0, 26.0),
     );
     let star = ui.interact(
         star_rect,
         ui.scope_id().with(("unavailable-star", selector)),
         Sense::click(),
     );
-    let hot = ui.ctx().animate_bool_with_time(
-        star.id.with("hot"),
-        resp.hovered() || star.hovered(),
-        0.08,
-    );
+    let row_hovered = ui.rect_contains_pointer(rect);
+    let login = row_hovered.then(|| {
+        ui.interact(
+            login_rect,
+            ui.scope_id().with(("unavailable-login", selector)),
+            Sense::click(),
+        )
+    });
+    let hot = ui
+        .ctx()
+        .animate_bool_with_time(star.id.with("hot"), row_hovered, 0.08);
     let p = ui.painter();
     row_plate(p, rect.shrink2(vec2(0.0, 1.0)), ink, false, hot);
     let left = rect.left() + 12.0;
@@ -1970,7 +2004,7 @@ fn unavailable_row(ui: &mut Ui, ink: &Ink, selector: &str) -> bool {
         selector,
         ink.prose(13.0),
         ink.dim(),
-        star_rect.left() - left - 4.0,
+        login_rect.left() - left - 4.0,
     );
     p.galley(
         pos2(left, rect.center().y - 15.0),
@@ -1992,12 +2026,44 @@ fn unavailable_row(ui: &mut Ui, ink: &Ink, selector: &str) -> bool {
         19.0 + 2.0 * hot,
         theme::mix(ink.dim(), ink.accent_text(), hot),
     );
+    if let Some(l) = &login {
+        let lit = l.hovered();
+        if lit {
+            p.rect(
+                login_rect,
+                theme::rad(5, 7),
+                theme::hover_fill(ink.p),
+                Stroke::new(1.0, theme::hover_stroke(ink.p)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        paint_icon(
+            p,
+            login_rect.center(),
+            Align2::CENTER_CENTER,
+            ICON_LOG_IN,
+            17.0,
+            if lit { ink.accent_text() } else { ink.text() },
+        );
+    }
     resp.on_hover_text(
-        "This saved favorite is unavailable. Sign in to its provider or reload the model list.",
+        "This saved favorite is unavailable. Log in to its provider or reload the model list.",
     );
-    star.on_hover_text("Remove from favorites")
+    if login.is_some_and(|l| {
+        l.on_hover_text("Log in to this provider")
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .clicked()
+    }) {
+        return Unavailable::Login;
+    }
+    if star
+        .on_hover_text("Remove from favorites")
         .on_hover_cursor(CursorIcon::PointingHand)
         .clicked()
+    {
+        return Unavailable::Star;
+    }
+    Unavailable::None
 }
 
 /// Segmented pills in the chat view's chip look; returns the clicked value.

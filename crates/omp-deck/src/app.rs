@@ -11,7 +11,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::icons::{
-    ICON_CLIPBOARD_LIST, ICON_COPY, ICON_EXTERNAL_LINK, ICON_TERMINAL, ICON_TRIANGLE_ALERT,
+    ICON_CLIPBOARD_LIST, ICON_COPY, ICON_EXTERNAL_LINK, ICON_KEY_ROUND, ICON_LOG_IN, ICON_TERMINAL,
+    ICON_TRIANGLE_ALERT,
 };
 use deck_core::agents::AgentsTarget;
 use deck_core::config::{
@@ -45,7 +46,7 @@ use crate::confirm::{self, Confirm};
 use crate::dashboard::DashState;
 use crate::folder_scope;
 use crate::gw::{Gw, LinkView};
-use crate::model_picker::{ModelsCache, PickerState};
+use crate::model_picker::{self, ModelsCache, PickerState};
 use crate::notify_view::NotifyInput;
 use crate::omp_settings::{config_dir_display, defaults_from_catalog};
 use crate::palette::PaletteState;
@@ -69,6 +70,7 @@ use crate::widgets::{empty_state, icon_text, menu_item};
 
 mod agent_config;
 mod agent_delete;
+mod agent_tools;
 mod agents;
 mod app_update;
 mod backup;
@@ -77,6 +79,7 @@ mod changes;
 mod chat_focus;
 mod ctl;
 mod desktop;
+mod login;
 mod mobile;
 mod notifications;
 mod palette;
@@ -203,6 +206,11 @@ enum PendingConfirm {
         provider: String,
         credential: String,
     },
+    /// Log out a stored credential (Usage → Accounts).
+    Logout {
+        provider: String,
+        credential_id: i64,
+    },
     /// Forget the saved backup server.
     RemoveServer,
     /// Remove a clean, merged worktree (with its branch) or park a clean, pushed one (the
@@ -223,6 +231,12 @@ enum PendingConfirm {
     },
     /// Discard or delete files from the Changes panel.
     Changes(changes::PendingWrite),
+}
+
+/// What the start screen (no tab open) was asked for.
+enum Start {
+    Install,
+    Login,
 }
 
 /// What a sidebar restart was asked about.
@@ -472,6 +486,8 @@ pub struct App {
     /// Revision of the usage topic last adopted.
     usage_rev: u64,
     usage_open: bool,
+    /// The login wizard and the `Topic::OmpAccounts` subscription.
+    accounts: login::Accounts,
     /// The Usage view was opened for omp's `/usage reset` (the saved-reset panel is wanted).
     usage_reset: bool,
     usage_ui: usage_view::ViewState,
@@ -505,6 +521,8 @@ pub struct App {
     mobile: mobile::MobileUi,
     /// Changes panel.
     changes: changes::ChangesUi,
+    /// Agent → OmpDeck tools: pending review requests and `show_changes` answers.
+    agent_tools: agent_tools::AgentToolsUi,
     /// OmpDeck self-update.
     app_update: app_update::AppUpdateUi,
     /// Window raise and what this window last told the gateway about itself.
@@ -671,6 +689,7 @@ impl App {
             usage: Usage::new(false),
             usage_rev: 0,
             usage_open: false,
+            accounts: login::Accounts::default(),
             usage_reset: false,
             usage_ui: usage_view::ViewState::default(),
             sessions: session_manager::SessionHub::default(),
@@ -697,6 +716,7 @@ impl App {
             sync: project_sync::SyncUi::new(),
             mobile: mobile::MobileUi::new(),
             changes: changes::ChangesUi::default(),
+            agent_tools: agent_tools::AgentToolsUi::default(),
             app_update: app_update::AppUpdateUi::new(),
             notify: notifications::NotifyUi::new(&cc.egui_ctx),
             file_drops: crate::file_drop::FileDrops::new(),
@@ -783,6 +803,31 @@ impl App {
             ClientEvent::OpenSession { file, split } => self.on_open_session(file, split),
             ClientEvent::CloseSession { file } => self.on_close_session(&file),
             ClientEvent::OpenUrl { url } => self.open_external(url),
+            ClientEvent::AgentOpenSession {
+                request,
+                opener,
+                cwd,
+                prompt,
+                model,
+                placement,
+                title,
+            } => self.on_agent_open_session(request, &opener, cwd, prompt, model, placement, title),
+            ClientEvent::AgentShowChanges {
+                request,
+                target,
+                path,
+            } => self.on_agent_show_changes(request, target, path),
+            ClientEvent::AgentReviewRequest {
+                request,
+                target,
+                summary,
+                paths,
+                activate,
+            } => self.on_agent_review_request(request, target, summary, paths, activate),
+            ClientEvent::AgentReviewCancel { request } => self.on_agent_review_cancel(request),
+            ClientEvent::AgentReviewsReplayed { pending } => {
+                self.on_agent_reviews_replayed(&pending);
+            }
             // Consumed by `Gw` (outcomes, progress) or read from the caches (topic changes).
             ClientEvent::Changed { .. }
             | ClientEvent::Outcome { .. }
@@ -1773,6 +1818,9 @@ impl App {
             .filter_map(|t| t.session_path())
             .collect();
         let place = self.backup_place();
+        let review_uids = self.review_uids();
+        let reviews = self.agent_tools.notes();
+        let inbox_entries = inbox.as_deref().map_or(&[][..], |v| v.entries.as_slice());
         let input = BarInput {
             tabs: TabBarInput {
                 tabs: &self.tabs,
@@ -1786,6 +1834,7 @@ impl App {
                 } else {
                     &[]
                 },
+                reviews: &review_uids,
                 menu: MenuEnv {
                     groups: groups.as_deref().map_or(&[][..], Vec::as_slice),
                     omp_available: omp_found,
@@ -1836,9 +1885,15 @@ impl App {
             pairing: self.pairing_pill(),
             backup: self.backup_chip(),
             notifications: crate::notify_panel::PanelInput {
-                entries: inbox.as_deref().map_or(&[][..], |v| v.entries.as_slice()),
-                badge: inbox.as_deref().and_then(|v| v.badge.as_deref()),
-                warn: inbox.as_deref().is_some_and(|v| v.warns),
+                entries: inbox_entries,
+                reviews,
+                badge: if reviews.is_empty() {
+                    inbox.as_deref().and_then(|v| v.badge.as_deref())
+                } else {
+                    crate::notify_panel::badge_text(inbox_entries.len() + reviews.len())
+                },
+                // A waiting agent needs the user.
+                warn: !reviews.is_empty() || inbox.as_deref().is_some_and(|v| v.warns),
                 now: std::time::SystemTime::now(),
             },
         };
@@ -1869,6 +1924,8 @@ impl App {
             BarAction::ShowPairing => self.mobile.restore(),
             BarAction::OpenBackupActivity(page) => self.open_backup_activity(page),
             BarAction::CancelBackup => self.cancel_backup_job(),
+            BarAction::Login => self.open_login(None),
+            BarAction::Accounts => self.open_accounts(),
         }
     }
 
@@ -2080,9 +2137,33 @@ impl App {
                 self.terminal_focused = false;
                 // Nothing is claimed missing before the gateway has said what it found.
                 let omp_missing = self.gw.gateway().is_some_and(|g| !g.omp_found);
-                let install = theme::skin::central(ui, pal, false, |ui| {
+                // First run: omp is there but has no provider to talk to.
+                let need_login = !omp_missing
+                    && self.models.state == model_picker::LoadState::Ready
+                    && self.models.all().is_empty();
+                let start = theme::skin::central(ui, pal, false, |ui| {
                         theme::skin::paint_canvas(ui.painter(), ui.max_rect(), pal);
                         ui.add_space((ui.available_height() / 2.0 - 90.0).max(20.0));
+                        if need_login {
+                            empty_state(
+                                ui,
+                                ICON_KEY_ROUND,
+                                pal.accent,
+                                "Log in to a provider",
+                                "omp has no model provider yet. Log in to one (omp stores the credential), then start a session from the sidebar.",
+                            );
+                            ui.add_space(12.0);
+                            let clicked = ui
+                                .vertical_centered(|ui| {
+                                    crate::widgets::DraftButton::new("Log in to a provider")
+                                        .kind(crate::widgets::DraftKind::Primary)
+                                        .icon(ICON_LOG_IN)
+                                        .show(ui)
+                                        .clicked()
+                                })
+                                .inner;
+                            return clicked.then_some(Start::Login);
+                        }
                         if !omp_missing {
                             empty_state(
                                 ui,
@@ -2091,7 +2172,7 @@ impl App {
                                 "No session open",
                                 "Pick a session from the sidebar, or press + next to a project to start a new one.",
                             );
-                            return false;
+                            return None;
                         }
                         empty_state(
                             ui,
@@ -2101,11 +2182,15 @@ impl App {
                             &format!("OmpDeck runs the omp coding agent, which was not found in {}.", crate::update::OMP_LOOKUP),
                         );
                         ui.add_space(12.0);
-                        ui.vertical_centered(crate::widgets::install_omp_button).inner
+                        ui.vertical_centered(crate::widgets::install_omp_button)
+                            .inner
+                            .then_some(Start::Install)
                     })
                     .inner;
-                if install {
-                    self.open_install_tab();
+                match start {
+                    Some(Start::Install) => self.open_install_tab(),
+                    Some(Start::Login) => self.open_login(None),
+                    None => {}
                 }
             }
             Some(_) if self.split_shown() => self.show_split(ui),
@@ -2138,6 +2223,7 @@ impl App {
             separated_panels: self.cfg.separated_panels,
             ui_font: self.cfg.ui_font,
             native_decorations: self.cfg.native_decorations,
+            agent_tools: &self.cfg.agent_tools,
             omp_found: self.omp_found(),
             omp_version: self.update.version.as_deref(),
             check_updates: self.cfg.check_updates,
@@ -2186,7 +2272,8 @@ impl App {
             || self.palette.is_some()
             || self.popup.is_some()
             || self.tree.is_some()
-            || self.usage_open;
+            || self.usage_open
+            || self.accounts.wizard.is_some();
         let actions = settings_page::window(ctx, &mut self.settings, &input, blocked);
         for a in actions {
             match a {
@@ -2204,6 +2291,10 @@ impl App {
                     self.dirty = true;
                 }
                 SettingsAction::NativeDecorations(v) => self.set_native_decorations(v),
+                SettingsAction::AgentTools(v) => {
+                    self.cfg.agent_tools = v;
+                    self.dirty = true;
+                }
                 SettingsAction::SetCheckUpdates(v) => {
                     self.cfg.check_updates = v;
                     self.dirty = true;
@@ -2355,6 +2446,7 @@ impl App {
             || self.sessions.open
             || self.palette.is_some()
             || self.settings_open
+            || self.accounts.wizard.is_some()
     }
 
     fn show_confirm(&mut self, ctx: &egui::Context) {
@@ -2419,6 +2511,10 @@ impl App {
                 provider,
                 credential,
             } => self.execute_spend_reset(provider, credential),
+            PendingConfirm::Logout {
+                provider,
+                credential_id,
+            } => self.execute_logout(provider, credential_id),
             PendingConfirm::ClearDraft { .. }
             | PendingConfirm::RestoreBackup(_)
             | PendingConfirm::ResumeForce => {}
@@ -3450,6 +3546,7 @@ impl eframe::App for App {
             && self.tree.is_none()
             && !self.settings_open
             && !self.usage_open
+            && self.accounts.wizard.is_none()
             && !self.sessions.open
             && self.palette.is_none()
             && !egui::Popup::is_any_open(&ctx)
@@ -3465,9 +3562,11 @@ impl eframe::App for App {
         self.drive_status();
         self.drive_ctl();
         self.drive_usage();
+        self.drive_login();
         self.drive_agents();
         self.drive_dashboard();
         self.drive_changes(&ctx);
+        self.drive_agent_tools();
         self.show_sidebar(ui, &snap);
         // The status bar belongs to the open tab view: it spans the area right of the sidebar
         // (sidebar first, so the bar's panel takes its width from what is left), under the
@@ -3478,6 +3577,7 @@ impl eframe::App for App {
         self.show_settings(&ctx);
         self.show_agent_popup(&ctx);
         self.show_tree(&ctx);
+        self.show_login(&ctx);
         self.show_usage(&ctx);
         self.show_sessions(&ctx);
         self.show_backup_dialogs(&ctx);

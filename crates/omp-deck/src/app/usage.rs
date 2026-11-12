@@ -150,6 +150,7 @@ impl App {
         }
         let now = Instant::now();
         let live = self.live_snapshot();
+        let accounts = self.gw.accounts();
         let input = ViewInput {
             load: self.usage.load(),
             summary: self.usage.summary(),
@@ -162,6 +163,8 @@ impl App {
             session: live.as_ref().and_then(|s| s.account.as_ref()),
             // omp's own default when the catalog has not been read.
             global_reserve: self.omp_usage_reserve.unwrap_or(10),
+            accounts: accounts.as_deref(),
+            keys: self.accounts.wizard.is_none() && self.confirm.is_none(),
         };
         let actions = usage_view::show(ctx, &mut self.usage_ui, &input);
         // "Updated Xs ago" ticks while the view is open.
@@ -213,6 +216,13 @@ impl App {
                         },
                     ));
                 }
+                UsageAction::Login(preselect) => self.open_login(preselect),
+                UsageAction::Logout {
+                    provider,
+                    credential_id,
+                    label,
+                    name,
+                } => self.ask_logout(provider, credential_id, label, name),
             }
         }
     }

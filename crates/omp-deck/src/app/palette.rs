@@ -968,6 +968,22 @@ impl App {
             None,
         );
 
+        // Accounts.
+        add(
+            "accounts.login",
+            "Accounts: Log in to provider…",
+            None,
+            ICON_LOG_IN,
+            need(omp, NEED_OMP),
+        );
+        add(
+            "accounts.manage",
+            "Accounts: Manage…",
+            None,
+            ICON_KEY_ROUND,
+            need(omp, NEED_OMP),
+        );
+
         // Updates.
         add(
             "omp.check",
@@ -1483,6 +1499,8 @@ impl App {
             "omp.canary" => self.confirm_channel_switch(UpdateKind::Canary),
             "omp.stable" => self.confirm_channel_switch(UpdateKind::Stable),
             "omp.install" => self.open_install_tab(),
+            "accounts.login" => self.open_login(None),
+            "accounts.manage" => self.open_accounts(),
             "omp.models" => self.reload_models(),
             "app.check_update" => self.check_app_update_manually(),
             "app.start_update" => self.start_app_update(),

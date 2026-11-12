@@ -33,6 +33,7 @@ use deck_core::ctl::{CtlCommand, LiveSnapshot};
 use deck_core::fleet::{FleetSnapshot, FleetTarget};
 use deck_core::inventory::{InventoryEntry, SessionStats};
 use deck_core::mux::MuxKind;
+use deck_core::omp::auth::{LoginProvider, LogoutOutcome};
 use deck_core::omp::{
     AdvisorDoc, AdvisorScope, DeleteTarget, ForeignSession, ForeignSource, ModelInfo, MoveOutcome,
     PluginConfig, PluginFeatures, PluginList, PluginScope, ResetAccounts, SettingsCatalog,
@@ -207,6 +208,14 @@ pub enum Request {
     },
     /// The record of an earlier mutation; never executes anything.
     Outcome(RequestKey),
+    /// A transient login answer: never journaled or restored on reconnect.
+    OmpLoginAnswer {
+        job: u64,
+        seq: u64,
+        value: SecretText,
+    },
+    /// Re-send pending review events after a GUI's event queue overflowed.
+    AgentReviewsResync,
     /// Wait until every earlier settings edit is committed.
     Flush,
     /// Bundle maintenance (CLI): raise the barrier and drain, or lower it.
@@ -282,6 +291,7 @@ pub enum Topic {
     Notifications,
     Status,
     Usage,
+    OmpAccounts,
     AppUpdate,
     /// The backup destinations ([`BackupView`]).
     Backup,
@@ -596,6 +606,7 @@ pub enum TopicValue {
     /// [`SessionStats`] with the per-source cost detail).
     Status(Box<Option<(SessionTarget, SessionStatus)>>),
     Usage(UsageView),
+    OmpAccounts(OmpAccountsView),
     AppUpdate(AppUpdateView),
     Backup(BackupView),
     Inventory(Vec<InventoryEntry>),
@@ -620,6 +631,50 @@ pub enum TopicValue {
     OmpUpdate(OmpUpdateView),
     Mobile(MobileView),
     Worktrees(Box<WorktreesView>),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmpAccountsView {
+    pub providers: Vec<LoginProvider>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub login: Option<LoginView>,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginView {
+    pub job: u64,
+    pub provider: String,
+    pub name: String,
+    pub auth: Option<LoginAuth>,
+    pub prompt: Option<LoginPrompt>,
+    pub manual: Option<u64>,
+    pub progress: Vec<String>,
+    pub outcome: Option<LoginOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginAuth {
+    pub url: String,
+    pub launch_url: Option<String>,
+    pub instructions: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginPrompt {
+    pub seq: u64,
+    pub message: String,
+    pub placeholder: Option<String>,
+    pub allow_empty: bool,
+    pub masked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoginOutcome {
+    Done { label: Option<String> },
+    Failed(String),
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1323,6 +1378,17 @@ pub enum Mutation {
     CancelBackupJob,
     /// Fetch usage now (through omp's report cache, like omp's own `/usage`).
     UsageRefresh,
+    OmpLogin {
+        provider: String,
+    },
+    OmpLoginCancel {
+        job: u64,
+    },
+    OmpLogout {
+        provider: String,
+        credential_id: i64,
+    },
+    OmpAccountsRefresh,
     /// Check omp for an update now.
     OmpUpdateCheck,
     /// Rescan the sessions and poll the backends now.
@@ -1363,6 +1429,20 @@ pub enum Mutation {
     DeviceSetPermissions {
         id: String,
         permissions: Permissions,
+    },
+    /// Completes a desktop agent-tool request; `opened` associates a newly launched session.
+    AgentToolDone {
+        request: u64,
+        target: SessionTarget,
+        ok: bool,
+        text: String,
+        opened: Option<SessionTarget>,
+    },
+    /// Returns the user's answer to a pending agent review request.
+    AgentReviewReply {
+        request: u64,
+        target: SessionTarget,
+        reply: ReviewReply,
     },
     /// Review comments on `root`'s changes as one prompt, inserted at omp's cursor or sent
     /// ([`Command::Review`](crate::controller::Command::Review)); answers like `Submit`.
@@ -1554,6 +1634,17 @@ pub struct ReviewItem {
     pub line_side: Option<crate::review::Side>,
 }
 
+/// The user's response to an agent's Changes-panel review request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewReply {
+    Comments {
+        comments: Vec<ReviewItem>,
+        general: Option<String>,
+    },
+    NoComments,
+    Dismissed,
+}
+
 impl Mutation {
     /// Short label for job lists and the journal (no payload values).
     pub fn label(&self) -> &'static str {
@@ -1620,6 +1711,10 @@ impl Mutation {
             Mutation::CancelJob(_) => "cancel-job",
             Mutation::CancelBackupJob => "cancel-backup-job",
             Mutation::UsageRefresh => "usage-refresh",
+            Mutation::OmpLogin { .. } => "omp-login",
+            Mutation::OmpLoginCancel { .. } => "omp-login-cancel",
+            Mutation::OmpLogout { .. } => "omp-logout",
+            Mutation::OmpAccountsRefresh => "omp-accounts-refresh",
             Mutation::OmpUpdateCheck => "omp-update-check",
             Mutation::RefreshSessions => "refresh-sessions",
             Mutation::RelaySet { .. } => "relay-set",
@@ -1633,6 +1728,8 @@ impl Mutation {
             Mutation::DeviceRename { .. } => "device-rename",
             Mutation::DeviceSetPermissions { .. } => "device-permissions",
             Mutation::Review { .. } => "review",
+            Mutation::AgentToolDone { .. } => "agent-tool-done",
+            Mutation::AgentReviewReply { .. } => "agent-review-reply",
             Mutation::AnswerUi { .. } => "answer-ui",
             Mutation::OpenOnDesktop { .. } => "open-on-desktop",
             Mutation::CloseOnDesktop { .. } => "close-on-desktop",
@@ -1691,6 +1788,7 @@ impl Mutation {
                 | Mutation::InboxClear
                 | Mutation::CancelJob(_)
                 | Mutation::CancelBackupJob
+                | Mutation::OmpLoginCancel { .. }
                 | Mutation::RefreshSessions
                 | Mutation::DriveLoginCancel(_)
                 | Mutation::DiscardRestore(_)
@@ -1700,6 +1798,8 @@ impl Mutation {
                 | Mutation::DeviceRevoke { .. }
                 | Mutation::RelayClear
                 | Mutation::AnswerUi { .. }
+                | Mutation::AgentToolDone { .. }
+                | Mutation::AgentReviewReply { .. }
                 | Mutation::CloseOnDesktop { .. }
         )
     }
@@ -1778,6 +1878,10 @@ impl Outcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Done {
     Unit,
+    OmpLogin {
+        job: u64,
+    },
+    OmpLogout(LogoutOutcome),
     /// A session opened (or restarted): its target and the view it runs in (see
     /// [`ControllerInfo::view`]; `Terminal` when `Chat` was asked for but unavailable).
     Session(SessionTarget, SessionView),
@@ -1967,6 +2071,39 @@ pub enum ServerEvent {
     OpenSession {
         file: PathBuf,
         split: Split,
+    },
+    /// Launch a parallel session relative to the opener's tab.
+    AgentOpenSession {
+        request: u64,
+        opener: SessionTarget,
+        cwd: PathBuf,
+        prompt: Option<String>,
+        model: Option<String>,
+        placement: Split,
+        title: Option<String>,
+    },
+    /// Focus the session and show its Changes panel.
+    AgentShowChanges {
+        request: u64,
+        target: SessionTarget,
+        path: Option<String>,
+    },
+    /// Collect a review from a GUI; remains pending across GUI reconnects.
+    AgentReviewRequest {
+        request: u64,
+        /// Raise/focus this window only on its designated first delivery; false on replay.
+        activate: bool,
+        target: SessionTarget,
+        summary: Option<String>,
+        paths: Vec<String>,
+    },
+    /// The underlying tool request was cancelled or its session ended.
+    AgentReviewCancel {
+        request: u64,
+    },
+    /// End of a review replay; prune local requests absent from this authoritative set.
+    AgentReviewsReplayed {
+        pending: Vec<u64>,
     },
     /// Close the tab of the session file `file` (every GUI).
     CloseSession {

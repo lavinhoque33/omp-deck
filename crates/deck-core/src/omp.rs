@@ -9,10 +9,14 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Map, Value};
 
+pub mod auth;
 mod plugins;
 mod sess;
 mod usage_reset;
 
+pub use auth::{
+    AuthError, AuthOrigin, LoginEvent, LoginProvider, LoginRun, LogoutOutcome, StoredAccount,
+};
 pub use plugins::{
     MarketplaceEntry, MarketplacePlugin, NpmPlugin, PluginConfig, PluginFeature, PluginFeatures,
     PluginList, PluginManifest, PluginScope, PluginSetting, PluginSettingKind,

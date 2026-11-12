@@ -91,7 +91,7 @@ impl App {
 
     /// Activates the tab of `target`; when this window has none, opens a view of the session
     /// the gateway runs (if it still runs it).
-    fn show_session_of(&mut self, target: &SessionTarget) {
+    pub(super) fn show_session_of(&mut self, target: &SessionTarget) {
         if let Some(i) = self.tab_of_target(target) {
             self.activate(i);
             return;
@@ -142,6 +142,7 @@ impl App {
             NotifyAction::TurnFinished(v) => cfg.turn_finished = v,
             NotifyAction::Attention(v) => cfg.attention = v,
             NotifyAction::Exited(v) => cfg.exited = v,
+            NotifyAction::AgentMessages(v) => cfg.agent_messages = v,
             NotifyAction::OnlyWhenUnfocused(v) => cfg.only_when_unfocused = v,
             NotifyAction::WhileViewing(v) => cfg.while_viewing = v,
             NotifyAction::Sound(v) => cfg.sound = v,
@@ -177,6 +178,7 @@ impl App {
                         }
                     });
             }
+            PanelAction::OpenReview(request) => self.show_review_ask(request),
             PanelAction::Settings => {
                 self.open_settings_page(OmpDeckPage::Notifications);
             }

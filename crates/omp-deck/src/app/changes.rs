@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use deck_core::changes::{ChangedFile, Changes, FileDiff};
 use deck_service::controller::Delivery;
 use deck_service::gateway::protocol::{
-    Answer, Done, Mutation, Query, ReviewItem, Topic, TopicValue,
+    Answer, Done, Mutation, Query, ReviewItem, ReviewReply, Topic, TopicValue,
 };
 use egui::Margin;
 
@@ -142,14 +142,43 @@ impl App {
     pub(super) fn toggle_changes_panel(&mut self) {
         if self.changes.open {
             self.changes.open = false;
+            self.focus_pending = true;
+            self.ctx.request_repaint();
         } else {
+            self.open_changes_panel();
+        }
+    }
+
+    /// Shows the panel (it replaces the agents dashboard, which would hide it).
+    pub(super) fn open_changes_panel(&mut self) {
+        if !self.changes.open {
             self.changes.open = true;
-            self.close_dashboard();
             // The next frame subscribes and reads the cache at once.
             self.changes.seen_rev = 0;
         }
+        self.close_dashboard();
         self.focus_pending = true;
         self.ctx.request_repaint();
+    }
+
+    /// The panel's listing state while it is open on tab `uid`.
+    pub(super) fn changes_load_of(&self, uid: u64) -> Option<LoadState> {
+        (self.changes.open && self.changes.uid == Some(uid)).then(|| self.changes.view.load.clone())
+    }
+
+    /// Files in the panel's listing.
+    pub(super) fn changes_file_count(&self) -> usize {
+        self.changes.view.files.len()
+    }
+
+    /// Selects `path` (repository-relative) in the panel and loads its diff; false when the
+    /// listing has no such file.
+    pub(super) fn changes_select_path(&mut self, path: &str) -> bool {
+        let found = self.changes.view.select_path(path);
+        if found {
+            self.changes_request_diff();
+        }
+        found
     }
 
     /// The panel can follow the active tab.
@@ -198,6 +227,15 @@ impl App {
         self.follow_changes(&cwd);
         self.take_listing(&cwd);
         self.show_offline_notice();
+        // The banner and answer buttons of the tab's pending agent review request, if any.
+        let ask = self
+            .tabs
+            .iter()
+            .find(|t| t.uid == uid)
+            .and_then(|t| self.agent_tools.ask_for(t.target()));
+        if self.changes.view.ask.as_ref() != ask {
+            self.changes.view.ask = ask.cloned();
+        }
     }
 
     /// The panel is read-only while the gateway is away: say so, and take the notice back when
@@ -460,6 +498,9 @@ impl App {
             }
             ChangesAction::InsertReview => self.hand_review(false),
             ChangesAction::SendReview => self.hand_review(true),
+            ChangesAction::ReturnReview => self.answer_review(None),
+            ChangesAction::NoComments => self.answer_review(Some(ReviewReply::NoComments)),
+            ChangesAction::DismissReview => self.answer_review(Some(ReviewReply::Dismissed)),
             ChangesAction::Close => {
                 self.changes.open = false;
                 self.focus_pending = true;
@@ -516,6 +557,90 @@ impl App {
                 // why, and the comments stay in the review.
                 Ok(_) => {}
                 Err(e) => app.toasts.error(&app.ctx, format!("Nothing was sent: {e}")),
+            },
+        );
+    }
+
+    /// Answers the agent's review request shown in the panel with `plain` ("no comments" /
+    /// dismissed), or with `None` the review's comments. The comments leave the review once the
+    /// gateway took them; a failure keeps everything for another try.
+    fn answer_review(&mut self, plain: Option<ReviewReply>) {
+        let Some(request) = self
+            .changes
+            .view
+            .ask
+            .as_ref()
+            .filter(|a| !a.sending)
+            .map(|a| a.request)
+        else {
+            return;
+        };
+        let Some(target) = self.agent_tools.asker(request).cloned() else {
+            return;
+        };
+        let mut handed: Option<(PathBuf, Vec<u64>)> = None;
+        let reply = if let Some(r) = plain {
+            r
+        } else {
+            let Some(root) = self.changes.view.root.clone() else {
+                return;
+            };
+            let list = self
+                .changes
+                .view
+                .reviews
+                .of(&root)
+                .map(|r| r.comments().to_vec())
+                .unwrap_or_default();
+            if list.is_empty() {
+                return;
+            }
+            let (items, general) = match self.review_items(&list) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.toasts.error(&self.ctx, e);
+                    return;
+                }
+            };
+            handed = Some((root, list.iter().map(|c| c.id).collect()));
+            ReviewReply::Comments {
+                comments: items,
+                general,
+            }
+        };
+        let done = match (&reply, &handed) {
+            (ReviewReply::Comments { .. }, Some((_, ids))) if ids.len() == 1 => {
+                "Returned 1 review comment to the agent".to_owned()
+            }
+            (ReviewReply::Comments { .. }, Some((_, ids))) => {
+                format!("Returned {} review comments to the agent", ids.len())
+            }
+            (ReviewReply::Dismissed, _) => "Dismissed the agent's review request".to_owned(),
+            _ => "Told the agent you had no comments".to_owned(),
+        };
+        self.agent_tools.set_sending(request, true);
+        if let Some(a) = self.changes.view.ask.as_mut() {
+            a.sending = true;
+        }
+        self.gw.mutate(
+            Mutation::AgentReviewReply {
+                request,
+                target,
+                reply,
+            },
+            move |app, result| match result {
+                Ok(_) => {
+                    if let Some((root, ids)) = handed {
+                        app.changes.view.reviews.of_mut(&root).remove_all(&ids);
+                    }
+                    app.review_answered(request);
+                    app.toasts.success(&app.ctx, done);
+                }
+                Err(e) => {
+                    app.agent_tools.set_sending(request, false);
+                    app.toasts
+                        .error(&app.ctx, format!("The review did not reach the agent: {e}"));
+                }
             },
         );
     }

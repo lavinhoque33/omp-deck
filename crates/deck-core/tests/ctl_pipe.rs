@@ -102,6 +102,11 @@ fn a_tab_pipe_serves_snapshots_and_takes_commands_at_the_same_time() {
     wait_for("snapshot", || client.latest().is_some());
     assert_eq!(client.latest().unwrap().pid, 4242);
     assert!(client.connected());
+    let subscription: serde_json::Value = serde_json::from_str(&read_line(&mut server)).unwrap();
+    assert_eq!(
+        subscription,
+        serde_json::json!({"rid":0,"t":"subscribe","snapshots":true,"tools":false})
+    );
 
     // The client's write goes out while its reader is waiting for the next push.
     let rid = client.send(CtlCommand::Kill {

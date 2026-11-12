@@ -212,6 +212,33 @@ pub enum ClientEvent {
         file: PathBuf,
         split: crate::gateway::protocol::Split,
     },
+    AgentOpenSession {
+        request: u64,
+        opener: SessionTarget,
+        cwd: PathBuf,
+        prompt: Option<String>,
+        model: Option<String>,
+        placement: protocol::Split,
+        title: Option<String>,
+    },
+    AgentShowChanges {
+        request: u64,
+        target: SessionTarget,
+        path: Option<String>,
+    },
+    AgentReviewRequest {
+        request: u64,
+        activate: bool,
+        target: SessionTarget,
+        summary: Option<String>,
+        paths: Vec<String>,
+    },
+    AgentReviewCancel {
+        request: u64,
+    },
+    AgentReviewsReplayed {
+        pending: Vec<u64>,
+    },
     /// Close the tab of the session file.
     CloseSession {
         file: PathBuf,
@@ -335,7 +362,15 @@ impl GatewayClient {
 
     /// Drains the events since the last call (bounded: overflow leaves one `Resync`).
     pub fn events(&self) -> Vec<ClientEvent> {
-        lock(&self.shared().inner).events.drain(..).collect()
+        let sh = self.shared();
+        let events: Vec<_> = lock(&sh.inner).events.drain(..).collect();
+        if events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Resync))
+        {
+            sh.notice(Request::AgentReviewsResync);
+        }
+        events
     }
 
     /// The latest-state cache.
@@ -424,6 +459,12 @@ impl GatewayClient {
             .notice(Request::ObserveModel { target, facts });
     }
 
+    /// Sends a transient answer, never journaled or restored after a reconnect.
+    pub fn login_answer(&self, job: u64, seq: u64, value: super::protocol::SecretText) {
+        self.shared()
+            .notice(Request::OmpLoginAnswer { job, seq, value });
+    }
+
     pub fn query(&self, q: Query) -> Pending<Result<Answer, GatewayError>> {
         self.shared().call(Request::Query(q), Ok)
     }
@@ -440,6 +481,38 @@ impl GatewayClient {
             accepted,
             outcome,
         }
+    }
+
+    /// Journals a desktop tool result without replaying it after reconnect.
+    pub fn agent_tool_done(
+        &self,
+        request: u64,
+        target: SessionTarget,
+        ok: bool,
+        text: String,
+        opened: Option<SessionTarget>,
+    ) -> Mutating {
+        self.mutate(Mutation::AgentToolDone {
+            request,
+            target,
+            ok,
+            text,
+            opened,
+        })
+    }
+
+    /// Journals a review response without replaying it after reconnect.
+    pub fn agent_review_reply(
+        &self,
+        request: u64,
+        target: SessionTarget,
+        reply: protocol::ReviewReply,
+    ) -> Mutating {
+        self.mutate(Mutation::AgentReviewReply {
+            request,
+            target,
+            reply,
+        })
     }
 
     /// The record of an earlier mutation (lookup only: never executes anything).
@@ -963,6 +1036,51 @@ impl Shared {
             ServerEvent::OpenSession { file, split } => {
                 self.push_event(ClientEvent::OpenSession { file, split })
             }
+            ServerEvent::AgentOpenSession {
+                request,
+                opener,
+                cwd,
+                prompt,
+                model,
+                placement,
+                title,
+            } => self.push_event(ClientEvent::AgentOpenSession {
+                request,
+                opener,
+                cwd,
+                prompt,
+                model,
+                placement,
+                title,
+            }),
+            ServerEvent::AgentShowChanges {
+                request,
+                target,
+                path,
+            } => self.push_event(ClientEvent::AgentShowChanges {
+                request,
+                target,
+                path,
+            }),
+            ServerEvent::AgentReviewRequest {
+                request,
+                activate,
+                target,
+                summary,
+                paths,
+            } => self.push_event(ClientEvent::AgentReviewRequest {
+                request,
+                activate,
+                target,
+                summary,
+                paths,
+            }),
+            ServerEvent::AgentReviewCancel { request } => {
+                self.push_event(ClientEvent::AgentReviewCancel { request })
+            }
+            ServerEvent::AgentReviewsReplayed { pending } => {
+                self.push_event(ClientEvent::AgentReviewsReplayed { pending })
+            }
             ServerEvent::CloseSession { file } => {
                 self.push_event(ClientEvent::CloseSession { file })
             }
@@ -1400,6 +1518,8 @@ fn request_label(r: &Request) -> &'static str {
         Request::Query(_) => "query",
         Request::Mutate { .. } => "mutation",
         Request::Outcome(_) => "outcome lookup",
+        Request::OmpLoginAnswer { .. } => "login answer",
+        Request::AgentReviewsResync => "agent reviews resync",
         Request::Flush => "flush",
         Request::Maintenance(_) => "maintenance",
         Request::SetFleetTargets(_) => "fleet targets",

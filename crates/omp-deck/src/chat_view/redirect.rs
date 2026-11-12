@@ -1,6 +1,6 @@
 //! Redirects: omp's own screens (`/settings`, the Alt+P model picker, `/usage`, `/resume`,
-//! `/tree`, the agents hub) are answered by OmpDeck's own counterparts, which do everything
-//! omp's do.
+//! `/tree`, the agents hub, `/login`, `/logout`) are answered by OmpDeck's own counterparts,
+//! which do everything omp's do.
 //!
 //! Three ways in, one outcome ([`Redirect`] on the frame's response):
 //!
@@ -9,7 +9,8 @@
 //!   first token of the text, with what was typed in the same frame. The press and its release
 //!   never reach omp and the composer is cleared by one `edit`; omp opens nothing, so nothing of
 //!   what it does on open (a usage fetch) happens. Arguments that make omp act directly
-//!   (`/switch <model>`, `/resume <id>`, `/usage reset <provider>/<id>`) pass through.
+//!   (`/switch <model>`, `/resume <id>`, `/usage reset <provider>/<id>`, `/logout <provider>`)
+//!   pass through; `/login <provider>` opens OmpDeck's login with that provider.
 //! * **Caught** ([`catch_page`], [`catch_layer`], [`Latch`]): every other way omp can open one of
 //!   them (a remapped chord, double Esc, a slash-menu click, an omp action) is recognised in the
 //!   pre-draw snapshot, redirected and closed with Esc in the same frame; the surface is never
@@ -17,10 +18,11 @@
 //! * **Clicked** (`Cx::click`): the composer's model and cost facts and the HUD's agents
 //!   segment (`agents.open`), drawn in split panes.
 //!
-//! The identifications are those of omp 18.16.0's recorded TSP (`redirect-fixtures.json`) and,
-//! for the agents hub, 18.17.0's (`hub-fixtures.json`): a `picker` node of the session's `layer`
+//! The identifications are those of omp 18.16.0's recorded TSP (`redirect-fixtures.json`), for
+//! the agents hub 18.17.0's (`hub-fixtures.json`): a `picker` node of the session's `layer`
 //! whose `tabs` hold the ids `agents` and `activity` (omp's `/agents`, the agent definitions,
-//! has the same title, icon and noun but no tabs).
+//! has the same title, icon and noun but no tabs), and for `/login` / `/logout` 18.18.9's
+//! (`login-fixtures.json`): the `providers` pickers titled "Sign in" / "Sign out".
 
 use std::time::{Duration, Instant};
 
@@ -49,6 +51,10 @@ pub enum Redirect {
     /// omp's agents hub (Alt+A, Ctrl+S, `←←` on an empty composer, `/hub`, the HUD's agents
     /// segment); `activity` when it shows its Activity tab (`/hub`).
     AgentHub { activity: bool },
+    /// `/login`, omp's provider picker; `provider` for `/login <provider>`.
+    Login { provider: Option<String> },
+    /// `/logout`, omp's stored-credential picker: Usage → Accounts.
+    Logout,
 }
 
 // ---- typed ----------------------------------------------------------------------------------
@@ -94,6 +100,11 @@ fn command(text: &str, popup: Option<&str>) -> Option<Redirect> {
         }),
         ("tree", "") => Some(Redirect::Tree),
         ("hub", "") => Some(Redirect::AgentHub { activity: true }),
+        ("login", "") => Some(Redirect::Login { provider: None }),
+        ("login", provider) if !provider.contains(char::is_whitespace) => Some(Redirect::Login {
+            provider: Some(provider.to_owned()),
+        }),
+        ("logout", "") => Some(Redirect::Logout),
         _ => None,
     }
 }
@@ -288,7 +299,7 @@ pub fn catch_page(page: &Snap) -> Option<Caught> {
 
 /// What the layer node `n` is, if one of the redirected screens: the Alt+P picker ("Switch
 /// model"; the task and role pickers carry other titles), the usage overlay, the session picker
-/// of `/resume`, the tree picker, the agents hub.
+/// of `/resume`, the tree picker, the agents hub, the provider pickers of `/login` and `/logout`.
 fn layer_screen(n: &SNode) -> Option<Redirect> {
     match n.kind.as_str() {
         "picker" => match (n.str("title"), n.str("noun"), n.str("icon")) {
@@ -298,6 +309,10 @@ fn layer_screen(n: &SNode) -> Option<Redirect> {
             (Some("Agents"), ..) if hub_tab(n).is_some() => Some(Redirect::AgentHub {
                 activity: hub_tab(n) == Some(true),
             }),
+            (Some("Sign in"), Some("providers"), Some("key-round")) => {
+                Some(Redirect::Login { provider: None })
+            }
+            (Some("Sign out"), Some("providers"), Some("key-round")) => Some(Redirect::Logout),
             _ => None,
         },
         "overlay" if n.role() == "omp.overlay.usage" => Some(Redirect::Usage { reset: false }),
@@ -400,6 +415,18 @@ mod tests {
             })
         );
         assert_eq!(none("/tree"), Some(Redirect::Tree));
+        assert_eq!(none("/login"), Some(Redirect::Login { provider: None }));
+        assert_eq!(
+            none("/login  anthropic "),
+            Some(Redirect::Login {
+                provider: Some("anthropic".into())
+            })
+        );
+        assert_eq!(none("/logout"), Some(Redirect::Logout));
+        assert_eq!(
+            command("/lo", Some("login")),
+            Some(Redirect::Login { provider: None })
+        );
         // Arguments that make omp act directly pass through.
         for text in [
             "/switch fake/fake-2",
@@ -412,6 +439,8 @@ mod tests {
             "/settingsx",
             "settings",
             "/jobs",
+            "/logout anthropic",
+            "/login a b",
             "/tree\n/usage",
         ] {
             assert_eq!(none(text), None, "{text}");

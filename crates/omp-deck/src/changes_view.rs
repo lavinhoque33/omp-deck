@@ -17,19 +17,62 @@ use egui::{
 
 use crate::badge::{self, Hue};
 use crate::icons::{
-    ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_COPY, ICON_FOLDER_GIT_2, ICON_FOLDER_OPEN,
-    ICON_GIT_BRANCH, ICON_MESSAGES_SQUARE, ICON_MINUS, ICON_PENCIL, ICON_PLUS, ICON_REFRESH_CW,
-    ICON_ROTATE_CCW, ICON_TRASH_2, ICON_X, Icon,
+    ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_COPY, ICON_FOLDER_GIT_2,
+    ICON_FOLDER_OPEN, ICON_GIT_BRANCH, ICON_MESSAGES_SQUARE, ICON_MINUS, ICON_PENCIL, ICON_PLUS,
+    ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_SEND, ICON_TRASH_2, ICON_X, Icon,
 };
 use crate::review::{Comment, Loc, MAX_QUOTE_LINES, Review, Reviews, Side, Span};
 use crate::theme::{self, Palette};
-use crate::widgets::{icon_text, paint_icon};
+use crate::widgets::{DraftButton, DraftKind, icon_text, paint_icon};
 use crate::{card, tips};
 
 /// Columns of a diff line that are laid out; the rest is cut with an ellipsis (minified files).
 const MAX_COLS: usize = 1000;
 /// Height of one file row.
 const FILE_ROW_H: f32 = 24.0;
+/// Requested paths the review banner names before "and N more" (the list marks all of them).
+const ASK_PATHS: usize = 6;
+
+/// `./a/b/` → `a/b`: how a requested path and a listed path are compared.
+fn norm_path(p: &str) -> &str {
+    p.trim_start_matches("./").trim_end_matches('/')
+}
+
+/// An agent-supplied path as one badge line of at most `max_chars`: control characters
+/// (newlines too) become spaces, and a long path keeps its end (the file name) after "…".
+fn path_label(p: &str, max_chars: usize) -> String {
+    let line: String = p
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let n = line.chars().count();
+    if n <= max_chars {
+        return line;
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out = String::from("…");
+    out.extend(line.chars().skip(n - keep));
+    out
+}
+
+/// An agent's pending review request on the panel's session (`ompdeck_request_review`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewAsk {
+    pub request: u64,
+    pub summary: Option<String>,
+    /// Repository-relative paths the agent asks about.
+    pub paths: Vec<String>,
+    /// The answer is on its way to the gateway: the answer buttons wait.
+    pub sending: bool,
+}
+
+impl ReviewAsk {
+    /// The agent named `path` (a listed file's repository-relative path).
+    pub fn requests(&self, path: &str) -> bool {
+        let path = norm_path(path);
+        self.paths.iter().any(|p| norm_path(p) == path)
+    }
+}
 
 // ------------------------------------------------------------------ sections
 
@@ -574,6 +617,8 @@ pub struct ViewState {
     pub anchor: Option<usize>,
     /// The "Review (N)" list is expanded.
     pub review_open: bool,
+    /// An agent's pending review request on this session: the banner and the answer buttons.
+    pub ask: Option<ReviewAsk>,
 }
 
 impl Default for ViewState {
@@ -593,6 +638,7 @@ impl Default for ViewState {
             editor: None,
             anchor: None,
             review_open: true,
+            ask: None,
         }
     }
 }
@@ -634,6 +680,29 @@ impl ViewState {
         let key = self.selected.as_ref()?;
         find(&self.groups, &self.files, key).map(|i| &self.files[i])
     }
+
+    /// Selects `path` (repository-relative) in the first section listing it, expanding that
+    /// section; false when the listing has no such file.
+    pub fn select_path(&mut self, path: &str) -> bool {
+        let want = norm_path(path);
+        let Some(key) = self.groups.iter().find_map(|g| {
+            g.files
+                .iter()
+                .find(|&&i| norm_path(&self.files[i].path) == want)
+                .map(|&i| FileKey {
+                    path: self.files[i].path.clone(),
+                    section: g.section,
+                })
+        }) else {
+            return false;
+        };
+        self.collapsed.remove(&key.section);
+        if self.selected.as_ref() != Some(&key) {
+            self.selected = Some(key);
+            self.diff = DiffPane::Loading;
+        }
+        true
+    }
 }
 
 // ------------------------------------------------------------------ painting
@@ -654,6 +723,12 @@ pub enum ChangesAction {
     InsertReview,
     /// Clear the composer, paste the review and submit it.
     SendReview,
+    /// Hand the review's comments to the agent that requested the review.
+    ReturnReview,
+    /// Answer the agent's review request with "no comments".
+    NoComments,
+    /// Decline the agent's review request.
+    DismissReview,
     Close,
 }
 
@@ -772,6 +847,11 @@ pub fn show(ui: &mut Ui, st: &mut ViewState) -> Vec<ChangesAction> {
             ui.colored_label(pal.danger, RichText::new(n).small());
         });
     }
+    if let Some(ask) = &st.ask {
+        // The Review section carries the answers when it is drawn; otherwise the banner does.
+        let composer = st.load == LoadState::Ready && st.root.is_some();
+        review_banner(ui, ask, !composer, &mut out);
+    }
     ui.add_space(4.0);
     // The panel's height below the header: the Review list is sized from it, not from what is
     // left once the other regions took theirs.
@@ -806,6 +886,89 @@ fn message(ui: &mut Ui, text: &str) {
     ui.vertical_centered(|ui| {
         ui.label(RichText::new(text).color(pal.weak));
     });
+}
+
+/// The pending agent review request: what the agent said and which files it asks about. With
+/// `answers` (no Review section on screen) it also carries the answers that need no comments.
+fn review_banner(ui: &mut Ui, ask: &ReviewAsk, answers: bool, out: &mut Vec<ChangesAction>) {
+    let pal = Palette::of_ui(ui);
+    let width = ui.available_width();
+    ui.add_space(4.0);
+    // A child `Ui`: the card paints its frame around its own content only.
+    ui.scope(|ui| {
+        let head = card::Header::new(ICON_MESSAGES_SQUARE, "Review requested")
+            .subtitle("The agent waits for your review")
+            .tone(pal.warn);
+        card::show(
+            ui,
+            card::Kind::Hover,
+            width,
+            &head,
+            |_| {},
+            |ui| {
+                if let Some(s) = ask.summary.as_deref().map(str::trim)
+                    && !s.is_empty()
+                {
+                    ScrollArea::vertical()
+                        .id_salt("review-ask-summary")
+                        .max_height(110.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(s).color(pal.text)).wrap());
+                        });
+                }
+                if !ask.paths.is_empty() {
+                    ui.label(theme::section_caption("Files to review", pal.weak));
+                    ui.horizontal_wrapped(|ui| {
+                        // One line each, no wider than the card: agents send any string.
+                        let fit = ((ui.available_width() - 24.0) / (tips::VALUE * 0.62)).floor();
+                        let max_chars = (fit as usize).clamp(8, 60);
+                        for p in ask.paths.iter().take(ASK_PATHS) {
+                            let label = path_label(p, max_chars);
+                            let resp = badge::show(ui, None, &label, Hue::Amber, tips::VALUE);
+                            if label != *p {
+                                resp.on_hover_text(p);
+                            }
+                        }
+                        let more = ask.paths.len().saturating_sub(ASK_PATHS);
+                        if more > 0 {
+                            ui.label(
+                                RichText::new(format!("and {more} more"))
+                                    .small()
+                                    .color(pal.weak),
+                            );
+                        }
+                    });
+                }
+                if answers {
+                    ui.horizontal_wrapped(|ui| ask_answers(ui, ask, out));
+                }
+            },
+        );
+    });
+    ui.add_space(4.0);
+}
+
+/// "No comments" and "Dismiss": the answers to a review request that carry no comments.
+fn ask_answers(ui: &mut Ui, ask: &ReviewAsk, out: &mut Vec<ChangesAction>) {
+    if DraftButton::new("No comments")
+        .icon(ICON_CHECK)
+        .enabled(!ask.sending)
+        .show(ui)
+        .on_hover_text("Tell the agent you looked at the changes and have nothing to add")
+        .clicked()
+    {
+        out.push(ChangesAction::NoComments);
+    }
+    if DraftButton::new("Dismiss")
+        .icon(ICON_X)
+        .enabled(!ask.sending)
+        .show(ui)
+        .on_hover_text("Decline the review; the agent continues without it")
+        .clicked()
+    {
+        out.push(ChangesAction::DismissReview);
+    }
 }
 
 fn show_ready(ui: &mut Ui, st: &mut ViewState, out: &mut Vec<ChangesAction>, total: f32) {
@@ -1005,6 +1168,18 @@ fn file_row(
     } else if resp.hovered() {
         ui.painter()
             .rect_filled(rect, 0, theme::hover_fill(pal).gamma_multiply(0.7));
+    }
+    // A file the agent asked to have reviewed: a warm wash and a marker bar on the left edge.
+    if st.ask.as_ref().is_some_and(|a| a.requests(&file.path)) {
+        if !hot {
+            ui.painter()
+                .rect_filled(rect, 0, theme::mix(pal.panel, pal.warn, 0.10));
+        }
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, vec2(3.0, rect.height())),
+            1,
+            pal.warn,
+        );
     }
     let ch = letter(file, section);
     let ch_color = match section {
@@ -1600,6 +1775,7 @@ fn show_review(ui: &mut Ui, st: &mut ViewState, out: &mut Vec<ChangesAction>, to
         files,
         groups,
         busy,
+        ask,
         ..
     } = st;
     let Some(root) = root.as_deref() else {
@@ -1689,7 +1865,22 @@ fn show_review(ui: &mut Ui, st: &mut ViewState, out: &mut Vec<ChangesAction>, to
                     });
             }
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(ask) = ask.as_ref() {
+                    // Requested by the agent: the comments go back to it, not into omp's composer.
+                    if DraftButton::new("Return review to agent")
+                        .kind(DraftKind::Primary)
+                        .icon(ICON_SEND)
+                        .enabled(n > 0 && !ask.sending)
+                        .show(ui)
+                        .on_hover_text("Hand these comments to the agent that asked for the review")
+                        .clicked()
+                    {
+                        out.push(ChangesAction::ReturnReview);
+                    }
+                    ask_answers(ui, ask, out);
+                    return;
+                }
                 let ok = n > 0 && busy.is_none();
                 if ui
                     .add_enabled(ok, egui::Button::new("Insert into omp"))
@@ -1855,6 +2046,45 @@ mod tests {
             branch: Some("main".into()),
             files,
         }
+    }
+
+    #[test]
+    fn an_agent_path_badge_is_one_bounded_line_ending_in_the_file_name() {
+        assert_eq!(path_label("src/a.rs", 20), "src/a.rs");
+        assert_eq!(path_label("a\nb\r\tc", 20), "a b  c");
+        let long = format!("{}/main.rs", "very/deep".repeat(10));
+        let label = path_label(&long, 12);
+        assert_eq!(label.chars().count(), 12);
+        assert!(label.starts_with('…') && label.ends_with("/main.rs"));
+        // Multi-byte characters are cut on char boundaries.
+        assert_eq!(path_label("ää/öö/üü.rs", 6), "…üü.rs");
+    }
+
+    #[test]
+    fn an_agent_path_selects_its_file_in_a_collapsed_section() {
+        let mut st = ViewState::default();
+        st.apply_listing(Some(listing(vec![
+            file("src/a.rs", None, Some(Change::Modified), false, false),
+            file("new/", None, None, true, false),
+        ])));
+        st.collapsed.insert(Section::Changes);
+        assert!(st.select_path("./src/a.rs"));
+        assert_eq!(
+            st.selected,
+            Some(FileKey {
+                path: "src/a.rs".into(),
+                section: Section::Changes
+            })
+        );
+        assert!(!st.collapsed.contains(&Section::Changes));
+        assert!(!st.select_path("src/missing.rs"));
+        let ask = ReviewAsk {
+            request: 1,
+            summary: None,
+            paths: vec!["./new".into()],
+            sending: false,
+        };
+        assert!(ask.requests("new/") && !ask.requests("src/a.rs"));
     }
 
     #[test]

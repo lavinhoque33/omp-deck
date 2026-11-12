@@ -5,11 +5,14 @@
 //!
 //! Everything painted here is pre-formatted by [`crate::usage_state`]; this module only lays out.
 
+mod stored;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use deck_core::ctl::LiveAccount;
 use deck_core::usage::{AccountPolicy, Heatmap, LimitStatus, PolicyState};
+use deck_service::gateway::protocol::OmpAccountsView;
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{
     Align, Align2, Color32, CursorIcon, Frame, Galley, Id, Key, Layout, Margin, Modifiers, Order,
@@ -86,6 +89,10 @@ pub struct ViewInput<'a> {
     pub session: Option<&'a LiveAccount>,
     /// omp's `retry.usageReservePct`: the reserve of accounts without their own.
     pub global_reserve: u32,
+    /// omp's providers and stored accounts (`None` until the gateway sends them).
+    pub accounts: Option<&'a OmpAccountsView>,
+    /// The view owns the keyboard (false while a dialog over it has it).
+    pub keys: bool,
 }
 
 pub enum UsageAction {
@@ -113,6 +120,16 @@ pub enum UsageAction {
         provider: String,
         credential: String,
         question: String,
+    },
+    /// Open the login wizard, preselecting a login or store id.
+    Login(Option<String>),
+    /// Log out the stored credential `credential_id` (omp's login id `provider`; the app asks
+    /// first, naming `label` of `name`).
+    Logout {
+        provider: String,
+        credential_id: i64,
+        label: String,
+        name: String,
     },
 }
 
@@ -150,12 +167,13 @@ pub fn show(ctx: &egui::Context, st: &mut ViewState, input: &ViewInput<'_>) -> V
             }
         });
 
-    if !egui::Popup::is_any_open(ctx)
+    if input.keys
+        && !egui::Popup::is_any_open(ctx)
         && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
     {
         out.push(UsageAction::Close);
     }
-    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::R)) && !input.fetching {
+    if input.keys && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::R)) && !input.fetching {
         out.push(UsageAction::Refresh);
     }
 
@@ -1252,12 +1270,21 @@ first. Account order and pinning only work for OAuth logins.";
 fn accounts(ui: &mut Ui, st: &mut ViewState, input: &ViewInput<'_>, out: &mut Vec<UsageAction>) {
     let pal = Palette::of_ui(ui);
     match input.load {
-        Load::OmpMissing | Load::Loading | Load::Failed => {
+        Load::OmpMissing => {
+            quotas(ui, input, out);
+            return;
+        }
+        Load::Loading | Load::Failed => {
+            stored::section(ui, input.accounts, &[], out);
+            ui.add_space(10.0);
             quotas(ui, input, out);
             return;
         }
         Load::Ready => {}
     }
+    let issues = input.summary.map_or(&[][..], |s| s.issues.as_slice());
+    stored::section(ui, input.accounts, issues, out);
+    ui.add_space(10.0);
     let Some(summary) = input.summary else {
         return;
     };
@@ -1270,19 +1297,14 @@ fn accounts(ui: &mut Ui, st: &mut ViewState, input: &ViewInput<'_>, out: &mut Ve
     if let Some(e) = input.error {
         error_strip(ui, e, out);
     }
-    // The routing note is about OAuth accounts; API-key groups carry their own.
-    if !summary.accounts.is_empty() || summary.keys.is_empty() {
-        ui.add(egui::Label::new(RichText::new(ROUTING_NOTE).small().color(pal.weak)).wrap());
-    }
+    // Order and pinning only exist for providers with several accounts: nothing to show else
+    // (the stored accounts are listed above).
     if summary.accounts.is_empty() && summary.keys.is_empty() {
-        empty_state(
-            ui,
-            ICON_KEY_ROUND,
-            pal.accent,
-            "One account per provider",
-            "Account order and pinning apply once a provider has two or more OAuth logins. Add another with `omp login`.",
-        );
         return;
+    }
+    // The routing note is about OAuth accounts; API-key groups carry their own.
+    if !summary.accounts.is_empty() {
+        ui.add(egui::Label::new(RichText::new(ROUTING_NOTE).small().color(pal.weak)).wrap());
     }
     for g in &summary.accounts {
         account_group(ui, st, input, g, out);

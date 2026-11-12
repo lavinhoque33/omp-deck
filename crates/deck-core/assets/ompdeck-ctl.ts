@@ -7,6 +7,58 @@ import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import * as net from "node:net";
 import * as path from "node:path";
+import { Type } from "@sinclair/typebox";
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+
+type ToolName = "open_session" | "notify" | "show_changes" | "request_review" | "sessions" | "send_prompt" | "wait_session";
+type ToolResult = { content: { type: "text"; text: string }[]; details?: Record<string, unknown>; isError?: boolean };
+interface ToolClient {
+  data: { buf: string; snapshots: boolean; tools: boolean };
+  write(line: string): unknown;
+  destroy?(): void;
+}
+const TOOL_NAMES: ToolName[] = ["open_session", "notify", "show_changes", "request_review", "sessions", "send_prompt", "wait_session"];
+const toolProcess = globalThis as typeof globalThis & { __ompdeckTools?: string[] };
+const toolResult = (text: string, isError = false, details?: Record<string, unknown>): ToolResult =>
+  ({ content: [{ type: "text", text }], ...(isError ? { isError: true } : {}), ...(details ? { details } : {}) });
+const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+
+// Byte caps are checked in execute, not just the model-facing schema (Unicode can use multiple bytes).
+function toolArgError(name: ToolName, args: Record<string, unknown>): string | undefined {
+  const bytes = (key: string, cap: number) => typeof args[key] === "string" && Buffer.byteLength(args[key]) > cap ? `${key} must be at most ${cap} bytes` : undefined;
+  const chars = (key: string, cap: number) => {
+    const value = args[key];
+    if (typeof value !== "string") return undefined;
+    let count = 0;
+    for (const _char of value) if (++count > cap) return `${key} must be at most ${cap} characters`;
+    return undefined;
+  };
+  if (name === "open_session") {
+    const error = bytes("prompt", 16 * 1024) ?? chars("title", 80);
+    if (error) return error;
+    if (typeof args.cwd === "string") {
+      if (!path.isAbsolute(args.cwd)) return "cwd must be an absolute directory";
+      try { if (!fs.statSync(args.cwd).isDirectory()) return "cwd must be an absolute directory"; }
+      catch { return "cwd must be an existing absolute directory"; }
+    }
+  }
+  if (name === "notify") return chars("title", 120) ?? bytes("body", 2 * 1024);
+  if (name === "request_review") {
+    return bytes("summary", 4 * 1024) ?? (Array.isArray(args.paths) && args.paths.length > 50 ? "paths must contain at most 50 entries" : undefined);
+  }
+  if (name === "send_prompt" || name === "wait_session") {
+    if (typeof args.session !== "string" || !args.session.trim() || Buffer.byteLength(args.session) > 32) return "session must be a non-empty handle of at most 32 bytes";
+    if (name === "send_prompt") {
+      if (typeof args.prompt !== "string" || Buffer.byteLength(args.prompt) === 0) return "prompt must contain 1 to 16384 bytes";
+      return bytes("prompt", 16 * 1024);
+    }
+    if (args.background !== undefined && typeof args.background !== "boolean") return "background must be a boolean";
+    const maximum = args.background === true ? 86400 : 3600;
+    if (args.timeout_seconds !== undefined && (typeof args.timeout_seconds !== "number" || !Number.isInteger(args.timeout_seconds) || args.timeout_seconds < 1 || args.timeout_seconds > maximum)) return `timeout_seconds must be an integer from 1 to ${maximum}`;
+  }
+  if (name === "show_changes" && typeof args.path === "string" && (path.isAbsolute(args.path) || path.normalize(args.path).split(path.sep)[0] === "..")) return "path must be repo-relative";
+  return undefined;
+}
 
 const IS_WIN = process.platform === "win32";
 const DIR = IS_WIN ? undefined : process.env.OMPDECK_CTL_DIR;
@@ -65,12 +117,105 @@ export default async function ompdeckCtl(api: any) {
     function start(ctx: any) {
       if (G.__ompdeckCtl) { G.__ompdeckCtl.setCtx(ctx); G.__ompdeckCtl.recompute(); return; }
       const registry = AgentRegistry.global();
-      const clients = new Set<any>();
+      const clients = new Set<ToolClient>();
       let mainCtx = ctx;
       let pending: any;
       const rootFile = (): string | null => { try { return mainCtx.sessionManager.getSessionFile?.() ?? null; } catch { return null; } };
       const mainIdle = (): boolean | null => { try { return typeof mainCtx.isIdle === "function" ? !!mainCtx.isIdle() : null; } catch { return null; } };
       const mainLeaf = (): string | null => { try { return mainCtx.sessionManager.getLeafId?.() ?? null; } catch { return null; } };
+
+      // Only this main-session factory registers tools. Subagent factories never see these definitions.
+      type PendingTool = { owner?: ToolClient; message: unknown; finish(result: ToolResult): void };
+      const pendingTools = new Map<number, PendingTool>();
+      let toolSeq = 0;
+      const dispatchTools = () => {
+        let owner: ToolClient | undefined;
+        for (const client of clients) if (client.data.tools) { owner = client; break; }
+        if (!owner) return;
+        for (const entry of pendingTools.values()) {
+          if (entry.owner) continue;
+          entry.owner = owner;
+          try { owner.write(JSON.stringify(entry.message) + "\n"); }
+          catch { entry.finish(toolResult("OmpDeck disconnected", true)); }
+        }
+      };
+      const executeTool = async (name: ToolName, args: Record<string, unknown>, signal: AbortSignal | undefined, context: ExtensionContext): Promise<ToolResult> => {
+        if (context.agent.kind !== "main") return toolResult("OmpDeck tools are only available to the main agent", true);
+        const invalid = toolArgError(name, args);
+        if (invalid) return toolResult(invalid, true);
+        const cancelled = toolResult(name === "request_review" ? "Review request cancelled" : "OmpDeck request cancelled", true);
+        if (signal?.aborted) return cancelled;
+        const id = ++toolSeq;
+        const { promise, resolve } = Promise.withResolvers<ToolResult>();
+        const abort = () => {
+          const owner = pendingTools.get(id)?.owner;
+          if (owner) { try { owner.write(JSON.stringify({ t: "tool_cancel", id }) + "\n"); } catch {} }
+          finish(cancelled);
+        };
+        const timer = setTimeout(() => {
+          if (!pendingTools.get(id)?.owner) finish(toolResult("OmpDeck is not connected to this session", true));
+        }, 5000);
+        const finish = (result: ToolResult) => {
+          if (!pendingTools.delete(id)) return;
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          resolve(result);
+        };
+        pendingTools.set(id, { message: { t: "tool", id, name, args, root: rootFile() }, finish });
+        signal?.addEventListener("abort", abort, { once: true });
+        dispatchTools();
+        return promise;
+      };
+      if (!toolProcess.__ompdeckTools) {
+        const enabled = new Set((process.env.OMPDECK_TOOLS ?? "").split(",").map(s => s.trim()));
+        const definitions = {
+          open_session: {
+            label: "Open OmpDeck session", approval: "exec",
+            description: "Start a parallel omp session in OmpDeck, optionally with an initial prompt, model and split placement. It runs independently; use ompdeck_sessions to check on it. Returns a session handle for ompdeck_send_prompt and ompdeck_wait_session when either is enabled. cwd defaults to this session's directory and placement defaults to tab.",
+            parameters: Type.Object({ prompt: Type.Optional(Type.String({ description: "Initial prompt, at most 16 KiB." })), cwd: Type.Optional(Type.String({ description: "Absolute existing directory; defaults to this session's cwd." })), model: Type.Optional(Type.String()), placement: Type.Optional(Type.Union([Type.Literal("tab"), Type.Literal("split_right"), Type.Literal("split_down")])), title: Type.Optional(Type.String({ description: "Session title, at most 80 characters." })) }),
+          },
+          notify: {
+            label: "Notify OmpDeck user", approval: "read",
+            description: "Tell the user something needing attention outside the chat: finished long work, a blocker, or a decision needed. Returns Posted, or Agent notifications are turned off (not an error).",
+            parameters: Type.Object({ title: Type.String({ description: "Notification title, at most 120 characters." }), body: Type.Optional(Type.String({ description: "Additional context, at most 2 KiB." })), level: Type.Optional(Type.Union([Type.Literal("info"), Type.Literal("success"), Type.Literal("warning"), Type.Literal("error")])) }),
+          },
+          show_changes: {
+            label: "Show OmpDeck changes", approval: "read",
+            description: "Open this session's Changes panel in OmpDeck, optionally selecting a repo-relative path. Returns Opened the Changes panel (N changed files).",
+            parameters: Type.Object({ path: Type.Optional(Type.String({ description: "Repository-relative file to select." })) }),
+          },
+          request_review: {
+            label: "Request OmpDeck review", approval: "read",
+            description: "Ask the user to review changes in OmpDeck and wait for their comments. Provide an optional summary (at most 4 KiB) and up to 50 paths to highlight. Returns review comments, The user had no comments, or The user dismissed the review request. Stop cancels the request.",
+            parameters: Type.Object({ summary: Type.Optional(Type.String({ description: "What to review, at most 4 KiB." })), paths: Type.Optional(Type.Array(Type.String(), { description: "At most 50 paths to highlight." })) }),
+          },
+          sessions: {
+            label: "List OmpDeck sessions", approval: "read",
+            description: "Check up to 30 OmpDeck sessions, including parallel sessions you opened: title, directory, busy/idle/needs attention/exited status, model, whether a tab is open, last reply (up to 300 characters), and whether this session opened it.",
+            parameters: Type.Object({}),
+          },
+          send_prompt: {
+            label: "Send prompt to OmpDeck session", approval: "exec",
+            description: "Send a prompt to a session you opened with ompdeck_open_session (by its handle). mode send needs the session idle; follow_up queues after the current turn; steer interrupts it.",
+            parameters: Type.Object({ session: Type.String({ description: "Session handle returned by ompdeck_open_session; at most 32 bytes." }), prompt: Type.String({ description: "Prompt text, 1 to 16 KiB." }), mode: Type.Optional(Type.Union([Type.Literal("send"), Type.Literal("follow_up"), Type.Literal("steer")])) }),
+          },
+          wait_session: {
+            label: "Wait for OmpDeck session", approval: "read",
+            description: "Wait until a session you opened finishes the turn of the last prompt you gave it (default 600 s, max 3600) and return its final reply. Returns early if it needs the user's attention or exits. background: true returns immediately and the result arrives later as a message; you can keep working. Background waits have no timeout by default, or an explicit timeout of up to 86400 seconds.",
+            parameters: Type.Object({ session: Type.String({ description: "Session handle returned by ompdeck_open_session; at most 32 bytes." }), timeout_seconds: Type.Optional(Type.Integer({ description: "Wait timeout in seconds: 1 to 3600 normally (default 600), or 1 to 86400 with background true (no default timeout)." })), background: Type.Optional(Type.Boolean({ description: "Return immediately and receive the result later as a message; default false." })) }),
+          },
+        } as const;
+        const registered: string[] = [];
+        for (const name of TOOL_NAMES) {
+          if (!enabled.has(name)) continue;
+          api.registerTool({
+            name: `ompdeck_${name}`, ...definitions[name], loadMode: "essential",
+            execute: (_callId: string, args: Record<string, unknown>, signal: AbortSignal | undefined, _onUpdate: unknown, context: ExtensionContext) => executeTool(name, args, signal, context),
+          });
+          registered.push(`ompdeck_${name}`);
+        }
+        toolProcess.__ompdeckTools = registered;
+      }
 
       // ---- /context breakdown (omp's computeSessionContextBreakdown + per-tool schema tokens), cached ----
       let contextCache: any = null;
@@ -198,7 +343,7 @@ export default async function ompdeckCtl(api: any) {
       const push = (m: unknown) => {
         if (!clients.size) return;
         let l: string; try { l = JSON.stringify(m) + "\n"; } catch { return; }
-        for (const c of clients) write(c, l);
+        for (const c of clients) if (c.data.snapshots) write(c, l);
       };
       const schedule = () => { if (pending) return; pending = setTimeout(() => { pending = undefined; push(snapshot()); }, 50); };
 
@@ -640,6 +785,23 @@ export default async function ompdeckCtl(api: any) {
 
       async function handle(cmd: any): Promise<any> {
         if (cmd.t === "list") return { ok: true, snapshot: snapshot() };
+        if (cmd.t === "refresh_provider") {
+          if (typeof cmd.provider !== "string" || !cmd.provider) return { ok: false, error: "provider is required" };
+          if (typeof mainCtx.modelRegistry?.refreshProvider !== "function") return { ok: false, error: "provider refresh unavailable" };
+          try {
+            // Match omp's /login and /logout: refresh the provider's online catalog, then the
+            // session's scoped models via ctx or the established mainSession helper, when available.
+            await mainCtx.modelRegistry.refreshProvider(cmd.provider, "online");
+            // 18.18.9 exposes the registry on ctx, but scoped refresh belongs to AgentSession.
+            if (typeof mainCtx.refreshScopedModels === "function") await mainCtx.refreshScopedModels();
+            else {
+              const session = mainSession();
+              if (typeof session?.refreshScopedModels === "function") await session.refreshScopedModels();
+            }
+            refreshNow();
+            return { ok: true };
+          } catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
+        }
         if (cmd.t === "delete_agents") return deleteAgents(cmd);
         if (cmd.t === "fork_at" || cmd.t === "navigate") {
           const want = rootFile();
@@ -779,12 +941,32 @@ export default async function ompdeckCtl(api: any) {
           }
         }
       }
+      async function deliver(client: ToolClient, command: Record<string, unknown>): Promise<{ ok: boolean; error?: string; code?: string }> {
+        if (!client.data.tools) return { ok: false, error: "not a tools client" };
+        const title = command.title, text = command.text, details = command.details;
+        if (typeof title !== "string") return { ok: false, error: "title must be a string of at most 200 characters" };
+        let titleChars = 0;
+        for (const _char of title) if (++titleChars > 200) return { ok: false, error: "title must be at most 200 characters" };
+        if (typeof text !== "string" || Buffer.byteLength(text) > 40 * 1024) return { ok: false, error: "text must be a string of at most 40960 bytes" };
+        if (details !== undefined && !object(details)) return { ok: false, error: "details must be an object" };
+        try {
+          if (!sameRoot(command)) return { ok: false, error: "session changed", code: "root_mismatch" };
+          await api.sendMessage(
+            { customType: "ompdeck-wait", content: `${title}\n\n${text}`, display: true, details: { title, ...details } },
+            { deliverAs: "aside", triggerTurn: true },
+          );
+          return { ok: true };
+        } catch (error) {
+          return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
+      }
       const reply = (s: any, rid: any, r: any) => { let l: string; try { l = JSON.stringify({ t: "reply", rid, ...r }) + "\n"; } catch { l = JSON.stringify({ t: "reply", rid, ok: false, error: "unserializable reply" }) + "\n"; } write(s, l); };
 
       // ---- endpoint ----
       const onOpen = (s: any) => {
-        s.data = { buf: "" }; clients.add(s);
-        write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid, ui_hook: uiState.hook }) + "\n" + JSON.stringify(snapshot()) + "\n");
+        s.data = { buf: "", snapshots: true, tools: false }; clients.add(s);
+        const tools = toolProcess.__ompdeckTools ?? [];
+        write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid, ui_hook: uiState.hook, ...(tools.length ? { features: ["tools", "deliver"], tools } : {}) }) + "\n" + JSON.stringify(snapshot()) + "\n");
       };
       const onData = (s: any, chunk: any) => {
         const st = s.data; if (!st) return;
@@ -794,11 +976,34 @@ export default async function ompdeckCtl(api: any) {
           const line = st.buf.slice(0, i); st.buf = st.buf.slice(i + 1);
           let cmd: any; try { cmd = JSON.parse(line); } catch { continue; }
           if (!cmd || typeof cmd !== "object") continue;
+          if (cmd.t === "subscribe") {
+            if (typeof cmd.snapshots !== "boolean" || typeof cmd.tools !== "boolean") { reply(s, cmd.rid, { ok: false, error: "bad subscription" }); continue; }
+            st.snapshots = cmd.snapshots; st.tools = cmd.tools;
+            if (st.snapshots) write(s, JSON.stringify(snapshot()) + "\n");
+            reply(s, cmd.rid, { ok: true });
+            dispatchTools();
+            continue;
+          }
+          if (cmd.t === "tool_result") {
+            const entry = pendingTools.get(cmd.id);
+            if (!entry || entry.owner !== s) { reply(s, cmd.rid, { ok: false, error: "no such request" }); continue; }
+            if (typeof cmd.ok !== "boolean" || typeof cmd.text !== "string" || (cmd.details !== undefined && !object(cmd.details))) { reply(s, cmd.rid, { ok: false, error: "bad tool result" }); continue; }
+            entry.finish(toolResult(cmd.text, !cmd.ok, cmd.details));
+            reply(s, cmd.rid, { ok: true });
+            continue;
+          }
+          if (cmd.t === "deliver") {
+            deliver(s, cmd).then(result => reply(s, cmd.rid, result));
+            continue;
+          }
           let p: Promise<any>; try { p = handle(cmd); } catch (e: any) { p = Promise.reject(e); }
           p.then(r => reply(s, cmd.rid, r), e => reply(s, cmd.rid, { ok: false, error: String(e?.message ?? e) }));
         }
       };
-      const onClose = (s: any) => { clients.delete(s); };
+      const onClose = (s: ToolClient) => {
+        clients.delete(s);
+        for (const entry of pendingTools.values()) if (entry.owner === s) entry.finish(toolResult("OmpDeck disconnected", true));
+      };
       let server: { stop(): void };
       let releaseEndpoint: () => void = () => {}; // Unix: unlink our socket, drop the lock, remove the dir
       let close: () => void = () => {};
@@ -842,7 +1047,7 @@ export default async function ompdeckCtl(api: any) {
           close();
         });
         try { srv.listen(PIPE); } catch (e) { log("listen failed: " + e); return; }
-        server = { stop() { try { srv.close(); } catch {} for (const c of clients) { try { c.destroy(); } catch {} } clients.clear(); } };
+        server = { stop() { try { srv.close(); } catch {} for (const c of clients) { try { c.destroy?.(); } catch {} } clients.clear(); } };
       } else {
         // The dir must be a private real directory of ours (created 0700 if missing); never chmod/follow anything.
         const me = process.getuid?.();
@@ -915,6 +1120,7 @@ export default async function ompdeckCtl(api: any) {
         try { if (typeof offRegistry === "function") offRegistry(); } catch {}
         try { if (typeof offProgress === "function") offProgress(); } catch {}
         try { clearInterval(tick); clearTimeout(pending); } catch {}
+        for (const entry of pendingTools.values()) entry.finish(toolResult("OmpDeck disconnected", true));
         try { server.stop(); } catch {}
         releaseEndpoint();
       };

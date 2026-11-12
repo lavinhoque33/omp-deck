@@ -62,6 +62,16 @@ fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
 fn say(s: &mut UnixStream, line: &str) {
     s.write_all(line.as_bytes()).unwrap();
     s.write_all(b"\n").unwrap();
+    if line.starts_with(r#"{"t":"hello","v":1"#) {
+        let mut subscription = String::new();
+        BufReader::new(s.try_clone().unwrap())
+            .read_line(&mut subscription)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&subscription).unwrap(),
+            serde_json::json!({"rid":0,"t":"subscribe","snapshots":true,"tools":false})
+        );
+    }
 }
 
 fn snapshot(c: &CtlClient) -> Arc<LiveSnapshot> {
@@ -172,6 +182,72 @@ fn reconnects_after_server_restart() {
     say(&mut s, &snapshot_line(2, ""));
     wait_for("reconnect", || client.latest().is_some_and(|s| s.pid == 2));
     assert!(client.connected());
+}
+
+#[test]
+fn tool_pushes_and_desired_subscription_survive_reconnect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = fake(tmp.path());
+    let client = CtlClient::spawn(tmp.path().to_owned(), || {});
+    let mut s = srv.accept();
+    say(
+        &mut s,
+        r#"{"t":"hello","v":1,"features":["tools"],"tools":["ompdeck_notify"]}"#,
+    );
+    assert_eq!(client.features(), ["tools"]);
+    let rid = client.send(CtlCommand::Subscribe {
+        snapshots: false,
+        tools: true,
+    });
+    let mut line = String::new();
+    BufReader::new(s.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+        serde_json::json!({"rid":rid,"t":"subscribe","snapshots":false,"tools":true})
+    );
+    say(&mut s, &format!(r#"{{"t":"reply","rid":{rid},"ok":true}}"#));
+    say(
+        &mut s,
+        r#"{"t":"tool","id":9,"name":"notify","args":{"title":"Done"},"root":"/s/main.jsonl"}"#,
+    );
+    say(&mut s, r#"{"t":"tool_cancel","id":9}"#);
+    let mut events = Vec::new();
+    wait_for("tool events", || {
+        events.extend(client.take_tool_requests());
+        events.len() == 2
+    });
+    assert_eq!(
+        events,
+        [
+            deck_core::ctl::ToolEvent::Request(deck_core::ctl::ToolRequest {
+                id: 9,
+                name: "notify".into(),
+                args: serde_json::json!({"title":"Done"}),
+                root: Some("/s/main.jsonl".into()),
+            }),
+            deck_core::ctl::ToolEvent::Cancel(9),
+        ]
+    );
+    assert!(client.take_tool_requests().is_empty());
+    drop(s);
+    wait_for("disconnect", || !client.connected());
+    assert!(client.features().is_empty());
+    let mut s = srv.accept();
+    s.write_all(
+        br#"{"t":"hello","v":1,"features":["tools"]}
+"#,
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(s.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+        serde_json::json!({"rid":0,"t":"subscribe","snapshots":false,"tools":true})
+    );
 }
 
 #[test]

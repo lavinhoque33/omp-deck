@@ -114,6 +114,17 @@ impl Live {
         seed: impl FnOnce(&Live),
         resume: impl FnOnce(&Live) -> Option<PathBuf>,
     ) -> Option<Live> {
+        Self::start_with_tools(tag, script, seed, resume, None)
+    }
+
+    /// As [`Self::start`], with an explicit agent-tool launch policy (None removes the env var).
+    pub fn start_with_tools(
+        tag: &str,
+        script: impl FnMut(&Value) -> Reply + Send + 'static,
+        seed: impl FnOnce(&Live),
+        resume: impl FnOnce(&Live) -> Option<PathBuf>,
+        tools: Option<&str>,
+    ) -> Option<Live> {
         let omp_exe = std::env::var_os("OMPDECK_TEST_OMP").map(PathBuf::from)?;
         ensure_host_exe();
         let ns = format!("omp-deck-test-{tag}-{}", std::process::id());
@@ -184,12 +195,18 @@ impl Live {
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.to_string_lossy().into_owned())),
         );
+        if let Some(tools) = tools {
+            launch_env.push((deck_core::ctl::OMPDECK_TOOLS_ENV.into(), tools.into()));
+        }
         let mut argv = vec![omp_exe.display().to_string()];
         if let Some(file) = &resume {
             argv.extend(["--resume".to_owned(), file.display().to_string()]);
         }
         let argv = with_ctl(&argv, &ext);
-        let (mut env_set, env_remove) = deck_core::mux::host_env(SESSION, &launch_env, false);
+        let (mut env_set, mut env_remove) = deck_core::mux::host_env(SESSION, &launch_env, false);
+        if tools.is_none() {
+            env_remove.push(deck_core::ctl::OMPDECK_TOOLS_ENV.into());
+        }
         env_set.retain(|(k, _)| k != "PI_NOTIFICATIONS");
         env_set.push(("PI_NOTIFICATIONS".into(), "off".into()));
         let (program, args) = argv.split_first().expect("argv");
@@ -214,6 +231,11 @@ impl Live {
 
     pub fn client(&self) -> &CtlClient {
         self.client.as_ref().expect("client started")
+    }
+
+    /// A second, independently subscribed client of this session (for routing/disconnect tests).
+    pub fn another_client(&self) -> CtlClient {
+        CtlClient::spawn_with_key(self.ctl.clone(), self.root.join("data/ctl.key"), || {})
     }
 
     pub fn peek(&self) -> Value {

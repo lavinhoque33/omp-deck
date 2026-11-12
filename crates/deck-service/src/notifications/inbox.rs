@@ -18,6 +18,12 @@ pub enum Kind {
     Attention,
     /// The process ended.
     Exited { code: Option<i32> },
+    /// An explicit message from the session's main agent.
+    AgentMessage {
+        title: String,
+        body: Option<String>,
+        level: String,
+    },
 }
 
 impl Kind {
@@ -30,12 +36,14 @@ impl Kind {
             Kind::Exited { code: Some(0) } => "Session ended".to_owned(),
             Kind::Exited { code: Some(c) } => format!("Process exited with code {c}"),
             Kind::Exited { code: None } => "Process exited".to_owned(),
+            Kind::AgentMessage { title, .. } => title.clone(),
         }
     }
 
     /// Needs the user more than a finished turn does (the badge turns to the warn colour).
     pub fn is_warn(&self) -> bool {
         matches!(self, Kind::Error(_) | Kind::Attention)
+            || matches!(self, Kind::AgentMessage { level, .. } if level == "warning" || level == "error")
     }
 }
 
@@ -64,6 +72,9 @@ impl<K> Entry<K> {
         {
             body.push('\n');
             body.push_str(msg);
+        }
+        if let Kind::AgentMessage { body: message, .. } = &kind {
+            body = message.clone().unwrap_or_default();
         }
         Entry {
             tab,

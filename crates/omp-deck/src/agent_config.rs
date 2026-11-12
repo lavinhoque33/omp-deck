@@ -78,10 +78,12 @@ pub enum AgentsAction {
         revision: String,
         name: String,
     },
-    /// The model dropdown's own controls: reload the catalog, star a model, filter by provider.
+    /// The model dropdown's own controls: reload the catalog, star a model, filter by provider,
+    /// log in to a provider.
     ReloadModels,
     ToggleFavorite(String),
     ModelProvider(Option<String>),
+    Login(Option<String>),
     OpenFile(PathBuf),
     OpenFolder(PathBuf),
     CopyPath(String),
@@ -1725,6 +1727,7 @@ fn pick_model(
             PickerAction::Refresh => actions.push(AgentsAction::ReloadModels),
             PickerAction::ToggleFavorite(s) => actions.push(AgentsAction::ToggleFavorite(s)),
             PickerAction::SetProvider(p) => actions.push(AgentsAction::ModelProvider(p)),
+            PickerAction::Login(p) => actions.push(AgentsAction::Login(p)),
         }
     }
     model

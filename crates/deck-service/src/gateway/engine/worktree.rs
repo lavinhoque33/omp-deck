@@ -1659,6 +1659,7 @@ impl Engine {
             restore: false,
             tool: None,
             confine: None,
+            agent_child: None,
         });
         self.pump_launches();
     }
@@ -1692,6 +1693,7 @@ impl Engine {
             restore: false,
             tool: None,
             confine: None,
+            agent_child: None,
         });
         self.pump_launches();
     }

@@ -1215,3 +1215,78 @@ fn startup_public_android_options_are_cached_and_never_change_device_registratio
     assert!(!push.android_configured());
     assert!(push.android_config().is_none());
 }
+
+#[test]
+fn agent_messages_use_attention_preferences_high_urgency_and_private_text() {
+    let rx = Receiver::start(&[201]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = registry(dir.path(), &["agent-private", "agent-titled", "agent-off"]);
+    let uas: Vec<Ua> = (0..3).map(|_| Ua::new()).collect();
+    for (ua, id) in uas
+        .iter()
+        .zip(["agent-private", "agent-titled", "agent-off"])
+    {
+        subscribe_ua(&mut reg, id, &rx.endpoint(id), ua);
+    }
+    set_prefs(
+        &mut reg,
+        "agent-titled",
+        PushPrefs {
+            show_titles: true,
+            ..PushPrefs::default()
+        },
+    )
+    .unwrap();
+    set_prefs(
+        &mut reg,
+        "agent-off",
+        PushPrefs {
+            attention: false,
+            ..PushPrefs::default()
+        },
+    )
+    .unwrap();
+    let mut push = push();
+    let opens = Opens::Session("agent-session".into());
+    push.offer(
+        reg.devices(),
+        |_| false,
+        &Offer {
+            title: "fix the parser: Choose a path",
+            ..offer(MobileKind::AgentMessage, &opens)
+        },
+    );
+    let mut got = vec![rx.next(), rx.next()];
+    rx.quiet(Duration::from_millis(500));
+    got.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(got[0].path, "/push/agent-private");
+    assert_eq!(got[1].path, "/push/agent-titled");
+    assert!(got.iter().all(|r| r.headers["urgency"] == "high"));
+    let titled = json(&uas[1].decrypt(got.pop().unwrap().body));
+    assert_eq!(
+        titled["notification"]["body"],
+        "fix the parser: Choose a path"
+    );
+    let private = json(&uas[0].decrypt(got.pop().unwrap().body));
+    assert_eq!(
+        private["notification"]["body"],
+        "An agent sent you a message"
+    );
+}
+
+#[test]
+fn agent_message_payload_keeps_shape_and_cuts_unicode_titles() {
+    let title = format!("session: {}", "é".repeat(TITLE_CHARS));
+    let encoded = payload(MobileKind::AgentMessage, Some(&title), ORIGIN, None, "tag").unwrap();
+    let value = json(&encoded);
+    assert_eq!(value["notification"]["body"], cut(&title, TITLE_CHARS));
+    assert_eq!(value["notification"]["title"], "OmpDeck");
+    assert_eq!(value["notification"].as_object().unwrap().len(), 5);
+    let prefs = PushPrefs {
+        attention: false,
+        ..PushPrefs::default()
+    };
+    assert!(!wants(&prefs, MobileKind::AgentMessage));
+    assert!(wants(&prefs, MobileKind::TurnFinished));
+    assert!(wants(&prefs, MobileKind::Ended));
+}

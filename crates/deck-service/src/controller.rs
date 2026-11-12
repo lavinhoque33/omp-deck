@@ -25,6 +25,11 @@
 //! a headless owner that also pumps the terminal's events): it builds the injector's view of the
 //! terminal, applies the input hold before any byte, writes, and reports [`ControllerEvent`]s.
 //! It never sleeps; `wake_in` says when to drive again.
+//!
+//! A live TSP hello/control socket is not input readiness: omp publishes both before binding
+//! its initial composer. Accepted injections wait up to 30 seconds from enqueue for the first
+//! ready composer, running turn or ask. Expiry writes nothing: an initial screen/dialog refuses
+//! input; otherwise it stalls. Later missing composers still refuse input as genuine dialogs.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
@@ -73,6 +78,8 @@ pub const INSERT_LABEL: &str = "Insert text";
 const HISTORY: usize = 256;
 /// While a switch command is still queued or being typed its confirmation timer is held.
 const SWITCH_RECHECK: Duration = Duration::from_millis(200);
+/// The injector has step deadlines but no deadline for a job held before its first poll.
+const TSP_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Generations are unique in the process, so a new controller for a restarted session never
 /// reuses a target an old client still holds; [`ServiceEpoch`] separates processes.
@@ -471,6 +478,8 @@ pub struct RequestRecord {
     pub runtime: Runtime,
     #[serde(skip)]
     fingerprint: u64,
+    #[serde(skip)]
+    queued_at: Option<Instant>,
 }
 
 impl RequestRecord {
@@ -616,6 +625,9 @@ pub struct SessionController {
     target: SessionTarget,
     session_path: Option<PathBuf>,
     injector: Injector,
+    /// TSP publishes its bootstrap editor and OSC idle before installing its submit handler.
+    /// Do not advertise idle input readiness until the first ready composer (or turn/dialog).
+    tsp_ready: bool,
     /// The job whose draft confirmation is outstanding.
     awaiting: Option<JobId>,
     /// What the live (not settled, not dropped) switch requests add up to, see
@@ -651,6 +663,7 @@ impl SessionController {
             },
             session_path,
             injector: Injector::default(),
+            tsp_ready: false,
             awaiting: None,
             pending_switch: None,
             assumed_switch: None,
@@ -800,7 +813,21 @@ impl SessionController {
     /// omp's state: its OSC 7501 report, else the `π` title, else (a TSP terminal) the document
     /// (see [`Activity::of_terminal`]).
     pub fn activity(&self) -> Activity {
-        Activity::of_terminal(&self.terminal)
+        let activity = Activity::of_terminal(&self.terminal);
+        if !self.tsp_ready && activity == Activity::Idle {
+            // Read-only controller owners may poll the terminal without ever driving input.
+            // Current facts prove readiness for them too; drive() retains that proof across
+            // later fullscreen pages whose inline facts disappear.
+            let tsp = self.terminal.tsp();
+            if tsp.live()
+                && !tsp
+                    .with(deck_term::TspFacts::of)
+                    .is_some_and(|facts| facts.composer || facts.working || facts.asking)
+            {
+                return Activity::Unknown;
+            }
+        }
+        activity
     }
 
     /// The session's indicator; `bell` is the client's own unseen-bell marker.
@@ -921,6 +948,7 @@ impl SessionController {
             delivery: Delivery::Queued,
             runtime,
             fingerprint,
+            queued_at: Some(Instant::now()),
         });
         self.trim_history();
         Ok(Submitted {
@@ -1089,7 +1117,16 @@ impl SessionController {
         {
             return Err(Rejected::BadPath);
         }
-        if self.terminal.paste_bytes("x").is_none() {
+        // Native `send` is atomic and does not paste terminal bytes. Reattached TSP
+        // sessions need no bracketed-paste mode for this path.
+        let native_send = mode == ComposeMode::Send
+            && attachments.is_empty()
+            && self.terminal.tsp().with(|document| {
+                document
+                    .program()
+                    .is_some_and(|program| program.supports("send"))
+            });
+        if !native_send && self.terminal.paste_bytes("x").is_none() {
             return Err(Rejected::NoBracketedPaste);
         }
         if self.is_busy() || (mode == ComposeMode::Send && self.activity().is_busy()) {
@@ -1270,6 +1307,13 @@ impl SessionController {
     /// Advances the injection queue (never blocks): input hold first, then the bytes due now.
     /// Then publishes a changed snapshot to read-only viewers.
     pub fn drive(&mut self, now: Instant) -> Driven {
+        if !self.tsp_ready {
+            let tsp = self.terminal.tsp();
+            self.tsp_ready = tsp.live()
+                && tsp
+                    .with(deck_term::TspFacts::of)
+                    .is_some_and(|facts| facts.composer || facts.working || facts.asking);
+        }
         let out = self.drive_queue(now);
         self.publish_views();
         out
@@ -1302,6 +1346,45 @@ impl SessionController {
         let screen = || term.screen_text();
         let paste = |t: &str| term.paste_bytes(t);
         let handle = term.tsp();
+        // The control socket/TSP hello precedes the initial submit handler. Do not feed
+        // that bootstrap UI, but also do not bypass delivery settlement indefinitely.
+        if handle.live() && !self.tsp_ready {
+            let mut refusal = None;
+            for index in 0..self.history.len() {
+                let record = &self.history[index];
+                if record.delivery != Delivery::Queued {
+                    continue;
+                }
+                let Some(queued_at) = record.queued_at else {
+                    continue;
+                };
+                let remaining = (queued_at + TSP_STARTUP_TIMEOUT).saturating_duration_since(now);
+                if !remaining.is_zero() {
+                    continue;
+                }
+                let id = record.id;
+                let delivery = refusal.get_or_insert_with(|| {
+                    let dialog = handle.with(|document| {
+                        deck_term::TspFacts::of(document).is_some_and(|facts| facts.asking)
+                            || document.surfaces().iter().any(|surface| {
+                                surface.is_open() && surface.mode() != deck_tsp::wire::Mode::Inline
+                            })
+                    });
+                    if dialog {
+                        Delivery::Refused(Refusal::DialogOpen)
+                    } else {
+                        Delivery::Stalled
+                    }
+                });
+                self.injector.drop_unwritten(&[JobId(id.0)]);
+                self.finish(id, delivery.clone(), &mut out.events);
+            }
+            self.trim_history();
+            if self.injector.is_busy() {
+                out.wake_in = Some(Duration::from_millis(30));
+            }
+            return out;
+        }
         let tsp = || handle.with(TspComposer::of);
         let poll = self.injector.poll(&Env {
             now,
@@ -1662,6 +1745,185 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         events
+    }
+
+    fn never_ready_bootstrap_expires(fullscreen: bool) {
+        use deck_tsp::stream::{Verb, encode_message};
+        let (mut ctl, fake) = controller("", None);
+        let mut bootstrap = encode_message(
+            Verb::Query,
+            &[],
+            br#"{"q":"hello","v":[1],"app":"omp","features":["send"]}"#,
+        );
+        bootstrap.extend(encode_message(
+            Verb::Open,
+            &[],
+            br#"{"id":"s","mode":"inline","role":"omp.session"}"#,
+        ));
+        bootstrap.extend(encode_message(Verb::Frame, &[],
+            br#"{"sf":"s","s":1,"ops":[["add","dock","s",null,{"id":"dock","k":"col"}],["add","ed","dock",null,{"id":"ed","k":"editor","p":{"sendable":false,"text":""}}]]}"#));
+        if fullscreen {
+            bootstrap.extend(encode_message(
+                Verb::Open,
+                &[],
+                br#"{"id":"settings","mode":"screen","role":"omp.settings"}"#,
+            ));
+        }
+        fake.out
+            .send(RemoteEvent::Output(bootstrap))
+            .expect("bootstrap");
+        run(&mut ctl, |c, _| c.terminal().tsp().live());
+        assert!(!ctl.tsp_ready);
+        let first = ctl
+            .submit(submission(
+                &ctl,
+                1,
+                Command::Action(Action::Rename("first".to_owned())),
+            ))
+            .expect("first")
+            .id;
+        let later = ctl
+            .submit(submission(
+                &ctl,
+                2,
+                Command::Action(Action::Rename("later".to_owned())),
+            ))
+            .expect("later")
+            .id;
+        let start = ctl.request(first).unwrap().queued_at.unwrap();
+        ctl.record_mut(later).unwrap().queued_at = Some(start + Duration::from_secs(20));
+        ctl.drive(start + TSP_STARTUP_TIMEOUT - Duration::from_millis(1));
+        assert_eq!(ctl.request(first).unwrap().delivery, Delivery::Queued);
+        assert_eq!(ctl.request(later).unwrap().delivery, Delivery::Queued);
+        let expected = if fullscreen {
+            Delivery::Refused(Refusal::DialogOpen)
+        } else {
+            Delivery::Stalled
+        };
+        let driven = ctl.drive(start + TSP_STARTUP_TIMEOUT);
+        assert_eq!(ctl.request(first).unwrap().delivery, expected);
+        assert!(driven.events.iter().any(|event| matches!(event,
+            ControllerEvent::Ended { id, delivery, .. } if *id == first && *delivery == expected)));
+        assert_eq!(
+            ctl.request(later).unwrap().delivery,
+            Delivery::Queued,
+            "newer requests keep their own enqueue deadline"
+        );
+        assert!(ctl.is_busy());
+        ctl.drive(start + TSP_STARTUP_TIMEOUT + Duration::from_secs(20));
+        assert_eq!(ctl.request(later).unwrap().delivery, expected);
+        assert!(!ctl.is_busy());
+        assert!(ctl.can_close(start + TSP_STARTUP_TIMEOUT + Duration::from_secs(21)));
+        assert!(fake.omp().input.is_empty(), "expiry must write no bytes");
+    }
+
+    #[test]
+    fn never_ready_inline_tsp_stalls_at_each_enqueue_deadline_without_writing() {
+        never_ready_bootstrap_expires(false);
+    }
+
+    #[test]
+    fn initial_fullscreen_tsp_refuses_at_each_enqueue_deadline_without_writing() {
+        never_ready_bootstrap_expires(true);
+    }
+
+    #[test]
+    fn tsp_bootstrap_idle_waits_for_the_submit_handler() {
+        use deck_tsp::stream::{Verb, encode_message};
+        let (mut ctl, fake) = controller("", None);
+        let mut bootstrap = b"\x1b]7501;state=idle:app=omp\x07".to_vec();
+        bootstrap.extend(encode_message(
+            Verb::Query,
+            &[],
+            br#"{"q":"hello","v":[1],"app":"omp","features":["send"]}"#,
+        ));
+        bootstrap.extend(encode_message(
+            Verb::Open,
+            &[],
+            br#"{"id":"s","mode":"inline","role":"omp.session"}"#,
+        ));
+        bootstrap.extend(encode_message(Verb::Frame, &[], br#"{"sf":"s","s":1,"ops":[["add","dock","s",null,{"id":"dock","k":"col"}],["add","ed","dock",null,{"id":"ed","k":"editor","p":{"sendable":false,"text":""}}],["focus","ed"]]}"#));
+        fake.out
+            .send(RemoteEvent::Output(bootstrap))
+            .expect("bootstrap");
+        run(&mut ctl, |c, _| c.terminal().tsp().live());
+        assert_eq!(
+            Activity::of_terminal(ctl.terminal()),
+            Activity::Idle,
+            "omp emits idle before binding onSubmit"
+        );
+        assert_eq!(
+            ctl.activity(),
+            Activity::Unknown,
+            "a connected control socket is not composer readiness"
+        );
+        assert!(!ctl.tsp_ready);
+        let accepted = ctl
+            .submit(submission(
+                &ctl,
+                1,
+                Command::Action(Action::Rename("ready-title".to_owned())),
+            ))
+            .expect("rename accepted during bootstrap");
+        let driven = ctl.drive(Instant::now());
+        assert!(
+            driven
+                .events
+                .iter()
+                .all(|event| !matches!(event, ControllerEvent::Ended { .. }))
+        );
+        assert_eq!(ctl.request(accepted.id).unwrap().delivery, Delivery::Queued);
+        assert!(
+            fake.omp().input.is_empty(),
+            "bootstrap must receive no input"
+        );
+
+        fake.out
+            .send(RemoteEvent::Output(encode_message(
+                Verb::Frame,
+                &[],
+                br#"{"sf":"s","s":2,"ops":[["set","ed",{"sendable":true}]]}"#,
+            )))
+            .expect("ready");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ctl.activity() != Activity::Idle && Instant::now() < deadline {
+            ctl.terminal_mut().poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            ctl.activity(),
+            Activity::Idle,
+            "read-only owners need no drive call"
+        );
+        assert!(!ctl.tsp_ready);
+        ctl.drive(Instant::now());
+        assert!(ctl.tsp_ready);
+        assert_eq!(ctl.activity(), Activity::Idle);
+        run(&mut ctl, |c, _| {
+            c.request(accepted.id)
+                .is_some_and(|r| r.delivery == Delivery::Delivered)
+        });
+        assert_eq!(
+            ctl.request(accepted.id).unwrap().delivery,
+            Delivery::Delivered,
+            "the queued rename must submit when the composer becomes ready"
+        );
+
+        // Once initialized, a later screen/dialog must not reset session startup readiness.
+        fake.out
+            .send(RemoteEvent::Output(encode_message(
+                Verb::Frame,
+                &[],
+                br#"{"sf":"s","s":3,"ops":[["set","ed",{"sendable":false}]]}"#,
+            )))
+            .expect("disabled");
+        run(&mut ctl, |c, _| {
+            c.terminal()
+                .tsp()
+                .with(|d| d.inline().is_some_and(|s| s.last_seq() == Some(3)))
+        });
+        assert!(ctl.tsp_ready);
+        assert_eq!(ctl.activity(), Activity::Idle);
     }
 
     fn submission(ctl: &SessionController, seq: u64, command: Command) -> Submission {

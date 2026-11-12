@@ -13,6 +13,7 @@ pub enum NotifyAction {
     TurnFinished(bool),
     Attention(bool),
     Exited(bool),
+    AgentMessages(bool),
     OnlyWhenUnfocused(bool),
     WhileViewing(bool),
     Sound(bool),
@@ -71,6 +72,14 @@ pub fn card_ui(ui: &mut Ui, input: &NotifyInput<'_>) -> Vec<NotifyAction> {
             "The omp process of a tab exited",
             cfg.exited,
             NotifyAction::Exited,
+        );
+        ui.add_space(4.0);
+        row(
+            ui,
+            "Agent messages",
+            "A session's agent tells you something with its OmpDeck notify tool",
+            cfg.agent_messages,
+            NotifyAction::AgentMessages,
         );
         ui.add_space(10.0);
         ui.label(theme::section_caption("Bell", pal.weak));

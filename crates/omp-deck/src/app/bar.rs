@@ -98,6 +98,7 @@ impl App {
                 .set_account(live.as_deref().and_then(|l| l.account.as_ref()));
             self.bar_view.set_usage(self.usage.summary());
             self.bar_view.update(snap.as_ref(), &tab.cwd, &self.models);
+            self.bar_view.set_login_hint(&self.models);
             if tab.copy.is_none() {
                 observed = Some((
                     tab.target().clone(),
@@ -152,6 +153,7 @@ impl App {
             || self.tree.is_some()
             || self.settings_open
             || self.usage_open
+            || self.accounts.wizard.is_some()
             || self.sessions.open
             || self.palette.is_some()
             || self.mobile_modal_open()
@@ -386,6 +388,8 @@ impl App {
             BarAction::ToggleChanges => self.toggle_changes_panel(),
             BarAction::OpenTree => self.open_tree_active(),
             BarAction::OpenUsage => self.open_usage(),
+            BarAction::Login(provider) => self.open_login(provider),
+            BarAction::Picker(PickerAction::Login(provider)) => self.open_login(provider),
         }
     }
 

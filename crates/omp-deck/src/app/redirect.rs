@@ -69,6 +69,8 @@ impl App {
                 };
                 self.open_dashboard(true, tab);
             }
+            Redirect::Login { provider } => self.open_login(provider),
+            Redirect::Logout => self.open_accounts(),
         }
     }
 }

@@ -77,6 +77,8 @@ pub(super) struct LaunchJob {
     pub(super) tool: Option<Tool>,
     /// A paired device's launch: its folder must still lead inside these when prepared.
     pub(super) confine: Option<crate::gateway::jobs::Confine>,
+    /// Tool-only attachment: not a persistent frontend-owned session.
+    pub(super) agent_child: Option<SessionKey>,
 }
 
 /// A launch prepared on a worker.
@@ -104,9 +106,12 @@ pub(super) struct CopyWatch {
 /// The live-control client of a session (while followed, or while a command waits on it).
 pub(super) struct LiveLink {
     pub(super) client: CtlClient,
-    queued: Vec<(RequestKey, CtlCommand, Instant)>,
-    pending: HashMap<u64, RequestKey>,
+    queued: Vec<(Option<RequestKey>, CtlCommand, Instant)>,
+    pending: HashMap<u64, Option<RequestKey>>,
     seen: (bool, Option<Arc<LiveSnapshot>>),
+    subscribed: Option<(bool, bool)>,
+    tools: bool,
+    probe_deadline: Instant,
 }
 
 pub(super) struct Managed {
@@ -121,8 +126,10 @@ pub(super) struct Managed {
     /// argv as requested (`omp` not yet resolved): what a restart runs again.
     argv: Vec<String>,
     pub(super) tool: Option<Tool>,
+    agent_child: Option<SessionKey>,
     pub(super) ctl_key: Option<String>,
     ctl_expect: bool,
+    ctl_probed: bool,
     spawned_ms: u64,
     /// A journaled close waiting for the controller to settle.
     closing: Option<RequestKey>,
@@ -201,7 +208,14 @@ struct ManifestEntry {
 }
 
 impl LaunchJob {
+    fn abandoned_agent_attach(&self, needed: impl FnOnce(&SessionKey) -> bool) -> bool {
+        self.agent_child.as_ref().is_some_and(|key| !needed(key))
+    }
+
     fn restore_manifest_entry(&self) -> Option<ManifestEntry> {
+        if self.agent_child.is_some() {
+            return None;
+        }
         let Owner::Restored(kind) = self.owner else {
             return None;
         };
@@ -295,6 +309,11 @@ impl Sessions {
 
     pub(super) fn queue(&mut self, job: LaunchJob) {
         self.launches.push_back(job);
+    }
+
+    fn cancel_agent_child_attach(&mut self, key: &SessionKey) {
+        self.launches
+            .retain(|job| job.agent_child.as_ref() != Some(key));
     }
 
     /// Removes the queued launches `client` asked for (not one already being prepared) and
@@ -557,6 +576,9 @@ impl Engine {
             })
         };
         let m = &mut self.sess.managed[i];
+        if m.agent_child.take().is_some() {
+            self.sess.manifest_dirty = true;
+        }
         let sub = Arc::new(m.ctl.terminal().subscribe_output(notify));
         if role == ViewRole::Controlling {
             // The previous controlling view keeps typing; focus, geometry and the clipboard
@@ -783,6 +805,8 @@ impl Engine {
         self.poll_copies(now);
         self.drive_live(now);
         self.update_status_target();
+        self.step_agent_tools(now);
+        self.poll_agent_child_attaches(now);
         self.poll_live_cwds(now);
         if self.sess.manifest_dirty {
             self.save_manifest();
@@ -881,6 +905,7 @@ impl Engine {
     }
 
     fn on_exited(&mut self, key: &SessionKey) {
+        self.drop_background_opener(key);
         let Some(i) = self.sess.find(key) else {
             return;
         };
@@ -981,13 +1006,13 @@ impl Engine {
         });
         // In-flight live-control commands of the session will never be answered.
         if let Some(link) = m.live.take() {
-            for (key, _, _) in link.queued {
+            for key in link.queued.into_iter().filter_map(|(key, _, _)| key) {
                 self.job_failed(
                     key,
                     GatewayError::Failed("the session was closed".to_owned()),
                 );
             }
-            for (_, key) in link.pending {
+            for key in link.pending.into_values().flatten() {
                 self.job_failed(
                     key,
                     GatewayError::Failed("the session was closed".to_owned()),
@@ -1150,6 +1175,7 @@ impl Engine {
             restore: false,
             tool: m.tool.clone(),
             confine: None,
+            agent_child: None,
         };
         self.remove_session(i, ViewEnd::Stale, Instant::now());
         self.sess.queue(job);
@@ -1171,7 +1197,78 @@ impl Engine {
     pub(super) fn queue_ctl(&mut self, i: usize, key: RequestKey, cmd: CtlCommand) {
         self.ensure_live(i);
         if let Some(link) = &mut self.sess.managed[i].live {
-            link.queued.push((key, cmd, Instant::now() + CTL_CONNECT));
+            link.queued
+                .push((Some(key), cmd, Instant::now() + CTL_CONNECT));
+        }
+        self.waker.now();
+    }
+
+    /// Best-effort refresh through the same connection/queue as journaled ctl work.
+    pub(super) fn refresh_live_provider(&mut self, provider: &str) {
+        for i in 0..self.sess.managed.len() {
+            if self.sess.managed[i].exited() || self.sess.managed[i].ctl_key.is_none() {
+                continue;
+            }
+            self.ensure_live(i);
+            if let Some(link) = &mut self.sess.managed[i].live {
+                link.queued.push((
+                    None,
+                    CtlCommand::RefreshProvider {
+                        provider: provider.to_owned(),
+                    },
+                    Instant::now() + CTL_CONNECT,
+                ));
+            }
+        }
+        // The Running monitor probes the control endpoint for every live backend name,
+        // including sessions whose tabs/controllers have been detached.
+        let managed_keys: HashSet<&String> = self
+            .sess
+            .managed
+            .iter()
+            .filter(|session| !session.exited())
+            .filter_map(|session| session.ctl_key.as_ref())
+            .collect();
+        let detached: Vec<PathBuf> = self.running.latest().map_or_else(Vec::new, |snapshot| {
+            snapshot
+                .ctl
+                .iter()
+                .filter(|key| snapshot.alive.contains(*key) && !managed_keys.contains(key))
+                .map(|key| ctl_dir(&self.ctl_ns, key))
+                .collect()
+        });
+        if !detached.is_empty() {
+            let provider = provider.to_owned();
+            self.spawn_worker("provider-refresh", move || {
+                // Keep clients alive through connection and reply; immediately dropping
+                // a fire-and-forget client could discard its queued command. All endpoint
+                // handshakes run concurrently and only this worker waits.
+                let mut clients: Vec<_> = detached
+                    .into_iter()
+                    .map(|dir| (CtlClient::spawn(dir, || {}), None))
+                    .collect();
+                let deadline = Instant::now() + CTL_CONNECT;
+                while !clients.is_empty() && Instant::now() < deadline {
+                    clients.retain_mut(|(client, pending)| {
+                        if pending.is_none() && client.connected() {
+                            *pending = Some(client.send(CtlCommand::RefreshProvider {
+                                provider: provider.clone(),
+                            }));
+                        }
+                        !client
+                            .take_replies()
+                            .iter()
+                            .any(|(id, _)| Some(*id) == *pending)
+                    });
+                    if !clients.is_empty() {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                }
+                Fin::Logged {
+                    what: "provider refresh",
+                    result: Ok(()),
+                }
+            });
         }
         self.waker.now();
     }
@@ -1191,6 +1288,9 @@ impl Engine {
             queued: Vec::new(),
             pending: HashMap::new(),
             seen: (false, None),
+            subscribed: None,
+            tools: false,
+            probe_deadline: Instant::now() + Duration::from_secs(10),
         });
     }
 
@@ -1203,9 +1303,11 @@ impl Engine {
                 crate::gateway::protocol::Topic::Live(k) => Some(k.clone()),
                 _ => None,
             })
+            .chain(self.child_live_keys())
             .collect();
         let mut finished: Vec<(RequestKey, Result<Done, GatewayError>)> = Vec::new();
         let mut changed: Vec<SessionKey> = Vec::new();
+        let mut replies = Vec::new();
         let mut resolved = false;
         for i in 0..self.sess.managed.len() {
             let key = self.sess.managed[i].ctl.target().key.clone();
@@ -1214,14 +1316,25 @@ impl Engine {
             // handle on every atomic rewrite (the title, in the first turn), so the open-file poll
             // in `follow_session_files` can miss a fresh session for good — and its pushes and
             // live entries would carry no session.
+            if let Some(link) = &self.sess.managed[i].live
+                && now >= link.probe_deadline
+            {
+                self.sess.managed[i].ctl_probed = true;
+            }
             let unresolved = {
                 let m = &self.sess.managed[i];
                 m.role == SessionRole::Session
                     && m.copy.is_none()
                     && !m.exited()
                     && m.ctl.session_path().is_none()
+                    && (!m.ctl_probed || m.live.as_ref().is_some_and(|l| l.client.connected()))
             };
-            if wanted.contains(&key) || unresolved {
+            if wanted.contains(&key)
+                || unresolved
+                || (!self.sess.managed[i].ctl_probed
+                    && self.sess.managed[i].ctl_key.is_some()
+                    && !self.sess.managed[i].exited())
+            {
                 self.ensure_live(i);
             }
             let m = &mut self.sess.managed[i];
@@ -1229,7 +1342,15 @@ impl Engine {
                 .live
                 .as_ref()
                 .is_some_and(|l| !l.queued.is_empty() || !l.pending.is_empty());
-            if !wanted.contains(&key) && !busy && !unresolved {
+            let tools = m.live.as_mut().is_some_and(|l| {
+                if l.client.connected() {
+                    l.tools = l.client.features().iter().any(|f| f == "tools");
+                }
+                l.tools
+            });
+            let probing = !m.ctl_probed && m.ctl_key.is_some() && !m.exited();
+            if m.exited() || (!wanted.contains(&key) && !busy && !unresolved && !tools && !probing)
+            {
                 if m.live.take().is_some() {
                     changed.push(key);
                 }
@@ -1240,6 +1361,17 @@ impl Engine {
             };
             let connected = link.client.connected();
             if connected {
+                m.ctl_probed = true;
+            }
+            let subscription = (wanted.contains(&key) || unresolved, tools);
+            if connected && link.subscribed != Some(subscription) {
+                link.client.send(CtlCommand::Subscribe {
+                    snapshots: subscription.0,
+                    tools: subscription.1,
+                });
+                link.subscribed = Some(subscription);
+            }
+            if connected {
                 for (rk, cmd, _) in std::mem::take(&mut link.queued) {
                     let rid = link.client.send(cmd);
                     link.pending.insert(rid, rk);
@@ -1249,7 +1381,7 @@ impl Engine {
                     .into_iter()
                     .partition(|(_, _, d)| *d <= now);
                 link.queued = waiting;
-                for (rk, _, _) in expired {
+                for rk in expired.into_iter().filter_map(|(rk, _, _)| rk) {
                     finished.push((
                         rk,
                         Err(GatewayError::Failed(
@@ -1262,9 +1394,18 @@ impl Engine {
                 }
             }
             for (rid, reply) in link.client.take_replies() {
-                if let Some(rk) = link.pending.remove(&rid) {
+                replies.push((
+                    key.clone(),
+                    rid,
+                    reply.ok,
+                    reply.code.as_deref() == Some("root_mismatch"),
+                ));
+                if let Some(Some(rk)) = link.pending.remove(&rid) {
                     finished.push((rk, Ok(Done::Ctl(reply))));
                 }
+            }
+            if !subscription.0 {
+                continue;
             }
             let latest = link.client.latest();
             // omp writes a fresh session's file only when its first reply lands; until then
@@ -1292,6 +1433,9 @@ impl Engine {
                 link.seen = (connected, latest);
                 changed.push(key);
             }
+        }
+        for (key, rid, ok, root_mismatch) in replies {
+            self.agent_tool_reply_done(&key, rid, ok, root_mismatch);
         }
         for (key, result) in finished {
             if let Some(change) = self.defer.model_changes.remove(&key) {
@@ -1590,6 +1734,64 @@ impl Engine {
             .map(|m| (m.ctl.target().clone(), m.view))
     }
 
+    /// Attach an existing child only for the lifetime of its outstanding tool operations.
+    pub(super) fn queue_agent_child_attach(
+        &mut self,
+        spec: LaunchSpec,
+        key: SessionKey,
+        kind: MuxKind,
+    ) {
+        self.sess.queue(LaunchJob {
+            spec,
+            key: None,
+            exact: true,
+            owner: Owner::Restored(kind),
+            restore: true,
+            tool: None,
+            confine: None,
+            agent_child: Some(key),
+        });
+    }
+
+    /// Release only our attachment after started input drains, never the underlying backend.
+    pub(super) fn release_agent_child_attach(&mut self, key: &SessionKey) {
+        if self.agent_child_attach_needed(key) {
+            return;
+        }
+        self.sess.cancel_agent_child_attach(key);
+        self.poll_agent_child_attaches(Instant::now());
+        self.sync_ctl_keep();
+    }
+
+    fn poll_agent_child_attaches(&mut self, now: Instant) {
+        for i in (0..self.sess.managed.len()).rev() {
+            let m = &self.sess.managed[i];
+            if m.agent_child.is_none() {
+                continue;
+            }
+            let key = &m.ctl.target().key;
+            let needed = self.agent_child_attach_needed(key);
+            let frontend = self.views.values().any(|v| v.target.key == *key);
+            let ctl = &mut self.sess.managed[i].ctl;
+            if agent_child_attach_can_release(needed, frontend, || ctl.can_close(now)) {
+                // No kill: the existing backend outlives this tool-only controller.
+                self.remove_session(i, ViewEnd::Closed, now);
+            } else if !needed && !frontend {
+                // can_close preserves started injections; normal ticks send their remaining
+                // steps, and this poll also covers the final input-flush grace period.
+                self.wake_within(CLOSE_POLL);
+            }
+        }
+    }
+
+    fn adopt_agent_child_attach(&mut self, key: &SessionKey) {
+        if let Some(i) = self.sess.find(key)
+            && self.sess.managed[i].agent_child.take().is_some()
+        {
+            self.sess.manifest_dirty = true;
+        }
+    }
+
     /// Starts the next queued launch once a running snapshot exists (names resolve against it).
     pub(super) fn pump_launches(&mut self) {
         if self.sess.launching.is_some() {
@@ -1599,9 +1801,15 @@ impl Engine {
             return;
         };
         while let Some(mut job) = self.sess.launches.pop_front() {
+            if job.abandoned_agent_attach(|key| self.agent_child_attach_needed(key)) {
+                continue;
+            }
             if job.spec.copy_of.is_none()
                 && let Some((t, view)) = self.existing_for(&job.spec, job.spec.mux_name.as_deref())
             {
+                if job.agent_child.is_none() {
+                    self.adopt_agent_child_attach(&t.key);
+                }
                 if let Some(key) = job.key.take() {
                     self.job_finished(key, Ok(Done::Session(t, view)));
                 }
@@ -1636,6 +1844,9 @@ impl Engine {
                 && let Some(n) = name.as_deref()
                 && let Some((t, view)) = self.existing_for(&job.spec, Some(n))
             {
+                if job.agent_child.is_none() {
+                    self.adopt_agent_child_attach(&t.key);
+                }
                 if let Some(key) = job.key.take() {
                     self.job_finished(key, Ok(Done::Session(t, view)));
                 }
@@ -1653,8 +1864,11 @@ impl Engine {
             let ext = self.ctl_ext.clone();
             let ns = self.ctl_ns.clone();
             let omp = self.omp.as_ref().map(|o| o.program().to_path_buf());
+            let tools = self.cfg.agent_tools.env_value();
             self.spawn_worker("launch", move || {
-                Fin::Prepared(Box::new(prepare(job, name, ctl_key, mux, ns, ext, omp)))
+                Fin::Prepared(Box::new(prepare(
+                    job, name, ctl_key, mux, ns, ext, omp, tools,
+                )))
             });
             return;
         }
@@ -1672,6 +1886,24 @@ impl Engine {
             view,
             gone,
         } = p;
+        // An ordinary queued launch adopts this result even before its frontend attaches.
+        if job.agent_child.is_some()
+            && self.sess.launches.iter().any(|queued| {
+                queued.agent_child.is_none()
+                    && queued.spec.copy_of.is_none()
+                    && ((name.is_some() && queued.spec.mux_name == name)
+                        || (job.spec.session_path.is_some()
+                            && queued.spec.session_path == job.spec.session_path))
+            })
+        {
+            job.agent_child = None;
+        }
+        if job.abandoned_agent_attach(|key| self.agent_child_attach_needed(key)) {
+            // Dropping a prepared attachment does not kill the existing backend session.
+            self.sync_ctl_keep();
+            self.pump_launches();
+            return;
+        }
         if gone {
             log::info!("not re-attaching {name:?}: the session ended");
             self.sess.manifest_dirty = true;
@@ -1737,8 +1969,10 @@ impl Engine {
                     argv,
                     view,
                     tool: job.tool,
+                    agent_child: job.agent_child,
                     // Attaching ignores the argv: only a created session opens the socket.
                     ctl_expect: ctl_key.is_some() && created,
+                    ctl_probed: false,
                     ctl_key,
                     spawned_ms: crate::gateway::unix_ms(),
                     closing: None,
@@ -1823,6 +2057,7 @@ impl Engine {
                 restore: true,
                 tool: None,
                 confine: None,
+                agent_child: None,
             });
         }
         self.sess.manifest_dirty = true;
@@ -1838,7 +2073,7 @@ impl Engine {
             .sess
             .managed
             .iter()
-            .filter(|m| m.role == SessionRole::Session && !m.exited())
+            .filter(|m| m.agent_child.is_none() && m.role == SessionRole::Session && !m.exited())
             .filter_map(|m| {
                 Some(ManifestEntry {
                     kind: m.mux.as_ref()?.kind(),
@@ -1931,6 +2166,7 @@ fn effective_view(
 }
 
 /// Worker: control dir and environment, the resolved argv and the backend launch.
+#[allow(clippy::too_many_arguments)]
 fn prepare(
     mut job: LaunchJob,
     name: Option<String>,
@@ -1939,6 +2175,7 @@ fn prepare(
     ns: String,
     ext: Option<PathBuf>,
     omp: Option<PathBuf>,
+    tools: Option<String>,
 ) -> Prepared {
     let created = match (&mux, &name) {
         (Some(m), Some(n)) => !m.has_session(n),
@@ -1991,7 +2228,7 @@ fn prepare(
             None
         }
     });
-    let (ctl_key, env) = match ctl_key {
+    let (ctl_key, mut env) = match ctl_key {
         Some(key) => match ctl_env(&ctl_dir(&ns, &key)) {
             Ok(vars) => (
                 Some(key),
@@ -2006,6 +2243,15 @@ fn prepare(
         },
         None => (None, Vec::new()),
     };
+    // Empty explicitly overrides a gateway environment inherited from another omp session.
+    env.push((
+        deck_core::ctl::OMPDECK_TOOLS_ENV.to_owned(),
+        if ctl_key.is_some() {
+            tools.unwrap_or_default()
+        } else {
+            String::new()
+        },
+    ));
     let mut argv = job.spec.argv.clone();
     // The detected omp may live outside PATH (`~/.local/bin`).
     if let (Some(first), Some(omp)) = (argv.first_mut(), &omp)
@@ -2039,8 +2285,148 @@ fn prepare(
     }
 }
 
+/// Never enter closing (which cancels unwritten input) while an operation or frontend owns it.
+fn agent_child_attach_can_release(
+    needed: bool,
+    frontend: bool,
+    can_close: impl FnOnce() -> bool,
+) -> bool {
+    !needed && !frontend && can_close()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn child_release_rechecks_operation_and_frontend_ownership_before_closing() {
+        for (needed, frontend) in [(true, false), (false, true), (true, true)] {
+            assert!(!agent_child_attach_can_release(needed, frontend, || {
+                panic!("an active or frontend-owned controller must not start closing")
+            }));
+        }
+        assert!(!agent_child_attach_can_release(false, false, || false));
+        assert!(agent_child_attach_can_release(false, false, || true));
+        // Ownership may change while a previously started injection drains.
+        assert!(!agent_child_attach_can_release(true, false, || true));
+        assert!(!agent_child_attach_can_release(false, true, || true));
+    }
+
+    #[test]
+    fn child_release_drains_started_steer_and_follow_up_before_detaching() {
+        use std::io;
+        use std::sync::mpsc::{self, Receiver, Sender};
+
+        use crate::controller::{Command, Submission};
+        use deck_term::{Remote, RemoteEvent, RemoteRx, RemoteTx};
+
+        // Like the controller tests' remote fixture, feed a rail composer and capture each
+        // transport write independently: paste must precede a later submit-key write.
+        struct Rx(Receiver<RemoteEvent>);
+        impl RemoteRx for Rx {
+            fn recv(&mut self) -> io::Result<RemoteEvent> {
+                Ok(self.0.recv().unwrap_or(RemoteEvent::Closed))
+            }
+        }
+        struct Tx(Sender<Vec<u8>>);
+        impl RemoteTx for Tx {
+            fn input(&self, bytes: &[u8]) -> io::Result<()> {
+                self.0.send(bytes.to_vec()).map_err(io::Error::other)
+            }
+            fn resize(&self, _: u16, _: u16, _: u16, _: u16) -> io::Result<()> {
+                Ok(())
+            }
+            fn palette(&self, _: [[u8; 3]; 19]) -> io::Result<()> {
+                Ok(())
+            }
+            fn kill(&self) -> io::Result<()> {
+                panic!("releasing an attachment must not kill the backend")
+            }
+            fn detach(&self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        struct Wire(Rx, Tx);
+        impl Remote for Wire {
+            fn split(self: Box<Self>) -> (Box<dyn RemoteRx>, Box<dyn RemoteTx>) {
+                (Box::new(self.0), Box::new(self.1))
+            }
+        }
+
+        for follow_up in [false, true] {
+            let (out, events) = mpsc::channel();
+            let (input, writes) = mpsc::channel();
+            let terminal = Terminal::connect_headless(
+                Box::new(Wire(Rx(events), Tx(input))),
+                TermOptions::default(),
+                Arc::new(|_| {}),
+            );
+            let mut ctl = SessionController::new(SessionKey::direct(), terminal, None);
+            out.send(RemoteEvent::Output(
+                "\x1b[2J\x1b[H\r\n  v18.12.5\r\n▎ \x1b[?2004h\x1b]0;π ⠋ work\x07"
+                    .as_bytes()
+                    .to_vec(),
+            ))
+            .expect("composer output");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ctl.activity().is_busy()
+                || !ctl
+                    .terminal()
+                    .screen_text()
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with('▎'))
+            {
+                assert!(Instant::now() < deadline, "composer never became ready");
+                ctl.tick(Instant::now());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            ctl.submit(Submission {
+                key: RequestKey {
+                    client: "child".into(),
+                    seq: 1,
+                },
+                target: ctl.target().clone(),
+                command: Command::Steer {
+                    text: "finish this".into(),
+                    follow_up,
+                },
+            })
+            .expect("steer accepted");
+            ctl.tick(Instant::now());
+            // Do not tick again before cancellation: the submit step must still be pending.
+            let paste = writes
+                .recv_timeout(Duration::from_secs(1))
+                .expect("paste started");
+            assert_eq!(paste, b"\x1b[200~finish this\x1b[201~");
+            // omp redraws its editor after accepting a paste; the injector must observe that
+            // change before it sends the submit key, even when cancellation requested a drain.
+            out.send(RemoteEvent::Output("\r▎ finish this".as_bytes().to_vec()))
+                .expect("pasted text redraw");
+            ctl.cancel_client("child");
+            assert!(!agent_child_attach_can_release(false, false, || {
+                ctl.can_close(Instant::now())
+            }));
+
+            loop {
+                let now = Instant::now();
+                ctl.tick(now);
+                if agent_child_attach_can_release(false, false, || ctl.can_close(now)) {
+                    break;
+                }
+                assert!(now < deadline, "started injection never drained");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                writes
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("submit key"),
+                if follow_up { b"\x11" } else { b"\r" }
+            );
+            assert!(writes.try_recv().is_err(), "unexpected extra input");
+            drop(ctl);
+            drop(out);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -2049,10 +2435,7 @@ mod tests {
             Ok(Done::Ctl(deck_core::ctl::CtlReply {
                 ok,
                 error: error.map(str::to_owned),
-                new_file: None,
-                leaf: None,
-                value: None,
-                message: None,
+                ..deck_core::ctl::CtlReply::default()
             }))
         };
         assert!(matches!(
@@ -2099,6 +2482,7 @@ mod tests {
             restore: false,
             tool: None,
             confine: None,
+            agent_child: None,
         };
         let mut sess = Sessions::new(PathBuf::from("/nowhere/sessions.json"));
         sess.queue(job("phone 1", Some(("d-phone", 1))));
@@ -2200,6 +2584,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cancelling_a_child_attachment_keeps_frontend_and_other_child_launches() {
+        let child = SessionKey::direct();
+        let other = SessionKey::direct();
+        let mut sess = Sessions::new(PathBuf::from("/nowhere/sessions.json"));
+        let frontend = prepare_job(SessionView::Chat, SessionRole::Session);
+        let mut abandoned = prepare_job(SessionView::Chat, SessionRole::Session);
+        abandoned.agent_child = Some(child.clone());
+        let mut active = prepare_job(SessionView::Chat, SessionRole::Session);
+        active.agent_child = Some(other.clone());
+        sess.queue(abandoned);
+        sess.queue(frontend);
+        sess.queue(active);
+
+        sess.cancel_agent_child_attach(&child);
+
+        assert_eq!(sess.launches.len(), 2);
+        assert!(sess.launches[0].agent_child.is_none());
+        assert_eq!(sess.launches[1].agent_child.as_ref(), Some(&other));
+    }
+
+    #[test]
+    fn late_child_results_require_an_operation_unless_frontend_adopted() {
+        let child = SessionKey::direct();
+        let mut job = prepare_job(SessionView::Chat, SessionRole::Session);
+        job.agent_child = Some(child.clone());
+        assert!(job.abandoned_agent_attach(|key| {
+            assert_eq!(key, &child);
+            false
+        }));
+        assert!(!job.abandoned_agent_attach(|key| key == &child));
+
+        // Frontend adoption is permanent, including after that view disconnects.
+        job.agent_child = None;
+        assert!(!job.abandoned_agent_attach(|_| false));
+    }
+
+    #[test]
+    fn active_tool_child_attachments_are_retained_but_not_persisted() {
+        let mut job = prepare_job(SessionView::Chat, SessionRole::Session);
+        job.restore = true;
+        job.owner = Owner::Restored(MuxKind::Host);
+        job.agent_child = Some(SessionKey::direct());
+        assert!(!job.abandoned_agent_attach(|_| true));
+        assert_eq!(job.restore_manifest_entry(), None);
+
+        job.agent_child = None;
+        assert!(job.restore_manifest_entry().is_some());
+    }
+
     fn prepare_job(view: SessionView, role: SessionRole) -> LaunchJob {
         LaunchJob {
             spec: LaunchSpec {
@@ -2218,6 +2652,7 @@ mod tests {
             restore: false,
             tool: None,
             confine: None,
+            agent_child: None,
         }
     }
 
@@ -2235,12 +2670,19 @@ mod tests {
             "omp-deck-test-prepare".into(),
             None,
             None,
+            None,
         );
         assert_eq!(chat.view, SessionView::Chat);
         match chat.launch.expect("launch") {
             Launch::Host(spec) => {
                 assert!(spec.tsp, "the daemon must act as the TSP terminal");
                 assert_eq!(spec.args, ["--resume", "/s/a.jsonl"]);
+                assert!(
+                    spec.env_set.iter().any(|(key, value)| {
+                        key == deck_core::ctl::OMPDECK_TOOLS_ENV && value.is_empty()
+                    }),
+                    "disabled tools must override an inherited tools setting"
+                );
             }
             other => panic!("not a host launch: {other:?}"),
         }
@@ -2250,6 +2692,7 @@ mod tests {
             None,
             Some(host_mux()),
             "omp-deck-test-prepare".into(),
+            None,
             None,
             None,
         );
@@ -2262,6 +2705,7 @@ mod tests {
             None,
             Some(host_mux()),
             "omp-deck-test-prepare".into(),
+            None,
             None,
             None,
         );
@@ -2286,6 +2730,7 @@ mod tests {
             "omp-deck-test-prepare".into(),
             None,
             None,
+            None,
         );
         assert_eq!(p.view, SessionView::Terminal);
         assert!(matches!(p.launch, Ok(Launch::Pty(_))));
@@ -2296,6 +2741,7 @@ mod tests {
             None,
             None,
             "direct".into(),
+            None,
             None,
             None,
         );

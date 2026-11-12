@@ -353,6 +353,7 @@ impl Engine {
             | Topic::Notifications
             | Topic::Status
             | Topic::Usage
+            | Topic::OmpAccounts
             | Topic::AppUpdate
             | Topic::Backup
             | Topic::Live(_)

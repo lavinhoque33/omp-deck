@@ -4384,3 +4384,424 @@ phone's, or an automatic pass), because the gateway owns the lane; the window's 
   session actions, process-manager navigation and history bulk selection. Fleet logic tests cover merged
   discovery, exited/stale rows, desktop-first order and fresh/direct controllers without backend discovery.
 
+## Provider login wizard (user, 2026-11-11)
+
+User: replace typing `/login` inside omp with a native OmpDeck flow. Picked: home = **Usage → Accounts**; status-bar
+hint = **key badge on the usage chip** (a "Log in" chip when nothing is logged in); entry points = model picker,
+first run, palette + app menu; phone later. Agent → OmpDeck tools follow as a separate wave.
+
+### Verified facts (installed omp 18.18.9, isolated `HOME`/`XDG_*`/`PI_CODING_AGENT_DIR`, 2026-11-11)
+- With no credential omp exits "No default model selected" **after** awaiting extension factories but **before**
+  `session_start`: helper work runs in the async factory (like `ompdeck-sess.ts`), never in an event handler.
+- Host-package **static** imports resolve in the compiled binary; literal dynamic `import()`s of
+  `@oh-my-pi/pi-coding-agent/config/settings` in a file without static host imports did **not** ("Cannot find
+  package"). The helper uses static imports only:
+  `discoverAuthStorage, ModelRegistry, Settings` from `@oh-my-pi/pi-coding-agent`;
+  `listLogoutAccounts` from `@oh-my-pi/pi-coding-agent/slash-commands/helpers/logout`;
+  `getOAuthProviders, getOAuthCredentialProvider` from `@oh-my-pi/pi-ai/oauth`; `getProjectDir` from `@oh-my-pi/pi-utils`.
+- Storage exactly like `omp login` (`cli/login-cli.ts`): `Settings.init({cwd})` → `discoverAuthStorage(undefined,
+  {settings})` (local `agent.db` or the auth broker) → `new ModelRegistry(auth)`; `auth.close()` at the end.
+- `getOAuthProviders()` → 91 `{id, name, available, storeCredentialsAs?}` in omp's `/login` order; aliases
+  `zai-coding-plan→zai`, `devin-cli|devin-windsurf→devin`, `openai-codex-device→openai-codex`. No flow kind exists.
+- `auth.oauth.login(id, {signal, onAuth, onPrompt, onProgress, onManualCodeInput})` → identity (`{type:"api_key"}`
+  for keys) or throws (`LoginCancelledError` on abort; provider errors e.g. `ProviderHttpError … 401`). Observed:
+  anthropic `onAuth{url: claude.ai/…, launchUrl: http://localhost:54545/launch, instructions: "…paste the final
+  redirect URL or authorization code…"}`; github-copilot `onPrompt{message:"GitHub Enterprise URL/domain (blank for
+  github.com)", allowEmpty:true}` **before** `onAuth{url: github.com/…, instructions:"Enter code: 0B90-E292"}`;
+  deepseek `onAuth{dashboard url, instructions}` → `onPrompt{message:"Paste your DeepSeek API key",
+  placeholder:"sk-..."}` (**no `secret` flag**) → `onProgress "Validating API key..."` → 401 error; vllm empty answer
+  stores (`allowEmpty`, `emptyFallback`).
+- Logout = what 18.18.9's `logoutCredential` does: `auth.credentials.reload()` → `removeById(store, credentialId)` →
+  `registry.refreshProvider(store, "online")` (+ `session.refreshScopedModels()` in a live session). Do **not** call
+  `logoutCredential` (18.18.9 signature is `(session, provider, id)`, differs from the 18.12 source).
+  `listLogoutAccounts(auth, loginId, sessionId)` → `[{credentialId, provider(store), label, detail, type, active}]`
+  (verified). After login: `registry.refreshProvider(storeCredentialsAs ?? id, "online")`.
+- Other omp processes adopt a new credential on their next resolution (SQLite `data_version`); their model lists
+  need `refreshProvider` (`[INFERENCE]` from source; implementer verifies `ctx.modelRegistry.refreshProvider` in a
+  live extension ctx).
+
+### deck-core (`omp/auth.rs` + `assets/ompdeck-auth.ts`)
+- Asset `ompdeck-auth.ts`, installed by `ctl::install_auth_extension(dir)` (same hardening as the others). Run:
+  `omp --mode rpc --no-session --no-extensions -e <ext>` (cwd `platform::home_or_root()`, stdin null, `NO_COLOR=1`,
+  `Omp.env` applied, `headless`, `spawn_killable`) with env `OMPDECK_AUTH_REQ` (one JSON request), `OMPDECK_AUTH_OUT`
+  (NDJSON events, appended + flushed per line) and `OMPDECK_AUTH_DIR` (answers dir). Inert unless all are set.
+  Requests: `{"op":"list"}` · `{"op":"login","provider":id}` · `{"op":"logout","provider":id,"credentialId":n}`.
+  Events: `{"t":"providers","providers":[{id,name,available,store,disabled,origin:{kind,envVar?}|null,accounts:[…]}]}`;
+  `{"t":"auth",url,launchUrl?,instructions?}`; `{"t":"prompt",seq,message,placeholder?,allowEmpty,secret}`;
+  `{"t":"manual",seq}` (paste field for the redirect URL / code, racing the callback); `{"t":"progress",message}`;
+  `{"t":"done",store,label?}` (label from the identity: email / accountId / orgName, never a token);
+  `{"t":"logged_out",removed,remaining?}`; `{"t":"error",message,cancelled}`. `disabled` = omp's `disabledProviders`
+  setting (read from the `Settings` instance; verify the accessor in 18.18.9). `seq` increases per login.
+- Answers: Rust writes `<dir>/answer-<seq>.json` = `{"value":…}` via temp file + rename (0600 on Unix); the helper
+  polls ~100 ms, reads, **deletes** the file, resolves that `seq`'s promise. `<dir>/cancel` (empty) → the helper aborts
+  its `AbortController` (omp closes its callback server) and reports `error{cancelled:true}`. Overall cap 15 min.
+  The tempdir is private (0700) and dropped with the run. Answers are never logged.
+- API (blocking ones run off the UI thread):
+  ```rust
+  pub struct LoginProvider { pub id: String, pub name: String, pub available: bool, pub store: String,
+      pub disabled: bool, pub origin: Option<AuthOrigin>, pub accounts: Vec<StoredAccount> }
+  pub struct AuthOrigin { pub kind: String /* "oauth" | "api_key" | "env" | … as omp reports */, pub env_var: Option<String> }
+  pub struct StoredAccount { pub credential_id: i64, pub label: String, pub detail: String,
+      pub kind: String /* "oauth" | "api_key" */, pub active: bool }
+  pub struct LogoutOutcome { pub removed: bool, pub remaining: Option<String> }
+  pub enum LoginEvent {
+      Auth { url: String, launch_url: Option<String>, instructions: Option<String> },
+      Prompt { seq: u64, message: String, placeholder: Option<String>, allow_empty: bool, masked: bool },
+      Manual { seq: u64 },
+      Progress(String),
+      Done { store: String, label: Option<String> },
+      Failed { message: String, cancelled: bool },
+  }
+  impl Omp {
+      pub fn login_providers(&self) -> Result<Vec<LoginProvider>, AuthError>;          // ≤ 20 s
+      pub fn logout(&self, provider: &str, credential_id: i64) -> Result<LogoutOutcome, AuthError>;
+      pub fn login(&self, provider: &str) -> Result<LoginRun, AuthError>;              // spawns, returns at once
+  }
+  impl LoginRun {                       // Drop kills the process tree and removes the tempdir
+      pub fn poll(&mut self) -> Vec<LoginEvent>;   // non-blocking; process exit without done/error → Failed(stderr)
+      pub fn answer(&self, seq: u64, value: &str) -> io::Result<()>;
+      pub fn cancel(&mut self);                     // cancel file, kill after 2 s
+  }
+  ```
+  `masked = secret || message` matches (case-insensitive) `api key|api-key|apikey|token|secret|password|passcode|
+  cookie` (pure fn, unit-tested). `AuthError` is a `thiserror` enum (Io / Failed(omp message or stderr) / Timeout).
+- ctl (live tabs): new client op `refresh_provider {provider}` → `ctx.modelRegistry.refreshProvider(provider,"online")`
+  (+ the scoped-model refresh when the ctx exposes it); reply `{ok}`. `CtlCommand::RefreshProvider { provider }`.
+
+### deck-service (gateway)
+- `Topic::OmpAccounts` (interest-driven) → `TopicValue::OmpAccounts(OmpAccountsView)`:
+  ```rust
+  pub struct OmpAccountsView { pub providers: Vec<LoginProvider>, pub loading: bool, pub error: Option<String>,
+      pub login: Option<LoginView>, pub generation: u64 /* +1 after each successful login/logout */ }
+  pub struct LoginView { pub job: u64, pub provider: String, pub name: String,
+      pub auth: Option<LoginAuth>, pub prompt: Option<LoginPrompt>, pub manual: Option<u64>,
+      pub progress: Vec<String> /* last 6 */, pub outcome: Option<LoginOutcome> }
+  pub struct LoginAuth { pub url: String, pub launch_url: Option<String>, pub instructions: Option<String> }
+  pub struct LoginPrompt { pub seq: u64, pub message: String, pub placeholder: Option<String>,
+      pub allow_empty: bool, pub masked: bool }
+  pub enum LoginOutcome { Done { label: Option<String> }, Failed(String), Cancelled }
+  ```
+  The list loads on subscribe when absent or older than 60 s, on `Mutation::OmpAccountsRefresh`, and after every
+  login/logout. A finished `login` stays in the view (outcome) until the next login starts or 10 min pass.
+- Mutations (journaled; no secrets in them): `OmpLogin { provider }` → `Done::OmpLogin { job }` (refused "Another
+  login is in progress ({name})" while one runs; refused when omp is missing); `OmpLoginCancel { job }` (inline);
+  `OmpLogout { provider, credential_id }` → `Done::OmpLogout(LogoutOutcome)`; `OmpAccountsRefresh` (inline).
+- **Answers are not mutations** (the journal hashes ops): `Request::OmpLoginAnswer { job: u64, seq: u64, value:
+  SecretText }`, never journaled or logged; a wrong job/seq is ignored. One login at a time, gateway-wide; it runs on
+  its own thread (not a lane), polled ≤ 100 ms, view updates mark the topic dirty.
+- After a successful login or logout: `generation += 1`, reload the list, run the usage refresh (as
+  `Mutation::UsageRefresh`), and best-effort `CtlCommand::RefreshProvider { provider: store }` to every running session
+  with live control (errors ignored).
+- No device (phone) op in this step.
+
+### omp-deck
+- **Login wizard** modal (`card.rs` chrome, `theme::dialog_margin()`, DraftButtons), opened with an optional
+  preselected login id or store id (resolved once the list arrives; store → the entry with `id == store`, else its
+  first alias). Steps: (1) provider picker — search over name/id, "Signed in" section (accounts or origin) then all
+  providers in omp's order, `disabled` hidden, unavailable greyed, origin badge (login / API key / env: VAR); (2) flow —
+  provider header, progress line, auth block (Open in browser = `launch_url ?? url`, Copy link, instructions; a device
+  code matching `[A-Z0-9]{4,}(-[A-Z0-9]{4,})+` is shown large with Copy), paste field while `manual` is pending, prompt
+  field (masked with a reveal toggle when `masked`, placeholder, Continue enabled on empty only when `allow_empty`);
+  (3) result — "Logged in to {name}[ as {label}]" + "Running sessions pick it up on their next request" / error with
+  Try again. The browser opens automatically once per job this window started. Closing the wizard during a login
+  cancels it. Subscribes `Topic::OmpAccounts` only while shown.
+- **Usage → Accounts**: "Add account…" header button → wizard; per provider with stored accounts (from
+  `OmpAccountsView`) rows with label, detail, type badge (OAuth / API key), Active badge, and the usage state merged
+  from the usage view (unavailable / disabled reason). Row actions as hover buttons **and** context menu: "Log in
+  again" (wizard preselected) on unavailable/disabled rows, "Log out…" (confirm: omp removes the stored credential;
+  env/config keys stay) → `OmpLogout`. Env-only providers show the env var, no Log out. Existing usage content stays.
+- **Status-bar hint**: amber key badge on the usage chip when the usage view has `disabled_credentials`, or the active
+  tab's model provider has no model in the loaded catalog; hover card lists each problem with "Log in…" (wizard
+  preselected). When the catalog is loaded and empty (nothing logged in) a compact "Log in" key chip shows where the
+  usage chip would be. Chips stay vertically centred; the badge never changes the usage chip's quota tone.
+- **Other entries**: model picker — unavailable favorites get a "Log in" hover button (wizard preselected to the
+  favorite's provider) and the provider dropdown a footer "+ Add provider…"; first run — the start screen shows a "Log
+  in to a provider" step when omp is installed and the catalog is empty; palette "Accounts: Log in to provider…" and
+  "Accounts: Manage…" (Usage → Accounts); app menu omp submenu "Log in to provider…", "Accounts…".
+- **Chat view redirect** (Wave 21 mechanism): typed `/login` → wizard (`/login <arg>` preselects `arg`); `/logout` →
+  Usage → Accounts; omp's own login/logout picker caught pre-draw is closed and redirected (identify it from a real
+  TSP capture under an isolated profile). Terminal view keeps omp's.
+- On `generation` change: re-query the model catalog (`Query::Models`).
+
+### As built (login wizard)
+- `OMPDECK_AUTH_REQ` carries the request JSON itself (no secrets in it), not a file path.
+- `disabled` comes from `cfgDisabledProviders.get(settings)` (`@oh-my-pi/pi-coding-agent/config/model-settings`,
+  verified on 18.18.9).
+- ctl `refresh_provider`: `ctx.modelRegistry.refreshProvider(p, "online")`, then the main AgentSession's
+  `refreshScopedModels()` reached through the ctl asset's existing `mainSession()` (`AgentRegistry`); the extension
+  ctx has no scoped refresh on 18.18.9. Both calls guarded.
+- The 15-min cap and a malformed answer file abort the login and report `cancelled: true`.
+- Gateway: `engine/auth.rs`, one `gateway-omp-login` thread driving an `EventSource` seam (tests use a scripted
+  source); `GatewayClient::login_answer` sends `Request::OmpLoginAnswer`. The post-auth usage refresh reuses an
+  in-flight fetch like `Mutation::UsageRefresh`.
+- Review fixes: login job ids are OS-random `u64`s (an open wizard can't adopt another login after a gateway restart);
+  `RefreshProvider` also reaches tab-less running sessions (`RunningSnapshot.ctl` ∩ alive, minus managed ctl keys,
+  short-lived `CtlClient`s on a worker).
+- omp-deck: the wizard deletes egui's stored state (undo history) of every secret field it stops drawing and on
+  close; an answered field stays hidden only while the gateway still shows the same seq for < 4 s (a lost answer
+  brings it back); Close cancels the accepted job even before the topic shows it; a job that vanishes (or never
+  appears within 15 s) → `Step::Gone` ("This login is no longer running", Try again / Back). Usage → Accounts
+  matches usage problems to stored accounts by store + identity (`email (org)` form, the store's only API key for
+  identity-less keys).
+
+## Agent → OmpDeck tools (user, 2026-11-11)
+
+User picked all five tools: `ompdeck_open_session`, `ompdeck_notify`, `ompdeck_show_changes`, `ompdeck_request_review`,
+`ompdeck_sessions`. Main agent only, only in sessions OmpDeck launched with live control, each toggleable in Settings
+(applies to sessions started or restarted afterwards).
+
+### Facts (omp source 18.12.6; implementer re-verifies on installed 18.18.9 with `support::fake_model`)
+- `pi.registerTool({name, label, description, parameters, approval?, execute(toolCallId, params, signal, onUpdate,
+  ctx)})` (`execute` argument order as listed; the `hello.ts`/`api-demo.ts` examples are stale). Result `{content:[{type:
+  "text",text}], details?, isError?}`; a throw becomes an error result. `approval` default `"exec"`; tiers
+  `"read"|"write"|"exec"`. No execute timeout; Stop aborts `signal`. Subagents get extension tools unless restricted;
+  there is no main-only flag → register inside `session_start` when `ctx.agent.kind === "main"` (runtime registration
+  auto-activates). TSP shows custom tools as generic cards (args summarized to 160 chars).
+
+### Extension (`assets/ompdeck-ctl.ts`) + ctl (`ctl.rs`)
+- Launch env `OMPDECK_TOOLS` = comma list of enabled short names (`open_session,notify,show_changes,request_review,
+  sessions`), set by the gateway beside `ctl_env` from `AppConfig.agent_tools`; absent/empty → no tools. Tools are
+  registered once per process in the main session's `session_start`.
+- `hello` gains `"features":["tools"]` (only when ≥ 1 tool is registered) and `"tools":[names]`.
+- New client op `{"t":"subscribe","snapshots":bool,"tools":bool}` (per connection; default `snapshots:true,
+  tools:false`, i.e. today's behaviour). A tool request goes to the **first** connected client with `tools:true`.
+- Extension → client push `{"t":"tool","id":n,"name":"<short>","args":{…},"root":<session file|null>}` and
+  `{"t":"tool_cancel","id":n}` (Stop / abort). Client op `{"t":"tool_result","id":n,"ok":bool,"text":str,
+  "details"?:obj}` → reply `{ok}`; unknown id → `ok:false "no such request"`.
+- In `execute`: no tools client connected → wait up to 5 s for one, else return `isError` "OmpDeck is not connected to
+  this session". A connection that drops with requests pending resolves them `isError` "OmpDeck disconnected".
+  Results map `ok:false` → `isError:true`.
+- Rust: `WireMsg::{Tool{id,name,args,root}, ToolCancel{id}}`, `CtlCommand::{Subscribe{snapshots,tools},
+  ToolResult{id,ok,text,details}}`, `CtlClient::take_tool_requests() -> Vec<ToolEvent>` (`ToolEvent::{Request(ToolRequest),
+  Cancel(u64)}`), `CtlClient::features()`. A client sends its `subscribe` after every (re)connect.
+- Tool definitions (approval tier; parameters; result text):
+  - `ompdeck_open_session` (`exec`): `{prompt?: string ≤16 KiB, cwd?: abs dir (default this session's cwd), model?:
+    string, placement?: "tab"|"split_right"|"split_down" (default "tab"), title?: string ≤80}` → "Opened a new omp
+    session in <~cwd> (<placement>)". Description: start a parallel omp session in OmpDeck, optionally with an initial
+    prompt, model and split placement; it runs independently (use `ompdeck_sessions` to check on it).
+  - `ompdeck_notify` (`read`): `{title: ≤120, body?: ≤2 KiB, level?: "info"|"success"|"warning"|"error"}` → "Posted"
+    or "Agent notifications are turned off" (not an error). Description: tell the user something that needs their
+    attention outside the chat (finished long work, blocked, a decision needed).
+  - `ompdeck_show_changes` (`read`): `{path?: repo-relative}` → "Opened the Changes panel (N changed files)".
+  - `ompdeck_request_review` (`read`): `{summary?: ≤4 KiB, paths?: string[] ≤50}` → blocks until the user returns the
+    review: the comments as text (same formatting as OmpDeck's review prompt) or "The user had no comments" /
+    "The user dismissed the review request"; Stop → `isError` "Review request cancelled".
+  - `ompdeck_sessions` (`read`): `{}` → up to 30 sessions: title, ~cwd, status (busy/idle/needs attention/exited),
+    model, tab open?, last reply snippet ≤300 chars, and whether this session opened it.
+
+### Gateway (`deck-service`)
+- A session whose `hello` advertises `tools` keeps its live link always (also with no `Topic::Live` subscriber): the
+  gateway connects once to every session launched with control to read `hello`; with `tools` it keeps the link,
+  `subscribe{snapshots: <Live subscribed>, tools:true}` (re-sent when Live interest changes), else today's drop rule.
+- Each request is attributed to the `Managed` that owns the link; fence by `m.ctl.target()` (generation) and the
+  request's `root`. Concurrency per session: ≤ 4 pending; more → `ok:false` "too many pending OmpDeck requests".
+- `open_session`: needs a GUI (`to_desktop`; none → `ok:false` "OmpDeck's window is not open"). `ServerEvent::
+  AgentOpenSession { request: u64, opener: SessionTarget, cwd: PathBuf, prompt: Option<String>, model: Option<String>,
+  placement: Split, title: Option<String> }`; the GUI launches through its normal new-session path with argv `omp
+  [--model M] [-- prompt]` (positional MESSAGES; prompt passed as one argv element, never typed), places it relative
+  to the opener's tab (split when the opener is visible, else a new tab) and answers `Mutation::AgentToolDone { request,
+  ok, text }`. Gateway timeout 30 s. The gateway remembers `opened_by` for `ompdeck_sessions`.
+- `notify`: `NotificationCenter::agent_message(target, title, body, level)` → new `Kind::AgentMessage` (inbox entry
+  with the agent's title/body, desktop pop-up under the existing desktop/only-when-unfocused/sound rules, `Effect::Mobile`
+  with `MobileKind::AgentMessage`), all gated by `NotifyConfig.agent_messages` (default true; toggle off silences every
+  path). Rate limit 1 / 10 s per session (excess → "Rate limited; try later", not an error).
+- `show_changes`: `ServerEvent::AgentShowChanges { request, target, path: Option<String> }` → GUI focuses the tab (pane),
+  opens Changes, selects `path`; answers `AgentToolDone`. No GUI → `ok:false`.
+- `request_review`: `ServerEvent::AgentReviewRequest { request, target, summary, paths }` to every GUI (latest one
+  focused/raised); `ServerEvent::AgentReviewCancel { request }` on `tool_cancel`/session end. GUI answers `Mutation::
+  AgentReviewReply { request, reply: ReviewReply }` (`ReviewReply::{Comments{comments, general}, NoComments,
+  Dismissed}`); the gateway formats comments with the existing `build_review` text and resolves the tool. No GUI →
+  `ok:false`. A GUI that disconnects leaves the request pending for the next GUI (re-sent on connect).
+- `sessions`: answered by the gateway from its controllers/running/sessions state (no GUI needed).
+- `AppConfig.agent_tools: AgentTools { open_session, notify, show_changes, request_review, sessions }` (all default
+  true) read at launch for `OMPDECK_TOOLS`.
+
+### Phone (no protocol change)
+- `PushPrefs` is frozen (`deny_unknown_fields`, `api-v1`/`api-s4` vectors reject unknown fields), so there is no new
+  phone toggle: `MobileKind::AgentMessage` is gated by the existing `prefs.attention` (urgency `high`), after the
+  desktop gate `NotifyConfig.agent_messages`. Push text: `show_titles` off → "An agent sent you a message"; on →
+  "<session title>: <message title>" (cut like other titles). Web Push and FCM payloads keep their current shape.
+  No tool UI on the phone; deck-remote, `pwa/` and `android/` are unchanged.
+
+### omp-deck
+- Settings → OmpDeck → General "Agent tools" group: five toggles with one-line descriptions + "Applies to sessions
+  started or restarted afterwards"; Notifications page: "Agent messages" toggle.
+- `AgentOpenSession` / `AgentShowChanges` handlers as above (gated like other desktop opens; window raised).
+- Changes panel **review request banner** (styled card header, padding): the agent's summary + requested paths
+  highlighted; while pending, the review composer's actions become "Return review to agent" (sends `Comments`), "No
+  comments", "Dismiss"; the normal Insert/Send stay for non-requested reviews. A pending request also shows a badge on
+  the tab and an inbox entry ("Review requested").
+
+### As built (agent tools)
+- `Mutation::AgentToolDone { request, target, ok, text, opened: Option<SessionTarget> }` and `Mutation::AgentReviewReply
+  { request, target, reply }` (`opened` = the session an `open_session` started, for `ompdeck_sessions`' opened-by flag;
+  request ids are OS-random `u64`s and the engine ignores a reply whose `target` differs, so a late reply can't complete
+  another request after a gateway restart). Client helpers `agent_tool_done`, `agent_review_reply`.
+- Review requests are transient events: on connect and whenever `GatewayClient::events` drains a `Resync`, the client
+  sends `Request::AgentReviewsResync`; the gateway re-emits every pending `AgentReviewRequest` (GUI dedupes by id) and
+  then `AgentReviewsReplayed { pending }`, the only point where the GUI prunes reviews it holds. `AgentReviewRequest.
+  activate` is true for exactly one GUI on first delivery (the desktop-activation chooser: focused, then newest);
+  replays carry false; only that GUI focuses the tab and raises.
+- Tool events buffered by a `CtlClient` are cleared when its connection resets (the extension already answered them
+  "OmpDeck disconnected"); the gateway probes a session's `hello` for a bounded time, keeps the link only for
+  tool-capable sessions, and always sets `OMPDECK_TOOLS` (empty when every tool is off) so an inherited value can't
+  re-enable them.
+- Inbox `Kind::AgentMessage { title, body: Option<String>, level: String }` (`Entry.title` =
+  session label, `Entry.body` = message title + optional body; `is_warn` for warning/error). The frozen phone inbox
+  feed shows it as its existing Attention kind with that title/body.
+- Config: `AppConfig.agent_tools: AgentTools` (`env_value()` → `OMPDECK_TOOLS`, `deck_core::ctl::OMPDECK_TOOLS_ENV`),
+  registered in `deck_service::settings` as a shared field; `NotifyConfig.agent_messages`.
+- omp 18.18.9 (live-verified, `deck-core/tests/agent_tools_live.rs`): extension tools default to *discoverable* and
+  are missing from the model's top-level tool list, so registration sets `loadMode: "essential"`; `parameters` use
+  `Type` from a static `@sinclair/typebox` import; `execute(toolCallId, params, signal, onUpdate, ctx)` (Stop aborts
+  the 3rd argument; `ctx.agent.kind === "main"` in the 5th); a `task` subagent's model request lists no `ompdeck_` tools.
+- TSP startup readiness (`deck_service::controller::SessionController::activity`): omp emits OSC 7501 `idle` and a
+  bootstrap `editor` with `sendable: false` before its submit handler exists; a command composed then is refused
+  (`DialogOpen`). A live TSP terminal therefore reports `Activity::Unknown` instead of `Idle` until its dock shows a
+  sendable composer, a working row or an ask (`TspFacts`, read by `activity()` itself while unlatched; `drive()` latches
+  it once per controller so a later full-screen page never reverts it). Non-TSP terminals are unaffected. Regression
+  gates: `remote_device_delete_running.rs` asserts the Compose is `Delivered`; `tsp_run_state_live.rs` (undriven owner).
+
+## Agent tools: send_prompt + wait_session (user, 2026-11-12)
+
+User asked for two more tools so an agent can drive the parallel sessions it opens with `ompdeck_open_session`:
+`ompdeck_send_prompt` and `ompdeck_wait_session`. Same rules as the other tools (main agent only, OmpDeck-launched
+sessions with live control, per-tool Settings toggle, ≤ 4 pending per session, Stop cancels).
+
+### Handles and ownership (gateway, ephemeral)
+- When `open_session` succeeds (`AgentToolDone { opened: Some(child) }`) the gateway creates a **handle** `s-<8 hex>`
+  (OS-random, unique within the gateway's lifetime) → `ChildSession { opener_root: PathBuf (the request's `root`,
+  canonical), key: SessionKey (child.key), file: Option<PathBuf> (learned when the child's controller / ctl `hello`
+  first reports its session file), last: Option<Baseline> }`. This registry replaces `opened_by`; `ompdeck_sessions`'
+  "opened by this session" flag comes from it. The open_session result text gains "\nHandle: s-…: use it with
+  ompdeck_send_prompt and ompdeck_wait_session." (only when ≥ 1 of those two tools is enabled for the opener).
+- A request naming a handle is accepted only when the request's `root` equals `opener_root` (else `ok:false` "Unknown
+  session handle"; also for handles that never existed or were lost when the gateway restarted). A child is valid while
+  its backend session `key` is alive and, once `file` is known, its current session file equals `file` (else `ok:false`
+  "That session has exited or switched conversations; open a new one"). Controller generation changes alone (tab
+  closed/re-attached, gateway re-attach) keep the handle valid. Sending to oneself is impossible (a child is never its
+  own opener's session).
+- If no managed controller exists for `key` (its tab was closed; omp keeps running), send/wait attach one headlessly
+  through the existing attach path used by the phone (no GUI tab opened).
+- `Baseline { offset: u64, prompt: String }`: for open_session with a prompt, `{0, prompt}` (the child's file is new);
+  for send_prompt, the child's session-file length (0 when it has no file yet) read immediately before submitting.
+  `last` is replaced by every successful send.
+
+### `ompdeck_send_prompt` (`exec`)
+- Params `{session: string (handle), prompt: string 1..=16 KiB, mode?: "send"|"follow_up"|"steer" (default "send")}`.
+- Gateway: `Command::Compose` through the same submit path as the device `Op::Compose` (Send needs Idle; FollowUp/Steer
+  need Busy; existing refusals apply). An existing human draft in the child's composer is never confirmed away: the
+  outcome that would need the draft confirmation fails the tool with "The session has unsent text in its composer; ask
+  the user to send or clear it". Waits for the controller outcome (≤ 30 s): `Delivered` → "Sent to <title> (<~cwd>).
+  Use ompdeck_wait_session to get the reply."; refusals → `ok:false` with a plain reason (busy → "The session is busy;
+  use mode follow_up or steer, or wait for it first"; idle with follow_up/steer → "The session is idle; use mode send";
+  dialog open → "The session is waiting on a question or approval for the user").
+
+### `ompdeck_wait_session` (`read`)
+- Params `{session: string (handle), timeout_seconds?: integer 1..=3600 (default 600)}`.
+- Waits for the turn of `last` (the most recent prompt this opener gave the child). With no `last`: answers at once
+  with the status line and the child's last reply (`SessionStatsReader::last_assistant_text`, same 32 KiB cap).
+  Calling it again after the turn ended answers at once with the same result (idempotent).
+- Done when the scan (below) has the turn's end **and** (the child is not Busy and has no pending injection, or a later
+  prompt already started). Not required: ever observing Busy (short turns).
+- Early answers (not errors): child Attention → "<title> needs the user's attention: <question/approval title when the
+  ctl `pending_ui` has one>"; child exited → "<title> exited (code N)" + the reply if the turn ended; timeout → "<title>
+  is still working after N s" (+ "no reply yet"). Stale handle / session switched → `ok:false` as above. Stop →
+  `tool_cancel` → the waiter is dropped.
+- Result: "<title> finished (completed|error: <message>|aborted) in <~cwd>.\n\n<reply>" where reply = the turn's final
+  assistant text, capped at 32 KiB (chars cut on a boundary) + "\n[… N more characters; full text in <session file>]".
+- Polling: the scan runs on a worker at most every 500 ms per waiter (incremental, never on the engine loop); activity/
+  exit/attention are read from the controller each engine tick. Waiters end with the child, the opener's session, the
+  request's cancel, or gateway shutdown (`ok:false` "OmpDeck is shutting down").
+
+### deck-core: `status::TurnWatch` (jsonl turn scan)
+- `TurnWatch::new(path: PathBuf, from: u64, prompt: Option<String>) -> TurnWatch`; `poll(&mut self) -> io::Result<
+  TurnScan>` reads only complete lines appended since its last poll (a truncated last line is kept for the next poll;
+  lines are streamed, bounded memory; the title line's in-place rewrite never moves past `from`). File shorter than
+  the scanned position → `Err(InvalidData)` ("rewritten").
+- `TurnScan { prompt_seen: bool, end: Option<TurnOutcome>, reply: Option<String>, reply_more: usize, later_prompt:
+  bool }` (`TurnOutcome` = the existing enum of `status::last_turn`; `Error(Some(msg))` carries the error text).
+- The turn's user entry = the first user message after `from` whose trimmed text equals the trimmed `prompt`; if none
+  matches, the first user message after `from` (slash commands, transformed prompts). The turn's end = an assistant
+  message after that entry, before the next user message, whose stop reason is terminal (anything but `toolUse`;
+  error/aborted carry their message). `reply` = text of the last assistant message with text in that span, capped at
+  32 KiB chars (`reply_more` = cut count). `later_prompt` = a user message exists after the turn's entry.
+
+### Config / Settings
+- `AgentTools` gains `send_prompt: bool`, `wait_session: bool` (default true; `#[serde(default)]` keeps old configs);
+  `env_value()` short names `send_prompt`, `wait_session` (after `sessions`); extension `TOOL_NAMES` in the same order.
+- Settings → General "Agent tools": two more toggles ("Send prompts to sessions it opened", "Wait for a session's
+  reply"). `ompdeck_sessions` rows show `handle: s-…` for the caller's children. Phone: unchanged.
+- Tool descriptions (extension): open_session mentions the handle; send_prompt "Send a prompt to a session you opened
+  with ompdeck_open_session (by its handle). mode send needs the session idle; follow_up queues after the current turn;
+  steer interrupts it."; wait_session "Wait until a session you opened finishes the turn of the last prompt you gave it
+  (default 600 s, max 3600) and return its final reply. Returns early if it needs the user's attention or exits."
+
+### As built (send/wait)
+- deck-core: `status::{TurnWatch, TurnScan}` in `status/turn.rs`; `CtlClient::tools() -> Vec<String>` (the `hello`'s
+  tool names, cleared on reset like `features()`) gates the handle text on the opener's enabled tools.
+- deck-service: registry in `gateway/engine/agent_tools/children.rs`. Headless reattach of a tab-less child waits for
+  the restored program metadata before admitting Compose. `controller::compose_job` no longer requires bracketed paste
+  for a plain **Send** without attachments when the program supports TSP `send` (atomic native send; a restored TSP
+  session may lack the terminal mode); steer, follow-up, attachments and terminal-mode compose still require it.
+- Handle validity uses the child's **live** conversation (ctl snapshot `session_file` overrides the controller's cached
+  path; snapshot interest is pinned while a tool needs it); a mismatch invalidates the handle for good.
+- Completion: `TurnWatch::matched_exactly()` — `later_prompt` may end a wait early only for an exact prompt match; any
+  idle completion needs a scan started after idle was observed (short turns, stale fallback scans).
+- Tool-initiated headless attachments are owned by the operations targeting the child, by tool requests the child itself
+  issued, and by their queued `ToolResult` acks; abandoned queued/in-flight attaches are dropped; an unowned controller
+  keeps ticking until `can_close()` (a started injection finishes) and is then detached (omp keeps running), never
+  written to the managed-session manifest unless a frontend adopted it.
+- Controller injections of every kind (`Requires::Any` included, e.g. device `action rename`) stay queued until the
+  initial TSP readiness above, for at most 30 s per request from enqueue; on expiry they settle without writing a byte
+  (`Refused(DialogOpen)` when an initial screen/dialog is shown, else `Stalled`). Non-TSP terminals are unaffected.
+- Gate: `deck-service/tests/agent_tools_live.rs` drives every tool from a real omp turn (scripted model calls): open with
+  prompt → wait → send → wait → busy follow-up → draft refusal → close the child's controller → headless send → re-wait
+  → stale handle after the child is killed.
+
+## Background wait_session (user, 2026-11-12)
+
+User asked for a non-blocking `ompdeck_wait_session`: the orchestrator keeps working and is told when the child's turn
+ends. omp's AsyncJobManager is not reachable from extension tools (jobs are `bash|task|eval` only); delivery uses the
+extension API `pi.sendMessage(msg, { deliverAs: "aside", triggerTurn: true })` (installed 18.19.0 has the `aside`
+path): injected at the next step boundary without interrupting the in-flight tool batch, starts a turn when idle.
+
+### Tool
+- `ompdeck_wait_session` gains `background?: boolean` (default false). With `background: true`, `timeout_seconds` is
+  optional with no default (no timeout), max 86400.
+- If the turn of `last` has already ended (or there is no `last`), the tool answers at once with the normal blocking
+  result. Otherwise it answers at once: "Watching <title> (s-…) in the background; its result will arrive as a message."
+- The watch is bound to the `last` baseline at the time of the call (a later `send_prompt` does not move it). One watch
+  per handle; a new background call replaces the previous watch (no message for the replaced one). A blocking wait on the
+  same handle is independent. ≤ 8 background watches per opener (else `ok:false` "Too many background waits").
+- Fires once with the same text the blocking form would return (finished/error/aborted + reply ≤ 32 KiB, needs
+  attention, exited, timeout), titled "Background wait: <title> (s-…)". A handle that becomes invalid before the turn
+  ends (child exited / switched conversation) fires once with that status text.
+- Dropped (no message) when the opener's session ends (its process exits or its conversation switches away from
+  `opener_root`) or the gateway restarts.
+
+### ctl: `deliver` op (deck-core)
+- Client op `{"t":"deliver","root":str,"title":str ≤ 200,"text":str ≤ 40 KiB,"details"?:obj}` on the existing
+  request/reply framing; accepted only from a connection subscribed with `tools:true` (else `ok:false` "not a tools
+  client"). `root` = the opener's `opener_root`; immediately before injecting, the extension applies the same
+  `sameRoot` check its tool requests use against the main session's current root file, and on mismatch replies
+  `ok:false` with `code:"root_mismatch"` without injecting (the gateway then drops the result: the opener switched away).
+  The extension calls the **main** session's `api.sendMessage({ customType: "ompdeck-wait", content: "<title>\n\n<text>",
+  display: true, details: { title, ...details } }, { deliverAs: "aside", triggerTurn: true })` and replies `{ok:true}`;
+  a throw → `ok:false` with the message. Rust: `CtlCommand::Deliver { root: PathBuf, title: String, text: String,
+  details: Option<serde_json::Value> }`; `hello.features` gains `"deliver"`.
+
+### Gateway (deck-service)
+- Watches live in the children registry (`ChildSession.background: Option<BackgroundWatch>`), reuse the blocking
+  completion logic (TurnWatch on a worker ≤ every 500 ms, fresh-scan rule, attention/exit/timeout), and are not pending
+  tool requests (the ≤ 4 pending cap and tool cancel don't apply; Stop on the call that registered it is moot since it
+  already returned).
+- Delivery: `CtlCommand::Deliver` on the opener's live ctl link (the managed session whose current conversation is
+  `opener_root`, features ⊇ `deliver`). No such link right now → the result is held (gateway memory) and delivered when
+  one appears; dropped when the opener's session ends as above. `ok:false` → logged, dropped. A headless child attachment
+  is retained while a background watch needs it (same ownership rules as blocking waits).
+- `ompdeck_sessions` rows of the caller's children show "background wait pending" while a watch is armed.
+- A direct-PTY opener (no mux name) whose controller is gone has ended: its watches are dropped.
+
+### Not changed
+- No new Settings toggle (covered by `wait_session`), no GUI or phone change; omp renders the custom message itself.

@@ -30,9 +30,9 @@ use std::thread::JoinHandle;
 
 use deck_core::backup::Destination;
 use deck_core::config::{
-    AppConfig, Density, FolderTabs, GatewayMode, NotifyConfig, ParkedBranch, RemovedWorktree,
-    SessionView, SplitState, SyncInterval, SyncRow, TabState, Theme, UiFont, UiStyle,
-    WindowGeometry, clamp_ui_scale, config_dir, parse_config,
+    AgentTools, AppConfig, Density, FolderTabs, GatewayMode, NotifyConfig, ParkedBranch,
+    RemovedWorktree, SessionView, SplitState, SyncInterval, SyncRow, TabState, Theme, UiFont,
+    UiStyle, WindowGeometry, clamp_ui_scale, config_dir, parse_config,
 };
 use deck_core::mux::BackendChoice;
 use serde::{Deserialize, Serialize};
@@ -297,6 +297,7 @@ settings! {
     RemovedWorktrees(removed_worktrees: BTreeMap<PathBuf, RemovedWorktree>) = Device,
     ParkedBranches(parked_branches: Vec<ParkedBranch>) = Device,
     Notify(notify: NotifyConfig) = Shared,
+    AgentTools(agent_tools: AgentTools) = Shared,
     CheckAppUpdates(check_app_updates: bool) = Shared,
     SkippedAppVersion(skipped_app_version: Option<String>) = Shared,
     PaletteRecent(palette_recent: Vec<String>) = Device,

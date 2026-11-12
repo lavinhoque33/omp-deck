@@ -18,6 +18,9 @@ use std::time::{Duration, Instant, SystemTime};
 use memchr::{memchr, memmem};
 use serde::Deserialize;
 
+mod turn;
+pub use turn::{TurnScan, TurnWatch};
+
 use crate::agents::tail;
 use crate::mux::Mux;
 use crate::platform::{self, FileId};
@@ -511,10 +514,7 @@ fn context_tokens(msg: &Message, u: &Usage) -> u64 {
 fn assistant_text(msg: &Message) -> Option<String> {
     let mut out = String::new();
     for part in msg.content.iter().flatten() {
-        if part.kind.as_deref() != Some("text") {
-            continue;
-        }
-        let Some(t) = part.text.as_deref().filter(|t| !t.is_empty()) else {
+        let Some(t) = part.text_part() else {
             continue;
         };
         if !out.is_empty() {
@@ -693,6 +693,15 @@ struct Part<'a> {
     text: Option<std::borrow::Cow<'a, str>>,
 }
 
+impl Part<'_> {
+    fn text_part(&self) -> Option<&str> {
+        if self.kind.as_deref() != Some("text") {
+            return None;
+        }
+        self.text.as_deref().filter(|text| !text.is_empty())
+    }
+}
+
 #[derive(Deserialize)]
 struct ContextSnapshot {
     #[serde(rename = "promptTokens")]
@@ -760,17 +769,7 @@ pub fn last_turn(path: &Path) -> LastTurn {
         if msg.role.as_deref() != Some("assistant") {
             continue;
         }
-        let outcome = match msg.stop_reason.as_deref() {
-            Some("error") => TurnOutcome::Error(
-                msg.error_message
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .map(|m| m.chars().take(MAX_ERROR_CHARS).collect()),
-            ),
-            Some("aborted") => TurnOutcome::Aborted,
-            _ => TurnOutcome::Completed,
-        };
+        let outcome = turn_outcome(msg.stop_reason.as_deref(), msg.error_message.as_deref());
         // The reply's finish time: `message.timestamp` is when the request started.
         let assistant_at = msg
             .completed_at
@@ -788,6 +787,19 @@ pub fn last_turn(path: &Path) -> LastTurn {
         };
     }
     unknown
+}
+
+fn turn_outcome(reason: Option<&str>, error: Option<&str>) -> TurnOutcome {
+    match reason {
+        Some("error") => TurnOutcome::Error(
+            error
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(|m| m.chars().take(MAX_ERROR_CHARS).collect()),
+        ),
+        Some("aborted") => TurnOutcome::Aborted,
+        _ => TurnOutcome::Completed,
+    }
 }
 
 /// The last [`TAIL_WINDOW`] bytes of `path`, starting at a line boundary: when the window does not

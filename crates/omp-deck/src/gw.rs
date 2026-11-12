@@ -31,8 +31,8 @@ use deck_service::gateway::client::{
 };
 use deck_service::gateway::protocol::{
     Accepted, Answer, AppUpdateView, BackupView, ClientState, ControllerInfo, Done, GatewayError,
-    GatewayStatus, InboxView, MobileView, ModelFactsView, Mutation, OmpUpdateView, Outcome,
-    Permissions, Progress, Query, SecretText, Topic, TopicValue, UsageView, ViewRole,
+    GatewayStatus, InboxView, MobileView, ModelFactsView, Mutation, OmpAccountsView, OmpUpdateView,
+    Outcome, Permissions, Progress, Query, SecretText, Topic, TopicValue, UsageView, ViewRole,
 };
 use deck_service::gateway::running::RunningSnapshot;
 
@@ -119,6 +119,7 @@ pub struct Gw {
     link: Link,
     fleet_cache: RefCell<(u64, Option<Arc<FleetSnapshot>>)>,
     agents_cache: RefCell<(u64, Option<Arc<AgentsSnapshot>>)>,
+    accounts_cache: RefCell<(u64, Option<Arc<OmpAccountsView>>)>,
     settings: RemoteSettings,
 }
 
@@ -139,6 +140,7 @@ impl Gw {
             relookup: false,
             fleet_cache: RefCell::new((u64::MAX, None)),
             agents_cache: RefCell::new((u64::MAX, None)),
+            accounts_cache: RefCell::new((u64::MAX, None)),
             settings,
         }
     }
@@ -534,6 +536,12 @@ impl Gw {
         self.client.observe_model(target, facts);
     }
 
+    /// Answers the prompt (or the paste field) `seq` of the login `job`. Never journaled, logged
+    /// or restored after a reconnect; a stale job or seq is ignored by the gateway.
+    pub fn login_answer(&self, job: u64, seq: u64, value: SecretText) {
+        self.client.login_answer(job, seq, value);
+    }
+
     pub fn subscribe(&self, t: Topic) {
         self.client.subscribe(t);
     }
@@ -661,6 +669,21 @@ impl Gw {
                 .get()
                 .and_then(|a| (*a).clone().map(Arc::new));
             *c = (rev, snap);
+        }
+        c.1.clone()
+    }
+
+    /// omp's providers, stored accounts and the login in progress ([`Topic::OmpAccounts`],
+    /// pushed while subscribed; unwrapped once per gateway revision).
+    pub fn accounts(&self) -> Option<Arc<OmpAccountsView>> {
+        let rev = self.revision(&Topic::OmpAccounts);
+        let mut c = self.accounts_cache.borrow_mut();
+        if c.0 != rev {
+            let view = match self.client.state().topic(&Topic::OmpAccounts) {
+                Some(TopicValue::OmpAccounts(v)) => Some(Arc::new(v)),
+                _ => None,
+            };
+            *c = (rev, view);
         }
         c.1.clone()
     }

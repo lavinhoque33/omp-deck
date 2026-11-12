@@ -3008,6 +3008,15 @@ mod tests {
             ("/hub now", None),
             ("/agents", None),
             ("/jobs", None),
+            ("/login", Some(Redirect::Login { provider: None })),
+            (
+                "/login anthropic",
+                Some(Redirect::Login {
+                    provider: Some("anthropic".into()),
+                }),
+            ),
+            ("/logout", Some(Redirect::Logout)),
+            ("/logout vllm", None),
         ];
         for (i, (text, want)) in cases.into_iter().enumerate() {
             let mut h = ready(&format!("rd-arg{i}"), "typed-usage", &[composer_text(text)]);
@@ -3251,6 +3260,43 @@ mod tests {
                     "{name}: omp's sheet is omp's"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn omps_login_and_logout_pickers_are_caught_before_they_are_drawn() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("login-fixtures.json")).expect("login fixtures");
+        for (name, want, painted) in [
+            (
+                "login-picker",
+                Redirect::Login { provider: None },
+                "Pick a provider",
+            ),
+            (
+                "logout-picker",
+                Redirect::Logout,
+                "Remove stored credentials",
+            ),
+        ] {
+            let mut h = Harness::redirect_case(
+                &format!("rd-{name}"),
+                "idle",
+                std::slice::from_ref(&fixtures[name]),
+            );
+            h.focus();
+            let out = h.settle();
+            assert_eq!(h.redirects, [want], "{name}");
+            assert!(
+                text_at(&out, painted).is_empty(),
+                "{name}: omp's picker was drawn"
+            );
+            assert!(
+                escapes(&mut h, 1) >= 1,
+                "{name}: omp was not asked to close it"
+            );
+            h.frame(vec![]);
+            assert_eq!(h.redirects.len(), 1, "{name}: redirected again");
         }
     }
 
