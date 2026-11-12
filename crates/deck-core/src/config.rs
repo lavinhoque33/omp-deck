@@ -212,6 +212,7 @@ pub struct AgentTools {
     pub sessions: bool,
     pub send_prompt: bool,
     pub wait_session: bool,
+    pub answer_question: bool,
 }
 
 impl Default for AgentTools {
@@ -224,6 +225,7 @@ impl Default for AgentTools {
             sessions: true,
             send_prompt: true,
             wait_session: true,
+            answer_question: true,
         }
     }
 }
@@ -240,6 +242,7 @@ impl AgentTools {
             (self.sessions, "sessions"),
             (self.send_prompt, "send_prompt"),
             (self.wait_session, "wait_session"),
+            (self.answer_question, "answer_question"),
         ] {
             if enabled {
                 if !value.is_empty() {
@@ -1278,16 +1281,18 @@ mod tests {
         assert_eq!(
             old.agent_tools.env_value().as_deref(),
             Some(
-                "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session"
+                "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question"
             )
         );
         let partial = load_str(r#"{"agent_tools":{"notify":false}}"#);
         assert_eq!(
             partial.agent_tools.env_value().as_deref(),
-            Some("open_session,show_changes,request_review,sessions,send_prompt,wait_session")
+            Some(
+                "open_session,show_changes,request_review,sessions,send_prompt,wait_session,answer_question"
+            )
         );
         let disabled = load_str(
-            r#"{"notify":{"agent_messages":false},"agent_tools":{"open_session":false,"notify":false,"show_changes":false,"request_review":false,"sessions":false,"send_prompt":false,"wait_session":false}}"#,
+            r#"{"notify":{"agent_messages":false},"agent_tools":{"open_session":false,"notify":false,"show_changes":false,"request_review":false,"sessions":false,"send_prompt":false,"wait_session":false,"answer_question":false}}"#,
         );
         assert_eq!(disabled.agent_tools.env_value(), None);
         assert!(!disabled.notify.agent_messages);

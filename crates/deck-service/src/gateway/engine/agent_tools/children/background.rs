@@ -60,6 +60,7 @@ enum WatchState {
 impl BackgroundWatch {
     fn new(id: u64, title: String, mut waiter: Box<Waiter>) -> Self {
         waiter.background = false;
+        waiter.background_watch = true;
         Self {
             id,
             title,
@@ -184,17 +185,26 @@ impl Engine {
     pub(in crate::gateway::engine) fn drop_background_waits(&mut self) {
         for child in self.agent_tools.children.entries.values_mut() {
             child.background = None;
+            child.forward_questions = false;
+            child.questions.stop();
         }
+        self.agent_tools.children.answers.clear();
         self.agent_tools.background_acks.clear();
     }
 
     pub(in crate::gateway::engine) fn drop_background_opener(&mut self, key: &SessionKey) {
+        for child in self.agent_tools.children.entries.values_mut() {
+            if &child.opener.key == key {
+                child.forward_questions = false;
+                child.questions.stop();
+            }
+        }
         for child in self.agent_tools.children.drop_background_opener(key) {
             self.release_idle_child_attachment(&child);
         }
     }
 
-    fn background_opener_ended(&self, child: &ChildSession) -> bool {
+    pub(super) fn background_opener_ended(&self, child: &ChildSession) -> bool {
         if let Some(i) = self.sess.find(&child.opener.key) {
             let session = &self.sess.managed[i];
             if session.exited() {
@@ -212,8 +222,10 @@ impl Engine {
                     true,
                 );
             }
-            self.with_current_child_file(i, |file| {
-                conversation_ended(&child.opener_root, file, false)
+            self.with_current_child_file(None, i, |file| {
+                file.map_or(true, |file| {
+                    conversation_ended(&child.opener_root, file, false)
+                })
             })
         } else {
             child
@@ -222,7 +234,7 @@ impl Engine {
         }
     }
 
-    fn background_delivery_target(&self, root: &Path) -> Option<usize> {
+    pub(super) fn background_delivery_target(&self, root: &Path) -> Option<usize> {
         self.sess
             .managed
             .iter()
@@ -238,11 +250,25 @@ impl Engine {
                                 .any(|feature| feature == "deliver")
                     });
                 (eligible
-                    && self.with_current_child_file(i, |file| {
-                        file.is_some_and(|file| canonical(file) == root)
+                    && self.with_current_child_file(None, i, |file| {
+                        file.is_ok_and(|file| file.is_some_and(|file| canonical(file) == root))
                     }))
                 .then_some(i)
             })
+    }
+
+    pub(super) fn deliver_child_message(&mut self, index: usize, command: CtlCommand) {
+        let session = &self.sess.managed[index];
+        let target = session.ctl.target().clone();
+        let rid = session
+            .live
+            .as_ref()
+            .expect("eligible live link")
+            .client
+            .send(command);
+        // Uncertain delivery is final: retain the issuer through the ACK, never retry.
+        self.agent_tools.reply_acks.push((target.clone(), rid));
+        self.agent_tools.background_acks.push((target, rid));
     }
 
     pub(super) fn step_background_waits(&mut self, now: Instant) {
@@ -310,18 +336,7 @@ impl Engine {
             if let Some(index) = self.background_delivery_target(root)
                 && let Some(command) = watch.take_command(&handle, root, true)
             {
-                let session = &self.sess.managed[index];
-                let target = session.ctl.target().clone();
-                let rid = session
-                    .live
-                    .as_ref()
-                    .expect("eligible live link")
-                    .client
-                    .send(command);
-                // Sending transfers ownership to its ACK, not to a retryable result. A lost
-                // connection is an uncertain delivery and must never duplicate the aside.
-                self.agent_tools.reply_acks.push((target.clone(), rid));
-                self.agent_tools.background_acks.push((target, rid));
+                self.deliver_child_message(index, command);
             } else {
                 self.agent_tools
                     .children

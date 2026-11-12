@@ -858,6 +858,7 @@ fn pending_ui_hook_and_answer_round_trip() {
         id: 5,
         value: serde_json::json!({"kind": "submit", "results": []}),
         root: "/s/main.jsonl".into(),
+        pid: None,
     });
     let mut rd = BufReader::new(s.try_clone().unwrap());
     let mut l = String::new();
@@ -868,6 +869,7 @@ fn pending_ui_hook_and_answer_round_trip() {
     assert_eq!(got["id"], 5);
     assert_eq!(got["value"]["kind"], "submit");
     assert_eq!(got["root"], "/s/main.jsonl");
+    assert!(got.get("pid").is_none());
     say(
         &mut s,
         &format!(r#"{{"t":"reply","rid":{rid},"ok":false,"error":"no such request"}}"#),

@@ -126,10 +126,10 @@ struct HostRx {
 }
 
 impl HostRx {
-    /// Waits briefly for the terminal's first grid size, then attaches (starting the daemon
-    /// when needed). `None`: the terminal was detached before the connection was made.
+    /// Waits briefly for the terminal's first grid size, then establishes the accepted backend.
+    /// A tab closed before connecting creates only a detached backend, never a controller.
     fn connect(&mut self) -> Option<Result<AttachedRx, deck_host::Error>> {
-        let (grid, palette) = {
+        let (grid, palette, request) = {
             let mut phase = self.link.lock();
             if last_grid().is_none() {
                 phase = self
@@ -149,15 +149,15 @@ impl HostRx {
                     .0;
             }
             match &*phase {
-                Phase::Connecting {
-                    request: Request::Detach,
-                    ..
-                }
-                | Phase::Dead => {
+                Phase::Dead => {
                     *phase = Phase::Dead;
                     return None;
                 }
-                Phase::Connecting { grid, palette, .. } => (*grid, *palette),
+                Phase::Connecting {
+                    grid,
+                    palette,
+                    request,
+                } => (*grid, *palette, *request),
                 Phase::Ready(_) => return None,
             }
         };
@@ -170,6 +170,32 @@ impl HostRx {
             history_lines: HISTORY_LINES,
             palette: palette.unwrap_or_default(),
         };
+        if request == Request::Detach {
+            // A reopened tab may already control this session. Even a momentary attach would
+            // displace it, so preserve an accepted launch using the creation-only API.
+            let result = deck_host::start(
+                &self.ns,
+                &self.spec,
+                if params.cols == 0 { 80 } else { params.cols },
+                if params.rows == 0 { 24 } else { params.rows },
+            );
+            let mut phase = self.link.lock();
+            if matches!(
+                &*phase,
+                Phase::Connecting {
+                    request: Request::Kill,
+                    ..
+                }
+            ) {
+                let _ = self.ns.kill(&self.spec.name);
+            }
+            *phase = Phase::Dead;
+            self.link.changed.notify_all();
+            return match result {
+                Ok(()) | Err(deck_host::Error::AlreadyRunning(_)) => None,
+                Err(e) => Some(Err(e)),
+            };
+        }
         let attached = match create_or_attach(&self.ns, &self.spec, params.clone()) {
             Ok(attached) => attached,
             Err(e) => {
@@ -190,6 +216,9 @@ impl HostRx {
         };
         match request {
             Request::Detach => {
+                // Cancellation after create_or_attach began cannot prevent displacement:
+                // deck-host has no cancellable attach API. Release the controller immediately
+                // rather than keeping a hidden terminal alive.
                 *phase = Phase::Dead;
                 self.link.changed.notify_all();
                 let _ = tx.detach();
@@ -484,7 +513,9 @@ impl ObserverTx for HostObserverTx {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
     #[cfg(unix)]
     use std::process::Command;
     #[cfg(unix)]
@@ -494,6 +525,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     fn spec(name: &str) -> SessionSpec {
         SessionSpec {
             name: name.to_owned(),
@@ -506,6 +538,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn test_ns(tag: &str) -> Namespace {
         Namespace::new(&format!("omp-deck-test-ui{}-{tag}", std::process::id())).expect("ns")
     }
@@ -519,9 +552,36 @@ mod tests {
         assert!(text.ends_with("Host log: /l/x.log\r\n"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn detaching_before_the_connection_ends_the_stream_without_attaching() {
-        let remote = HostRemote::new(test_ns("early"), spec("omp-early"));
+    fn detaching_before_connection_creates_the_accepted_session_then_ends_the_stream() {
+        let Some(exe) = host_exe() else {
+            return;
+        };
+        // Isolate executable discovery from the parallel unit suite's process environment.
+        if std::env::var_os("OMPDECK_EARLY_DETACH_TEST_CHILD").is_none() {
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", "host_remote::tests::detaching_before_connection_creates_the_accepted_session_then_ends_the_stream", "--nocapture"])
+                .env("OMPDECK_EARLY_DETACH_TEST_CHILD", "1")
+                .env(deck_host::HOST_EXE_ENV, exe)
+                .output().expect("isolated early-detach test");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let ns = test_ns("early");
+        struct Cleanup(Namespace);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.kill("omp-early");
+            }
+        }
+        let _cleanup = Cleanup(ns.clone());
+        let remote = HostRemote::new(ns.clone(), spec("omp-early"));
         let (mut rx, tx) = Box::new(remote).split();
         tx.resize(100, 30, 8, 16).unwrap();
         tx.detach().unwrap();
@@ -531,6 +591,48 @@ mod tests {
         );
         assert_eq!(rx.recv().unwrap(), RemoteEvent::Closed);
         assert!(tx.input(b"x").is_err(), "input after detach fails");
+        assert!(
+            ns.has("omp-early"),
+            "an accepted backend survives an immediate tab close"
+        );
+
+        // Reopen the surviving backend, then let a cancelled lazy reader connect.
+        // The cancelled reader must not steal this new controlling attachment.
+        let (mut active_rx, active_tx) =
+            Box::new(HostRemote::new(ns.clone(), spec("omp-early"))).split();
+        active_tx.resize(100, 30, 8, 16).unwrap();
+        assert!(
+            recv_until(&mut *active_rx, |e| matches!(e, RemoteEvent::Snapshot(_))).is_some(),
+            "the reopened tab controls the surviving backend"
+        );
+        let (mut cancelled_rx, cancelled_tx) =
+            Box::new(HostRemote::new(ns.clone(), spec("omp-early"))).split();
+        drop(cancelled_tx);
+        assert!(matches!(
+            cancelled_rx.recv().unwrap(),
+            RemoteEvent::Output(_)
+        ));
+        assert_eq!(cancelled_rx.recv().unwrap(), RemoteEvent::Closed);
+
+        active_tx.input(b"still-controlled-after-reopen\n").unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let echoed = recv_until(&mut *active_rx, |e| {
+                matches!(e, RemoteEvent::Output(bytes)
+                    if String::from_utf8_lossy(bytes).contains("still-controlled-after-reopen"))
+            });
+            let _ = done_tx.send(echoed);
+        });
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("the active controller still receives output")
+                .is_some(),
+            "a cancelled lazy reader must not displace the reopened controller"
+        );
+        reader.join().unwrap();
+        active_tx.detach().unwrap();
+        assert!(ns.has("omp-early"), "the backend still survives detach");
     }
 
     /// `omp-deck-host` next to the test binaries, when the workspace build produced it.

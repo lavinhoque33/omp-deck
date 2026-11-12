@@ -436,6 +436,82 @@ fn ask_script(request: &Value) -> Reply {
 }
 
 #[test]
+fn ui_answers_are_fenced_to_the_omp_process_incarnation() {
+    let Some(live) = Live::start("ask-pid", ask_script, |_| {}, |_| None) else {
+        eprintln!("skipping: OMPDECK_TEST_OMP is not set");
+        return;
+    };
+    live.send("ASKME");
+    let snapshot = wait_for("the pending ask dialog", TURN, || {
+        live.client()
+            .latest()
+            .filter(|snapshot| !snapshot.pending_ui.is_empty())
+    });
+    assert!(live.client().ui_hook());
+    let id = snapshot.pending_ui[0].id;
+    let root = snapshot
+        .session_file
+        .clone()
+        .expect("the ask's conversation root");
+    let before = live.model.count();
+    let refused = live.ctl(
+        CtlCommand::AnswerUi {
+            id,
+            value: json!({"fields":[{"checked":[0],"other":null}]}),
+            root: root.clone(),
+            pid: Some(snapshot.pid.wrapping_add(1)),
+        },
+        TURN,
+    );
+    assert!(!refused.ok, "{refused:?}");
+    assert_eq!(refused.error.as_deref(), Some("no such request"));
+    assert!(
+        live.client()
+            .latest()
+            .unwrap()
+            .pending_ui
+            .iter()
+            .any(|pending| pending.id == id)
+    );
+    assert!(
+        live.entries()
+            .iter()
+            .all(|entry| entry["message"]["toolName"] != "ask"),
+        "the stale process answer must leave the ask unresolved"
+    );
+
+    let accepted = live.ctl(
+        CtlCommand::AnswerUi {
+            id,
+            value: json!({"fields":[{"checked":[1],"other":null}]}),
+            root,
+            pid: Some(snapshot.pid),
+        },
+        TURN,
+    );
+    assert!(accepted.ok, "{accepted:?}");
+    wait_for(
+        "the correct process answer in the next model step",
+        TURN,
+        || {
+            live.model.find(before, |request| {
+                fm::has_tools(request)
+                    && fm::after_last_user(request).iter().any(|message| {
+                        fm::role(message) == "tool"
+                            && fm::text(message).contains("beta")
+                            && !fm::text(message).contains("alpha")
+                    })
+            })
+        },
+    );
+    wait_for("the answered dialog to close", TURN, || {
+        live.client()
+            .latest()
+            .filter(|snapshot| snapshot.pending_ui.iter().all(|pending| pending.id != id))
+    });
+}
+
+#[test]
 fn reanswering_an_ask_opens_omps_dialog_and_resumes_the_turn() {
     let Some(live) = Live::start("ask", ask_script, |_| {}, |_| None) else {
         eprintln!("skipping: OMPDECK_TEST_OMP is not set");

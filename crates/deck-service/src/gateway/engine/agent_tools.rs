@@ -34,6 +34,7 @@ struct Pending {
     answering: bool,
     opens_session: bool,
     open_prompt: Option<String>,
+    forward_questions: bool,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +44,11 @@ struct OpenArgs {
     model: Option<String>,
     placement: Option<String>,
     title: Option<String>,
+    #[serde(default = "forward_questions_default")]
+    forward_questions: bool,
+}
+fn forward_questions_default() -> bool {
+    true
 }
 #[derive(Deserialize)]
 struct NotifyArgs {
@@ -264,6 +270,7 @@ impl Engine {
                 answering: false,
                 opens_session: false,
                 open_prompt: None,
+                forward_questions: true,
             },
         );
         let result: Result<Option<ServerEvent>, String> = (|| {
@@ -289,6 +296,7 @@ impl Engine {
                     let pending = self.agent_tools.pending.get_mut(&request).expect("pending");
                     pending.opens_session = true;
                     pending.open_prompt.clone_from(&a.prompt);
+                    pending.forward_questions = a.forward_questions;
                     Some(ServerEvent::AgentOpenSession {
                         request,
                         opener: target.clone(),
@@ -359,6 +367,10 @@ impl Engine {
                 }
                 "send_prompt" | "wait_session" => {
                     self.begin_child_tool(request, &req.name, req.args, now)?;
+                    None
+                }
+                "answer_question" => {
+                    self.begin_answer_question(request, req.args, now)?;
                     None
                 }
                 "sessions" => {
@@ -452,7 +464,7 @@ impl Engine {
         if ok && let Some(opened) = opened {
             match self.register_agent_child(request, &opened) {
                 Ok(Some(handle)) => text.push_str(&format!(
-                    "\nHandle: {handle}: use it with ompdeck_send_prompt and ompdeck_wait_session."
+                    "\nHandle: {handle}: use it with ompdeck_send_prompt and ompdeck_wait_session. Use ompdeck_answer_question to answer forwarded questions."
                 )),
                 Ok(None) => {}
                 Err(error) => {
@@ -732,6 +744,7 @@ mod tests {
                     answering: false,
                     opens_session: false,
                     open_prompt: None,
+                    forward_questions: true,
                 },
             );
         }
@@ -770,5 +783,17 @@ mod tests {
         assert!(!tools.notify_allowed(&target(1), now + Duration::from_secs(9)));
         assert!(tools.notify_allowed(&target(2), now));
         assert!(tools.notify_allowed(&target(1), now + Duration::from_secs(10)));
+    }
+    #[test]
+    fn open_session_forwards_questions_by_default_and_allows_opt_out() {
+        let default: OpenArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(default.forward_questions);
+        let disabled: OpenArgs =
+            serde_json::from_value(serde_json::json!({"forward_questions": false})).unwrap();
+        assert!(!disabled.forward_questions);
+        assert!(
+            serde_json::from_value::<OpenArgs>(serde_json::json!({"forward_questions": "false"}),)
+                .is_err()
+        );
     }
 }

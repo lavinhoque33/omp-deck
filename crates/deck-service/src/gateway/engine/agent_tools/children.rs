@@ -21,6 +21,8 @@ use crate::statusfmt::Activity;
 
 mod background;
 use background::{BackgroundWatch, OpenerSource};
+mod questions;
+use questions::QuestionWatch;
 
 const STALE: &str = "That session has exited or switched conversations; open a new one";
 const UNKNOWN: &str = "Unknown session handle";
@@ -47,6 +49,8 @@ pub(super) struct ChildSession {
     last: Option<Baseline>,
     background: Option<BackgroundWatch>,
     background_call: Option<u64>,
+    forward_questions: bool,
+    questions: QuestionWatch,
     attach: LaunchSpec,
     backend: Option<MuxKind>,
     attaching: bool,
@@ -63,6 +67,7 @@ impl ChildSession {
 #[derive(Default)]
 pub(super) struct Registry {
     entries: HashMap<String, ChildSession>,
+    answers: HashMap<u64, questions::AnswerRequest>,
 }
 impl Registry {
     fn handle(&self, root: &Path, key: &SessionKey) -> Option<&str> {
@@ -201,6 +206,7 @@ pub(super) struct Waiter {
     seconds: Option<u64>,
     baseline: Option<Baseline>,
     background: bool,
+    background_watch: bool,
     status: &'static str,
     next: Instant,
     watch: Option<TurnWatch>,
@@ -244,6 +250,7 @@ impl Waiter {
             until,
             seconds,
             background,
+            background_watch: false,
             status: "invalid",
             fallback: baseline.is_none(),
             baseline,
@@ -317,16 +324,18 @@ pub(super) fn canonical(path: &Path) -> PathBuf {
 }
 fn conversation_file<'a>(
     cached: Option<&'a Path>,
-    live: Option<Option<&'a Path>>,
+    live: [Option<Option<&'a Path>>; 2],
     files: &'a [PathBuf],
-) -> Option<&'a Path> {
-    if let Some(current) = live {
-        return current;
+) -> Result<Option<&'a Path>, ()> {
+    match live {
+        [Some(a), Some(b)] if a != b => return Err(()),
+        [Some(current), _] | [_, Some(current)] => return Ok(current),
+        [None, None] => {}
     }
     if files.is_empty() || cached.is_some_and(|path| files.iter().any(|file| file == path)) {
-        cached
+        Ok(cached)
     } else {
-        files.first().map(PathBuf::as_path)
+        Ok(files.first().map(PathBuf::as_path))
     }
 }
 
@@ -410,6 +419,9 @@ impl super::AgentTools {
             .any(|pending| &pending.target.key == key)
             || self.reply_acks.iter().any(|(target, _)| &target.key == key)
             || self.children.entries.values().any(|child| {
+                child.forward_questions && !child.invalidated && &child.opener.key == key
+            })
+            || self.children.entries.values().any(|child| {
                 child
                     .background
                     .as_ref()
@@ -481,6 +493,8 @@ impl Engine {
                 .map(|prompt| Baseline { offset: 0, prompt }),
             background: None,
             background_call: None,
+            forward_questions: p.forward_questions,
+            questions: QuestionWatch::new(m.ctl_key.clone()),
             attach: LaunchSpec {
                 mux_name: m.mux_name.clone(),
                 cwd: m.current_cwd().to_path_buf(),
@@ -503,7 +517,7 @@ impl Engine {
                 link.client.tools().iter().any(|name| {
                     matches!(
                         name.as_str(),
-                        "ompdeck_send_prompt" | "ompdeck_wait_session"
+                        "ompdeck_send_prompt" | "ompdeck_wait_session" | "ompdeck_answer_question"
                     )
                 })
             });
@@ -512,20 +526,25 @@ impl Engine {
     }
 
     pub(in crate::gateway::engine) fn child_handle_row(&self, row: String, handle: &str) -> String {
-        let pending = self
-            .agent_tools
-            .children
-            .entries
-            .get(handle)
-            .is_some_and(|child| child.background.is_some());
-        format!(
-            "{row} | handle: {handle}{}",
-            if pending {
-                " | background wait pending"
-            } else {
-                ""
+        let child = &self.agent_tools.children.entries[handle];
+        let mut row = format!("{row} | handle: {handle}");
+        if child.background.is_some() {
+            row.push_str(" | background wait pending");
+        }
+        if child.forward_questions && !child.invalidated {
+            row.push_str(" | forwarding questions");
+        }
+        let pending = child.questions.pending_tokens();
+        if !pending.is_empty() {
+            row.push_str(" | pending questions: ");
+            for (i, question) in pending.iter().enumerate() {
+                if i > 0 {
+                    row.push_str(", ");
+                }
+                row.push_str(question);
             }
-        )
+        }
+        row
     }
 
     pub(in crate::gateway::engine) fn child_handle(
@@ -538,7 +557,9 @@ impl Engine {
         let index = self.sess.find(key)?;
         let m = &self.sess.managed[index];
         (!m.exited()
-            && self.with_current_child_file(index, |file| child.matches(m.ctl.target(), file)))
+            && self.with_current_child_file(Some(handle), index, |file| {
+                file.is_ok_and(|file| child.matches(m.ctl.target(), file))
+            }))
         .then_some(handle)
     }
 
@@ -710,27 +731,37 @@ impl Engine {
         Ok(())
     }
 
-    fn with_current_child_file<R>(&self, index: usize, read: impl FnOnce(Option<&Path>) -> R) -> R {
+    fn with_current_child_file<R>(
+        &self,
+        handle: Option<&str>,
+        index: usize,
+        read: impl FnOnce(Result<Option<&Path>, ()>) -> R,
+    ) -> R {
         let m = &self.sess.managed[index];
-        if let Some(snapshot) = m
+        let question = handle.and_then(|handle| self.child_question_snapshot(handle));
+        let managed = m
             .live
             .as_ref()
             .filter(|link| link.client.connected())
-            .and_then(|link| link.client.latest())
-        {
-            return read(conversation_file(
-                m.ctl.session_path(),
-                Some(snapshot.session_file.as_deref()),
-                &[],
-            ));
-        }
+            .and_then(|link| link.client.latest());
         let running = self.running.latest();
         let files = m
             .mux_name
             .as_deref()
             .and_then(|name| running.as_ref().map(|snapshot| snapshot.files_of(name)))
             .unwrap_or_default();
-        read(conversation_file(m.ctl.session_path(), None, files))
+        read(conversation_file(
+            m.ctl.session_path(),
+            [
+                managed
+                    .as_ref()
+                    .map(|snapshot| snapshot.session_file.as_deref()),
+                question
+                    .as_ref()
+                    .map(|snapshot| snapshot.session_file.as_deref()),
+            ],
+            files,
+        ))
     }
 
     fn validate_child_identity(&mut self, handle: &str, index: usize) -> Result<(), String> {
@@ -740,7 +771,8 @@ impl Engine {
             .entries
             .get(handle)
             .ok_or_else(|| UNKNOWN.to_owned())?;
-        let learned = self.with_current_child_file(index, |current| {
+        let learned = self.with_current_child_file(Some(handle), index, |current| {
+            let current = current?;
             if !child.matches(self.sess.managed[index].ctl.target(), current) {
                 return Err(());
             }
@@ -988,6 +1020,7 @@ impl Engine {
     }
 
     pub(in crate::gateway::engine) fn child_operation_finished(&mut self, request: u64) {
+        self.agent_tools.children.answers.remove(&request);
         let Some(operation) = self.agent_tools.operations.remove(&request) else {
             return;
         };
@@ -1057,6 +1090,14 @@ impl Engine {
                         child.background.as_ref().map(|_| child.opener.key.clone())
                     }),
             )
+            .chain(
+                self.agent_tools
+                    .children
+                    .entries
+                    .values()
+                    .filter(|child| child.forward_questions && !child.invalidated)
+                    .map(|child| child.opener.key.clone()),
+            )
     }
     fn step_child_waiter(
         &mut self,
@@ -1087,11 +1128,21 @@ impl Engine {
         if let Err(error) = self.validate_child_identity(&waiter.handle, i) {
             return Some((false, error));
         }
+        if !waiter.background
+            && !waiter.background_watch
+            && let Some(text) = self.take_forwarded_question(&waiter.handle)
+        {
+            waiter.status = "attention";
+            return Some((true, text));
+        }
+        let forwarding_question = self.has_forwardable_question(&waiter.handle);
+        let activity = self.sess.managed[i].ctl.activity();
+        let refreshing_question =
+            self.question_attention_refresh(&waiter.handle, activity == Activity::Attention, now);
         let m = &self.sess.managed[i];
         if waiter.file.is_none() {
             waiter.file = m.ctl.session_path().map(ToOwned::to_owned);
         }
-        let activity = m.ctl.activity();
         let injecting = m.ctl.is_busy();
         waiter
             .freshness
@@ -1131,6 +1182,8 @@ impl Engine {
         } else if activity == Activity::Attention
             && (!waiter.background || waiter.scanned || waiter.baseline.is_none())
             && !(waiter.background && completed)
+            && !forwarding_question
+            && !refreshing_question
         {
             waiter.status = "attention";
             let question = m
@@ -1281,6 +1334,7 @@ impl Engine {
                     .map(ToOwned::to_owned);
             }
         }
+        self.step_child_questions(now);
         let ids: Vec<_> = self.agent_tools.operations.keys().copied().collect();
         for request in ids {
             let Some(mut operation) = self.agent_tools.operations.remove(&request) else {
@@ -1444,6 +1498,7 @@ impl Engine {
             }
         }
         self.step_background_waits(now);
+        self.deliver_child_questions();
         if !self.agent_tools.operations.is_empty() {
             self.wake_within(POLL);
         }
@@ -1469,6 +1524,8 @@ mod tests {
             last: None,
             background: None,
             background_call: None,
+            forward_questions: false,
+            questions: QuestionWatch::new(Some("child".into())),
             attach: LaunchSpec {
                 mux_name: Some("child".into()),
                 cwd: PathBuf::from("."),
@@ -1583,13 +1640,50 @@ mod tests {
         let old = Path::new("old.jsonl");
         let new = Path::new("new.jsonl");
         assert_eq!(
-            conversation_file(Some(old), Some(Some(new)), &[]),
-            Some(new)
+            conversation_file(Some(old), [Some(Some(new)), None], &[]),
+            Ok(Some(new))
         );
-        assert_eq!(conversation_file(Some(old), Some(None), &[]), None);
+        assert_eq!(
+            conversation_file(Some(old), [Some(None), None], &[]),
+            Ok(None)
+        );
         let running = [new.to_path_buf()];
-        assert_eq!(conversation_file(Some(old), None, &running), Some(new));
-        assert_eq!(conversation_file(Some(old), None, &[]), Some(old));
+        assert_eq!(
+            conversation_file(Some(old), [None, None], &running),
+            Ok(Some(new))
+        );
+        assert_eq!(
+            conversation_file(Some(old), [None, None], &[]),
+            Ok(Some(old))
+        );
+    }
+
+    #[test]
+    fn either_live_link_switching_conversation_invalidates_the_child() {
+        let child = child();
+        let old = child.file.as_deref().expect("recorded root");
+        let new = Path::new("new.jsonl");
+        for links in [
+            [Some(Some(new)), Some(Some(old))],
+            [Some(Some(old)), Some(Some(new))],
+            [Some(None), Some(Some(old))],
+            [Some(Some(old)), Some(None)],
+        ] {
+            assert_eq!(conversation_file(Some(old), links, &[]), Err(()));
+        }
+        assert_eq!(
+            conversation_file(Some(old), [Some(Some(old)), Some(Some(old))], &[]),
+            Ok(Some(old))
+        );
+        for links in [[None, Some(Some(new))], [Some(Some(new)), None]] {
+            let current = conversation_file(Some(old), links, &[]).expect("one authoritative link");
+            let target = SessionTarget {
+                epoch: ServiceEpoch::current(),
+                key: child.key.clone(),
+                generation: 9,
+            };
+            assert!(!child.matches(&target, current));
+        }
     }
 
     #[test]
@@ -1728,6 +1822,7 @@ mod tests {
                 answering: false,
                 opens_session: false,
                 open_prompt: None,
+                forward_questions: true,
             },
         );
         assert!(

@@ -2010,6 +2010,7 @@ impl Engine {
                     .iter()
                     .filter_map(|j| j.spec.mux_name.clone()),
             )
+            .chain(self.child_question_ctl_keys())
             .collect();
         self.running.set_ctl_keep(keep);
     }

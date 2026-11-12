@@ -688,10 +688,13 @@ pub enum CtlCommand {
     /// (`input`/`editor`), omp's `{kind:"submit",results:[…]}` (`ask`), or `"once"` / `"session"`
     /// / `"deny"` / `{grant,always}` (`approve`). `null` cancels. Replies `no such request` when
     /// the request is gone (the terminal answered first) or the extension has no UI hook.
+    /// When set, `pid` must match the current omp process or the answer is refused as gone.
     AnswerUi {
         id: u64,
         value: serde_json::Value,
         root: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
     },
     /// Refresh the provider's online catalog after another omp logged in or out.
     RefreshProvider {
@@ -1165,8 +1168,17 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
         CtlCommand::ForkAt { root, entry_id } => {
             serde_json::json!({"rid": rid, "t": "fork_at", "entryId": entry_id, "root": root})
         }
-        CtlCommand::AnswerUi { id, value, root } => {
-            serde_json::json!({"rid": rid, "t": "answer_ui", "id": id, "value": value, "root": root})
+        CtlCommand::AnswerUi {
+            id,
+            value,
+            root,
+            pid,
+        } => {
+            let mut command = serde_json::json!({"rid": rid, "t": "answer_ui", "id": id, "value": value, "root": root});
+            if let Some(pid) = pid {
+                command["pid"] = serde_json::json!(pid);
+            }
+            command
         }
         CtlCommand::Navigate {
             root,
@@ -1757,6 +1769,24 @@ mod tests {
                     details: Some(serde_json::json!({"session":"s-1234abcd"})),
                 },
                 serde_json::json!({"rid":7,"t":"deliver","root":"/s/opener.jsonl","title":"Child","text":"Reply","details":{"session":"s-1234abcd"}}),
+            ),
+            (
+                CtlCommand::AnswerUi {
+                    id: 9,
+                    value: serde_json::json!("once"),
+                    root: "/s/child.jsonl".into(),
+                    pid: None,
+                },
+                serde_json::json!({"rid":7,"t":"answer_ui","id":9,"value":"once","root":"/s/child.jsonl"}),
+            ),
+            (
+                CtlCommand::AnswerUi {
+                    id: 9,
+                    value: serde_json::json!("deny"),
+                    root: "/s/child.jsonl".into(),
+                    pid: Some(42),
+                },
+                serde_json::json!({"rid":7,"t":"answer_ui","id":9,"value":"deny","root":"/s/child.jsonl","pid":42}),
             ),
         ] {
             assert_eq!(

@@ -4805,3 +4805,88 @@ path): injected at the next step boundary without interrupting the in-flight too
 
 ### Not changed
 - No new Settings toggle (covered by `wait_session`), no GUI or phone change; omp renders the custom message itself.
+
+## Forwarded child questions (user, 2026-11-12)
+
+User: a child session's questions should reach the parent orchestrator (opt-out parameter) so the parent can answer
+them when the user asks it to. User picked: approvals are forwarded too, but the parent may only **Approve once** or
+**Deny** (never "for this session"/"always" grants).
+
+### Facts (omp source + installed 18.19.0, scout 2026-11-12)
+- Subagents run headless (`hasUI: false`, `task/executor.ts:4611–4665`): `ask` is not in their toolset
+  (`tools/ask.ts:580`), approval-required calls fail without an interactive runner (`wrapper.ts:422–439`). So the
+  child's **main** session is the only asker; its `ctx.ui` calls are already the ctl `pendingUi` entries (ask/form,
+  select, confirm, input, editor, approve). omp's own TUI screens (`/login` prompts, plan-mode exit confirm) are not
+  `ctx.ui` calls and are not forwarded.
+- 18.19.0's `ask` uses `formDialog(html)` (kind `form`); older omp uses `askDialog` (kind `ask`). Approvals use
+  `ui.approve({full, compact, session?, grants?})` (kind `approve`); answers `"once" | "session" | "deny" | {grant, always}`.
+- Answers already go through `ui_answer::value_for` + `CtlCommand::AnswerUi { id, value, root }` (first answer wins
+  against the child's terminal and the phone; `"no such request"` = answered elsewhere / gone; `"session changed"`).
+- **Atomic incarnation fence (deck-core):** `CtlCommand::AnswerUi` gains `pid: Option<u32>` (JSON `"pid"`, omitted when
+  None). The extension's `answer_ui` handler replies `{ok:false, error:"no such request"}` without resolving anything
+  when `cmd.pid` is present and `!== process.pid` (checked with the root check, before the pending lookup). The gateway
+  always sends the token's pid for agent answers (the phone path may keep None).
+
+### Tools
+- `ompdeck_open_session` gains `forward_questions?: boolean` (default **true**). Stored on the child
+  (`ChildSession.forward_questions`); forwarding stops when the handle becomes invalid.
+- New tool **`ompdeck_answer_question`** (approval tier `exec`, main agent only, own toggle): `{ session: handle,
+  question: string (the id from the forwarded text), choice?: string, choices?: string[], yes?: boolean, text?: string,
+  decision?: "once" | "deny", fields?: [{ choices?: string[], text?: string }] }`. Same ownership rule as send_prompt
+  (opener root must equal the handle's `opener_root`). The gateway validates against the question's current kind:
+  select → `choice` (`choices` when multi); confirm → `yes`; input/editor → `text`; ask/form → `fields` in the listed
+  order (choice fields: `choices` by option label; text fields: `text`; "other" text allowed where the field allows
+  it); approve → `decision` (anything else, incl. session/always grants, is refused). An option may be named by its
+  exact label (trimmed, case-insensitive) or its listed 1-based number. Results: "Answered." / "That question was
+  already answered or is gone." / a refusal naming the expected shape. Form answers that omp's `fieldError` rejects
+  return that error (the question stays pending).
+- Extension-side validation like the other tools (`question` 1..32 bytes, strings ≤ 16 KiB, ≤ 40 fields/choices).
+
+### Forwarding (deck-service)
+- For every valid child with `forward_questions`, the gateway watches the child's live ctl snapshot `pending_ui`
+  (needs `ui_hook`), whether or not the child has a tab, and whether or not a wait is active. A tab-less child keeps
+  a gateway ctl link (not a terminal controller) while forwarding is on.
+- Each pending question is forwarded **once** per child conversation as a `CtlCommand::Deliver` to the opener
+  (same opener resolution, root fence, hold-until-reachable and drop rules as background waits). A held question that
+  is no longer pending when the opener becomes reachable is dropped.
+- The `question` token is gateway-assigned and opaque, bound to (child conversation root, the child's omp process
+  incarnation = the ctl `pid` (hello and every snapshot carry `process.pid`; `LiveSnapshot.pid`), pending ui id). The
+  extension's ids restart per process (they survive ctl reconnects and extension reloads: `globalThis.__ompdeckUi`), so
+  dedupe and answers key on that triple; a token from an earlier incarnation is refused as gone (never matched to a new
+  question with the same numeric id). A ctl reconnect to the same process neither re-forwards nor invalidates a question.
+- Handle identity: the handle is invalid when **any** connected live snapshot of the child (managed controller link or
+  the question link) reports a conversation file other than the recorded one.
+- Message: title `Question from <title> (s-…)`; text renders the question for a model: kind, title/message, numbered
+  options (recommended marked, multi stated), numbered form fields with their type and options, the approval's
+  `compact` text with "allowed decisions: once, deny"; then `question: "<id>"` and the instruction: "The user can
+  also answer it in that session; the first answer wins. Answer with ompdeck_answer_question only if the user asked
+  you to answer this session's questions; otherwise tell the user about it." Capped at 32 KiB. `details`:
+  `{handle, question, kind}`.
+- Blocking `ompdeck_wait_session` on that child: a new forwarded question ends the wait early with the same rendered
+  text (+ "answer it, then call ompdeck_wait_session again"), and the separate message for that question is skipped.
+- Background wait on that child: a forwarded question does **not** end the watch (the turn continues once answered);
+  the watch fires at turn end. Attention without a forwardable question, and children with `forward_questions: false`,
+  keep today's behavior.
+- `ompdeck_sessions` child rows add `forwarding questions` and the ids of questions pending right now.
+
+### Config / Settings / GUI
+- `AgentTools.answer_question: bool` (default true), env short name `answer_question` after `wait_session`; Settings →
+  General "Agent tools" toggle "Answer questions of sessions it opened". No other GUI or phone change: the question still
+  shows in the child's tab and on the phone.
+
+### As built (forwarded questions)
+- deck-service `gateway/engine/agent_tools/children/questions.rs`: per-child question monitor on a ctl-only
+  `CtlClient` (tab-less children too), opaque tokens bound to (root, `LiveSnapshot.pid`, ui id), forwarding through the
+  background-wait `Deliver` plumbing, answer validation/mapping onto `ui_answer::UiAnswer`; agent answers send
+  `AnswerUi.pid`, the phone path keeps `pid: None`. A monitor retires when its opener ends (no further wakeups).
+- A background watch whose attention is caused by a not-yet-snapshotted question is held until an ack-fenced fresh
+  snapshot shows whether a forwardable question exists (native attention can arrive before ctl `pending_ui`).
+- `host_remote.rs`: a Close queued before the host connection exists no longer cancels an accepted launch; it creates
+  the session through creation-only `deck_host::start` (AlreadyRunning = success) without taking the host's single
+  controlling attachment, so a quick close → reopen keeps the reopened tab attached. Known limit (pre-existing): a
+  Close arriving after an attach is already in flight can still displace a reopened controller; fixing it needs a
+  deck-host cancel/fenced-attach API.
+- Gate: `deck-service/tests/agent_tools_live.rs` — a tab-less child's omp `ask` (formDialog on 18.19) is forwarded, the
+  parent's `ompdeck_answer_question` resolves it and the child's turn finishes; an exec approval is forwarded,
+  `decision:"session"` is refused and `"once"` runs the command; `forward_questions:false` forwards nothing. deck-core's
+  live test covers the tool's visibility (main only), argument validation and the `AnswerUi.pid` fence.

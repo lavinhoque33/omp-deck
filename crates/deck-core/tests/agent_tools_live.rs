@@ -11,8 +11,7 @@ use serde_json::{Value, json};
 use support::fake_model::{self as fm, Reply};
 use support::{Live, TURN, wait_for};
 
-const ALL: &str =
-    "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session";
+const ALL: &str = "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question";
 const RESULT: &str = "Posted: verified round trip";
 const DELIVERED_IDLE: &str = "DELIVERED-IDLE: the child finished.";
 const DELIVERED_BUSY: &str = "DELIVERED-BUSY: the child finished during this tool.";
@@ -38,6 +37,10 @@ fn script(request: &Value) -> Reply {
     }
     let user = fm::last_user_text(request);
     let prompt = user.lines().last().unwrap_or_default();
+    if let Some(args) = prompt.strip_prefix("answer-question ") {
+        let args: Value = serde_json::from_str(args).expect("scripted question arguments");
+        return Reply::tool_call("ompdeck_answer_question", &args);
+    }
     if prompt == "deliver-busy" {
         return Reply::slow_tool_call(
             "ompdeck_notify",
@@ -93,6 +96,10 @@ fn script(request: &Value) -> Reply {
             "wait_session",
             json!({"session":"s-1234abcd","timeout_seconds":3601}),
         ),
+        "open-no-forward" => ("open_session", json!({"forward_questions":false})),
+        "open-forward" => ("open_session", json!({"forward_questions":true})),
+        "open-forward-default" => ("open_session", json!({})),
+        "invalid-forward-questions" => ("open_session", json!({"forward_questions":"invalid"})),
         "oversize-prompt" => ("open_session", json!({"prompt":"é".repeat(8193)})),
         "oversize-title" => ("open_session", json!({"title":"x".repeat(81)})),
         "oversize-notify-title" => ("notify", json!({"title":"x".repeat(121)})),
@@ -479,6 +486,11 @@ fn execute_rejects_oversized_arguments_without_dispatching() {
             "long-background-timeout",
             "wait_session",
             "timeout_seconds must be an integer from 1 to 86400",
+        ),
+        (
+            "invalid-forward-questions",
+            "open_session",
+            "forward_questions",
         ),
     ] {
         let before = live.model.count();
@@ -868,4 +880,154 @@ fn deliver_rejects_non_tools_connections_and_oversized_payloads() {
             .iter()
             .all(|entry| entry["customType"] != "ompdeck-wait")
     );
+}
+
+#[test]
+fn question_tools_are_gated_and_forward_answers_and_open_preferences() {
+    let Some(live) = start("tools-questions", Some("open_session,answer_question")) else {
+        return;
+    };
+    assert_eq!(
+        live.client().tools(),
+        ["ompdeck_open_session", "ompdeck_answer_question"]
+    );
+    subscribe(&live, true);
+    for (prompt, expected) in [
+        ("open-no-forward", json!({"forward_questions":false})),
+        ("open-forward", json!({"forward_questions":true})),
+        ("open-forward-default", json!({})),
+    ] {
+        let before = live.model.count();
+        live.send(prompt);
+        let req = request(live.client());
+        assert_eq!(req.name, "open_session");
+        assert_eq!(req.args, expected);
+        let reply = live.ctl(
+            CtlCommand::ToolResult {
+                id: req.id,
+                ok: true,
+                text: "Opened Child (s-1234abcd)".into(),
+                details: None,
+            },
+            TURN,
+        );
+        assert!(reply.ok, "{reply:?}");
+        next_model_result(&live, before, "Opened Child (s-1234abcd)");
+        wait_for("the open turn to finish", TURN, || {
+            live.main_idle().then_some(())
+        });
+    }
+    for mut args in [
+        json!({"choice":"2"}),
+        json!({"choices":["Blue","1"]}),
+        json!({"yes":false}),
+        json!({"text":"Use the alternate approach."}),
+        json!({"fields":[{"choices":["2"]},{"text":"Other answer"}]}),
+        json!({"decision":"once"}),
+        json!({"decision":"deny"}),
+    ] {
+        args["session"] = json!("s-1234abcd");
+        args["question"] = json!("q-1234abcd");
+        let before = live.model.count();
+        let entry_start = live.entries().len();
+        live.send(&format!("answer-question {args}"));
+        let req = request(live.client());
+        assert_eq!(req.name, "answer_question");
+        assert_eq!(req.args, args);
+        let reply = live.ctl(
+            CtlCommand::ToolResult {
+                id: req.id,
+                ok: true,
+                text: "Answered.".into(),
+                details: None,
+            },
+            TURN,
+        );
+        assert!(reply.ok, "{reply:?}");
+        next_model_result(&live, before, "Answered.");
+        assert_eq!(
+            tool_result(&live, "ompdeck_answer_question", entry_start)["isError"],
+            false
+        );
+        wait_for("the answer turn to finish", TURN, || {
+            live.main_idle().then_some(())
+        });
+    }
+}
+
+#[test]
+fn answer_question_rejects_invalid_arguments_without_dispatching() {
+    let Some(live) = start("tools-ans-bounds", Some("answer_question")) else {
+        return;
+    };
+    subscribe(&live, true);
+    for (mut args, reason) in [
+        (
+            json!({"session":""}),
+            "session must be a non-empty handle of at most 32 bytes",
+        ),
+        (
+            json!({"question":""}),
+            "question must contain 1 to 32 bytes",
+        ),
+        (
+            json!({"question":"é".repeat(17)}),
+            "question must contain 1 to 32 bytes",
+        ),
+        (
+            json!({"choice":"é".repeat(8193)}),
+            "choice must be at most 16384 bytes",
+        ),
+        (
+            json!({"text":"é".repeat(8193)}),
+            "text must be at most 16384 bytes",
+        ),
+        (
+            json!({"choices":vec!["1";41]}),
+            "choices must contain at most 40 choices",
+        ),
+        (
+            json!({"choices":["é".repeat(8193)]}),
+            "choices entries must be at most 16384 bytes",
+        ),
+        (
+            json!({"fields":vec![json!({"text":"OK"});41]}),
+            "fields must contain at most 40 fields",
+        ),
+        (
+            json!({"fields":[{"text":"é".repeat(8193)}]}),
+            "field text must be at most 16384 bytes",
+        ),
+        (
+            json!({"fields":[{"choices":vec!["1";41]}]}),
+            "field choices must contain at most 40 choices",
+        ),
+        (
+            json!({"fields":[{"choices":["é".repeat(8193)]}]}),
+            "field choices entries must be at most 16384 bytes",
+        ),
+        (json!({"decision":"session"}), "decision"),
+        (json!({"decision":"always"}), "decision"),
+    ] {
+        if args.get("session").is_none() {
+            args["session"] = json!("s-1234abcd");
+        }
+        if args.get("question").is_none() {
+            args["question"] = json!("q-1234abcd");
+        }
+        let before = live.model.count();
+        let entry_start = live.entries().len();
+        live.send(&format!("answer-question {args}"));
+        next_model_result(&live, before, reason);
+        let result = tool_result(&live, "ompdeck_answer_question", entry_start);
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(result.to_string().contains(reason), "{result}");
+        wait_for("the invalid answer turn to finish", TURN, || {
+            live.main_idle().then_some(())
+        });
+        assert!(
+            live.client().take_tool_requests().is_empty(),
+            "invalid arguments escaped execute: {args}"
+        );
+    }
 }

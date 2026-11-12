@@ -10,14 +10,14 @@ import * as path from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-type ToolName = "open_session" | "notify" | "show_changes" | "request_review" | "sessions" | "send_prompt" | "wait_session";
+type ToolName = "open_session" | "notify" | "show_changes" | "request_review" | "sessions" | "send_prompt" | "wait_session" | "answer_question";
 type ToolResult = { content: { type: "text"; text: string }[]; details?: Record<string, unknown>; isError?: boolean };
 interface ToolClient {
   data: { buf: string; snapshots: boolean; tools: boolean };
   write(line: string): unknown;
   destroy?(): void;
 }
-const TOOL_NAMES: ToolName[] = ["open_session", "notify", "show_changes", "request_review", "sessions", "send_prompt", "wait_session"];
+const TOOL_NAMES: ToolName[] = ["open_session", "notify", "show_changes", "request_review", "sessions", "send_prompt", "wait_session", "answer_question"];
 const toolProcess = globalThis as typeof globalThis & { __ompdeckTools?: string[] };
 const toolResult = (text: string, isError = false, details?: Record<string, unknown>): ToolResult =>
   ({ content: [{ type: "text", text }], ...(isError ? { isError: true } : {}), ...(details ? { details } : {}) });
@@ -34,6 +34,7 @@ function toolArgError(name: ToolName, args: Record<string, unknown>): string | u
     return undefined;
   };
   if (name === "open_session") {
+    if (args.forward_questions !== undefined && typeof args.forward_questions !== "boolean") return "forward_questions must be a boolean";
     const error = bytes("prompt", 16 * 1024) ?? chars("title", 80);
     if (error) return error;
     if (typeof args.cwd === "string") {
@@ -46,15 +47,40 @@ function toolArgError(name: ToolName, args: Record<string, unknown>): string | u
   if (name === "request_review") {
     return bytes("summary", 4 * 1024) ?? (Array.isArray(args.paths) && args.paths.length > 50 ? "paths must contain at most 50 entries" : undefined);
   }
-  if (name === "send_prompt" || name === "wait_session") {
+  if (name === "send_prompt" || name === "wait_session" || name === "answer_question") {
     if (typeof args.session !== "string" || !args.session.trim() || Buffer.byteLength(args.session) > 32) return "session must be a non-empty handle of at most 32 bytes";
     if (name === "send_prompt") {
       if (typeof args.prompt !== "string" || Buffer.byteLength(args.prompt) === 0) return "prompt must contain 1 to 16384 bytes";
       return bytes("prompt", 16 * 1024);
     }
-    if (args.background !== undefined && typeof args.background !== "boolean") return "background must be a boolean";
-    const maximum = args.background === true ? 86400 : 3600;
-    if (args.timeout_seconds !== undefined && (typeof args.timeout_seconds !== "number" || !Number.isInteger(args.timeout_seconds) || args.timeout_seconds < 1 || args.timeout_seconds > maximum)) return `timeout_seconds must be an integer from 1 to ${maximum}`;
+    if (name === "wait_session") {
+      if (args.background !== undefined && typeof args.background !== "boolean") return "background must be a boolean";
+      const maximum = args.background === true ? 86400 : 3600;
+      if (args.timeout_seconds !== undefined && (typeof args.timeout_seconds !== "number" || !Number.isInteger(args.timeout_seconds) || args.timeout_seconds < 1 || args.timeout_seconds > maximum)) return `timeout_seconds must be an integer from 1 to ${maximum}`;
+    }
+  }
+  if (name === "answer_question") {
+    if (typeof args.question !== "string" || args.question.length === 0 || Buffer.byteLength(args.question) > 32) return "question must contain 1 to 32 bytes";
+    if (args.decision !== undefined && args.decision !== "once" && args.decision !== "deny") return "decision must be once or deny";
+    const error = bytes("choice", 16 * 1024) ?? bytes("text", 16 * 1024);
+    if (error) return error;
+    const choicesError = (choices: unknown, label: string): string | undefined => {
+      if (!Array.isArray(choices)) return undefined;
+      if (choices.length > 40) return `${label} must contain at most 40 choices`;
+      for (const choice of choices) if (typeof choice === "string" && Buffer.byteLength(choice) > 16 * 1024) return `${label} entries must be at most 16384 bytes`;
+      return undefined;
+    };
+    const choices = choicesError(args.choices, "choices");
+    if (choices) return choices;
+    if (Array.isArray(args.fields)) {
+      if (args.fields.length > 40) return "fields must contain at most 40 fields";
+      for (const field of args.fields) {
+        if (!object(field)) return "fields must contain answer objects";
+        if (typeof field.text === "string" && Buffer.byteLength(field.text) > 16 * 1024) return "field text must be at most 16384 bytes";
+        const error = choicesError(field.choices, "field choices");
+        if (error) return error;
+      }
+    }
   }
   if (name === "show_changes" && typeof args.path === "string" && (path.isAbsolute(args.path) || path.normalize(args.path).split(path.sep)[0] === "..")) return "path must be repo-relative";
   return undefined;
@@ -171,8 +197,8 @@ export default async function ompdeckCtl(api: any) {
         const definitions = {
           open_session: {
             label: "Open OmpDeck session", approval: "exec",
-            description: "Start a parallel omp session in OmpDeck, optionally with an initial prompt, model and split placement. It runs independently; use ompdeck_sessions to check on it. Returns a session handle for ompdeck_send_prompt and ompdeck_wait_session when either is enabled. cwd defaults to this session's directory and placement defaults to tab.",
-            parameters: Type.Object({ prompt: Type.Optional(Type.String({ description: "Initial prompt, at most 16 KiB." })), cwd: Type.Optional(Type.String({ description: "Absolute existing directory; defaults to this session's cwd." })), model: Type.Optional(Type.String()), placement: Type.Optional(Type.Union([Type.Literal("tab"), Type.Literal("split_right"), Type.Literal("split_down")])), title: Type.Optional(Type.String({ description: "Session title, at most 80 characters." })) }),
+            description: "Start a parallel omp session in OmpDeck, optionally with an initial prompt, model and split placement. It runs independently; use ompdeck_sessions to check on it. Returns a session handle for enabled session tools: ompdeck_send_prompt, ompdeck_wait_session and ompdeck_answer_question. cwd defaults to this session's directory and placement defaults to tab. forward_questions defaults to true: questions the new session asks (ask, approvals, choices) are forwarded to you as messages; answer them with ompdeck_answer_question only when the user asked you to.",
+            parameters: Type.Object({ prompt: Type.Optional(Type.String({ description: "Initial prompt, at most 16 KiB." })), cwd: Type.Optional(Type.String({ description: "Absolute existing directory; defaults to this session's cwd." })), model: Type.Optional(Type.String()), placement: Type.Optional(Type.Union([Type.Literal("tab"), Type.Literal("split_right"), Type.Literal("split_down")])), title: Type.Optional(Type.String({ description: "Session title, at most 80 characters." })), forward_questions: Type.Optional(Type.Boolean({ description: "default true: questions the new session asks (ask, approvals, choices) are forwarded to you as messages; answer them with ompdeck_answer_question only when the user asked you to." })) }),
           },
           notify: {
             label: "Notify OmpDeck user", approval: "read",
@@ -203,6 +229,23 @@ export default async function ompdeckCtl(api: any) {
             label: "Wait for OmpDeck session", approval: "read",
             description: "Wait until a session you opened finishes the turn of the last prompt you gave it (default 600 s, max 3600) and return its final reply. Returns early if it needs the user's attention or exits. background: true returns immediately and the result arrives later as a message; you can keep working. Background waits have no timeout by default, or an explicit timeout of up to 86400 seconds.",
             parameters: Type.Object({ session: Type.String({ description: "Session handle returned by ompdeck_open_session; at most 32 bytes." }), timeout_seconds: Type.Optional(Type.Integer({ description: "Wait timeout in seconds: 1 to 3600 normally (default 600), or 1 to 86400 with background true (no default timeout)." })), background: Type.Optional(Type.Boolean({ description: "Return immediately and receive the result later as a message; default false." })) }),
+          },
+          answer_question: {
+            label: "Answer OmpDeck child question", approval: "exec",
+            description: "Answer a forwarded question from a session you opened, only when the user asked you to answer that session's questions. Use the question id from its message. For select use choice, or choices for multi-select; for confirm use yes; for input/editor use text; for ask/form use fields in the listed order (choice fields use choices, text fields use text; other text is allowed only where the field permits it); for approval use decision once or deny, never session or always grants. Options may be named by label (trimmed, case-insensitive) or listed 1-based number. The user can also answer in that session; the first answer wins.",
+            parameters: Type.Object({
+              session: Type.String({ description: "Session handle returned by ompdeck_open_session; 1 to 32 bytes." }),
+              question: Type.String({ description: "Question id from the forwarded message; 1 to 32 bytes." }),
+              choice: Type.Optional(Type.String({ description: "Single-select option label or listed 1-based number; at most 16 KiB." })),
+              choices: Type.Optional(Type.Array(Type.String(), { description: "Multi-select option labels or listed 1-based numbers; at most 40 choices, each at most 16 KiB." })),
+              yes: Type.Optional(Type.Boolean({ description: "Answer to a confirmation." })),
+              text: Type.Optional(Type.String({ description: "Input/editor answer; at most 16 KiB." })),
+              decision: Type.Optional(Type.Union([Type.Literal("once"), Type.Literal("deny")], { description: "Approve this call once or deny it; broader grants are forbidden." })),
+              fields: Type.Optional(Type.Array(Type.Object({
+                choices: Type.Optional(Type.Array(Type.String(), { description: "Choice-field option labels or listed 1-based numbers; at most 40 choices, each at most 16 KiB." })),
+                text: Type.Optional(Type.String({ description: "Text-field answer or permitted other text; at most 16 KiB." })),
+              }), { description: "Ask/form answers in listed field order; at most 40 fields." })),
+            }),
           },
         } as const;
         const registered: string[] = [];
@@ -860,6 +903,7 @@ export default async function ompdeckCtl(api: any) {
         if (cmd.t === "answer_ui") {
           const want = rootFile();
           if (typeof cmd.root !== "string" || !want || cmd.root !== want) return { ok: false, error: "session changed" };
+          if (typeof cmd.pid === "number" && cmd.pid !== process.pid) return { ok: false, error: "no such request" };
           const p = pendingUi.get(Number(cmd.id));
           if (!p) return { ok: false, error: "no such request" };
           if (p.form && cmd.value !== null && cmd.value !== undefined) {
