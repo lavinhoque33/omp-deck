@@ -43,6 +43,7 @@ mod paint_cache;
 mod palette;
 mod panes;
 mod plugins_page;
+mod progress_view;
 mod resume_model;
 mod review;
 mod running_model;

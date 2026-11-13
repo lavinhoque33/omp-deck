@@ -114,7 +114,7 @@ export class SmokeGateway {
         max_views: api.MAX_VIEWS,
         max_feeds: api.MAX_FEEDS,
       },
-      features: this.opts.s4 ? [api.FEATURE_S4] : [],
+      features: this.opts.s4 ? [api.FEATURE_S4, api.FEATURE_FORM, api.FEATURE_PROGRESS] : [],
     };
     if (this.opts.s4 && this.opts.pushKey !== null) welcome.push_key = this.opts.pushKey;
     send([{ kind: 'welcome', body: utf8(JSON.stringify(welcome)) }]);

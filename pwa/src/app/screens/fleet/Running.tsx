@@ -8,6 +8,7 @@ import { useNav } from '../../nav.ts';
 import { perform, shortModel, statusLabel } from '../../ui/format.ts';
 import { useCan, useClient, useFeed, useNow } from '../../ui/hooks.ts';
 import { ConfirmSheet, Empty, NeedsS4, StaleBanner, useS4 } from '../../ui/kit.tsx';
+import { ProgressCount } from '../../ui/progress.tsx';
 import { doneResult } from './common.ts';
 import { bytes, isUnmapped, memoryFreed, plural, uptime } from './logic.ts';
 import '../../../styles/fleet.css';
@@ -151,6 +152,7 @@ export function RunningScreen(): ReactNode {
                       </span>
                     )}
                     {live?.desktop_controlled === true && <span className="chip">desktop control</span>}
+                    <ProgressCount progress={live?.progress} />
                     {entry.live === null && <span className="chip">not attachable</span>}
                   </div>
                   <dl className="facts">

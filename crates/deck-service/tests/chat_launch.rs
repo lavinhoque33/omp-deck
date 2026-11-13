@@ -89,6 +89,7 @@ fn launch(client: &GatewayClient, name: &str, file: &Path, cwd: &Path, view: Ses
     run(
         client,
         Mutation::Launch(LaunchSpec {
+            agent_child: false,
             mux_name: Some(name.to_owned()),
             cwd: cwd.to_path_buf(),
             session_path: Some(file.to_path_buf()),

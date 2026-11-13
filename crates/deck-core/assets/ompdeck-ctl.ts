@@ -10,14 +10,14 @@ import * as path from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-type ToolName = "open_session" | "notify" | "show_changes" | "request_review" | "sessions" | "send_prompt" | "wait_session" | "answer_question";
+type ToolName = "open_session" | "notify" | "show_changes" | "request_review" | "sessions" | "send_prompt" | "wait_session" | "answer_question" | "finish_worktree" | "report";
 type ToolResult = { content: { type: "text"; text: string }[]; details?: Record<string, unknown>; isError?: boolean };
 interface ToolClient {
   data: { buf: string; snapshots: boolean; tools: boolean };
   write(line: string): unknown;
   destroy?(): void;
 }
-const TOOL_NAMES: ToolName[] = ["open_session", "notify", "show_changes", "request_review", "sessions", "send_prompt", "wait_session", "answer_question"];
+const TOOL_NAMES: ToolName[] = ["open_session", "notify", "show_changes", "request_review", "sessions", "send_prompt", "wait_session", "answer_question", "finish_worktree", "report"];
 const toolProcess = globalThis as typeof globalThis & { __ompdeckTools?: string[] };
 const toolResult = (text: string, isError = false, details?: Record<string, unknown>): ToolResult =>
   ({ content: [{ type: "text", text }], ...(isError ? { isError: true } : {}), ...(details ? { details } : {}) });
@@ -26,8 +26,7 @@ const object = (value: unknown): value is Record<string, unknown> => typeof valu
 // Byte caps are checked in execute, not just the model-facing schema (Unicode can use multiple bytes).
 function toolArgError(name: ToolName, args: Record<string, unknown>): string | undefined {
   const bytes = (key: string, cap: number) => typeof args[key] === "string" && Buffer.byteLength(args[key]) > cap ? `${key} must be at most ${cap} bytes` : undefined;
-  const chars = (key: string, cap: number) => {
-    const value = args[key];
+  const chars = (key: string, cap: number, value: unknown = args[key]) => {
     if (typeof value !== "string") return undefined;
     let count = 0;
     for (const _char of value) if (++count > cap) return `${key} must be at most ${cap} characters`;
@@ -37,6 +36,15 @@ function toolArgError(name: ToolName, args: Record<string, unknown>): string | u
     if (args.forward_questions !== undefined && typeof args.forward_questions !== "boolean") return "forward_questions must be a boolean";
     const error = bytes("prompt", 16 * 1024) ?? chars("title", 80);
     if (error) return error;
+    if (args.worktree !== undefined) {
+      if (!object(args.worktree)) return "worktree must be an object";
+      for (const key of ["branch", "base"]) {
+        const value = args.worktree[key];
+        if (value !== undefined && typeof value !== "string") return `worktree.${key} must be a string`;
+        const error = chars(`worktree.${key}`, 200, value);
+        if (error) return error;
+      }
+    }
     if (typeof args.cwd === "string") {
       if (!path.isAbsolute(args.cwd)) return "cwd must be an absolute directory";
       try { if (!fs.statSync(args.cwd).isDirectory()) return "cwd must be an absolute directory"; }
@@ -47,7 +55,7 @@ function toolArgError(name: ToolName, args: Record<string, unknown>): string | u
   if (name === "request_review") {
     return bytes("summary", 4 * 1024) ?? (Array.isArray(args.paths) && args.paths.length > 50 ? "paths must contain at most 50 entries" : undefined);
   }
-  if (name === "send_prompt" || name === "wait_session" || name === "answer_question") {
+  if (name === "send_prompt" || name === "wait_session" || name === "answer_question" || name === "finish_worktree") {
     if (typeof args.session !== "string" || !args.session.trim() || Buffer.byteLength(args.session) > 32) return "session must be a non-empty handle of at most 32 bytes";
     if (name === "send_prompt") {
       if (typeof args.prompt !== "string" || Buffer.byteLength(args.prompt) === 0) return "prompt must contain 1 to 16384 bytes";
@@ -58,6 +66,10 @@ function toolArgError(name: ToolName, args: Record<string, unknown>): string | u
       const maximum = args.background === true ? 86400 : 3600;
       if (args.timeout_seconds !== undefined && (typeof args.timeout_seconds !== "number" || !Number.isInteger(args.timeout_seconds) || args.timeout_seconds < 1 || args.timeout_seconds > maximum)) return `timeout_seconds must be an integer from 1 to ${maximum}`;
     }
+  }
+  if (name === "report") {
+    if (typeof args.text !== "string" || Buffer.byteLength(args.text) < 1 || Buffer.byteLength(args.text) > 4096) return "text must contain 1 to 4096 bytes";
+    if (args.kind !== undefined && !["progress", "blocked", "done"].includes(args.kind as string)) return "kind must be progress, blocked or done";
   }
   if (name === "answer_question") {
     if (typeof args.question !== "string" || args.question.length === 0 || Buffer.byteLength(args.question) > 32) return "question must contain 1 to 32 bytes";
@@ -138,6 +150,9 @@ export default async function ompdeckCtl(api: any) {
     for (const name of ["agent_end", "turn_end", "model_select", "session_compact"]) {
       try { api.on(name, (_ev: any, ctx: any) => { try { if (isMain(ctx)) G.__ompdeckCtl?.recompute(); } catch (e) { log(name + " failed: " + e); } }); } catch (e) { log("on " + name + " failed: " + e); }
     }
+    for (const name of ["tool_execution_end", "goal_updated", "session_tree", "session_branch"]) {
+      try { api.on(name, (_ev: unknown, ctx: ExtensionContext) => { try { if (isMain(ctx)) G.__ompdeckCtl?.schedule(); } catch (e) { log(name + " failed: " + e); } }); } catch (e) { log("on " + name + " failed: " + e); }
+    }
     api.on("session_shutdown", (_ev: any, ctx: any) => { try { if (isMain(ctx)) stop(); } catch (e) { log("stop failed: " + e); } });
 
     function start(ctx: any) {
@@ -197,8 +212,8 @@ export default async function ompdeckCtl(api: any) {
         const definitions = {
           open_session: {
             label: "Open OmpDeck session", approval: "exec",
-            description: "Start a parallel omp session in OmpDeck, optionally with an initial prompt, model and split placement. It runs independently; use ompdeck_sessions to check on it. Returns a session handle for enabled session tools: ompdeck_send_prompt, ompdeck_wait_session and ompdeck_answer_question. cwd defaults to this session's directory and placement defaults to tab. forward_questions defaults to true: questions the new session asks (ask, approvals, choices) are forwarded to you as messages; answer them with ompdeck_answer_question only when the user asked you to.",
-            parameters: Type.Object({ prompt: Type.Optional(Type.String({ description: "Initial prompt, at most 16 KiB." })), cwd: Type.Optional(Type.String({ description: "Absolute existing directory; defaults to this session's cwd." })), model: Type.Optional(Type.String()), placement: Type.Optional(Type.Union([Type.Literal("tab"), Type.Literal("split_right"), Type.Literal("split_down")])), title: Type.Optional(Type.String({ description: "Session title, at most 80 characters." })), forward_questions: Type.Optional(Type.Boolean({ description: "default true: questions the new session asks (ask, approvals, choices) are forwarded to you as messages; answer them with ompdeck_answer_question only when the user asked you to." })) }),
+            description: "Start a parallel omp session; returns a handle for session tools. cwd defaults to this directory; placement defaults to tab. worktree gives the child its own git worktree (branch/base optional); use one per parallel child. The result includes its worktree, branch and merge base. forward_questions defaults to true: child questions arrive as messages; answer with ompdeck_answer_question only when the user asked you to.",
+            parameters: Type.Object({ prompt: Type.Optional(Type.String({ description: "Initial prompt, at most 16 KiB." })), cwd: Type.Optional(Type.String({ description: "Absolute existing directory; defaults to this session's cwd. With worktree, must be inside a git repo with commits." })), model: Type.Optional(Type.String()), placement: Type.Optional(Type.Union([Type.Literal("tab"), Type.Literal("split_right"), Type.Literal("split_down")])), title: Type.Optional(Type.String({ description: "Session title, at most 80 characters." })), forward_questions: Type.Optional(Type.Boolean({ description: "default true: child questions are forwarded as messages; answer only when the user asked you to." })), worktree: Type.Optional(Type.Object({ branch: Type.Optional(Type.String({ maxLength: 200, description: "New branch, at most 200 characters; defaults to wt/<timestamp>." })), base: Type.Optional(Type.String({ maxLength: 200, description: "Base ref, at most 200 characters; defaults to the primary checkout's current branch, else HEAD." })) })) }),
           },
           notify: {
             label: "Notify OmpDeck user", approval: "read",
@@ -246,6 +261,16 @@ export default async function ompdeckCtl(api: any) {
                 text: Type.Optional(Type.String({ description: "Text-field answer or permitted other text; at most 16 KiB." })),
               }), { description: "Ask/form answers in listed field order; at most 40 fields." })),
             }),
+          },
+          finish_worktree: {
+            label: "Finish OmpDeck worktree", approval: "exec",
+            description: "Ask a session you opened to commit and merge its worktree, following the project's rules. Returns once Finish starts; the outcome arrives as a message. OmpDeck removes the worktree only once it is clean and merged.",
+            parameters: Type.Object({ session: Type.String({ description: "Child session handle returned by ompdeck_open_session; 1 to 32 bytes." }) }),
+          },
+          report: {
+            label: "Report to OmpDeck parent", approval: "read",
+            description: "Report progress, a blocker or completion to the session that opened this one. kind defaults to progress; reports do not end waits. Send only when something changes (rate-limited). Returns Reported to <opener title>.",
+            parameters: Type.Object({ text: Type.String({ description: "Report text, 1 byte to 4 KiB." }), kind: Type.Optional(Type.Union([Type.Literal("progress"), Type.Literal("blocked"), Type.Literal("done")])) }),
           },
         } as const;
         const registered: string[] = [];
@@ -334,6 +359,46 @@ export default async function ompdeckCtl(api: any) {
         }
         return out.sort((a, b) => b[1] - a[1]);
       };
+      const mainProgress = () => {
+        try {
+          const sess = mainSession();
+          let truncated = false;
+          const cut = (value: string, cap: number): string => {
+            if (value.length <= cap) return value;
+            let text = "", count = 0;
+            for (const ch of value) {
+              if (++count === cap && text.length + ch.length < value.length) { truncated = true; return text + "…"; }
+              text += ch;
+            }
+            return text;
+          };
+          const phases: { name: string; tasks: { content: string; status: string }[] }[] = [];
+          let total = 0;
+          const source = sess?.getTodoPhases?.() ?? [];
+          if (Array.isArray(source)) {
+            if (source.length > 16) truncated = true;
+            for (const phase of source.slice(0, 16)) {
+              if (typeof phase?.name !== "string" || !Array.isArray(phase.tasks)) continue;
+              const tasks = [];
+              for (const task of phase.tasks) {
+                if (total === 80) { truncated = true; break; }
+                if (typeof task?.content !== "string" || typeof task.status !== "string") continue;
+                tasks.push({ content: cut(task.content, 200), status: task.status });
+                total++;
+              }
+              phases.push({ name: cut(phase.name, 80), tasks });
+            }
+          }
+          let goal: { objective: string; status: string; tokensUsed: number; tokenBudget?: number; timeUsedSeconds: number } | null = null;
+          const state = sess?.getGoalModeState?.();
+          const g = state?.goal;
+          if (g && g.status !== "dropped" && typeof g.objective === "string" && typeof g.status === "string") {
+            const count = (n: number) => Math.max(0, Math.floor(n));
+            goal = { objective: cut(g.objective, 400), status: g.status, tokensUsed: count(g.tokensUsed), timeUsedSeconds: count(g.timeUsedSeconds), ...(g.tokenBudget === undefined ? {} : { tokenBudget: count(g.tokenBudget) }) };
+          }
+          return total || goal ? { phases, goal, truncated } : null;
+        } catch (e) { log("progress state failed: " + e); return null; }
+      };
       const recompute = () => {
         try {
           const sess = mainSession();
@@ -356,7 +421,7 @@ export default async function ompdeckCtl(api: any) {
             computedAt: Date.now(),
           };
         } catch (e) { log("context compute failed: " + e); contextCache = null; }
-        schedule();
+        finally { schedule(); }
       };
 
       const unreadOf = (id: string): number | null => {
@@ -380,12 +445,15 @@ export default async function ompdeckCtl(api: any) {
               unread: unreadOf(r.id),
             }));
         } catch (e) { log("snapshot failed: " + e); }
-        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache, model: mainModel(), account: mainAccount(), pendingUi: [...pendingUi.values()].map(p => p.summary) };
+        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache, model: mainModel(), account: mainAccount(), progress: mainProgress(), pendingUi: [...pendingUi.values()].map(p => p.summary) };
       };
       const write = (c: any, l: string) => { try { c.write(l); } catch {} };
+      let lastSnapshot = "";
       const push = (m: unknown) => {
         if (!clients.size) return;
         let l: string; try { l = JSON.stringify(m) + "\n"; } catch { return; }
+        if (l === lastSnapshot) return;
+        lastSnapshot = l;
         for (const c of clients) if (c.data.snapshots) write(c, l);
       };
       const schedule = () => { if (pending) return; pending = setTimeout(() => { pending = undefined; push(snapshot()); }, 50); };
@@ -1171,11 +1239,12 @@ export default async function ompdeckCtl(api: any) {
       try {
         try { wrapUi(ctx.ui); } catch (e) { log("ui hook failed: " + e); uiState.hook = false; }
         offRegistry = registry.onChange(schedule); // registered/status_changed/metadata_changed(activity)/removed
-        tick = setInterval(() => { if (!clients.size) return; if (modelKey() !== contextKey) recompute(); push(snapshot()); }, 1000); // safety net for isStreaming/mainIdle
+        tick = setInterval(() => { if (!clients.size) return; if (modelKey() !== contextKey) recompute(); schedule(); }, 1000); // safety net for isStreaming/mainIdle and progress changes without events
         try { offProgress = api.events.on("task:subagent:progress", schedule); } catch (e) { log("progress listener failed: " + e); }
         G.__ompdeckCtl = {
           setCtx(c: any) { mainCtx = c; schedule(); },
           recompute,
+          schedule,
           close,
         };
       } catch (e) { log("setup failed: " + e); close(); return; }

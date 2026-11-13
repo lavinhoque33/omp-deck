@@ -778,6 +778,8 @@ pub struct ControllerInfo {
     pub backend: BackendRef,
     pub title: Option<String>,
     pub activity: Activity,
+    #[serde(default)]
+    pub progress: Option<deck_core::ctl::Progress>,
     pub exit_code: Option<i32>,
     /// The indicator without the client's own bell marker ([`ServerEvent::Bell`]).
     pub status: TabStatus,
@@ -1824,6 +1826,8 @@ pub struct LaunchSpec {
     /// is reported by [`Done::Session`] and [`ControllerInfo::view`].
     #[serde(default)]
     pub view: SessionView,
+    #[serde(default)]
+    pub agent_child: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

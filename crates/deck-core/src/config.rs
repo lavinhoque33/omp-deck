@@ -213,6 +213,8 @@ pub struct AgentTools {
     pub send_prompt: bool,
     pub wait_session: bool,
     pub answer_question: bool,
+    pub finish_worktree: bool,
+    pub report: bool,
 }
 
 impl Default for AgentTools {
@@ -226,6 +228,8 @@ impl Default for AgentTools {
             send_prompt: true,
             wait_session: true,
             answer_question: true,
+            finish_worktree: true,
+            report: true,
         }
     }
 }
@@ -243,6 +247,8 @@ impl AgentTools {
             (self.send_prompt, "send_prompt"),
             (self.wait_session, "wait_session"),
             (self.answer_question, "answer_question"),
+            (self.finish_worktree, "finish_worktree"),
+            (self.report, "report"),
         ] {
             if enabled {
                 if !value.is_empty() {
@@ -1281,18 +1287,18 @@ mod tests {
         assert_eq!(
             old.agent_tools.env_value().as_deref(),
             Some(
-                "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question"
+                "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report"
             )
         );
         let partial = load_str(r#"{"agent_tools":{"notify":false}}"#);
         assert_eq!(
             partial.agent_tools.env_value().as_deref(),
             Some(
-                "open_session,show_changes,request_review,sessions,send_prompt,wait_session,answer_question"
+                "open_session,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report"
             )
         );
         let disabled = load_str(
-            r#"{"notify":{"agent_messages":false},"agent_tools":{"open_session":false,"notify":false,"show_changes":false,"request_review":false,"sessions":false,"send_prompt":false,"wait_session":false,"answer_question":false}}"#,
+            r#"{"notify":{"agent_messages":false},"agent_tools":{"open_session":false,"notify":false,"show_changes":false,"request_review":false,"sessions":false,"send_prompt":false,"wait_session":false,"answer_question":false,"finish_worktree":false,"report":false}}"#,
         );
         assert_eq!(disabled.agent_tools.env_value(), None);
         assert!(!disabled.notify.agent_messages);

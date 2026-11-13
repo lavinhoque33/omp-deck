@@ -158,6 +158,11 @@ impl DeviceConn {
         self.features.contains(api::FEATURE_FORM)
     }
 
+    /// The device renders live todo/goal progress ([`api::FEATURE_PROGRESS`]).
+    fn progress(&self) -> bool {
+        self.features.contains(api::FEATURE_PROGRESS)
+    }
+
     /// `topic` has a new revision: the feeds projected from it are recomputed.
     pub(super) fn topic_changed(&mut self, topic: &Topic) {
         let mut follow = false;
@@ -165,7 +170,7 @@ impl DeviceConn {
             let hit = match (feed, topic) {
                 (Feed::Projects {} | Feed::Sessions { .. }, Topic::Sessions) => true,
                 (Feed::Live {}, Topic::Sessions | Topic::Live(_)) => true,
-                // The live sessions' control links (busy, model, live control) follow them.
+                // Control links include busy, model, live control and progress changes.
                 (Feed::Live {}, Topic::Controllers) => {
                     follow = true;
                     true
@@ -570,6 +575,71 @@ fn own_requests(info: &ControllerInfo, device: &str) -> Vec<api::OwnRequest> {
         .collect()
 }
 
+/// Map the control types explicitly and enforce the phone's bounds at the boundary.
+fn progress_view(progress: &deck_core::ctl::Progress) -> api::ProgressView {
+    use deck_core::ctl::{GoalStatus, TodoStatus};
+    let mut remaining = api::ProgressView::MAX_TASKS;
+    let mut truncated = progress.truncated || progress.phases.len() > api::ProgressView::MAX_PHASES;
+    api::ProgressView::new(
+        progress
+            .phases
+            .iter()
+            .take(api::ProgressView::MAX_PHASES)
+            .map(|phase| {
+                let count = phase.tasks.len().min(remaining);
+                truncated |= count < phase.tasks.len();
+                remaining -= count;
+                api::ProgressPhaseView {
+                    name: progress_text(&phase.name, api::ProgressView::MAX_PHASE_NAME),
+                    tasks: phase
+                        .tasks
+                        .iter()
+                        .take(count)
+                        .map(|task| api::ProgressTaskView {
+                            content: progress_text(
+                                &task.content,
+                                api::ProgressView::MAX_TASK_CONTENT,
+                            ),
+                            status: match task.status {
+                                TodoStatus::Pending => api::ProgressTaskStatus::Pending,
+                                TodoStatus::InProgress => api::ProgressTaskStatus::InProgress,
+                                TodoStatus::Completed => api::ProgressTaskStatus::Completed,
+                                TodoStatus::Abandoned => api::ProgressTaskStatus::Abandoned,
+                                TodoStatus::Blocked => api::ProgressTaskStatus::Blocked,
+                                TodoStatus::Unknown => api::ProgressTaskStatus::Unknown,
+                            },
+                        })
+                        .collect(),
+                }
+            })
+            .collect(),
+        progress.goal.as_ref().map(|goal| api::ProgressGoalView {
+            objective: progress_text(&goal.objective, api::ProgressView::MAX_GOAL_OBJECTIVE),
+            status: match goal.status {
+                GoalStatus::Active => api::ProgressGoalStatus::Active,
+                GoalStatus::Paused => api::ProgressGoalStatus::Paused,
+                GoalStatus::BudgetLimited => api::ProgressGoalStatus::BudgetLimited,
+                GoalStatus::Complete => api::ProgressGoalStatus::Complete,
+                GoalStatus::Dropped => api::ProgressGoalStatus::Dropped,
+                GoalStatus::Unknown => api::ProgressGoalStatus::Unknown,
+            },
+            tokens_used: goal.tokens_used,
+            token_budget: goal.token_budget,
+            time_used_seconds: goal.time_used_seconds,
+        }),
+        truncated,
+    )
+}
+
+/// Retain at most one extra scalar so the bounded constructor can add its cut mark.
+fn progress_text(text: &str, cap: usize) -> String {
+    let end = text
+        .char_indices()
+        .nth(cap + 1)
+        .map_or(text.len(), |(end, _)| end);
+    text[..end].to_owned()
+}
+
 /// A controlled session as `device` sees it. Its `project` is always an inventory project's
 /// id when one holds it (see [`live_project`]), whichever way omp spells its folder.
 fn live_session(
@@ -578,6 +648,7 @@ fn live_session(
     groups: &[ProjectGroup],
     canon: &Canon,
     desktop_controlled: bool,
+    progress: bool,
 ) -> api::LiveSession {
     let held = info
         .session_path
@@ -587,6 +658,11 @@ fn live_session(
         .map_or_else(|| project_id(&info.cwd), |g| project_id(&g.cwd));
     let cwd = info.live_cwd.as_deref().unwrap_or(&info.cwd);
     api::LiveSession {
+        progress: info
+            .progress
+            .as_ref()
+            .filter(|_| progress)
+            .map(progress_view),
         live: live_ref(&info.target),
         kind: match info.role {
             SessionRole::Session => api::LiveKind::Session,
@@ -960,7 +1036,11 @@ impl Engine {
         let out = DeviceOut::new(wake, self.waker.callback());
         let next_seq = self.journal.next_seq(id);
         let protocol = negotiated_protocol(api);
-        let mut offered = vec![api::FEATURE_S4.to_owned(), api::FEATURE_FORM.to_owned()];
+        let mut offered = vec![
+            api::FEATURE_S4.to_owned(),
+            api::FEATURE_FORM.to_owned(),
+            api::FEATURE_PROGRESS.to_owned(),
+        ];
         if self.notify.push.android_configured() {
             // Only with a valid FCM service account: a phone must not offer a registration the
             // gateway cannot deliver.
@@ -1127,6 +1207,7 @@ impl Engine {
         };
         let lowered = d.permissions.control && !perms.control;
         let form = d.form();
+        let progress = d.progress();
         d.permissions = perms;
         let now = std::time::Instant::now();
         d.transfers.expire(now);
@@ -1156,7 +1237,7 @@ impl Engine {
         let interest = resubscribe.then(|| self.device_interest(&feeds));
         for (feed, st) in &mut feeds {
             if st.dirty {
-                self.refresh_feed(&device, form, feed, st, &out);
+                self.refresh_feed(&device, form, progress, feed, st, &out);
             }
         }
         let mut resubscribed = false;
@@ -1259,9 +1340,8 @@ impl Engine {
         (subs, fleet)
     }
 
-    /// The live sessions as `device` sees them; `form`: it announced [`api::FEATURE_FORM`] (else
-    /// form requests are not listed).
-    fn live_sessions(&self, device: &str, form: bool) -> Vec<api::LiveSession> {
+    /// The live sessions as `device` sees them, gated by its form and progress features.
+    fn live_sessions(&self, device: &str, form: bool, progress: bool) -> Vec<api::LiveSession> {
         let groups = self.groups();
         self.controller_infos()
             .iter()
@@ -1270,7 +1350,14 @@ impl Engine {
                 let desktop = m
                     .controlling()
                     .is_some_and(|v| self.views.get(&v).is_some_and(|v| v.owner.is_none()));
-                let mut s = live_session(info, device, &groups, &self.devices.canon, desktop);
+                let mut s = live_session(
+                    info,
+                    device,
+                    &groups,
+                    &self.devices.canon,
+                    desktop,
+                    progress,
+                );
                 // Only an extension that hooks omp's dialogs lists them (else the terminal
                 // answers them).
                 if let Some(link) = m.live.as_ref().filter(|l| l.client.ui_hook())
@@ -1283,11 +1370,12 @@ impl Engine {
             .collect()
     }
 
-    /// Recomputes one feed and queues it when it changed; `form` as in [`Self::live_sessions`].
+    /// Recomputes one feed and queues it when changed, with the negotiated features.
     fn refresh_feed(
         &self,
         device: &str,
         form: bool,
+        progress: bool,
         feed: &Feed,
         st: &mut FeedState,
         out: &DeviceOut,
@@ -1314,7 +1402,7 @@ impl Engine {
                 })
             }
             Feed::Live {} => {
-                let list = self.live_sessions(device, form);
+                let list = self.live_sessions(device, form, progress);
                 fit_feed(feed, &list, |sessions, truncated| FeedValue::Live {
                     sessions,
                     truncated,
@@ -1867,6 +1955,7 @@ impl Engine {
             Op::NewSession { project } => {
                 let cwd = resolve_project(&groups, &project)?.to_path_buf();
                 Mutation::Launch(LaunchSpec {
+                    agent_child: false,
                     mux_name: backend.then(|| deck_core::mux::new_session_name(SystemTime::now())),
                     cwd,
                     session_path: None,
@@ -1880,6 +1969,7 @@ impl Engine {
             Op::Resume { session } => {
                 let s = resolve_session(&groups, &session)?;
                 Mutation::Launch(LaunchSpec {
+                    agent_child: false,
                     mux_name: backend.then(|| deck_core::mux::session_name_for(&s.id)),
                     cwd: s.cwd.clone(),
                     session_path: Some(s.path.clone()),
@@ -2378,6 +2468,7 @@ mod tests {
     ) -> ControllerInfo {
         use crate::controller::{ServiceEpoch, SessionKey};
         ControllerInfo {
+            progress: None,
             target: SessionTarget {
                 epoch: ServiceEpoch([7; 16]),
                 key: SessionKey::tmux("omp-deck-test-1", "omp-x"),
@@ -2409,6 +2500,153 @@ mod tests {
     }
 
     #[test]
+    fn live_progress_is_negotiated_and_preserves_every_status() {
+        let mut info = controller_info(Path::new("/srv/alpha"), None, None, Vec::new());
+        let statuses = [
+            "pending",
+            "in_progress",
+            "completed",
+            "abandoned",
+            "blocked",
+            "unknown",
+        ];
+        let tasks: Vec<_> = statuses
+            .iter()
+            .map(|s| serde_json::json!({"content": "task", "status": s}))
+            .collect();
+        let wake: Wake = Arc::new(|| {});
+        let mut device = DeviceConn::new(
+            DeviceOut::new(wake.clone(), wake),
+            Permissions::default(),
+            1,
+            1,
+            BTreeSet::new(),
+        );
+        for goal in [
+            "active",
+            "paused",
+            "budget_limited",
+            "complete",
+            "dropped",
+            "unknown",
+        ] {
+            info.progress = Some(
+                serde_json::from_value(serde_json::json!({
+                    "phases": [{"name": "Build", "tasks": tasks}],
+                    "goal": {"objective": "Ship", "status": goal, "tokens_used": 123,
+                        "token_budget": 456, "time_used_seconds": 78},
+                    "truncated": false
+                }))
+                .unwrap(),
+            );
+            for enabled in [false, true] {
+                device.features.clear();
+                if enabled {
+                    device.features.insert(api::FEATURE_PROGRESS.to_owned());
+                }
+                let session = live_session(
+                    &info,
+                    "d-1",
+                    &groups(),
+                    &Canon::default(),
+                    false,
+                    device.progress(),
+                );
+                let json = serde_json::to_value(session).unwrap();
+                if !enabled {
+                    assert!(json.get("progress").is_none());
+                    continue;
+                }
+                let progress = &json["progress"];
+                assert!(progress.is_object());
+                for (task, expected) in progress["phases"][0]["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(statuses)
+                {
+                    assert_eq!(task["status"], expected);
+                }
+                assert_eq!(progress["goal"]["status"], goal);
+                assert_eq!(progress["goal"]["tokens_used"], 123);
+                assert_eq!(progress["goal"]["token_budget"], 456);
+                assert_eq!(progress["goal"]["time_used_seconds"], 78);
+            }
+        }
+        info.progress = None;
+        assert!(
+            live_session(&info, "d-1", &groups(), &Canon::default(), false, true,)
+                .progress
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn live_progress_obeys_phone_caps_and_retains_source_truncation() {
+        let task = serde_json::json!({"content": "🦀".repeat(201), "status": "blocked"});
+        let phase = serde_json::json!({"name": "é".repeat(81), "tasks": vec![task; 81]});
+        let source: deck_core::ctl::Progress = serde_json::from_value(serde_json::json!({
+            "phases": vec![phase; 17],
+            "goal": {"objective": "🦀".repeat(401), "status": "budget_limited",
+                "tokens_used": u64::MAX, "token_budget": null, "time_used_seconds": 55},
+            "truncated": false
+        }))
+        .unwrap();
+        let view = progress_view(&source);
+        assert!(view.truncated);
+        assert_eq!(view.phases.len(), 16);
+        assert_eq!(view.phases.iter().map(|p| p.tasks.len()).sum::<usize>(), 80);
+        assert_eq!(view.phases[0].name.chars().count(), 80);
+        assert!(view.phases[0].name.ends_with(api::CUT_MARK));
+        for task in view.phases.iter().flat_map(|p| &p.tasks) {
+            assert_eq!(task.content.chars().count(), 200);
+            assert!(task.content.ends_with(api::CUT_MARK));
+            assert_eq!(task.status, api::ProgressTaskStatus::Blocked);
+        }
+        let goal = view.goal.unwrap();
+        assert_eq!(goal.objective.chars().count(), 400);
+        assert!(goal.objective.ends_with(api::CUT_MARK));
+        assert_eq!(goal.status, api::ProgressGoalStatus::BudgetLimited);
+        assert_eq!(goal.tokens_used, u64::MAX);
+        assert_eq!(goal.token_budget, None);
+        assert_eq!(goal.time_used_seconds, 55);
+        assert!(
+            progress_view(&deck_core::ctl::Progress {
+                truncated: true,
+                ..Default::default()
+            })
+            .truncated
+        );
+    }
+
+    #[test]
+    fn live_feed_refreshes_on_progress_updates_and_clears() {
+        let wake: Wake = Arc::new(|| {});
+        let mut device = DeviceConn::new(
+            DeviceOut::new(wake.clone(), wake),
+            Permissions::default(),
+            1,
+            1,
+            BTreeSet::from([api::FEATURE_PROGRESS.to_owned()]),
+        );
+        let feed = Feed::Live {};
+        device.feeds.insert(feed.clone(), FeedState::default());
+        for topic in [
+            Topic::Controllers,
+            Topic::Live(
+                controller_info(Path::new("/"), None, None, Vec::new())
+                    .target
+                    .key,
+            ),
+            Topic::Controllers,
+        ] {
+            device.feeds.get_mut(&feed).unwrap().dirty = false;
+            device.topic_changed(&topic);
+            assert!(device.feeds[&feed].dirty);
+        }
+    }
+
+    #[test]
     fn live_projection_shows_only_the_devices_own_requests_and_no_ctl_key() {
         use crate::controller::CommandKind;
         let record = |client: &str, seq| {
@@ -2432,7 +2670,7 @@ mod tests {
             None,
             vec![record("d-1", 1), record("gui-other", 2)],
         );
-        let s = live_session(&info, "d-1", &groups(), &Canon::default(), false);
+        let s = live_session(&info, "d-1", &groups(), &Canon::default(), false, false);
         assert_eq!(s.session.as_deref(), Some("a1"));
         assert_eq!(s.project, Some(project_id(Path::new("/srv/alpha"))));
         assert_eq!(s.requests.len(), 1);
@@ -2453,7 +2691,7 @@ mod tests {
             Vec::new(),
         );
         let canon = Canon::default();
-        let s = live_session(&info, "d-1", &groups(), &canon, false);
+        let s = live_session(&info, "d-1", &groups(), &canon, false, false);
         assert_eq!(s.project, Some(project_id(Path::new("/srv/beta"))));
     }
 
@@ -2557,19 +2795,19 @@ mod tests {
             Vec::new(),
         );
         let mut canon = Canon::default();
-        let first = live_session(&info, "d-1", &groups, &canon, false);
+        let first = live_session(&info, "d-1", &groups, &canon, false, false);
         assert_eq!(first.session, None, "not resolved yet");
         resolve_wanted(&mut canon);
-        let s = live_session(&info, "d-1", &groups, &canon, false);
+        let s = live_session(&info, "d-1", &groups, &canon, false, false);
         assert_eq!(s.project, Some(project_id(&link)));
         assert_eq!(s.session.as_deref(), Some("s1"));
         // And the other way round: the inventory has the target, omp the link (no file).
         let groups = vec![group(&real)];
         let info = controller_info(&link, None, Some(link.clone()), Vec::new());
         let mut canon = Canon::default();
-        live_session(&info, "d-1", &groups, &canon, false);
+        live_session(&info, "d-1", &groups, &canon, false, false);
         resolve_wanted(&mut canon);
-        let s = live_session(&info, "d-1", &groups, &canon, false);
+        let s = live_session(&info, "d-1", &groups, &canon, false, false);
         assert_eq!(s.project, Some(project_id(&real)));
     }
 

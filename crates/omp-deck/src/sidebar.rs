@@ -252,6 +252,8 @@ pub struct SidebarInput<'a> {
     pub active_tab: usize,
     /// Live omp state (`Busy` / `Attention` only) of sessions open in a tab, by session file.
     pub tab_activity: &'a HashMap<&'a Path, TabStatus>,
+    /// Live todo / goal progress of the managed sessions (row badges and hover rows).
+    pub progress: &'a crate::progress_view::ProgressIndex,
     /// Height of the Running dock (`AppConfig.running_dock_height`; 0 = fit its rows, at most
     /// six) and whether it is folded to its header.
     pub dock_height: f32,
@@ -1865,6 +1867,7 @@ fn session_row(
         .get(entry.path.as_path())
         .copied()
         .filter(|_| !busy);
+    let progress = input.progress.of_path(entry.path.as_path());
     let marker = if busy {
         Marker::Spin
     } else {
@@ -2009,10 +2012,15 @@ fn session_row(
         } else {
             23.0 * slots.len() as f32 - 3.0
         };
+        // Live todos: a compact `3/7` badge left of the age (the hover keys take its place).
+        let prog = progress
+            .filter(|_| !show_btns)
+            .and_then(|pr| crate::progress_view::row_badge(p, pal, pr));
+        let prog_w = prog.as_ref().map_or(0.0, |b| b.width() + 6.0);
         let mut text_right = if show_btns {
             pill.right() - 8.0 - acts_w - 6.0
         } else {
-            pill.right() - 8.0 - age.size().x - 6.0
+            pill.right() - 8.0 - age.size().x - 6.0 - prog_w
         };
         text_right = text_right.max(text_left + 20.0);
         let mut job =
@@ -2031,6 +2039,9 @@ fn session_row(
             galley,
             title_c,
         );
+        if let Some(b) = &prog {
+            b.paint_at(p, pill.right() - 8.0 - age.size().x - prog_w, stub_y);
+        }
         if !show_btns {
             p.galley(
                 pos2(
@@ -2116,7 +2127,7 @@ fn session_row(
         session_menu(ui, entry, running, true, &env, out)
     });
     row_hover_card(
-        &resp, pal, entry, age_text, row, busy, live, running, over_btn,
+        &resp, pal, entry, age_text, row, busy, live, running, over_btn, progress,
     );
 }
 
@@ -2169,6 +2180,7 @@ fn row_hover_card(
     live: Option<TabStatus>,
     running: bool,
     over_btn: bool,
+    progress: Option<&deck_core::ctl::Progress>,
 ) {
     const KEY_W: f32 = 76.0;
     let tone = live.map_or(Color32::TRANSPARENT, |s| tips::status_tone(pal, s));
@@ -2255,6 +2267,9 @@ fn row_hover_card(
                 if let Some(path) = chip.wt.path() {
                     card::kv(ui, KEY_W, "Worktree", |ui| tips::path(ui, path));
                 }
+            }
+            if let Some(p) = progress {
+                crate::progress_view::kv_rows(ui, KEY_W, p);
             }
             card::kv(ui, KEY_W, "Updated", |ui| {
                 let ago = if age_text == "now" {

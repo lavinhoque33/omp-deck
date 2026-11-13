@@ -569,6 +569,8 @@ impl App {
             role: SessionRole::Session,
             copy_of: None,
             view: self.cfg.session_view,
+            // A restart without the flag: the report tool goes away with the opener's link.
+            agent_child: false,
         });
         self.gw.mutate(attach, move |app, attached| {
             let restarted = match attached {

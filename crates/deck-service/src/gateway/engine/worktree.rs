@@ -1529,9 +1529,22 @@ impl Engine {
                     // until the finish times out.
                     f.injected = false;
                     f.retry_at = Some(now + RETRY);
+                } else if record.delivery == Delivery::Delivered {
+                    let key = f.key.clone();
+                    let branch = f.wt.branch.clone().unwrap_or_else(|| "HEAD".to_owned());
+                    let base = f.ready.as_ref().map(|ready| ready.base.clone());
+                    if let Some(base) = base {
+                        self.child_finish_injected(&key, &branch, &base);
+                    }
                 }
             }
             Purpose::Move { flow, session } => {
+                if matches!(flow, FlowRef::Retire(_)) {
+                    self.child_retire_move_delivered(
+                        &session,
+                        record.delivery == Delivery::Delivered,
+                    );
+                }
                 if !(lost || cancelled) {
                     return;
                 }
@@ -1605,6 +1618,35 @@ impl Engine {
         self.worktree.moves.retain(|m| m.key.client != client);
     }
 
+    pub(super) fn prefer_worktree_finish_session(&mut self, key: &RequestKey, session: SessionKey) {
+        if let Some(finish) = self
+            .worktree
+            .finishing
+            .values_mut()
+            .find(|finish| &finish.key == key)
+        {
+            finish.session = Some(session);
+        }
+    }
+
+    pub(super) fn append_worktree_finish_state(&self, row: &mut String, path: &Path) {
+        if let Some(finish) = self.worktree.finishing.get(path) {
+            if finish.warned {
+                row.push_str(" | finish blocked: ");
+                if let Some(stage) = self
+                    .jobs
+                    .get(&finish.key)
+                    .and_then(|job| job.progress.as_ref())
+                {
+                    row.extend(stage.stage.chars().take(240));
+                }
+            } else {
+                row.push_str(" | finishing");
+            }
+        } else if self.worktree.retiring.contains_key(path) {
+            row.push_str(" | finishing");
+        }
+    }
     // ---- sessions ---------------------------------------------------------------------------
 
     /// The running omp session (not exited) whose folder lies inside `wt`.
@@ -1642,6 +1684,7 @@ impl Engine {
         // A controller of this session that already exited would swallow the launch.
         self.drop_exited_for(&path, mux_name.as_deref());
         let spec = LaunchSpec {
+            agent_child: false,
             mux_name,
             cwd,
             argv: omp_argv(Some(&path)),
@@ -1677,6 +1720,7 @@ impl Engine {
         }
         self.sess.queue(LaunchJob {
             spec: LaunchSpec {
+                agent_child: false,
                 mux_name: (!self.backends.is_empty())
                     .then(|| deck_core::mux::new_session_name(SystemTime::now())),
                 cwd: dest,
@@ -1833,6 +1877,14 @@ impl Engine {
     }
 
     fn drive_finish(&mut self, path: &Path, now: Instant) {
+        let key = self
+            .worktree
+            .finishing
+            .get(path)
+            .map(|finish| finish.key.clone());
+        if let Some(error) = key.as_ref().and_then(|key| self.child_finish_refusal(key)) {
+            return self.end_finish(path, Err(failed(error)));
+        }
         let Some(f) = self.worktree.finishing.get(path) else {
             return;
         };
@@ -1958,12 +2010,14 @@ impl Engine {
         if !f.warned {
             f.warned = true;
             let key = f.key.clone();
+            self.child_finish_blocked(&key, &text);
             self.wt_stage(&key, text);
         }
     }
 
     fn end_finish(&mut self, path: &Path, result: Result<Done, GatewayError>) {
         if let Some(f) = self.worktree.finishing.remove(path) {
+            self.child_finish_done(&f.key, &result);
             self.job_finished(f.key, result);
             self.wt_views_changed();
         }
@@ -2171,6 +2225,7 @@ impl Engine {
             {
                 self.set_session_path(i, Some(new));
             }
+            self.sync_child_relocations(now);
         }
         for (i, session) in send {
             let r = self.wt_submit(
@@ -2189,6 +2244,9 @@ impl Engine {
                     Ok(()) => {
                         m.sent = true;
                         m.retry_at = None;
+                        if matches!(flow, FlowRef::Retire(_)) {
+                            self.arm_child_retire_move(&session, &reloc.dest, now);
+                        }
                     }
                     Err(_) => {
                         m.sent = false;
@@ -2443,6 +2501,7 @@ impl Engine {
 
     fn end_retire(&mut self, path: &Path, result: Result<Done, GatewayError>) {
         if let Some(r) = self.worktree.retiring.remove(path) {
+            self.child_finish_done(&r.key, &result);
             self.job_finished(r.key, result);
             self.wt_views_changed();
         }
@@ -2979,7 +3038,7 @@ pub(in crate::gateway) fn destination(
 }
 
 /// `WorktreeNew` on a worker: the worktree is made and its merge target recorded.
-fn create_new(
+pub(super) fn create_new(
     omp: Option<&Omp>,
     settings: &SettingsService,
     repo: &Path,

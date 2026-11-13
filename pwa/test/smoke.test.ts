@@ -101,8 +101,8 @@ const VIEW_OPS: [api.Op, api.Resp['type']][] = [
 ];
 
 describe('smoke gateway', () => {
-  test('the Welcome announces s4 and a push key, or neither for an old desktop', () => {
-    expect(setup().recorder.welcome).toMatchObject({ features: ['s4'], push_key: 'BAAA' });
+  test('the Welcome announces optional phone features and a push key, or neither for an old desktop', () => {
+    expect(setup().recorder.welcome).toMatchObject({ features: ['s4', 'form', 'progress'], push_key: 'BAAA' });
     const old = setup(false).recorder.welcome;
     expect(old?.features).toEqual([]);
     expect(old?.push_key).toBeUndefined();

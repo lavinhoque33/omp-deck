@@ -4,7 +4,8 @@
 //! the Rust value, encode equals the text). The slice-4 additions are in `api_s4` against
 //! `tests/vectors/api-s4.json`, the HTML-form additions in `api_form` against
 //! `tests/vectors/api-form.json`, the model-picker preferences in `api_models` against
-//! `tests/vectors/api-models.json`; variant coverage spans all four files.
+//! `tests/vectors/api-models.json`, and live progress in `api_progress` against
+//! `tests/vectors/api-progress.json`; variant coverage spans all API vector files.
 //!
 //! Rewrite after an intentional protocol change:
 //! `OMPDECK_WRITE_VECTORS=1 cargo test -p deck-remote --test api`
@@ -17,9 +18,11 @@ use serde_json::{Value, json};
 mod api_android;
 mod api_form;
 mod api_models;
+mod api_progress;
 mod api_s4;
 use api_form as form;
 use api_models as models;
+use api_progress as progress;
 use api_s4 as s4;
 
 const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/api-v1.json");
@@ -830,6 +833,7 @@ fn feeds() -> Vec<(&'static str, Event)> {
         views: 1,
         requests,
         pending_ui: vec![],
+        progress: None,
     };
     let item = |kind: InboxKind| InboxItem {
         live: live(),
@@ -1976,6 +1980,8 @@ plain!(AppUpdateStep: Download, Apply);
 plain!(ConflictResolution: Keep, Overwrite, Both);
 plain!(UiKind: Select, Confirm, Input, Editor, Ask, Approve, Form);
 plain!(SpanStyle: Code, Strong, Em);
+plain!(ProgressTaskStatus: Pending, InProgress, Completed, Abandoned, Blocked, Unknown);
+plain!(ProgressGoalStatus: Active, Paused, BudgetLimited, Complete, Dropped, Unknown);
 plain!(MuxBackend: Tmux, Host);
 plain!(AgentStatus: Running, Done, Failed, Aborted, Interrupted, Parked);
 plain!(SyncInterval: Off, TenMinutes, ThirtyMinutes, Hourly, SixHours, Daily);
@@ -2923,6 +2929,16 @@ impl Seen {
                     self.add(&s.kind);
                     self.add(&s.activity);
                     self.add(&s.status);
+                    if let Some(p) = &s.progress {
+                        for phase in &p.phases {
+                            for task in &phase.tasks {
+                                self.add(&task.status);
+                            }
+                        }
+                        if let Some(goal) = &p.goal {
+                            self.add(&goal.status);
+                        }
+                    }
                     for r in &s.requests {
                         self.delivery(&r.delivery);
                     }
@@ -3020,6 +3036,8 @@ fn the_vectors_cover_every_variant() {
         serde_json::from_str(include_str!("vectors/api-android.json")).unwrap();
     let models_file: Value =
         serde_json::from_str(&std::fs::read_to_string(models::PATH).unwrap()).unwrap();
+    let progress_file: Value =
+        serde_json::from_str(&std::fs::read_to_string(progress::PATH).unwrap()).unwrap();
     let mut seen = Seen::default();
     for m in file["messages"]
         .as_array()
@@ -3029,6 +3047,7 @@ fn the_vectors_cover_every_variant() {
         .chain(form_file["messages"].as_array().unwrap())
         .chain(android_file["messages"].as_array().unwrap())
         .chain(models_file["messages"].as_array().unwrap())
+        .chain(progress_file["messages"].as_array().unwrap())
     {
         let text = m["json"].as_str().unwrap();
         match m["type"].as_str().unwrap() {
@@ -3084,6 +3103,8 @@ fn the_vectors_cover_every_variant() {
     seen.covered::<UiFormBlock>();
     seen.covered::<UiFormFieldView>();
     seen.covered::<SpanStyle>();
+    seen.covered::<ProgressTaskStatus>();
+    seen.covered::<ProgressGoalStatus>();
     seen.covered::<MuxBackend>();
     seen.covered::<AgentStatus>();
     seen.covered::<SyncInterval>();

@@ -139,7 +139,35 @@ export function liveSession(spec: LiveSpec, requests: api.OwnRequest[] = []): ap
     requests,
   };
   if (spec.ui !== null) out.pending_ui = [spec.ui];
+  if (spec.session === 's-convo' || spec.session === 's-idle') out.progress = progress(spec.session === 's-convo');
   return out;
+}
+
+export function progress(busy = true): api.ProgressView {
+  return {
+    phases: [
+      { name: 'Plan & protocol', tasks: [
+        { content: 'Map phone progress surfaces', status: 'completed' },
+        { content: 'Freeze shared progress vectors', status: 'completed' },
+        { content: 'Preserve compatibility for older phones', status: 'completed' },
+        { content: 'Use a separate progress connection', status: 'abandoned' },
+      ] },
+      { name: 'Phone experience', tasks: [
+        { content: 'Render progress across phone screens', status: busy ? 'in_progress' : 'pending' },
+        { content: 'Capture the progress sheet smoke', status: 'pending' },
+        { content: 'Publish the signed Android release', status: 'blocked' },
+        { content: 'Verify end-to-end delivery', status: 'pending' },
+      ] },
+    ],
+    goal: {
+      objective: 'Make every live session’s plan and goal visible on the phone.',
+      status: busy ? 'active' : 'paused',
+      tokens_used: 24500,
+      token_budget: 80000,
+      time_used_seconds: 1325,
+    },
+    truncated: true,
+  };
 }
 
 const HISTORY: Readonly<Record<string, readonly [string, string | null, string | null, number, boolean?][]>> = {

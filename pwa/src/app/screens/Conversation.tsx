@@ -12,6 +12,7 @@ import { adaptTranscript } from '../transcript/adapter.ts';
 import { perform, shortModel, statusLabel, succeeded } from '../ui/format.ts';
 import { useCan, useClient, useClientState, useFeed, useNow, useTranscript } from '../ui/hooks.ts';
 import { ConfirmSheet, Empty, Sheet, StaleBanner, useS4 } from '../ui/kit.tsx';
+import { ProgressPill, ProgressSheet } from '../ui/progress.tsx';
 import '../../styles/convo.css';
 import { Composer } from './conversation/Composer.tsx';
 import { ContextSheet } from './conversation/ContextSheet.tsx';
@@ -71,7 +72,7 @@ export function ConversationScreen({
   const online = useClientState((state) => state.conn.phase === 'online');
   const allConfirms = useClientState((state) => state.confirms);
   const confirms = live === null ? [] : allConfirms.filter((confirm) => confirm.live.key === live.live.key);
-  const [sheet, setSheet] = useState<'actions' | 'model' | 'meter' | null>(null);
+  const [sheet, setSheet] = useState<'actions' | 'model' | 'meter' | 'progress' | null>(null);
   const pending = live?.pending_ui ?? [];
   const [tracker, setTracker] = useState(EMPTY_TRACKER);
 
@@ -177,6 +178,7 @@ export function ConversationScreen({
             </button>
           )}
           {live?.desktop_controlled === true && <span className="pill warn">Desktop has control</span>}
+          {live?.progress != null && <ProgressPill progress={live.progress} onClick={() => setSheet('progress')} />}
         </div>
       </header>
       <div
@@ -275,6 +277,7 @@ export function ConversationScreen({
       {sheet === 'meter' && (
         <ContextSheet live={live} card={card} model={model} effort={effort} contextWindow={contextWindow} onClose={() => setSheet(null)} />
       )}
+      {sheet === 'progress' && live?.progress != null && <ProgressSheet progress={live.progress} onClose={() => setSheet(null)} />}
     </div>
   );
 }

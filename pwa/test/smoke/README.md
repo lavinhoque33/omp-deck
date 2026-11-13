@@ -102,6 +102,8 @@ Everything is in `fixtures.ts`, keyed to `now` at server start.
   - Cards with git counts and subagent counts.
   - Subagents of `s-convo`: running, done, failed and parked.
   - The context breakdown.
+  - Todo/goal progress on `s-convo` and `s-idle`: Sessions/Running counts, Agents mini bars,
+    and the Conversation **Session progress** pill → goal and phased-task sheet, including a truncated indicator.
 - **Project data.**
   - Changes covering every change kind, plus a conflict and an untracked directory.
   - Inventory with stats.

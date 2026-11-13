@@ -1,5 +1,6 @@
 //! Session-bound extension tools. Requests are ephemeral and never replayed on restart.
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use crate::controller::SessionTarget;
 use crate::gateway::protocol::{ReviewReply, Role, ServerEvent, Split};
 
 pub(super) mod children;
+mod worktrees;
 
 const CAP: usize = 4;
 const NOTIFY_INTERVAL: Duration = Duration::from_secs(10);
@@ -35,6 +37,7 @@ struct Pending {
     opens_session: bool,
     open_prompt: Option<String>,
     forward_questions: bool,
+    worktree_result: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -44,6 +47,7 @@ struct OpenArgs {
     model: Option<String>,
     placement: Option<String>,
     title: Option<String>,
+    worktree: Option<worktrees::OpenWorktree>,
     #[serde(default = "forward_questions_default")]
     forward_questions: bool,
 }
@@ -271,6 +275,7 @@ impl Engine {
                 opens_session: false,
                 open_prompt: None,
                 forward_questions: true,
+                worktree_result: None,
             },
         );
         let result: Result<Option<ServerEvent>, String> = (|| {
@@ -297,7 +302,7 @@ impl Engine {
                     pending.opens_session = true;
                     pending.open_prompt.clone_from(&a.prompt);
                     pending.forward_questions = a.forward_questions;
-                    Some(ServerEvent::AgentOpenSession {
+                    let event = ServerEvent::AgentOpenSession {
                         request,
                         opener: target.clone(),
                         cwd,
@@ -305,7 +310,13 @@ impl Engine {
                         model: a.model,
                         placement,
                         title: a.title,
-                    })
+                    };
+                    if let Some(worktree) = a.worktree {
+                        self.begin_agent_worktree_open(request, event, worktree);
+                        None
+                    } else {
+                        Some(event)
+                    }
                 }
                 "notify" => {
                     let a: NotifyArgs =
@@ -371,6 +382,14 @@ impl Engine {
                 }
                 "answer_question" => {
                     self.begin_answer_question(request, req.args, now)?;
+                    None
+                }
+                "finish_worktree" => {
+                    self.begin_child_finish(request, req.args, now)?;
+                    None
+                }
+                "report" => {
+                    self.begin_child_report(request, req.args, now)?;
                     None
                 }
                 "sessions" => {
@@ -461,6 +480,10 @@ impl Engine {
             return;
         }
         let mut text = text;
+        if ok && let Some(line) = &p.worktree_result {
+            text.push('\n');
+            text.push_str(line);
+        }
         if ok && let Some(opened) = opened {
             match self.register_agent_child(request, &opened) {
                 Ok(Some(handle)) => text.push_str(&format!(
@@ -622,7 +645,7 @@ impl Engine {
                 let open = self.views.values().any(|v| &v.target == target);
                 let model = m.ctl.current_model();
                 let handle = self.child_handle(opener_root.as_deref(), &target.key);
-                let row = format!(
+                let mut row = format!(
                     "{} | {} | {} | model: {:?} | tab open: {} | opened by this session: {}",
                     m.display_label(),
                     home_path(m.current_cwd()),
@@ -631,6 +654,11 @@ impl Engine {
                     open,
                     handle.is_some()
                 );
+                if let Some(snapshot) = m.live.as_ref().and_then(|link| link.client.latest())
+                    && let Some(progress) = &snapshot.progress
+                {
+                    append_progress(&mut row, progress);
+                }
                 let row = match handle {
                     Some(handle) => self.child_handle_row(row, handle),
                     None => row,
@@ -679,6 +707,38 @@ impl Engine {
         }
         rows
     }
+}
+fn append_progress(row: &mut String, progress: &deck_core::ctl::Progress) {
+    if progress.phases.iter().any(|phase| !phase.tasks.is_empty()) {
+        let (done, total) = progress.counts();
+        let _ = write!(row, " | todos: {done}/{total}");
+        if let Some(task) = progress.current() {
+            row.push_str(" (now: ");
+            append_short(row, &task.content, 80);
+            row.push(')');
+        }
+    }
+    if let Some(goal) = &progress.goal {
+        use deck_core::ctl::GoalStatus;
+        let status = match goal.status {
+            GoalStatus::Active => "active",
+            GoalStatus::Paused => "paused",
+            GoalStatus::BudgetLimited => "budget-limited",
+            GoalStatus::Complete => "complete",
+            GoalStatus::Dropped => "dropped",
+            GoalStatus::Unknown => "unknown",
+        };
+        let _ = write!(row, " | goal: {status} — ");
+        append_short(row, &goal.objective, 80);
+    }
+}
+
+fn append_short(out: &mut String, text: &str, cap: usize) {
+    out.extend(
+        text.chars()
+            .take(cap)
+            .map(|ch| if ch.is_control() { ' ' } else { ch }),
+    );
 }
 
 fn relative_path(path: &str) -> bool {
@@ -745,6 +805,7 @@ mod tests {
                     opens_session: false,
                     open_prompt: None,
                     forward_questions: true,
+                    worktree_result: None,
                 },
             );
         }

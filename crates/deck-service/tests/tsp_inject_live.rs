@@ -590,6 +590,7 @@ fn gateway_commands_reach_a_chat_session_that_has_a_view_attached() {
     let Done::Session(target, view) = run(
         &client,
         Mutation::Launch(LaunchSpec {
+            agent_child: false,
             mux_name: Some(mux_name.to_owned()),
             cwd: sb.proj(),
             session_path: None,

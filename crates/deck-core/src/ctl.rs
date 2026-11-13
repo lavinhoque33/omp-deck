@@ -257,6 +257,92 @@ pub struct LiveAgent {
     pub unread: Option<u32>,
 }
 
+/// Bounded live todo and goal state from the main omp session.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct Progress {
+    pub phases: Vec<TodoPhase>,
+    pub goal: Option<GoalInfo>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct TodoPhase {
+    pub name: String,
+    pub tasks: Vec<TodoTask>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct TodoTask {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+    Abandoned,
+    Blocked,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct GoalInfo {
+    pub objective: String,
+    pub status: GoalStatus,
+    pub tokens_used: u64,
+    pub token_budget: Option<u64>,
+    pub time_used_seconds: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    #[default]
+    Active,
+    Paused,
+    BudgetLimited,
+    Complete,
+    Dropped,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Progress {
+    /// Completed tasks and total tasks, excluding abandoned ones.
+    pub fn counts(&self) -> (usize, usize) {
+        self.phases.iter().flat_map(|p| &p.tasks).fold(
+            (0, 0),
+            |(completed, total), task| match task.status {
+                TodoStatus::Abandoned => (completed, total),
+                TodoStatus::Completed => (completed + 1, total + 1),
+                _ => (completed, total + 1),
+            },
+        )
+    }
+
+    /// First in-progress task, otherwise the first pending task.
+    pub fn current(&self) -> Option<&TodoTask> {
+        let mut pending = None;
+        for task in self.phases.iter().flat_map(|p| &p.tasks) {
+            match task.status {
+                TodoStatus::InProgress => return Some(task),
+                TodoStatus::Pending if pending.is_none() => pending = Some(task),
+                _ => {}
+            }
+        }
+        pending
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.goal.is_none() && self.phases.iter().all(|p| p.tasks.is_empty())
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LiveSnapshot {
     pub pid: u32,
@@ -276,6 +362,9 @@ pub struct LiveSnapshot {
     /// `authStorage.oauth.identity`); `None` from older extensions, for api-key providers, or on
     /// any failure.
     pub account: Option<LiveAccount>,
+    /// Main session todo/goal state; `None` from older extensions or on malformed progress.
+    #[serde(default)]
+    pub progress: Option<Progress>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -868,6 +957,61 @@ struct WireSnapshot {
     pending_ui: Vec<Lenient<PendingUi>>,
     #[serde(default)]
     account: Option<Lenient<WireAccount>>,
+    #[serde(default)]
+    progress: Option<Lenient<WireProgress>>,
+}
+
+#[derive(Deserialize)]
+struct WireProgress {
+    phases: Vec<TodoPhase>,
+    goal: Option<WireGoalInfo>,
+    #[serde(default)]
+    truncated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireGoalInfo {
+    objective: String,
+    status: WireGoalStatus,
+    tokens_used: u64,
+    token_budget: Option<u64>,
+    time_used_seconds: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum WireGoalStatus {
+    Active,
+    Paused,
+    BudgetLimited,
+    Complete,
+    Dropped,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<WireProgress> for Progress {
+    fn from(w: WireProgress) -> Self {
+        Self {
+            phases: w.phases,
+            goal: w.goal.map(|g| GoalInfo {
+                objective: g.objective,
+                status: match g.status {
+                    WireGoalStatus::Active => GoalStatus::Active,
+                    WireGoalStatus::Paused => GoalStatus::Paused,
+                    WireGoalStatus::BudgetLimited => GoalStatus::BudgetLimited,
+                    WireGoalStatus::Complete => GoalStatus::Complete,
+                    WireGoalStatus::Dropped => GoalStatus::Dropped,
+                    WireGoalStatus::Unknown => GoalStatus::Unknown,
+                },
+                tokens_used: g.tokens_used,
+                token_budget: g.token_budget,
+                time_used_seconds: g.time_used_seconds,
+            }),
+            truncated: w.truncated,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1062,6 +1206,14 @@ impl From<WireSnapshot> for LiveSnapshot {
             main_idle: w.main_idle,
             leaf: w.leaf,
             agents,
+            progress: match w.progress {
+                Some(Lenient::Ok(p)) => Some(p.into()),
+                Some(Lenient::Bad(_)) => {
+                    log::debug!("ctl: ignored malformed progress");
+                    None
+                }
+                None => None,
+            },
             context: match w.context {
                 Some(Lenient::Ok(c)) => Some(c.into()),
                 Some(Lenient::Bad(_)) => {
@@ -1281,11 +1433,16 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+enum WorkerMessage {
+    Command(u64, CtlCommand),
+    Shutdown,
+}
+
 /// One thread per client: connects to the endpoint of `dir` (`<dir>/ctl.sock` on Unix), reconnects with backoff (≤ 2 s) when the
 /// socket is absent or closed; never blocks the caller. Dropping closes the socket and joins the thread.
 pub struct CtlClient {
     shared: Arc<Shared>,
-    commands: Sender<(u64, CtlCommand)>,
+    commands: Sender<WorkerMessage>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -1367,7 +1524,7 @@ impl CtlClient {
             };
         }
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        if self.commands.send((id, cmd)).is_err() {
+        if self.commands.send(WorkerMessage::Command(id, cmd)).is_err() {
             lock(&self.shared.replies).push((id, failure("control client stopped")));
         }
         id
@@ -1381,8 +1538,9 @@ impl CtlClient {
 impl Drop for CtlClient {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
+        // recv_timeout is not woken by Thread::unpark: wake reconnect backoff on its own channel.
+        let _ = self.commands.send(WorkerMessage::Shutdown);
         if let Some(t) = self.thread.take() {
-            t.thread().unpark();
             let _ = t.join();
         }
     }
@@ -1398,7 +1556,7 @@ fn failure(msg: &str) -> CtlReply {
 
 struct Worker {
     shared: Arc<Shared>,
-    commands: Receiver<(u64, CtlCommand)>,
+    commands: Receiver<WorkerMessage>,
     dir: PathBuf,
     key_file: PathBuf,
     on_update: Box<dyn Fn() + Send>,
@@ -1440,11 +1598,12 @@ impl Worker {
     /// Sleeps up to `d` while rejecting commands (nothing is connected). False = shutdown.
     fn wait(&mut self, d: Duration) -> bool {
         match self.commands.recv_timeout(d) {
-            Ok((id, _)) => {
+            Ok(WorkerMessage::Command(id, _)) => {
                 lock(&self.shared.replies).push((id, failure("not connected")));
                 (self.on_update)();
                 !self.stopping()
             }
+            Ok(WorkerMessage::Shutdown) => false,
             Err(RecvTimeoutError::Timeout) => !self.stopping(),
             Err(RecvTimeoutError::Disconnected) => false,
         }
@@ -1482,7 +1641,10 @@ impl Worker {
             if self.stopping() {
                 return Exit::Shutdown;
             }
-            while let Ok((id, cmd)) = self.commands.try_recv() {
+            while let Ok(message) = self.commands.try_recv() {
+                let WorkerMessage::Command(id, cmd) = message else {
+                    return Exit::Shutdown;
+                };
                 if !hello {
                     lock(&self.shared.replies).push((id, failure("not connected")));
                     (self.on_update)();
@@ -1668,6 +1830,211 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_a_disconnected_client_wakes_maximum_reconnect_backoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = Arc::new(Shared::default());
+        let (commands, receiver) = mpsc::channel();
+        let (waiting, ready) = mpsc::channel();
+        let (stopped, result) = mpsc::channel();
+        let mut worker = Worker {
+            shared: Arc::clone(&shared),
+            commands: receiver,
+            dir: temp.path().join("dead-socket"),
+            key_file: temp.path().join("ctl.key"),
+            on_update: Box::new(|| panic!("shutdown must not publish a command failure")),
+            pending: HashSet::new(),
+        };
+        let thread = thread::spawn(move || {
+            assert!(os::connect(&worker.dir, &worker.key_file).is_err());
+            // Enter the production backoff directly, without timing the earlier short retries.
+            waiting.send(()).unwrap();
+            stopped.send(worker.wait(BACKOFF_MAX)).unwrap();
+        });
+        let client = CtlClient {
+            shared,
+            commands,
+            thread: Some(thread),
+        };
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        let start = std::time::Instant::now();
+        drop(client);
+        assert!(
+            start.elapsed() < Duration::from_millis(300),
+            "dropping waited for reconnect backoff: {:?}",
+            start.elapsed()
+        );
+        assert!(!result.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn progress_maps_omp_goal_wire_keys_to_public_snake_case() {
+        let wire: WireSnapshot = serde_json::from_value(serde_json::json!({
+            "pid": 42,
+            "progress": {
+                "phases": [{"name": "Build", "tasks": [
+                    {"content": "Implement", "status": "in_progress"},
+                    {"content": "Verify", "status": "pending"}
+                ]}],
+                "goal": {
+                    "objective": "Ship the feature",
+                    "status": "budget-limited",
+                    "tokensUsed": 1200,
+                    "tokenBudget": 2000,
+                    "timeUsedSeconds": 90
+                },
+                "truncated": true
+            }
+        }))
+        .unwrap();
+        let snapshot = LiveSnapshot::from(wire);
+        assert_eq!(snapshot.pid, 42);
+        let progress = snapshot.progress.unwrap();
+        assert!(progress.truncated);
+        assert_eq!(progress.current().unwrap().status, TodoStatus::InProgress);
+        let goal = progress.goal.as_ref().unwrap();
+        assert_eq!(
+            goal,
+            &GoalInfo {
+                objective: "Ship the feature".into(),
+                status: GoalStatus::BudgetLimited,
+                tokens_used: 1200,
+                token_budget: Some(2000),
+                time_used_seconds: 90,
+            }
+        );
+        let value = serde_json::to_value(&progress).unwrap();
+        assert_eq!(value["goal"]["status"], "budget_limited");
+        assert_eq!(value["goal"]["tokens_used"], 1200);
+        assert_eq!(value["goal"]["token_budget"], 2000);
+        assert_eq!(value["goal"]["time_used_seconds"], 90);
+        assert!(value["goal"].get("tokensUsed").is_none());
+        assert_eq!(serde_json::from_value::<Progress>(value).unwrap(), progress);
+    }
+
+    #[test]
+    fn malformed_progress_never_drops_the_snapshot() {
+        for progress in [
+            serde_json::json!("bad"),
+            serde_json::json!({"phases": "bad"}),
+            serde_json::json!({"phases": [{"name": "Build", "tasks": [{}]}]}),
+            serde_json::json!({"phases": [], "goal": {
+                "objective": "Build", "status": "active", "tokensUsed": -1,
+                "timeUsedSeconds": 0
+            }}),
+            serde_json::json!({"phases": [], "goal": {
+                "objective": "Build", "status": 42, "tokensUsed": 0,
+                "timeUsedSeconds": 0
+            }}),
+            serde_json::Value::Null,
+        ] {
+            let message: WireMsg = serde_json::from_value(serde_json::json!({
+                "t": "agents", "pid": 73, "mainIdle": true, "leaf": "live",
+                "progress": progress
+            }))
+            .unwrap();
+            let WireMsg::Agents(wire) = message else {
+                panic!("expected snapshot");
+            };
+            let snapshot = LiveSnapshot::from(*wire);
+            assert_eq!(snapshot.pid, 73);
+            assert_eq!(snapshot.main_idle, Some(true));
+            assert_eq!(snapshot.leaf.as_deref(), Some("live"));
+            assert_eq!(snapshot.progress, None);
+        }
+        let old: WireSnapshot = serde_json::from_str(r#"{"pid":73}"#).unwrap();
+        assert_eq!(LiveSnapshot::from(old).progress, None);
+    }
+
+    #[test]
+    fn progress_preserves_unknown_statuses_and_optional_goal_budget() {
+        let wire: WireSnapshot = serde_json::from_value(serde_json::json!({
+            "progress": {
+                "phases": [{"name": "Build", "tasks": [
+                    {"content": "Future task", "status": "new_status"}
+                ]}],
+                "goal": {
+                    "objective": "Future goal", "status": "new-status",
+                    "tokensUsed": 0, "timeUsedSeconds": 0
+                }
+            }
+        }))
+        .unwrap();
+        let progress = LiveSnapshot::from(wire).progress.unwrap();
+        assert_eq!(progress.phases[0].tasks[0].status, TodoStatus::Unknown);
+        assert_eq!(progress.counts(), (0, 1));
+        assert_eq!(progress.current(), None);
+        assert!(!progress.truncated);
+        let goal = progress.goal.unwrap();
+        assert_eq!(goal.status, GoalStatus::Unknown);
+        assert_eq!(goal.token_budget, None);
+        assert_eq!(TodoStatus::default(), TodoStatus::Pending);
+        assert_eq!(GoalStatus::default(), GoalStatus::Active);
+    }
+
+    #[test]
+    fn progress_counts_and_current_span_phases_and_ignore_abandoned_tasks() {
+        let mut progress = Progress::default();
+        assert!(progress.is_empty());
+        assert_eq!(progress.counts(), (0, 0));
+        assert_eq!(progress.current(), None);
+        progress.phases.push(TodoPhase::default());
+        assert!(progress.is_empty());
+        progress.goal = Some(GoalInfo::default());
+        assert!(!progress.is_empty());
+        progress.goal = None;
+        progress.phases = vec![
+            TodoPhase {
+                name: "First".into(),
+                tasks: vec![
+                    TodoTask {
+                        content: "Pending".into(),
+                        status: TodoStatus::Pending,
+                    },
+                    TodoTask {
+                        content: "Done".into(),
+                        status: TodoStatus::Completed,
+                    },
+                    TodoTask {
+                        content: "Abandoned".into(),
+                        status: TodoStatus::Abandoned,
+                    },
+                ],
+            },
+            TodoPhase {
+                name: "Second".into(),
+                tasks: vec![
+                    TodoTask {
+                        content: "Working".into(),
+                        status: TodoStatus::InProgress,
+                    },
+                    TodoTask {
+                        content: "Blocked".into(),
+                        status: TodoStatus::Blocked,
+                    },
+                    TodoTask {
+                        content: "Future".into(),
+                        status: TodoStatus::Unknown,
+                    },
+                    TodoTask {
+                        content: "Later working".into(),
+                        status: TodoStatus::InProgress,
+                    },
+                ],
+            },
+        ];
+        assert!(!progress.is_empty());
+        assert_eq!(progress.counts(), (1, 6));
+        assert_eq!(progress.current().unwrap().content, "Working");
+        for task in &mut progress.phases[1].tasks {
+            task.status = TodoStatus::Completed;
+        }
+        assert_eq!(progress.current().unwrap().content, "Pending");
+        progress.phases[0].tasks[0].status = TodoStatus::Completed;
+        assert_eq!(progress.current(), None);
+        assert_eq!(progress.counts(), (6, 6));
+    }
 
     #[test]
     fn reconnect_does_not_expose_tool_events_from_the_dropped_connection() {

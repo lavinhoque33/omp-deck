@@ -103,7 +103,7 @@ pub(super) struct CopyWatch {
     busy: bool,
 }
 
-/// The live-control client of a session (while followed, or while a command waits on it).
+/// The persistent live-control link of a managed session, independent of UI subscriptions.
 pub(super) struct LiveLink {
     pub(super) client: CtlClient,
     queued: Vec<(Option<RequestKey>, CtlCommand, Instant)>,
@@ -463,6 +463,11 @@ impl Engine {
                         .zip(snap.as_deref())
                         .is_some_and(|(k, s)| s.has_ctl(k));
                 ControllerInfo {
+                    progress: m
+                        .live
+                        .as_ref()
+                        .and_then(|link| link.client.latest())
+                        .and_then(|snapshot| snapshot.progress.clone()),
                     role: m.role.clone(),
                     label: m.display_label(),
                     cwd: m.cwd.clone(),
@@ -1157,6 +1162,7 @@ impl Engine {
         };
         let job = LaunchJob {
             spec: LaunchSpec {
+                agent_child: false,
                 mux_name: m.mux_name.clone(),
                 cwd: m.cwd.clone(),
                 session_path: m.ctl.session_path().map(Path::to_path_buf),
@@ -1295,18 +1301,8 @@ impl Engine {
     }
 
     fn drive_live(&mut self, now: Instant) {
-        let wanted: HashSet<SessionKey> = self
-            .conns
-            .values()
-            .flat_map(|c| c.subs.iter())
-            .filter_map(|t| match t {
-                crate::gateway::protocol::Topic::Live(k) => Some(k.clone()),
-                _ => None,
-            })
-            .chain(self.child_live_keys())
-            .collect();
         let mut finished: Vec<(RequestKey, Result<Done, GatewayError>)> = Vec::new();
-        let mut changed: Vec<SessionKey> = Vec::new();
+        let mut changed: Vec<(SessionKey, bool)> = Vec::new();
         let mut replies = Vec::new();
         let mut resolved = false;
         for i in 0..self.sess.managed.len() {
@@ -1329,30 +1325,25 @@ impl Engine {
                     && m.ctl.session_path().is_none()
                     && (!m.ctl_probed || m.live.as_ref().is_some_and(|l| l.client.connected()))
             };
-            if wanted.contains(&key)
-                || unresolved
-                || (!self.sess.managed[i].ctl_probed
-                    && self.sess.managed[i].ctl_key.is_some()
-                    && !self.sess.managed[i].exited())
-            {
+            if self.sess.managed[i].ctl_key.is_some() && !self.sess.managed[i].exited() {
                 self.ensure_live(i);
             }
             let m = &mut self.sess.managed[i];
+            let monitored = m.ctl_key.is_some();
             let busy = m
                 .live
                 .as_ref()
                 .is_some_and(|l| !l.queued.is_empty() || !l.pending.is_empty());
             let tools = m.live.as_mut().is_some_and(|l| {
-                if l.client.connected() {
+                if l.client.connected() && (!l.seen.0 || l.subscribed.is_none()) {
                     l.tools = l.client.features().iter().any(|f| f == "tools");
                 }
                 l.tools
             });
             let probing = !m.ctl_probed && m.ctl_key.is_some() && !m.exited();
-            if m.exited() || (!wanted.contains(&key) && !busy && !unresolved && !tools && !probing)
-            {
+            if m.exited() || (!monitored && !busy && !unresolved && !tools && !probing) {
                 if m.live.take().is_some() {
-                    changed.push(key);
+                    changed.push((key, true));
                 }
                 continue;
             }
@@ -1363,7 +1354,7 @@ impl Engine {
             if connected {
                 m.ctl_probed = true;
             }
-            let subscription = (wanted.contains(&key) || unresolved, tools);
+            let subscription = (monitored || unresolved, tools);
             if connected && link.subscribed != Some(subscription) {
                 link.client.send(CtlCommand::Subscribe {
                     snapshots: subscription.0,
@@ -1399,6 +1390,7 @@ impl Engine {
                     rid,
                     reply.ok,
                     reply.code.as_deref() == Some("root_mismatch"),
+                    reply.error.clone(),
                 ));
                 if let Some(Some(rk)) = link.pending.remove(&rid) {
                     finished.push((rk, Ok(Done::Ctl(reply))));
@@ -1430,12 +1422,20 @@ impl Engine {
                     _ => false,
                 };
             if !same {
+                let previous = link.seen.1.as_deref();
+                let current = latest.as_deref();
+                let connection_changed = link.seen.0 != connected;
+                let model_changed = previous.and_then(|s| s.model.as_ref())
+                    != current.and_then(|s| s.model.as_ref());
+                let progress_changed = previous.and_then(|s| s.progress.as_ref())
+                    != current.and_then(|s| s.progress.as_ref());
+                self.dirty.controllers |= connection_changed || progress_changed;
                 link.seen = (connected, latest);
-                changed.push(key);
+                changed.push((key, connection_changed || model_changed));
             }
         }
-        for (key, rid, ok, root_mismatch) in replies {
-            self.agent_tool_reply_done(&key, rid, ok, root_mismatch);
+        for (key, rid, ok, root_mismatch, error) in replies {
+            self.agent_tool_reply_done(&key, rid, ok, root_mismatch, error);
         }
         for (key, result) in finished {
             if let Some(change) = self.defer.model_changes.remove(&key) {
@@ -1473,12 +1473,11 @@ impl Engine {
             self.sess.manifest_dirty = true;
             self.dirty.controllers = true;
         }
-        for key in changed {
-            if let Some(i) = self.sess.find(&key) {
+        for (key, observe) in changed {
+            if observe && let Some(i) = self.sess.find(&key) {
                 self.run_observe(i, now);
             }
             self.changed(crate::gateway::protocol::Topic::Live(key));
-            self.dirty.controllers = true;
         }
     }
 
@@ -1864,7 +1863,9 @@ impl Engine {
             let ext = self.ctl_ext.clone();
             let ns = self.ctl_ns.clone();
             let omp = self.omp.as_ref().map(|o| o.program().to_path_buf());
-            let tools = self.cfg.agent_tools.env_value();
+            let mut tools = self.cfg.agent_tools.clone();
+            tools.report &= job.spec.agent_child;
+            let tools = tools.env_value();
             self.spawn_worker("launch", move || {
                 Fin::Prepared(Box::new(prepare(
                     job, name, ctl_key, mux, ns, ext, omp, tools,
@@ -2043,6 +2044,7 @@ impl Engine {
             }
             self.sess.queue(LaunchJob {
                 spec: LaunchSpec {
+                    agent_child: false,
                     mux_name: Some(e.name),
                     argv: omp_argv(e.session_path.as_deref()),
                     cwd: e.cwd,
@@ -2465,6 +2467,7 @@ mod tests {
     fn a_client_losing_its_rights_loses_only_its_own_queued_launches() {
         let job = |label: &str, key: Option<(&str, u64)>| LaunchJob {
             spec: LaunchSpec {
+                agent_child: false,
                 mux_name: None,
                 cwd: PathBuf::from("/p"),
                 session_path: None,
@@ -2638,6 +2641,7 @@ mod tests {
     fn prepare_job(view: SessionView, role: SessionRole) -> LaunchJob {
         LaunchJob {
             spec: LaunchSpec {
+                agent_child: false,
                 mux_name: Some("omp-prep-chat".into()),
                 cwd: PathBuf::from("/tmp"),
                 session_path: Some(PathBuf::from("/s/a.jsonl")),

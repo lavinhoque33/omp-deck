@@ -294,6 +294,7 @@ fn events() -> Vec<(&'static str, Event)> {
         desktop_controlled: false,
         views: 0,
         requests: vec![],
+        progress: None,
         pending_ui: vec![UiRequestView {
             title: s("Ask"),
             timeout_ms: Some(60_000),

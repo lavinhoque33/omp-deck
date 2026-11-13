@@ -206,7 +206,7 @@ describe('connection', () => {
     expect(client.getState().conn.phase).toBe('connecting');
     expect(last().target.hello.ts).toBe(11);
     expect(store.value?.last).toBe(11);
-    expect(last().target.hello.features).toEqual(['s4', 'form']);
+    expect(last().target.hello.features).toEqual(['s4', 'form', 'progress']);
     welcome(last());
     expect(client.getState().conn.phase).toBe('online');
     expect(client.getState().welcome?.next_seq).toBe(28);

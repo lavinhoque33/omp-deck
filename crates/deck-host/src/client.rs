@@ -2,6 +2,7 @@
 //! events.
 
 use std::collections::HashMap;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -331,11 +332,62 @@ pub struct AttachedRx {
 impl AttachedRx {
     /// Next event. After `Exited`, `Displaced` or `Closed`, the following call returns `Closed`.
     pub fn recv(&mut self) -> Result<HostEvent> {
+        self.recv_inner(None)
+    }
+
+    /// Next event within one total budget, including partial frames and snapshot chunks.
+    ///
+    /// On timeout returns [`Error::Timeout`] and aborts the connection (both halves).
+    /// Any other read/protocol error also aborts it: a partially consumed frame cannot
+    /// safely be resumed. Subsequent reads return [`HostEvent::Closed`]. Success restores
+    /// ordinary blocking reads. OS timer granularity and I/O cancellation can delay return
+    /// slightly beyond the budget; this is not a hard real-time deadline.
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<HostEvent> {
+        if self.closed {
+            return Ok(HostEvent::Closed);
+        }
+        let budget = ReadBudget {
+            started: Instant::now(),
+            timeout,
+        };
+        let result = self.recv_inner(Some(&budget));
+        let result = match result {
+            Err(Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Err(Error::Timeout("receiving host event"))
+            }
+            other => other,
+        };
+        let result = result.and_then(|event| {
+            self.stream.set_read_timeout(None)?;
+            Ok(event)
+        });
+        if result.is_err() {
+            self.closed = true;
+            self.stream.abort();
+        }
+        result
+    }
+
+    fn recv_inner(&mut self, budget: Option<&ReadBudget>) -> Result<HostEvent> {
         loop {
             if self.closed {
                 return Ok(HostEvent::Closed);
             }
-            let kind = read_event_frame(&mut self.stream, &mut self.payload)?;
+            let kind = match budget {
+                Some(budget) => read_event_frame(
+                    &mut DeadlineReader {
+                        stream: &mut self.stream,
+                        budget,
+                    },
+                    &mut self.payload,
+                )?,
+                None => read_event_frame(&mut self.stream, &mut self.payload)?,
+            };
             match kind {
                 None => {
                     self.closed = true;
@@ -443,8 +495,35 @@ impl AttachedRx {
     }
 }
 
+/// Shared by every underlying read, not renewed at frame or snapshot chunk boundaries.
+struct ReadBudget {
+    started: Instant,
+    timeout: Duration,
+}
+
+struct DeadlineReader<'a> {
+    stream: &'a mut Stream,
+    budget: &'a ReadBudget,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self
+            .budget
+            .timeout
+            .checked_sub(self.budget.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+        // Keep Windows' millisecond timeout below its INFINITE sentinel even for
+        // caller-supplied budgets of many days.
+        let remaining = remaining.min(Duration::from_millis(u64::from(u32::MAX - 1)));
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buf)
+    }
+}
+
 /// Reads one frame of an event stream; a connection reset or broken pipe counts as the end.
-fn read_event_frame(stream: &mut Stream, payload: &mut Vec<u8>) -> Result<Option<Kind>> {
+fn read_event_frame(stream: &mut impl Read, payload: &mut Vec<u8>) -> Result<Option<Kind>> {
     match protocol::read_frame(stream, payload) {
         Err(Error::Io(e))
             if matches!(
@@ -743,5 +822,173 @@ impl AttachedTx {
     /// Detaches (the session keeps running); the receiver gets `Closed`.
     pub fn detach(&self) -> Result<()> {
         self.0.finish(Kind::Detach)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::mpsc;
+    use std::thread;
+
+    use super::*;
+    use crate::transport::{self, Listener};
+
+    fn connection() -> (AttachedRx, Stream) {
+        let mut nonce = [0; 4];
+        getrandom::fill(&mut nonce).unwrap();
+        let ns = Namespace::new(&format!(
+            "omp-deck-test-{}-{:08x}",
+            std::process::id(),
+            u32::from_ne_bytes(nonce)
+        ))
+        .unwrap();
+        let endpoint = ns.endpoint("recv").unwrap();
+        let listener = Listener::bind(&endpoint).unwrap();
+        let accept = thread::spawn(move || {
+            let stream = listener.accept().unwrap();
+            listener.remove();
+            stream
+        });
+        let stream = transport::connect(&endpoint).unwrap();
+        let peer = accept.join().unwrap();
+        #[cfg(unix)]
+        std::fs::remove_dir_all(ns.dir()).unwrap();
+        (
+            AttachedRx {
+                stream,
+                payload: Vec::new(),
+                snapshot: Vec::new(),
+                blobs: HashMap::new(),
+                closed: false,
+            },
+            peer,
+        )
+    }
+
+    fn frame(kind: Kind, bytes: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        protocol::write_frame(&mut encoded, &mut Vec::new(), kind, bytes).unwrap();
+        encoded
+    }
+
+    #[test]
+    fn timeout_aborts_silent_and_partially_consumed_connections() {
+        let encoded = frame(Kind::Snapshot, b"snapshot");
+        // No header, partial header, and partial payload.
+        for prefix in [0, 2, 7] {
+            let (mut rx, mut peer) = connection();
+            let mut writer = rx.stream.try_clone().unwrap();
+            peer.write_all(&encoded[..prefix]).unwrap();
+            assert!(matches!(
+                rx.recv_timeout(Duration::from_millis(30)),
+                Err(Error::Timeout("receiving host event"))
+            ));
+            assert_eq!(rx.recv().unwrap(), HostEvent::Closed);
+            assert_eq!(rx.recv_timeout(Duration::ZERO).unwrap(), HostEvent::Closed);
+            assert!(writer.write_all(b"input").is_err());
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn zero_budget_closes_without_reading() {
+        let (mut rx, mut peer) = connection();
+        peer.write_all(&frame(Kind::SnapshotEnd, b"")).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::ZERO),
+            Err(Error::Timeout(_))
+        ));
+        assert_eq!(rx.recv().unwrap(), HostEvent::Closed);
+    }
+
+    #[test]
+    fn deadline_is_not_renewed_by_trickling_bytes_or_snapshot_chunks() {
+        for chunks in [false, true] {
+            let (mut rx, mut peer) = connection();
+            let (started_tx, started_rx) = mpsc::channel();
+            let sender = thread::spawn(move || {
+                // Each read/frame fits inside the budget, but the complete event does not.
+                let bytes = frame(Kind::Snapshot, &[b'x'; 100]);
+                started_tx.send(()).unwrap();
+                for i in 0..100 {
+                    let bytes = if chunks {
+                        frame(Kind::Snapshot, b"x")
+                    } else {
+                        vec![bytes[i]]
+                    };
+                    if peer.write_all(&bytes).is_err() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if !chunks && peer.write_all(&bytes[100..]).is_err() {
+                    return;
+                }
+                let _ = peer.write_all(&frame(Kind::SnapshotEnd, b""));
+            });
+            started_rx.recv().unwrap();
+            assert!(matches!(
+                rx.recv_timeout(Duration::from_millis(100)),
+                Err(Error::Timeout(_))
+            ));
+            assert_eq!(rx.recv().unwrap(), HostEvent::Closed);
+            sender.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn complete_snapshot_restores_blocking_recv() {
+        let (mut rx, mut peer) = connection();
+        peer.write_all(&frame(Kind::Snapshot, b"first ")).unwrap();
+        peer.write_all(&frame(Kind::Snapshot, b"snapshot")).unwrap();
+        peer.write_all(&frame(Kind::SnapshotEnd, b"")).unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+            HostEvent::Snapshot(b"first snapshot".to_vec())
+        );
+        let sender = thread::spawn(move || {
+            // Exceed the old budget: a leaked transport timeout would fail this read.
+            thread::sleep(Duration::from_millis(200));
+            peer.write_all(&frame(Kind::Output, b"live")).unwrap();
+            peer.write_all(&frame(Kind::Displaced, b"")).unwrap();
+        });
+        assert_eq!(rx.recv().unwrap(), HostEvent::Output(b"live".to_vec()));
+        assert_eq!(rx.recv().unwrap(), HostEvent::Displaced);
+        assert_eq!(rx.recv().unwrap(), HostEvent::Closed);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn frame_reads_share_the_original_budget() {
+        let (mut rx, mut peer) = connection();
+        peer.write_all(&frame(Kind::Snapshot, b"chunk")).unwrap();
+        peer.write_all(&frame(Kind::SnapshotEnd, b"")).unwrap();
+        let mut budget = ReadBudget {
+            started: Instant::now(),
+            timeout: Duration::from_secs(60),
+        };
+        assert_eq!(
+            read_event_frame(
+                &mut DeadlineReader {
+                    stream: &mut rx.stream,
+                    budget: &budget,
+                },
+                &mut rx.payload,
+            )
+            .unwrap(),
+            Some(Kind::Snapshot)
+        );
+        // Expire the same budget without sleeping or depending on thread scheduling.
+        budget.started -= Duration::from_secs(120);
+        let result = read_event_frame(
+            &mut DeadlineReader {
+                stream: &mut rx.stream,
+                budget: &budget,
+            },
+            &mut rx.payload,
+        );
+        assert!(matches!(result, Err(Error::Io(e)) if e.kind() == io::ErrorKind::TimedOut));
     }
 }

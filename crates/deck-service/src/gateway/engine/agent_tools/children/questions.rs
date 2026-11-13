@@ -863,6 +863,10 @@ impl Engine {
                     .file
                     .as_ref()
                     .is_some_and(|known| snapshot.session_file.as_ref() != Some(known))
+                    && !child
+                        .relocation
+                        .as_ref()
+                        .is_some_and(|permit| permit.allows(snapshot.session_file.as_deref(), now))
                 {
                     child.invalidated = true;
                     child.forward_questions = false;

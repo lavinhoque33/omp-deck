@@ -142,6 +142,11 @@ pub(crate) enum Fin {
         request: u64,
         result: Result<String, String>,
     },
+    AgentWorktreeOpen {
+        request: u64,
+        event: Box<ServerEvent>,
+        result: Result<(PathBuf, String, String), String>,
+    },
     /// A journaled job ended.
     Mutation {
         key: RequestKey,
@@ -735,6 +740,13 @@ impl Engine {
                 Ok(text) => self.finish_agent_tool(request, true, text),
                 Err(text) => self.finish_agent_tool(request, false, text),
             },
+            Fin::AgentWorktreeOpen {
+                request,
+                event,
+                result,
+            } => {
+                self.agent_worktree_opened(request, *event, result);
+            }
             Fin::Mutation { key, result } => self.job_finished(key, result),
             Fin::Worktree(fin) => self.on_worktree_fin(*fin),
             Fin::Progress { key, progress } => self.job_progress(key, progress),

@@ -332,6 +332,7 @@ fn retired(d: Done) -> (Vec<String>, u32, bool) {
 /// Launches omp in `dir` (a tmux session named `name`) and waits until it runs.
 fn launch_omp(client: &GatewayClient, dir: &Path, name: &str) -> SessionTarget {
     let launch = client.mutate(Mutation::Launch(LaunchSpec {
+        agent_child: false,
         mux_name: Some(format!("{name}-{}", std::process::id())),
         cwd: dir.to_path_buf(),
         session_path: None,

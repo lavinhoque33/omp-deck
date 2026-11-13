@@ -11,11 +11,11 @@ use crate::icons::{
     ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_BRAIN, ICON_CHART_PIE, ICON_CHEVRON_DOWN,
     ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_STOP, ICON_COPY, ICON_CPU, ICON_DOWNLOAD,
     ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_FOLDER_GIT_2, ICON_GAUGE, ICON_GIT_BRANCH,
-    ICON_GIT_FORK, ICON_GIT_MERGE, ICON_HANDSHAKE, ICON_HISTORY, ICON_KEY_ROUND, ICON_LIST_TREE,
-    ICON_LOG_IN, ICON_MAP, ICON_NETWORK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE,
-    ICON_VIBRATE,
+    ICON_GIT_FORK, ICON_GIT_MERGE, ICON_HANDSHAKE, ICON_HISTORY, ICON_KEY_ROUND, ICON_LIST_CHECKS,
+    ICON_LIST_TREE, ICON_LOG_IN, ICON_MAP, ICON_NETWORK, ICON_PENCIL, ICON_ROTATE_CCW,
+    ICON_SPARKLES, ICON_SQUARE, ICON_VIBRATE,
 };
-use deck_core::ctl::{ContextBreakdown, LiveAccount, LiveModel};
+use deck_core::ctl::{ContextBreakdown, LiveAccount, LiveModel, Progress};
 use deck_core::omp::ModelInfo;
 use deck_core::sessions::abbreviate_home;
 use deck_core::status::{GitInfo, SessionStats, SessionStatus};
@@ -186,6 +186,10 @@ pub struct BarView {
     pub show_cost: bool,
     pub last_turn_failed: bool,
     pub has_reply: bool,
+    /// The session's live todo / goal progress (`None` or empty: no segment).
+    progress: Option<Progress>,
+    /// Its chip label: checklist + `3/7`, or target + the goal's status.
+    progress_label: Option<(crate::icons::Icon, String)>,
 }
 
 /// omp's configured default model and thinking level (`modelRoles.default`,
@@ -243,6 +247,16 @@ impl BarView {
     pub fn set_account(&mut self, account: Option<&LiveAccount>) {
         if self.account.as_ref() != account {
             self.account = account.cloned();
+            self.rev += 1;
+        }
+    }
+
+    /// The live todo / goal progress; a change changes the Progress chip: bumps `rev`.
+    pub fn set_progress(&mut self, progress: Option<&Progress>) {
+        let progress = progress.filter(|p| !p.is_empty());
+        if self.progress.as_ref() != progress {
+            self.progress = progress.cloned();
+            self.progress_label = progress.and_then(crate::progress_view::compact);
             self.rev += 1;
         }
     }
@@ -715,15 +729,17 @@ enum Seg {
     Ctx,
     Usage,
     Git,
+    Progress,
     Cost,
     Tokens,
     Path,
 }
 
-const SEGS: [Seg; 6] = [
+const SEGS: [Seg; 7] = [
     Seg::Ctx,
     Seg::Usage,
     Seg::Git,
+    Seg::Progress,
     Seg::Cost,
     Seg::Tokens,
     Seg::Path,
@@ -743,7 +759,7 @@ type SegKey = (
 struct SegWidths {
     key: SegKey,
     /// The path's entry is its smallest chip (last folder only).
-    w: [f32; 6],
+    w: [f32; 7],
     /// What the path chip adds around its text, and the width of the whole path as text.
     path_chrome: f32,
     path_text_w: f32,
@@ -791,7 +807,7 @@ fn seg_widths(ui: &mut Ui, ink: &Ink, v: &BarView) -> SegWidths {
     {
         return c;
     }
-    let mut w = [0.0; 6];
+    let mut w = [0.0; 7];
     let mut sink = Vec::new();
     for (i, s) in SEGS.into_iter().enumerate() {
         w[i] = if s == Seg::Path {
@@ -896,6 +912,7 @@ fn info_row(
                 || v.login_hint.nothing_logged_in
                 || !v.login_hint.problems.is_empty()
         }
+        Seg::Progress => v.progress_label.is_some(),
         Seg::Ctx | Seg::Path => true,
     });
     // The model chip has one width in every session, but never takes over the bar: it yields
@@ -915,11 +932,12 @@ fn info_row(
     let spare = budget - spent(&widths.w, &shown, gap);
     let path = shown[Seg::Path as usize]
         .then(|| path_text(ui, v, &widths, widths.w[Seg::Path as usize] + spare));
-    // Drawn in reading order: path, git, ctx, tokens, cost, usage.
+    // Drawn in reading order: path, git, ctx, progress, tokens, cost, usage.
     for s in [
         Seg::Path,
         Seg::Git,
         Seg::Ctx,
+        Seg::Progress,
         Seg::Tokens,
         Seg::Cost,
         Seg::Usage,
@@ -1013,6 +1031,15 @@ fn segment(ui: &mut Ui, ink: &Ink, v: &BarView, seg: Seg, path: &str, out: &mut 
                 ui.add(text(&v.cost, TEXT_PX, pal.ok));
             });
             cost_tip::hover(&r, &v.cost_tip);
+        }
+        Seg::Progress => {
+            if let (Some(p), Some((icon, label))) = (&v.progress, &v.progress_label) {
+                let r = chip(ui, ink, "progress", Sense::hover(), Tone::Plain, |ui| {
+                    ui.label(icon_text(*icon, ICON_PX, pal.accent));
+                    ui.add(text(label, TEXT_PX, pal.text));
+                });
+                progress_hover(&r, p);
+            }
         }
         Seg::Usage => usage_segment(ui, ink, v, out),
     }
@@ -1440,6 +1467,28 @@ fn tokens_hover(resp: &Response, tip: &TokensTip) {
                 });
             }
         },
+    );
+}
+
+/// Hover card of the Progress chip: the goal (objective, status, tokens, elapsed) and the todo
+/// phases with each task's status.
+fn progress_hover(resp: &Response, p: &Progress) {
+    let sub = crate::progress_view::todos_line(p);
+    let mut head = card::Header::new(ICON_LIST_CHECKS, "Progress");
+    if let Some(s) = &sub {
+        head = head.subtitle(s);
+    }
+    card::hover(
+        resp,
+        380.0,
+        false,
+        &head,
+        |ui| {
+            if let Some(t) = crate::progress_view::counts_text(p) {
+                badge::show(ui, Some(ICON_LIST_CHECKS), &t, Hue::Blue, tips::VALUE);
+            }
+        },
+        |ui| crate::progress_view::card_body(ui, p),
     );
 }
 
@@ -2536,19 +2585,20 @@ mod tests {
 
     #[test]
     fn segments_drop_monotonically_as_the_bar_narrows() {
-        // In priority order: ctx, usage, git, cost, tokens, path (smallest chip). Greedy skipping
-        // would show a narrow low-priority segment while a wider higher one is gone.
-        let widths = [60.0, 90.0, 300.0, 70.0, 80.0, 130.0];
-        let all = [true; 6];
-        let mut prev = [true; 6];
+        // In priority order: ctx, usage, git, progress, cost, tokens, path (smallest chip).
+        // Greedy skipping would show a narrow low-priority segment while a wider higher one is
+        // gone.
+        let widths = [60.0, 90.0, 300.0, 50.0, 70.0, 80.0, 130.0];
+        let all = [true; 7];
+        let mut prev = [true; 7];
         let mut w = 900.0;
         while w >= 0.0 {
             let now = fit_segments(&widths, &all, w, 6.0);
-            for i in 0..6 {
+            for i in 0..7 {
                 assert!(prev[i] || !now[i], "segment {i} came back at {w}px");
             }
             // Never a lower-priority segment without every higher-priority one.
-            for i in 1..6 {
+            for i in 1..7 {
                 assert!(
                     !now[i] || now[i - 1],
                     "segment {i} shown without {} at {w}",
@@ -2577,8 +2627,8 @@ mod tests {
 
         // Usage (index 1) is dropped only once the chip is at its minimum and still leaves no
         // room; every segment still drops monotonically.
-        let widths = [150.0, 250.0, 420.0, 70.0, 80.0, 130.0];
-        let all = [true; 6];
+        let widths = [150.0, 250.0, 420.0, 50.0, 70.0, 80.0, 130.0];
+        let all = [true; 7];
         let fit = |bar: f32| {
             let (chip, _) = model_chip_width(bar, reserved);
             fit_segments(&widths, &all, bar - chip - 6.0, 6.0)
@@ -2592,11 +2642,11 @@ mod tests {
             !fit(least - 20.0)[1],
             "usage goes once the chip cannot yield more"
         );
-        let mut prev = [true; 6];
+        let mut prev = [true; 7];
         let mut bar = 1400.0;
         while bar >= 0.0 {
             let now = fit(bar);
-            for i in 0..6 {
+            for i in 0..7 {
                 assert!(prev[i] || !now[i], "segment {i} came back at {bar}px");
             }
             prev = now;
@@ -2860,6 +2910,7 @@ mod layout_tests {
         ctx: bool,
         usage: bool,
         git: bool,
+        progress: bool,
         cost: bool,
         tokens: bool,
         /// The path chip's text.
@@ -2867,12 +2918,13 @@ mod layout_tests {
     }
 
     impl Shown {
-        /// `[ctx, usage, git, cost, tokens, path]` in priority order.
-        fn flags(&self) -> [bool; 6] {
+        /// `[ctx, usage, git, progress, cost, tokens, path]` in priority order.
+        fn flags(&self) -> [bool; 7] {
             [
                 self.ctx,
                 self.usage,
                 self.git,
+                self.progress,
                 self.cost,
                 self.tokens,
                 self.path.is_some(),
@@ -2944,6 +2996,25 @@ mod layout_tests {
             view.update(Some(&Arc::new(st)), Path::new("/x"), &cat);
             let usage = deck_core::usage::UsageSnapshot::parse(USAGE).expect("fixture parses");
             view.set_usage(Some(&Arc::new(Summary::build(&usage, 0))));
+            view.set_progress(Some(&Progress {
+                phases: vec![deck_core::ctl::TodoPhase {
+                    name: "Build".into(),
+                    tasks: [
+                        deck_core::ctl::TodoStatus::Completed,
+                        deck_core::ctl::TodoStatus::Completed,
+                        deck_core::ctl::TodoStatus::InProgress,
+                        deck_core::ctl::TodoStatus::Pending,
+                        deck_core::ctl::TodoStatus::Pending,
+                    ]
+                    .into_iter()
+                    .map(|status| deck_core::ctl::TodoTask {
+                        content: "task".into(),
+                        status,
+                    })
+                    .collect(),
+                }],
+                ..Progress::default()
+            }));
             Rig {
                 ctx,
                 view,
@@ -3004,6 +3075,7 @@ mod layout_tests {
                 git: has(BRANCH),
                 cost: has("$7.00"),
                 tokens: has("50K"),
+                progress: has("2/5"),
                 path: info
                     .iter()
                     .find(|t| t.ends_with(FOLDER))
@@ -3068,13 +3140,13 @@ mod layout_tests {
     #[test]
     fn segments_drop_in_priority_order_and_never_come_back_on_a_narrower_bar() {
         let mut rig = Rig::new(WORKTREE);
-        let mut prev = [true; 6];
+        let mut prev = [true; 7];
         let mut width = 3200.0;
         while width >= 500.0 {
             let now = rig.shown(width).flags();
-            for i in 0..6 {
+            for i in 0..7 {
                 assert!(prev[i] || !now[i], "segment {i} came back at {width}px");
-                // ctx, usage, git, cost, tokens, path: never one without all before it.
+                // ctx, usage, git, progress, cost, tokens, path: never one without all before it.
                 assert!(
                     i == 0 || !now[i] || now[i - 1],
                     "segment {i} shown without {} at {width}px",

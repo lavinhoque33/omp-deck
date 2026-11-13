@@ -65,6 +65,9 @@ pub(super) struct SpawnReq {
     pub copy_of: Option<String>,
     /// The view the session opens in (what the gateway uses when it has to create it).
     pub view: SessionView,
+    /// Opened by another session's agent (`ompdeck_open_session`): the gateway offers it the
+    /// report tool.
+    pub agent_child: bool,
     pub post: Post,
     pub focus: Focus,
 }
@@ -90,6 +93,7 @@ impl SpawnReq {
             tool: None,
             copy_of: None,
             view,
+            agent_child: false,
             post,
             focus,
         }
@@ -106,6 +110,7 @@ impl SpawnReq {
             tool: Some(tool),
             copy_of: None,
             view: SessionView::Terminal,
+            agent_child: false,
             post: Post::None,
             focus: Focus::Claim,
         }
@@ -131,6 +136,7 @@ impl SpawnReq {
                 role: SessionRole::Session,
                 copy_of: self.copy_of.clone(),
                 view: self.view,
+                agent_child: self.agent_child,
             }),
         }
     }

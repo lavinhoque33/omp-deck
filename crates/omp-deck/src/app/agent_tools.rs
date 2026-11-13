@@ -291,6 +291,7 @@ impl App {
             Focus::Claim,
         );
         req.argv = tabs::agent_omp_argv(model.as_deref(), prompt.as_deref());
+        req.agent_child = true;
         self.spawn_tab_post(req);
         self.raise_window(None);
         self.ctx.request_repaint();

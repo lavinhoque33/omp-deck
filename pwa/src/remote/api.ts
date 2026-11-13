@@ -60,6 +60,8 @@ export const MAX_DIFF_TEXT = 768 * 1024;
 export const FEATURE_S4 = 's4';
 /** omp 18.18's HTML-form `ask` (`UiKind` `form`): listed to a device that announced it. */
 export const FEATURE_FORM = 'form';
+/** Live todo phases and goal state, sent only after the device announces this feature. */
+export const FEATURE_PROGRESS = 'progress';
 /**
  * Native Android encrypted FCM push (`push_android_subscribe`): the gateway lists it in
  * `Welcome.features` only while its FCM sender is configured. Gateway → device only; a device never announces it.
@@ -710,6 +712,35 @@ export interface LiveSession {
   requests: OwnRequest[];
   /** Slice 4, absent when empty: omp's pending UI requests, oldest first. */
   pending_ui?: UiRequestView[];
+  /** Feature `progress`, absent when there are no tasks or current goal. */
+  progress?: ProgressView | null;
+}
+
+export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'abandoned' | 'blocked' | 'unknown';
+export type GoalStatus = 'active' | 'paused' | 'budget_limited' | 'complete' | 'dropped' | 'unknown';
+
+export interface TodoTask {
+  content: string;
+  status: TodoStatus;
+}
+
+export interface TodoPhase {
+  name: string;
+  tasks: TodoTask[];
+}
+
+export interface GoalInfo {
+  objective: string;
+  status: GoalStatus;
+  tokens_used: number;
+  token_budget: number | null;
+  time_used_seconds: number;
+}
+
+export interface ProgressView {
+  phases: TodoPhase[];
+  goal: GoalInfo | null;
+  truncated: boolean;
 }
 
 /** An image of a transcript message, fetched with the `blob` op. */
@@ -2111,6 +2142,19 @@ const delivery = tagged<DeliveryView, 'state'>('state', {
   unobserved: {},
 });
 const ownRequest = struct<OwnRequest>({ request: u64, seq: u64, label: str, delivery });
+const todoTask = struct<TodoTask>({
+  content: str,
+  status: oneOf<TodoStatus>(['pending', 'in_progress', 'completed', 'abandoned', 'blocked', 'unknown']),
+});
+const todoPhase = struct<TodoPhase>({ name: str, tasks: list(todoTask) });
+const goalInfo = struct<GoalInfo>({
+  objective: str,
+  status: oneOf<GoalStatus>(['active', 'paused', 'budget_limited', 'complete', 'dropped', 'unknown']),
+  tokens_used: u64,
+  token_budget: nullable(u64),
+  time_used_seconds: u64,
+});
+const progressView = struct<ProgressView>({ phases: list(todoPhase), goal: nullable(goalInfo), truncated: bool });
 const liveSession = struct<LiveSession>({
   live: liveRef,
   kind: oneOf<LiveKind>(['session', 'tool']),
@@ -2130,6 +2174,7 @@ const liveSession = struct<LiveSession>({
   views: u32,
   requests: list(ownRequest),
   pending_ui: optional(list(uiRequestView)),
+  progress: optional(nullable(progressView)),
 });
 const inboxKind = tagged<InboxKind, 'type'>('type', {
   finished: {},

@@ -96,6 +96,12 @@ impl App {
                 .set_context(live.as_deref().and_then(|l| l.context.as_ref()));
             self.bar_view
                 .set_account(live.as_deref().and_then(|l| l.account.as_ref()));
+            // The active tab's live snapshot, else what the gateway's controller list carries.
+            let progress = live
+                .as_deref()
+                .and_then(|l| l.progress.as_ref())
+                .or_else(|| tab.info().and_then(|i| i.progress.as_ref()));
+            self.bar_view.set_progress(progress);
             self.bar_view.set_usage(self.usage.summary());
             self.bar_view.update(snap.as_ref(), &tab.cwd, &self.models);
             self.bar_view.set_login_hint(&self.models);

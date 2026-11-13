@@ -444,13 +444,16 @@ impl App {
                 let mut hit = pressed && header.pressed;
                 let body = panes::body_of(pane, HEADER_H);
                 if let Some(t) = index.map(|i| &mut self.tabs[i]) {
+                    let uid = t.uid;
+                    // Each pane's widgets live under its own tab: ids made from the child's
+                    // scope id must not collide between panes (nor follow a pane's slot).
                     let mut child = ui.new_child(
                         UiBuilder::new()
+                            .id_salt(("pane", uid))
                             .max_rect(body)
                             .layout(Layout::top_down(Align::Min)),
                     );
                     child.set_clip_rect(body.intersect(ui.clip_rect()));
-                    let uid = t.uid;
                     let chat = t.terminal().tsp().live();
                     let (response, url) = if chat {
                         let want = super::chat_focus::request(

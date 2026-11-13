@@ -302,6 +302,7 @@ fn headless_gateway_controls_real_omp_without_a_gui() {
 
     // Launch a real omp session in a sandbox project.
     let launch = client.mutate(Mutation::Launch(LaunchSpec {
+        agent_child: false,
         mux_name: Some("omp-new-gwe2e".into()),
         cwd: sb.proj(),
         session_path: None,

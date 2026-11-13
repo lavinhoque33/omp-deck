@@ -23,6 +23,10 @@ mod background;
 use background::{BackgroundWatch, OpenerSource};
 mod questions;
 use questions::QuestionWatch;
+mod reports;
+use reports::{ReportDelivery, ReportRate};
+mod worktrees;
+use worktrees::{ChildFinish, ChildRelocation};
 
 const STALE: &str = "That session has exited or switched conversations; open a new one";
 const UNKNOWN: &str = "Unknown session handle";
@@ -55,12 +59,17 @@ pub(super) struct ChildSession {
     backend: Option<MuxKind>,
     attaching: bool,
     invalidated: bool,
+    reports: ReportRate,
+    last_report: Option<String>,
+    relocation: Option<ChildRelocation>,
 }
 impl ChildSession {
     fn matches(&self, target: &SessionTarget, file: Option<&Path>) -> bool {
         !self.invalidated
             && self.key == target.key
-            && self.file.as_deref().is_none_or(|known| Some(known) == file)
+            && self.file.as_deref().is_none_or(|known| {
+                Some(known) == file || self.relocation_file(file, Instant::now())
+            })
     }
 }
 
@@ -68,6 +77,9 @@ impl ChildSession {
 pub(super) struct Registry {
     entries: HashMap<String, ChildSession>,
     answers: HashMap<u64, questions::AnswerRequest>,
+    reports: HashMap<u64, ReportDelivery>,
+    finishes: HashMap<RequestKey, ChildFinish>,
+    finish_sequence: u64,
 }
 impl Registry {
     fn handle(&self, root: &Path, key: &SessionKey) -> Option<&str> {
@@ -418,6 +430,16 @@ impl super::AgentTools {
             .values()
             .any(|pending| &pending.target.key == key)
             || self.reply_acks.iter().any(|(target, _)| &target.key == key)
+            || self
+                .children
+                .reports
+                .values()
+                .any(|report| report.needs_controller(key, &self.children))
+            || self
+                .children
+                .finishes
+                .values()
+                .any(|finish| finish.needs_controller(key, &self.children))
             || self.children.entries.values().any(|child| {
                 child.forward_questions && !child.invalidated && &child.opener.key == key
             })
@@ -496,6 +518,7 @@ impl Engine {
             forward_questions: p.forward_questions,
             questions: QuestionWatch::new(m.ctl_key.clone()),
             attach: LaunchSpec {
+                agent_child: false,
                 mux_name: m.mux_name.clone(),
                 cwd: m.current_cwd().to_path_buf(),
                 session_path: m.ctl.session_path().map(ToOwned::to_owned),
@@ -508,6 +531,9 @@ impl Engine {
             backend: m.mux.as_ref().map(deck_core::mux::Mux::kind),
             attaching: false,
             invalidated: false,
+            reports: ReportRate::new(Instant::now()),
+            last_report: None,
+            relocation: None,
         };
         let enabled = self
             .sess
@@ -517,7 +543,10 @@ impl Engine {
                 link.client.tools().iter().any(|name| {
                     matches!(
                         name.as_str(),
-                        "ompdeck_send_prompt" | "ompdeck_wait_session" | "ompdeck_answer_question"
+                        "ompdeck_send_prompt"
+                            | "ompdeck_wait_session"
+                            | "ompdeck_answer_question"
+                            | "ompdeck_finish_worktree"
                     )
                 })
             });
@@ -543,6 +572,11 @@ impl Engine {
                 }
                 row.push_str(question);
             }
+        }
+        self.append_child_worktree(&mut row, handle);
+        if let Some(report) = &child.last_report {
+            row.push_str(" | last report: ");
+            super::append_short(&mut row, report, 120);
         }
         row
     }
@@ -750,6 +784,22 @@ impl Engine {
             .as_deref()
             .and_then(|name| running.as_ref().map(|snapshot| snapshot.files_of(name)))
             .unwrap_or_default();
+        // Our retire /move can reach the two ctl links in opposite orders. Both
+        // roots must prove that same conversation and exact destination.
+        if let Some(child) = handle.and_then(|handle| self.agent_tools.children.entries.get(handle))
+        {
+            let sources = [
+                managed
+                    .as_ref()
+                    .map(|snapshot| snapshot.session_file.as_deref()),
+                question
+                    .as_ref()
+                    .map(|snapshot| snapshot.session_file.as_deref()),
+            ];
+            if let Some(current) = child.relocation_current_file(sources, Instant::now()) {
+                return read(Ok(Some(current)));
+            }
+        }
         read(conversation_file(
             m.ctl.session_path(),
             [
@@ -765,6 +815,7 @@ impl Engine {
     }
 
     fn validate_child_identity(&mut self, handle: &str, index: usize) -> Result<(), String> {
+        self.sync_child_relocations(Instant::now());
         let child = self
             .agent_tools
             .children
@@ -1020,6 +1071,7 @@ impl Engine {
     }
 
     pub(in crate::gateway::engine) fn child_operation_finished(&mut self, request: u64) {
+        self.cancel_child_finish_request(request);
         self.agent_tools.children.answers.remove(&request);
         let Some(operation) = self.agent_tools.operations.remove(&request) else {
             return;
@@ -1056,49 +1108,13 @@ impl Engine {
         rid: u64,
         ok: bool,
         root_mismatch: bool,
+        error: Option<String>,
     ) {
         self.agent_tools.acknowledge_reply(key, rid);
         self.background_reply_done(key, rid, ok, root_mismatch);
+        self.child_report_reply_done(key, rid, ok, root_mismatch, error);
     }
 
-    pub(in crate::gateway::engine) fn child_live_keys(
-        &self,
-    ) -> impl Iterator<Item = SessionKey> + '_ {
-        self.agent_tools
-            .operations
-            .values()
-            .filter_map(|op| {
-                self.agent_tools
-                    .children
-                    .entries
-                    .get(op.handle())
-                    .map(|c| c.key.clone())
-            })
-            .chain(
-                self.agent_tools
-                    .children
-                    .entries
-                    .values()
-                    .filter_map(|child| child.background.as_ref().map(|_| child.key.clone())),
-            )
-            .chain(
-                self.agent_tools
-                    .children
-                    .entries
-                    .values()
-                    .filter_map(|child| {
-                        child.background.as_ref().map(|_| child.opener.key.clone())
-                    }),
-            )
-            .chain(
-                self.agent_tools
-                    .children
-                    .entries
-                    .values()
-                    .filter(|child| child.forward_questions && !child.invalidated)
-                    .map(|child| child.opener.key.clone()),
-            )
-    }
     fn step_child_waiter(
         &mut self,
         request: u64,
@@ -1323,6 +1339,7 @@ impl Engine {
     }
 
     pub(in crate::gateway::engine) fn step_child_tools(&mut self, now: Instant) {
+        self.sync_child_relocations(now);
         // Learn a fresh child's file even if the opener waits only after it closed the tab.
         for child in self.agent_tools.children.entries.values_mut() {
             if child.file.is_none()
@@ -1499,6 +1516,8 @@ impl Engine {
         }
         self.step_background_waits(now);
         self.deliver_child_questions();
+        self.step_child_reports(now);
+        self.step_child_finish_messages(now);
         if !self.agent_tools.operations.is_empty() {
             self.wake_within(POLL);
         }
@@ -1527,6 +1546,7 @@ mod tests {
             forward_questions: false,
             questions: QuestionWatch::new(Some("child".into())),
             attach: LaunchSpec {
+                agent_child: false,
                 mux_name: Some("child".into()),
                 cwd: PathBuf::from("."),
                 session_path: None,
@@ -1539,6 +1559,9 @@ mod tests {
             backend: Some(MuxKind::Host),
             attaching: false,
             invalidated: false,
+            reports: ReportRate::new(Instant::now()),
+            last_report: None,
+            relocation: None,
         }
     }
 
@@ -1823,6 +1846,7 @@ mod tests {
                 opens_session: false,
                 open_prompt: None,
                 forward_questions: true,
+                worktree_result: None,
             },
         );
         assert!(

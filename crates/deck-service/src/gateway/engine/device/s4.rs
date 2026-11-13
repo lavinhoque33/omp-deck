@@ -1800,7 +1800,7 @@ impl Engine {
             } => {
                 let target = self.live_target(&live)?;
                 let project = self
-                    .live_sessions(&key.client, false)
+                    .live_sessions(&key.client, false, false)
                     .into_iter()
                     .find(|s| s.live.key == live.key)
                     .and_then(|s| s.project)
@@ -1896,6 +1896,7 @@ impl Engine {
             Op::NewSessionIn { dir } => {
                 let cwd = self.dir_of(conn, &dir)?;
                 Mutation::Launch(LaunchSpec {
+                    agent_child: false,
                     mux_name: backend.then(|| deck_core::mux::new_session_name(SystemTime::now())),
                     cwd,
                     session_path: None,

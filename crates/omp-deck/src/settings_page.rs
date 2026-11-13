@@ -1558,7 +1558,7 @@ fn agent_tools_card(ui: &mut Ui, tools: &AgentTools, actions: &mut Vec<SettingsA
         );
         ui.add_space(10.0);
         type Field = fn(&mut AgentTools) -> &mut bool;
-        let rows: [(&str, &str, Field); 8] = [
+        let rows: [(&str, &str, Field); 10] = [
             (
                 "Open sessions",
                 "Start a parallel omp session in a new tab or split, optionally with a prompt",
@@ -1598,6 +1598,16 @@ fn agent_tools_card(ui: &mut Ui, tools: &AgentTools, actions: &mut Vec<SettingsA
                 "Answer questions of sessions it opened",
                 "Lets the agent answer questions and approve-once/deny prompts of sessions it opened, when you ask it to",
                 |t| &mut t.answer_question,
+            ),
+            (
+                "Finish worktrees of sessions it opened",
+                "Lets the agent ask a session it opened in a worktree to commit and merge, then remove the worktree",
+                |t| &mut t.finish_worktree,
+            ),
+            (
+                "Sessions it opened can report back",
+                "Lets sessions opened by the agent send it progress, blocked or done reports",
+                |t| &mut t.report,
             ),
         ];
         for (i, (title, sub, field)) in rows.into_iter().enumerate() {

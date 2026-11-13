@@ -1080,6 +1080,7 @@ impl Engine {
                 self.accepted(conn, id, &key);
                 self.sess.queue(LaunchJob {
                     spec: LaunchSpec {
+                        agent_child: false,
                         mux_name: None,
                         cwd: deck_core::platform::home_or_root(),
                         session_path: None,

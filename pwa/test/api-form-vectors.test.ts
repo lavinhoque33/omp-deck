@@ -12,6 +12,7 @@ import {
   decodeReply,
   decodeWelcome,
   FEATURE_FORM,
+  FEATURE_PROGRESS,
   FEATURE_S4,
   opJournaled,
   PROTOCOL,
@@ -32,10 +33,10 @@ const vectors: FormVectors = JSON.parse(
   readFileSync(new URL('../../crates/deck-remote/tests/vectors/api-form.json', import.meta.url), 'utf8'),
 );
 
-test('protocol version and features; the app announces both', () => {
+test('protocol version and form features stay frozen; the app also announces progress', () => {
   expect(vectors.protocol).toBe(PROTOCOL);
   expect(vectors.features).toEqual([FEATURE_S4, FEATURE_FORM]);
-  expect(DEVICE_FEATURES).toEqual(vectors.features);
+  expect(DEVICE_FEATURES).toEqual([...vectors.features, FEATURE_PROGRESS]);
 });
 
 describe('form answers encode canonically', () => {

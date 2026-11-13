@@ -8,6 +8,7 @@ import { subagentIds } from '../transcript/adapter.ts';
 import { age, dollars, perform, shortModel, statusLabel, succeeded, tokens } from '../ui/format.ts';
 import { useCan, useClient, useClientState, useFeed, useNow, useTranscript } from '../ui/hooks.ts';
 import { ConfirmSheet, ConnectionPill, Empty, StaleBanner, useS4 } from '../ui/kit.tsx';
+import { ProgressLine } from '../ui/progress.tsx';
 import { findModel } from './Conversation.tsx';
 import '../../styles/fleet.css';
 
@@ -108,6 +109,7 @@ function FleetCard({
           {card !== null ? `↑${tokens(card.input_tokens)} ↓${tokens(card.output_tokens)}` : ''}
         </span>
       </div>
+      <ProgressLine progress={live.progress} />
       {card?.last_reply != null && (
         <div className={`snippet${card.last_turn_failed ? ' warn' : ''}`}>{card.last_reply}</div>
       )}

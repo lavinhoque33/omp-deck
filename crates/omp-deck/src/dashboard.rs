@@ -29,8 +29,8 @@ use crate::agent_model::{AgentsView, Metric, MetricKind};
 use crate::badge::{self, Badge, Hue};
 use crate::dashboard_model::{
     Card, CardKey, FILTERS, GAP, Grid, Item, PAD, Query, REPLY_LINE_H, REPLY_LINES, ROW_AGENTS,
-    ROW_CTX, ROW_FILES, ROW_HEAD, ROW_MODEL, ROW_PROJECT, SECTION_GAP, Status, StatusFilter,
-    card_height, columns, layout, visible,
+    ROW_CTX, ROW_FILES, ROW_HEAD, ROW_MODEL, ROW_PROGRESS, ROW_PROJECT, SECTION_GAP, Status,
+    StatusFilter, card_height, columns, layout, visible,
 };
 use crate::icons::{
     ICON_BRAIN, ICON_BROOM, ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CPU,
@@ -1166,6 +1166,53 @@ fn paint_card(
             p.galley(pos2(left, cy - g.size().y / 2.0), g, pal.text);
         }
         y += ROW_FILES;
+    }
+
+    // Todo / goal progress: mini bar, `3/7` and the current task; without tasks the goal's
+    // status and objective.
+    if let Some(pr) = &card.progress {
+        let cy = y + ROW_PROGRESS / 2.0;
+        let mut x = left;
+        if let (Some(r), Some(counts)) = (
+            crate::progress_view::ratio(pr),
+            crate::progress_view::counts_text(pr),
+        ) {
+            let bar_w = ((right - left) * 0.22).clamp(48.0, 110.0);
+            let bar = Rect::from_min_size(pos2(x, cy - 2.5), vec2(bar_w, 5.0));
+            crate::progress_view::paint_mini_bar(&p, pal, bar, r);
+            x += bar_w + 8.0;
+            let g = p.layout_no_wrap(counts, theme::label_font(11.5), pal.text_strong);
+            let w = g.size().x;
+            p.galley(pos2(x, cy - g.size().y / 2.0), g, pal.text_strong);
+            x += w + 8.0;
+        } else if let Some(goal) = &pr.goal {
+            let b = Badge::single(
+                &p,
+                Some(crate::icons::ICON_TARGET),
+                crate::progress_view::goal_label(&goal.status),
+                crate::progress_view::goal_hue(&goal.status).color(pal),
+                11.0,
+            );
+            b.paint_at(&p, x, cy);
+            x += b.width() + 8.0;
+        }
+        let tail = match pr.current() {
+            Some(t) if crate::progress_view::task_counts(pr).is_some() => Some(t.content.as_str()),
+            _ => pr.goal.as_ref().map(|g| g.objective.as_str()),
+        };
+        if let Some(text) = tail
+            && right - x > 24.0
+        {
+            let mut job =
+                LayoutJob::simple_singleline(text.trim().to_owned(), theme::font(11.5), pal.weak);
+            job.wrap.max_width = right - x;
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            job.wrap.overflow_character = Some('…');
+            let g = p.layout_job(job);
+            p.galley(pos2(x, cy - g.size().y / 2.0), g, pal.weak);
+        }
+        y += ROW_PROGRESS;
     }
 
     // Last reply.

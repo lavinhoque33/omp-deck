@@ -4890,3 +4890,137 @@ them when the user asks it to. User picked: approvals are forwarded too, but the
   parent's `ompdeck_answer_question` resolves it and the child's turn finishes; an exec approval is forwarded,
   `decision:"session"` is refused and `"once"` runs the command; `forward_questions:false` forwards nothing. deck-core's
   live test covers the tool's visibility (main only), argument validation and the `AnswerUi.pid` fence.
+
+## Worktree children, live progress, child reports (user, 2026-11-12)
+
+User picked three follow-ups to the agent tools: (1) children in their own git worktree + parent-triggered Finish,
+(3) live todo/goal progress mirrored everywhere, (6) child → parent reports. Sibling notes (the optional part of 6)
+are not built.
+
+### (1) Worktree children
+Facts: `agent://WorktreeMap` scout map (2026-11-12): `engine/worktree.rs` `create_new` (`:2982`) = repo_info → has
+commits → `check_branch_name` → base (given, else current branch, else `HEAD`) → `default_dest` (`<managed base>/
+<slug(branch)>-<slug(primary)>`, `-2`…) → `check_destination` → `worktree::create` (`omp worktree add` with the
+`clone: false` overlay) → `CfgOp::Unremove` + `CfgOp::RecordBase`. Finish = `Mutation::WorktreeFinish{worktree}` (finish
+prompt injected idle-only into a session running inside the worktree, auto-remove when clean + merged, running sessions
+`/move`d into the primary).
+- `ompdeck_open_session` gains `worktree?: { branch?: string, base?: string }`. `cwd` (default: the opener's cwd) must be
+  inside a git repo with commits; the child starts in a **new** worktree of that repo's primary. `branch` default
+  `wt/<yyyymmdd-hhmm>` (+ `-2`, `-3`… while the branch exists); `base` default = the primary's current branch, else
+  `HEAD`. Creation reuses `create_new` verbatim (same validation, default location, `RecordBase`, `Unremove`) on a
+  gateway worker; on success the existing `AgentOpenSession` is emitted with `cwd = <worktree path>`; on failure the tool
+  fails with the creation error and nothing is opened. The tool result adds `Worktree: <path> on branch <branch> (merges
+  into <base>)`. No GUI or phone change: grouping, branch chip and Finish availability follow from the cwd as today.
+- New tool **`ompdeck_finish_worktree { session }`** (approval `exec`, main agent only, own toggle `AgentTools.
+  finish_worktree`, env short name `finish_worktree`): ownership like send_prompt; the child's current cwd must be a
+  linked worktree (`worktree::resolve`), else "That session is not running in a worktree". Starts the gateway's
+  `WorktreeFinish` job for it (same refusals: already finishing/retiring, unknown base). Returns once the finish prompt has
+  been injected into the child: "Finish started: <title> was asked to commit and merge <branch> into <base>. OmpDeck
+  removes the worktree once it is clean and merged; the outcome arrives as a message." (or the job's refusal/failure).
+  The outcome is delivered to the opener like a background wait (`Deliver`, title `Worktree finish: <title> (s-…)`):
+  removed (with where the session now runs), parked, failed (reason), cancelled; plus, once, the first blocker
+  explanation the job reports while it keeps waiting ("not merged yet: …").
+- A child relocated by OmpDeck's own worktree retire (`/move` into the primary) **keeps its handle**: the registry
+  re-records the child's new conversation file when that relocation completes (the only sanctioned file change; any
+  other change still invalidates).
+- `ompdeck_sessions` child rows add `worktree <branch> → <base>` and `finishing` / `finish blocked: …` while the job runs.
+
+### (6) Child → parent reports
+- New tool **`ompdeck_report { text, kind? }`** (`kind`: `progress` (default) | `blocked` | `done`; `text` 1 B–4 KiB;
+  approval `read`, main agent only, own toggle `AgentTools.report`, env short name `report`). Registered for every
+  OmpDeck-launched session with tools on; when the session was not opened by another session's
+  `ompdeck_open_session` (no live opener) the call fails "No session opened this one; nothing to report to" so the
+  model learns to stop. The opener is the session that registered the child (`opener_root`); reports go only there.
+- The gateway delivers via ctl `Deliver` to the opener (title `Report from <title> (s-…)`, text with `[blocked]`/`[done]`
+  prefix for those kinds), same fencing as background waits (opener root current, otherwise the report is dropped and the
+  tool returns "The session that opened this one has ended or moved on"). Reports do not end a wait.
+- Flood guard per child: at most one delivered report per 10 s, burst 3; excess fails "Too many reports; send one when
+  something changes" (no queueing).
+- Tool result: "Reported to <opener title>." The opener's `ompdeck_sessions` child row adds `last report: <≤ 120 chars>`.
+
+- Registration: `ompdeck_report` is offered only to sessions launched as agent children. `protocol::LaunchSpec` gains
+  `#[serde(default)] agent_child: bool`; the GUI sets it in `on_agent_open_session`; the gateway adds the short name
+  `report` to `OMPDECK_TOOLS` only when `agent_child && AgentTools.report` (and live control is on). A child restarted
+  later without the flag simply has no report tool.
+
+### (3) Live todo/goal progress
+Facts: `agent://ProgressScout` (installed omp is now **18.20.0**): current todos = `AgentSession.getTodoPhases()` →
+`[{name, tasks:[{content, status}]}]`, statuses on 18.20 `pending|in_progress|completed|abandoned` (source also has
+`blocked`); restored on resume; no universal change event (`todo_reminder` is a nag, not a change). Goal =
+`AgentSession.getGoalModeState()` → `{enabled, mode, goal:{id, objective, status: active|paused|budget-limited|complete|
+dropped, tokenBudget?, tokensUsed, timeUsedSeconds}}` or `undefined`; event `goal_updated` (a dropped goal clears state
+without a null event → read state, never cache events). Both read through `mainSession()` (as the ctl extension already
+does). Late `pi.registerTool` works (not needed here).
+- **Extension** (`ompdeck-ctl.ts`): the snapshot gains `progress` = `{ phases: [{name, tasks: [{content, status}]}],
+  goal: {objective, status, tokensUsed, tokenBudget?, timeUsedSeconds} | null }`, or `null` when there are no tasks and
+  no current goal. Caps: ≤ 16 phases, ≤ 80 tasks total (later ones dropped, `truncated: true`), task content ≤ 200
+  chars, phase name ≤ 80, objective ≤ 400 (cut with `…`). Recomputed on `tool_execution_end` (any tool), `turn_end`,
+  `agent_end`, `goal_updated`, `session_switch`, `session_tree`, `session_branch` and on every snapshot build; pushed
+  only when it changed (stable JSON compare), through the existing debounced `schedule()`. The goal is included
+  whenever `getGoalModeState()` returns one (active, paused, budget-limited, **complete** — omp keeps a completed goal
+  with `enabled:false`); dropped goals are cleared upstream.
+- **deck-core** `ctl.rs` (exact shared types, all `Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize`; enum
+  defaults `Pending` / `Active`):
+  ```rust
+  pub struct Progress { pub phases: Vec<TodoPhase>, pub goal: Option<GoalInfo>, pub truncated: bool }
+  pub struct TodoPhase { pub name: String, pub tasks: Vec<TodoTask> }
+  pub struct TodoTask { pub content: String, pub status: TodoStatus }
+  pub enum TodoStatus { Pending, InProgress, Completed, Abandoned, Blocked, #[serde(other)] Unknown } // snake_case
+  pub struct GoalInfo { pub objective: String, pub status: GoalStatus, pub tokens_used: u64,
+                        pub token_budget: Option<u64>, pub time_used_seconds: u64 }
+  pub enum GoalStatus { Active, Paused, BudgetLimited, Complete, Dropped, #[serde(other)] Unknown } // kebab-case wire
+  impl Progress {
+      pub fn counts(&self) -> (usize, usize);   // (completed, total excluding abandoned)
+      pub fn current(&self) -> Option<&TodoTask>; // first in_progress, else first pending
+      pub fn is_empty(&self) -> bool;           // no tasks and no goal
+  }
+  ```
+  `LiveSnapshot.progress: Option<Progress>` (lenient parse: a malformed `progress` → `None`, never a dropped snapshot).
+  The Rust types serialize snake_case (`budget_limited`, `tokens_used`); only the ctl wire parse (`WireSnapshot`) maps
+  omp's camelCase keys / kebab-case goal status into them.
+- **Gateway**: `ControllerInfo.progress: Option<Progress>` (`#[serde(default)]`) from the session's latest live snapshot,
+  so the GUI gets every managed session's progress from `Topic::Controllers`. To have it, the gateway keeps a ctl live
+  link to **every** managed session with live control (not only those with a `Topic::Live` subscriber); a progress
+  change marks controllers dirty. `ompdeck_sessions` rows (managed sessions) append ` | todos: 3/7 (now: <task ≤ 80>)`
+  and ` | goal: <status> — <objective ≤ 80>` when present.
+- **Desktop** (omp-deck), every surface reads `ControllerInfo.progress` (status bar may use the active tab's live
+  snapshot, same value):
+  - status bar: new segment `Seg::Progress` — checklist icon + `3/7` (goal only: target icon + goal status); dropped
+    before Usage, after Cost (drop order path, tokens, cost, **progress**, git, usage, ctx). Hover card (`card.rs`):
+    header "Progress", Goal block (objective, status badge, tokens used / budget, elapsed) and the phases with per-task
+    status icons (in-progress accent, completed muted + check, abandoned struck, blocked warning), `+N more` when cut.
+  - tabs: a 2 px progress line along the tab's bottom edge (accent, width = done/total) when the session has tasks.
+  - sidebar session rows and Running dock rows: compact `3/7` badge left of the age (hidden while hover keys show);
+    row hover card gains Todos (`3/7 · now: <task>`) and Goal rows.
+  - agents dashboard cards: a Progress line (mini bar + `3/7` + current task, goal status/objective).
+- **Phone**: new device feature `progress` (`api::FEATURE_PROGRESS`): `LiveSession.progress: Option<ProgressView>`
+  (`#[serde(default, skip_serializing_if = "Option::is_none")]`, sent only to devices with the feature) with the same
+  shape and caps (snake_case); vectors `api-progress.json` + `wire_freeze` pin, older vector files byte-identical; PWA
+  `DEVICE_FEATURES` adds it. PWA shows it on Sessions live rows (`3/7`), Running rows, Agents cards and as a
+  Conversation header pill opening a sheet with goal + phases.
+
+### As built (worktree children, progress, reports)
+- deck-core: `ompdeck-ctl.ts` `mainProgress` (caps, stable compare, completed goals kept), tool schemas for
+  `worktree`, `ompdeck_finish_worktree`, `ompdeck_report` (omp 18.20 coerces a numeric `branch` to a string before
+  execute); `ctl::Progress` family; `AgentTools.finish_worktree/report`.
+- deck-service: `agent_tools/children/worktrees.rs` (creation on a worker via `create_new`, finish start + outcome
+  delivery, monotonic epoch-fenced journal keys), relocation permit (handle survives only OmpDeck's own retire
+  `/move`), reports (ACK-confirmed `Deliver`, root fence, rate limit), persistent ctl links for every live-control
+  session → `ControllerInfo.progress`, device feature `progress`; `deck-host` client `AttachedRx::recv_timeout`.
+- omp-deck: `progress_view.rs` (`ProgressIndex` cached on `App`, refreshed only when the Controllers `Arc` changes),
+  `Seg::Progress`, tab progress line, sidebar/Running badges, dashboard row, two Settings toggles, `agent_child` on
+  agent-opened launches; `app/split.rs` pane `id_salt(("pane", uid))` (fixes the split-view widget-ID clash).
+- deck-remote/pwa: `ProgressView` (+ public `MAX_*` caps), `api-progress.json` vectors, PWA progress badge/sheet.
+- Gates: `deck-core/tests/agent_tools_live.rs` (progress after omp's `todo`, completed goal, tool visibility/args);
+  `deck-service/tests/agent_tools_live.rs` (worktree child created → report delivered → todo progress in
+  `ompdeck_sessions`/Controllers → finish: real merge, worktree removed, outcome delivered, handle reused after
+  relocation); screenshots `~/omp-deck-tools-smoke/60–62, 70–72, 80–81`.
+
+### Host attach ordering (fix, 2026-11-12)
+The close → reopen race (a Close arriving after a host attach is already in flight could let that stale attach
+displace the reopened tab's controller) is fixed in deck-service `host_remote.rs`: one gate per (namespace, session)
+is held from the attach until its first `Snapshot`/`Exited` (host has applied it) or a 10 s first-event deadline
+(`deck_host` client `AttachedRx::recv_timeout`, additive); a cancelled attach that got its first event detaches before
+the gate opens; a newer attach waits ≤ 15 s for the gate and is refused on timeout, never bypassing. Residual
+(accepted): after a deadline drop the host may still apply the stale Attach late — only a daemon-side fenced attach
+would rule that out; it needs a hung host to matter.

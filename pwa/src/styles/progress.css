@@ -1,0 +1,37 @@
+/* Shared progress surfaces use the six phone themes' semantic tokens. */
+.progress-count {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  background: var(--raised);
+  padding: 1px 5px;
+  color: var(--accent);
+  font: 10px/1.5 var(--mono);
+  white-space: nowrap;
+}
+.session-indicator { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+.progress-pill { color: var(--accent); }
+.progress-summary { margin: 10px 0; }
+.progress-line { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.progress-track { display: block; flex: 0 0 54px; height: 4px; overflow: hidden; border-radius: var(--r); background: var(--raised); }
+.progress-track i { display: block; height: 100%; background: var(--accent); }
+.progress-current { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
+.progress-goal { margin: 7px 0 0; font-size: 11px; overflow-wrap: anywhere; }
+.progress-goal .chip { margin-right: 4px; }
+.progress-details h4 { margin: 0; color: var(--heading); font-size: 12px; }
+.progress-objective { margin-bottom: 16px; }
+.progress-objective > p { margin: 8px 0 10px; overflow-wrap: anywhere; }
+.progress-tasks-heading { margin: 0 0 9px; }
+.progress-phase { border: 1px solid var(--border); border-radius: var(--r); margin: 0 0 10px; overflow: hidden; }
+.progress-phase h5 { margin: 0; padding: 8px 10px; background: var(--raised); border-bottom: 1px solid var(--border); color: var(--strong); font-size: 11px; overflow-wrap: anywhere; }
+.progress-phase ul { list-style: none; padding: 6px 10px; margin: 0; }
+.progress-task { display: flex; gap: 8px; padding: 5px 0; font-size: 11px; overflow-wrap: anywhere; }
+.progress-task > span:last-child { min-width: 0; }
+.progress-task-icon { flex: 0 0 14px; text-align: center; color: var(--muted); }
+.progress-task.in_progress, .progress-task.in_progress .progress-task-icon { color: var(--accent); }
+.progress-task.completed, .progress-task.abandoned { color: var(--muted); }
+.progress-task.abandoned > span:last-child { text-decoration: line-through; }
+.progress-task.blocked, .progress-task.blocked .progress-task-icon { color: var(--warn); }
+.progress-truncated { border-left: 2px solid var(--warn); padding: 7px 10px; color: var(--warn); font-size: 11px; }

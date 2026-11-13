@@ -7,7 +7,7 @@
 //! kill request) is remembered and applied once the connection is up.
 
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use deck_host::{
@@ -21,6 +21,72 @@ const HISTORY_LINES: u32 = 10_000;
 /// How long a fresh connection waits for the terminal's first grid size before attaching
 /// with the last one known (a tab that is not on screen never reports one).
 const GRID_WAIT: Duration = Duration::from_millis(400);
+/// First-event confirmation is bounded independently of the host client's connection timeout.
+const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+/// New readers fail rather than bypass an attachment whose confirmation is still pending.
+const ATTACH_QUEUE_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Default)]
+struct AttachGate {
+    busy: Mutex<bool>,
+    available: Condvar,
+}
+
+struct AttachPermit(Arc<AttachGate>);
+
+impl AttachGate {
+    fn enter(self: &Arc<Self>, timeout: Duration) -> deck_host::Result<AttachPermit> {
+        let (mut busy, _) = self
+            .available
+            .wait_timeout_while(
+                self.busy.lock().unwrap_or_else(PoisonError::into_inner),
+                timeout,
+                |busy| *busy,
+            )
+            .unwrap_or_else(PoisonError::into_inner);
+        if *busy {
+            return Err(deck_host::Error::Timeout(
+                "waiting for an earlier host attachment",
+            ));
+        }
+        *busy = true;
+        Ok(AttachPermit(Arc::clone(self)))
+    }
+}
+
+impl Drop for AttachPermit {
+    fn drop(&mut self) {
+        *self.0.busy.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        self.0.available.notify_one();
+    }
+}
+
+struct AttachEntry {
+    ns: Namespace,
+    name: String,
+    gate: Weak<AttachGate>,
+}
+
+static ATTACH_GATES: Mutex<Vec<AttachEntry>> = Mutex::new(Vec::new());
+
+fn attach_gate(ns: &Namespace, name: &str) -> Arc<AttachGate> {
+    let mut entries = ATTACH_GATES.lock().unwrap_or_else(PoisonError::into_inner);
+    entries.retain(|entry| entry.gate.strong_count() != 0);
+    if let Some(gate) = entries.iter().find_map(|entry| {
+        (entry.ns == *ns && entry.name == name)
+            .then(|| entry.gate.upgrade())
+            .flatten()
+    }) {
+        return gate;
+    }
+    let gate = Arc::new(AttachGate::default());
+    entries.push(AttachEntry {
+        ns: ns.clone(),
+        name: name.to_owned(),
+        gate: Arc::downgrade(&gate),
+    });
+    gate
+}
 
 const STARTING: &[u8] = b"\x1b[2mStarting session\xe2\x80\xa6\x1b[0m";
 
@@ -128,8 +194,11 @@ struct HostRx {
 impl HostRx {
     /// Waits briefly for the terminal's first grid size, then establishes the accepted backend.
     /// A tab closed before connecting creates only a detached backend, never a controller.
-    fn connect(&mut self) -> Option<Result<AttachedRx, deck_host::Error>> {
-        let (grid, palette, request) = {
+    fn connect(
+        &mut self,
+        first_timeout: Duration,
+    ) -> Option<Result<(AttachedRx, HostEvent), deck_host::Error>> {
+        {
             let mut phase = self.link.lock();
             if last_grid().is_none() {
                 phase = self
@@ -148,18 +217,27 @@ impl HostRx {
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
             }
-            match &*phase {
-                Phase::Dead => {
-                    *phase = Phase::Dead;
-                    return None;
-                }
-                Phase::Connecting {
-                    grid,
-                    palette,
-                    request,
-                } => (*grid, *palette, *request),
-                Phase::Ready(_) => return None,
+            if matches!(&*phase, Phase::Dead | Phase::Ready(_)) {
+                return None;
             }
+        }
+        let gate = attach_gate(&self.ns, &self.spec.name);
+        let _permit = match gate.enter(ATTACH_QUEUE_TIMEOUT) {
+            Ok(permit) => permit,
+            Err(error) => {
+                *self.link.lock() = Phase::Dead;
+                self.link.changed.notify_all();
+                return Some(Err(error));
+            }
+        };
+        // Close/resize may have arrived while an earlier attachment held the gate.
+        let (grid, palette, request) = match &*self.link.lock() {
+            Phase::Connecting {
+                grid,
+                palette,
+                request,
+            } => (*grid, *palette, *request),
+            Phase::Ready(_) | Phase::Dead => return None,
         };
         let size = grid.or_else(last_grid);
         let params = AttachParams {
@@ -204,7 +282,23 @@ impl HostRx {
                 return Some(Err(e));
             }
         };
-        let (rx, tx) = attached.split();
+        let (mut rx, tx) = attached.split();
+        // Writing Attach is not an acknowledgment: another connection can overtake it.
+        // Keep the gate until the host confirms this attachment has actually been applied.
+        let first = match rx.recv_timeout(first_timeout) {
+            Ok(first @ (HostEvent::Snapshot(_) | HostEvent::Exited(_))) => first,
+            result => {
+                let _ = tx.detach();
+                *self.link.lock() = Phase::Dead;
+                self.link.changed.notify_all();
+                return Some(Err(match result {
+                    Err(error) => error,
+                    Ok(other) => deck_host::Error::Protocol(format!(
+                        "host attachment did not begin with a snapshot: {other:?}"
+                    )),
+                }));
+            }
+        };
         let mut phase = self.link.lock();
         let (grid, palette, request) = match &*phase {
             Phase::Connecting {
@@ -216,9 +310,7 @@ impl HostRx {
         };
         match request {
             Request::Detach => {
-                // Cancellation after create_or_attach began cannot prevent displacement:
-                // deck-host has no cancellable attach API. Release the controller immediately
-                // rather than keeping a hidden terminal alive.
+                // Confirmation arrived: detach before a reopened tab can take its turn.
                 *phase = Phase::Dead;
                 self.link.changed.notify_all();
                 let _ = tx.detach();
@@ -238,7 +330,7 @@ impl HostRx {
         }
         *phase = Phase::Ready(tx);
         self.link.changed.notify_all();
-        Some(Ok(rx))
+        Some(Ok((rx, first)))
     }
 }
 
@@ -250,9 +342,12 @@ impl RemoteRx for HostRx {
                     self.state = RxState::Connect;
                     return Ok(RemoteEvent::Output(STARTING.to_vec()));
                 }
-                RxState::Connect => match self.connect() {
+                RxState::Connect => match self.connect(FIRST_EVENT_TIMEOUT) {
                     None => self.state = RxState::Over,
-                    Some(Ok(rx)) => self.state = RxState::Live(rx),
+                    Some(Ok((rx, first))) => {
+                        self.state = RxState::Live(rx);
+                        return Ok(event(first));
+                    }
                     Some(Err(e)) => {
                         let text = failure_text(&e, self.ns.log_path(&self.spec.name).as_deref());
                         self.state = RxState::Failed;
@@ -541,6 +636,212 @@ mod tests {
     #[cfg(unix)]
     fn test_ns(tag: &str) -> Namespace {
         Namespace::new(&format!("omp-deck-test-ui{}-{tag}", std::process::id())).expect("ns")
+    }
+
+    #[test]
+    fn attach_gate_times_out_without_bypassing_its_owner_and_releases_on_drop() {
+        let gate = Arc::new(AttachGate::default());
+        let owner = gate.enter(Duration::ZERO).expect("first owner");
+        assert!(matches!(
+            gate.enter(Duration::from_millis(20)),
+            Err(deck_host::Error::Timeout(_))
+        ));
+        drop(owner);
+        assert!(gate.enter(Duration::ZERO).is_ok());
+    }
+
+    #[cfg(unix)]
+    fn fake_attaching(mut stream: deck_host::transport::Stream) -> deck_host::transport::Stream {
+        use deck_host::protocol::{self, Hello, Kind};
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut payload = Vec::new();
+        let mut out = Vec::new();
+        assert_eq!(
+            protocol::read_frame(&mut stream, &mut payload).unwrap(),
+            Some(Kind::Hello)
+        );
+        protocol::write_json(&mut stream, &mut out, Kind::Hello, &Hello::ours()).unwrap();
+        assert_eq!(
+            protocol::read_frame(&mut stream, &mut payload).unwrap(),
+            Some(Kind::Info)
+        );
+        protocol::write_json(&mut stream, &mut out, Kind::Info, &serde_json::json!({
+            "name":"fake", "protocol":deck_host::PROTOCOL, "host_version":deck_host::HOST_VERSION,
+            "daemon_pid":1, "child_pid":2, "child_started_unix_ms":0,
+            "cwd":"/", "argv":[], "tty":null, "term_session_id":null,
+            "attached":false, "cols":80, "rows":24
+        })).unwrap();
+        assert_eq!(
+            protocol::read_frame(&mut stream, &mut payload).unwrap(),
+            Some(Kind::Attach)
+        );
+        stream
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_during_in_flight_attach_cannot_overtake_the_reopened_controller() {
+        use deck_host::{
+            protocol::{self, Kind},
+            transport::{Endpoint, Listener, Stream},
+        };
+        let ns = test_ns("flight");
+        let name = "omp-flight";
+        let listener = Arc::new(Listener::bind(&Endpoint::new(&ns, name).unwrap()).unwrap());
+        struct Cleanup(Arc<Listener>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.remove();
+            }
+        }
+        let _cleanup = Cleanup(Arc::clone(&listener));
+        let gate = attach_gate(&ns, name);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            type Current = Arc<Mutex<Option<(usize, Stream)>>>;
+            let current: Current = Arc::new(Mutex::new(None));
+            let mut clients = Vec::new();
+            let mut first = Some((entered_tx, release_rx));
+            for id in 0..2 {
+                let stream = listener.accept().unwrap();
+                let current = Arc::clone(&current);
+                let first = first.take();
+                clients.push(std::thread::spawn(move || {
+                    let mut stream = fake_attaching(stream);
+                    if let Some((entered, release)) = first {
+                        entered.send(()).unwrap();
+                        release.recv_timeout(Duration::from_secs(3)).unwrap();
+                    }
+                    let mut out = Vec::new();
+                    {
+                        let mut active = current.lock().unwrap();
+                        if let Some((_, previous)) = &mut *active {
+                            let _ = protocol::write_frame(previous, &mut out, Kind::Displaced, &[]);
+                        }
+                        *active = Some((id, stream.try_clone().unwrap()));
+                        protocol::write_frame(&mut stream, &mut out, Kind::Snapshot, b"attached")
+                            .unwrap();
+                        protocol::write_frame(&mut stream, &mut out, Kind::SnapshotEnd, &[])
+                            .unwrap();
+                    }
+                    let mut payload = Vec::new();
+                    while let Some(kind) = protocol::read_frame(&mut stream, &mut payload).unwrap()
+                    {
+                        match kind {
+                            Kind::Input
+                                if current
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .is_some_and(|(active, _)| *active == id) =>
+                            {
+                                protocol::write_frame(
+                                    &mut stream,
+                                    &mut out,
+                                    Kind::Output,
+                                    &payload,
+                                )
+                                .unwrap();
+                            }
+                            Kind::Detach => break,
+                            _ => {}
+                        }
+                    }
+                }));
+            }
+            for client in clients {
+                client.join().unwrap();
+            }
+        });
+        let (mut old_rx, old_tx) = Box::new(HostRemote::new(ns.clone(), spec(name))).split();
+        old_tx.resize(80, 24, 8, 16).unwrap();
+        let old = std::thread::spawn(move || {
+            assert!(matches!(old_rx.recv().unwrap(), RemoteEvent::Output(_)));
+            old_rx.recv().unwrap()
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("old Attach is in flight");
+        old_tx.detach().unwrap();
+        assert!(
+            gate.enter(Duration::from_millis(50)).is_err(),
+            "sending Attach alone must not release its gate"
+        );
+        let (mut new_rx, new_tx) = Box::new(HostRemote::new(ns, spec(name))).split();
+        new_tx.resize(80, 24, 8, 16).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reopened = std::thread::spawn(move || {
+            assert!(matches!(new_rx.recv().unwrap(), RemoteEvent::Output(_)));
+            let first = new_rx.recv().unwrap();
+            done_tx.send(first).unwrap();
+            let echo = new_rx.recv().unwrap();
+            done_tx.send(echo).unwrap();
+        });
+        release_tx.send(()).unwrap();
+        assert_eq!(old.join().unwrap(), RemoteEvent::Closed);
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            RemoteEvent::Snapshot(_)
+        ));
+        new_tx.input(b"reopened-still-controls").unwrap();
+        let echo = done_rx.recv_timeout(Duration::from_secs(3));
+        new_tx.detach().unwrap();
+        assert_eq!(
+            echo.unwrap(),
+            RemoteEvent::Output(b"reopened-still-controls".to_vec())
+        );
+        reopened.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unconfirmed_attach_times_out_and_releases_the_session_gate() {
+        use deck_host::{
+            protocol,
+            transport::{Endpoint, Listener},
+        };
+        let ns = test_ns("ack-timeout");
+        let name = "omp-timeout";
+        let listener = Listener::bind(&Endpoint::new(&ns, name).unwrap()).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = fake_attaching(listener.accept().unwrap());
+            let mut payload = Vec::new();
+            let _ = protocol::read_frame(&mut stream, &mut payload);
+        });
+        let gate = attach_gate(&ns, name);
+        let link = Arc::new(Link {
+            phase: Mutex::new(Phase::Connecting {
+                grid: Some(Grid {
+                    cols: 80,
+                    rows: 24,
+                    cell_width: 8,
+                    cell_height: 16,
+                }),
+                palette: None,
+                request: Request::None,
+            }),
+            changed: Condvar::new(),
+        });
+        let mut reader = HostRx {
+            link: Arc::clone(&link),
+            state: RxState::Connect,
+            ns,
+            spec: spec(name),
+        };
+        assert!(matches!(
+            reader.connect(Duration::from_millis(30)),
+            Some(Err(deck_host::Error::Timeout(_)))
+        ));
+        assert!(matches!(*link.lock(), Phase::Dead));
+        assert!(
+            gate.enter(Duration::ZERO).is_ok(),
+            "a hung host cannot retain the gate forever"
+        );
+        server.join().unwrap();
     }
 
     #[test]

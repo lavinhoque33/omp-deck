@@ -1375,6 +1375,7 @@ fn feeds() -> Vec<(&'static str, Event)> {
         views: 0,
         requests: vec![],
         pending_ui: pending_ui(),
+        progress: None,
     };
     let mut out = vec![
         (

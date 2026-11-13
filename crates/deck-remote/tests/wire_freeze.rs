@@ -23,6 +23,10 @@ const PINNED: &[(&str, &str)] = &[
         "d16806c7cff85a2bf34210283151e4e1cb7e7525a3896f555b7829b75e041478",
     ),
     (
+        "api-progress.json",
+        "4b9e0049cd3ac7a5d37328807c48b315dc3e70adc281de197baa79f2e79682a9",
+    ),
+    (
         "api-s4.json",
         "c2f61bf6eb1c7113b250fd891f81ff86f992e54df551c097d8ebeae47ebe1047",
     ),

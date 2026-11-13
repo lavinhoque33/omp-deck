@@ -3,7 +3,8 @@
 
 mod support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +66,7 @@ fn launch(client: &GatewayClient, sb: &Sandbox, name: &str, prompt: &str) -> Ses
     let done = run(
         client,
         Mutation::Launch(LaunchSpec {
+            agent_child: false,
             mux_name: Some(format!("omp-tools-{name}")),
             cwd: sb.proj(),
             session_path: None,
@@ -465,6 +467,7 @@ fn exercise_open_wait_send_follow_up_draft_and_stale_handle() {
                 let done = run(
                     &gui,
                     Mutation::Launch(LaunchSpec {
+                        agent_child: true,
                         mux_name: Some("omp-tools-driven-child".into()),
                         cwd,
                         session_path: None,
@@ -560,24 +563,29 @@ fn exercise_open_wait_send_follow_up_draft_and_stale_handle() {
             "{reply}"
         );
     }
-    let Answer::Topic(value) = gui
-        .query(Query::Topic(Topic::Controllers))
-        .wait(STEP)
-        .expect("controllers")
-        .expect("controller topic")
-    else {
-        panic!("controller topic");
-    };
-    let TopicValue::Controllers(controllers) = *value else {
-        panic!("controller rows");
-    };
-    assert!(
-        !controllers.iter().any(|info| info.target.key == child.key),
-        "finished headless tools must release their controller"
+    // Completion can reach the model before the input-tail grace and the next
+    // Controllers publication. Progress subscriptions do not own this attachment.
+    let release_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    wait_for(
+        "finished headless tools release their controller",
+        Duration::from_secs(10),
+        || {
+            let Ok(Answer::Topic(value)) = gui
+                .query(Query::Topic(Topic::Controllers))
+                .wait(release_deadline.saturating_duration_since(std::time::Instant::now()))?
+            else {
+                return None;
+            };
+            let TopicValue::Controllers(controllers) = *value else {
+                return None;
+            };
+            (!controllers.iter().any(|info| info.target.key == child.key)).then_some(())
+        },
     );
     let adopted = run(
         &gui,
         Mutation::Launch(LaunchSpec {
+            agent_child: true,
             mux_name: Some("omp-tools-driven-child".into()),
             cwd: sb.proj(),
             session_path: None,
@@ -729,6 +737,7 @@ fn exercise_background_wait_idle_and_busy_delivery() {
                     let done = run(
                         &gui,
                         Mutation::Launch(LaunchSpec {
+                            agent_child: true,
                             mux_name: Some(format!("omp-tools-background-{name}")),
                             cwd,
                             session_path: None,
@@ -994,6 +1003,7 @@ fn exercise_forwarded_child_questions() {
                     let done = run(
                         &gui,
                         Mutation::Launch(LaunchSpec {
+                            agent_child: true,
                             mux_name: Some(child_mux.clone()),
                             cwd,
                             session_path: None,
@@ -1183,11 +1193,525 @@ fn exercise_forwarded_child_questions() {
     }
 }
 
+/// Make the selected real binary visible to both fixture admission and Omp::detect.
+fn test_omp_override() -> Option<tempfile::TempDir> {
+    let binary = std::env::var_os("OMPDECK_TEST_OMP")?;
+    let binary = std::fs::canonicalize(binary).expect("OMPDECK_TEST_OMP must name a real binary");
+    assert!(binary.is_file(), "OMPDECK_TEST_OMP must name a file");
+    let dir = tempfile::tempdir().expect("omp override directory");
+    let target = dir
+        .path()
+        .join(if cfg!(windows) { "omp.exe" } else { "omp" });
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&binary, &target).expect("link selected omp");
+    #[cfg(windows)]
+    std::fs::copy(&binary, &target).expect("copy selected omp");
+    let mut paths = vec![dir.path().to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    // SAFETY: the sole test calls this before any fixture/model/gateway threads start.
+    unsafe {
+        std::env::set_var("PATH", std::env::join_paths(paths).expect("override PATH"));
+    }
+    Some(dir)
+}
+
+fn fixture_git(repo: &Path, args: &[&str]) -> String {
+    let output = ProcessCommand::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .expect("run sandbox git");
+    assert!(
+        output.status.success(),
+        "git {args:?} in {}: {}",
+        repo.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git UTF-8 output")
+        .trim()
+        .to_owned()
+}
+
+const WORKTREE_BRANCH: &str = "wt/agent-live";
+const WORKTREE_REPORT: &str = "WT-REPORT: committed the child change; now validating it.";
+const WORKTREE_CURRENT: &str = "Validate the linked checkout";
+
+fn worktree_script(req: &Value, primary: &Path, registered: &Path, release: &Path) -> Reply {
+    if !fm::has_tools(req) {
+        return Reply::text("Fake title");
+    }
+    let prompt = fm::last_user_text(req);
+    let results = tool_texts(req);
+    let quote = |path: &Path| deck_core::worktree::shell_quote(&path.to_string_lossy());
+    let (name, args) = if prompt.contains("Finish this worktree:") {
+        if !results.is_empty() {
+            assert!(results[0].contains("WT-MERGE-RAN"), "{results:?}");
+            return Reply::text("WT-FINISH-MERGED: committed work merged into main.");
+        }
+        (
+            "bash",
+            json!({"command": format!(
+                "git -C {} merge --no-ff -m 'merge live agent child' {} && printf WT-MERGE-RAN",
+                quote(primary), WORKTREE_BRANCH
+            )}),
+        )
+    } else if prompt.contains("WT-CHILD-WORK") {
+        match results.len() {
+            0 => (
+                "bash",
+                json!({"command": format!(
+                    "while [ ! -f {} ]; do sleep 0.05; done; pwd > child-cwd.txt && printf 'real child work\\n' > child-change.txt && git add child-cwd.txt child-change.txt && git commit -qm 'child worktree change' && printf WT-CHILD-COMMITTED",
+                    quote(registered)
+                )}),
+            ),
+            1 => {
+                assert!(results[0].contains("WT-CHILD-COMMITTED"), "{results:?}");
+                (
+                    "todo",
+                    json!({"op": "init", "list": [{
+                        "phase": "Worktree delivery",
+                        "items": ["Commit the child change", WORKTREE_CURRENT, "Summarize the result"]
+                    }]}),
+                )
+            }
+            2 => (
+                "todo",
+                json!({"op": "done", "task": "Commit the child change"}),
+            ),
+            3 => ("todo", json!({"op": "start", "task": WORKTREE_CURRENT})),
+            4 => ("ompdeck_report", json!({"text": WORKTREE_REPORT})),
+            5 => {
+                assert!(results[4].starts_with("Reported to "), "{results:?}");
+                (
+                    "bash",
+                    json!({"command": format!(
+                        "while [ ! -f {} ]; do sleep 0.05; done; printf WT-PROGRESS-RELEASED",
+                        quote(release)
+                    )}),
+                )
+            }
+            6 => {
+                assert!(results[5].contains("WT-PROGRESS-RELEASED"), "{results:?}");
+                ("todo", json!({"op": "done", "task": WORKTREE_CURRENT}))
+            }
+            7 => (
+                "todo",
+                json!({"op": "done", "task": "Summarize the result"}),
+            ),
+            _ => return Reply::text("WT-CHILD-READY: committed, validated, and ready for Finish."),
+        }
+    } else if prompt.contains("WT-CHILD-AFTER") {
+        if !results.is_empty() {
+            assert!(
+                results[0].contains(&*primary.to_string_lossy()),
+                "{results:?}"
+            );
+            return Reply::text("WT-RELOCATED-REPLY: the same child now runs in primary.");
+        }
+        ("bash", json!({"command": "pwd"}))
+    } else if prompt.contains("WT-PARENT-OPEN") {
+        assert!(
+            !fm::tool_names(req).contains(&"ompdeck_report"),
+            "ordinary parent launches must not expose child reports"
+        );
+        if !results.is_empty() {
+            return Reply::text("Worktree child opened.");
+        }
+        (
+            "ompdeck_open_session",
+            json!({
+                "prompt": "WT-CHILD-WORK", "title": "Worktree live child", "placement": "tab",
+                "worktree": {"branch": WORKTREE_BRANCH}
+            }),
+        )
+    } else if prompt.contains("WT-PARENT-LIST") {
+        if !results.is_empty() {
+            return Reply::text("Progress row received.");
+        }
+        ("ompdeck_sessions", json!({}))
+    } else if prompt.contains("WT-PARENT-FINISH") {
+        if !results.is_empty() {
+            return Reply::text("Finish injection acknowledged.");
+        }
+        (
+            "ompdeck_finish_worktree",
+            json!({"session": session_handle(req)}),
+        )
+    } else if prompt.contains("WT-PARENT-AFTER") {
+        match results.len() {
+            0 => (
+                "ompdeck_send_prompt",
+                json!({"session": session_handle(req), "prompt": "WT-CHILD-AFTER"}),
+            ),
+            1 => (
+                "ompdeck_wait_session",
+                json!({"session": session_handle(req), "timeout_seconds": 60}),
+            ),
+            2 => ("ompdeck_sessions", json!({})),
+            _ => return Reply::text("Same handle survived worktree retirement."),
+        }
+    } else {
+        // Reports and finish outcomes arrive as real aside messages.
+        return Reply::text("Child message received.");
+    };
+    assert!(
+        fm::tool_names(req).contains(&name),
+        "extension must advertise {name}"
+    );
+    Reply::tool_call(name, &args)
+}
+
+fn exercise_worktree_report_progress_and_finish() {
+    if which(if cfg!(windows) { "omp.exe" } else { "omp" }).is_none()
+        || which(if cfg!(windows) { "git.exe" } else { "git" }).is_none()
+    {
+        eprintln!("skipped: omp or git is not installed");
+        return;
+    }
+    let config = format!("{OMP_CONFIG}modelRoles:\n  default: {}\n", fm::MODEL);
+    let sb = Sandbox::new("wr", &config);
+    sb.report_failures();
+    let managed = sb.root.join("home/worktrees");
+    // SAFETY: previous fixtures have dropped their model/client/owner; set these before
+    // starting this scenario's model or gateway threads.
+    unsafe {
+        std::env::set_var("OMP_WORKTREE_DIR", &managed);
+        std::env::set_var("GIT_CONFIG_GLOBAL", sb.root.join("home/.gitconfig"));
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    }
+    std::fs::write(
+        sb.root.join("home/.gitconfig"),
+        "[user]\n\tname = Deck Test\n\temail = deck@test.invalid\n[commit]\n\tgpgsign = false\n",
+    )
+    .expect("sandbox git config");
+    let primary = sb.proj();
+    fixture_git(&primary, &["init", "-q", "-b", "main"]);
+    std::fs::write(primary.join("initial.txt"), "initial\n").expect("initial fixture file");
+    fixture_git(&primary, &["add", "initial.txt"]);
+    fixture_git(&primary, &["commit", "-qm", "initial fixture commit"]);
+    let initial_tip = fixture_git(&primary, &["rev-parse", "HEAD"]);
+    let registered = sb.root.join("child-registered");
+    let release = sb.root.join("release-progress");
+    let model = {
+        let primary = primary.clone();
+        let registered = registered.clone();
+        let release = release.clone();
+        FakeModel::start(move |req| worktree_script(req, &primary, &registered, &release))
+    };
+    std::fs::write(sb.agent().join("models.yml"), model.models_yml()).expect("models.yml");
+    let gui = sb.client();
+    wait_for("worktree GUI link", STEP, || {
+        matches!(gui.link(), Link::Up(_)).then_some(())
+    });
+    // No Topic::Live subscription: Controllers must mirror todos on its own ctl link.
+    let opener = launch(&gui, &sb, "worktree-parent", "WT-PARENT-OPEN");
+    let (request, child, cwd) = wait_for("new linked worktree child launch", TURN, || {
+        gui.events().into_iter().find_map(|event| match event {
+            ClientEvent::AgentOpenSession {
+                request,
+                opener: target,
+                cwd,
+                prompt,
+                title,
+                ..
+            } if target == opener => {
+                assert!(
+                    cwd.starts_with(&managed),
+                    "worktree escaped sandbox: {cwd:?}"
+                );
+                assert_ne!(cwd, primary);
+                let worktree = deck_core::worktree::resolve(&cwd).expect("real linked worktree");
+                assert_eq!(worktree.primary, primary);
+                assert_eq!(worktree.branch.as_deref(), Some(WORKTREE_BRANCH));
+                assert!(
+                    cwd.join(".git").is_file(),
+                    "linked worktree has a .git file"
+                );
+                let done = run(
+                    &gui,
+                    Mutation::Launch(LaunchSpec {
+                        agent_child: true,
+                        mux_name: Some("omp-tools-worktree-child".into()),
+                        cwd: cwd.clone(),
+                        session_path: None,
+                        label: title.expect("worktree child title"),
+                        argv: vec!["omp".into(), prompt.expect("worktree child prompt")],
+                        role: SessionRole::Session,
+                        copy_of: None,
+                        view: SessionView::Chat,
+                    }),
+                )
+                .expect("GUI launches worktree child");
+                let Done::Session(child, SessionView::Chat) = done else {
+                    panic!("worktree child launch: {done:?}");
+                };
+                Some((request, child, cwd))
+            }
+            _ => None,
+        })
+    });
+    let Answer::Topic(settings) = gui
+        .query(Query::Topic(Topic::Settings))
+        .wait(STEP)
+        .expect("settings response")
+        .expect("settings query")
+    else {
+        panic!("settings response");
+    };
+    let TopicValue::Settings(settings) = *settings else {
+        panic!("settings topic");
+    };
+    assert_eq!(
+        settings.config.worktree_bases.get(&cwd).map(String::as_str),
+        Some("main")
+    );
+    assert_eq!(fixture_git(&cwd, &["rev-parse", "main"]), initial_tip);
+    run(
+        &gui,
+        Mutation::AgentToolDone {
+            request,
+            target: opener.clone(),
+            ok: true,
+            text: "Opened Worktree live child.".into(),
+            opened: Some(child.clone()),
+        },
+    )
+    .expect("register real worktree child");
+    std::fs::write(&registered, "registered").expect("release registered child");
+    let opened = result(&model, "WT-PARENT-OPEN");
+    let open_request = wait_for("opener receives child handle", TURN, || {
+        model.find(0, |req| {
+            fm::last_user_text(req).contains("WT-PARENT-OPEN") && !tool_texts(req).is_empty()
+        })
+    });
+    let handle = session_handle(&open_request);
+    assert!(opened.contains("Worktree: "), "{opened}");
+    assert!(opened.contains(&*cwd.to_string_lossy()), "{opened}");
+    assert!(
+        opened.contains(WORKTREE_BRANCH) && opened.contains("merges into main"),
+        "{opened}"
+    );
+    let report = wait_for("child report delivered as an opener aside", TURN, || {
+        model.find(0, |req| {
+            fm::has_tools(req)
+                && fm::messages(req).iter().any(|message| {
+                    let text = fm::text(message);
+                    fm::role(message) == "user"
+                        && text.contains("Report from Worktree live child")
+                        && text.contains(WORKTREE_REPORT)
+                        && text.contains(&handle)
+                })
+        })
+    });
+    assert!(
+        conversation_text(&report).contains("WT-PARENT-OPEN"),
+        "report belongs to opener"
+    );
+    wait_for("controller mirrors native todo mutation", TURN, || {
+        let Ok(Answer::Topic(value)) = gui.query(Query::Topic(Topic::Controllers)).wait(STEP)?
+        else {
+            return None;
+        };
+        let TopicValue::Controllers(controllers) = *value else {
+            return None;
+        };
+        let info = controllers.into_iter().find(|info| info.target == child)?;
+        let progress = info.progress?;
+        (progress.counts() == (1, 3)
+            && progress.current().is_some_and(|task| {
+                task.content == WORKTREE_CURRENT
+                    && task.status == deck_core::ctl::TodoStatus::InProgress
+            }))
+        .then_some(())
+    });
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("child-cwd.txt"))
+            .expect("child pwd")
+            .trim(),
+        cwd.to_string_lossy()
+    );
+    assert_eq!(fixture_git(&cwd, &["status", "--porcelain"]), "");
+    assert_ne!(fixture_git(&cwd, &["rev-parse", "HEAD"]), initial_tip);
+    assert!(
+        !primary.join("child-change.txt").exists(),
+        "child change is isolated until merge"
+    );
+    prompt(&gui, &opener, "WT-PARENT-LIST");
+    let listed = result(&model, "WT-PARENT-LIST");
+    let row = listed
+        .lines()
+        .find(|row| row.contains(&format!("handle: {handle}")))
+        .expect("child session row");
+    assert!(row.contains("worktree wt/agent-live → main"), "{row}");
+    assert!(
+        row.contains("todos: 1/3") && row.contains(&format!("now: {WORKTREE_CURRENT}")),
+        "{row}"
+    );
+    assert!(
+        row.contains("last report:") && row.contains(WORKTREE_REPORT),
+        "{row}"
+    );
+    std::fs::write(&release, "continue").expect("release child validation tool");
+    wait_for("child completes its native todo tools", TURN, || {
+        model.find(0, |req| {
+            fm::last_user_text(req).contains("WT-CHILD-WORK") && tool_texts(req).len() == 8
+        })
+    });
+    idle(&gui, &child);
+    let before_move = wait_for("child conversation before relocation", STEP, || {
+        let Ok(Answer::Topic(value)) = gui.query(Query::Topic(Topic::Controllers)).wait(STEP)?
+        else {
+            return None;
+        };
+        let TopicValue::Controllers(controllers) = *value else {
+            return None;
+        };
+        let info = controllers.into_iter().find(|info| info.target == child)?;
+        assert_eq!(info.progress.as_ref().map(|p| p.counts()), Some((3, 3)));
+        info.session_path
+    });
+    prompt(&gui, &opener, "WT-PARENT-FINISH");
+    let started = result(&model, "WT-PARENT-FINISH");
+    assert!(started.starts_with("Finish started:"), "{started}");
+    assert!(
+        started.contains(WORKTREE_BRANCH) && started.contains("main"),
+        "{started}"
+    );
+    wait_for(
+        "actual Finish prompt reaches the worktree child",
+        TURN,
+        || {
+            model.find(0, |req| {
+                fm::has_tools(req)
+                    && fm::last_user_text(req).contains("Finish this worktree:")
+                    && fm::last_user_text(req).contains(WORKTREE_BRANCH)
+                    && fm::last_user_text(req).contains("Do not delete the worktree")
+            })
+        },
+    );
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for(
+            "opener receives real worktree removal outcome",
+            Duration::from_secs(150),
+            || {
+                model.find(0, |req| {
+                    fm::has_tools(req)
+                        && fm::messages(req).iter().any(|message| {
+                            let text = fm::text(message);
+                            fm::role(message) == "user"
+                                && text.contains("Worktree finish: Worktree live child")
+                                && text.contains(&handle)
+                                && text.to_lowercase().contains("removed")
+                                && (text.contains("~/proj")
+                                    || text.contains(&*primary.to_string_lossy()))
+                        })
+                })
+            },
+        );
+    }));
+    if let Err(error) = outcome {
+        eprintln!(
+            "finish controller state: {:?}",
+            gui.query(Query::Topic(Topic::Controllers)).wait(STEP)
+        );
+        if let Some(req) = model.find(0, |req| {
+            fm::has_tools(req)
+                && fm::last_user_text(req).contains("Finish this worktree:")
+                && !tool_texts(req).is_empty()
+        }) {
+            eprintln!("finish model tool results: {:?}", tool_texts(&req));
+        }
+        if let Some(req) = model.find(0, |req| {
+            fm::messages(req)
+                .iter()
+                .any(|message| fm::text(message).contains("Worktree finish:"))
+        }) {
+            for message in fm::messages(&req) {
+                let text = fm::text(message);
+                if text.contains("Worktree finish:") {
+                    eprintln!("finish opener aside: {text}");
+                }
+            }
+        }
+        std::panic::resume_unwind(error);
+    }
+    assert!(!cwd.exists(), "gateway must remove the finished worktree");
+    assert!(
+        !fixture_git(&primary, &["worktree", "list", "--porcelain"])
+            .contains(&*cwd.to_string_lossy()),
+        "worktree remains registered"
+    );
+    assert!(
+        !fixture_git(&primary, &["branch", "--list", WORKTREE_BRANCH]).contains(WORKTREE_BRANCH),
+        "merged child branch must be removed"
+    );
+    assert_eq!(fixture_git(&primary, &["status", "--porcelain"]), "");
+    assert_eq!(
+        std::fs::read_to_string(primary.join("child-change.txt"))
+            .expect("actual merged child file"),
+        "real child work\n"
+    );
+    assert!(
+        fixture_git(&primary, &["log", "-1", "--format=%s"]).contains("merge live agent child")
+    );
+    let relocated = wait_for("same live child relocates to primary", STEP, || {
+        let Ok(Answer::Topic(value)) = gui.query(Query::Topic(Topic::Controllers)).wait(STEP)?
+        else {
+            return None;
+        };
+        let TopicValue::Controllers(controllers) = *value else {
+            return None;
+        };
+        let info = controllers
+            .into_iter()
+            .find(|info| info.target.key == child.key)?;
+        (info.cwd == primary
+            && info.exit_code.is_none()
+            && info
+                .session_path
+                .as_ref()
+                .is_some_and(|path| path != &before_move))
+        .then_some(info.target)
+    });
+    prompt(&gui, &opener, "WT-PARENT-AFTER");
+    let after = wait_for(
+        "same handle works after sanctioned relocation",
+        TURN,
+        || {
+            model.find(0, |req| {
+                fm::last_user_text(req).contains("WT-PARENT-AFTER") && tool_texts(req).len() == 3
+            })
+        },
+    );
+    assert_eq!(session_handle(&after), handle);
+    let results = tool_texts(&after);
+    assert!(results[0].contains("Sent to"), "{results:?}");
+    assert!(
+        results[1].contains("finished (completed)")
+            && results[1].ends_with("WT-RELOCATED-REPLY: the same child now runs in primary."),
+        "{results:?}"
+    );
+    assert!(
+        results[2]
+            .lines()
+            .any(|row| row.contains(&format!("handle: {handle}"))
+                && !row.contains("worktree wt/agent-live")),
+        "{results:?}"
+    );
+    run(&gui, Mutation::Kill(relocated)).expect("stop relocated worktree child");
+    run(&gui, Mutation::Kill(opener)).expect("stop worktree opener");
+}
+
 #[test]
 fn real_agent_tools_notify_list_review_and_require_a_window() {
     // Sandbox owns process-wide HOME/XDG variables: keep all scenarios in one test.
+    let _omp_override = test_omp_override();
     exercise_notify_list_review_and_require_a_window();
     exercise_open_wait_send_follow_up_draft_and_stale_handle();
     exercise_background_wait_idle_and_busy_delivery();
     exercise_forwarded_child_questions();
+    exercise_worktree_report_progress_and_finish();
 }

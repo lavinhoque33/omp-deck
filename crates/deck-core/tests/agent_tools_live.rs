@@ -5,13 +5,13 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use deck_core::ctl::{CtlClient, CtlCommand, ToolEvent, ToolRequest};
+use deck_core::ctl::{CtlClient, CtlCommand, GoalStatus, TodoStatus, ToolEvent, ToolRequest};
 use deck_tsp::wire::Event;
 use serde_json::{Value, json};
 use support::fake_model::{self as fm, Reply};
 use support::{Live, TURN, wait_for};
 
-const ALL: &str = "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question";
+const ALL: &str = "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report";
 const RESULT: &str = "Posted: verified round trip";
 const DELIVERED_IDLE: &str = "DELIVERED-IDLE: the child finished.";
 const DELIVERED_BUSY: &str = "DELIVERED-BUSY: the child finished during this tool.";
@@ -29,14 +29,46 @@ fn script(request: &Value) -> Reply {
     }) {
         return Reply::text("Acknowledged the background result.");
     }
+    let user = fm::last_user_text(request);
+    let prompt = user.lines().last().unwrap_or_default();
+    if prompt == "goal-progress-completion" {
+        return if fm::after_last_user(request)
+            .iter()
+            .any(|m| fm::role(m) == "tool")
+        {
+            Reply::slow_text("Goal completion recorded.", Duration::from_secs(3))
+        } else {
+            Reply::slow_tool_call("goal", &json!({"op":"complete"}), Duration::from_secs(2))
+        };
+    }
+    if prompt == "todo-progress" {
+        let steps = fm::after_last_user(request)
+            .iter()
+            .filter(|m| fm::role(m) == "tool")
+            .count();
+        return match steps {
+            0 => Reply::tool_call(
+                "todo",
+                &json!({"op":"init","list":[
+                    {"phase":"Implement","items":["Read requirements","Implement feature"]},
+                    {"phase":"Verify","items":["Run tests"]}
+                ]}),
+            ),
+            1 => Reply::tool_call("todo", &json!({"op":"done","task":"Read requirements"})),
+            2 => Reply::tool_call("todo", &json!({"op":"start","task":"Run tests"})),
+            _ => Reply::text("Progress recorded."),
+        };
+    }
     if fm::after_last_user(request)
         .iter()
         .any(|m| fm::role(m) == "tool")
     {
         return Reply::text("Agent received the tool result.");
     }
-    let user = fm::last_user_text(request);
-    let prompt = user.lines().last().unwrap_or_default();
+    if let Some(call) = prompt.strip_prefix("agent-tool ") {
+        let call: Value = serde_json::from_str(call).expect("scripted tool call");
+        return Reply::tool_call(call["name"].as_str().unwrap(), &call["args"]);
+    }
     if let Some(args) = prompt.strip_prefix("answer-question ") {
         let args: Value = serde_json::from_str(args).expect("scripted question arguments");
         return Reply::tool_call("ompdeck_answer_question", &args);
@@ -1030,4 +1062,305 @@ fn answer_question_rejects_invalid_arguments_without_dispatching() {
             "invalid arguments escaped execute: {args}"
         );
     }
+}
+
+#[test]
+fn snapshot_mirrors_real_todo_phase_updates_and_current_task() {
+    let Some(live) = start("tools-progress", None) else {
+        return;
+    };
+    assert!(live.client().latest().unwrap().progress.is_none());
+    let entry_start = live.entries().len();
+    live.send("todo-progress");
+    let progress = wait_for("the live started todo task", TURN, || {
+        let progress = live.client().latest()?.progress.clone()?;
+        (progress.counts() == (1, 3)
+            && progress.current().is_some_and(|t| t.content == "Run tests"))
+        .then_some(progress)
+    });
+    assert_eq!(progress.phases.len(), 2);
+    assert_eq!(progress.phases[0].name, "Implement");
+    assert_eq!(progress.phases[1].name, "Verify");
+    assert_eq!(progress.phases[0].tasks[0].status, TodoStatus::Completed);
+    assert_eq!(progress.current().unwrap().status, TodoStatus::InProgress);
+    assert!(progress.goal.is_none());
+    assert!(!progress.truncated);
+    let result = tool_result(&live, "todo", entry_start);
+    assert_eq!(result["isError"], false, "{result}");
+    assert_eq!(result["details"]["op"], "start");
+}
+
+#[test]
+fn snapshot_caps_real_todo_phases_tasks_and_unicode_text() {
+    let Some(live) = start("todo-caps", None) else {
+        return;
+    };
+    let list: Vec<_> = (0..17)
+        .map(|phase| json!({
+            "phase": format!("Phase {phase} {}", "🦀".repeat(81)),
+            "items": (0..6).map(|task| format!("{phase}-{task} {}", "🦀".repeat(201))).collect::<Vec<_>>()
+        }))
+        .collect();
+    live.send(&format!(
+        "agent-tool {}",
+        json!({"name":"todo","args":{"op":"init","list":list}})
+    ));
+    let progress = wait_for("capped todo progress", TURN, || {
+        let progress = live.client().latest()?.progress.clone()?;
+        progress.truncated.then_some(progress)
+    });
+    assert_eq!(progress.phases.len(), 16);
+    assert_eq!(progress.counts(), (0, 80));
+    for phase in &progress.phases {
+        assert_eq!(phase.name.chars().count(), 80);
+        assert!(phase.name.ends_with('…'));
+        for task in &phase.tasks {
+            assert_eq!(task.content.chars().count(), 200);
+            assert!(task.content.ends_with('…'));
+        }
+    }
+}
+
+#[test]
+fn worktree_and_report_tools_are_gated_and_forward_valid_arguments() {
+    let Some(live) = start(
+        "tools-wt-report",
+        Some("open_session,finish_worktree,report"),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        live.client().tools(),
+        [
+            "ompdeck_open_session",
+            "ompdeck_finish_worktree",
+            "ompdeck_report"
+        ]
+    );
+    subscribe(&live, true);
+    for (name, args, text) in [
+        (
+            "open_session",
+            json!({"prompt":"Implement independently","worktree":{}}),
+            "Opened Child. Worktree: /tmp/child on branch wt/test (merges into main)",
+        ),
+        (
+            "open_session",
+            json!({"worktree":{"branch":"wt/child","base":"main"}}),
+            "Opened Child. Worktree: /tmp/child on branch wt/child (merges into main)",
+        ),
+        (
+            "open_session",
+            json!({"worktree":{"branch":"x".repeat(200),"base":"y".repeat(200)}}),
+            "Opened boundary child.",
+        ),
+        (
+            "finish_worktree",
+            json!({"session":"s-1234abcd"}),
+            "Finish started: Child was asked to commit and merge wt/child into main. OmpDeck removes the worktree once it is clean and merged; the outcome arrives as a message.",
+        ),
+        (
+            "report",
+            json!({"text":"Implementation is ready"}),
+            "Reported to Parent.",
+        ),
+        (
+            "report",
+            json!({"text":"Waiting for credentials","kind":"blocked"}),
+            "Reported to Parent.",
+        ),
+        (
+            "report",
+            json!({"text":"Merged and verified","kind":"done"}),
+            "Reported to Parent.",
+        ),
+        (
+            "report",
+            json!({"text":"é".repeat(2048),"kind":"progress"}),
+            "Reported to Parent.",
+        ),
+        ("report", json!({"text":"x"}), "Reported to Parent."),
+    ] {
+        let before = live.model.count();
+        let entry_start = live.entries().len();
+        live.send(&format!(
+            "agent-tool {}",
+            json!({"name":format!("ompdeck_{name}"),"args":args})
+        ));
+        let req = request(live.client());
+        assert_eq!(req.name, name);
+        assert_eq!(req.args, args);
+        assert_eq!(req.root.as_deref(), Some(live.session_file().as_path()));
+        let model = live.model.find(before, fm::has_tools).unwrap();
+        let offered: Vec<_> = fm::tool_names(&model)
+            .into_iter()
+            .filter(|n| n.starts_with("ompdeck_"))
+            .collect();
+        assert_eq!(offered.len(), 3);
+        for tool in [
+            "ompdeck_open_session",
+            "ompdeck_finish_worktree",
+            "ompdeck_report",
+        ] {
+            assert!(offered.contains(&tool), "{offered:?}");
+        }
+        assert!(
+            live.ctl(
+                CtlCommand::ToolResult {
+                    id: req.id,
+                    ok: true,
+                    text: text.into(),
+                    details: None,
+                },
+                TURN
+            )
+            .ok
+        );
+        next_model_result(&live, before, text);
+        assert_eq!(
+            tool_result(&live, &format!("ompdeck_{name}"), entry_start)["isError"],
+            false
+        );
+        wait_for("the tool turn to finish", TURN, || {
+            live.main_idle().then_some(())
+        });
+    }
+}
+
+#[test]
+fn worktree_finish_and_report_reject_invalid_arguments_without_dispatching() {
+    let Some(live) = start(
+        "tools-wt-limits",
+        Some("open_session,finish_worktree,report"),
+    ) else {
+        return;
+    };
+    subscribe(&live, true);
+    for (name, args, reason) in [
+        ("open_session", json!({"worktree":"invalid"}), "worktree"),
+        (
+            "open_session",
+            json!({"worktree":{"branch":"x".repeat(201)}}),
+            "worktree",
+        ),
+        (
+            "open_session",
+            json!({"worktree":{"base":"x".repeat(201)}}),
+            "worktree",
+        ),
+        (
+            "finish_worktree",
+            json!({"session":""}),
+            "session must be a non-empty handle of at most 32 bytes",
+        ),
+        (
+            "finish_worktree",
+            json!({"session":"é".repeat(17)}),
+            "session must be a non-empty handle of at most 32 bytes",
+        ),
+        (
+            "report",
+            json!({"text":""}),
+            "text must contain 1 to 4096 bytes",
+        ),
+        (
+            "report",
+            json!({"text":"é".repeat(2049)}),
+            "text must contain 1 to 4096 bytes",
+        ),
+        ("report", json!({"text":"Ready","kind":"invalid"}), "kind"),
+    ] {
+        let before = live.model.count();
+        let tool = format!("ompdeck_{name}");
+        let entry_start = live.entries().len();
+        live.send(&format!("agent-tool {}", json!({"name":tool,"args":args})));
+        let result = wait_for(&format!("rejection of {name} {args}"), TURN, || {
+            assert!(
+                live.client().take_tool_requests().is_empty(),
+                "invalid arguments dispatched: {name} {args}"
+            );
+            live.entries()
+                .into_iter()
+                .skip(entry_start)
+                .find_map(|entry| {
+                    let message = &entry["message"];
+                    (message["role"] == "toolResult" && message["toolName"] == tool)
+                        .then(|| message.clone())
+                })
+        });
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(result.to_string().contains(reason), "{result}");
+        next_model_result(&live, before, reason);
+        wait_for("the rejected tool turn to finish", TURN, || {
+            live.main_idle().then_some(())
+        });
+        assert!(
+            live.client().take_tool_requests().is_empty(),
+            "invalid arguments escaped: {args}"
+        );
+    }
+}
+
+#[test]
+fn omp_normalizes_worktree_fields_before_extension_validation() {
+    let Some(live) = start("tools-wt-coerce", Some("open_session")) else {
+        return;
+    };
+    subscribe(&live, true);
+    let before = live.model.count();
+    live.send(&format!(
+        "agent-tool {}",
+        json!({
+            "name": "ompdeck_open_session",
+            "args": {"worktree": {"branch": 17, "base": false}}
+        })
+    ));
+    let req = request(live.client());
+    assert_eq!(req.name, "open_session");
+    // omp repairs model arguments against the tool schema before execute receives them.
+    assert_eq!(req.args, json!({"worktree":{"branch":"17","base":"false"}}));
+    assert!(
+        live.ctl(
+            CtlCommand::ToolResult {
+                id: req.id,
+                ok: true,
+                text: "Opened normalized child.".into(),
+                details: None,
+            },
+            TURN
+        )
+        .ok
+    );
+    next_model_result(&live, before, "Opened normalized child.");
+}
+
+#[test]
+fn snapshot_keeps_completed_goals_until_omp_clears_their_state() {
+    let Some(live) = start("goal-complete", None) else {
+        return;
+    };
+    assert!(live.client().latest().unwrap().progress.is_none());
+    live.send("/goal goal-progress-completion");
+    wait_for("the active goal", TURN, || {
+        let progress = live.client().latest()?.progress.clone()?;
+        (progress.goal.as_ref()?.status == GoalStatus::Active).then_some(())
+    });
+    let completed = wait_for("the disabled completed goal", TURN, || {
+        let progress = live.client().latest()?.progress.clone()?;
+        (progress.goal.as_ref()?.status == GoalStatus::Complete).then_some(progress)
+    });
+    assert_eq!(
+        completed.goal.as_ref().unwrap().objective,
+        "goal-progress-completion"
+    );
+    assert_eq!(completed.counts(), (0, 0));
+    assert!(!completed.is_empty());
+    wait_for(
+        "omp to clear the completed goal after the turn",
+        TURN,
+        || {
+            let snapshot = live.client().latest()?;
+            (snapshot.main_idle == Some(true) && snapshot.progress.is_none()).then_some(())
+        },
+    );
 }

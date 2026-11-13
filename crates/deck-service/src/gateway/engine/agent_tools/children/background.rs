@@ -189,6 +189,11 @@ impl Engine {
             child.questions.stop();
         }
         self.agent_tools.children.answers.clear();
+        self.agent_tools.children.reports.clear();
+        self.agent_tools.children.finishes.clear();
+        for child in self.agent_tools.children.entries.values_mut() {
+            child.reports = ReportRate::new(Instant::now());
+        }
         self.agent_tools.background_acks.clear();
     }
 

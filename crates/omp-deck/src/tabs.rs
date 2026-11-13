@@ -672,6 +672,14 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
             crate::deco::fill(p, outline.clone(), fill);
             crate::deco::outline(p, outline, stroke);
         }
+        // The session's todos: a 2 px progress line along the tab's bottom edge.
+        if let Some(r) = tab
+            .info()
+            .and_then(|i| i.progress.as_ref())
+            .and_then(crate::progress_view::ratio)
+        {
+            crate::progress_view::paint_tab_line(p, pal, pill, slant, skin::tab_radius(), r);
+        }
         // Leading icon / status.
         let ic = pos2(inner.left() + 12.0 + ICON_W / 2.0, inner.center().y);
         if !paint_status(ui, ic, ICON_W, status) {
@@ -775,6 +783,9 @@ pub fn hover_card(resp: &egui::Response, pal: &Palette, tab: &Tab, title: &str, 
                     let name = m.rsplit('/').next().unwrap_or(m);
                     badge::show(ui, Some(ICON_SPARKLES), name, Hue::Violet, tips::VALUE);
                 });
+            }
+            if let Some(p) = tab.info().and_then(|i| i.progress.as_ref()) {
+                crate::progress_view::kv_rows(ui, KEY_W, p);
             }
             if let Some(n) = &tab.mux_name {
                 card::kv(ui, KEY_W, "tmux", |ui| tips::mono(ui, n));

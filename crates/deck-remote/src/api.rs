@@ -30,6 +30,8 @@
 //! [`UiRequestView::form`] (omitted when absent, like the additive fields above) capped by the
 //! `MAX_FORM_*` bounds; the device answers it with [`UiAnswer::Form`]. The vectors are
 //! `tests/vectors/api-form.json`.
+//! Live todo/goal progress is additive behind [`FEATURE_PROGRESS`], carried by
+//! [`LiveSession::progress`] and bounded by [`ProgressView::new`] on decode.
 //!
 //! A request that is well-formed JSON with a numeric `id` but names an op, feed, session
 //! action type, tagged request value or enum value this gateway does not know (for example
@@ -173,6 +175,8 @@ pub const MAX_UI_OPTIONS: usize = 50;
 /// The HTML-form feature name ([`UiKind::Form`], [`UiAnswer::Form`]; [`Welcome::features`],
 /// `DeviceHello.features`).
 pub const FEATURE_FORM: &str = "form";
+/// Live todo/goal progress on session rows and conversation headers.
+pub const FEATURE_PROGRESS: &str = "progress";
 /// Fields of a [`UiFormView`] at most.
 pub const MAX_FORM_FIELDS: usize = 40;
 /// Sections of a [`UiFormView`] at most.
@@ -2141,6 +2145,131 @@ pub struct LiveSession {
     /// first, at most [`MAX_PENDING_UI`]; answered with [`Op::AnswerUi`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_ui: Vec<UiRequestView>,
+    /// Live todo/goal progress, sent only when the device announces `progress`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ProgressView>,
+}
+
+/// Bounded live todo/goal state. Text caps count Unicode scalar values, including the cut mark.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ProgressWire")]
+pub struct ProgressView {
+    pub phases: Vec<ProgressPhaseView>,
+    pub goal: Option<ProgressGoalView>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressPhaseView {
+    pub name: String,
+    pub tasks: Vec<ProgressTaskView>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressTaskView {
+    pub content: String,
+    pub status: ProgressTaskStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressTaskStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+    Abandoned,
+    Blocked,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressGoalView {
+    pub objective: String,
+    pub status: ProgressGoalStatus,
+    pub tokens_used: u64,
+    pub token_budget: Option<u64>,
+    pub time_used_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressGoalStatus {
+    #[default]
+    Active,
+    Paused,
+    BudgetLimited,
+    Complete,
+    Dropped,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize)]
+struct ProgressWire {
+    phases: Vec<ProgressPhaseView>,
+    goal: Option<ProgressGoalView>,
+    #[serde(default)]
+    truncated: bool,
+}
+
+impl From<ProgressWire> for ProgressView {
+    fn from(value: ProgressWire) -> Self {
+        Self::new(value.phases, value.goal, value.truncated)
+    }
+}
+
+impl ProgressView {
+    pub const MAX_PHASES: usize = 16;
+    pub const MAX_TASKS: usize = 80;
+    pub const MAX_PHASE_NAME: usize = 80;
+    pub const MAX_TASK_CONTENT: usize = 200;
+    pub const MAX_GOAL_OBJECTIVE: usize = 400;
+
+    /// Construct a bounded view without depending on the desktop's control types.
+    pub fn new(
+        mut phases: Vec<ProgressPhaseView>,
+        mut goal: Option<ProgressGoalView>,
+        mut truncated: bool,
+    ) -> Self {
+        fn cut(text: &mut String, cap: usize, truncated: &mut bool) {
+            if let Some((end, _)) = text.char_indices().nth(cap) {
+                let keep = text[..end].char_indices().next_back().map_or(0, |(i, _)| i);
+                text.truncate(keep);
+                text.push_str(CUT_MARK);
+                *truncated = true;
+            }
+        }
+        if phases.len() > Self::MAX_PHASES {
+            phases.truncate(Self::MAX_PHASES);
+            truncated = true;
+        }
+        let mut remaining = Self::MAX_TASKS;
+        for phase in &mut phases {
+            cut(&mut phase.name, Self::MAX_PHASE_NAME, &mut truncated);
+            if phase.tasks.len() > remaining {
+                phase.tasks.truncate(remaining);
+                truncated = true;
+            }
+            remaining -= phase.tasks.len();
+            for task in &mut phase.tasks {
+                cut(&mut task.content, Self::MAX_TASK_CONTENT, &mut truncated);
+            }
+        }
+        if let Some(goal) = &mut goal {
+            cut(
+                &mut goal.objective,
+                Self::MAX_GOAL_OBJECTIVE,
+                &mut truncated,
+            );
+        }
+        Self {
+            phases,
+            goal,
+            truncated,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

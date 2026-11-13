@@ -477,6 +477,11 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
     let folder = cwd.and_then(Path::file_name).and_then(|n| n.to_str());
     let active = row.tab == Some(input.active_tab);
     let attention = status == TabStatus::Attention;
+    let progress = tab
+        .and_then(|t| t.info())
+        .and_then(|i| i.progress.as_ref())
+        .filter(|p| !p.is_empty())
+        .or_else(|| input.progress.of_name(&row.name));
 
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), dock_row_h()), Sense::click());
@@ -531,7 +536,7 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
         }
         // Right side. Tabbed rows: accent window marker at rest, keys on hover. Tab-less
         // rows: dashed attach pill at rest, the Attach key on hover.
-        let text_right;
+        let mut text_right;
         if tab.is_some() {
             if hov > 0.01 {
                 paint_key_at(
@@ -565,6 +570,14 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
         } else {
             let w = attach_pill(p, pal, pill);
             text_right = pill.right() - 8.0 - w;
+        }
+        // Live todos: a compact `3/7` badge before the right-hand marker (keys replace it).
+        if hov <= 0.01
+            && let Some(b) = progress.and_then(|pr| crate::progress_view::row_badge(p, pal, pr))
+        {
+            let left = text_right - b.width();
+            b.paint_at(p, left, pill.center().y);
+            text_right = left - 6.0;
         }
         let color = theme::mix(pal.text, pal.text_strong, sel.max(hov * 0.6));
         let mut job = LayoutJob::default();
@@ -670,7 +683,7 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
             }
         }
     });
-    hover_card(&resp, pal, row, label, status, entry, cwd, input);
+    hover_card(&resp, pal, row, label, status, entry, cwd, input, progress);
 }
 
 #[expect(
@@ -686,6 +699,7 @@ fn hover_card(
     entry: Option<&SessionEntry>,
     cwd: Option<&Path>,
     input: &SidebarInput<'_>,
+    progress: Option<&deck_core::ctl::Progress>,
 ) {
     const KEY_W: f32 = 76.0;
     let mut head = card::Header::new(ICON_TERMINAL, label).tone(tips::status_tone(pal, status));
@@ -717,6 +731,9 @@ fn hover_card(
                 card::kv(ui, KEY_W, "Tab", |ui| {
                     badge::show(ui, Some(ICON_APP_WINDOW), "open", Hue::Blue, tips::VALUE);
                 });
+            }
+            if let Some(p) = progress {
+                crate::progress_view::kv_rows(ui, KEY_W, p);
             }
             card::footer_hints(
                 ui,

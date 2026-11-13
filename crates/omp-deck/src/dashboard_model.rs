@@ -163,6 +163,8 @@ pub struct Extra {
     pub window: Option<u64>,
     /// Live `(used tokens, window)` from the control link (active tab only).
     pub live_ctx: Option<(u64, u64)>,
+    /// Live todo / goal progress of the session (the gateway's controller record).
+    pub progress: Option<deck_core::ctl::Progress>,
 }
 
 /// The context meter of a card.
@@ -219,6 +221,8 @@ pub struct Card {
     pub branch: Option<String>,
     pub worktree: bool,
     pub files: Option<Files>,
+    /// Live todo / goal progress (`None` when the session has neither).
+    pub progress: Option<deck_core::ctl::Progress>,
     /// Lowercase `title project branch` for the search box.
     hay: String,
     id_lc: String,
@@ -282,6 +286,7 @@ impl Card {
             branch,
             worktree,
             files,
+            progress: extra.progress.clone().filter(|p| !p.is_empty()),
             hay,
             id_lc: src.id.to_lowercase(),
         }
@@ -291,6 +296,7 @@ impl Card {
         Shape {
             metrics: self.metrics.is_some(),
             git: self.files.is_some(),
+            progress: self.progress.is_some(),
             reply: self
                 .metrics
                 .as_ref()
@@ -383,6 +389,7 @@ pub const ROW_PROJECT: f32 = 18.0;
 pub const ROW_MODEL: f32 = 24.0;
 pub const ROW_CTX: f32 = 20.0;
 pub const ROW_FILES: f32 = 20.0;
+pub const ROW_PROGRESS: f32 = 20.0;
 pub const REPLY_LINES: usize = 3;
 pub const REPLY_LINE_H: f32 = 16.0;
 pub const ROW_AGENTS: f32 = 28.0;
@@ -393,6 +400,7 @@ pub const SECTION_GAP: f32 = 6.0;
 pub struct Shape {
     pub metrics: bool,
     pub git: bool,
+    pub progress: bool,
     pub reply: bool,
     pub agents: bool,
 }
@@ -405,6 +413,9 @@ pub fn card_height(s: Shape) -> f32 {
     }
     if s.git {
         h += ROW_FILES;
+    }
+    if s.progress {
+        h += ROW_PROGRESS;
     }
     if s.reply {
         h += SECTION_GAP + REPLY_LINES as f32 * REPLY_LINE_H;
@@ -729,12 +740,20 @@ mod tests {
             Shape {
                 metrics: true,
                 git: true,
+                progress: true,
+                ..Shape::default()
+            },
+            Shape {
+                metrics: true,
+                git: true,
+                progress: true,
                 reply: true,
                 ..Shape::default()
             },
             Shape {
                 metrics: true,
                 git: true,
+                progress: true,
                 reply: true,
                 agents: true,
             },
@@ -785,6 +804,7 @@ mod tests {
                 model_name: Some("Opus 5".into()),
                 window: Some(1_000_000),
                 live_ctx: None,
+                progress: None,
             },
             SystemTime::UNIX_EPOCH,
         );
@@ -817,6 +837,7 @@ mod tests {
                 model_name: None,
                 window: Some(1_000_000),
                 live_ctx: Some((50_000, 200_000)),
+                progress: None,
             },
             SystemTime::UNIX_EPOCH,
         );

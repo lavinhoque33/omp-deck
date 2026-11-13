@@ -150,6 +150,7 @@ fn a_subscriber_sees_a_chat_sessions_turn_without_any_title_change() {
     let done = run(
         &client,
         Mutation::Launch(LaunchSpec {
+            agent_child: false,
             mux_name: Some("omp-chat-rs".to_owned()),
             cwd: sb.proj(),
             session_path: None,

@@ -477,6 +477,8 @@ pub struct App {
     agents_view: AgentsView,
     dash: DashState,
     dash_index: agents::DashIndex,
+    /// Todo / goal progress of every managed session, rebuilt when the controller list changes.
+    progress_index: crate::progress_view::ProgressIndex,
     popup: Option<PopupState>,
     /// An "Open in chat view" waiting for its tab's chat view.
     pending_focus: Option<chat_focus::PendingFocus>,
@@ -682,6 +684,7 @@ impl App {
             agents_view: AgentsView::default(),
             dash: DashState::default(),
             dash_index: agents::DashIndex::default(),
+            progress_index: crate::progress_view::ProgressIndex::default(),
             popup: None,
             pending_focus: None,
             tree: None,
@@ -1991,6 +1994,8 @@ impl App {
             .filter_map(|t| Some((t.session_path()?, t.status(false))))
             .filter(|(_, s)| matches!(s, TabStatus::Busy | TabStatus::Attention))
             .collect();
+        // Every managed session's todo / goal progress (the rows' `3/7` badges and hover rows).
+        self.progress_index.refresh(self.gw.controllers());
         let generation = self.gw.sessions_generation();
         let place = self.backup_place();
         let input = SidebarInput {
@@ -2017,6 +2022,7 @@ impl App {
             labels: &self.labels,
             active_tab: self.active,
             tab_activity: &tab_activity,
+            progress: &self.progress_index,
             dock_height: self.cfg.running_dock_height,
             dock_collapsed: self.cfg.running_dock_collapsed,
             backup: crate::sidebar::BackupMenu {

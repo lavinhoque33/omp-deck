@@ -173,6 +173,7 @@ fn the_screens_mutations_reach_a_running_session() {
     let Ok(Outcome::Done(done)) = run(
         &client,
         Mutation::Launch(LaunchSpec {
+            agent_child: false,
             mux_name: Some("omp-screens".to_owned()),
             cwd: sb.proj(),
             session_path: None,
@@ -545,6 +546,7 @@ fn model_and_effort_changes_leave_the_composer_draft_alone() {
     let Ok(Outcome::Done(done)) = run(
         &client,
         Mutation::Launch(LaunchSpec {
+            agent_child: false,
             mux_name: Some("omp-modelsw".to_owned()),
             cwd: sb.proj(),
             session_path: None,
@@ -638,8 +640,10 @@ fn model_and_effort_changes_leave_the_composer_draft_alone() {
     let Ok(Outcome::Done(done)) = effort else {
         panic!("effort: {effort:?}")
     };
+    // A confirmed live model takes the existing thinking-only route; before its
+    // snapshot arrives, the combined model/level route reports the selector.
     assert!(
-        matches!(&*done, Done::Message(m) if m.contains("fake/fake-2")),
+        matches!(&*done, Done::Message(m) if m.contains("fake/fake-2") || m == "Thinking set to low."),
         "{done:?}"
     );
     assert_eq!(

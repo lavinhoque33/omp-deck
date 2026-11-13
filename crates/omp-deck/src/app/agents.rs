@@ -52,6 +52,8 @@ struct Src<'a> {
     card: CardSrc<'a>,
     /// The session's omp process is running (decides how the fleet reports unfinished agents).
     owner_alive: bool,
+    /// Live todo / goal progress (the gateway's controller record).
+    progress: Option<&'a deck_core::ctl::Progress>,
 }
 
 /// Open session tabs plus live backend sessions that no tab shows, as card inputs.
@@ -61,6 +63,7 @@ fn collect_sources<'a>(
     index: &'a DashIndex,
     running: Option<&'a RunningSnapshot>,
     active: usize,
+    progress: &'a crate::progress_view::ProgressIndex,
     now: SystemTime,
 ) -> Vec<Src<'a>> {
     let now_bucket = now
@@ -91,6 +94,7 @@ fn collect_sources<'a>(
                 active: i == active,
             },
             owner_alive: !t.terminal().is_exited(),
+            progress: t.info().and_then(|i| i.progress.as_ref()),
         });
     }
     let Some(running) = running else { return out };
@@ -123,6 +127,7 @@ fn collect_sources<'a>(
                 active: false,
             },
             owner_alive: true,
+            progress: progress.of_name(name),
         });
     }
     out
@@ -221,12 +226,14 @@ impl App {
             .map(|c| (c.used_tokens, c.context_window));
         let sig = self.dash_signature(running.as_ref(), fleet.as_ref(), live_ctx, now);
         if self.dash.sig != Some(sig) {
+            self.progress_index.refresh(self.gw.controllers());
             let srcs = collect_sources(
                 &self.tabs,
                 &self.labels,
                 &self.dash_index,
                 running.as_deref(),
                 self.active,
+                &self.progress_index,
                 now,
             );
             let cards = build_cards(&srcs, fleet.as_deref(), &self.models, live_ctx, now);
@@ -271,6 +278,8 @@ impl App {
         fleet.map(Arc::as_ptr).hash(&mut h);
         self.models.generation.hash(&mut h);
         live_ctx.hash(&mut h);
+        // Progress and the tabs' controller records arrive with the controller list.
+        self.gw.revision(&Topic::Controllers).hash(&mut h);
         self.active.hash(&mut h);
         for (i, t) in self.tabs.iter().enumerate() {
             if t.role != TabRole::Session {
@@ -715,6 +724,7 @@ fn build_cards(
                 model_name: info.map(|i| short_model_name(&i.name).to_owned()),
                 window: info.and_then(|i| i.context_window),
                 live_ctx: live_ctx.filter(|_| s.card.active),
+                progress: s.progress.cloned(),
             };
             Card::build(&s.card, session, &extra, now)
         })

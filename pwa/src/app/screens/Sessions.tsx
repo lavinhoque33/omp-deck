@@ -10,6 +10,7 @@ import { useNav } from '../nav.ts';
 import { age, perform, shortModel, statusLabel, succeeded } from '../ui/format.ts';
 import { useCan, useClient, useClientState, useFeed, useNow } from '../ui/hooks.ts';
 import { ConfirmSheet, ConnectionPill, Empty, InstallHint, NativeUpdateBanner, Sheet, StaleBanner, UpdateBanner, useS4 } from '../ui/kit.tsx';
+import { ProgressCount } from '../ui/progress.tsx';
 import { doneResult } from './fleet/common.ts';
 import { type WorktreeLink, nestWorktrees, plural, runningRows } from './fleet/logic.ts';
 import { ProjectPicker, SessionActionsSheet } from './fleet/SessionActions.tsx';
@@ -571,11 +572,13 @@ function ProjectGroup({
 }
 
 function Indicator({ live }: { live: api.LiveSession | null }): ReactNode {
-  if (live === null) return <span className="dot idle" aria-label="Not running" />;
-  if (live.status.state === 'attention') return <span className="warn" aria-label="Needs input">⚠</span>;
-  if (live.busy || live.status.state === 'busy') return <span className="busy" aria-label="Working" />;
-  if (live.status.state === 'exited') return <span className="dot off" aria-label="Exited" />;
-  return <span className="dot" aria-label="Running" />;
+  let status: ReactNode;
+  if (live === null) status = <span className="dot idle" aria-label="Not running" />;
+  else if (live.status.state === 'attention') status = <span className="warn" aria-label="Needs input">⚠</span>;
+  else if (live.busy || live.status.state === 'busy') status = <span className="busy" aria-label="Working" />;
+  else if (live.status.state === 'exited') status = <span className="dot off" aria-label="Exited" />;
+  else status = <span className="dot" aria-label="Running" />;
+  return <span className="session-indicator">{status}<ProgressCount progress={live?.progress} /></span>;
 }
 
 function NewSessionSheet({
