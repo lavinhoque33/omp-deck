@@ -12,8 +12,8 @@ use deck_core::config::SessionView;
 use deck_service::controller::{Command, Delivery, SessionTarget};
 use deck_service::gateway::client::{ClientEvent, GatewayClient, GatewayOptions, Link};
 use deck_service::gateway::protocol::{
-    Answer, Done, LaunchSpec, Mutation, Outcome, Query, ReviewReply, Role, SessionRole, Topic,
-    TopicValue,
+    Answer, Done, LaunchSpec, Mutation, OrchFinish, Outcome, Query, ReviewReply, Role, SessionRole,
+    Topic, TopicValue, WorktreeFlow,
 };
 use serde_json::{Value, json};
 use support::device::{GATEWAY, OMP_CONFIG, STEP, Sandbox, run, wait_for};
@@ -1095,18 +1095,35 @@ fn exercise_forwarded_child_questions() {
                 "forward_questions:false must never send a question message"
             );
         } else {
-            let forwarded = wait_for("parent receives a full forwarded question", TURN, || {
-                model.find(0, |req| {
-                    let all = conversation_text(req);
-                    fm::has_tools(req)
-                        && all.contains(mark)
-                        && all.contains("Question from")
-                        && all.contains(if name == "ask" {
-                            "Forwarded color?"
-                        } else {
-                            "FWD-EXEC-RAN"
-                        })
+            let forwarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                wait_for("parent receives a full forwarded question", TURN, || {
+                    model.find(0, |req| {
+                        let all = conversation_text(req);
+                        fm::has_tools(req)
+                            && all.contains(mark)
+                            && all.contains("Question from")
+                            && all.contains(if name == "ask" {
+                                "Forwarded color?"
+                            } else {
+                                "FWD-EXEC-RAN"
+                            })
+                    })
                 })
+            }))
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "forwarded-question timeout: scenario={name}, mark={mark}, opener={opener:?}, child={child:?}, captured_requests={}",
+                    model.count()
+                );
+                for (index, req) in model.since(0).into_iter().enumerate() {
+                    eprintln!(
+                        "==== forwarding model request {index}: has_tools={}, last_user={:?} ====\n{:#}\n==== end forwarding model request {index} ====",
+                        fm::has_tools(&req),
+                        fm::last_user_text(&req),
+                        json!(fm::messages(&req))
+                    );
+                }
+                std::panic::resume_unwind(error);
             });
             let question_id = forwarded_question_id(&forwarded);
             assert!(!question_id.is_empty());
@@ -1705,6 +1722,748 @@ fn exercise_worktree_report_progress_and_finish() {
     run(&gui, Mutation::Kill(opener)).expect("stop worktree opener");
 }
 
+const FAN_BRANCHES: [&str; 2] = ["wt/fan-a", "wt/fan-b"];
+const FAN_TITLES: [&str; 2] = ["Fan A", "Fan B"];
+const FAN_REPLIES: [&str; 2] = [
+    "FAN-A-DONE: the first isolated change is committed.",
+    "FAN-B-DONE: the second isolated change is committed.",
+];
+
+fn session_handles(req: &Value) -> Vec<String> {
+    let mut handles = Vec::new();
+    for message in fm::messages(req).iter().filter(|m| fm::role(m) == "tool") {
+        for word in fm::text(message).split_whitespace() {
+            let word = word.trim_end_matches(':');
+            if word.len() == 10
+                && word.starts_with("s-")
+                && word[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !handles.iter().any(|handle| handle == word)
+            {
+                handles.push(word.to_owned());
+            }
+        }
+    }
+    handles
+}
+
+fn session_file(client: &GatewayClient, target: &SessionTarget) -> PathBuf {
+    wait_for("persisted live session identity", TURN, || {
+        let Ok(Answer::Topic(value)) = client.query(Query::Topic(Topic::Controllers)).wait(STEP)?
+        else {
+            return None;
+        };
+        let TopicValue::Controllers(controllers) = *value else {
+            return None;
+        };
+        controllers
+            .into_iter()
+            .find(|info| &info.target == target)?
+            .session_path
+            .filter(|path| path.is_file())
+    })
+}
+
+fn session_entries(file: &Path) -> Vec<Value> {
+    std::fs::read_to_string(file)
+        .expect("read sandbox session")
+        .lines()
+        // A live append can leave only the final line incomplete.
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn orchestration_script(req: &Value, primary: &Path, markers: &Path) -> Reply {
+    if !fm::has_tools(req) {
+        return Reply::text("Fake title");
+    }
+    let prompt = fm::last_user_text(req);
+    let results = tool_texts(req);
+    let quote = |path: &Path| deck_core::worktree::shell_quote(&path.to_string_lossy());
+    let (name, args) = if prompt.contains("Finish this worktree:") {
+        let index = FAN_BRANCHES
+            .iter()
+            .position(|branch| prompt.contains(branch))
+            .expect("finish prompt identifies a fan-out branch");
+        if !results.is_empty() {
+            assert!(results[0].contains("FAN-MERGE-RAN"), "{results:?}");
+            return Reply::text("FAN-FINISH-DONE: updated from main and merged.");
+        }
+        let lane = if index == 0 { "a" } else { "b" };
+        let hold = if index == 0 {
+            format!(
+                "touch {} && for ((i=0;i<2400;i++)); do [ -f {} ] && break; sleep 0.05; done; test -f {} && ",
+                quote(&markers.join("first-entered")),
+                quote(&markers.join("release-first")),
+                quote(&markers.join("release-first"))
+            )
+        } else {
+            format!("touch {} && ", quote(&markers.join("second-entered")))
+        };
+        (
+            "bash",
+            json!({"command": format!(
+                "mkdir {} && printf '{lane}-start\\n' >> {} && {hold}git merge --no-edit main && git -C {} merge --no-ff -m 'merge fan {lane}' {} && printf '{lane}-end\\n' >> {} && rmdir {} && printf FAN-MERGE-RAN",
+                quote(&markers.join("merge-lock")),
+                quote(&markers.join("merge-events")),
+                quote(primary),
+                FAN_BRANCHES[index],
+                quote(&markers.join("merge-events")),
+                quote(&markers.join("merge-lock"))
+            )}),
+        )
+    } else if prompt.contains("FAN-CHILD-A") || prompt.contains("FAN-CHILD-B") {
+        assert!(
+            fm::tool_names(req).contains(&"ompdeck_report"),
+            "the GUI bridge must launch each fan-out session as an agent child"
+        );
+        let index = usize::from(prompt.contains("FAN-CHILD-B"));
+        if !results.is_empty() {
+            assert!(results[0].contains("FAN-CHILD-COMMITTED"), "{results:?}");
+            return Reply::slow_text(FAN_REPLIES[index], Duration::from_secs(2));
+        }
+        let lane = if index == 0 { "a" } else { "b" };
+        (
+            "bash",
+            json!({"command": format!(
+                "for ((i=0;i<2400;i++)); do [ -f {} ] && break; sleep 0.05; done; test -f {} && printf 'isolated {lane}\\n' > fan-{lane}.txt && git add fan-{lane}.txt && git commit -qm 'fan {lane} work' && printf FAN-CHILD-COMMITTED",
+                quote(&markers.join("children-registered")),
+                quote(&markers.join("children-registered"))
+            )}),
+        )
+    } else if prompt.contains("FAN-PARENT-OPEN") {
+        if !results.is_empty() {
+            return Reply::text("Fan-out opened; waiting for its single combined result.");
+        }
+        (
+            "ompdeck_fan_out",
+            json!({
+                "tasks": [
+                    {"prompt": "FAN-CHILD-A", "title": FAN_TITLES[0], "branch": FAN_BRANCHES[0]},
+                    {"prompt": "FAN-CHILD-B", "title": FAN_TITLES[1], "branch": FAN_BRANCHES[1]}
+                ],
+                "worktree": true,
+                "timeout_seconds": 120
+            }),
+        )
+    } else if prompt.contains("FAN-PARENT-FINISH") {
+        let handles = session_handles(req);
+        assert_eq!(handles.len(), 2, "each fan-out child has its own handle");
+        match results.len() {
+            0 | 1 => (
+                "ompdeck_finish_worktree",
+                json!({"session": handles[results.len()]}),
+            ),
+            _ => return Reply::text("Both queued finishes were acknowledged."),
+        }
+    } else if prompt.contains("CHECKPOINT-READ") {
+        if !results.is_empty() {
+            assert!(results[0].contains("before checkpoint"), "{results:?}");
+            return Reply::text("Read-only turn completed without a checkpoint.");
+        }
+        ("read", json!({"path": "checkpoint-file.txt"}))
+    } else if prompt.contains("CHECKPOINT-EDIT") {
+        if !results.is_empty() {
+            assert!(
+                results[0].contains("CHECKPOINT-CAPTURED-BEFORE-EDIT"),
+                "{results:?}"
+            );
+            return Reply::text("Checkpoint edit turn completed.");
+        }
+        let session_id = prompt
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("session="))
+            .expect("checkpoint prompt includes the actual session id");
+        assert!(
+            session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+            "safe git ref component"
+        );
+        (
+            "bash",
+            json!({"command": format!(
+                "ref=$(git for-each-ref --sort=-refname --format='%(refname)' refs/ompdeck/checkpoints/{session_id}/ | head -n 1); test -n \"$ref\" && test \"$(git show \"$ref:checkpoint-file.txt\")\" = 'before checkpoint' && printf 'after checkpoint\\n' > checkpoint-file.txt && printf CHECKPOINT-CAPTURED-BEFORE-EDIT"
+            )}),
+        )
+    } else {
+        // Only the real extension's Deliver messages produce these model requests.
+        return Reply::text("Orchestration aside received.");
+    };
+    assert!(
+        fm::tool_names(req).contains(&name),
+        "extension must advertise {name}"
+    );
+    Reply::tool_call(name, &args)
+}
+
+fn exercise_fan_out_merge_queue_and_checkpoints() {
+    if which(if cfg!(windows) { "omp.exe" } else { "omp" }).is_none()
+        || which(if cfg!(windows) { "git.exe" } else { "git" }).is_none()
+    {
+        eprintln!("skipped: omp or git is not installed");
+        return;
+    }
+    let config = format!("{OMP_CONFIG}modelRoles:\n  default: {}\n", fm::MODEL);
+    let sb = Sandbox::new("oq", &config);
+    sb.report_failures();
+    let managed = sb.root.join("home/worktrees");
+    // SAFETY: the preceding scenario has dropped all clients/model/owner. All paths
+    // are private fixture paths, set before this scenario starts any threads.
+    unsafe {
+        std::env::set_var("OMP_WORKTREE_DIR", &managed);
+        std::env::set_var("GIT_CONFIG_GLOBAL", sb.root.join("home/.gitconfig"));
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    }
+    std::fs::write(
+        sb.root.join("home/.gitconfig"),
+        "[user]\n\tname = Deck Test\n\temail = deck@test.invalid\n[commit]\n\tgpgsign = false\n",
+    )
+    .expect("sandbox git config");
+    let primary = sb.proj();
+    fixture_git(&primary, &["init", "-q", "-b", "main"]);
+    std::fs::write(primary.join("initial.txt"), "initial\n").expect("initial fixture file");
+    fixture_git(&primary, &["add", "initial.txt"]);
+    fixture_git(&primary, &["commit", "-qm", "initial fixture commit"]);
+    let initial_tip = fixture_git(&primary, &["rev-parse", "HEAD"]);
+    let markers = sb.root.join("orchestration-markers");
+    std::fs::create_dir(&markers).expect("private fixture markers outside git");
+    let model = {
+        let primary = primary.clone();
+        let markers = markers.clone();
+        FakeModel::start(move |req| orchestration_script(req, &primary, &markers))
+    };
+    std::fs::write(sb.agent().join("models.yml"), model.models_yml()).expect("models.yml");
+    let gui = sb.client();
+    wait_for("orchestration GUI link", STEP, || {
+        matches!(gui.link(), Link::Up(_)).then_some(())
+    });
+    gui.subscribe(Topic::Orchestration);
+    gui.subscribe(Topic::Worktrees(primary.clone()));
+    let opener = launch(&gui, &sb, "fan-parent", "FAN-PARENT-OPEN");
+    let mut children = Vec::new();
+    let mut open_requests = Vec::new();
+    wait_for(
+        "both fan-out GUI opens individually registered",
+        TURN,
+        || {
+            // Drain the whole batch: find_map would discard a concurrent second open.
+            for event in gui.events() {
+                if let ClientEvent::AgentOpenSession {
+                    request,
+                    opener: target,
+                    cwd,
+                    prompt,
+                    title,
+                    model,
+                    ..
+                } = event
+                {
+                    assert_eq!(target, opener);
+                    assert!(model.is_none());
+                    assert!(
+                        !open_requests.contains(&request),
+                        "distinct per-child open ids"
+                    );
+                    let title = title.expect("fan-out child title");
+                    let index = FAN_TITLES
+                        .iter()
+                        .position(|expected| *expected == title)
+                        .expect("expected fan-out task");
+                    assert!(
+                        !children.iter().any(|(i, _, _)| *i == index),
+                        "task opened once"
+                    );
+                    assert!(cwd.starts_with(&managed), "worktree escaped sandbox HOME");
+                    let worktree =
+                        deck_core::worktree::resolve(&cwd).expect("real linked checkout");
+                    assert_eq!(worktree.primary, primary);
+                    assert_eq!(worktree.branch.as_deref(), Some(FAN_BRANCHES[index]));
+                    assert_eq!(fixture_git(&cwd, &["rev-parse", "main"]), initial_tip);
+                    let done = run(
+                        &gui,
+                        Mutation::Launch(LaunchSpec {
+                            agent_child: true,
+                            mux_name: Some(format!("omp-tools-fan-child-{index}")),
+                            cwd: cwd.clone(),
+                            session_path: None,
+                            label: title.clone(),
+                            argv: vec!["omp".into(), prompt.expect("fan-out initial prompt")],
+                            role: SessionRole::Session,
+                            copy_of: None,
+                            view: SessionView::Chat,
+                        }),
+                    )
+                    .expect("GUI launches fan-out child");
+                    let Done::Session(child, SessionView::Chat) = done else {
+                        panic!("fan-out child launch: {done:?}");
+                    };
+                    run(
+                        &gui,
+                        Mutation::AgentToolDone {
+                            request,
+                            target: opener.clone(),
+                            ok: true,
+                            text: format!("Opened {title}."),
+                            opened: Some(child.clone()),
+                        },
+                    )
+                    .expect("acknowledge this individual fan-out open");
+                    open_requests.push(request);
+                    children.push((index, child, cwd));
+                }
+            }
+            (children.len() == 2).then_some(())
+        },
+    );
+    children.sort_by_key(|(index, _, _)| *index);
+    assert_ne!(children[0].1.key, children[1].1.key);
+    let opened = result(&model, "FAN-PARENT-OPEN");
+    assert!(
+        opened.contains("Their combined result arrives as one message when all have finished."),
+        "{opened}"
+    );
+    let open_request = model
+        .find(0, |req| {
+            fm::last_user_text(req).contains("FAN-PARENT-OPEN") && !tool_texts(req).is_empty()
+        })
+        .expect("real fan-out tool result");
+    let handles = session_handles(&open_request);
+    assert_eq!(handles.len(), 2, "{opened}");
+    for index in 0..2 {
+        let row = opened
+            .lines()
+            .find(|line| line.starts_with(&format!("{}.", index + 1)))
+            .expect("one result line per task");
+        assert!(
+            row.contains(&handles[index])
+                && row.contains(FAN_TITLES[index])
+                && row.contains(FAN_BRANCHES[index]),
+            "{row}"
+        );
+    }
+    let fan_out = wait_for("orchestration records both fan-out children", TURN, || {
+        let Ok(Answer::Topic(value)) = gui.query(Query::Topic(Topic::Orchestration)).wait(STEP)?
+        else {
+            return None;
+        };
+        let TopicValue::Orchestration(view) = *value else {
+            return None;
+        };
+        let root = view
+            .roots
+            .iter()
+            .find(|root| root.target.as_ref() == Some(&opener))?;
+        if root.children.len() != 2 {
+            return None;
+        }
+        let group = root.children[0].fan_out.clone()?;
+        for (index, target, cwd) in &children {
+            let node = root
+                .children
+                .iter()
+                .find(|node| node.target.as_ref() == Some(target))?;
+            assert_eq!(node.handle.as_deref(), Some(handles[*index].as_str()));
+            assert_eq!(node.fan_out.as_deref(), Some(group.as_str()));
+            assert_eq!(node.cwd, *cwd);
+            assert_eq!(
+                node.worktree.as_ref()?.branch.as_deref(),
+                Some(FAN_BRANCHES[*index])
+            );
+        }
+        Some(group)
+    });
+    let parent_file = session_file(&gui, &opener);
+    std::fs::write(markers.join("children-registered"), "continue").expect("release initial turns");
+    let combined_title = format!("Fan-out {fan_out} finished (2/2 done)");
+    let delivered = wait_for(
+        "one combined result really reaches the parent model",
+        TURN,
+        || {
+            model.find(0, |req| {
+                fm::has_tools(req)
+                    && conversation_text(req).contains("FAN-PARENT-OPEN")
+                    && fm::messages(req).iter().any(|message| {
+                        fm::role(message) == "user" && fm::text(message).contains(&combined_title)
+                    })
+            })
+        },
+    );
+    for index in 0..2 {
+        let text = conversation_text(&delivered);
+        for expected in [
+            handles[index].as_str(),
+            FAN_TITLES[index],
+            FAN_BRANCHES[index],
+            FAN_REPLIES[index],
+        ] {
+            assert!(
+                text.contains(expected),
+                "combined result missing {expected}: {text}"
+            );
+        }
+        idle(&gui, &children[index].1);
+        assert_eq!(
+            fixture_git(&children[index].2, &["status", "--porcelain"]),
+            ""
+        );
+        assert!(
+            !primary
+                .join(format!("fan-{}.txt", if index == 0 { "a" } else { "b" }))
+                .exists()
+        );
+    }
+    let child_tips: Vec<_> = children
+        .iter()
+        .map(|(_, _, cwd)| fixture_git(cwd, &["rev-parse", "HEAD"]))
+        .collect();
+    prompt(&gui, &opener, "FAN-PARENT-FINISH");
+    wait_for("first finish actually owns the merge lane", TURN, || {
+        markers.join("first-entered").is_file().then_some(())
+    });
+    wait_for(
+        "second agent finish visibly queues before first release",
+        TURN,
+        || {
+            let Ok(Answer::Topic(value)) = gui
+                .query(Query::Topic(Topic::Worktrees(primary.clone())))
+                .wait(STEP)?
+            else {
+                return None;
+            };
+            let TopicValue::Worktrees(view) = *value else {
+                return None;
+            };
+            let first = view
+                .linked
+                .iter()
+                .find(|entry| entry.worktree.path == children[0].2)?;
+            let second = view
+                .linked
+                .iter()
+                .find(|entry| entry.worktree.path == children[1].2)?;
+            (matches!(
+                first.flow,
+                Some(WorktreeFlow::Finishing {
+                    state: OrchFinish::Merging,
+                    ..
+                })
+            ) && matches!(
+                second.flow,
+                Some(WorktreeFlow::Finishing {
+                    state: OrchFinish::Queued { ahead: 1.. },
+                    ..
+                })
+            ))
+            .then_some(())
+        },
+    );
+    assert_eq!(fixture_git(&primary, &["rev-parse", "HEAD"]), initial_tip);
+    assert!(
+        !markers.join("second-entered").exists(),
+        "queued child must do nothing"
+    );
+    assert!(
+        model
+            .find(0, |req| {
+                fm::last_user_text(req).contains("Finish this worktree:")
+                    && fm::last_user_text(req).contains(FAN_BRANCHES[1])
+            })
+            .is_none(),
+        "queued finish must not inject its prompt before lane release"
+    );
+    assert_eq!(
+        std::fs::read_to_string(markers.join("merge-events")).expect("held lane events"),
+        "a-start\n"
+    );
+    std::fs::write(markers.join("release-first"), "continue").expect("release first merge lane");
+    wait_for(
+        "both actual finish removal asides reach the parent",
+        Duration::from_secs(180),
+        || {
+            let entries = session_entries(&parent_file);
+            FAN_TITLES
+                .iter()
+                .zip(&handles)
+                .all(|(title, handle)| {
+                    entries.iter().any(|entry| {
+                        entry["type"] == "custom_message"
+                            && entry["customType"] == "ompdeck-wait"
+                            && entry["content"].as_str().is_some_and(|text| {
+                                text.contains(&format!("Worktree finish: {title}"))
+                                    && text.contains(handle)
+                                    && text.to_lowercase().contains("removed")
+                            })
+                    })
+                })
+                .then_some(())
+        },
+    );
+    assert_eq!(
+        std::fs::read_to_string(markers.join("merge-events")).expect("actual merge order"),
+        "a-start\na-end\nb-start\nb-end\n"
+    );
+    assert!(!markers.join("merge-lock").exists());
+    for (index, _, cwd) in &children {
+        assert!(!cwd.exists(), "finished worktree removed");
+        assert!(
+            !fixture_git(&primary, &["worktree", "list", "--porcelain"])
+                .contains(&*cwd.to_string_lossy()),
+            "finished worktree unregistered"
+        );
+        assert_eq!(
+            fixture_git(&primary, &["branch", "--list", FAN_BRANCHES[*index]]),
+            ""
+        );
+        fixture_git(
+            &primary,
+            &["merge-base", "--is-ancestor", &child_tips[*index], "HEAD"],
+        );
+        let lane = if *index == 0 { "a" } else { "b" };
+        assert_eq!(
+            std::fs::read_to_string(primary.join(format!("fan-{lane}.txt")))
+                .expect("real merged file"),
+            format!("isolated {lane}\n")
+        );
+    }
+    assert_eq!(
+        fixture_git(
+            &primary,
+            &[
+                "log",
+                "--first-parent",
+                "--format=%s",
+                &format!("{initial_tip}..HEAD")
+            ]
+        ),
+        "merge fan b\nmerge fan a"
+    );
+    assert_eq!(fixture_git(&primary, &["status", "--porcelain"]), "");
+    idle(&gui, &opener);
+    let entries = session_entries(&parent_file);
+    let combined: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            entry["type"] == "custom_message"
+                && entry["customType"] == "ompdeck-wait"
+                && entry["details"]["title"]
+                    .as_str()
+                    .is_some_and(|title| title.starts_with(&format!("Fan-out {fan_out} finished")))
+        })
+        .collect();
+    assert_eq!(
+        combined.len(),
+        1,
+        "one persisted Deliver, not one per child: {combined:?}"
+    );
+    assert_eq!(combined[0]["details"]["title"], combined_title);
+    for expected in FAN_REPLIES {
+        assert!(
+            combined[0]["content"]
+                .as_str()
+                .expect("combined content")
+                .contains(expected)
+        );
+    }
+
+    // A read-only initial turn must not snapshot. The next turn's bash verifies
+    // the snapshot exists and contains the old bytes before it performs the edit.
+    std::fs::write(primary.join("checkpoint-file.txt"), "before checkpoint\n")
+        .expect("checkpoint fixture");
+    std::fs::write(primary.join("index-only.txt"), "staged fixture\n").expect("staged fixture");
+    fixture_git(&primary, &["add", "index-only.txt"]);
+    std::fs::write(primary.join("index-only.txt"), "unstaged fixture\n").expect("unstaged fixture");
+    let index_path = PathBuf::from(fixture_git(
+        &primary,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    ));
+    let index_before = std::fs::read(&index_path).expect("user index before capture");
+    let editor = launch(&gui, &sb, "checkpoint-editor", "CHECKPOINT-READ");
+    result(&model, "CHECKPOINT-READ");
+    idle(&gui, &editor);
+    let editor_file = session_file(&gui, &editor);
+    gui.subscribe(Topic::Checkpoints(editor_file.clone()));
+    let view = wait_for(
+        "subscribed checkpoint identity after read-only turn",
+        TURN,
+        || {
+            let Ok(Answer::Topic(value)) = gui
+                .query(Query::Topic(Topic::Checkpoints(editor_file.clone())))
+                .wait(STEP)?
+            else {
+                return None;
+            };
+            let TopicValue::Checkpoints(view) = *value else {
+                return None;
+            };
+            (view.repo.as_ref() == Some(&primary) && view.session_id.is_some()).then_some(view)
+        },
+    );
+    assert!(view.error.is_none(), "{view:?}");
+    assert!(view.items.is_empty(), "read must not create a checkpoint");
+    let session_id = view.session_id.expect("checkpoint session id");
+    let ref_prefix = format!("refs/ompdeck/checkpoints/{session_id}/");
+    assert_eq!(
+        fixture_git(
+            &primary,
+            &["for-each-ref", "--format=%(refname)", &ref_prefix]
+        ),
+        ""
+    );
+    prompt(
+        &gui,
+        &editor,
+        &format!("CHECKPOINT-EDIT session={session_id}"),
+    );
+    let edited = result(&model, "CHECKPOINT-EDIT");
+    assert!(
+        edited.contains("CHECKPOINT-CAPTURED-BEFORE-EDIT"),
+        "{edited}"
+    );
+    idle(&gui, &editor);
+    assert_eq!(
+        std::fs::read_to_string(primary.join("checkpoint-file.txt")).expect("actual agent edit"),
+        "after checkpoint\n"
+    );
+    let checkpoint = wait_for("automatic pre-edit checkpoint publication", TURN, || {
+        let Ok(Answer::Topic(value)) = gui
+            .query(Query::Topic(Topic::Checkpoints(editor_file.clone())))
+            .wait(STEP)?
+        else {
+            return None;
+        };
+        let TopicValue::Checkpoints(view) = *value else {
+            return None;
+        };
+        assert!(view.error.is_none(), "{view:?}");
+        view.items.into_iter().find(|item| {
+            item.kind == deck_core::checkpoints::CheckpointKind::Turn
+                && item.prompt.contains("CHECKPOINT-EDIT")
+        })
+    });
+    assert!(
+        checkpoint.entry.is_some(),
+        "checkpoint links to the persisted user entry"
+    );
+    assert_eq!(
+        fixture_git(
+            &primary,
+            &[
+                "show",
+                &format!("{}:checkpoint-file.txt", checkpoint.commit)
+            ]
+        ),
+        "before checkpoint"
+    );
+    assert_eq!(
+        std::fs::read(&index_path).expect("index after capture"),
+        index_before
+    );
+    let diff = gui
+        .query(Query::CheckpointDiff {
+            session: editor_file.clone(),
+            seq: checkpoint.seq,
+        })
+        .wait(STEP)
+        .expect("checkpoint diff response")
+        .expect("checkpoint diff");
+    let Answer::CheckpointDiff { rows: files, total } = diff else {
+        panic!("checkpoint diff answer: {diff:?}");
+    };
+    assert_eq!(total, 1, "the full diff count must include the agent edit");
+    assert_eq!(files.len(), 1, "only the agent edit differs: {files:?}");
+    assert_eq!(files[0].path, "checkpoint-file.txt");
+    assert_eq!(files[0].status, 'M');
+    assert_eq!(files[0].added, Some(1));
+    assert_eq!(files[0].removed, Some(1));
+    let done = run(
+        &gui,
+        Mutation::CheckpointRestore {
+            target: editor.clone(),
+            session: editor_file.clone(),
+            seq: checkpoint.seq,
+        },
+    )
+    .expect("idle gateway checkpoint restore");
+    let Done::CheckpointRestored {
+        safety: Some(safety),
+        changed,
+    } = done
+    else {
+        panic!("restore must return its real safety checkpoint: {done:?}");
+    };
+    assert!(changed >= 1);
+    assert_ne!(safety, checkpoint.seq);
+    assert_eq!(
+        std::fs::read_to_string(primary.join("checkpoint-file.txt")).expect("restored agent edit"),
+        "before checkpoint\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(primary.join("index-only.txt")).expect("preserved unstaged file"),
+        "unstaged fixture\n"
+    );
+    assert_eq!(
+        std::fs::read(&index_path).expect("index after restore"),
+        index_before
+    );
+    let safety_ref = format!("{ref_prefix}{safety:06}");
+    assert_eq!(
+        fixture_git(
+            &primary,
+            &["show", &format!("{safety_ref}:checkpoint-file.txt")]
+        ),
+        "after checkpoint"
+    );
+    assert!(
+        fixture_git(&primary, &["show", "-s", "--format=%B", &safety_ref])
+            .lines()
+            .any(|line| line == "kind: rollback"),
+        "safety ref is a real rollback checkpoint"
+    );
+    wait_for(
+        "safety checkpoint appears on subscribed topic",
+        TURN,
+        || {
+            let Ok(Answer::Topic(value)) = gui
+                .query(Query::Topic(Topic::Checkpoints(editor_file.clone())))
+                .wait(STEP)?
+            else {
+                return None;
+            };
+            let TopicValue::Checkpoints(view) = *value else {
+                return None;
+            };
+            view.items
+                .iter()
+                .any(|item| {
+                    item.seq == safety
+                        && item.kind == deck_core::checkpoints::CheckpointKind::Rollback
+                })
+                .then_some(())
+        },
+    );
+    gui.unsubscribe(&Topic::Checkpoints(editor_file));
+    run(&gui, Mutation::Kill(editor)).expect("stop checkpoint editor");
+    for (_, child, _) in children {
+        // Retirement may replace the controller generation while preserving its key.
+        let target = wait_for("relocated fan-out child controller", STEP, || {
+            let Ok(Answer::Topic(value)) =
+                gui.query(Query::Topic(Topic::Controllers)).wait(STEP)?
+            else {
+                return None;
+            };
+            let TopicValue::Controllers(controllers) = *value else {
+                return None;
+            };
+            controllers
+                .into_iter()
+                .find(|info| info.target.key == child.key)
+                .map(|info| info.target)
+        });
+        run(&gui, Mutation::Kill(target)).expect("stop relocated fan-out child");
+    }
+    run(&gui, Mutation::Kill(opener)).expect("stop fan-out parent");
+}
+
 #[test]
 fn real_agent_tools_notify_list_review_and_require_a_window() {
     // Sandbox owns process-wide HOME/XDG variables: keep all scenarios in one test.
@@ -1714,4 +2473,5 @@ fn real_agent_tools_notify_list_review_and_require_a_window() {
     exercise_background_wait_idle_and_busy_delivery();
     exercise_forwarded_child_questions();
     exercise_worktree_report_progress_and_finish();
+    exercise_fan_out_merge_queue_and_checkpoints();
 }

@@ -260,7 +260,7 @@ pub struct SidebarInput<'a> {
     pub dock_collapsed: bool,
     pub backup: BackupMenu<'a>,
     /// Worktrees (by folder) that were sent the finish prompt and are being waited for.
-    pub finishing: &'a HashMap<PathBuf, bool>,
+    pub finishing: &'a HashMap<PathBuf, crate::worktree_ui::FinishMark>,
     /// Worktrees OmpDeck removed: their sessions nest under the primary, marked as removed.
     pub removed: &'a BTreeMap<PathBuf, RemovedWorktree>,
     /// Parked branches: their sessions carry a chip and the continue actions.
@@ -517,7 +517,7 @@ impl LedgerGeom {
 }
 
 /// The ledger rail colour: `mix(panel, weak, 0.62)` (plain `stroke` vanishes at 1 px).
-fn rail_color(pal: &Palette) -> Color32 {
+pub(crate) fn rail_color(pal: &Palette) -> Color32 {
     theme::mix(pal.panel, pal.weak, 0.62)
 }
 
@@ -1029,13 +1029,14 @@ fn show_group(
             let entry = row_group.sessions.get(r.session)?;
             let chip =
                 RowWorktree::of(row_group, &entry.id, input.removed, &input.parked).map(|wt| {
-                    let own = match wt {
+                    let mark = match wt {
                         RowWorktree::Live(w) => input.finishing.get(&w.path).copied(),
                         _ => None,
                     };
                     RowChip {
-                        finishing: own.is_some(),
-                        own_finish: own == Some(true),
+                        finishing: mark.is_some(),
+                        own_finish: mark.is_some_and(|m| m.own),
+                        queued: mark.and_then(|m| m.queued),
                         wt,
                     }
                 });
@@ -1170,7 +1171,7 @@ impl RowAct {
 /// worktree `w`.
 fn live_acts(env: &MenuEnv<'_>, w: &Worktree) -> Vec<RowAct> {
     let mut acts = Vec::new();
-    if let Some(&own) = env.finishing.get(&w.path) {
+    if let Some(own) = env.finishing.get(&w.path).map(|m| m.own) {
         acts.push(RowAct {
             icon: ICON_X,
             label: "Cancel finishing".to_owned(),
@@ -1741,6 +1742,8 @@ struct RowChip<'a> {
     finishing: bool,
     /// This window started the finish, so it can cancel it.
     own_finish: bool,
+    /// Finishes of the same repository ahead of this one in the merge queue.
+    queued: Option<u32>,
 }
 
 impl RowChip<'_> {
@@ -1784,7 +1787,11 @@ impl RowChip<'_> {
             (_, true) => badge::Badge::single(
                 p,
                 Some(ICON_GIT_MERGE),
-                "Finishing…",
+                &crate::worktree_ui::FinishMark {
+                    own: self.own_finish,
+                    queued: self.queued,
+                }
+                .label(),
                 Hue::Amber.color(pal),
                 size,
             ),
@@ -2133,7 +2140,14 @@ fn session_row(
 
 /// The elbow (└, radius 5) of the last row: from the rail above down to the stub height, then
 /// right to the box.
-fn paint_elbow(p: &egui::Painter, rail_x: f32, top: f32, box_x: f32, stub_y: f32, color: Color32) {
+pub(crate) fn paint_elbow(
+    p: &egui::Painter,
+    rail_x: f32,
+    top: f32,
+    box_x: f32,
+    stub_y: f32,
+    color: Color32,
+) {
     let r = 5.0;
     p.vline(rail_x, top..=stub_y - r, Stroke::new(1.0, color));
     p.add(egui::Shape::line(
@@ -2185,10 +2199,17 @@ fn row_hover_card(
     const KEY_W: f32 = 76.0;
     let tone = live.map_or(Color32::TRANSPARENT, |s| tips::status_tone(pal, s));
     let mut head = card::Header::new(ICON_MESSAGES_SQUARE, entry.label()).tone(tone);
+    let queued_text = row
+        .chip
+        .as_ref()
+        .and_then(|c| c.queued)
+        .map(|ahead| format!("Queued in the merge queue ({ahead} ahead)"));
     if let Some(hint) = live.and_then(TabStatus::hint) {
         head = head.subtitle(hint);
     } else if let Some(chip) = &row.chip {
-        if chip.finishing && !chip.own_finish {
+        if let Some(q) = queued_text.as_deref().filter(|_| chip.finishing) {
+            head = head.subtitle(q);
+        } else if chip.finishing && !chip.own_finish {
             head = head.subtitle("Finishing: another device or window started it");
         } else if chip.finishing {
             head = head.subtitle("Finishing: waiting for the agent to merge");
@@ -2478,7 +2499,7 @@ pub struct MenuEnv<'a> {
     /// Session files open in a live tab (a move to a worktree types into that tab).
     pub live_tabs: &'a [&'a Path],
     /// Worktrees (by folder) that were sent the finish prompt and are being waited for.
-    pub finishing: &'a HashMap<PathBuf, bool>,
+    pub finishing: &'a HashMap<PathBuf, crate::worktree_ui::FinishMark>,
     pub parked: ParkView<'a>,
 }
 
@@ -2957,6 +2978,7 @@ mod tests {
                 wt: RowWorktree::Parked(&rec, at),
                 finishing: false,
                 own_finish: false,
+                queued: None,
             };
             let acts = parked_acts(&env, &entry, &rec, at);
             let sl = slots(&chip, true);
@@ -2978,7 +3000,10 @@ mod tests {
         let parkable = HashSet::new();
         let (records, states) = ([], []);
         for own in [true, false] {
-            let finishing = HashMap::from([(wt.path.clone(), own)]);
+            let finishing = HashMap::from([(
+                wt.path.clone(),
+                crate::worktree_ui::FinishMark { own, queued: None },
+            )]);
             let env = MenuEnv {
                 groups: &[],
                 omp_available: true,
@@ -3007,6 +3032,7 @@ mod tests {
                 wt: RowWorktree::Live(&wt),
                 finishing: true,
                 own_finish: own,
+                queued: None,
             };
             assert_eq!(slots(&chip, true)[0].map(|s| s.enabled), Some(own));
         }

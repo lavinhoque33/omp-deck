@@ -82,6 +82,7 @@ mod desktop;
 mod login;
 mod mobile;
 mod notifications;
+mod orchestration;
 mod palette;
 mod project_sync;
 mod redirect;
@@ -213,6 +214,14 @@ enum PendingConfirm {
     },
     /// Forget the saved backup server.
     RemoveServer,
+    /// Stop these children of an orchestration card: (backend name, title).
+    StopChildren(Vec<(String, String)>),
+    /// Roll the working tree of tab `uid`'s session back to checkpoint `seq`.
+    Rollback {
+        uid: u64,
+        session: PathBuf,
+        seq: u32,
+    },
     /// Remove a clean, merged worktree (with its branch) or park a clean, pushed one (the
     /// branch stays); the gateway moves the sessions inside it into the primary checkout.
     RemoveWorktree {
@@ -479,6 +488,8 @@ pub struct App {
     dash_index: agents::DashIndex,
     /// Todo / goal progress of every managed session, rebuilt when the controller list changes.
     progress_index: crate::progress_view::ProgressIndex,
+    /// Dialogs omp sessions wait on (Needs-you inbox), rebuilt when the controller list changes.
+    needs_you: crate::needs_you::Index,
     popup: Option<PopupState>,
     /// An "Open in chat view" waiting for its tab's chat view.
     pending_focus: Option<chat_focus::PendingFocus>,
@@ -685,6 +696,7 @@ impl App {
             dash: DashState::default(),
             dash_index: agents::DashIndex::default(),
             progress_index: crate::progress_view::ProgressIndex::default(),
+            needs_you: crate::needs_you::Index::default(),
             popup: None,
             pending_focus: None,
             tree: None,
@@ -1746,17 +1758,19 @@ impl App {
         let sessions_key = self.sessions_shortcut(ctx);
         let changes_key =
             self.changes_available() && ctx.input_mut(|i| i.consume_key(ctrl_shift, Key::G));
-        let (reopen, prev, next, bigger, smaller, reset, dashboard) = ctx.input_mut(|i| {
-            (
-                i.consume_key(ctrl_shift, Key::T),
-                i.consume_key(Modifiers::COMMAND, Key::PageUp),
-                i.consume_key(Modifiers::COMMAND, Key::PageDown),
-                i.consume_key(ctrl_shift, Key::Plus) | i.consume_key(ctrl_shift, Key::Equals),
-                i.consume_key(ctrl_shift, Key::Minus),
-                i.consume_key(ctrl_shift, Key::Num0),
-                i.consume_key(ctrl_shift, Key::A),
-            )
-        });
+        let (reopen, prev, next, bigger, smaller, reset, dashboard, needs_you) =
+            ctx.input_mut(|i| {
+                (
+                    i.consume_key(ctrl_shift, Key::T),
+                    i.consume_key(Modifiers::COMMAND, Key::PageUp),
+                    i.consume_key(Modifiers::COMMAND, Key::PageDown),
+                    i.consume_key(ctrl_shift, Key::Plus) | i.consume_key(ctrl_shift, Key::Equals),
+                    i.consume_key(ctrl_shift, Key::Minus),
+                    i.consume_key(ctrl_shift, Key::Num0),
+                    i.consume_key(ctrl_shift, Key::A),
+                    i.consume_key(ctrl_shift, Key::I),
+                )
+            });
         if self.consume_popup_escape(ctx) {
             self.close_agent_popup();
         }
@@ -1776,6 +1790,9 @@ impl App {
         }
         if sessions_key {
             self.toggle_sessions();
+        }
+        if needs_you {
+            self.open_needs_you();
         }
         if reopen {
             self.reopen_closed();
@@ -1810,6 +1827,8 @@ impl App {
 
     fn show_bar(&mut self, ui: &mut egui::Ui, maximized: bool) {
         self.refresh_backup_chip();
+        self.needs_you
+            .refresh(self.gw.controllers(), std::time::SystemTime::now());
         let active = self.tabs.get(self.active);
         let groups = self.groups();
         let inbox = self.gw.inbox();
@@ -1899,13 +1918,25 @@ impl App {
                 warn: !reviews.is_empty() || inbox.as_deref().is_some_and(|v| v.warns),
                 now: std::time::SystemTime::now(),
             },
+            needs_you: crate::needs_you::Input {
+                index: &self.needs_you,
+                models: &self.models,
+                now: std::time::SystemTime::now(),
+            },
         };
         let action = titlebar::show(ui, &input);
         self.scroll_to_active = false;
         let Some(action) = action else {
             return;
         };
-        self.focus_pending = true;
+        // Answering in the Needs-you popover keeps it (and its text fields) focused; every
+        // other bar action, "Open session" included, hands the keyboard back to the terminal.
+        if !matches!(
+            action,
+            BarAction::NeedsYou(crate::needs_you::Action::Answer { .. })
+        ) {
+            self.focus_pending = true;
+        }
         match action {
             BarAction::Tab(a) => self.apply_tab_action(a),
             BarAction::OpenSettings => self.open_settings(),
@@ -1924,6 +1955,7 @@ impl App {
             BarAction::CheckUpdates => self.check_updates_manually(),
             BarAction::AppUpdate(a) => self.apply_app_update_action(a),
             BarAction::Inbox(a) => self.apply_inbox_action(a),
+            BarAction::NeedsYou(a) => self.apply_needs_you_action(a),
             BarAction::ShowPairing => self.mobile.restore(),
             BarAction::OpenBackupActivity(page) => self.open_backup_activity(page),
             BarAction::CancelBackup => self.cancel_backup_job(),
@@ -2230,6 +2262,7 @@ impl App {
             ui_font: self.cfg.ui_font,
             native_decorations: self.cfg.native_decorations,
             agent_tools: &self.cfg.agent_tools,
+            checkpoints: self.cfg.checkpoints,
             omp_found: self.omp_found(),
             omp_version: self.update.version.as_deref(),
             check_updates: self.cfg.check_updates,
@@ -2299,6 +2332,10 @@ impl App {
                 SettingsAction::NativeDecorations(v) => self.set_native_decorations(v),
                 SettingsAction::AgentTools(v) => {
                     self.cfg.agent_tools = v;
+                    self.dirty = true;
+                }
+                SettingsAction::Checkpoints(v) => {
+                    self.cfg.checkpoints = v;
                     self.dirty = true;
                 }
                 SettingsAction::SetCheckUpdates(v) => {
@@ -2513,6 +2550,10 @@ impl App {
             PendingConfirm::SwitchMain { entry, open } => self.execute_switch_main(entry, open),
             PendingConfirm::DropSyncRow { path } => self.drop_sync_row(&path),
             PendingConfirm::Changes(w) => self.execute_changes_write(w),
+            PendingConfirm::StopChildren(kills) => self.execute_stop_children(kills),
+            PendingConfirm::Rollback { uid, session, seq } => {
+                self.execute_rollback(uid, session, seq);
+            }
             PendingConfirm::SpendReset {
                 provider,
                 credential,

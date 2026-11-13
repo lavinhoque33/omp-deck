@@ -68,6 +68,8 @@ impl Engine {
             .values()
             .flat_map(|c| c.subs.iter().cloned())
             .collect();
+        self.step_orchestration(wanted.contains(&Topic::Orchestration), now);
+        self.step_checkpoints(&wanted, now);
         let mut changed: Vec<Topic> = Vec::new();
         self.step_inventory(wanted.contains(&Topic::Inventory));
         self.step_changes(&wanted, now);
@@ -359,6 +361,8 @@ impl Engine {
             | Topic::Live(_)
             | Topic::OmpUpdate
             | Topic::Mobile
+            | Topic::Orchestration
+            | Topic::Checkpoints(_)
             | Topic::Worktrees(_) => {
                 return Err(GatewayError::Refused(format!(
                     "{topic:?} is not an interest-driven topic"

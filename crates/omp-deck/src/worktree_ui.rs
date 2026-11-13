@@ -113,6 +113,25 @@ pub fn layout(
     families
 }
 
+/// A finish flow running on a worktree: whether this window started it (and so can cancel it),
+/// and how many finishes of the same repository run before it while it waits in the merge
+/// queue (`None`: it holds the lane or is past it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FinishMark {
+    pub own: bool,
+    pub queued: Option<u32>,
+}
+
+impl FinishMark {
+    /// The indicator's text: "Queued (N ahead)" while waiting, else "Finishing…".
+    pub fn label(self) -> String {
+        match self.queued {
+            Some(ahead) => format!("Queued ({ahead} ahead)"),
+            None => "Finishing…".to_owned(),
+        }
+    }
+}
+
 /// Where each parked branch is checked out, as last seen by the periodic check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParkState {

@@ -1,5 +1,5 @@
 //! Session-bound extension tools. Requests are ephemeral and never replayed on restart.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -25,6 +25,9 @@ pub(super) struct AgentTools {
     operations: HashMap<u64, children::Operation>,
     reply_acks: Vec<(SessionTarget, u64)>,
     background_acks: Vec<(SessionTarget, u64)>,
+    deferred_deliveries: VecDeque<(SessionTarget, CtlCommand)>,
+    orchestration: children::orchestration::State,
+    fan_out: children::fanout::Groups,
 }
 
 struct Pending {
@@ -74,6 +77,32 @@ struct ReviewArgs {
     paths: Option<Vec<String>>,
 }
 impl AgentTools {
+    fn delivery_awaiting_ack(&self, target: &SessionTarget) -> bool {
+        self.reply_acks.iter().any(|(pending, _)| pending == target)
+    }
+
+    fn delivery_pending(&self, target: &SessionTarget) -> bool {
+        self.delivery_awaiting_ack(target)
+            || self
+                .deferred_deliveries
+                .iter()
+                .any(|(pending, _)| pending == target)
+    }
+
+    fn admit_delivery(
+        &mut self,
+        target: SessionTarget,
+        command: CtlCommand,
+        restoring: bool,
+    ) -> Option<(SessionTarget, CtlCommand)> {
+        if restoring {
+            self.deferred_deliveries.push_back((target, command));
+            None
+        } else {
+            Some((target, command))
+        }
+    }
+
     fn at_capacity(&self, target: &SessionTarget) -> bool {
         self.pending
             .values()
@@ -103,6 +132,7 @@ impl AgentTools {
 
 impl Engine {
     pub(super) fn step_agent_tools(&mut self, now: Instant) {
+        self.step_child_persistence(now);
         let mut events = Vec::new();
         for m in &mut self.sess.managed {
             if let Some(link) = &mut m.live {
@@ -162,6 +192,7 @@ impl Engine {
             }
         }
         self.step_child_tools(now);
+        self.flush_child_deliveries();
         if let Some(deadline) = self
             .agent_tools
             .pending
@@ -235,7 +266,7 @@ impl Engine {
             self.tool_result(&target, req.id, false, "The session changed".to_owned());
             return;
         }
-        if self.agent_tools.at_capacity(&target) {
+        if req.name != "fan_out" && self.agent_tools.at_capacity(&target) {
             self.tool_result(
                 &target,
                 req.id,
@@ -376,6 +407,10 @@ impl Engine {
                         paths,
                     })
                 }
+                "fan_out" => {
+                    self.begin_fan_out(request, req.args, cwd)?;
+                    None
+                }
                 "send_prompt" | "wait_session" => {
                     self.begin_child_tool(request, &req.name, req.args, now)?;
                     None
@@ -473,6 +508,10 @@ impl Engine {
         text: String,
         opened: Option<SessionTarget>,
     ) {
+        if self.agent_tools.fan_out.contains(request) {
+            self.fanout_open_done(request, target, ok, text, opened);
+            return;
+        }
         let Some(p) = self.agent_tools.pending.get(&request) else {
             return;
         };

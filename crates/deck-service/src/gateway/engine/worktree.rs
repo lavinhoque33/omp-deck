@@ -9,7 +9,7 @@
 //! [`Command::MoveTo`]) run under internal request keys (fresh ones per retry); their draft
 //! confirmations and ends reach the client that started the flow, which may answer them.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,8 +31,8 @@ use crate::controller::{
 };
 use crate::gateway::jobs;
 use crate::gateway::protocol::{
-    Answer, ContinueIn, DestinationView, Done, GatewayError, LaunchSpec, Mutation, ParkedEntry,
-    Progress, Retirement, SessionRole, Topic, TopicValue, WorktreeEntry, WorktreeFlow,
+    Answer, ContinueIn, DestinationView, Done, GatewayError, LaunchSpec, Mutation, OrchFinish,
+    ParkedEntry, Progress, Retirement, SessionRole, Topic, TopicValue, WorktreeEntry, WorktreeFlow,
     WorktreeVerdict, WorktreesView,
 };
 use crate::settings::{Edit, Setting, SettingsError, SettingsService};
@@ -89,6 +89,8 @@ pub(crate) enum WtFin {
     },
     FinishReady {
         path: PathBuf,
+        key: RequestKey,
+        retry: bool,
         result: Result<(String, MergeTarget), String>,
     },
     FinishTurn {
@@ -98,7 +100,9 @@ pub(crate) enum WtFin {
     },
     FinishChecked {
         path: PathBuf,
-        result: Result<Vec<String>, String>,
+        key: RequestKey,
+        retry: bool,
+        result: Result<WorktreeStatus, GatewayError>,
     },
     RetireInspected {
         path: PathBuf,
@@ -206,6 +210,8 @@ pub(crate) struct TurnScan {
     asked: bool,
     /// An assistant message followed it (the model answered).
     answered: bool,
+    /// An assistant reply in the watched turn was aborted.
+    aborted: bool,
 }
 
 /// Reads the session file `file` from `offset` for a turn's evidence: a user message written
@@ -226,11 +232,14 @@ fn scan_turn(file: &Path, offset: Option<u64>, asked: bool, not_before_ms: i64) 
     #[derive(serde::Deserialize)]
     struct Role {
         role: Option<String>,
+        #[serde(rename = "stopReason")]
+        stop_reason: Option<String>,
     }
     let none = TurnScan {
         end: offset,
         asked,
         answered: false,
+        aborted: false,
     };
     let Ok(mut f) = std::fs::File::open(file) else {
         return none;
@@ -249,6 +258,7 @@ fn scan_turn(file: &Path, offset: Option<u64>, asked: bool, not_before_ms: i64) 
         end: Some(start),
         asked,
         answered: false,
+        aborted: false,
     };
     let mut read = start;
     let mut reader = std::io::BufReader::new(f);
@@ -267,6 +277,10 @@ fn scan_turn(file: &Path, offset: Option<u64>, asked: bool, not_before_ms: i64) 
         if entry.kind.as_deref() != Some("message") {
             continue;
         }
+        let aborted = entry
+            .message
+            .as_ref()
+            .is_some_and(|message| message.stop_reason.as_deref() == Some("aborted"));
         match entry.message.and_then(|m| m.role).as_deref() {
             Some("user")
                 if entry
@@ -277,7 +291,10 @@ fn scan_turn(file: &Path, offset: Option<u64>, asked: bool, not_before_ms: i64) 
             {
                 out.asked = true;
             }
-            Some("assistant") if out.asked => out.answered = true,
+            Some("assistant") if out.asked => {
+                out.answered = true;
+                out.aborted |= aborted;
+            }
             _ => {}
         }
     }
@@ -299,6 +316,7 @@ struct TurnWatch {
     not_before_ms: i64,
     asked: bool,
     answered: bool,
+    aborted: bool,
     /// Turns counted so far: a read started before the last one ended is stale.
     turns: u64,
     /// The read in flight: its watch and ticket.
@@ -388,6 +406,7 @@ impl TurnWatch {
         }
         self.asked = scan.asked;
         self.answered |= scan.answered;
+        self.aborted |= scan.aborted;
     }
 
     /// One look at the session at `now_ms`; true when a turn ended (`may_end`: a check may
@@ -419,7 +438,10 @@ struct Finish {
     cancel: Arc<AtomicBool>,
     /// The merge target and where to merge, once a worker looked.
     ready: Option<Ready>,
-    started: Instant,
+    /// Set only when released from the merge queue.
+    started: Option<Instant>,
+    state: OrchFinish,
+    retried: bool,
     /// The session the prompt goes to, once one was found.
     session: Option<SessionKey>,
     /// The closed session to open when none runs inside the worktree.
@@ -428,8 +450,73 @@ struct Finish {
     retry_at: Option<Instant>,
     turn: TurnWatch,
     checking: bool,
-    warned: bool,
     pending: Option<RequestKey>,
+}
+
+/// One primary checkout's FIFO lane. A blocked finish stays watched, but is not in this lane.
+#[derive(Default)]
+struct MergeLane {
+    active: Option<PathBuf>,
+    queued: VecDeque<PathBuf>,
+}
+
+impl MergeLane {
+    fn enqueue(&mut self, path: PathBuf) {
+        self.queued.push_back(path);
+    }
+
+    fn ahead(&self, path: &Path) -> Option<u32> {
+        self.queued
+            .iter()
+            .position(|p| p == path)
+            .map(|n| u32::try_from(n + usize::from(self.active.is_some())).unwrap_or(u32::MAX))
+    }
+
+    fn release(&mut self) -> Option<PathBuf> {
+        if self.active.is_some() {
+            return None;
+        }
+        let path = self.queued.pop_front()?;
+        self.active = Some(path.clone());
+        Some(path)
+    }
+
+    fn remove(&mut self, path: &Path) {
+        if self.active.as_deref() == Some(path) {
+            self.active = None;
+        }
+        self.queued.retain(|p| p != path);
+    }
+
+    fn empty(&self) -> bool {
+        self.active.is_none() && self.queued.is_empty()
+    }
+}
+
+impl Finish {
+    /// Retry at most once, and only when merging is the sole remaining blocker.
+    fn retry_merge(&mut self, st: &WorktreeStatus) -> bool {
+        if self.retried || st.dirty || st.merged {
+            return false;
+        }
+        self.retried = true;
+        self.state = OrchFinish::Queued { ahead: 0 };
+        self.started = None;
+        self.ready = None;
+        self.injected = false;
+        true
+    }
+
+    fn release(&mut self, now: Instant) {
+        self.started = Some(now);
+        self.state = OrchFinish::Merging;
+        self.ready = None;
+        self.injected = false;
+        self.retry_at = None;
+        self.pending = None;
+        self.checking = false;
+        self.turn = TurnWatch::default();
+    }
 }
 
 enum RetireStage {
@@ -540,6 +627,9 @@ struct PendingMove {
 #[derive(Default)]
 pub(super) struct Worktrees {
     finishing: HashMap<PathBuf, Finish>,
+    lanes: HashMap<PathBuf, MergeLane>,
+    child_outcomes: HashMap<String, OrchFinish>,
+    finish_children: HashMap<RequestKey, Vec<String>>,
     retiring: HashMap<PathBuf, Retire>,
     continuing: HashMap<RequestKey, Continue>,
     moves: Vec<PendingMove>,
@@ -557,6 +647,23 @@ pub(super) struct Worktrees {
 }
 
 impl Worktrees {
+    fn leave_lane(&mut self, primary: &Path, path: &Path) {
+        if let Some(lane) = self.lanes.get_mut(primary) {
+            lane.remove(path);
+            if lane.empty() {
+                self.lanes.remove(primary);
+            }
+        }
+    }
+
+    fn remove_finish(&mut self, path: &Path) -> Option<Finish> {
+        let finish = self.finishing.remove(path)?;
+        self.leave_lane(&finish.wt.primary, path);
+        self.internal
+            .retain(|_, internal| !matches!(&internal.purpose, Purpose::Finish(p) if p == path));
+        Some(finish)
+    }
+
     /// The client a flow's typed command belongs to.
     pub(super) fn owner(&self, key: &RequestKey) -> Option<&str> {
         self.internal.get(key).map(|i| i.owner.as_str())
@@ -1057,8 +1164,12 @@ impl Engine {
                 self.wt_job(&key, "worktree-finish", Some(cancel.clone()));
                 let label = worktree_label(&worktree);
                 let path = worktree.path.clone();
-                let recorded = self.cfg.worktree_bases.get(&path).cloned();
-                let asked = worktree.clone();
+                let primary = worktree.primary.clone();
+                let handles = self.child_worktree_handles(&worktree);
+                for handle in &handles {
+                    self.worktree.child_outcomes.remove(handle);
+                }
+                self.worktree.finish_children.insert(key.clone(), handles);
                 self.worktree.finishing.insert(
                     path.clone(),
                     Finish {
@@ -1067,28 +1178,24 @@ impl Engine {
                         label: label.clone(),
                         cancel,
                         ready: None,
-                        started: Instant::now(),
+                        started: None,
+                        state: OrchFinish::Queued { ahead: 0 },
+                        retried: false,
                         session: None,
                         resume: None,
                         injected: false,
                         retry_at: None,
                         turn: TurnWatch::default(),
                         checking: false,
-                        warned: false,
                         pending: None,
                     },
                 );
-                self.wt_views_changed();
-                self.wt_worker("worktree-finish", move || {
-                    let result = inspect(&asked, recorded)
-                        .map_err(|e| format!("Worktree “{label}”: {e}"))
-                        .and_then(|(base, _)| {
-                            worktree::find_merge_target(&asked.primary, &base)
-                                .map(|t| (base, t))
-                                .map_err(|e| format!("Cannot finish “{label}”: {e}"))
-                        });
-                    WtFin::FinishReady { path, result }
-                });
+                self.worktree
+                    .lanes
+                    .entry(primary)
+                    .or_default()
+                    .enqueue(path);
+                self.release_finish_lanes(Instant::now());
             }
             Mutation::WorktreeRetire { worktree, park } => {
                 self.accepted(conn, id, &key);
@@ -1222,6 +1329,7 @@ impl Engine {
                                     .get(&f.key)
                                     .and_then(|j| j.progress.as_ref())
                                     .map(|p| p.stage.clone()),
+                                state: self.finish_path_state(&wt.path).unwrap_or_default(),
                             })
                             .or_else(|| {
                                 w.retiring.get(&wt.path).map(|r| WorktreeFlow::Retiring {
@@ -1267,6 +1375,7 @@ impl Engine {
     }
 
     fn wt_views_changed(&mut self) {
+        self.changed(Topic::Orchestration);
         let dirs: Vec<PathBuf> = self.worktree.looks.keys().cloned().collect();
         for d in dirs {
             self.changed(Topic::Worktrees(d));
@@ -1309,6 +1418,7 @@ impl Engine {
         for p in paths {
             self.drive_finish(&p, now);
         }
+        self.release_finish_lanes(now);
         let paths: Vec<PathBuf> = self.worktree.retiring.keys().cloned().collect();
         for p in paths {
             self.drive_retire(&p, now);
@@ -1393,8 +1503,26 @@ impl Engine {
                 branch,
                 base,
             } => self.on_move_base(key, target, branch, base),
-            WtFin::FinishReady { path, result } => self.on_finish_ready(&path, result, now),
-            WtFin::FinishChecked { path, result } => self.on_finish_checked(&path, result),
+            WtFin::FinishReady {
+                path,
+                key,
+                retry,
+                result,
+            } => {
+                if self.current_finish_attempt(&path, &key, retry) {
+                    self.on_finish_ready(&path, result);
+                }
+            }
+            WtFin::FinishChecked {
+                path,
+                key,
+                retry,
+                result,
+            } => {
+                if self.current_finish_attempt(&path, &key, retry) {
+                    self.on_finish_checked(&path, result, now);
+                }
+            }
             WtFin::FinishTurn { path, probe, scan } => {
                 if let Some(f) = self.worktree.finishing.get_mut(&path) {
                     f.turn.probed(&probe, scan);
@@ -1446,9 +1574,12 @@ impl Engine {
         purpose: Purpose,
         command: Command,
     ) -> Result<(), Rejected> {
+        if self.checkpoint_restore_busy(self.sess.managed[i].ctl.target()) {
+            return Err(Rejected::Busy);
+        }
         self.worktree.seq += 1;
         let key = RequestKey {
-            client: INTERNAL.to_owned(),
+            client: format!("{INTERNAL}/{}", self.worktree.seq),
             seq: self.worktree.seq,
         };
         let target = self.sess.managed[i].ctl.target().clone();
@@ -1513,10 +1644,11 @@ impl Engine {
                 let Some(f) = self.worktree.finishing.get_mut(&path) else {
                     return;
                 };
-                if f.pending.as_ref() == Some(&record.key) {
-                    f.pending = None;
+                if f.pending.as_ref() != Some(&record.key) {
+                    return;
                 }
-                if cancelled || record.delivery == Delivery::Declined {
+                f.pending = None;
+                if cancelled || matches!(record.delivery, Delivery::Declined | Delivery::Aborted) {
                     let label = f.label.clone();
                     self.end_finish(
                         &path,
@@ -1589,6 +1721,12 @@ impl Engine {
             .filter(|(_, f)| f.key.client == client)
             .map(|(p, _)| p.clone())
             .collect();
+        // Mark the whole batch first: ending one must not release another revoked flow.
+        for path in &finishes {
+            if let Some(finish) = self.worktree.finishing.get(path) {
+                finish.cancel.store(true, Ordering::Relaxed);
+            }
+        }
         for p in finishes {
             self.end_finish(&p, Err(GatewayError::Cancelled));
         }
@@ -1630,22 +1768,85 @@ impl Engine {
     }
 
     pub(super) fn append_worktree_finish_state(&self, row: &mut String, path: &Path) {
-        if let Some(finish) = self.worktree.finishing.get(path) {
-            if finish.warned {
-                row.push_str(" | finish blocked: ");
-                if let Some(stage) = self
-                    .jobs
-                    .get(&finish.key)
-                    .and_then(|job| job.progress.as_ref())
-                {
-                    row.extend(stage.stage.chars().take(240));
-                }
-            } else {
-                row.push_str(" | finishing");
+        match self.finish_path_state(path) {
+            Some(OrchFinish::Queued { ahead }) => {
+                row.push_str(&format!(" | finish: queued ({ahead} ahead)"));
             }
-        } else if self.worktree.retiring.contains_key(path) {
-            row.push_str(" | finishing");
+            Some(OrchFinish::Blocked { reason }) => {
+                row.push_str(" | finish: blocked: ");
+                row.extend(reason.chars().take(240));
+            }
+            Some(OrchFinish::Merging) => row.push_str(" | finish: merging"),
+            _ => {}
         }
+    }
+
+    fn finish_path_state(&self, path: &Path) -> Option<OrchFinish> {
+        self.worktree
+            .finishing
+            .get(path)
+            .map(|f| f.state.clone())
+            .or_else(|| {
+                self.worktree
+                    .retiring
+                    .contains_key(path)
+                    .then_some(OrchFinish::Merging)
+            })
+    }
+
+    fn last_child_finish(&self, handle: &str) -> Option<OrchFinish> {
+        self.worktree.child_outcomes.get(handle).cloned()
+    }
+
+    fn record_finish_outcome(&mut self, key: &RequestKey, result: &Result<Done, GatewayError>) {
+        let Some(handles) = self.worktree.finish_children.remove(key) else {
+            return;
+        };
+        let outcome = match result {
+            Ok(Done::Retired { parked: true, .. }) => "parked".to_owned(),
+            Ok(Done::Retired { .. }) => "removed".to_owned(),
+            Ok(_) => "completed".to_owned(),
+            Err(GatewayError::Cancelled) => "cancelled".to_owned(),
+            Err(error) => format!("failed: {error}"),
+        };
+        for handle in handles {
+            self.worktree.child_outcomes.insert(
+                handle,
+                OrchFinish::Done {
+                    outcome: outcome.clone(),
+                },
+            );
+        }
+        self.changed(Topic::Orchestration);
+    }
+
+    fn finish_key_state(&self, key: &RequestKey) -> Option<OrchFinish> {
+        self.worktree
+            .finishing
+            .values()
+            .find(|f| &f.key == key)
+            .map(|f| f.state.clone())
+            .or_else(|| {
+                self.worktree
+                    .retiring
+                    .values()
+                    .any(|r| &r.key == key)
+                    .then_some(OrchFinish::Merging)
+            })
+    }
+
+    pub(in crate::gateway::engine) fn child_finish_view(&self, handle: &str) -> Option<OrchFinish> {
+        self.worktree
+            .finish_children
+            .iter()
+            .find_map(|(key, handles)| {
+                handles
+                    .iter()
+                    .any(|h| h == handle)
+                    .then(|| self.finish_key_state(key))
+                    .flatten()
+            })
+            .or_else(|| self.last_child_finish(handle))
     }
     // ---- sessions ---------------------------------------------------------------------------
 
@@ -1753,6 +1954,12 @@ impl Engine {
             Ok(i) => i,
             Err(e) => return self.job_failed(key, e),
         };
+        if self.checkpoint_restore_busy(&target) {
+            return self.job_failed(
+                key,
+                GatewayError::Refused("A checkpoint restore is in progress".to_owned()),
+            );
+        }
         let from = self.sess.managed[i].ctl.session_path().and_then(|p| {
             self.scanned().iter().find_map(|g| {
                 g.sessions
@@ -1827,12 +2034,102 @@ impl Engine {
 
     // ---- finish -----------------------------------------------------------------------------
 
-    fn on_finish_ready(
-        &mut self,
-        path: &Path,
-        result: Result<(String, MergeTarget), String>,
-        now: Instant,
-    ) {
+    fn current_finish_attempt(&self, path: &Path, key: &RequestKey, retry: bool) -> bool {
+        self.worktree.finishing.get(path).is_some_and(|f| {
+            &f.key == key && f.retried == retry && !matches!(f.state, OrchFinish::Queued { .. })
+        })
+    }
+
+    /// Releases at most one finish per primary. Nothing (including git inspection or opening a
+    /// session) is started for a queued finish, and its injection clock does not run.
+    fn release_finish_lanes(&mut self, now: Instant) {
+        let primaries: Vec<_> = self
+            .worktree
+            .lanes
+            .iter()
+            .filter_map(|(primary, lane)| {
+                if lane.active.is_some() {
+                    return None;
+                }
+                let path = lane.queued.front()?;
+                let finish = self.worktree.finishing.get(path)?;
+                let index = finish
+                    .session
+                    .as_ref()
+                    .and_then(|key| self.sess.find(key))
+                    .or_else(|| self.session_inside(&finish.wt));
+                if finish.cancel.load(Ordering::Relaxed)
+                    || index.is_some_and(|i| {
+                        self.checkpoint_restore_busy(self.sess.managed[i].ctl.target())
+                    })
+                {
+                    return None;
+                }
+                Some(primary.clone())
+            })
+            .collect();
+        let released: Vec<_> = primaries
+            .into_iter()
+            .filter_map(|primary| self.worktree.lanes.get_mut(&primary)?.release())
+            .collect();
+        let mut workers = Vec::new();
+        let mut stages = Vec::new();
+        for path in released {
+            let Some(f) = self.worktree.finishing.get_mut(&path) else {
+                continue;
+            };
+            if f.cancel.load(Ordering::Relaxed) {
+                continue;
+            }
+            f.release(now);
+            stages.push((f.key.clone(), "Merging".to_owned()));
+            workers.push((
+                path.clone(),
+                f.key.clone(),
+                f.retried,
+                f.wt.clone(),
+                f.label.clone(),
+            ));
+        }
+        for (primary, lane) in &self.worktree.lanes {
+            for path in &lane.queued {
+                if let Some(f) = self.worktree.finishing.get_mut(path) {
+                    debug_assert_eq!(&f.wt.primary, primary);
+                    let ahead = lane.ahead(path).unwrap_or(0);
+                    let state = OrchFinish::Queued { ahead };
+                    if f.state != state
+                        || self.jobs.get(&f.key).is_none_or(|j| j.progress.is_none())
+                    {
+                        f.state = state;
+                        stages.push((f.key.clone(), format!("Queued ({ahead} ahead)")));
+                    }
+                }
+            }
+        }
+        for (key, stage) in stages {
+            self.wt_stage(&key, stage);
+        }
+        for (path, key, retry, asked, label) in workers {
+            let recorded = self.cfg.worktree_bases.get(&path).cloned();
+            self.wt_worker("worktree-finish", move || {
+                let result = inspect(&asked, recorded)
+                    .map_err(|e| format!("Worktree “{label}”: {e}"))
+                    .and_then(|(base, _)| {
+                        worktree::find_merge_target(&asked.primary, &base)
+                            .map(|target| (base, target))
+                            .map_err(|e| format!("Cannot finish “{label}”: {e}"))
+                    });
+                WtFin::FinishReady {
+                    path,
+                    key,
+                    retry,
+                    result,
+                }
+            });
+        }
+    }
+
+    fn on_finish_ready(&mut self, path: &Path, result: Result<(String, MergeTarget), String>) {
         let Some(f) = self.worktree.finishing.get(path) else {
             return;
         };
@@ -1860,7 +2157,6 @@ impl Engine {
             let Some(f) = self.worktree.finishing.get_mut(path) else {
                 return;
             };
-            f.started = now;
             f.resume = resume;
             f.ready = Some(Ready {
                 base: base.clone(),
@@ -1888,15 +2184,18 @@ impl Engine {
         let Some(f) = self.worktree.finishing.get(path) else {
             return;
         };
-        if f.cancel.load(Ordering::Relaxed) {
+        if f.cancel.load(Ordering::Relaxed) || f.turn.aborted {
             return self.end_finish(path, Err(GatewayError::Cancelled));
         }
-        let Some(ready) = &f.ready else {
+        if matches!(f.state, OrchFinish::Queued { .. }) {
             return;
-        };
+        }
         let label = f.label.clone();
-        // The prompt has to go in within the timeout, whatever state the session is stuck in.
-        if !f.injected && now.duration_since(f.started) > FINISH_TIMEOUT {
+        // The release clock includes inspection and session launch, but never queue time.
+        if !f.injected
+            && f.started
+                .is_some_and(|start| now.duration_since(start) > FINISH_TIMEOUT)
+        {
             return self.end_finish(
                 path,
                 Err(failed(format!(
@@ -1904,6 +2203,9 @@ impl Engine {
                 ))),
             );
         }
+        let Some(ready) = &f.ready else {
+            return;
+        };
         let wt = f.wt.clone();
         let known = f
             .session
@@ -1930,7 +2232,16 @@ impl Engine {
             return;
         };
         let prompt = (!f.injected).then(|| {
-            worktree::finish_prompt(wt.branch.as_deref(), &ready.base, &wt.path, &ready.target)
+            if f.retried {
+                worktree::finish_retry_prompt(
+                    wt.branch.as_deref(),
+                    &ready.base,
+                    &wt.path,
+                    &ready.target,
+                )
+            } else {
+                worktree::finish_prompt(wt.branch.as_deref(), &ready.base, &wt.path, &ready.target)
+            }
         });
         let base = ready.base.clone();
         let m = &self.sess.managed[i];
@@ -1971,17 +2282,34 @@ impl Engine {
         // After the prompt: every turn's end checks the worktree, one at a time. While idle
         // without a turn's end, the session file tells whether the turn ran meanwhile.
         let now_ms = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
+        let not_before_ms = f.turn.not_before_ms;
         if f.turn.look(activity, !f.checking, now_ms) {
             f.checking = true;
             let path = path.to_path_buf();
-            self.wt_worker("worktree-check", move || WtFin::FinishChecked {
-                path,
-                result: worktree::status(&wt, &base)
-                    .map(|st| worktree::blockers(&st, &base))
-                    .map_err(|e| e.to_string()),
+            let key = f.key.clone();
+            let retry = f.retried;
+            self.wt_worker("worktree-check", move || {
+                let aborted = file.as_deref().is_some_and(|file| {
+                    let last = deck_core::status::last_turn(file);
+                    last.outcome == deck_core::status::TurnOutcome::Aborted
+                        && last.assistant_at.is_some_and(|at| {
+                            at.duration_since(SystemTime::UNIX_EPOCH).is_ok_and(|age| {
+                                age.as_millis() >= u128::try_from(not_before_ms).unwrap_or(0)
+                            })
+                        })
+                });
+                WtFin::FinishChecked {
+                    path,
+                    key,
+                    retry,
+                    result: if aborted {
+                        Err(GatewayError::Cancelled)
+                    } else {
+                        worktree::status(&wt, &base).map_err(|e| failed(e.to_string()))
+                    },
+                }
             });
-        } else if activity == Activity::Idle
-            && !f.checking
+        } else if !f.checking
             && let Some(probe) = f.turn.probe(file.as_deref(), now)
         {
             let path = path.to_path_buf();
@@ -1992,40 +2320,82 @@ impl Engine {
         }
     }
 
-    fn on_finish_checked(&mut self, path: &Path, result: Result<Vec<String>, String>) {
+    fn on_finish_checked(
+        &mut self,
+        path: &Path,
+        result: Result<WorktreeStatus, GatewayError>,
+        now: Instant,
+    ) {
         let Some(f) = self.worktree.finishing.get_mut(path) else {
             return;
         };
         f.checking = false;
+        let primary = f.wt.primary.clone();
         let text = match result {
-            Ok(b) if b.is_empty() => return self.retire_finished(path),
-            Ok(b) => format!(
-                "{} is not finished yet: {}. OmpDeck keeps waiting and checks again after the agent's next turn.",
-                f.label,
-                b.join("; ")
-            ),
+            Err(GatewayError::Cancelled) => {
+                return self.end_finish(path, Err(GatewayError::Cancelled));
+            }
+            Ok(st) => {
+                let base = f.ready.as_ref().map_or("HEAD", |r| r.base.as_str());
+                let blockers = worktree::blockers(&st, base);
+                if blockers.is_empty() {
+                    return self.retire_finished(path);
+                }
+                if f.retry_merge(&st) {
+                    self.worktree.leave_lane(&primary, path);
+                    self.worktree
+                        .lanes
+                        .entry(primary)
+                        .or_default()
+                        .enqueue(path.to_path_buf());
+                    self.release_finish_lanes(now);
+                    return;
+                }
+                format!(
+                    "{} is not finished yet: {}. OmpDeck keeps waiting and checks again after the agent's next turn.",
+                    f.label,
+                    blockers.join("; ")
+                )
+            }
             Err(e) => format!("Could not check {}: {e}", f.label),
         };
-        // Explained once; the wait goes on.
-        if !f.warned {
-            f.warned = true;
-            let key = f.key.clone();
+        let key = f.key.clone();
+        let changed = f.state
+            != (OrchFinish::Blocked {
+                reason: text.clone(),
+            });
+        f.state = OrchFinish::Blocked {
+            reason: text.clone(),
+        };
+        self.worktree.leave_lane(&primary, path);
+        if changed {
             self.child_finish_blocked(&key, &text);
             self.wt_stage(&key, text);
         }
+        self.release_finish_lanes(now);
     }
 
     fn end_finish(&mut self, path: &Path, result: Result<Done, GatewayError>) {
-        if let Some(f) = self.worktree.finishing.remove(path) {
+        if let Some(f) = self.worktree.remove_finish(path) {
+            if let Some(pending) = &f.pending {
+                // Internal command clients are unique, so cancelling a queued draft can never
+                // cancel another worktree's prompt or relocation.
+                for m in &mut self.sess.managed {
+                    m.ctl.cancel_client(&pending.client);
+                }
+                self.dirty.controllers = true;
+            }
+            self.record_finish_outcome(&f.key, &result);
             self.child_finish_done(&f.key, &result);
             self.job_finished(f.key, result);
             self.wt_views_changed();
+            self.release_finish_lanes(Instant::now());
         }
     }
 
     /// The finished worktree is clean and merged: the finish job goes on as its removal.
     fn retire_finished(&mut self, path: &Path) {
-        let Some(f) = self.worktree.finishing.remove(path) else {
+        let Some(f) = self.worktree.remove_finish(path) else {
             return;
         };
         let Some(ready) = f.ready else {
@@ -2048,7 +2418,9 @@ impl Engine {
                 moved: Vec::new(),
             },
         );
+        self.wt_views_changed();
         self.start_moving(path, Instant::now());
+        self.release_finish_lanes(Instant::now());
     }
 
     // ---- remove / park ----------------------------------------------------------------------
@@ -2176,6 +2548,16 @@ impl Engine {
         flow: &FlowRef,
         now: Instant,
     ) {
+        if reloc.pending.iter().any(|mover| {
+            self.sess
+                .find(&mover.session)
+                .is_some_and(|i| self.checkpoint_restore_busy(self.sess.managed[i].ctl.target()))
+        }) {
+            // Rollback is destructive: neither `/move` nor the retire timeout's stop/remove
+            // path may race it. Give relocation its normal allowance after the reservation.
+            reloc.started = now;
+            return;
+        }
         let groups = self.scanned();
         let mut send: Vec<(usize, SessionKey)> = Vec::new();
         let mut left: Vec<(usize, Option<PathBuf>)> = Vec::new();
@@ -2501,6 +2883,7 @@ impl Engine {
 
     fn end_retire(&mut self, path: &Path, result: Result<Done, GatewayError>) {
         if let Some(r) = self.worktree.retiring.remove(path) {
+            self.record_finish_outcome(&r.key, &result);
             self.child_finish_done(&r.key, &result);
             self.job_finished(r.key, result);
             self.wt_views_changed();
@@ -3100,6 +3483,224 @@ fn add_parked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queued_finish(path: &str, primary: &str, client: &str, seq: u64) -> Finish {
+        Finish {
+            key: RequestKey {
+                client: client.to_owned(),
+                seq,
+            },
+            wt: wt(path, primary, Some("feature")),
+            label: "feature".to_owned(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            ready: None,
+            started: None,
+            state: OrchFinish::Queued { ahead: 0 },
+            retried: false,
+            session: None,
+            resume: None,
+            injected: false,
+            retry_at: None,
+            turn: TurnWatch::default(),
+            checking: false,
+            pending: None,
+        }
+    }
+
+    #[test]
+    fn merge_lanes_are_same_primary_fifo_for_manual_phone_and_agent_finishes() {
+        let mut state = Worktrees::default();
+        for (path, primary, client, seq) in [
+            ("/r/a", "/r", "desktop", 1),
+            ("/r/b", "/r", "phone", 2),
+            ("/r/c", "/r", "~agent-finish/epoch", 3),
+            ("/other/a", "/other", "desktop", 4),
+        ] {
+            let finish = queued_finish(path, primary, client, seq);
+            state
+                .lanes
+                .entry(finish.wt.primary.clone())
+                .or_default()
+                .enqueue(finish.wt.path.clone());
+            state.finishing.insert(finish.wt.path.clone(), finish);
+        }
+        let lane = state.lanes.get_mut(Path::new("/r")).unwrap();
+        assert_eq!(lane.release().as_deref(), Some(Path::new("/r/a")));
+        assert!(
+            lane.release().is_none(),
+            "an active lane releases no second finish"
+        );
+        assert_eq!(lane.ahead(Path::new("/r/b")), Some(1));
+        assert_eq!(lane.ahead(Path::new("/r/c")), Some(2));
+        lane.remove(Path::new("/r/a"));
+        assert_eq!(lane.ahead(Path::new("/r/b")), Some(0));
+        assert_eq!(lane.release().as_deref(), Some(Path::new("/r/b")));
+        lane.remove(Path::new("/r/b"));
+        assert_eq!(lane.release().as_deref(), Some(Path::new("/r/c")));
+        assert_eq!(
+            state
+                .lanes
+                .get_mut(Path::new("/other"))
+                .unwrap()
+                .release()
+                .as_deref(),
+            Some(Path::new("/other/a")),
+            "independent primaries do not share a lane"
+        );
+    }
+
+    #[test]
+    fn an_aborted_finish_is_seen_even_if_another_turn_has_already_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session.jsonl");
+        let prefix = "{\"type\":\"message\",\"timestamp\":\"2026-11-12T12:00:00Z\",\"message\":{\"role\":\"user\"}}\n";
+        let aborted = "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"aborted\"}}\n";
+        let resumed = "{\"type\":\"message\",\"timestamp\":\"2026-11-12T12:00:01Z\",\"message\":{\"role\":\"user\"}}\n";
+        std::fs::write(&file, format!("{prefix}{aborted}{resumed}")).unwrap();
+        let mut watch = TurnWatch::default();
+        watch.submitted(1, Some(file.clone()), Some(0), 0);
+        let now = Instant::now();
+        let probe = watch.probe(Some(&file), now).unwrap();
+        watch.probed(&probe, probe.run());
+        assert!(
+            watch.aborted,
+            "the later busy turn cannot conceal the abort"
+        );
+        watch.submitted(2, Some(file), None, 0);
+        assert!(!watch.aborted, "a new injection gets fresh turn evidence");
+    }
+
+    #[test]
+    fn queue_time_does_not_count_and_release_resets_injection_and_turn_state() {
+        let now = Instant::now();
+        let released = now + FINISH_TIMEOUT * 3;
+        let mut finish = queued_finish("/r/a", "/r", "desktop", 1);
+        assert!(finish.started.is_none());
+        assert!(!finish.injected);
+        assert!(finish.ready.is_none());
+        assert!(
+            finish
+                .turn
+                .probe(Some(Path::new("never-opened")), released)
+                .is_none()
+        );
+        finish.injected = true;
+        finish.checking = true;
+        finish.pending = Some(RequestKey {
+            client: "old".to_owned(),
+            seq: 1,
+        });
+        finish.retry_at = Some(now + RETRY);
+        finish.turn.submitted(10, None, None, 100);
+        finish.release(released);
+        assert_eq!(finish.started, Some(released));
+        assert_eq!(finish.state, OrchFinish::Merging);
+        assert!(!finish.injected);
+        assert!(!finish.checking);
+        assert!(finish.pending.is_none());
+        assert!(finish.retry_at.is_none());
+        assert_eq!(finish.turn.id, 0);
+        assert!(released.duration_since(finish.started.unwrap()) < FINISH_TIMEOUT);
+    }
+
+    #[test]
+    fn only_unmerged_requeues_once_at_the_tail_with_a_new_release_clock() {
+        let now = Instant::now();
+        let mut finish = queued_finish("/r/a", "/r", "agent", 1);
+        let mut lane = MergeLane::default();
+        for path in ["/r/a", "/r/b", "/r/c"] {
+            lane.enqueue(PathBuf::from(path));
+        }
+        assert_eq!(lane.release().as_deref(), Some(Path::new("/r/a")));
+        finish.release(now);
+        finish.injected = true;
+        assert!(finish.retry_merge(&status(false, false, false)));
+        assert!(finish.started.is_none());
+        assert!(!finish.injected);
+        lane.remove(&finish.wt.path);
+        lane.enqueue(finish.wt.path.clone());
+        assert_eq!(lane.ahead(&finish.wt.path), Some(2));
+        assert_eq!(lane.release().as_deref(), Some(Path::new("/r/b")));
+        lane.remove(Path::new("/r/b"));
+        assert_eq!(lane.release().as_deref(), Some(Path::new("/r/c")));
+        lane.remove(Path::new("/r/c"));
+        assert_eq!(lane.release().as_deref(), Some(Path::new("/r/a")));
+        let again = now + FINISH_TIMEOUT * 4;
+        finish.release(again);
+        assert_eq!(finish.started, Some(again));
+        assert!(finish.retried);
+        assert!(
+            !finish.retry_merge(&status(false, false, false)),
+            "second failure is blocked, not retried"
+        );
+    }
+
+    #[test]
+    fn dirty_or_merged_finishes_do_not_retry_but_resolving_a_blocker_can_requeue() {
+        for st in [
+            status(true, false, false),
+            status(true, true, false),
+            status(false, true, false),
+        ] {
+            let mut finish = queued_finish("/r/a", "/r", "desktop", 1);
+            finish.release(Instant::now());
+            assert!(!finish.retry_merge(&st));
+            assert!(!finish.retried);
+        }
+        let mut finish = queued_finish("/r/a", "/r", "desktop", 1);
+        finish.state = OrchFinish::Blocked {
+            reason: "dirty".to_owned(),
+        };
+        assert!(finish.retry_merge(&status(false, false, false)));
+    }
+
+    #[test]
+    fn cancelling_active_or_queued_finishes_cleans_only_their_lane_and_internal_requests() {
+        let mut state = Worktrees::default();
+        let primary = Path::new("/r");
+        for (seq, path) in [(1, "/r/a"), (2, "/r/b"), (3, "/r/c")] {
+            let mut finish = queued_finish(path, "/r", "desktop", seq);
+            let pending = RequestKey {
+                client: format!("{INTERNAL}/{seq}"),
+                seq,
+            };
+            finish.pending = Some(pending.clone());
+            state.internal.insert(
+                pending,
+                Internal {
+                    owner: "desktop".to_owned(),
+                    purpose: Purpose::Finish(PathBuf::from(path)),
+                },
+            );
+            state
+                .lanes
+                .entry(primary.to_path_buf())
+                .or_default()
+                .enqueue(finish.wt.path.clone());
+            state.finishing.insert(finish.wt.path.clone(), finish);
+        }
+        state.lanes.get_mut(primary).unwrap().release();
+        state.remove_finish(Path::new("/r/b")).unwrap();
+        assert_eq!(state.internal.len(), 2);
+        assert_eq!(state.finishing.len(), 2);
+        assert_eq!(
+            state.lanes[primary].active.as_deref(),
+            Some(Path::new("/r/a"))
+        );
+        assert_eq!(state.lanes[primary].ahead(Path::new("/r/c")), Some(1));
+        state.remove_finish(Path::new("/r/a")).unwrap();
+        assert_eq!(state.internal.len(), 1);
+        assert_eq!(state.lanes[primary].ahead(Path::new("/r/c")), Some(0));
+        assert_eq!(
+            state.lanes.get_mut(primary).unwrap().release().as_deref(),
+            Some(Path::new("/r/c"))
+        );
+        assert!(state.remove_finish(Path::new("/r/a")).is_none());
+        state.remove_finish(Path::new("/r/c")).unwrap();
+        assert!(state.lanes.is_empty());
+        assert!(state.internal.is_empty());
+        assert!(!state.busy());
+    }
 
     fn wt(path: &str, primary: &str, branch: Option<&str>) -> Worktree {
         Worktree {

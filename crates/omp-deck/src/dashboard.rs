@@ -90,7 +90,7 @@ impl ManageState {
     }
 }
 
-/// What the dashboard shows: omp's agent hub has the same two tabs.
+/// What the dashboard shows: omp's agent hub has the first two tabs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DashTab {
     /// The session cards with their subagents.
@@ -98,14 +98,18 @@ pub enum DashTab {
     Agents,
     /// The events of one session's subagents (see `activity`).
     Activity,
+    /// Sessions that opened sessions, as trees (see `orchestration`).
+    Orchestration,
 }
 
 mod activity;
+pub mod orchestration;
 
 /// Dashboard state owned by the app.
 pub struct DashState {
     pub tab: DashTab,
     pub activity: activity::ActivityState,
+    pub orch: orchestration::OrchState,
     pub open: bool,
     pub query: String,
     pub filter: StatusFilter,
@@ -139,6 +143,7 @@ impl Default for DashState {
         DashState {
             tab: DashTab::Agents,
             activity: activity::ActivityState::default(),
+            orch: orchestration::OrchState::default(),
             open: false,
             query: String::new(),
             filter: StatusFilter::All,
@@ -351,6 +356,8 @@ pub enum DashAction {
     },
     /// Restart the active session with live control.
     Restart,
+    /// An Orchestration card or row asked for something.
+    Orch(orchestration::OrchAction),
 }
 
 pub struct DashInput<'a> {
@@ -382,7 +389,9 @@ pub fn show(ui: &mut Ui, st: &mut DashState, input: &DashInput<'_>) -> Vec<DashA
             } else {
                 st.activity.stop();
             }
-            if st.tab == DashTab::Activity {
+            if st.tab == DashTab::Orchestration {
+                orchestration::show(ui, &st.orch, &mut out);
+            } else if st.tab == DashTab::Activity {
             } else if st.cards.is_empty() {
                 empty_state(
                     ui,
@@ -447,7 +456,11 @@ fn header(ui: &mut Ui, st: &mut DashState, out: &mut Vec<DashAction>) {
             if !st.cards.is_empty() {
                 pill(ui, &st.cards.len().to_string(), pal.weak, pal.raised);
             }
-            for (tab, label) in [(DashTab::Agents, "Agents"), (DashTab::Activity, "Activity")] {
+            for (tab, label) in [
+                (DashTab::Agents, "Agents"),
+                (DashTab::Activity, "Activity"),
+                (DashTab::Orchestration, "Orchestration"),
+            ] {
                 if filter_chip_plain(ui, label, st.tab == tab).clicked() {
                     st.tab = tab;
                 }
@@ -490,7 +503,7 @@ fn header(ui: &mut Ui, st: &mut DashState, out: &mut Vec<DashAction>) {
         },
     );
     ui.add_space(8.0);
-    if st.tab == DashTab::Activity {
+    if st.tab != DashTab::Agents {
         return;
     }
     ui.horizontal_wrapped(|ui| {

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use deck_core::config::SessionView;
 use deck_core::ctl::{
-    CtlClient, CtlCommand, LiveSnapshot, ctl_dir, ctl_env, prepare_ctl_dir, with_ctl,
+    CtlClient, CtlCommand, LiveSnapshot, PendingUi, ctl_dir, ctl_env, prepare_ctl_dir, with_ctl,
 };
 use deck_core::mux::{Launch, Mux, MuxKind};
 use deck_core::status::{self as core_status, StatusTarget};
@@ -24,7 +24,7 @@ use crate::controller::{
 use crate::gateway::protocol::{
     Attach, BackendRef, ControllerInfo, Done, GatewayError, Hello, InputRefused, LaunchSpec,
     ModelFactsView, Outcome, Refusal, Role, ScreenView, ServerEvent, SessionRole, SwitchInfo, Tool,
-    TopicValue, ViewEnd, ViewRole, Welcome,
+    Topic, TopicValue, ViewEnd, ViewRole, Welcome,
 };
 use crate::gateway::server::{SideItem, ViewSide};
 use crate::host_remote::HostRemote;
@@ -103,12 +103,22 @@ pub(super) struct CopyWatch {
     busy: bool,
 }
 
+/// The extension keeps pending requests in creation order; never expose an absent UI hook.
+fn controller_pending_ui(snapshot: Option<&LiveSnapshot>, ui_hook: bool) -> &[PendingUi] {
+    if !ui_hook {
+        return &[];
+    }
+    let pending = snapshot.map_or(&[][..], |snapshot| snapshot.pending_ui.as_slice());
+    &pending[..pending.len().min(8)]
+}
+
 /// The persistent live-control link of a managed session, independent of UI subscriptions.
 pub(super) struct LiveLink {
     pub(super) client: CtlClient,
     queued: Vec<(Option<RequestKey>, CtlCommand, Instant)>,
     pending: HashMap<u64, Option<RequestKey>>,
     seen: (bool, Option<Arc<LiveSnapshot>>),
+    seen_ui_hook: bool,
     subscribed: Option<(bool, bool)>,
     tools: bool,
     probe_deadline: Instant,
@@ -148,6 +158,23 @@ pub(super) struct Managed {
 }
 
 impl Managed {
+    /// Includes commands queued for the live socket, not just the terminal injector.
+    pub(super) fn checkpoint_pending_command(&self) -> bool {
+        self.ctl.is_busy()
+            || self
+                .ctl
+                .requests()
+                .any(|record| !record.delivery.is_final())
+            || self.live.as_ref().is_some_and(|link| {
+                !link.queued.is_empty()
+                    || !link.pending.is_empty()
+                    || link
+                        .client
+                        .latest()
+                        .is_some_and(|snapshot| snapshot.main_idle == Some(false))
+            })
+    }
+
     /// The launch created the session with the control extension.
     pub(super) fn ctl_expect(&self) -> bool {
         self.ctl_expect
@@ -462,12 +489,20 @@ impl Engine {
                         .as_deref()
                         .zip(snap.as_deref())
                         .is_some_and(|(k, s)| s.has_ctl(k));
+                let snapshot = m.live.as_ref().and_then(|link| link.client.latest());
                 ControllerInfo {
-                    progress: m
-                        .live
+                    progress: snapshot
                         .as_ref()
-                        .and_then(|link| link.client.latest())
                         .and_then(|snapshot| snapshot.progress.clone()),
+                    pending_ui: controller_pending_ui(
+                        snapshot.as_deref(),
+                        m.live.as_ref().is_some_and(|link| link.client.ui_hook()),
+                    )
+                    .to_vec(),
+                    current_thinking: snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.model.as_ref())
+                        .map(|model| model.thinking.clone()),
                     role: m.role.clone(),
                     label: m.display_label(),
                     cwd: m.cwd.clone(),
@@ -483,7 +518,7 @@ impl Engine {
                     activity: m.ctl.activity(),
                     exit_code: m.ctl.terminal().exit_code(),
                     status: m.ctl.status(false),
-                    busy: m.ctl.is_busy(),
+                    busy: m.ctl.is_busy() || self.checkpoint_restore_busy(m.ctl.target()),
                     current_model: m.ctl.current_model(),
                     pending_switch: m.ctl.pending_switch().map(SwitchInfo::from),
                     assumed_switch: m.ctl.assumed_switch().map(SwitchInfo::from),
@@ -622,6 +657,12 @@ impl Engine {
         let Some(i) = self.sess.find(&target.key) else {
             return;
         };
+        if matches!(&op, ViewOp::Input(..) | ViewOp::Clipboard(..))
+            && self.checkpoint_restore_busy(&target)
+        {
+            side.push(SideItem::Refused(InputRefused::Rejected(Rejected::Busy)));
+            return;
+        }
         let controlling = self.sess.managed[i].controlling == Some(view);
         let m = &mut self.sess.managed[i];
         match op {
@@ -821,6 +862,7 @@ impl Engine {
     fn tick_controllers(&mut self, now: Instant) {
         let mut delivered: Vec<Delivered> = Vec::new();
         let mut exited: Vec<SessionKey> = Vec::new();
+        let mut checkpoint_turns = Vec::new();
         let mut observe: Vec<usize> = Vec::new();
         let mut wake: Option<Duration> = None;
         let mut changed = false;
@@ -828,6 +870,17 @@ impl Engine {
             let tick = m.ctl.tick(now);
             let activity = m.ctl.activity();
             if tick.terminal.title_changed.is_some() || activity != m.published_activity {
+                if m.published_activity == Activity::Busy
+                    && activity == Activity::Idle
+                    && let Some(path) = m.ctl.session_path()
+                    && self.conns.values().any(|conn| {
+                        conn.subs.iter().any(
+                            |topic| matches!(topic, Topic::Checkpoints(session) if session == path),
+                        )
+                    })
+                {
+                    checkpoint_turns.push(path.to_owned());
+                }
                 m.published_activity = activity;
                 changed = true;
             }
@@ -857,6 +910,9 @@ impl Engine {
                 let d = t.saturating_duration_since(now);
                 wake = Some(wake.map_or(d, |w| w.min(d)));
             }
+        }
+        for path in checkpoint_turns {
+            self.refresh_checkpoints(&path);
         }
         if let Some(d) = wake {
             self.wake_within(d);
@@ -1201,6 +1257,13 @@ impl Engine {
 
     /// Queues a live-control command (it waits up to [`CTL_CONNECT`] for the socket).
     pub(super) fn queue_ctl(&mut self, i: usize, key: RequestKey, cmd: CtlCommand) {
+        if self.checkpoint_restore_busy(self.sess.managed[i].ctl.target()) {
+            self.job_failed(
+                key,
+                GatewayError::Refused("A checkpoint rollback is in progress".to_owned()),
+            );
+            return;
+        }
         self.ensure_live(i);
         if let Some(link) = &mut self.sess.managed[i].live {
             link.queued
@@ -1294,6 +1357,7 @@ impl Engine {
             queued: Vec::new(),
             pending: HashMap::new(),
             seen: (false, None),
+            seen_ui_hook: false,
             subscribed: None,
             tools: false,
             probe_deadline: Instant::now() + Duration::from_secs(10),
@@ -1415,7 +1479,9 @@ impl Engine {
                     self.soon = Some(self.soon.map_or(d, |s| s.min(d)));
                 }
             }
+            let ui_hook = link.client.ui_hook();
             let same = link.seen.0 == connected
+                && link.seen_ui_hook == ui_hook
                 && match (&link.seen.1, &latest) {
                     (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                     (None, None) => true,
@@ -1429,7 +1495,11 @@ impl Engine {
                     != current.and_then(|s| s.model.as_ref());
                 let progress_changed = previous.and_then(|s| s.progress.as_ref())
                     != current.and_then(|s| s.progress.as_ref());
-                self.dirty.controllers |= connection_changed || progress_changed;
+                let pending_ui_changed = controller_pending_ui(previous, link.seen_ui_hook)
+                    != controller_pending_ui(current, ui_hook);
+                self.dirty.controllers |=
+                    connection_changed || progress_changed || model_changed || pending_ui_changed;
+                link.seen_ui_hook = ui_hook;
                 link.seen = (connected, latest);
                 changed.push((key, connection_changed || model_changed));
             }
@@ -1752,6 +1822,20 @@ impl Engine {
         });
     }
 
+    /// Resume a persisted child whose backend no longer exists, still as a tool-owned attachment.
+    pub(super) fn queue_agent_child_resume(&mut self, spec: LaunchSpec, key: SessionKey) {
+        self.sess.queue(LaunchJob {
+            spec,
+            key: None,
+            exact: true,
+            owner: Owner::Snapshot,
+            restore: false,
+            tool: None,
+            confine: None,
+            agent_child: Some(key),
+        });
+    }
+
     /// Release only our attachment after started input drains, never the underlying backend.
     pub(super) fn release_agent_child_attach(&mut self, key: &SessionKey) {
         if self.agent_child_attach_needed(key) {
@@ -1866,9 +1950,18 @@ impl Engine {
             let mut tools = self.cfg.agent_tools.clone();
             tools.report &= job.spec.agent_child;
             let tools = tools.env_value();
+            let checkpoints = self.cfg.checkpoints;
             self.spawn_worker("launch", move || {
                 Fin::Prepared(Box::new(prepare(
-                    job, name, ctl_key, mux, ns, ext, omp, tools,
+                    job,
+                    name,
+                    ctl_key,
+                    mux,
+                    ns,
+                    ext,
+                    omp,
+                    tools,
+                    checkpoints,
                 )))
             });
             return;
@@ -2179,6 +2272,7 @@ fn prepare(
     ext: Option<PathBuf>,
     omp: Option<PathBuf>,
     tools: Option<String>,
+    checkpoints: bool,
 ) -> Prepared {
     let created = match (&mux, &name) {
         (Some(m), Some(n)) => !m.has_session(n),
@@ -2255,6 +2349,15 @@ fn prepare(
             String::new()
         },
     ));
+    env.push((
+        "OMPDECK_CHECKPOINTS".to_owned(),
+        if checkpoints && ctl_key.is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .to_owned(),
+    ));
     let mut argv = job.spec.argv.clone();
     // The detected omp may live outside PATH (`~/.local/bin`).
     if let (Some(first), Some(omp)) = (argv.first_mut(), &omp)
@@ -2299,6 +2402,28 @@ fn agent_child_attach_can_release(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_ui_projection_requires_a_hook_and_caps_the_oldest_eight() {
+        let snapshot = super::LiveSnapshot {
+            pending_ui: (0..12)
+                .map(|id| {
+                    serde_json::from_value(serde_json::json!({"id": id, "kind": "input"})).unwrap()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let projected = super::controller_pending_ui(Some(&snapshot), true);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|request| request.id)
+                .collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+        assert!(super::controller_pending_ui(Some(&snapshot), false).is_empty());
+        assert!(super::controller_pending_ui(None, true).is_empty());
+    }
+
     #[test]
     fn child_release_rechecks_operation_and_frontend_ownership_before_closing() {
         for (needed, frontend) in [(true, false), (false, true), (true, true)] {
@@ -2676,6 +2801,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(chat.view, SessionView::Chat);
         match chat.launch.expect("launch") {
@@ -2700,6 +2826,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(term.view, SessionView::Terminal);
         assert!(matches!(term.launch, Ok(Launch::Host(s)) if !s.tsp));
@@ -2713,6 +2840,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(tool.view, SessionView::Terminal);
         assert!(matches!(tool.launch, Ok(Launch::Host(s)) if !s.tsp));
@@ -2736,6 +2864,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(p.view, SessionView::Terminal);
         assert!(matches!(p.launch, Ok(Launch::Pty(_))));
@@ -2749,6 +2878,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(p.view, SessionView::Terminal);
         assert!(matches!(p.launch, Ok(Launch::Pty(_))));

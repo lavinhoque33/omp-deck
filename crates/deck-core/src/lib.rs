@@ -5,6 +5,7 @@ pub mod agent_defs;
 pub mod agents;
 pub mod backup;
 pub mod changes;
+pub mod checkpoints;
 pub mod config;
 pub mod ctl;
 pub mod fleet;

@@ -115,6 +115,7 @@ impl super::super::AgentTools {
             .filter_map(|child| child.background.as_mut())
             .find(|watch| watch.id == request)
             .and_then(BackgroundWatch::waiter_mut)
+            .or_else(|| self.fan_out.waiter_mut(request))
     }
 
     pub(in crate::gateway::engine) fn background_request(&self, request: u64) -> bool {
@@ -123,12 +124,15 @@ impl super::super::AgentTools {
                 .background
                 .as_ref()
                 .is_some_and(|watch| watch.id == request)
-        })
+        }) || self.fan_out.contains(request)
     }
 }
 
 impl Engine {
     pub(super) fn finish_child_wait(&mut self, request: u64, result: WaitResult) {
+        if self.fanout_wait_failed(request, &result.text) {
+            return;
+        }
         if matches!(self.agent_tools.operations.get(&request),
             Some(Operation::Wait(waiter)) if waiter.background && waiter.baseline.is_some())
         {
@@ -183,6 +187,7 @@ impl Engine {
     }
 
     pub(in crate::gateway::engine) fn drop_background_waits(&mut self) {
+        self.agent_tools.fan_out.clear();
         for child in self.agent_tools.children.entries.values_mut() {
             child.background = None;
             child.forward_questions = false;
@@ -198,6 +203,7 @@ impl Engine {
     }
 
     pub(in crate::gateway::engine) fn drop_background_opener(&mut self, key: &SessionKey) {
+        self.drop_fan_out_opener(key);
         for child in self.agent_tools.children.entries.values_mut() {
             if &child.opener.key == key {
                 child.forward_questions = false;
@@ -240,12 +246,14 @@ impl Engine {
     }
 
     pub(super) fn background_delivery_target(&self, root: &Path) -> Option<usize> {
+        // The caller must retain its unsent result while rollback owns this session.
         self.sess
             .managed
             .iter()
             .enumerate()
             .find_map(|(i, session)| {
                 let eligible = !session.exited()
+                    && !self.checkpoint_restore_busy(session.ctl.target())
                     && session.live.as_ref().is_some_and(|link| {
                         link.client.connected()
                             && link
@@ -263,8 +271,14 @@ impl Engine {
     }
 
     pub(super) fn deliver_child_message(&mut self, index: usize, command: CtlCommand) {
+        let target = self.sess.managed[index].ctl.target().clone();
+        let restoring = self.checkpoint_restore_busy(&target);
+        let Some((target, command)) = self.agent_tools.admit_delivery(target, command, restoring)
+        else {
+            return;
+        };
         let session = &self.sess.managed[index];
-        let target = session.ctl.target().clone();
+        debug_assert_eq!(session.ctl.target(), &target);
         let rid = session
             .live
             .as_ref()
@@ -274,6 +288,52 @@ impl Engine {
         // Uncertain delivery is final: retain the issuer through the ACK, never retry.
         self.agent_tools.reply_acks.push((target.clone(), rid));
         self.agent_tools.background_acks.push((target, rid));
+    }
+
+    pub(in crate::gateway::engine) fn checkpoint_delivery_pending(
+        &self,
+        target: &SessionTarget,
+    ) -> bool {
+        self.agent_tools.delivery_pending(target)
+    }
+
+    pub(in crate::gateway::engine) fn checkpoint_delivery_awaiting_ack(
+        &self,
+        target: &SessionTarget,
+    ) -> bool {
+        self.agent_tools.delivery_awaiting_ack(target)
+    }
+
+    pub(in crate::gateway::engine) fn flush_child_deliveries(&mut self) {
+        // Only unsent frames are deferred. Once sent, an uncertain ACK is never retried.
+        for _ in 0..self.agent_tools.deferred_deliveries.len() {
+            let (target, command) = self
+                .agent_tools
+                .deferred_deliveries
+                .pop_front()
+                .expect("queued delivery");
+            let Some(index) = self.sess.find(&target.key) else {
+                continue;
+            };
+            let session = &self.sess.managed[index];
+            if session.ctl.target() != &target || session.exited() {
+                continue;
+            }
+            if self.checkpoint_restore_busy(&target)
+                || !session
+                    .live
+                    .as_ref()
+                    .is_some_and(|link| link.client.connected())
+            {
+                self.agent_tools
+                    .deferred_deliveries
+                    .push_back((target, command));
+                continue;
+            }
+            // The original target/generation is retained, and Deliver carries its original
+            // conversation root for the extension's authoritative root check.
+            self.deliver_child_message(index, command);
+        }
     }
 
     pub(super) fn step_background_waits(&mut self, now: Instant) {

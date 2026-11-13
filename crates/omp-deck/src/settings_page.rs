@@ -378,6 +378,8 @@ pub struct SettingsInput<'a> {
     pub native_decorations: bool,
     /// Which OmpDeck tools omp agents get (Settings → General → Agent tools).
     pub agent_tools: &'a AgentTools,
+    /// Checkpoint the repo before agent edits (`AppConfig.checkpoints`).
+    pub checkpoints: bool,
     pub omp_found: bool,
     pub omp_version: Option<&'a str>,
     pub check_updates: bool,
@@ -418,6 +420,8 @@ pub enum SettingsAction {
     NativeDecorations(bool),
     /// The whole "Agent tools" group after one toggle changed.
     AgentTools(AgentTools),
+    /// "Checkpoint the repo before agent edits" (`AppConfig.checkpoints`).
+    Checkpoints(bool),
     SetCheckUpdates(bool),
     CheckUpdates,
     /// Load (or reload) omp's settings catalog on a worker.
@@ -1540,13 +1544,18 @@ fn general_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Setti
         );
     });
 
-    agent_tools_card(ui, input.agent_tools, actions);
+    agent_tools_card(ui, input.agent_tools, input.checkpoints, actions);
 
     mobile_card(ui, input, actions);
 }
 
 /// The OmpDeck tools omp agents may call; read when a session starts.
-fn agent_tools_card(ui: &mut Ui, tools: &AgentTools, actions: &mut Vec<SettingsAction>) {
+fn agent_tools_card(
+    ui: &mut Ui,
+    tools: &AgentTools,
+    checkpoints: bool,
+    actions: &mut Vec<SettingsAction>,
+) {
     let pal = Palette::of_ui(ui);
     card(ui, "Agent tools", |ui| {
         ui.label(
@@ -1558,7 +1567,7 @@ fn agent_tools_card(ui: &mut Ui, tools: &AgentTools, actions: &mut Vec<SettingsA
         );
         ui.add_space(10.0);
         type Field = fn(&mut AgentTools) -> &mut bool;
-        let rows: [(&str, &str, Field); 10] = [
+        let rows: [(&str, &str, Field); 11] = [
             (
                 "Open sessions",
                 "Start a parallel omp session in a new tab or split, optionally with a prompt",
@@ -1609,6 +1618,11 @@ fn agent_tools_card(ui: &mut Ui, tools: &AgentTools, actions: &mut Vec<SettingsA
                 "Lets sessions opened by the agent send it progress, blocked or done reports",
                 |t| &mut t.report,
             ),
+            (
+                "Let agents fan out parallel sessions",
+                "Lets the agent start up to 8 parallel sessions at once (each in its own worktree by default) and collect their results",
+                |t| &mut t.fan_out,
+            ),
         ];
         for (i, (title, sub, field)) in rows.into_iter().enumerate() {
             if i > 0 {
@@ -1622,6 +1636,18 @@ fn agent_tools_card(ui: &mut Ui, tools: &AgentTools, actions: &mut Vec<SettingsA
                 }
             });
         }
+        ui.add_space(4.0);
+        setting_row(
+            ui,
+            "Checkpoint the repo before agent edits",
+            "Snapshot the working tree before each turn's first edit, so the Changes panel can roll back to it",
+            |ui| {
+                let mut on = checkpoints;
+                if toggle(ui, &mut on).changed() {
+                    actions.push(SettingsAction::Checkpoints(on));
+                }
+            },
+        );
     });
 }
 

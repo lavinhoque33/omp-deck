@@ -1196,7 +1196,9 @@ pub fn finish_prompt(
                 branch.map_or_else(|| "<that branch>".to_owned(), q)
             );
             format!(
-                "then merge it into {} (checked out at {}), for example {}",
+                "then first bring {} into the branch inside this worktree with {}, resolve conflicts there and re-run the project's checks, then merge it into {} (checked out at {}), for example {}",
+                code_span(base),
+                code_span(&format!("git -C {wt_dir} merge {}", q(base))),
                 code_span(base),
                 code_span(&dir_s),
                 code_span(&merge)
@@ -1214,6 +1216,41 @@ pub fn finish_prompt(
     };
     sanitize_line(&format!(
         "Finish this worktree: commit any remaining work on {work}, {how}. Follow this project's rules on committing and merging; if they do not let you do that without being asked, ask me first. Do not delete the worktree or its branch — OmpDeck removes both once everything is merged. When you are done, tell me the result."
+    ))
+}
+
+/// Retry after another queued finish moved the merge base. Conflicts stay in the worktree.
+pub fn finish_retry_prompt(
+    branch: Option<&str>,
+    base: &str,
+    worktree: &Path,
+    target: &MergeTarget,
+) -> String {
+    let update = code_span(&format!(
+        "git -C {} merge {}",
+        shell_quote(&worktree.to_string_lossy()),
+        shell_quote(base)
+    ));
+    let merge = match target {
+        MergeTarget::In(dir) => code_span(&format!(
+            "git -C {} merge {}",
+            shell_quote(&dir.to_string_lossy()),
+            branch.map_or_else(|| "<that branch>".to_owned(), shell_quote)
+        )),
+        MergeTarget::Nowhere => code_span(&format!(
+            "git -C {} push . {}",
+            shell_quote(&worktree.to_string_lossy()),
+            shell_quote(&format!("HEAD:refs/heads/{base}"))
+        )),
+    };
+    let detached = if branch.is_none() {
+        " This is a detached HEAD; create a branch for it first."
+    } else {
+        ""
+    };
+    sanitize_line(&format!(
+        "{} moved while you were finishing: update again from it in the worktree with {update}, resolve conflicts there, re-run the project's checks, then merge with {merge}.{detached} Follow this project's rules on committing and merging; if they do not let you do that without being asked, ask me first. Do not delete the worktree or its branch — OmpDeck removes both once everything is merged. When you are done, tell me the result.",
+        code_span(base)
     ))
 }
 
@@ -1510,8 +1547,32 @@ mod tests {
         let p = finish_prompt(Some("feat/x"), "main", Path::new("/wt/x"), &to);
         assert!(p.contains("`feat/x`") && p.contains("`main`") && p.contains("/p/repo"));
         assert!(p.contains("`git -C '/p/repo' merge 'feat/x'`"));
+        let update = p.find("`git -C '/wt/x' merge 'main'`").unwrap();
+        let merge = p.find("`git -C '/p/repo' merge 'feat/x'`").unwrap();
+        assert!(update < merge, "{p}");
+        assert!(p[update..merge].contains("resolve conflicts"));
+        assert!(p[update..merge].contains("re-run the project's checks"));
         let d = finish_prompt(None, "main", Path::new("/wt/x"), &to);
         assert!(d.contains("detached HEAD"));
+    }
+
+    #[test]
+    fn finish_retry_updates_before_merging_and_quotes_hostile_names() {
+        let prompt = finish_retry_prompt(
+            Some("feat/it's`x`\n"),
+            "ma`in",
+            Path::new("/wt/it's"),
+            &MergeTarget::In(PathBuf::from("/base/it's")),
+        );
+        assert!(prompt.starts_with("`` ma`in `` moved while you were finishing:"));
+        assert!(prompt.contains(r"git -C '/wt/it'\''s' merge 'ma`in'"));
+        assert!(prompt.contains(r"git -C '/base/it'\''s' merge 'feat/it'\''s`x` "));
+        assert!(prompt.contains("resolve conflicts") && prompt.contains("re-run"));
+        assert!(!prompt.chars().any(|ch| ch.is_control()));
+        let nowhere = finish_retry_prompt(None, "main", Path::new("/wt/x"), &MergeTarget::Nowhere);
+        assert!(nowhere.contains("`git -C '/wt/x' merge 'main'`"));
+        assert!(nowhere.contains("`git -C '/wt/x' push . 'HEAD:refs/heads/main'`"));
+        assert!(nowhere.contains("detached HEAD"));
     }
 
     #[test]

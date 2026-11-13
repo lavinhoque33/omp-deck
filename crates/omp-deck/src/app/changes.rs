@@ -57,6 +57,10 @@ pub(super) struct ChangesUi {
     diff_generation: u64,
     /// The offline notice is the one shown in the panel.
     offline_shown: bool,
+    /// The session file whose `Topic::Checkpoints` this window is subscribed to.
+    cp_followed: Option<PathBuf>,
+    /// Revision of the checkpoint list last shown.
+    cp_seen_rev: u64,
 }
 
 impl ChangesUi {
@@ -81,6 +85,12 @@ impl ChangesUi {
         self.diff_generation += 1;
         true
     }
+}
+
+/// A turn runs or a command is still on its way into the session: a rollback would race it.
+/// `requests` keeps settled history, so only deliveries still in flight count.
+fn agent_working(info: &deck_service::gateway::protocol::ControllerInfo) -> bool {
+    info.busy || info.requests.iter().any(|r| !r.delivery.is_final())
 }
 
 /// The folder the panel follows: the live cwd of the active session tab (what the status bar
@@ -191,6 +201,219 @@ impl App {
         if let Some(path) = self.changes.followed.take() {
             self.gw.unsubscribe(&Topic::Changes(path));
         }
+        self.unfollow_checkpoints();
+    }
+
+    fn unfollow_checkpoints(&mut self) {
+        if let Some(path) = self.changes.cp_followed.take() {
+            self.gw.unsubscribe(&Topic::Checkpoints(path));
+        }
+    }
+
+    /// While the Checkpoints section is shown: follow the tab's session file, take the newest
+    /// list and say why a rollback is unavailable (a turn runs, the session is not live).
+    fn drive_checkpoints(&mut self, uid: u64) {
+        let tab = self.tabs.iter().find(|t| t.uid == uid);
+        let session = tab.and_then(|t| t.session_path()).map(Path::to_path_buf);
+        let blocked = match tab.map(|t| (t, self.gw.controller(t.target()))) {
+            None => Some("No session tab".to_owned()),
+            Some((t, _)) if t.terminal().is_exited() => {
+                Some("The session has exited: resume it to roll back".to_owned())
+            }
+            Some((_, None)) => Some("The session is not running: open it to roll back".to_owned()),
+            Some((_, Some(info))) if agent_working(&info) => {
+                Some("The agent is working: roll back once its turn has ended".to_owned())
+            }
+            Some(_) => None,
+        };
+        let disabled = !self.cfg.checkpoints;
+        let cp = &mut self.changes.view.checkpoints;
+        cp.blocked = blocked;
+        cp.disabled = disabled;
+        cp.retarget(session.clone());
+        if self.changes.cp_followed != session {
+            self.unfollow_checkpoints();
+            if let Some(s) = &session {
+                self.gw.subscribe(Topic::Checkpoints(s.clone()));
+            }
+            self.changes.cp_followed = session.clone();
+            self.changes.cp_seen_rev = 0;
+        }
+        let Some(session) = session else {
+            return;
+        };
+        let topic = Topic::Checkpoints(session);
+        let rev = self.gw.revision(&topic);
+        if rev == 0 || rev == self.changes.cp_seen_rev {
+            return;
+        }
+        self.changes.cp_seen_rev = rev;
+        if let Some(TopicValue::Checkpoints(view)) = self.gw.topic(&topic) {
+            let cp = &mut self.changes.view.checkpoints;
+            // A checkpoint gone from the list takes its preview along.
+            if let Some(seq) = cp.preview.seq()
+                && !view.items.iter().any(|c| c.seq == seq)
+            {
+                cp.preview = crate::checkpoints_view::Preview::Idle;
+            }
+            cp.view = Some(view);
+        }
+    }
+
+    /// Asks the gateway what rolling back to `seq` changes (the first rows and the full count);
+    /// `then` runs with the answer while the section still shows the same session.
+    fn checkpoint_diff(
+        &mut self,
+        seq: u32,
+        then: impl FnOnce(&mut App, Result<(Vec<deck_core::checkpoints::FileDelta>, u32), String>)
+        + 'static,
+    ) {
+        let Some(session) = self.changes.view.checkpoints.session.clone() else {
+            return;
+        };
+        let asked = session.clone();
+        self.gw
+            .query(Query::CheckpointDiff { session, seq }, move |app, r| {
+                if app.changes.view.checkpoints.session.as_ref() != Some(&asked) {
+                    return;
+                }
+                let r = match r {
+                    Ok(Answer::CheckpointDiff { rows, total }) => Ok((rows, total)),
+                    Ok(_) => Err("the gateway answered with something else".to_owned()),
+                    Err(e) => Err(e),
+                };
+                then(app, r);
+            });
+    }
+
+    /// Shows what rolling back to `seq` changes; with `confirm`, asks to roll back once the
+    /// fresh count is in.
+    fn load_checkpoint_diff(&mut self, seq: u32, confirm: bool) {
+        use crate::checkpoints_view::Preview;
+        if !confirm
+            && matches!(self.changes.view.checkpoints.preview, Preview::Loading(s) if s == seq)
+        {
+            return;
+        }
+        self.changes.view.checkpoints.preview = Preview::Loading(seq);
+        self.checkpoint_diff(seq, move |app, r| {
+            let cp = &mut app.changes.view.checkpoints;
+            let shown = cp.preview.seq() == Some(seq);
+            match r {
+                Ok((rows, total)) => {
+                    if shown {
+                        cp.preview = Preview::Ready(seq, rows, total);
+                    }
+                    if confirm {
+                        app.confirm_rollback(seq, total as usize);
+                    }
+                }
+                Err(e) => {
+                    if confirm {
+                        app.toasts.error(
+                            &app.ctx,
+                            format!("Could not compare with the checkpoint: {e}"),
+                        );
+                    }
+                    if shown {
+                        app.changes.view.checkpoints.preview = Preview::Failed(seq, e);
+                    }
+                }
+            }
+        });
+    }
+
+    fn preview_checkpoint(&mut self, seq: u32) {
+        self.load_checkpoint_diff(seq, false);
+    }
+
+    /// "Roll back to here": compare afresh (the working tree may have moved since a preview),
+    /// then confirm with the full count.
+    fn ask_rollback(&mut self, seq: u32) {
+        self.load_checkpoint_diff(seq, true);
+    }
+
+    fn confirm_rollback(&mut self, seq: u32, n: usize) {
+        let cp = &self.changes.view.checkpoints;
+        let (Some(uid), Some(session)) = (self.changes.uid, cp.session.clone()) else {
+            return;
+        };
+        if let Some(why) = &cp.blocked {
+            self.toasts.info(&self.ctx, why.clone());
+            return;
+        }
+        let Some(c) = cp
+            .view
+            .as_ref()
+            .and_then(|v| v.items.iter().find(|c| c.seq == seq))
+        else {
+            return;
+        };
+        self.confirm = Some((
+            Confirm {
+                title: "Roll back to this checkpoint?".to_owned(),
+                body: crate::checkpoints_view::confirm_body(c, n),
+                confirm_label: "Roll back".to_owned(),
+                danger: true,
+            },
+            PendingConfirm::Rollback { uid, session, seq },
+        ));
+    }
+
+    /// The user confirmed: restore, if the tab still shows that session and it is still idle.
+    pub(super) fn execute_rollback(&mut self, uid: u64, session: PathBuf, seq: u32) {
+        let Some(t) = self.tabs.iter().find(|t| t.uid == uid) else {
+            return;
+        };
+        if t.session_path() != Some(session.as_path()) {
+            return;
+        }
+        let target = t.target().clone();
+        if let Some(info) = self.gw.controller(&target)
+            && agent_working(&info)
+        {
+            self.toasts.info(
+                &self.ctx,
+                "The agent started working: roll back once its turn has ended",
+            );
+            return;
+        }
+        self.changes.view.checkpoints.restoring = Some(seq);
+        self.gw.mutate(
+            Mutation::CheckpointRestore {
+                target,
+                session,
+                seq,
+            },
+            move |app, r| {
+                let cp = &mut app.changes.view.checkpoints;
+                if cp.restoring == Some(seq) {
+                    cp.restoring = None;
+                }
+                match r {
+                    Ok(Done::CheckpointRestored { safety, changed }) => {
+                        let files = if changed == 1 {
+                            "1 file".to_owned()
+                        } else {
+                            format!("{changed} files")
+                        };
+                        let safety = safety
+                            .map(|s| format!("; safety copy #{s} keeps the state before"))
+                            .unwrap_or_default();
+                        app.toasts
+                            .success(&app.ctx, format!("Rolled back: {files} changed{safety}"));
+                        // The listing and the preview are stale now.
+                        app.changes.seen_rev = 0;
+                        app.changes.view.checkpoints.preview =
+                            crate::checkpoints_view::Preview::Idle;
+                    }
+                    Ok(_) => {}
+                    Err(e) => app
+                        .toasts
+                        .error(&app.ctx, format!("Could not roll back: {e}")),
+                }
+            },
+        );
     }
 
     /// Follows the gateway's listing of `cwd`; the gateway re-reads the repository on its own
@@ -227,6 +450,12 @@ impl App {
         self.follow_changes(&cwd);
         self.take_listing(&cwd);
         self.show_offline_notice();
+        // Only while the section is on screen: the dashboard covers the panel.
+        if self.changes.view.show_checkpoints && !self.dash.open && self.changes_available() {
+            self.drive_checkpoints(uid);
+        } else {
+            self.unfollow_checkpoints();
+        }
         // The banner and answer buttons of the tab's pending agent review request, if any.
         let ask = self
             .tabs
@@ -501,6 +730,12 @@ impl App {
             ChangesAction::ReturnReview => self.answer_review(None),
             ChangesAction::NoComments => self.answer_review(Some(ReviewReply::NoComments)),
             ChangesAction::DismissReview => self.answer_review(Some(ReviewReply::Dismissed)),
+            ChangesAction::ToggleCheckpoints => {
+                let v = &mut self.changes.view;
+                v.show_checkpoints = !v.show_checkpoints;
+            }
+            ChangesAction::PreviewCheckpoint(seq) => self.preview_checkpoint(seq),
+            ChangesAction::RollBack(seq) => self.ask_rollback(seq),
             ChangesAction::Close => {
                 self.changes.open = false;
                 self.focus_pending = true;

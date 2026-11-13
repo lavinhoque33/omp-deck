@@ -754,7 +754,7 @@ impl App {
         );
         let finish_state = worktree
             .as_ref()
-            .and_then(|w| self.wt.finishing.get(&w.path).copied());
+            .and_then(|w| self.wt.finishing.get(&w.path).map(|m| m.own));
         let finishing = finish_state.is_some();
         let wt_why = need(worktree.is_some(), NOT_WORKTREE);
         add(
@@ -804,6 +804,13 @@ impl App {
             "View: Agents dashboard",
             Some("Ctrl+Shift+A"),
             ICON_NETWORK,
+            None,
+        );
+        add(
+            "agents.orchestration",
+            "Agents: Orchestration",
+            None,
+            ICON_WORKFLOW,
             None,
         );
         add(
@@ -1062,6 +1069,13 @@ impl App {
             "Notifications: Open panel",
             None,
             ICON_BELL,
+            None,
+        );
+        add(
+            "needs_you.open",
+            "Needs you: Open",
+            Some("Ctrl+Shift+I"),
+            ICON_MESSAGE_CIRCLE_QUESTION,
             None,
         );
         add(
@@ -1442,6 +1456,9 @@ impl App {
             "view.usage" => self.toggle_usage(),
             "view.sessions" => self.toggle_sessions(),
             "view.dashboard" => self.toggle_dashboard(false),
+            "agents.orchestration" => {
+                self.open_dashboard(false, crate::dashboard::DashTab::Orchestration)
+            }
             "view.changes" => self.toggle_changes_panel(),
             "view.switcher" => self.open_palette(Mode::Switcher),
             "app.settings" => self.open_settings(),
@@ -1505,6 +1522,7 @@ impl App {
             "app.check_update" => self.check_app_update_manually(),
             "app.start_update" => self.start_app_update(),
             "notify.panel" => self.open_inbox_panel(),
+            "needs_you.open" => self.open_needs_you(),
             "notify.toggle" => {
                 self.apply_notify_action(NotifyAction::Desktop(!self.cfg.notify.desktop))
             }

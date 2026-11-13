@@ -18,8 +18,8 @@ use egui::{
 use crate::badge::{self, Hue};
 use crate::icons::{
     ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_COPY, ICON_FOLDER_GIT_2,
-    ICON_FOLDER_OPEN, ICON_GIT_BRANCH, ICON_MESSAGES_SQUARE, ICON_MINUS, ICON_PENCIL, ICON_PLUS,
-    ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_SEND, ICON_TRASH_2, ICON_X, Icon,
+    ICON_FOLDER_OPEN, ICON_GIT_BRANCH, ICON_HISTORY, ICON_MESSAGES_SQUARE, ICON_MINUS, ICON_PENCIL,
+    ICON_PLUS, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_SEND, ICON_TRASH_2, ICON_X, Icon,
 };
 use crate::review::{Comment, Loc, MAX_QUOTE_LINES, Review, Reviews, Side, Span};
 use crate::theme::{self, Palette};
@@ -619,6 +619,9 @@ pub struct ViewState {
     pub review_open: bool,
     /// An agent's pending review request on this session: the banner and the answer buttons.
     pub ask: Option<ReviewAsk>,
+    /// The Checkpoints section replaces the file list and diff.
+    pub show_checkpoints: bool,
+    pub checkpoints: crate::checkpoints_view::State,
 }
 
 impl Default for ViewState {
@@ -639,6 +642,8 @@ impl Default for ViewState {
             anchor: None,
             review_open: true,
             ask: None,
+            show_checkpoints: false,
+            checkpoints: crate::checkpoints_view::State::default(),
         }
     }
 }
@@ -729,6 +734,12 @@ pub enum ChangesAction {
     NoComments,
     /// Decline the agent's review request.
     DismissReview,
+    /// Show or hide the Checkpoints section.
+    ToggleCheckpoints,
+    /// Show what rolling back to checkpoint `seq` would change.
+    PreviewCheckpoint(u32),
+    /// Ask to roll the working tree back to checkpoint `seq`.
+    RollBack(u32),
     Close,
 }
 
@@ -780,6 +791,26 @@ fn header_button(ui: &mut Ui, icon: Icon, tip: &str, enabled: bool) -> bool {
     mini_button(ui, rect, id, icon, tip, pal.glyph, enabled)
 }
 
+/// A header button that shows a mode: filled while on.
+fn header_toggle(ui: &mut Ui, icon: Icon, tip: &str, on: bool) -> bool {
+    let pal = Palette::of_ui(ui);
+    let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+    if on {
+        ui.painter()
+            .rect_filled(rect, 5, theme::accent_fill(pal, 0.28));
+    }
+    let id = resp.id.with("btn");
+    mini_button(
+        ui,
+        rect,
+        id,
+        icon,
+        tip,
+        if on { pal.accent } else { pal.glyph },
+        true,
+    )
+}
+
 /// The panel body. Returns what the user asked for.
 pub fn show(ui: &mut Ui, st: &mut ViewState) -> Vec<ChangesAction> {
     let pal = Palette::of_ui(ui);
@@ -811,6 +842,18 @@ pub fn show(ui: &mut Ui, st: &mut ViewState) -> Vec<ChangesAction> {
             }
             if header_button(ui, ICON_REFRESH_CW, "Refresh", true) {
                 out.push(ChangesAction::Refresh);
+            }
+            if header_toggle(
+                ui,
+                ICON_HISTORY,
+                if st.show_checkpoints {
+                    "Back to the changed files"
+                } else {
+                    "Checkpoints: roll back to before an agent turn"
+                },
+                st.show_checkpoints,
+            ) {
+                out.push(ChangesAction::ToggleCheckpoints);
             }
         });
     });
@@ -857,6 +900,19 @@ pub fn show(ui: &mut Ui, st: &mut ViewState) -> Vec<ChangesAction> {
     // left once the other regions took theirs.
     let total = ui.available_height();
 
+    if st.show_checkpoints {
+        ui.horizontal(|ui| {
+            ui.label(icon_text(ICON_HISTORY, 14.0, pal.glyph));
+            ui.label(
+                theme::strong("Checkpoints")
+                    .size(13.0)
+                    .color(pal.text_strong),
+            );
+        });
+        ui.add_space(4.0);
+        crate::checkpoints_view::show(ui, &st.checkpoints, &mut out);
+        return out;
+    }
     match st.load.clone() {
         LoadState::NoTab => message(ui, "Open a session tab to review its changes."),
         LoadState::Loading => {

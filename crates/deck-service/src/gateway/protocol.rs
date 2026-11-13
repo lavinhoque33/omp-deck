@@ -313,6 +313,10 @@ pub enum Topic {
     Mobile,
     /// The worktree state of the git repository holding this folder ([`WorktreesView`]).
     Worktrees(PathBuf),
+    /// Persisted opener/child links and their current orchestration state.
+    Orchestration,
+    /// Checkpoints of this session file.
+    Checkpoints(PathBuf),
 }
 
 impl Topic {
@@ -327,6 +331,8 @@ impl Topic {
                 | Topic::Agents
                 | Topic::Transcript(_)
                 | Topic::Worktrees(_)
+                | Topic::Orchestration
+                | Topic::Checkpoints(_)
         )
     }
 }
@@ -334,6 +340,10 @@ impl Topic {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Query {
     Topic(Topic),
+    CheckpointDiff {
+        session: PathBuf,
+        seq: u32,
+    },
     /// The visible screen text of a controlled session.
     Screen(SessionTarget),
     /// `deck_core::usage::activity` over `days`.
@@ -444,6 +454,11 @@ pub enum Query {
 pub enum Answer {
     /// Boxed: topic values are large next to the other answers (JSON is unchanged).
     Topic(Box<TopicValue>),
+    CheckpointDiff {
+        rows: Vec<deck_core::checkpoints::FileDelta>,
+        /// Full changed-file count, before the 500-row preview cap.
+        total: u32,
+    },
     Screen(ScreenView),
     UsageActivity(UsageActivity),
     OmpVersion(String),
@@ -551,6 +566,8 @@ pub enum WorktreeFlow {
     Finishing {
         job: RequestKey,
         stage: Option<String>,
+        #[serde(default)]
+        state: OrchFinish,
     },
     /// [`Mutation::WorktreeRetire`] (or a finish that reached the removal).
     Retiring { job: RequestKey, park: bool },
@@ -631,6 +648,72 @@ pub enum TopicValue {
     OmpUpdate(OmpUpdateView),
     Mobile(MobileView),
     Worktrees(Box<WorktreesView>),
+    Orchestration(OrchestrationView),
+    Checkpoints(CheckpointsView),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OrchestrationView {
+    pub roots: Vec<OrchNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OrchNode {
+    pub handle: Option<String>,
+    pub target: Option<SessionTarget>,
+    pub session_path: PathBuf,
+    pub title: String,
+    pub cwd: PathBuf,
+    pub status: TabStatus,
+    pub busy: bool,
+    pub live: bool,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub progress: Option<deck_core::ctl::Progress>,
+    pub last_report: Option<OrchReport>,
+    pub worktree: Option<OrchWorktree>,
+    pub finish: Option<OrchFinish>,
+    pub fan_out: Option<String>,
+    pub cost: Option<f64>,
+    pub opened_at_unix_ms: u64,
+    pub children: Vec<OrchNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchReport {
+    pub kind: String,
+    pub text: String,
+    pub at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchWorktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub base: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrchFinish {
+    Queued {
+        ahead: u32,
+    },
+    #[default]
+    Merging,
+    Blocked {
+        reason: String,
+    },
+    Done {
+        outcome: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointsView {
+    pub repo: Option<PathBuf>,
+    pub session_id: Option<String>,
+    pub items: Vec<deck_core::checkpoints::Checkpoint>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -780,6 +863,10 @@ pub struct ControllerInfo {
     pub activity: Activity,
     #[serde(default)]
     pub progress: Option<deck_core::ctl::Progress>,
+    #[serde(default)]
+    pub pending_ui: Vec<deck_core::ctl::PendingUi>,
+    #[serde(default)]
+    pub current_thinking: Option<String>,
     pub exit_code: Option<i32>,
     /// The indicator without the client's own bell marker ([`ServerEvent::Bell`]).
     pub status: TabStatus,
@@ -1161,6 +1248,11 @@ pub enum ServerConnectOutcome {
 pub enum Mutation {
     /// Open (attach or create) a session; the result is its target.
     Launch(LaunchSpec),
+    CheckpointRestore {
+        target: SessionTarget,
+        session: PathBuf,
+        seq: u32,
+    },
     /// Kill and relaunch the session with the same identity request, in `view` (`None`: the
     /// view it runs in now). `Some(other)` is "switch view": the same session file resumed in
     /// the other mode.
@@ -1658,6 +1750,7 @@ impl Mutation {
             Mutation::KillNames { .. } => "kill-names",
             Mutation::Close { .. } => "close",
             Mutation::Submit { .. } => "submit",
+            Mutation::CheckpointRestore { .. } => "checkpoint-restore",
             Mutation::Answer { .. } => "answer",
             Mutation::SetSessionPath { .. } => "set-session-path",
             Mutation::ForkAt { .. } => "fork",
@@ -1762,6 +1855,7 @@ impl Mutation {
             | Mutation::Kill(t)
             | Mutation::Close { target: t, .. }
             | Mutation::Submit { target: t, .. }
+            | Mutation::CheckpointRestore { target: t, .. }
             | Mutation::Answer { target: t, .. }
             | Mutation::SetSessionPath { target: t, .. }
             | Mutation::Ctl { target: t, .. }
@@ -1894,6 +1988,10 @@ pub enum Done {
     /// `answer` applied (`false`: no such outstanding confirmation).
     Answered(bool),
     Path(PathBuf),
+    CheckpointRestored {
+        safety: Option<u32>,
+        changed: u32,
+    },
     Moved(MoveOutcome),
     /// Per file: `None` = deleted, else the error text.
     Deleted(Vec<(PathBuf, Option<String>)>),

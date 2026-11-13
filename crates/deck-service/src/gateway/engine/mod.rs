@@ -10,6 +10,7 @@
 
 mod agent_tools;
 mod auth;
+pub(super) mod checkpoints;
 mod deferred;
 mod device;
 mod interest;
@@ -138,9 +139,17 @@ pub(crate) enum ViewOp {
 pub(crate) enum Fin {
     Auth(auth::AuthFin),
     AgentChildren(agent_tools::children::WorkerResult),
+    OrchestrationStats(agent_tools::children::orchestration::StatsUpdate),
+    Checkpoints(checkpoints::Update),
     AgentTool {
         request: u64,
         result: Result<String, String>,
+    },
+    AgentFanoutValidated {
+        request: u64,
+        opener: SessionTarget,
+        root: PathBuf,
+        result: Result<PathBuf, String>,
     },
     AgentWorktreeOpen {
         request: u64,
@@ -455,6 +464,7 @@ pub(crate) struct Engine {
     interest: interest::Interest,
     auth: auth::Auth,
     agent_tools: agent_tools::AgentTools,
+    checkpoints: checkpoints::State,
     mobile: remote::Mobile,
     /// Device-protocol state shared by every device session.
     devices: device::Devices,
@@ -595,6 +605,7 @@ impl Engine {
             interest: interest::Interest::default(),
             auth: auth::Auth::default(),
             agent_tools: agent_tools::AgentTools::default(),
+            checkpoints: checkpoints::State::default(),
             mobile,
             devices: device::Devices::default(),
             worktree: worktree::Worktrees::default(),
@@ -736,10 +747,20 @@ impl Engine {
         match fin {
             Fin::Auth(fin) => self.on_auth_fin(fin),
             Fin::AgentChildren(result) => self.on_child_worker(result),
+            Fin::OrchestrationStats(update) => self.on_orchestration_stats(update),
+            Fin::Checkpoints(update) => self.on_checkpoint_update(update),
             Fin::AgentTool { request, result } => match result {
                 Ok(text) => self.finish_agent_tool(request, true, text),
                 Err(text) => self.finish_agent_tool(request, false, text),
             },
+            Fin::AgentFanoutValidated {
+                request,
+                opener,
+                root,
+                result,
+            } => {
+                self.fanout_validated(request, opener, root, result);
+            }
             Fin::AgentWorktreeOpen {
                 request,
                 event,
@@ -1438,6 +1459,8 @@ impl Engine {
             Topic::Mobile => TopicValue::Mobile(self.mobile_view()),
             Topic::Live(key) => self.live_value(key),
             Topic::Worktrees(dir) => self.worktrees_value(dir),
+            Topic::Orchestration => TopicValue::Orchestration(self.orchestration_value()),
+            Topic::Checkpoints(session) => TopicValue::Checkpoints(self.checkpoints_value(session)),
             Topic::Inventory
             | Topic::Changes(_)
             | Topic::Tree(_)

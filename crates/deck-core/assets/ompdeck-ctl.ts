@@ -7,17 +7,19 @@ import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import * as net from "node:net";
 import * as path from "node:path";
+import * as os from "node:os";
+import { execFile } from "node:child_process";
 import { Type } from "@sinclair/typebox";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-type ToolName = "open_session" | "notify" | "show_changes" | "request_review" | "sessions" | "send_prompt" | "wait_session" | "answer_question" | "finish_worktree" | "report";
+type ToolName = "open_session" | "notify" | "show_changes" | "request_review" | "sessions" | "send_prompt" | "wait_session" | "answer_question" | "finish_worktree" | "report" | "fan_out";
 type ToolResult = { content: { type: "text"; text: string }[]; details?: Record<string, unknown>; isError?: boolean };
 interface ToolClient {
   data: { buf: string; snapshots: boolean; tools: boolean };
   write(line: string): unknown;
   destroy?(): void;
 }
-const TOOL_NAMES: ToolName[] = ["open_session", "notify", "show_changes", "request_review", "sessions", "send_prompt", "wait_session", "answer_question", "finish_worktree", "report"];
+const TOOL_NAMES: ToolName[] = ["open_session", "notify", "show_changes", "request_review", "sessions", "send_prompt", "wait_session", "answer_question", "finish_worktree", "report", "fan_out"];
 const toolProcess = globalThis as typeof globalThis & { __ompdeckTools?: string[] };
 const toolResult = (text: string, isError = false, details?: Record<string, unknown>): ToolResult =>
   ({ content: [{ type: "text", text }], ...(isError ? { isError: true } : {}), ...(details ? { details } : {}) });
@@ -32,8 +34,15 @@ function toolArgError(name: ToolName, args: Record<string, unknown>): string | u
     for (const _char of value) if (++count > cap) return `${key} must be at most ${cap} characters`;
     return undefined;
   };
-  if (name === "open_session") {
+  if (name === "open_session" || name === "fan_out") {
     if (args.forward_questions !== undefined && typeof args.forward_questions !== "boolean") return "forward_questions must be a boolean";
+    if (typeof args.cwd === "string") {
+      if (!path.isAbsolute(args.cwd)) return "cwd must be an absolute directory";
+      try { if (!fs.statSync(args.cwd).isDirectory()) return "cwd must be an absolute directory"; }
+      catch { return "cwd must be an existing absolute directory"; }
+    }
+  }
+  if (name === "open_session") {
     const error = bytes("prompt", 16 * 1024) ?? chars("title", 80);
     if (error) return error;
     if (args.worktree !== undefined) {
@@ -45,10 +54,17 @@ function toolArgError(name: ToolName, args: Record<string, unknown>): string | u
         if (error) return error;
       }
     }
-    if (typeof args.cwd === "string") {
-      if (!path.isAbsolute(args.cwd)) return "cwd must be an absolute directory";
-      try { if (!fs.statSync(args.cwd).isDirectory()) return "cwd must be an absolute directory"; }
-      catch { return "cwd must be an existing absolute directory"; }
+  }
+  if (name === "fan_out") {
+    if (!Array.isArray(args.tasks) || args.tasks.length < 1 || args.tasks.length > 8) return "tasks must contain 1 to 8 tasks";
+    if (args.worktree !== undefined && typeof args.worktree !== "boolean") return "worktree must be a boolean";
+    if (args.timeout_seconds !== undefined && (typeof args.timeout_seconds !== "number" || !Number.isInteger(args.timeout_seconds) || args.timeout_seconds < 1 || args.timeout_seconds > 86400)) return "timeout_seconds must be an integer from 1 to 86400";
+    const baseError = chars("base", 200);
+    if (baseError) return baseError;
+    for (const task of args.tasks) {
+      if (!object(task) || typeof task.prompt !== "string" || Buffer.byteLength(task.prompt) < 1 || Buffer.byteLength(task.prompt) > 16384) return "each task prompt must contain 1 to 16384 bytes";
+      const error = chars("task title", 80, task.title) ?? chars("task branch", 200, task.branch);
+      if (error) return error;
     }
   }
   if (name === "notify") return chars("title", 120) ?? bytes("body", 2 * 1024);
@@ -109,6 +125,102 @@ const log = (s: string) => {
   if (!LOG) return;
   try { fs.appendFileSync(LOG, `${new Date().toISOString()} ${s}\n`); } catch {}
 };
+
+// Explicit subprocess environments keep the real index untouched, including linked worktrees.
+async function captureCheckpoint(ctx: ExtensionContext, signal: AbortSignal, deadline: number): Promise<void> {
+  const environment: Record<string, string | undefined> = { ...process.env, LC_ALL: "C", GIT_TERMINAL_PROMPT: "0", GIT_AUTHOR_NAME: "OmpDeck", GIT_AUTHOR_EMAIL: "checkpoints@omp-deck.local", GIT_COMMITTER_NAME: "OmpDeck", GIT_COMMITTER_EMAIL: "checkpoints@omp-deck.local" };
+  delete environment.GIT_INDEX_FILE;
+  const run = (cwd: string, args: string[], index?: string, input?: Uint8Array): Promise<{ code: number; stdout: string; stderr: string; bytes: Buffer }> => {
+    signal.throwIfAborted();
+    if (Date.now() >= deadline) throw new Error("checkpoint budget exceeded");
+    const { promise, resolve, reject } = Promise.withResolvers<{ code: number; stdout: string; stderr: string; bytes: Buffer }>();
+    const child = execFile("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "-C", cwd, ...args], {
+      env: { ...environment, ...(index ? { GIT_INDEX_FILE: index } : {}) },
+      encoding: null, windowsHide: true, timeout: Math.max(1, deadline - Date.now()), killSignal: "SIGKILL", signal, maxBuffer: 16 * 1024 * 1024,
+    }, (error, stdout, stderr) => {
+      if (error && (typeof error.code !== "number" || error.killed || signal.aborted)) { reject(error); return; }
+      resolve({ code: error?.code ?? 0, stdout: stdout.toString("utf8").replace(/\r?\n$/, ""), stderr: stderr.toString("utf8"), bytes: stdout });
+    });
+    child.stdin?.on("error", reject);
+    child.stdin?.end(input);
+    return promise;
+  };
+  const found = await run(ctx.cwd, ["rev-parse", "--show-toplevel"]);
+  if (found.code === 128) return;
+  if (found.code !== 0) throw new Error(found.stderr);
+  const repo = found.stdout;
+  const git = async (args: string[], index?: string, input?: Uint8Array): Promise<string> => {
+    const result = await run(repo, args, index, input);
+    if (result.code !== 0) throw new Error(result.stderr || `git ${args[0]} failed`);
+    return result.stdout;
+  };
+  const session = ctx.sessionManager.getSessionId();
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(session)) throw new Error("invalid checkpoint session id");
+  let entry = "", prompt = "";
+  const branch = ctx.sessionManager.getBranch();
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const item = branch[i];
+    if (item.type !== "message" || item.message.role !== "user") continue;
+    entry = item.id.replace(/[\r\n]/g, " ");
+    const content = item.message.content;
+    const text = typeof content === "string" ? content : content.filter(part => part.type === "text").map(part => part.text).join(" ");
+    let length = 0;
+    for (const ch of text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim()) {
+      if (length++ === 120) break;
+      prompt += ch;
+    }
+    break;
+  }
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "ompdeck-checkpoint-"));
+  const index = path.join(directory, "index");
+  try {
+    const realIndex = await git(["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    try { await fs.promises.copyFile(realIndex, index); }
+    catch (error) {
+      if (!object(error) || error.code !== "ENOENT") throw error;
+      await git(["read-tree", "--empty"], index);
+    }
+    const listed = await run(repo, ["ls-files", "-v", "-z"], index);
+    if (listed.code !== 0) throw new Error(listed.stderr);
+    const assumed: Buffer[] = [];
+    for (let start = 0; start < listed.bytes.length;) {
+      const end = listed.bytes.indexOf(0, start);
+      if (end < 0) throw new Error("malformed index flags");
+      const tag = listed.bytes[start];
+      if (tag >= 97 && tag <= 122) {
+        if (listed.bytes[start + 1] !== 32) throw new Error("malformed index flags");
+        assumed.push(listed.bytes.subarray(start + 2, end + 1));
+      }
+      start = end + 1;
+    }
+    if (assumed.length) await git(["update-index", "--no-assume-unchanged", "-z", "--stdin"], index, Buffer.concat(assumed));
+    await git(["add", "-A", "--", "."], index);
+    const tree = await git(["write-tree"], index);
+    const prefix = `refs/ompdeck/checkpoints/${session}/`;
+    const raw = await git(["for-each-ref", "--format=%(refname)%00%(objectname)%00%(tree)%00", prefix]);
+    const fields = raw.split("\0");
+    const refs: { seq: number; commit: string; tree: string }[] = [];
+    for (let i = 0; i + 2 < fields.length; i += 3) {
+      const name = fields[i].replace(/^[\r\n]+/, "");
+      if (!name.startsWith(prefix)) continue;
+      const suffix = name.slice(prefix.length);
+      if (!/^\d+$/.test(suffix)) continue;
+      const seq = Number(suffix);
+      if (Number.isSafeInteger(seq) && seq <= 0xffffffff) refs.push({ seq, commit: fields[i + 1], tree: fields[i + 2] });
+    }
+    refs.sort((a, b) => b.seq - a.seq);
+    if (refs[0]?.tree === tree) return;
+    const seq = (refs[0]?.seq ?? 0) + 1;
+    if (seq > 0xffffffff) throw new Error("checkpoint sequence exhausted");
+    const head = await run(repo, ["rev-parse", "--verify", "HEAD"]);
+    const message = `ompdeck checkpoint\n\nsession: ${session}\nentry: ${entry}\nprompt: ${prompt}\nkind: turn\nat: ${Date.now()}\n`;
+    const commit = await git(["commit-tree", tree, ...(head.code === 0 ? ["-p", head.stdout] : []), "-m", message]);
+    await git(["update-ref", `${prefix}${String(seq).padStart(6, "0")}`, commit, "0".repeat(commit.length)]);
+    for (const old of refs.slice(49)) await git(["update-ref", "-d", `${prefix}${String(old.seq).padStart(6, "0")}`, old.commit]);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+}
 const G = globalThis as any; // process-wide: the factory runs for the main session and for every subagent session
 
 export default async function ompdeckCtl(api: any) {
@@ -144,6 +256,23 @@ export default async function ompdeckCtl(api: any) {
     if (!AgentLifecycleManager || !AgentRegistry || typeof sessionFileBelongsToRoot !== "function") { log("internal API missing"); return; }
 
     const isMain = (ctx: any) => ctx?.agent?.kind === "main";
+    if (process.env.OMPDECK_CHECKPOINTS === "1") {
+      let checkpointed = false;
+      const readOnly: Record<string, true> = { read: true, grep: true, glob: true, find: true, ast_grep: true, web_search: true, security_scan: true, ask: true, wait: true, todo: true, think: true, yield: true, goal: true };
+      api.on("agent_start", (_event: unknown, ctx: ExtensionContext) => { if (ctx.agent.kind === "main") checkpointed = false; });
+      api.on("tool_call", async (event: { toolName: string }, ctx: ExtensionContext) => {
+        if (ctx.agent.kind !== "main" || checkpointed || Object.hasOwn(readOnly, event.toolName)
+          || (event.toolName.startsWith("ompdeck_") && event.toolName !== "ompdeck_finish_worktree")) return;
+        checkpointed = true;
+        const controller = new AbortController();
+        const { promise: timeout, reject } = Promise.withResolvers<never>();
+        const timer = setTimeout(() => { controller.abort(); reject(new Error("checkpoint budget exceeded")); }, 15000);
+        try {
+          await Promise.race([captureCheckpoint(ctx, controller.signal, Date.now() + 15000), timeout]);
+        } catch (error) { log("checkpoint skipped: " + error); }
+        finally { clearTimeout(timer); }
+      });
+    }
     api.on("session_start", (_ev: any, ctx: any) => { try { if (isMain(ctx)) start(ctx); } catch (e) { log("start failed: " + e); } });
     api.on("session_switch", (ev: any, ctx: any) => { try { if (isMain(ctx)) { log(`session_switch ${ev?.reason}`); G.__ompdeckCtl?.setCtx(ctx); G.__ompdeckCtl?.recompute(); } } catch (e) { log("switch failed: " + e); } });
     // Context numbers move on these; `recompute` is cheap (cached per message) and never throws.
@@ -271,6 +400,23 @@ export default async function ompdeckCtl(api: any) {
             label: "Report to OmpDeck parent", approval: "read",
             description: "Report progress, a blocker or completion to the session that opened this one. kind defaults to progress; reports do not end waits. Send only when something changes (rate-limited). Returns Reported to <opener title>.",
             parameters: Type.Object({ text: Type.String({ description: "Report text, 1 byte to 4 KiB." }), kind: Type.Optional(Type.Union([Type.Literal("progress"), Type.Literal("blocked"), Type.Literal("done")])) }),
+          },
+          fan_out: {
+            label: "Fan out OmpDeck sessions", approval: "exec",
+            description: "Open up to 8 parallel sessions in one call, each in its own worktree by default. Returns handles; their combined result arrives as one message when all have finished. forward_questions defaults to true; timeout_seconds optionally limits each child's initial turn to one day.",
+            parameters: Type.Object({
+              tasks: Type.Array(Type.Object({
+                prompt: Type.String({ description: "Task prompt, 1 byte to 16 KiB." }),
+                title: Type.Optional(Type.String({ description: "Child title, at most 80 characters." })),
+                model: Type.Optional(Type.String()),
+                branch: Type.Optional(Type.String({ maxLength: 200, description: "New worktree branch, at most 200 characters; otherwise generated." })),
+              }), { minItems: 1, maxItems: 8 }),
+              worktree: Type.Optional(Type.Boolean({ description: "Give each child a new git worktree; default true." })),
+              base: Type.Optional(Type.String({ maxLength: 200, description: "Worktree base ref; defaults to the primary checkout's current branch." })),
+              cwd: Type.Optional(Type.String({ description: "Absolute existing project directory; defaults to this session's directory." })),
+              forward_questions: Type.Optional(Type.Boolean({ description: "Forward child questions as messages; default true." })),
+              timeout_seconds: Type.Optional(Type.Integer({ description: "Initial-turn timeout per child, 1 to 86400 seconds; no timeout by default." })),
+            }),
           },
         } as const;
         const registered: string[] = [];

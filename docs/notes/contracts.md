@@ -5024,3 +5024,141 @@ is held from the attach until its first `Snapshot`/`Exited` (host has applied it
 the gate opens; a newer attach waits ≤ 15 s for the gate and is refused on timeout, never bypassing. Residual
 (accepted): after a deadline drop the host may still apply the stale Attach late — only a daemon-side fenced attach
 would rule that out; it needs a hung host to matter.
+
+## Orchestration, fan-out, merge queue, checkpoints, Needs-you inbox (user, 2026-11-12)
+User picked A–E from the "what next" list. Facts: omp 18.20 extension events (`tool_call` handlers awaited before
+execution, 30 s per-handler timeout fails closed, `ctx.agent.kind === "main"` filter — never `depth`), `pi.exec` has
+no `env` option, git temp-index snapshot/restore experiments (all verified in mktemp repos; agent://CheckpointScout of
+2026-11-12). Owners: deck-core (extension, `checkpoints`, finish prompts, config), deck-service (gateway), omp-deck (UI).
+No phone/protocol change in this wave (deck-remote/pwa untouched).
+
+### (D) Checkpoints + rollback
+- **Capture** (`ompdeck-ctl.ts`, only when env `OMPDECK_CHECKPOINTS=1`): `pi.on("tool_call")`, main agent only
+  (`ctx.agent.kind === "main"`). Once per `agent_start` run, before the first tool call whose name is NOT in the
+  read-only allowlist (`read grep glob find ast_grep web_search security_scan ask wait todo think yield goal` and
+  every `ompdeck_*` tool except `ompdeck_finish_worktree`), await a snapshot; afterwards skip until the next
+  `agent_start`. Fail open: any error/timeout (budget 15 s total) skips the checkpoint, logs once, never blocks the
+  tool. Not a git repo → nothing. Git runs with an explicit env (`GIT_INDEX_FILE`) through `node:child_process`
+  `execFile`/`Bun.spawn` (cross-platform; never `env` the binary, never mutate `process.env`).
+- **Snapshot** (verified): index path = `git rev-parse --path-format=absolute --git-path index` (linked worktrees);
+  copy to a temp file (missing index → empty temp index); `GIT_INDEX_FILE=tmp git add -A`; `write-tree`; skip when
+  the tree equals the newest checkpoint of this session; `commit-tree <tree> [-p HEAD]` (unborn HEAD → no parent);
+  `update-ref refs/ompdeck/checkpoints/<session-id>/<seq>` with `<seq>` zero-padded to 6 digits, max+1 of that
+  session's refs. Commit message: first line `ompdeck checkpoint`, blank line, then `key: value` lines `session`,
+  `entry` (latest persisted user message entry id from `sessionManager.getBranch()`, may be empty), `prompt` (its text,
+  one line, ≤ 120 chars), `kind` (`turn` | `rollback`), `at` (unix ms). Keep the newest 50 per session (delete older
+  refs). The user's real index and working tree are never touched by capture.
+- **deck-core `checkpoints`** (new module, pure git via `std::process::Command`, typed errors):
+  `list(repo: &Path, session_id: &str) -> Result<Vec<Checkpoint>>` newest first;
+  `Checkpoint { seq: u32, commit: String, at_unix_ms: u64, prompt: String, entry: Option<String>, kind: CheckpointKind { Turn, Rollback } }`;
+  `repo_root(cwd) -> Option<PathBuf>`; `diff_stat(repo, commit) -> Result<Vec<FileDelta { path, old_path: Option<String>, added: Option<u32>, removed: Option<u32>, status: char }>>`
+  = current temp-index snapshot tree vs the checkpoint (tree-to-tree, so untracked files show), `create(repo,
+  session_id, kind, prompt) -> Result<Option<Checkpoint>>` (same format as the extension; used for the rollback safety
+  copy), `restore(repo, commit) -> Result<RestoreReport { changed: u32 }>` = the verified sequence: current snapshot in
+  a temp index, refuse on ignored-path collisions with target paths and on any gitlink (submodule) entry that differs
+  between current and target (typed errors, nothing touched), delete current snapshot's file/symlink paths deepest
+  first + empty parents only, `read-tree <commit>` into a temp index, `checkout-index -a -f`. The user's real index is
+  preserved (never `read-tree --reset`). Unit tests on temp repos (rename, file↔dir, symlink, exec bit, untracked,
+  ignored untouched, ignored collision refused, linked worktree).
+- **Gateway**: launch env `OMPDECK_CHECKPOINTS=1` when `AppConfig.checkpoints` (default true) and live control is
+  on. `Topic::Checkpoints(PathBuf)` (session file; interest-driven; worker; refresh on the session's turn end and every
+  5 s while subscribed) → `TopicValue::Checkpoints(CheckpointsView { repo: Option<PathBuf>, session_id: Option<String>,
+  items: Vec<deck_core::checkpoints::Checkpoint>, error: Option<String> })`. `Query::CheckpointDiff { session:
+  PathBuf, seq: u32 }` → `Answer::CheckpointDiff(Vec<FileDelta>)` (worker, capped 500 rows).
+  `Mutation::CheckpointRestore { target: SessionTarget, session: PathBuf, seq: u32 }`: refused unless the session is
+  idle (no turn running, no pending command); takes a `rollback` safety checkpoint first (its seq returned), then
+  restores; `Done::CheckpointRestored { safety: Option<u32>, changed: u32 }`. Journaled like other mutations; never
+  replayed when uncertain.
+- **UI**: Changes panel gains a **Checkpoints** section (toggle beside the file list header): rows "Before turn: <prompt>"
+  + relative time + kind badge (`rollback` = "Safety copy"), click → diff-stat preview list; row hover buttons
+  Preview / **Roll back to here** (confirm modal: N files will change, a safety checkpoint is taken first, idle only;
+  disabled with the reason while busy) + the same actions in a row context menu. Settings → General → Agent tools:
+  "Checkpoint the repo before agent edits" (`AppConfig.checkpoints`, applies to sessions started afterwards).
+
+### (B) `ompdeck_fan_out`
+- Tool (`AgentTools.fan_out`, default true; short name `fan_out`): `{ tasks: [{ prompt (1..16 KiB), title? (≤ 80),
+  model?, branch? }] (1..=8), worktree?: bool = true, base?: string, cwd?: string (absolute), forward_questions?: bool =
+  true, timeout_seconds?: 1..=86400 }`. Opens one child per task (tabs, never splits), with `worktree: { branch, base }`
+  when `worktree` (same creation path as open_session's worktree), each registered as an agent child with a handle
+  (send_prompt/wait/finish/report all apply). One pending tool request regardless of N (not limited by the 4-pending
+  cap); per child the 30 s open deadline starts at that child's own open event; worktree creation stays serialized.
+- Returns once every child is opened or failed: one line per task `N. <handle> — <title> — <branch or cwd>` or
+  `N. failed: <reason>`, plus "Their combined result arrives as one message when all have finished." Zero opened →
+  tool error.
+- Group watch (background, like `wait_session { background: true }`): each child's turn of its initial prompt; ends
+  per child on done / failed / exited / timeout. A child needing attention does NOT end its entry; it delivers one
+  short message "Fan-out <id>: <title> needs your attention" (skipped when its question is forwarded). When all
+  entries ended: one `Deliver` titled `Fan-out <id> finished (<done>/<n> done)` with per child: handle, title, status,
+  branch, final reply (≤ 2 KiB each, ≤ 16 KiB total, truncated with a marker). ≤ 2 active fan-outs per opener root;
+  dropped with the opener like background waits. `ompdeck_sessions` rows show `fan-out <id>`.
+
+### (C) Merge queue
+- Gateway `worktree.finishing`: every finish (manual GUI, phone, agent `finish_worktree`) of the same primary repo runs
+  one at a time, FIFO. A queued finish is `Queued { ahead }` and does nothing; its 90 s injection timeout and
+  `started` count from release. The active finish holds the lane from release until its post-turn check: clean+merged
+  → retire (lane freed); otherwise the lane is freed and, when the only blocker is "commits not merged", the finish is
+  re-queued once at the back with the retry prompt; a second failure → Blocked as today (outcome delivered for agent
+  finishes). Cancel/abort/exit frees the lane. `worktree_precheck` still refuses a duplicate for the same path.
+- deck-core prompts: `finish_prompt` gains the update-first step for `MergeTarget::In`: commit remaining work, then
+  bring the base into the branch inside the worktree (`git -C <wt> merge <base>`), resolve conflicts there and re-run
+  the project's checks, then merge into the base checkout (`git -C <dir> merge <branch>`); `Nowhere` text unchanged in
+  substance. New `finish_retry_prompt(branch, base, worktree, target)`: "<base> moved while you were finishing: update
+  again from it in the worktree, resolve conflicts, re-run the checks, then merge" (same sanitizing/quoting helpers).
+  Update the tests that pin the prompt text.
+- Visible state: worktree finishing indicators show "Queued (N ahead)"; Orchestration nodes carry the finish state;
+  `ompdeck_sessions` worktree line shows `finish: queued (N ahead)` / `merging` / `blocked: …`.
+
+### (A) Orchestration view
+- Gateway persists the opener → child links (`<data dir>/omp-deck/agent-children.json`, atomic write on change): per
+  child `{ handle, opener_root, child_file, title, opened_at_unix_ms, fan_out: Option<String>, last_report: Option<{
+  kind, text, at_unix_ms }> }`; restored at gateway start as registry entries (handles valid only after the normal
+  identity validation, child file must exist; unmanaged restored children attach through a resume launch of their file
+  like opening the session); pruned when the child file is gone or the link is older than 14 days with no live
+  session. Fan-out groups / background waits / finish state are NOT persisted.
+- `Topic::Orchestration` (interest-driven) → `TopicValue::Orchestration(OrchestrationView { roots: Vec<OrchNode> })`;
+  roots = sessions that opened children and are not themselves children (nesting = children of children);
+  `OrchNode { handle: Option<String>, target: Option<SessionTarget>, session_path: PathBuf, title: String, cwd: PathBuf,
+  status: TabStatus, busy: bool, live: bool, model: Option<String>, thinking: Option<String>, progress:
+  Option<Progress>, last_report: Option<OrchReport { kind, text, at_unix_ms }>, worktree: Option<OrchWorktree { path,
+  branch: Option<String>, base: Option<String> }>, finish: Option<OrchFinish { Queued { ahead: u32 } | Merging | Blocked
+  { reason } | Done { outcome } }>, fan_out: Option<String>, cost: Option<f64>, opened_at_unix_ms: u64, children:
+  Vec<OrchNode> }`. Cost via incremental `SessionStatsReader`s on a worker while subscribed (≤ every 5 s).
+- UI: agents dashboard tab **Orchestration** (Agents / Activity / Orchestration; Ctrl+Shift+A then the chip; palette
+  "Agents: Orchestration"). Per root a card: title + model/thinking, tree total cost, counts by status; children as
+  rows hanging off a rail (Branch Ledger elbows, status marker, title + model/thinking, branch chip, progress mini bar
+  `3/7`, finish chip, cost, last report line with kind badge). Row hover buttons + context menu: Open (tab focus or
+  open), Open in split right, Finish worktree (worktree children not finishing; same gated path as the sidebar),
+  Stop session; card header: Stop all children… (confirm, lists them). Empty state explains `ompdeck_open_session` /
+  `ompdeck_fan_out`.
+
+### (E) Needs-you inbox
+- Gateway: `ControllerInfo.pending_ui: Vec<deck_core::ctl::PendingUi>` (oldest first, ≤ 8, only when the live link has
+  `ui_hook`; empty otherwise) published on `Topic::Controllers` on change.
+- UI: title-bar **Needs you** button left of the bell (lucide `message-circle-question`), shown only while ≥ 1 request
+  is pending, warn-coloured count badge; Ctrl+Shift+I and palette "Needs you: Open" open the popover even when empty
+  ("Nothing is waiting for you"). Popover (card chrome, scroll): one card per request, newest session first:
+  session title + model/thinking + project, kind badge, age, then native controls per kind — Select (single radio /
+  multi checkbox toggling one label per answer, as omp), Confirm (Yes/No), Input (single line), Editor (multi-line,
+  prefill), Ask (each question: options + custom text, recommended marked), Approve (Allow once / Allow for session
+  when offered / Deny / grants with "always"), Form (sections' text/list/pre/table blocks + choice/text fields,
+  required enforced) — and Cancel; "Open session" link. Answers go through `Mutation::AnswerUi` (`Answered(false)` →
+  "Already answered"). Answering never focuses or switches tabs.
+
+### As built (orchestration, fan-out, merge queue, checkpoints, Needs-you)
+- deck-core: `checkpoints.rs` (+ `checkpoints/tests.rs`): restore preflights every ancestor of every path it deletes or
+  writes and refuses symlink/reparse parents (`UnsafeParent`) before touching anything; ignored-collision checks are
+  component-wise and case-insensitive on Windows; temporary indexes (Rust and `ompdeck-ctl.ts`) clear assume-unchanged
+  before staging (skip-worktree untouched). `finish_prompt` update-first, `finish_retry_prompt`.
+- deck-service: `agent_tools/children/{orchestration,fanout}.rs`, merge lanes in `engine/worktree.rs` (same-primary
+  FIFO for manual/phone/agent finishes, queue time not counted, one tail re-queue when only "not merged"),
+  `engine/checkpoints.rs` (restore fences target file/repo/sequence, fails closed when the safety capture fails, a
+  restore reservation shows as `busy`), `ControllerInfo.pending_ui` + `current_thinking`. `Answer::CheckpointDiff {
+  rows, total }` (total counted before the 500-row cap). Link pruning keeps an announced-but-not-yet-written child
+  file while its child is live (regression found during this wave).
+- omp-deck: `dashboard/orchestration.rs` + `app/orchestration.rs`, `needs_you.rs` + `needs_you_model.rs` (cards keyed
+  by `push_id((session, request))`; answering never sets terminal focus), `checkpoints_view.rs` + `app/changes.rs`
+  (rollback gate = busy or a non-final request; confirm fetches a fresh diff total; follows only while the panel is
+  visible), "Queued (N ahead)" in the worktree UI.
+- Gates: `deck-core/tests/agent_tools_live.rs` (checkpoint ref before a write with the real index unchanged; fan_out
+  visible), `deck-service/tests/agent_tools_live.rs` (fan-out of worktree children → one combined message; two
+  finishes serialized through the queue with the second shown queued; checkpoint restore).

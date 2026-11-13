@@ -8,8 +8,8 @@ static CREATE: Mutex<()> = Mutex::new(());
 
 #[derive(Deserialize)]
 pub(super) struct OpenWorktree {
-    branch: Option<String>,
-    base: Option<String>,
+    pub(super) branch: Option<String>,
+    pub(super) base: Option<String>,
 }
 
 impl Engine {
@@ -71,6 +71,12 @@ impl Engine {
         mut event: ServerEvent,
         result: Result<(PathBuf, String, String), String>,
     ) {
+        if self.fanout_open_current(request).is_some() {
+            if self.fanout_open_current(request) == Some(true) {
+                self.fanout_worktree_opened(request, event, result);
+            }
+            return;
+        }
         if !self.agent_tool_current(request) {
             return;
         }

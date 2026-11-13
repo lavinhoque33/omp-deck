@@ -58,6 +58,8 @@ pub struct BarInput<'a> {
     pub backup: Option<&'a ChipView>,
     /// The notification bell (badge + popover).
     pub notifications: crate::notify_panel::PanelInput<'a>,
+    /// The Needs-you inbox (button shown only while something is pending).
+    pub needs_you: crate::needs_you::Input<'a>,
 }
 
 /// omp CLI state shown in the bar; absent when omp was not found.
@@ -98,6 +100,8 @@ pub enum BarAction {
     CancelBackup,
     /// The notification popover asked for something.
     Inbox(crate::notify_panel::PanelAction),
+    /// The Needs-you popover answered a dialog or asked to show a session.
+    NeedsYou(crate::needs_you::Action),
     /// Open the provider login wizard.
     Login,
     /// Open Usage → Accounts.
@@ -383,9 +387,15 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                 + pill_label
                     .as_ref()
                     .map_or(0.0, |l| 4.0 + badge_width(&badge_galley(ui, l)));
+            let needs_you_w = crate::needs_you::width(&input.needs_you, ui.ctx());
             let right_w = 68.0
                 + notify_panel::bell_width()
                 + 2.0
+                + if needs_you_w > 0.0 {
+                    needs_you_w + 2.0
+                } else {
+                    0.0
+                }
                 + badge_w
                 + tab_row_chip.map_or(0.0, |v| 4.0 + backup_chip::width(ui, v))
                 + input
@@ -413,6 +423,9 @@ pub fn show(ui: &mut egui::Ui, input: &BarInput<'_>) -> Option<BarAction> {
                     }
                     if let Some(a) = notify_panel::bell(ui, &input.notifications) {
                         action = Some(BarAction::Inbox(a));
+                    }
+                    if let Some(a) = crate::needs_you::button(ui, &input.needs_you) {
+                        action = Some(BarAction::NeedsYou(a));
                     }
                     if let Some(o) = &input.omp
                         && let Some((current, latest)) = o.available
@@ -1228,6 +1241,8 @@ mod tests {
         let finishing = std::collections::HashMap::new();
         let parkable = HashSet::new();
         let state = UpdateState::default();
+        let needs_you = crate::needs_you::Index::default();
+        let models = crate::model_picker::ModelsCache::default();
         let chip = ChipView::new(
             &deck_service::gateway::protocol::LaneJob {
                 label: "Backing up /srv/proj".to_owned(),
@@ -1306,6 +1321,11 @@ mod tests {
                 reviews: &[],
                 badge: None,
                 warn: false,
+                now: std::time::SystemTime::UNIX_EPOCH,
+            },
+            needs_you: crate::needs_you::Input {
+                index: &needs_you,
+                models: &models,
                 now: std::time::SystemTime::UNIX_EPOCH,
             },
         };

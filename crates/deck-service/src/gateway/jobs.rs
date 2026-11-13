@@ -227,6 +227,8 @@ pub fn plan_view(p: &PreparedRestore) -> RestorePlanView {
 /// Read-only queries that block. `None`: not a worker query (the engine answers it).
 pub fn query(ctx: &JobCtx, q: &Query) -> Option<Result<Answer, GatewayError>> {
     let r = match q {
+        Query::CheckpointDiff { session, seq } => super::engine::checkpoints::diff(session, *seq)
+            .map(|(rows, total)| Answer::CheckpointDiff { rows, total }),
         Query::UsageActivity { days } => {
             deck_core::usage::activity(&deck_core::usage::stats_db_path(), *days)
                 .map(Answer::UsageActivity)

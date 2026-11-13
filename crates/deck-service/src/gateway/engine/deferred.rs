@@ -175,6 +175,13 @@ impl Deferred {
 }
 
 impl Engine {
+    pub(super) fn checkpoint_deferred_pending(&self, target: &SessionTarget) -> bool {
+        self.defer
+            .items
+            .iter()
+            .any(|item| item.session == target.key)
+    }
+
     /// Types `/reload-plugins` into `target`'s session once it is idle, for `owner`'s
     /// confirmations. A session that is gone is dropped silently; one reload per session waits.
     pub(super) fn queue_reload(&mut self, target: &SessionTarget, owner: &str) {
@@ -238,6 +245,9 @@ impl Engine {
         target: SessionTarget,
         command: Command,
     ) -> Result<RequestKey, Rejected> {
+        if self.checkpoint_restore_busy(&target) {
+            return Err(Rejected::Busy);
+        }
         self.defer.seq += 1;
         let key = RequestKey {
             client: INTERNAL.to_owned(),
@@ -304,6 +314,9 @@ impl Engine {
             }
             return None;
         };
+        if self.checkpoint_restore_busy(self.sess.managed[i].ctl.target()) {
+            return Some(item);
+        }
         let gone = self.sess.managed[i].exited();
         let owner_here = self.client_connected(&item.owner);
         match item.what {

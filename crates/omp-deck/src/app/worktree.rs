@@ -52,9 +52,9 @@ pub(super) struct WtUi {
     /// What the gateway reports of each repository that has linked worktrees or parked branches
     /// (by primary), with the topic revision it was read at.
     views: HashMap<PathBuf, (u64, WorktreesView)>,
-    /// Worktrees (by folder) a finish flow runs on: the sidebar shows "Finishing…". The value is
-    /// whether this window started the job (and so can cancel it).
-    pub(super) finishing: HashMap<PathBuf, bool>,
+    /// Worktrees (by folder) a finish flow runs on: the sidebar shows "Finishing…" or
+    /// "Queued (N ahead)", and whether this window started the job (and so can cancel it).
+    pub(super) finishing: HashMap<PathBuf, worktree_ui::FinishMark>,
     /// Where each parked branch is checked out (as the gateway last looked).
     pub(super) park_states: Vec<ParkState>,
     /// Worktrees last seen clean and pushed but not merged: their remove action parks.
@@ -393,13 +393,24 @@ impl App {
         for (_, view) in self.wt.views.values() {
             for e in &view.linked {
                 if let Some(deck_service::gateway::protocol::WorktreeFlow::Finishing {
-                    job, ..
+                    job,
+                    state,
+                    ..
                 }) = &e.flow
                 {
                     // Only a job this window sent can be cancelled from here: the gateway
                     // refuses another client's job.
                     let own = self.wt.finish_jobs.get(&e.worktree.path) == Some(job);
-                    self.wt.finishing.insert(e.worktree.path.clone(), own);
+                    let queued = match state {
+                        deck_service::gateway::protocol::OrchFinish::Queued { ahead } => {
+                            Some(*ahead)
+                        }
+                        _ => None,
+                    };
+                    self.wt.finishing.insert(
+                        e.worktree.path.clone(),
+                        worktree_ui::FinishMark { own, queued },
+                    );
                 }
                 if e.parkable {
                     self.wt.parkable.insert(e.worktree.path.clone());
@@ -416,6 +427,16 @@ impl App {
             }
         }
         self.ctx.request_repaint();
+    }
+
+    /// The linked worktree at `path`, as the gateway's worktree view of its repository has it.
+    pub(super) fn linked_worktree(&self, path: &Path) -> Option<Worktree> {
+        self.wt
+            .views
+            .values()
+            .flat_map(|(_, v)| v.linked.iter())
+            .find(|e| e.worktree.path == path)
+            .map(|e| e.worktree.clone())
     }
 
     /// The merge target the gateway knows for `wt`.

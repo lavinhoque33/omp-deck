@@ -126,6 +126,8 @@ pub struct AppConfig {
     /// Agent-facing OmpDeck tools enabled for sessions started or restarted afterwards.
     #[serde(default)]
     pub agent_tools: AgentTools,
+    /// Capture the repository before the main agent's first mutating tool in each run.
+    pub checkpoints: bool,
     /// Look for new OmpDeck releases at startup and every 6 h.
     pub check_app_updates: bool,
     /// Version the user chose to skip ("Skip this version").
@@ -215,6 +217,7 @@ pub struct AgentTools {
     pub answer_question: bool,
     pub finish_worktree: bool,
     pub report: bool,
+    pub fan_out: bool,
 }
 
 impl Default for AgentTools {
@@ -230,6 +233,7 @@ impl Default for AgentTools {
             answer_question: true,
             finish_worktree: true,
             report: true,
+            fan_out: true,
         }
     }
 }
@@ -249,6 +253,7 @@ impl AgentTools {
             (self.answer_question, "answer_question"),
             (self.finish_worktree, "finish_worktree"),
             (self.report, "report"),
+            (self.fan_out, "fan_out"),
         ] {
             if enabled {
                 if !value.is_empty() {
@@ -349,6 +354,7 @@ impl Default for AppConfig {
             worktree_bases: BTreeMap::new(),
             notify: NotifyConfig::default(),
             agent_tools: AgentTools::default(),
+            checkpoints: true,
             check_app_updates: true,
             skipped_app_version: None,
             palette_recent: Vec::new(),
@@ -1284,28 +1290,31 @@ mod tests {
     fn agent_settings_migrate_and_preserve_disabled_tools() {
         let old = load_str(r#"{"notify":{"desktop":false}}"#);
         assert!(old.notify.agent_messages);
+        assert!(old.checkpoints);
         assert_eq!(
             old.agent_tools.env_value().as_deref(),
             Some(
-                "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report"
+                "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report,fan_out"
             )
         );
         let partial = load_str(r#"{"agent_tools":{"notify":false}}"#);
         assert_eq!(
             partial.agent_tools.env_value().as_deref(),
             Some(
-                "open_session,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report"
+                "open_session,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report,fan_out"
             )
         );
         let disabled = load_str(
-            r#"{"notify":{"agent_messages":false},"agent_tools":{"open_session":false,"notify":false,"show_changes":false,"request_review":false,"sessions":false,"send_prompt":false,"wait_session":false,"answer_question":false,"finish_worktree":false,"report":false}}"#,
+            r#"{"checkpoints":false,"notify":{"agent_messages":false},"agent_tools":{"open_session":false,"notify":false,"show_changes":false,"request_review":false,"sessions":false,"send_prompt":false,"wait_session":false,"answer_question":false,"finish_worktree":false,"report":false,"fan_out":false}}"#,
         );
         assert_eq!(disabled.agent_tools.env_value(), None);
         assert!(!disabled.notify.agent_messages);
+        assert!(!disabled.checkpoints);
         let back: AppConfig =
             serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
         assert_eq!(back.agent_tools, disabled.agent_tools);
         assert!(!back.notify.agent_messages);
+        assert!(!back.checkpoints);
     }
 
     fn load_str(json: &str) -> AppConfig {

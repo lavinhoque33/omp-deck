@@ -63,7 +63,7 @@ struct ReportArgs {
     #[serde(default)]
     kind: ReportKind,
 }
-#[derive(Default, Deserialize)]
+#[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ReportKind {
     #[default]
@@ -87,6 +87,7 @@ impl ReportArgs {
 pub(super) struct ReportDelivery {
     handle: String,
     text: String,
+    report: crate::gateway::protocol::OrchReport,
     sent: Option<(SessionTarget, u64, String)>,
     until: Instant,
 }
@@ -107,6 +108,16 @@ impl Engine {
         now: Instant,
     ) -> Result<(), String> {
         let args: ReportArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+        let report = crate::gateway::protocol::OrchReport {
+            kind: match args.kind {
+                ReportKind::Progress => "progress",
+                ReportKind::Blocked => "blocked",
+                ReportKind::Done => "done",
+            }
+            .to_owned(),
+            text: args.text.clone(),
+            at_unix_ms: crate::gateway::unix_ms(),
+        };
         let text = args.message()?;
         let pending = &self.agent_tools.pending[&request];
         let index = self
@@ -141,6 +152,7 @@ impl Engine {
             ReportDelivery {
                 handle,
                 text,
+                report,
                 sent: None,
                 until: now + DELIVERY,
             },
@@ -288,13 +300,13 @@ impl Engine {
             let title = &report.sent.as_ref().expect("sent report").2;
             let result = format!("Reported to {title}.");
             let handle = report.handle.clone();
-            let text = report.text.clone();
+            let report = report.report.clone();
             self.agent_tools
                 .children
                 .entries
                 .get_mut(&handle)
                 .expect("registered child")
-                .last_report = Some(text.chars().take(120).collect());
+                .last_report = Some(report);
             self.finish_child_report(request, true, result, false);
         } else {
             self.finish_child_report(

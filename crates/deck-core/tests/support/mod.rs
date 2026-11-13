@@ -125,6 +125,18 @@ impl Live {
         resume: impl FnOnce(&Live) -> Option<PathBuf>,
         tools: Option<&str>,
     ) -> Option<Live> {
+        Self::start_with_policy(tag, script, seed, resume, tools, false)
+    }
+
+    /// As [`Self::start_with_tools`], with checkpoint capture explicitly enabled or disabled.
+    pub fn start_with_policy(
+        tag: &str,
+        script: impl FnMut(&Value) -> Reply + Send + 'static,
+        seed: impl FnOnce(&Live),
+        resume: impl FnOnce(&Live) -> Option<PathBuf>,
+        tools: Option<&str>,
+        checkpoints: bool,
+    ) -> Option<Live> {
         let omp_exe = std::env::var_os("OMPDECK_TEST_OMP").map(PathBuf::from)?;
         ensure_host_exe();
         let ns = format!("omp-deck-test-{tag}-{}", std::process::id());
@@ -198,6 +210,13 @@ impl Live {
         if let Some(tools) = tools {
             launch_env.push((deck_core::ctl::OMPDECK_TOOLS_ENV.into(), tools.into()));
         }
+        if checkpoints {
+            launch_env.push(("OMPDECK_CHECKPOINTS".into(), "1".into()));
+            launch_env.push((
+                "OMPDECK_CTL_LOG".into(),
+                live.root.join("checkpoint.log").display().to_string(),
+            ));
+        }
         let mut argv = vec![omp_exe.display().to_string()];
         if let Some(file) = &resume {
             argv.extend(["--resume".to_owned(), file.display().to_string()]);
@@ -206,6 +225,9 @@ impl Live {
         let (mut env_set, mut env_remove) = deck_core::mux::host_env(SESSION, &launch_env, false);
         if tools.is_none() {
             env_remove.push(deck_core::ctl::OMPDECK_TOOLS_ENV.into());
+        }
+        if !checkpoints {
+            env_remove.push("OMPDECK_CHECKPOINTS".into());
         }
         env_set.retain(|(k, _)| k != "PI_NOTIFICATIONS");
         env_set.push(("PI_NOTIFICATIONS".into(), "off".into()));

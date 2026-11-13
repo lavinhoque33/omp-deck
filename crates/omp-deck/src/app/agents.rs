@@ -208,6 +208,7 @@ impl App {
     /// Per frame while the dashboard is open: rebuild the cards when their inputs changed, follow
     /// the sessions with the fleet watcher, refresh the subagent views. Closed: the watcher idles.
     pub(super) fn drive_dashboard(&mut self) {
+        self.drive_orchestration();
         if !self.dash.open {
             if self.dash.sig.is_some() {
                 self.dash.close();
@@ -513,6 +514,7 @@ impl App {
                     scope,
                 } => self.request_delete_agents(key, session, plan, scope),
                 DashAction::Restart => self.request_restart_live(),
+                DashAction::Orch(a) => self.apply_orch_action(a),
             }
         }
     }

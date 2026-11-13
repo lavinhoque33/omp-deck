@@ -5,13 +5,14 @@ mod support;
 
 use std::time::{Duration, Instant};
 
+use deck_core::checkpoints::{self, CheckpointKind};
 use deck_core::ctl::{CtlClient, CtlCommand, GoalStatus, TodoStatus, ToolEvent, ToolRequest};
 use deck_tsp::wire::Event;
 use serde_json::{Value, json};
 use support::fake_model::{self as fm, Reply};
 use support::{Live, TURN, wait_for};
 
-const ALL: &str = "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report";
+const ALL: &str = "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report,fan_out";
 const RESULT: &str = "Posted: verified round trip";
 const DELIVERED_IDLE: &str = "DELIVERED-IDLE: the child finished.";
 const DELIVERED_BUSY: &str = "DELIVERED-BUSY: the child finished during this tool.";
@@ -31,6 +32,24 @@ fn script(request: &Value) -> Reply {
     }
     let user = fm::last_user_text(request);
     let prompt = user.lines().last().unwrap_or_default();
+    if prompt == "checkpoint-edit" {
+        let steps = fm::after_last_user(request)
+            .iter()
+            .filter(|m| fm::role(m) == "tool")
+            .count();
+        return match steps {
+            0 => Reply::tool_call("read", &json!({"path":"tracked.txt"})),
+            1 => Reply::tool_call(
+                "write",
+                &json!({"path":"tracked.txt","content":"agent changed the file\n"}),
+            ),
+            2 => Reply::tool_call(
+                "write",
+                &json!({"path":"generated.txt","content":"second mutation in the same run\n"}),
+            ),
+            _ => Reply::text("Checkpointed writes finished."),
+        };
+    }
     if prompt == "goal-progress-completion" {
         return if fm::after_last_user(request)
             .iter()
@@ -1363,4 +1382,241 @@ fn snapshot_keeps_completed_goals_until_omp_clears_their_state() {
             (snapshot.main_idle == Some(true) && snapshot.progress.is_none()).then_some(())
         },
     );
+}
+
+fn git(repo: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-C"])
+        .arg(repo)
+        .args(args)
+        .env_remove("GIT_INDEX_FILE")
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .trim_end_matches(['\r', '\n'])
+        .to_owned()
+}
+
+#[test]
+fn checkpoint_precedes_real_writes_once_per_run_and_preserves_the_real_index() {
+    let Some(live) = Live::start_with_policy(
+        "cp-write",
+        script,
+        |live| {
+            git(&live.proj, &["init", "--initial-branch=main"]);
+            git(&live.proj, &["config", "user.name", "Checkpoint test"]);
+            git(
+                &live.proj,
+                &["config", "user.email", "checkpoint@example.invalid"],
+            );
+            git(&live.proj, &["config", "core.autocrlf", "false"]);
+            std::fs::write(live.proj.join("tracked.txt"), "committed\n").unwrap();
+            git(&live.proj, &["add", "-A"]);
+            git(&live.proj, &["commit", "-m", "fixture"]);
+            std::fs::write(live.proj.join("tracked.txt"), "staged\n").unwrap();
+            git(&live.proj, &["add", "tracked.txt"]);
+            git(
+                &live.proj,
+                &["update-index", "--assume-unchanged", "tracked.txt"],
+            );
+            std::fs::write(live.proj.join("tracked.txt"), "before the agent\n").unwrap();
+        },
+        |_| None,
+        None,
+        true,
+    ) else {
+        return;
+    };
+    let index = std::path::PathBuf::from(git(
+        &live.proj,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    ));
+    let before = std::fs::read(&index).unwrap();
+    for expected_seq in 1..=2 {
+        let entry_start = live.entries().len();
+        live.send("checkpoint-edit");
+        let write = tool_result(&live, "write", entry_start);
+        assert_eq!(write["isError"], false, "{write}");
+        wait_for("both checkpointed writes to finish", TURN, || {
+            let entries = live.entries();
+            let finished = entries.iter().skip(entry_start).any(|entry| {
+                entry["message"]["role"] == "assistant"
+                    && fm::text(&entry["message"]).contains("Checkpointed writes finished.")
+            });
+            let leaf = entries.last()?.get("id")?.as_str()?;
+            (finished
+                && live.client().latest()?.main_idle == Some(true)
+                && live.client().latest()?.leaf.as_deref() == Some(leaf))
+            .then_some(())
+        });
+        let session = git(
+            &live.proj,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/ompdeck/checkpoints/",
+            ],
+        );
+        let session = session
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split('/')
+            .nth(3)
+            .unwrap_or_default();
+        let items = checkpoints::list(&live.proj, session).unwrap();
+        assert_eq!(
+            items.len(),
+            expected_seq,
+            "{}",
+            std::fs::read_to_string(live.root.join("checkpoint.log")).unwrap_or_default()
+        );
+        let newest = &items[0];
+        assert_eq!(newest.seq as usize, expected_seq);
+        assert_eq!(newest.kind, CheckpointKind::Turn);
+        let user = live
+            .entries()
+            .into_iter()
+            .skip(entry_start)
+            .find(|e| e["type"] == "message" && e["message"]["role"] == "user")
+            .unwrap();
+        let prompt: String = fm::text(&user["message"])
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(120)
+            .collect();
+        assert_eq!(newest.prompt, prompt);
+        assert_eq!(newest.entry.as_deref(), user["id"].as_str());
+        assert_eq!(
+            git(
+                &live.proj,
+                &["show", &format!("{}:tracked.txt", newest.commit)]
+            ),
+            if expected_seq == 1 {
+                "before the agent"
+            } else {
+                "agent changed the file"
+            }
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+    }
+}
+
+#[test]
+fn fan_out_is_gated_and_forwards_tasks_and_group_options() {
+    let Some(live) = start("fan-out", Some("fan_out")) else {
+        return;
+    };
+    assert_eq!(live.client().tools(), ["ompdeck_fan_out"]);
+    subscribe(&live, true);
+    for args in [
+        json!({"tasks":[{"prompt":"One independent task"}]}),
+        json!({"tasks":[
+            {"prompt":"Implement backend","title":"Backend","model":"fake/fake-1","branch":"wt/backend"},
+            {"prompt":"Implement frontend","title":"Frontend","branch":"wt/frontend"}
+        ],"worktree":true,"base":"main","cwd":live.proj,"forward_questions":false,"timeout_seconds":86400}),
+        json!({"tasks":vec![json!({"prompt":"Independent task"});8],"worktree":false}),
+    ] {
+        let before = live.model.count();
+        let entry_start = live.entries().len();
+        live.send(&format!(
+            "agent-tool {}",
+            json!({"name":"ompdeck_fan_out","args":args})
+        ));
+        let request = request(live.client());
+        assert_eq!(request.name, "fan_out");
+        assert_eq!(request.args, args);
+        let model = live.model.find(before, fm::has_tools).unwrap();
+        let tools: Vec<_> = fm::tool_names(&model)
+            .into_iter()
+            .filter(|name| name.starts_with("ompdeck_"))
+            .collect();
+        assert_eq!(tools, ["ompdeck_fan_out"]);
+        let text = "1. s-1234abcd — Backend — wt/backend\nTheir combined result arrives as one message when all have finished.";
+        assert!(
+            live.ctl(
+                CtlCommand::ToolResult {
+                    id: request.id,
+                    ok: true,
+                    text: text.into(),
+                    details: None
+                },
+                TURN
+            )
+            .ok
+        );
+        next_model_result(&live, before, text);
+        assert_eq!(
+            tool_result(&live, "ompdeck_fan_out", entry_start)["isError"],
+            false
+        );
+        wait_for("the fan-out call to finish", TURN, || {
+            live.main_idle().then_some(())
+        });
+    }
+}
+
+#[test]
+fn fan_out_rejects_task_and_group_limits_without_dispatching() {
+    let Some(live) = start("fan-limits", Some("fan_out")) else {
+        return;
+    };
+    subscribe(&live, true);
+    for (args, reason) in [
+        (json!({"tasks":[]}), "tasks"),
+        (json!({"tasks":vec![json!({"prompt":"task"});9]}), "tasks"),
+        (json!({"tasks":[{"prompt":""}]}), "each task prompt"),
+        (
+            json!({"tasks":[{"prompt":"é".repeat(8193)}]}),
+            "each task prompt",
+        ),
+        (
+            json!({"tasks":[{"prompt":"task","title":"x".repeat(81)}]}),
+            "task title",
+        ),
+        (
+            json!({"tasks":[{"prompt":"task","branch":"x".repeat(201)}]}),
+            "branch",
+        ),
+        (
+            json!({"tasks":[{"prompt":"task"}],"base":"x".repeat(201)}),
+            "base",
+        ),
+        (json!({"tasks":[{"prompt":"task"}],"cwd":"relative"}), "cwd"),
+        (
+            json!({"tasks":[{"prompt":"task"}],"timeout_seconds":0}),
+            "timeout_seconds",
+        ),
+        (
+            json!({"tasks":[{"prompt":"task"}],"timeout_seconds":86401}),
+            "timeout_seconds",
+        ),
+    ] {
+        let before = live.model.count();
+        let entry_start = live.entries().len();
+        live.send(&format!(
+            "agent-tool {}",
+            json!({"name":"ompdeck_fan_out","args":args})
+        ));
+        let result = tool_result(&live, "ompdeck_fan_out", entry_start);
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(result.to_string().contains(reason), "{result}");
+        next_model_result(&live, before, reason);
+        wait_for("the refused fan-out call", TURN, || {
+            live.main_idle().then_some(())
+        });
+        assert!(
+            live.client().take_tool_requests().is_empty(),
+            "invalid fan-out dispatched: {args}"
+        );
+    }
 }

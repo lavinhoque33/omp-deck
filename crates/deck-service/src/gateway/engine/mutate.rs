@@ -35,6 +35,8 @@ pub(super) enum Post {
     Refresh,
     /// Recompute the changes of this repository (when followed).
     Changes(PathBuf),
+    /// Release a rollback's session/repository reservations and reload checkpoint/git views.
+    CheckpointRestore(PathBuf),
     /// Reload the destinations' records (sign-in, server, backups).
     Accounts,
     OmpAccounts(String),
@@ -255,6 +257,13 @@ impl Engine {
         {
             return Some(e);
         }
+        if let Some(target) = op.target()
+            && self.checkpoint_restore_busy(target)
+        {
+            return Some(GatewayError::Refused(
+                "a checkpoint rollback is running for this session".to_owned(),
+            ));
+        }
         let managed = |t: &crate::controller::SessionTarget| {
             self.sess.find(&t.key).map(|i| &self.sess.managed[i])
         };
@@ -271,6 +280,9 @@ impl Engine {
         }
         match op {
             Mutation::Launch(spec) if spec.argv.is_empty() => refused("there is nothing to run"),
+            Mutation::CheckpointRestore {
+                target, session, ..
+            } => self.checkpoint_restore_refusal(target, session),
             Mutation::Close {
                 target,
                 kill_direct: false,
@@ -557,6 +569,7 @@ impl Engine {
                     self.running.poke();
                 }
                 Post::Changes(root) => self.refresh_changes(&root),
+                Post::CheckpointRestore(session) => self.finish_checkpoint_restore(&key, &session),
                 Post::Accounts => self.load_accounts(),
                 Post::OmpAccounts(store) => {
                     self.load_omp_accounts();
@@ -735,6 +748,14 @@ impl Engine {
         let index = op.target().and_then(|t| self.sess.find(&t.key));
         let lane = self.lane_claim(&op);
         match op {
+            Mutation::CheckpointRestore {
+                target,
+                session,
+                seq,
+            } => {
+                self.accepted(conn, id, &key);
+                self.begin_checkpoint_restore(key, target, session, seq);
+            }
             Mutation::Launch(spec) => {
                 self.track(&key, "launch", Post::None);
                 self.accepted(conn, id, &key);

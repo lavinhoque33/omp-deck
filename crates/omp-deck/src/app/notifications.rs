@@ -71,7 +71,7 @@ impl App {
 
     /// The tab showing exactly this session generation, if one is open: a click on a pop-up of a
     /// replaced conversation finds nothing instead of activating the new one.
-    fn tab_of_target(&self, target: &SessionTarget) -> Option<usize> {
+    pub(super) fn tab_of_target(&self, target: &SessionTarget) -> Option<usize> {
         self.tabs.iter().position(|t| t.target() == target)
     }
 
@@ -196,6 +196,38 @@ impl App {
     /// Opens the inbox popover under the bell.
     pub(super) fn open_inbox_panel(&self) {
         egui::Popup::open_id(&self.ctx, notify_panel::popup_id());
+    }
+
+    /// Opens the Needs-you popover (Ctrl+Shift+I, palette), also while nothing is pending.
+    pub(super) fn open_needs_you(&self) {
+        egui::Popup::open_id(&self.ctx, crate::needs_you::popup_id());
+    }
+
+    /// Answers a pending omp dialog in place (never switches tabs), or shows its session.
+    pub(super) fn apply_needs_you_action(&mut self, action: crate::needs_you::Action) {
+        match action {
+            crate::needs_you::Action::Open(target) => self.show_session_of(&target),
+            crate::needs_you::Action::Answer {
+                target,
+                request,
+                answer,
+            } => {
+                self.gw.mutate(
+                    Mutation::AnswerUi {
+                        target,
+                        request,
+                        answer,
+                    },
+                    |app, r| match r {
+                        Ok(deck_service::gateway::protocol::Done::Answered(false)) => {
+                            app.toasts.info(&app.ctx, "Already answered");
+                        }
+                        Ok(_) => {}
+                        Err(e) => app.toasts.error(&app.ctx, format!("Could not answer: {e}")),
+                    },
+                );
+            }
+        }
     }
 
     /// Asks the gateway for a sample desktop notification.

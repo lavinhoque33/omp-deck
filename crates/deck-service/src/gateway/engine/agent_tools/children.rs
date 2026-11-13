@@ -25,6 +25,8 @@ mod questions;
 use questions::QuestionWatch;
 mod reports;
 use reports::{ReportDelivery, ReportRate};
+pub(in crate::gateway::engine) mod fanout;
+pub(in crate::gateway::engine) mod orchestration;
 mod worktrees;
 use worktrees::{ChildFinish, ChildRelocation};
 
@@ -60,7 +62,13 @@ pub(super) struct ChildSession {
     attaching: bool,
     invalidated: bool,
     reports: ReportRate,
-    last_report: Option<String>,
+    last_report: Option<crate::gateway::protocol::OrchReport>,
+    title: String,
+    opened_at_unix_ms: u64,
+    /// Whether this current path has ever materialized (fresh omp paths are announced early).
+    file_seen: bool,
+    fan_out: Option<String>,
+    restored: bool,
     relocation: Option<ChildRelocation>,
 }
 impl ChildSession {
@@ -425,11 +433,26 @@ fn rejected(rejected: Rejected, mode: ComposeMode) -> String {
 }
 
 impl super::AgentTools {
+    /// Registry references outlive controller ownership (notably a started finish's callback).
+    fn child_registry_referenced(&self, handle: &str) -> bool {
+        self.children.finish_references(handle)
+            || self
+                .children
+                .entries
+                .get(handle)
+                .is_some_and(|child| self.controller_needed(&child.key))
+    }
+
     fn controller_needed(&self, key: &SessionKey) -> bool {
         self.pending
             .values()
             .any(|pending| &pending.target.key == key)
             || self.reply_acks.iter().any(|(target, _)| &target.key == key)
+            || self
+                .deferred_deliveries
+                .iter()
+                .any(|(target, _)| &target.key == key)
+            || self.fan_out.needs_controller(key, &self.children)
             || self
                 .children
                 .reports
@@ -533,6 +556,11 @@ impl Engine {
             invalidated: false,
             reports: ReportRate::new(Instant::now()),
             last_report: None,
+            title: m.display_label(),
+            opened_at_unix_ms: crate::gateway::unix_ms(),
+            file_seen: false,
+            fan_out: None,
+            restored: false,
             relocation: None,
         };
         let enabled = self
@@ -547,6 +575,7 @@ impl Engine {
                             | "ompdeck_wait_session"
                             | "ompdeck_answer_question"
                             | "ompdeck_finish_worktree"
+                            | "ompdeck_fan_out"
                     )
                 })
             });
@@ -557,6 +586,9 @@ impl Engine {
     pub(in crate::gateway::engine) fn child_handle_row(&self, row: String, handle: &str) -> String {
         let child = &self.agent_tools.children.entries[handle];
         let mut row = format!("{row} | handle: {handle}");
+        if let Some(group) = &child.fan_out {
+            row.push_str(&format!(" | fan-out {group}"));
+        }
         if child.background.is_some() {
             row.push_str(" | background wait pending");
         }
@@ -576,7 +608,7 @@ impl Engine {
         self.append_child_worktree(&mut row, handle);
         if let Some(report) = &child.last_report {
             row.push_str(" | last report: ");
-            super::append_short(&mut row, report, 120);
+            super::append_short(&mut row, &report.text, 120);
         }
         row
     }
@@ -603,6 +635,14 @@ impl Engine {
         file: &Path,
     ) -> Option<&str> {
         let root = root?;
+        if let Some((handle, _)) = self.agent_tools.children.entries.iter().find(|(_, child)| {
+            child.restored
+                && !child.invalidated
+                && child.opener_root == root
+                && child.file.as_deref() == Some(file)
+        }) {
+            return Some(handle);
+        }
         let running = self.running.latest()?;
         self.agent_tools
             .children
@@ -729,6 +769,72 @@ impl Engine {
     }
 
     fn attach_agent_child(&mut self, handle: &str) -> Result<(), String> {
+        if self
+            .agent_tools
+            .children
+            .entries
+            .get(handle)
+            .is_some_and(|child| child.restored)
+        {
+            let file = self.agent_tools.children.entries[handle]
+                .file
+                .clone()
+                .ok_or_else(|| STALE.to_owned())?;
+            if let Some(index) = self
+                .sess
+                .managed
+                .iter()
+                .position(|m| m.ctl.session_path() == Some(file.as_path()) && !m.exited())
+            {
+                let child = self
+                    .agent_tools
+                    .children
+                    .entries
+                    .get_mut(handle)
+                    .expect("restored child");
+                child.key = self.sess.managed[index].ctl.target().key.clone();
+                return self.validate_child_identity(handle, index);
+            }
+            let child = self
+                .agent_tools
+                .children
+                .entries
+                .get_mut(handle)
+                .expect("restored child");
+            if !child.attaching {
+                let mux = self
+                    .backends
+                    .for_launch(None, child.attach.view)
+                    .ok_or_else(|| "No persistent session backend is available".to_owned())?;
+                let preferred = child
+                    .attach
+                    .mux_name
+                    .as_deref()
+                    .ok_or_else(|| STALE.to_owned())?;
+                let name = self.running.latest().map_or_else(
+                    || format!("{preferred}-{}", crate::gateway::unix_ms()),
+                    |running| {
+                        running
+                            .resolve_for(
+                                running.blind,
+                                preferred,
+                                Some(&file),
+                                crate::gateway::unix_ms() as u128,
+                            )
+                            .into_name()
+                    },
+                );
+                child.key = SessionKey::backend(mux, &name);
+                child.backend = Some(mux.kind());
+                child.attach.mux_name = Some(name);
+                child.attaching = true;
+                let mut spec = child.attach.clone();
+                spec.argv = omp_argv(Some(&file));
+                let key = child.key.clone();
+                self.queue_agent_child_resume(spec, key);
+            }
+            return Ok(());
+        }
         let child = self
             .agent_tools
             .children
@@ -964,6 +1070,12 @@ impl Engine {
                     }
                     let i = self.valid_child(&handle)?;
                     let target = self.sess.managed[i].ctl.target().clone();
+                    if self.checkpoint_restore_busy(&target) {
+                        return Err(
+                            "The session is restoring a checkpoint; wait for it to finish"
+                                .to_owned(),
+                        );
+                    }
                     let activity = self.sess.managed[i].ctl.activity();
                     if mode == ComposeMode::Send && activity == Activity::Busy {
                         return Err(BUSY.to_owned());
@@ -1340,6 +1452,29 @@ impl Engine {
 
     pub(in crate::gateway::engine) fn step_child_tools(&mut self, now: Instant) {
         self.sync_child_relocations(now);
+        for child in self
+            .agent_tools
+            .children
+            .entries
+            .values_mut()
+            .filter(|c| c.restored)
+        {
+            if let Some(m) = self
+                .sess
+                .managed
+                .iter()
+                .find(|m| m.ctl.session_path() == child.file.as_deref() && !m.exited())
+            {
+                child.key = m.ctl.target().key.clone();
+            }
+            if let Some(m) =
+                self.sess.managed.iter().find(|m| {
+                    m.ctl.session_path() == Some(child.opener_root.as_path()) && !m.exited()
+                })
+            {
+                child.opener = OpenerSource::from_managed(m);
+            }
+        }
         // Learn a fresh child's file even if the opener waits only after it closed the tab.
         for child in self.agent_tools.children.entries.values_mut() {
             if child.file.is_none()
@@ -1515,9 +1650,25 @@ impl Engine {
             }
         }
         self.step_background_waits(now);
+        self.step_fan_outs(now);
         self.deliver_child_questions();
         self.step_child_reports(now);
         self.step_child_finish_messages(now);
+        let pruned: Vec<_> = self
+            .agent_tools
+            .orchestration
+            .pending_prunes
+            .iter()
+            .filter(|handle| !self.agent_tools.child_registry_referenced(handle))
+            .cloned()
+            .collect();
+        for handle in pruned {
+            self.agent_tools.children.entries.remove(&handle);
+            self.agent_tools
+                .orchestration
+                .pending_prunes
+                .remove(&handle);
+        }
         if !self.agent_tools.operations.is_empty() {
             self.wake_within(POLL);
         }
@@ -1529,6 +1680,43 @@ mod tests {
     use super::*;
     use crate::controller::ServiceEpoch;
     use deck_core::config::SessionView;
+    #[test]
+    fn restore_defers_deliveries_and_pending_acknowledgements_block_idle_admission() {
+        let mut tools = crate::gateway::engine::agent_tools::AgentTools::default();
+        let target = SessionTarget {
+            epoch: ServiceEpoch([5; 16]),
+            key: child().key,
+            generation: 1,
+        };
+        let command = deck_core::ctl::CtlCommand::Deliver {
+            root: PathBuf::from("/opener.jsonl"),
+            title: "Fan-out finished".into(),
+            text: "Combined result".into(),
+            details: None,
+        };
+        assert!(
+            tools
+                .admit_delivery(target.clone(), command, true)
+                .is_none()
+        );
+        assert!(tools.delivery_pending(&target));
+        assert!(!tools.delivery_awaiting_ack(&target));
+        assert!(tools.controller_needed(&target.key));
+        let (stored_target, command) = tools.deferred_deliveries.pop_front().unwrap();
+        let (stored_target, _) = tools.admit_delivery(stored_target, command, false).unwrap();
+        assert_eq!(stored_target, target);
+        assert!(!tools.delivery_pending(&target));
+        tools.reply_acks.push((target.clone(), 88));
+        assert!(tools.delivery_pending(&target));
+        assert!(tools.delivery_awaiting_ack(&target));
+        let other_generation = SessionTarget {
+            generation: 2,
+            ..target.clone()
+        };
+        assert!(!tools.delivery_pending(&other_generation));
+        tools.acknowledge_reply(&target.key, 88);
+        assert!(!tools.delivery_pending(&target));
+    }
 
     pub(super) fn child() -> ChildSession {
         ChildSession {
@@ -1561,6 +1749,11 @@ mod tests {
             invalidated: false,
             reports: ReportRate::new(Instant::now()),
             last_report: None,
+            title: "child".into(),
+            opened_at_unix_ms: 0,
+            file_seen: false,
+            fan_out: None,
+            restored: false,
             relocation: None,
         }
     }

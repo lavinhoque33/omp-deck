@@ -66,6 +66,10 @@ fn finish_request_key(epoch: crate::controller::ServiceEpoch, sequence: u64) -> 
 }
 
 impl Registry {
+    pub(super) fn finish_references(&self, handle: &str) -> bool {
+        self.finishes.values().any(|finish| finish.handle == handle)
+    }
+
     fn next_finish_key(
         &mut self,
         epoch: crate::controller::ServiceEpoch,
@@ -124,6 +128,12 @@ fn session_cwd(file: &Path) -> Option<PathBuf> {
 }
 
 impl ChildSession {
+    pub(super) fn relocation_discovering(&self, now: Instant) -> bool {
+        self.relocation
+            .as_ref()
+            .is_some_and(|permit| now < permit.until && self.file.as_ref() == Some(&permit.old))
+    }
+
     /// A relocation exception requires at least one live snapshot, never cached paths alone.
     pub(super) fn relocation_current_file<'a>(
         &'a self,
@@ -160,11 +170,35 @@ impl ChildSession {
             permit.new = Some(file.clone());
         }
         self.attach.session_path = Some(file.clone());
+        if self.file.as_ref() != Some(&file) {
+            self.file_seen = false;
+        }
         self.file = Some(file);
     }
 }
 
 impl Engine {
+    /// Capture links at admission, before retire moves their sessions out of the worktree.
+    /// The worktree engine owns the outcomes; child watches may be removed after delivery.
+    pub(in crate::gateway::engine) fn child_worktree_handles(
+        &self,
+        wt: &worktree::Worktree,
+    ) -> Vec<String> {
+        self.agent_tools
+            .children
+            .entries
+            .iter()
+            .filter_map(|(handle, child)| {
+                let cwd = self
+                    .sess
+                    .find(&child.key)
+                    .map(|i| self.sess.managed[i].current_cwd())
+                    .unwrap_or(&child.attach.cwd);
+                (!child.invalidated && cwd.starts_with(&wt.path)).then(|| handle.clone())
+            })
+            .collect()
+    }
+
     pub(in crate::gateway::engine) fn begin_child_finish(
         &mut self,
         request: u64,
@@ -212,6 +246,8 @@ impl Engine {
         let Some(finish) = self.agent_tools.children.finishes.get_mut(key) else {
             return;
         };
+        // A requeued merge is a new attempt; its terminal blocker must still reach the opener.
+        finish.blocked = None;
         let request = finish.request.take();
         let title = finish.title.clone();
         if let Some(request) = request {
@@ -529,6 +565,53 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_finish_callback_keeps_registry_identity_without_owning_the_child_controller() {
+        let mut tools = crate::gateway::engine::agent_tools::AgentTools::default();
+        let child = super::super::tests::child();
+        let child_key = child.key.clone();
+        let handle = "s-retained";
+        tools.children.entries.insert(handle.into(), child);
+        tools.children.finishes.insert(
+            RequestKey {
+                client: "finish-test".into(),
+                seq: 1,
+            },
+            ChildFinish {
+                handle: handle.into(),
+                request: None,
+                title: "Retired".into(),
+                started: true,
+                finished: true,
+                blocked: None,
+                messages: VecDeque::new(),
+                until: Instant::now() + Duration::from_secs(10),
+            },
+        );
+        assert!(!tools.controller_needed(&child_key));
+        assert!(tools.child_registry_referenced(handle));
+        tools.children.finishes.clear();
+        assert!(!tools.child_registry_referenced(handle));
+    }
+
+    #[test]
+    fn relocation_preserves_discovery_until_the_new_file_can_materialize() {
+        let mut child = super::super::tests::child();
+        let now = Instant::now();
+        child.file_seen = true;
+        child.relocation = Some(ChildRelocation {
+            old: child.file.clone().unwrap(),
+            destination: PathBuf::from("primary"),
+            until: now + Duration::from_secs(30),
+            delivered: true,
+            new: None,
+        });
+        assert!(child.relocation_discovering(now));
+        child.record_relocation(PathBuf::from("primary/child.jsonl"));
+        assert!(!child.file_seen);
+        assert!(!child.relocation_discovering(now));
+    }
 
     #[test]
     fn finish_sequences_cross_the_journal_retention_window_and_keep_the_epoch_fence() {

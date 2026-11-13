@@ -2469,6 +2469,8 @@ mod tests {
         use crate::controller::{ServiceEpoch, SessionKey};
         ControllerInfo {
             progress: None,
+            pending_ui: Vec::new(),
+            current_thinking: None,
             target: SessionTarget {
                 epoch: ServiceEpoch([7; 16]),
                 key: SessionKey::tmux("omp-deck-test-1", "omp-x"),
