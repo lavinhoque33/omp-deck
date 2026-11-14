@@ -28,6 +28,7 @@ pub(super) struct AgentTools {
     deferred_deliveries: VecDeque<(SessionTarget, CtlCommand)>,
     orchestration: children::orchestration::State,
     fan_out: children::fanout::Groups,
+    cross_sessions: children::cross_sessions::State,
 }
 
 struct Pending {
@@ -192,6 +193,7 @@ impl Engine {
             }
         }
         self.step_child_tools(now);
+        self.step_cross_sessions(now);
         self.flush_child_deliveries();
         if let Some(deadline) = self
             .agent_tools
@@ -309,6 +311,19 @@ impl Engine {
                 worktree_result: None,
             },
         );
+        if matches!(
+            req.name.as_str(),
+            "send_prompt" | "wait_session" | "answer_question" | "finish_worktree"
+        ) {
+            match self.begin_owned_session_ref(request, &req.name, &req.args) {
+                Ok(true) => return,
+                Err(error) => {
+                    self.finish_agent_tool(request, false, error);
+                    return;
+                }
+                Ok(false) => {}
+            }
+        }
         let result: Result<Option<ServerEvent>, String> = (|| {
             Ok(match req.name.as_str() {
                 "open_session" => {
@@ -415,6 +430,10 @@ impl Engine {
                     self.begin_child_tool(request, &req.name, req.args, now)?;
                     None
                 }
+                "watch_session" | "message_session" => {
+                    self.begin_cross_session_tool(request, &req.name, req.args, now)?;
+                    None
+                }
                 "answer_question" => {
                     self.begin_answer_question(request, req.args, now)?;
                     None
@@ -429,10 +448,43 @@ impl Engine {
                 }
                 "sessions" => {
                     let rows = self.agent_session_rows(&target);
+                    let watches = self.cross_session_watches();
                     self.spawn_worker("agent-sessions", move || {
                         let text = rows
                             .into_iter()
                             .map(|(mut row, path)| {
+                                if let Some(path) = path.as_ref()
+                                    && let Some(reference) =
+                                        children::cross_sessions::session_row_ref(path)
+                                {
+                                    row.push_str(&format!(" | ref: {reference}"));
+                                    let watching: Vec<_> = watches
+                                        .iter()
+                                        .filter(|watch| watch.watcher.session_path == *path)
+                                        .map(|watch| watch.watched.ref_.as_str())
+                                        .collect();
+                                    let watched_by: Vec<_> = watches
+                                        .iter()
+                                        .filter(|watch| watch.watched.session_path == *path)
+                                        .map(|watch| watch.watcher.ref_.as_str())
+                                        .collect();
+                                    if !watching.is_empty() {
+                                        row.push_str(&format!(
+                                            " | watching: {}",
+                                            watching.join(", ")
+                                        ));
+                                    }
+                                    if !watched_by.is_empty() {
+                                        row.push_str(&format!(
+                                            " | watched by: {}",
+                                            watched_by.join(", ")
+                                        ));
+                                    }
+                                } else {
+                                    row.push_str(
+                                        " | ref: unavailable (no readable omp session header)",
+                                    );
+                                }
                                 let snippet = path
                                     .and_then(|p| {
                                         let mut r = deck_core::status::SessionStatsReader::new(p);
@@ -450,6 +502,7 @@ impl Engine {
                                         stats.last_assistant_text.clone()
                                     })
                                     .unwrap_or_default();
+                                row = row.replace(" | model: unknown", "");
                                 row.push_str(" | last reply: ");
                                 row.extend(snippet.chars().take(300));
                                 row
@@ -613,6 +666,7 @@ impl Engine {
 
     pub(super) fn stop_agent_tools(&mut self) {
         self.drop_background_waits();
+        self.agent_tools.cross_sessions = children::cross_sessions::State::default();
         let requests: Vec<_> = self.agent_tools.operations.keys().copied().collect();
         for request in requests {
             self.child_operation_finished(request);
@@ -663,7 +717,7 @@ impl Engine {
             .sess
             .find(&opener.key)
             .and_then(|i| self.sess.managed[i].ctl.session_path())
-            .map(children::canonical);
+            .map(ToOwned::to_owned);
         let mut rows: Vec<_> = self
             .sess
             .managed
@@ -685,11 +739,11 @@ impl Engine {
                 let model = m.ctl.current_model();
                 let handle = self.child_handle(opener_root.as_deref(), &target.key);
                 let mut row = format!(
-                    "{} | {} | {} | model: {:?} | tab open: {} | opened by this session: {}",
+                    "{} | {} | {} | model: {} | tab open: {} | opened by this session: {}",
                     m.display_label(),
                     home_path(m.current_cwd()),
                     state,
-                    model,
+                    model.as_deref().unwrap_or("unknown"),
                     open,
                     handle.is_some()
                 );

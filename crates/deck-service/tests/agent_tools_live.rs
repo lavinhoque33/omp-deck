@@ -2464,6 +2464,455 @@ fn exercise_fan_out_merge_queue_and_checkpoints() {
     run(&gui, Mutation::Kill(opener)).expect("stop fan-out parent");
 }
 
+const CROSS_INITIAL_REPLY: &str = "CROSS-B-INITIAL: not the watched next turn.";
+const CROSS_WATCH_REPLY: &str = "CROSS-B-FINAL: first complete reply line.\nSecond complete reply line, including its final sentence.";
+const CROSS_MESSAGE: &str = "CROSS-MESSAGE-BODY: please write the message receipt marker.";
+const CROSS_DISABLED_MESSAGE: &str = "CROSS-DISABLED-BODY: this must never reach A.";
+
+fn cross_session_script(req: &Value) -> Reply {
+    if !fm::has_tools(req) {
+        return Reply::text("Fake title");
+    }
+    if !tool_texts(req).is_empty() {
+        return Reply::text("Cross-session tool completed.");
+    }
+    let prompt = fm::last_user_text(req);
+    let action = if prompt.contains("Watch:") && prompt.contains(CROSS_WATCH_REPLY) {
+        Some(("cross-watch-acted", "watch-delivery-acted"))
+    } else if prompt.contains("Message from") && prompt.contains(CROSS_MESSAGE) {
+        Some(("cross-message-acted", "message-delivery-acted"))
+    } else {
+        None
+    };
+    if let Some((file, receipt)) = action {
+        return Reply::tool_call(
+            "bash",
+            &json!({"command": format!("printf '%s' '{receipt}' > {file}")}),
+        );
+    }
+    if prompt.contains("CROSS-B-TURN") {
+        return Reply::slow_text(CROSS_WATCH_REPLY, Duration::from_secs(2));
+    }
+    if prompt.contains("CROSS-B-OPEN") {
+        return Reply::text(CROSS_INITIAL_REPLY);
+    }
+    let session = prompt.split_whitespace().last().unwrap_or("");
+    let (name, args) = if prompt.contains("CROSS-A-WATCH")
+        || prompt.contains("CROSS-A-STOP")
+        || prompt.contains("CROSS-A-DISABLE")
+    {
+        (
+            "ompdeck_watch_session",
+            json!({"session": session, "background": true, "next": true}),
+        )
+    } else if prompt.contains("CROSS-B-MESSAGE") {
+        (
+            "ompdeck_message_session",
+            json!({
+                "session": session,
+                "text": if prompt.contains("DISABLED") {
+                    CROSS_DISABLED_MESSAGE
+                } else {
+                    CROSS_MESSAGE
+                }
+            }),
+        )
+    } else if prompt.contains("CROSS-A-LIST") {
+        ("ompdeck_sessions", json!({}))
+    } else {
+        return Reply::text("Independent session ready.");
+    };
+    assert!(
+        fm::tool_names(req).contains(&name),
+        "the native session must still advertise {name}: {req}"
+    );
+    Reply::tool_call(name, &args)
+}
+
+fn cross_session_settings(client: &GatewayClient, watch: bool, message: bool) {
+    let Answer::Topic(value) = client
+        .query(Query::Topic(Topic::Settings))
+        .wait(STEP)
+        .expect("cross-session settings response")
+        .expect("cross-session settings query")
+    else {
+        panic!("cross-session settings response");
+    };
+    let TopicValue::Settings(settings) = *value else {
+        panic!("cross-session settings topic");
+    };
+    let base = settings.config;
+    let mut edited = (*base).clone();
+    edited.agent_tools.watch_session = watch;
+    edited.agent_tools.message_session = message;
+    let done = run(
+        client,
+        Mutation::Settings(deck_service::settings::Edit::between(base, &edited)),
+    )
+    .expect("commit current cross-session tool toggles");
+    let Done::Settings(settings) = done else {
+        panic!("cross-session settings mutation: {done:?}");
+    };
+    assert_eq!(settings.config.agent_tools.watch_session, watch);
+    assert_eq!(settings.config.agent_tools.message_session, message);
+}
+
+fn cross_session_ref(file: &Path) -> String {
+    let entries = session_entries(file);
+    let id = entries
+        .iter()
+        .find(|entry| entry["type"] == "session")
+        .and_then(|entry| entry["id"].as_str())
+        .expect("real session header id");
+    let reference = id
+        .get(id.len().saturating_sub(8)..)
+        .expect("ASCII session id")
+        .to_owned();
+    assert_eq!(reference.len(), 8, "session id: {id}");
+    assert!(reference.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    reference
+}
+
+fn cross_session_controllers(
+    client: &GatewayClient,
+) -> Vec<deck_service::gateway::protocol::ControllerInfo> {
+    let Answer::Topic(value) = client
+        .query(Query::Topic(Topic::Controllers))
+        .wait(STEP)
+        .expect("independent controller response")
+        .expect("independent controller query")
+    else {
+        panic!("independent controller response");
+    };
+    let TopicValue::Controllers(controllers) = *value else {
+        panic!("independent controllers topic");
+    };
+    controllers
+}
+
+fn cross_session_orchestration(
+    client: &GatewayClient,
+) -> deck_service::gateway::protocol::OrchestrationView {
+    let Answer::Topic(value) = client
+        .query(Query::Topic(Topic::Orchestration))
+        .wait(STEP)
+        .expect("cross-session orchestration response")
+        .expect("cross-session orchestration query")
+    else {
+        panic!("cross-session orchestration response");
+    };
+    let TopicValue::Orchestration(view) = *value else {
+        panic!("cross-session orchestration topic");
+    };
+    assert!(
+        view.roots.is_empty(),
+        "unrelated GUI launches and watches must never manufacture opener/child links: {view:?}"
+    );
+    view
+}
+
+fn exercise_unrelated_session_watch_and_messages() {
+    if which(if cfg!(windows) { "omp.exe" } else { "omp" }).is_none() {
+        eprintln!("skipped: omp is not installed");
+        return;
+    }
+    let config = format!("{OMP_CONFIG}modelRoles:\n  default: {}\n", fm::MODEL);
+    let sb = Sandbox::new("xs", &config);
+    sb.report_failures();
+    let model = FakeModel::start(cross_session_script);
+    std::fs::write(sb.agent().join("models.yml"), model.models_yml()).expect("models.yml");
+    let gui = sb.client();
+    wait_for("cross-session GUI gateway link", STEP, || {
+        matches!(gui.link(), Link::Up(_)).then_some(())
+    });
+    let defaults = deck_core::config::AgentTools::default();
+    assert!(defaults.watch_session);
+    assert!(!defaults.message_session);
+    // Native schemas are fixed at launch. Enable messaging before either independent process starts.
+    cross_session_settings(&gui, true, true);
+    gui.subscribe(Topic::Orchestration);
+    let a = launch(&gui, &sb, "cross-a", "CROSS-A-OPEN");
+    let b = launch(&gui, &sb, "cross-b", "CROSS-B-OPEN");
+    idle(&gui, &a);
+    idle(&gui, &b);
+    let a_file = session_file(&gui, &a);
+    let b_file = session_file(&gui, &b);
+    let a_ref = cross_session_ref(&a_file);
+    let b_ref = cross_session_ref(&b_file);
+    assert_ne!(a_ref, b_ref);
+    let before = cross_session_controllers(&gui);
+    assert_eq!(
+        before.len(),
+        2,
+        "only independent GUI controllers: {before:?}"
+    );
+    let b_before = before
+        .iter()
+        .find(|info| info.target == b)
+        .expect("B controller");
+    assert_eq!(b_before.views, 0);
+    assert!(!b_before.controlled);
+    assert!(cross_session_orchestration(&gui).watches.is_empty());
+    assert!(
+        !gui.events()
+            .iter()
+            .any(|event| matches!(event, ClientEvent::AgentOpenSession { .. })),
+        "both sessions must come only from GUI Launch(agent_child:false)"
+    );
+
+    prompt(&gui, &a, &format!("CROSS-A-WATCH {b_ref}"));
+    let registered = result(&model, "CROSS-A-WATCH");
+    assert!(registered.contains(&b_ref), "{registered}");
+    assert!(
+        registered.to_lowercase().contains("background"),
+        "{registered}"
+    );
+    idle(&gui, &a);
+    let watch = wait_for("independent next-turn watch projection", TURN, || {
+        let view = cross_session_orchestration(&gui);
+        view.watches
+            .first()
+            .filter(|watch| {
+                view.watches.len() == 1
+                    && watch.watcher.model.is_some()
+                    && watch.watched.model.is_some()
+            })
+            .cloned()
+    });
+    assert_eq!(watch.watcher.target.as_ref(), Some(&a));
+    assert_eq!(watch.watched.target.as_ref(), Some(&b));
+    assert_eq!(watch.watcher.session_path, a_file);
+    assert_eq!(watch.watched.session_path, b_file);
+    assert_eq!(watch.watcher.ref_, a_ref);
+    assert_eq!(watch.watched.ref_, b_ref);
+    assert!(watch.watcher.live && watch.watched.live);
+    assert!(watch.watcher.model.is_some() && watch.watched.model.is_some());
+    assert!(watch.background && watch.next);
+    assert!(watch.since_unix_ms > 0);
+    assert!(
+        !sb.proj().join("cross-watch-acted").exists(),
+        "next:true must not deliver B's initial idle reply"
+    );
+    let watching = cross_session_controllers(&gui);
+    let b_watching = watching
+        .iter()
+        .find(|info| info.target == b)
+        .expect("B remains live");
+    assert_eq!(
+        watching.len(),
+        before.len(),
+        "watch must not create a controller"
+    );
+    assert_eq!(
+        b_watching.views, b_before.views,
+        "watch must not attach a view"
+    );
+    assert_eq!(
+        b_watching.requests.len(),
+        b_before.requests.len(),
+        "watch must not type into B"
+    );
+
+    prompt(&gui, &a, "CROSS-A-LIST");
+    let listed = result(&model, "CROSS-A-LIST");
+    assert!(listed.contains(&format!("ref: {a_ref}")), "{listed}");
+    assert!(listed.contains(&format!("ref: {b_ref}")), "{listed}");
+    assert!(listed.contains(&format!("watching: {b_ref}")), "{listed}");
+    assert!(listed.contains(&format!("watched by: {a_ref}")), "{listed}");
+    idle(&gui, &a);
+    let watch_start = model.count();
+    prompt(&gui, &b, "CROSS-B-TURN");
+    wait_for(
+        "watch Deliver actually starts A's marker-writing turn",
+        TURN,
+        || {
+            let marker = std::fs::read_to_string(sb.proj().join("cross-watch-acted")).ok()?;
+            (marker == "watch-delivery-acted").then_some(())
+        },
+    );
+    let delivered = model
+        .find(watch_start, |req| {
+            fm::has_tools(req)
+                && fm::last_user_text(req).contains("Watch:")
+                && fm::last_user_text(req).contains(CROSS_WATCH_REPLY)
+        })
+        .expect("A model receives the full watch result before acting");
+    let watch_text = fm::last_user_text(&delivered);
+    assert!(
+        watch_text.contains(&format!("Watch: {} ({b_ref})", watch.watched.title)),
+        "{watch_text}"
+    );
+    assert!(watch_text.contains("status: completed"), "{watch_text}");
+    for line in CROSS_WATCH_REPLY.lines() {
+        assert!(watch_text.contains(line), "{watch_text}");
+    }
+    assert!(!watch_text.contains(CROSS_INITIAL_REPLY), "{watch_text}");
+    idle(&gui, &a);
+    idle(&gui, &b);
+    wait_for("completed watch leaves projection", TURN, || {
+        cross_session_orchestration(&gui)
+            .watches
+            .is_empty()
+            .then_some(())
+    });
+
+    let message_start = model.count();
+    prompt(&gui, &b, &format!("CROSS-B-MESSAGE {a_ref}"));
+    let sent = result(&model, "CROSS-B-MESSAGE");
+    assert!(
+        sent.contains("Message delivered to"),
+        "native sender must receive a successful message ACK: {sent}"
+    );
+    let message = wait_for("A receives the actual peer message", TURN, || {
+        model.find(message_start, |req| {
+            fm::has_tools(req)
+                && fm::last_user_text(req).contains("Message from")
+                && fm::last_user_text(req).contains(CROSS_MESSAGE)
+        })
+    });
+    let message_text = fm::last_user_text(&message);
+    assert!(
+        message_text.contains(&format!("Message from {} ({b_ref})", watch.watched.title)),
+        "{message_text}"
+    );
+    assert!(message_text.contains(CROSS_MESSAGE), "{message_text}");
+    assert!(
+        message_text.contains(&format!("Reply with ompdeck_message_session to {b_ref}.")),
+        "{message_text}"
+    );
+    wait_for(
+        &format!(
+            "message Deliver wakes A to write its receipt; input={message_text:?}; prior tool results={:?}",
+            tool_texts(&message)
+        ),
+        TURN,
+        || {
+            let marker = std::fs::read_to_string(sb.proj().join("cross-message-acted")).ok()?;
+            (marker == "message-delivery-acted").then_some(())
+        },
+    );
+    idle(&gui, &a);
+    idle(&gui, &b);
+
+    // B keeps its launch-time schema, but the gateway must use the current settings.
+    cross_session_settings(&gui, true, false);
+    let disabled_start = model.count();
+    prompt(&gui, &b, &format!("CROSS-B-MESSAGE-DISABLED {a_ref}"));
+    let refused = result(&model, "CROSS-B-MESSAGE-DISABLED");
+    assert!(
+        refused.contains("Session messaging is turned off"),
+        "{refused}"
+    );
+    idle(&gui, &b);
+    wait_for(
+        "native disabled tool result persists as an error",
+        TURN,
+        || {
+            session_entries(&b_file).into_iter().find(|entry| {
+                let message = &entry["message"];
+                message["role"] == "toolResult"
+                    && message["toolName"] == "ompdeck_message_session"
+                    && message["isError"] == true
+                    && fm::text(message).contains(&refused)
+            })
+        },
+    );
+    // The extension maps gateway ToolResult.ok=false to the native isError=true above.
+    assert!(
+        model
+            .find(disabled_start, |req| {
+                fm::has_tools(req) && fm::last_user_text(req).contains(CROSS_DISABLED_MESSAGE)
+            })
+            .is_none(),
+        "disabled peer messages must never reach or wake A"
+    );
+
+    for (mark, stopped) in [("CROSS-A-STOP", true), ("CROSS-A-DISABLE", false)] {
+        prompt(&gui, &a, &format!("{mark} {b_ref}"));
+        let registered = result(&model, mark);
+        assert!(registered.contains(&b_ref), "{registered}");
+        idle(&gui, &a);
+        let watch = wait_for("cancellable watch appears in orchestration", TURN, || {
+            let view = cross_session_orchestration(&gui);
+            (view.watches.len() == 1).then(|| view.watches[0].clone())
+        });
+        let after = model.count();
+        let reason = if stopped {
+            run(&gui, Mutation::StopWatch { id: watch.id }).expect("stop watch from orchestration");
+            "Stopped by the user"
+        } else {
+            cross_session_settings(&gui, false, false);
+            "Watching was turned off"
+        };
+        wait_for(
+            "cancelled background watch wakes A with its final reason",
+            TURN,
+            || {
+                model.find(after, |req| {
+                    let text = fm::last_user_text(req);
+                    fm::has_tools(req)
+                        && text.contains("Watch:")
+                        && text.contains(&b_ref)
+                        && text.contains(reason)
+                })
+            },
+        );
+        idle(&gui, &a);
+        wait_for(
+            "cancelled watch disappears from orchestration",
+            TURN,
+            || {
+                cross_session_orchestration(&gui)
+                    .watches
+                    .is_empty()
+                    .then_some(())
+            },
+        );
+    }
+    prompt(&gui, &a, &format!("CROSS-A-WATCH-DISABLED {b_ref}"));
+    let refused = result(&model, "CROSS-A-WATCH-DISABLED");
+    assert!(refused.contains("Watching was turned off"), "{refused}");
+    idle(&gui, &a);
+    wait_for("disabled watch returns native ok:false", TURN, || {
+        session_entries(&a_file).into_iter().find(|entry| {
+            let message = &entry["message"];
+            message["role"] == "toolResult"
+                && message["toolName"] == "ompdeck_watch_session"
+                && message["isError"] == true
+                && fm::text(message).contains("Watching was turned off")
+        })
+    });
+    assert!(cross_session_orchestration(&gui).watches.is_empty());
+    let after = cross_session_controllers(&gui);
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "no watch-created controllers: {after:?}"
+    );
+    let b_after = after
+        .iter()
+        .find(|info| info.target == b)
+        .expect("same B generation");
+    assert_eq!(b_after.session_path, b_before.session_path);
+    assert_eq!(b_after.spawned_unix_ms, b_before.spawned_unix_ms);
+    assert_eq!(b_after.ctl_key, b_before.ctl_key);
+    assert_eq!(
+        serde_json::to_value(&b_after.backend).expect("B backend"),
+        serde_json::to_value(&b_before.backend).expect("original B backend")
+    );
+    assert_eq!(b_after.views, b_before.views);
+    assert_eq!(b_after.controlled, b_before.controlled);
+    assert_eq!(cross_session_ref(&b_file), b_ref);
+    assert!(
+        !gui.events()
+            .iter()
+            .any(|event| matches!(event, ClientEvent::AgentOpenSession { .. })),
+        "cross-session tools must not request GUI opens or opener links"
+    );
+    run(&gui, Mutation::Kill(b)).expect("stop unrelated B");
+    run(&gui, Mutation::Kill(a)).expect("stop unrelated A");
+}
+
 #[test]
 fn real_agent_tools_notify_list_review_and_require_a_window() {
     // Sandbox owns process-wide HOME/XDG variables: keep all scenarios in one test.
@@ -2474,4 +2923,5 @@ fn real_agent_tools_notify_list_review_and_require_a_window() {
     exercise_forwarded_child_questions();
     exercise_worktree_report_progress_and_finish();
     exercise_fan_out_merge_queue_and_checkpoints();
+    exercise_unrelated_session_watch_and_messages();
 }

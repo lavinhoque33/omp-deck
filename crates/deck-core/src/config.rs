@@ -218,6 +218,8 @@ pub struct AgentTools {
     pub finish_worktree: bool,
     pub report: bool,
     pub fan_out: bool,
+    pub watch_session: bool,
+    pub message_session: bool,
 }
 
 impl Default for AgentTools {
@@ -234,6 +236,8 @@ impl Default for AgentTools {
             finish_worktree: true,
             report: true,
             fan_out: true,
+            watch_session: true,
+            message_session: false,
         }
     }
 }
@@ -254,6 +258,8 @@ impl AgentTools {
             (self.finish_worktree, "finish_worktree"),
             (self.report, "report"),
             (self.fan_out, "fan_out"),
+            (self.watch_session, "watch_session"),
+            (self.message_session, "message_session"),
         ] {
             if enabled {
                 if !value.is_empty() {
@@ -1291,21 +1297,23 @@ mod tests {
         let old = load_str(r#"{"notify":{"desktop":false}}"#);
         assert!(old.notify.agent_messages);
         assert!(old.checkpoints);
+        assert!(old.agent_tools.watch_session);
+        assert!(!old.agent_tools.message_session);
         assert_eq!(
             old.agent_tools.env_value().as_deref(),
             Some(
-                "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report,fan_out"
+                "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report,fan_out,watch_session"
             )
         );
         let partial = load_str(r#"{"agent_tools":{"notify":false}}"#);
         assert_eq!(
             partial.agent_tools.env_value().as_deref(),
             Some(
-                "open_session,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report,fan_out"
+                "open_session,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report,fan_out,watch_session"
             )
         );
         let disabled = load_str(
-            r#"{"checkpoints":false,"notify":{"agent_messages":false},"agent_tools":{"open_session":false,"notify":false,"show_changes":false,"request_review":false,"sessions":false,"send_prompt":false,"wait_session":false,"answer_question":false,"finish_worktree":false,"report":false,"fan_out":false}}"#,
+            r#"{"checkpoints":false,"notify":{"agent_messages":false},"agent_tools":{"open_session":false,"notify":false,"show_changes":false,"request_review":false,"sessions":false,"send_prompt":false,"wait_session":false,"answer_question":false,"finish_worktree":false,"report":false,"fan_out":false,"watch_session":false,"message_session":false}}"#,
         );
         assert_eq!(disabled.agent_tools.env_value(), None);
         assert!(!disabled.notify.agent_messages);
@@ -1315,6 +1323,32 @@ mod tests {
         assert_eq!(back.agent_tools, disabled.agent_tools);
         assert!(!back.notify.agent_messages);
         assert!(!back.checkpoints);
+    }
+
+    #[test]
+    fn cross_session_tool_overrides_round_trip_in_protocol_order() {
+        let mut configured =
+            load_str(r#"{"agent_tools":{"watch_session":false,"message_session":true}}"#);
+        assert!(!configured.agent_tools.watch_session);
+        assert!(configured.agent_tools.message_session);
+        assert!(
+            configured
+                .agent_tools
+                .env_value()
+                .unwrap()
+                .ends_with(",fan_out,message_session")
+        );
+        configured.agent_tools.watch_session = true;
+        assert!(
+            configured
+                .agent_tools
+                .env_value()
+                .unwrap()
+                .ends_with(",fan_out,watch_session,message_session")
+        );
+        let back: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
+        assert_eq!(back.agent_tools, configured.agent_tools);
     }
 
     fn load_str(json: &str) -> AppConfig {

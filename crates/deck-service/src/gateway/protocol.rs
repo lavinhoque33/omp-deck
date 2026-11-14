@@ -655,6 +655,31 @@ pub enum TopicValue {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct OrchestrationView {
     pub roots: Vec<OrchNode>,
+    #[serde(default)]
+    pub watches: Vec<OrchWatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchWatch {
+    pub id: String,
+    pub watcher: OrchEnd,
+    pub watched: OrchEnd,
+    pub since_unix_ms: u64,
+    pub background: bool,
+    pub next: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchEnd {
+    pub session_path: PathBuf,
+    pub title: String,
+    pub target: Option<SessionTarget>,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub status: TabStatus,
+    pub live: bool,
+    #[serde(rename = "ref")]
+    pub ref_: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1253,6 +1278,9 @@ pub enum Mutation {
         session: PathBuf,
         seq: u32,
     },
+    StopWatch {
+        id: String,
+    },
     /// Kill and relaunch the session with the same identity request, in `view` (`None`: the
     /// view it runs in now). `Some(other)` is "switch view": the same session file resumed in
     /// the other mode.
@@ -1746,6 +1774,7 @@ impl Mutation {
             Mutation::Launch(_) => "launch",
             Mutation::Restart { .. } => "restart",
             Mutation::Stop(_) => "stop",
+            Mutation::StopWatch { .. } => "stop-watch",
             Mutation::Kill(_) => "kill",
             Mutation::KillNames { .. } => "kill-names",
             Mutation::Close { .. } => "close",
@@ -1883,6 +1912,7 @@ impl Mutation {
                 | Mutation::InboxDismiss(_)
                 | Mutation::InboxClear
                 | Mutation::CancelJob(_)
+                | Mutation::StopWatch { .. }
                 | Mutation::CancelBackupJob
                 | Mutation::OmpLoginCancel { .. }
                 | Mutation::RefreshSessions
@@ -2297,6 +2327,33 @@ pub fn decode_palette(b: &[u8]) -> Option<[[u8; 3]; 19]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_protocol_keeps_legacy_views_and_serializes_session_ref() {
+        let old: OrchestrationView =
+            serde_json::from_value(serde_json::json!({"roots": []})).unwrap();
+        assert!(old.watches.is_empty());
+        let end = OrchEnd {
+            session_path: PathBuf::from("/session.jsonl"),
+            title: "Session".into(),
+            target: None,
+            model: None,
+            thinking: None,
+            status: TabStatus::Idle,
+            live: false,
+            ref_: "1234abcd".into(),
+        };
+        let value = serde_json::to_value(&end).unwrap();
+        assert_eq!(value["ref"], "1234abcd");
+        assert!(value.get("ref_").is_none());
+        let back: OrchEnd = serde_json::from_value(value).unwrap();
+        assert_eq!(back, end);
+        let stop = Mutation::StopWatch {
+            id: "watch-1".into(),
+        };
+        let back: Mutation = serde_json::from_value(serde_json::to_value(stop).unwrap()).unwrap();
+        assert!(matches!(back, Mutation::StopWatch { id } if id == "watch-1"));
+    }
 
     #[test]
     fn secret_text_is_redacted_in_debug_but_serialized_plainly() {

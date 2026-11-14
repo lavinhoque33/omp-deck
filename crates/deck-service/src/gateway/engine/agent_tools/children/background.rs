@@ -58,7 +58,7 @@ enum WatchState {
     Sent,
 }
 impl BackgroundWatch {
-    fn new(id: u64, title: String, mut waiter: Box<Waiter>) -> Self {
+    pub(super) fn new(id: u64, title: String, mut waiter: Box<Waiter>) -> Self {
         waiter.background = false;
         waiter.background_watch = true;
         Self {
@@ -96,10 +96,12 @@ impl BackgroundWatch {
             unreachable!()
         };
         Some(CtlCommand::Deliver {
+            kind: deck_core::ctl::DeliverKind::Wait,
             root: root.to_owned(),
             title: format!("Background wait: {} ({handle})", self.title),
             text: result.text,
             details: Some(serde_json::json!({"handle": handle, "status": result.status})),
+            trigger_turn: true,
         })
     }
 }
@@ -125,6 +127,7 @@ impl super::super::AgentTools {
                 .as_ref()
                 .is_some_and(|watch| watch.id == request)
         }) || self.fan_out.contains(request)
+            || self.cross_sessions.contains(request)
     }
 }
 
@@ -168,6 +171,14 @@ impl Engine {
     pub(super) fn arm_background_wait(&mut self, request: u64, waiter: Box<Waiter>) {
         let handle = waiter.handle.clone();
         let child = &self.agent_tools.children.entries[&handle];
+        if child.background.is_none()
+            && self.cross_background_count(&child.opener_root) >= BACKGROUND_CAP
+        {
+            let key = child.key.clone();
+            self.finish_agent_tool(request, false, "Too many background waits".to_owned());
+            self.release_idle_child_attachment(&key);
+            return;
+        }
         let title = self
             .sess
             .find(&child.key)
@@ -295,6 +306,7 @@ impl Engine {
         target: &SessionTarget,
     ) -> bool {
         self.agent_tools.delivery_pending(target)
+            || self.cross_session_delivery_pending(target, false)
     }
 
     pub(in crate::gateway::engine) fn checkpoint_delivery_awaiting_ack(
@@ -302,6 +314,7 @@ impl Engine {
         target: &SessionTarget,
     ) -> bool {
         self.agent_tools.delivery_awaiting_ack(target)
+            || self.cross_session_delivery_pending(target, true)
     }
 
     pub(in crate::gateway::engine) fn flush_child_deliveries(&mut self) {
@@ -645,6 +658,7 @@ mod tests {
             title,
             text,
             details,
+            ..
         }) = watch.take_command("s-00000001", &child.opener_root, true)
         else {
             panic!("eligible link receives held delivery");

@@ -1,21 +1,23 @@
 //! The Orchestration tab of the agents dashboard: every session that opened sessions of its own
 //! (`ompdeck_open_session` / `ompdeck_fan_out`) as a card, its children hanging off a Branch
-//! Ledger rail. The gateway publishes the tree (`Topic::Orchestration`, followed only while this
-//! tab is on screen); [`OrchState::set_view`] flattens it once per revision, so painting
-//! allocates nothing per frame beyond the galleys.
+//! Ledger rail, and above them a Watches card listing which session watches which
+//! (`ompdeck_watch_session`). The gateway publishes both (`Topic::Orchestration`, followed only
+//! while this tab is on screen); [`OrchState::set_view`] flattens them once per revision, so
+//! painting allocates nothing per frame beyond the galleys.
 //!
 //! The pure parts (flattening, totals, counts) are at the top and unit-tested.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use deck_core::ctl::Progress;
 use deck_service::controller::SessionTarget;
 use deck_service::gateway::protocol::{
-    OrchFinish, OrchNode, OrchReport, OrchWorktree, OrchestrationView,
+    OrchEnd, OrchFinish, OrchNode, OrchReport, OrchWatch, OrchWorktree, OrchestrationView,
 };
 use deck_service::status::TabStatus;
 use deck_service::statusfmt::{fmt_cost, short_model_name};
+use egui::text::LayoutJob;
 use egui::{
     Align, Align2, CursorIcon, Frame, Id, Layout, Margin, Rect, RichText, ScrollArea, Sense,
     Stroke, StrokeKind, Ui, pos2, vec2,
@@ -24,8 +26,9 @@ use egui::{
 use super::DashAction;
 use crate::badge::{Badge, Hue};
 use crate::icons::{
-    ICON_BRAIN, ICON_CIRCLE_STOP, ICON_COLUMNS_2, ICON_CPU, ICON_EXTERNAL_LINK, ICON_FOLDER,
-    ICON_GIT_BRANCH, ICON_GIT_MERGE, ICON_HOURGLASS, ICON_NETWORK, ICON_WORKFLOW, Icon,
+    ICON_BRAIN, ICON_CIRCLE_STOP, ICON_COLUMNS_2, ICON_CPU, ICON_EXTERNAL_LINK, ICON_EYE,
+    ICON_EYE_OFF, ICON_FOLDER, ICON_GIT_BRANCH, ICON_GIT_MERGE, ICON_HOURGLASS, ICON_NETWORK,
+    ICON_WORKFLOW, Icon,
 };
 use crate::model_picker::ModelsCache;
 use crate::progress_view;
@@ -43,6 +46,8 @@ const INDENT: f32 = 22.0;
 const RAIL_DX: f32 = 9.0;
 /// Width of the row hover buttons.
 const BTN: f32 = 24.0;
+/// Room the eye glyph between a watch's two ends takes.
+const EYE_W: f32 = 30.0;
 
 // ------------------------------------------------------------------ pure parts
 
@@ -104,6 +109,8 @@ pub struct Node {
     /// "fan-out <id>" of the fan-out the node belongs to.
     pub fan_out: Option<String>,
     pub cost: Option<f64>,
+    /// Some session watches this one (`ompdeck_watch_session`).
+    pub watched: bool,
 }
 
 impl Node {
@@ -112,13 +119,7 @@ impl Node {
             handle: n.handle.clone(),
             target: n.target.clone(),
             session_path: n.session_path.clone(),
-            title: if n.title.trim().is_empty() {
-                n.session_path
-                    .file_stem()
-                    .map_or_else(String::new, |s| s.to_string_lossy().into_owned())
-            } else {
-                n.title.clone()
-            },
+            title: display_title(&n.title, &n.session_path),
             cwd: n.cwd.clone(),
             status: n.status,
             live: n.live,
@@ -134,6 +135,7 @@ impl Node {
             finish_chip: n.finish.as_ref().map(finish_chip),
             fan_out: n.fan_out.as_ref().map(|f| format!("fan-out {f}")),
             cost: n.cost,
+            watched: false,
         }
     }
 
@@ -176,8 +178,15 @@ pub struct RootCard {
     pub rows: Vec<Row>,
 }
 
-/// Flattens the gateway's tree into cards (roots in the gateway's order, children depth first).
+/// Flattens the gateway's tree into cards (roots in the gateway's order, children depth first);
+/// nodes some watch observes are marked.
 pub fn build(view: &OrchestrationView, short: &impl Fn(&str) -> String) -> Vec<RootCard> {
+    let watched = |n: &mut Node| {
+        n.watched = view
+            .watches
+            .iter()
+            .any(|w| w.watched.session_path == n.session_path);
+    };
     view.roots
         .iter()
         .map(|r| {
@@ -185,20 +194,114 @@ pub fn build(view: &OrchestrationView, short: &impl Fn(&str) -> String) -> Vec<R
             let mut guides = Vec::new();
             flatten(&r.children, 1, &mut guides, &mut rows, short);
             let mut counts = [0; 4];
-            for row in &rows {
+            for row in &mut rows {
                 let i = Bucket::EACH
                     .iter()
                     .position(|b| *b == row.node.bucket)
                     .unwrap_or(0);
                 counts[i] += 1;
+                watched(&mut row.node);
             }
+            let mut root = Node::of(r, short);
+            watched(&mut root);
             RootCard {
-                root: Node::of(r, short),
+                root,
                 total_cost: tree_cost(r),
                 counts,
                 rows,
             }
         })
+        .collect()
+}
+
+/// The session's title, else its file name.
+fn display_title(title: &str, session_path: &Path) -> String {
+    if title.trim().is_empty() {
+        session_path
+            .file_stem()
+            .map_or_else(String::new, |s| s.to_string_lossy().into_owned())
+    } else {
+        title.to_owned()
+    }
+}
+
+/// One end of a watch, the model and thinking already short.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WatchEnd {
+    pub target: Option<SessionTarget>,
+    pub session_path: PathBuf,
+    pub title: String,
+    /// The short ref agents name it by.
+    pub ref_: String,
+    pub status: TabStatus,
+    pub live: bool,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+}
+
+impl WatchEnd {
+    fn of(e: &OrchEnd, short: &impl Fn(&str) -> String) -> WatchEnd {
+        WatchEnd {
+            target: e.target.clone(),
+            session_path: e.session_path.clone(),
+            title: display_title(&e.title, &e.session_path),
+            ref_: e.ref_.clone(),
+            status: e.status,
+            live: e.live,
+            model: e.model.as_deref().map(short),
+            thinking: e.thinking.clone().filter(|t| t != "off"),
+        }
+    }
+
+    fn reference(&self) -> NodeRef {
+        NodeRef {
+            target: self.target.clone(),
+            session: self.session_path.clone(),
+            title: self.title.clone(),
+        }
+    }
+}
+
+/// One watch: which session waits on which, since when and how.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WatchRow {
+    pub id: String,
+    pub watcher: WatchEnd,
+    pub watched: WatchEnd,
+    pub since: SystemTime,
+    /// The watcher goes on working; the result arrives as a message.
+    pub background: bool,
+    /// Waits for the watched session's next turn rather than its current one.
+    pub next: bool,
+}
+
+impl WatchRow {
+    fn of(w: &OrchWatch, short: &impl Fn(&str) -> String) -> WatchRow {
+        WatchRow {
+            id: w.id.clone(),
+            watcher: WatchEnd::of(&w.watcher, short),
+            watched: WatchEnd::of(&w.watched, short),
+            since: SystemTime::UNIX_EPOCH + Duration::from_millis(w.since_unix_ms),
+            background: w.background,
+            next: w.next,
+        }
+    }
+
+    /// The mode badge's text and tone.
+    pub fn mode(&self) -> (&'static str, Hue) {
+        if self.background {
+            ("Background", Hue::Blue)
+        } else {
+            ("Waiting", Hue::Amber)
+        }
+    }
+}
+
+/// The gateway's watches in its order.
+pub fn watch_rows(view: &OrchestrationView, short: &impl Fn(&str) -> String) -> Vec<WatchRow> {
+    view.watches
+        .iter()
+        .map(|w| WatchRow::of(w, short))
         .collect()
 }
 
@@ -259,7 +362,7 @@ fn report_hue(kind: &str) -> Hue {
 
 // ------------------------------------------------------------------ state
 
-/// What the tab remembers: the flattened tree of the last revision read.
+/// What the tab remembers: the flattened tree and the watches of the last revision read.
 #[derive(Default)]
 pub struct OrchState {
     /// This window follows `Topic::Orchestration`.
@@ -267,6 +370,7 @@ pub struct OrchState {
     /// Topic revision the cards were built from (0: nothing yet).
     pub rev: u64,
     pub cards: Vec<RootCard>,
+    pub watches: Vec<WatchRow>,
 }
 
 impl OrchState {
@@ -278,6 +382,7 @@ impl OrchState {
             )
         };
         self.cards = build(view, &short);
+        self.watches = watch_rows(view, &short);
         self.rev = rev;
     }
 
@@ -286,6 +391,7 @@ impl OrchState {
         self.subscribed = false;
         self.rev = 0;
         self.cards.clear();
+        self.watches.clear();
     }
 }
 
@@ -309,6 +415,12 @@ pub enum OrchAction {
     Stop(NodeRef),
     /// Stop every live child of a card (asks first, listing them).
     StopAll(Vec<NodeRef>),
+    /// End a watch; the watcher gets "Stopped by the user".
+    StopWatch {
+        id: String,
+        /// The watched session's title, for an error toast.
+        title: String,
+    },
 }
 
 // ------------------------------------------------------------------ view
@@ -323,13 +435,13 @@ pub fn show(ui: &mut Ui, st: &OrchState, out: &mut Vec<DashAction>) {
         });
         return;
     }
-    if st.cards.is_empty() {
+    if st.cards.is_empty() && st.watches.is_empty() {
         empty_state(
             ui,
             ICON_WORKFLOW,
             pal.accent,
             "No orchestrated sessions",
-            "When an agent opens sessions of its own — ompdeck_open_session for one, ompdeck_fan_out for up to 8 in parallel worktrees — they show here as a tree under the session that opened them, with their progress, reports, finish state and cost.",
+            "When an agent opens sessions of its own — ompdeck_open_session for one, ompdeck_fan_out for up to 8 in parallel worktrees — they show here as a tree under the session that opened them, with their progress, reports, finish state and cost. Sessions watching another session (ompdeck_watch_session) are listed here too.",
         );
         return;
     }
@@ -339,6 +451,9 @@ pub fn show(ui: &mut Ui, st: &OrchState, out: &mut Vec<DashAction>) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 12.0;
+            if !st.watches.is_empty() {
+                watches_card(ui, &st.watches, now, out);
+            }
             for (i, card) in st.cards.iter().enumerate() {
                 root_card(ui, i, card, now, out);
             }
@@ -413,6 +528,10 @@ fn card_header(ui: &mut Ui, card: &RootCard, out: &mut Vec<DashAction>) -> Rect 
             out.push(DashAction::Orch(OrchAction::Open(root.reference())));
         }
         model_badges(ui, root);
+        if root.watched {
+            crate::badge::show(ui, Some(ICON_EYE), "watched", Hue::Orange, 11.0)
+                .on_hover_text("Another session is watching this one");
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let live = |r: &&Row| r.node.live;
             if DraftButton::new("Stop all children…")
@@ -510,29 +629,11 @@ fn child_row(
         p.vline(rail_x, rect.top()..=rect.bottom(), Stroke::new(1.0, rail));
         p.hline(rail_x..=box_x - 2.0, stub_y, Stroke::new(1.0, rail));
     }
-    // The row box: the outline pops on hover.
     let body = Rect::from_min_max(
         pos2(box_x, rect.top() + 1.0),
         pos2(rect.right(), rect.bottom() - 1.0),
     );
-    let hov = ui
-        .ctx()
-        .animate_bool_with_time(id.with("hov"), hovered, 0.1);
-    let r = theme::ui_rad(7);
-    p.rect_filled(
-        body,
-        r,
-        theme::hover_fill(pal).gamma_multiply(0.25 + 0.6 * hov),
-    );
-    p.rect_stroke(
-        body,
-        r,
-        Stroke::new(
-            1.0,
-            theme::mix(theme::mix(pal.stroke, pal.weak, 0.25), pal.accent, hov),
-        ),
-        StrokeKind::Inside,
-    );
+    paint_row_box(ui, id, body, hovered);
     paint_status(ui, pos2(body.left() + 13.0, stub_y), 13.0, n.status);
     let p = ui.painter();
     // Right side first: cost, progress (they keep their room; the title is cut).
@@ -590,6 +691,9 @@ fn child_row(
     if let Some(f) = &n.fan_out {
         badge(ICON_NETWORK, f, Hue::Blue);
     }
+    if n.watched {
+        badge(ICON_EYE, "watched", Hue::Orange);
+    }
     // The last report: kind badge, text, age.
     if let Some(rep) = &n.report {
         let ry = rect.top() + ROW_H + REPORT_H / 2.0 - 4.0;
@@ -632,6 +736,228 @@ fn child_row(
         out.push(DashAction::Orch(OrchAction::Open(n.reference())));
     }
     row_menu(&resp, n, out);
+}
+
+/// The row box: the outline pops on hover.
+fn paint_row_box(ui: &Ui, id: Id, body: Rect, hovered: bool) {
+    let pal = Palette::of_ui(ui);
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(id.with("hov"), hovered, 0.1);
+    let p = ui.painter();
+    let r = theme::ui_rad(7);
+    p.rect_filled(
+        body,
+        r,
+        theme::hover_fill(pal).gamma_multiply(0.25 + 0.6 * hov),
+    );
+    p.rect_stroke(
+        body,
+        r,
+        Stroke::new(
+            1.0,
+            theme::mix(theme::mix(pal.stroke, pal.weak, 0.25), pal.accent, hov),
+        ),
+        StrokeKind::Inside,
+    );
+}
+
+/// Which session watches which (`ompdeck_watch_session`), above the trees.
+fn watches_card(ui: &mut Ui, watches: &[WatchRow], now: SystemTime, out: &mut Vec<DashAction>) {
+    let pal = Palette::of_ui(ui);
+    Frame::NONE
+        .fill(pal.surface)
+        .stroke(Stroke::new(1.0, theme::mix(pal.stroke, pal.weak, 0.35)))
+        .corner_radius(theme::ui_rad(10))
+        .inner_margin(Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(icon_text(ICON_EYE, 15.0, pal.accent));
+                ui.label(theme::strong("Watches").size(14.5).color(pal.text_strong));
+                ui.label(
+                    RichText::new("Sessions waiting on another session's turn")
+                        .size(11.5)
+                        .color(pal.weak),
+                );
+            });
+            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for w in watches {
+                watch_row(ui, w, now, out);
+            }
+        });
+}
+
+/// One watch: watcher (title + model/thinking) → eye → watched (status marker, title +
+/// model/thinking); since and Background/Waiting on the right. Hover shows the actions the
+/// context menu offers too.
+fn watch_row(ui: &mut Ui, w: &WatchRow, now: SystemTime, out: &mut Vec<DashAction>) {
+    let pal = Palette::of_ui(ui);
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
+    let hovered = resp.hovered() || ui.rect_contains_pointer(rect);
+    if !ui.is_rect_visible(rect) {
+        watch_menu(&resp, w, out);
+        return;
+    }
+    let body = rect.shrink2(vec2(0.0, 1.0));
+    paint_row_box(ui, Id::unique(("orch-watch", w.id.as_str())), body, hovered);
+    let cy = body.center().y;
+    // Right side first: the hover buttons, then the mode badge and the age, which stay visible
+    // while the buttons show (the ends are cut instead).
+    let mut right = if hovered {
+        watch_buttons(ui, body, cy, w, out) - 4.0
+    } else {
+        body.right() - 8.0
+    };
+    let p = ui.painter();
+    let (mode, hue) = w.mode();
+    let icon = (!w.background).then_some(ICON_HOURGLASS);
+    let b = Badge::single(p, icon, mode, hue.color(pal), 10.5);
+    right -= b.width();
+    b.paint_at(p, right, cy);
+    right -= 8.0;
+    let age = p.layout_no_wrap(format_age(now, w.since), theme::label_font(10.5), pal.weak);
+    right -= age.size().x;
+    p.galley(pos2(right, cy - age.size().y / 2.0), age, pal.weak);
+    right -= 10.0;
+    let left = body.left() + 10.0;
+    let half = ((right - left - EYE_W) / 2.0).max(0.0);
+    paint_end(ui, &w.watcher, left, half, cy, false);
+    paint_icon(
+        ui.painter(),
+        pos2(left + half + EYE_W / 2.0, cy),
+        Align2::CENTER_CENTER,
+        ICON_EYE,
+        14.0,
+        pal.accent,
+    );
+    paint_end(ui, &w.watched, left + half + EYE_W, half, cy, true);
+    // Built only while the tooltip shows.
+    let resp = resp.on_hover_ui(|ui| watch_tip(ui, w));
+    if resp.double_clicked() {
+        out.push(DashAction::Orch(OrchAction::Open(w.watched.reference())));
+    }
+    watch_menu(&resp, w, out);
+}
+
+/// One end of a watch inside `[x, x + w]`: the watched end's status marker, the title (cut to
+/// leave the model/thinking their room) and the model/thinking badges.
+fn paint_end(ui: &Ui, e: &WatchEnd, mut x: f32, w: f32, cy: f32, marker: bool) {
+    let pal = Palette::of_ui(ui);
+    let end = x + w;
+    if marker {
+        paint_status(ui, pos2(x + 6.0, cy), 12.0, e.status);
+        x += 18.0;
+    }
+    let p = ui.painter().with_clip_rect(Rect::from_min_max(
+        pos2(x, cy - ROW_H / 2.0),
+        pos2(end, cy + ROW_H / 2.0),
+    ));
+    let model = e
+        .model
+        .as_deref()
+        .map(|m| Badge::single(&p, Some(ICON_CPU), m, Hue::Violet.color(pal), 10.5));
+    let thinking = e
+        .thinking
+        .as_deref()
+        .map(|t| Badge::single(&p, Some(ICON_BRAIN), t, Hue::Rose.color(pal), 10.5));
+    let badges = model.iter().chain(thinking.iter());
+    let badges_w: f32 = badges.clone().map(|b| b.width() + 5.0).sum();
+    let color = if e.live { pal.text_strong } else { pal.weak };
+    // The title keeps at least half the room; badges past the end are clipped.
+    let room = end - x;
+    let mut job = LayoutJob::simple_singleline(e.title.clone(), theme::font(12.5), color);
+    job.wrap.max_width = (room - 8.0 - badges_w).max(room * 0.5).max(8.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    let title = p.layout_job(job);
+    let tw = title.size().x;
+    p.galley(pos2(x, cy - title.size().y / 2.0), title, color);
+    x += tw + 8.0;
+    for b in badges {
+        b.paint_at(&p, x, cy);
+        x += b.width() + 5.0;
+    }
+}
+
+/// The watch row's hover buttons; returns the x left of them.
+fn watch_buttons(ui: &mut Ui, body: Rect, cy: f32, w: &WatchRow, out: &mut Vec<DashAction>) -> f32 {
+    let mut right = body.right() - 6.0;
+    let mut place = |ui: &mut Ui, icon: Icon, tip: &str, danger: bool| -> bool {
+        let r = Rect::from_center_size(pos2(right - BTN / 2.0, cy), vec2(BTN, BTN));
+        right -= BTN + 3.0;
+        row_button(ui, r, icon, tip, true, danger)
+    };
+    if place(ui, ICON_EYE_OFF, STOP_WATCH_TIP, true) {
+        out.push(stop_watch(w));
+    }
+    if place(ui, ICON_EYE, "Open watched", false) {
+        out.push(DashAction::Orch(OrchAction::Open(w.watched.reference())));
+    }
+    if place(ui, ICON_EXTERNAL_LINK, "Open watcher", false) {
+        out.push(DashAction::Orch(OrchAction::Open(w.watcher.reference())));
+    }
+    right - 4.0
+}
+
+const STOP_WATCH_TIP: &str = "Stop watching: the watcher gets “Stopped by the user”";
+
+fn stop_watch(w: &WatchRow) -> DashAction {
+    DashAction::Orch(OrchAction::StopWatch {
+        id: w.id.clone(),
+        title: w.watched.title.clone(),
+    })
+}
+
+/// The same actions as the watch row's hover buttons.
+fn watch_menu(resp: &egui::Response, w: &WatchRow, out: &mut Vec<DashAction>) {
+    theme::context_menu(resp, 230.0, |ui| {
+        if menu_item(ui, ICON_EXTERNAL_LINK, "Open watcher", None, true, false).clicked() {
+            out.push(DashAction::Orch(OrchAction::Open(w.watcher.reference())));
+            ui.close();
+        }
+        if menu_item(ui, ICON_EYE, "Open watched", None, true, false).clicked() {
+            out.push(DashAction::Orch(OrchAction::Open(w.watched.reference())));
+            ui.close();
+        }
+        ui.separator();
+        if menu_item(ui, ICON_EYE_OFF, "Stop watching", None, true, true)
+            .on_hover_text(STOP_WATCH_TIP)
+            .clicked()
+        {
+            out.push(stop_watch(w));
+            ui.close();
+        }
+    });
+}
+
+/// Who watches whom (with the refs agents use), until when and how.
+fn watch_tip(ui: &mut Ui, w: &WatchRow) {
+    let pal = Palette::of_ui(ui);
+    let end = |ui: &mut Ui, key: &str, e: &WatchEnd| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(key).color(pal.weak));
+            ui.label(RichText::new(e.title.as_str()).color(pal.text_strong));
+            crate::badge::show(ui, None, &e.ref_, Hue::Blue, 10.5);
+        });
+    };
+    end(ui, "Watcher", &w.watcher);
+    end(ui, "Watched", &w.watched);
+    ui.label(if w.next {
+        "Until the watched session's next turn ends"
+    } else {
+        "Until the watched session's current turn ends"
+    });
+    ui.label(if w.background {
+        "Background: the watcher keeps working and gets the result as a message"
+    } else {
+        "Waiting: the watcher's turn is blocked until then"
+    });
 }
 
 /// The row's hover buttons (right-aligned, vertically centred on the title line); returns the
@@ -802,7 +1128,7 @@ mod tests {
             vec![node("a1", None, vec![]), node("a2", None, vec![])],
         );
         let root = node("root", None, vec![a, node("b", None, vec![])]);
-        let cards = build(&OrchestrationView { roots: vec![root] }, &short);
+        let cards = build(&view(vec![root], vec![]), &short);
         let rows: Vec<(&str, usize, bool, Vec<bool>)> = cards[0]
             .rows
             .iter()
@@ -831,7 +1157,7 @@ mod tests {
         let mut asks = node("asks", Some(1.0), vec![]);
         asks.status = TabStatus::Attention;
         let root = node("root", Some(2.0), vec![busy, gone, asks]);
-        let cards = build(&OrchestrationView { roots: vec![root] }, &short);
+        let cards = build(&view(vec![root], vec![]), &short);
         assert_eq!(cards[0].total_cost, Some(3.75));
         // need you, working, idle (deep), ended.
         assert_eq!(cards[0].counts, [1, 1, 1, 1]);
@@ -856,5 +1182,62 @@ mod tests {
             finish_chip(&OrchFinish::Queued { ahead: 2 }).0,
             "Queued (2 ahead)"
         );
+    }
+
+    fn view(roots: Vec<OrchNode>, watches: Vec<OrchWatch>) -> OrchestrationView {
+        OrchestrationView { roots, watches }
+    }
+
+    fn end(title: &str, ref_: &str) -> OrchEnd {
+        OrchEnd {
+            session_path: PathBuf::from(format!("/s/{title}.jsonl")),
+            title: title.to_owned(),
+            target: None,
+            model: Some("openai/gpt-y".into()),
+            thinking: Some("off".into()),
+            status: TabStatus::Busy,
+            live: true,
+            ref_: ref_.to_owned(),
+        }
+    }
+
+    #[test]
+    fn watches_become_rows_and_mark_the_watched_tree_nodes() {
+        let root = node(
+            "root",
+            None,
+            vec![node("a", None, vec![]), node("b", None, vec![])],
+        );
+        let watch = OrchWatch {
+            id: "w1".into(),
+            watcher: end("other", "1234abcd"),
+            watched: end("a", "deadbeef"),
+            since_unix_ms: 1_000,
+            background: true,
+            next: false,
+        };
+        let v = view(vec![root], vec![watch]);
+        let cards = build(&v, &short);
+        let marked: Vec<(&str, bool)> = std::iter::once(&cards[0].root)
+            .chain(cards[0].rows.iter().map(|r| &r.node))
+            .map(|n| (n.title.as_str(), n.watched))
+            .collect();
+        assert_eq!(marked, vec![("root", false), ("a", true), ("b", false)]);
+        let rows = watch_rows(&v, &short);
+        assert_eq!(rows.len(), 1);
+        let w = &rows[0];
+        assert_eq!(
+            (w.watcher.title.as_str(), w.watched.ref_.as_str()),
+            ("other", "deadbeef")
+        );
+        assert_eq!(w.watched.model.as_deref(), Some("gpt-y"));
+        assert_eq!(w.watched.thinking, None, "\"off\" thinking is not shown");
+        assert_eq!(w.since, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        assert_eq!(w.mode().0, "Background");
+        let waiting = WatchRow {
+            background: false,
+            ..w.clone()
+        };
+        assert_eq!(waiting.mode().0, "Waiting");
     }
 }

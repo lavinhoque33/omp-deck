@@ -1078,12 +1078,14 @@ impl Engine {
                 child.questions.take_question(child.file.as_deref())
             } {
                 let command = CtlCommand::Deliver {
+                    kind: deck_core::ctl::DeliverKind::Wait,
                     root: root.clone(),
                     title: title.clone(),
                     text: render(&ui, &token, false),
                     details: Some(
                         json!({"handle": handle, "question": token, "kind": kind_name(ui.kind)}),
                     ),
+                    trigger_turn: true,
                 };
                 self.deliver_child_message(index, command);
             }

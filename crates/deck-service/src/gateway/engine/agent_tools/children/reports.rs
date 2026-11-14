@@ -236,10 +236,12 @@ impl Engine {
                 .map(|i| self.sess.managed[i].display_label())
                 .unwrap_or_else(|| child.attach.label.clone());
             let command = CtlCommand::Deliver {
+                kind: deck_core::ctl::DeliverKind::Wait,
                 root: child.opener_root.clone(),
                 title: format!("Report from {title} ({})", report.handle),
                 text: report.text.clone(),
                 details: Some(serde_json::json!({"handle": report.handle, "report": true})),
+                trigger_turn: true,
             };
             let target = session.ctl.target().clone();
             let opener_title = session.display_label();

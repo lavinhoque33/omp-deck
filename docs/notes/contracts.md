@@ -5162,3 +5162,70 @@ No phone/protocol change in this wave (deck-remote/pwa untouched).
 - Gates: `deck-core/tests/agent_tools_live.rs` (checkpoint ref before a write with the real index unchanged; fan_out
   visible), `deck-service/tests/agent_tools_live.rs` (fan-out of worktree children → one combined message; two
   finishes serialized through the queue with the second shown queued; checkpoint restore).
+
+## Cross-session watch + messages (user, 2026-11-14)
+Two independently running sessions (no opener/child link) can observe and talk to each other. User decisions: session
+messages default **off**; watching default **on** and shown in the Orchestration tab; every OmpDeck agent tool has its
+own Settings toggle.
+
+- **Session refs**: every `ompdeck_sessions` row gains `ref: <LAST 8 hex of the session id>` (omp ids are UUIDv7: the
+  first hex digits are a millisecond timestamp, so sessions started within ~65 s share their first 8 — the tail is
+  random). Stable across `/move`, restarts, renames. Tools taking `session` accept a ref (8-hex suffix), the full id, or
+  a unique id prefix of ≥ 8 hex (a pasted id); resolution over managed + scanned sessions; ambiguous / unknown → tool
+  error listing the candidates. Child handles (`s-…`) keep working where they did. Rows also show
+  `watching: <refs>` / `watched by: <refs>` when present.
+- **`ompdeck_watch_session`** (`AgentTools.watch_session`, default **true**; short name `watch_session`):
+  `{ session: ref, next?: bool = false, background?: bool = false, timeout_seconds? }` (timeouts as wait_session: 1..3600,
+  default 600; background 1..86400, none by default). Read-only: never attaches a terminal/controller to the watched
+  session, never types, never changes it. Semantics: watched busy → until its current turn ends; idle and `next` false →
+  returns its last reply at once (state + reply); `next` true → waits for the next turn to start and end. Ends early on
+  attention (returns the pending question's title) / exit / timeout, like wait_session. Result = title, ref, status,
+  final reply (same capped renderer as wait_session). `background: true` returns at once and delivers the result later as
+  `Deliver` titled `Watch: <title> (<ref>) …` (triggers a turn), counting toward the per-opener background cap (8).
+  Refused: watching itself; a session that is not an OmpDeck/omp session file. Gateway re-checks the CURRENT toggle at
+  call time (a toggle switched off mid-session refuses new calls; in-flight background watches end with "Watching was
+  turned off" on the next step).
+- **`ompdeck_message_session`** (`AgentTools.message_session`, default **false**; short name `message_session`):
+  `{ session: ref, text: 1..8 KiB, wake?: bool = true }`. Delivered to the target's live-control link as `Deliver`
+  (`title: "Message from <sender title> (<sender ref>)"`, body = text + one line "Reply with ompdeck_message_session to
+  <sender ref>."; `CtlCommand::Deliver.trigger_turn` (serde default true): `wake: true` → omp `deliverAs: "aside"` (starts
+  a turn when idle); `wake: false` → `deliverAs: "nextTurn"`, `triggerTurn: false` (held until the target's next turn —
+  omp's aside starts idle turns regardless of `triggerTurn`, agent-session.ts:9733–9768); older extensions advertise
+  `deliver` but ignore `triggerTurn: false`, so the extension's hello adds the capability `deliver_no_wake` and the
+  gateway refuses `wake: false` to a target without it ("That session can't hold a message without waking; restart it
+  to update OmpDeck's extension"); `wake: true` works with every `deliver` target); ACK required, same retention/ack rules as background deliveries; target without
+  live control or without the `deliver` feature → tool error "That session can't receive messages". Refused: messaging
+  itself. Rate limit per (sender, target): 1 / 10 s, burst 3. Re-checks the current toggle at send time. Never types into
+  the composer (no draft clobbering). The extension accepts `deliver` from any authenticated, root-fenced ctl client
+  (a snapshots-only client included — subscribing with `tools: true` would steal the recipient's tool requests);
+  `tool_result`/`tool_cancel` stay tools-client only. Not an auth widening: any ctl client may already select tools.
+- **Orchestration view**: `OrchestrationView.watches: Vec<OrchWatch { id: String, watcher: OrchEnd, watched: OrchEnd,
+  since_unix_ms: u64, background: bool, next: bool }>` with `OrchEnd { session_path, title, target: Option<SessionTarget>,
+  model: Option<String>, thinking: Option<String>, status: TabStatus, live: bool, ref_: String }` (serde name `ref`).
+  Not persisted (like background waits). `Mutation::StopWatch { id }` ends a watch; the watcher gets the result
+  "Stopped by the user" (blocking call returns that text; background delivers it).
+- **UI**: Orchestration tab gains a **Watches** card above the trees (only when ≥ 1): one row per watch, watcher (title
+  + model/thinking) → eye glyph → watched (title + model/thinking + status marker), since, Background/Waiting badge;
+  row hover buttons + context menu: Open watcher, Open watched, Stop watching. Tree nodes that are watched get a small
+  `watched` chip. Settings → General → Agent tools lists every tool incl. "Let agents watch any session" (on) and
+  "Let sessions message each other" (off), each with a one-line explanation; the message toggle's explanation states that
+  it lets one session's agent start turns in another.
+
+### As built (2026-11-14)
+- Gateway: `deck-service` `agent_tools/children/cross_sessions.rs` (refs, resolver, watches, messages, view endpoints);
+  watches share the background cap (8 per opener root) and end on watcher exit / gateway stop / toggle off; ctl clients
+  of finished watches and messages are retired off the actor. Missing first jsonl (omp writes it at the first turn's
+  end) = empty baseline; exit before any file completes the watch. The baseline read returns offset, active-turn state
+  and missing flag together (no second probe, no stale-snapshot override).
+- Turn attribution: `deck_core::status::TurnWatch::any_turn(path, from)` (any turn, incl. delivery-started turns, which
+  begin with a `custom_message` and count only once assistant output follows) and `TurnWatch::next_turn(path, from,
+  first_start_pending)` (skips the known current turn without resetting the cursor); `TurnWatch::new` (wait_session's
+  exact-prompt attribution) unchanged.
+- `CtlCommand::Deliver.kind: DeliverKind { Wait (default), Watch, Message }` → customType `ompdeck-wait` /
+  `ompdeck-watch` / `ompdeck-message` (the chat shows it as the block label). Delivery titles are capped at 200 chars
+  (char-safe) in every envelope.
+- `ompdeck_sessions` rows print the model plainly (no `Some(…)`); refs verified distinct for UUIDv7 ids created within
+  the same second.
+- Smoke (`~/omp-deck-tools-smoke/94*`, `95`, `96*`): two GUI-opened sessions, A background-watches B → Watches card
+  (Background badge, hover buttons) → B's turn ends → A gets "Watch: Worker B (2a62879c) completed" and acts; Stop watching
+  → "Stopped by the user"; B messages A → A wakes with "Message from Worker B (2a62879c)"; Settings shows 13 tool toggles.

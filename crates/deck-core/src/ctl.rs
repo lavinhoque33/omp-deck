@@ -669,6 +669,30 @@ pub struct ContextBreakdown {
     pub computed_at_ms: i64,
 }
 
+fn default_trigger_turn() -> bool {
+    true
+}
+
+/// Presentation label for a delivered custom message; omitted kinds retain the wait label.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliverKind {
+    #[default]
+    Wait,
+    Watch,
+    Message,
+}
+
+impl DeliverKind {
+    fn custom_type(self) -> &'static str {
+        match self {
+            Self::Wait => "ompdeck-wait",
+            Self::Watch => "ompdeck-watch",
+            Self::Message => "ompdeck-message",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CtlCommand {
     /// Select pushed feeds for this connection. Remembered and re-sent after reconnect.
@@ -683,13 +707,19 @@ pub enum CtlCommand {
         text: String,
         details: Option<serde_json::Value>,
     },
-    /// Inject a main-session custom message at the next step boundary, or start a turn if idle.
-    /// Accepted only on a connection subscribed to tools; optional `details` must be an object.
+    /// Inject a main-session custom message at a step boundary, or start a turn if idle.
+    /// With `trigger_turn: false`, retain it for the next user-started turn without waking.
+    /// Accepted on any authenticated, root-fenced connection; `details` must be an object.
     Deliver {
         root: PathBuf,
         title: String,
         text: String,
         details: Option<serde_json::Value>,
+        #[serde(default)]
+        kind: DeliverKind,
+        /// Start a turn when idle; false queues the message for the next user-started turn.
+        #[serde(default = "default_trigger_turn")]
+        trigger_turn: bool,
     },
     Kill {
         id: String,
@@ -1301,10 +1331,15 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
             title,
             text,
             details,
+            trigger_turn,
+            kind,
         } => {
-            let mut value = serde_json::json!({"rid": rid, "t": "deliver", "root": root, "title": title, "text": text});
+            let mut value = serde_json::json!({"rid": rid, "t": "deliver", "root": root, "title": title, "text": text, "customType": kind.custom_type()});
             if let Some(details) = details {
                 value["details"] = details.clone();
+            }
+            if !trigger_turn {
+                value["triggerTurn"] = serde_json::json!(false);
             }
             value
         }
@@ -1495,6 +1530,8 @@ impl CtlClient {
     }
 
     /// Features advertised by the connected extension; empty while offline.
+    /// `deliver_no_wake` is required before sending `Deliver { trigger_turn: false, .. }`;
+    /// legacy `deliver` alone only guarantees waking delivery.
     pub fn features(&self) -> Vec<String> {
         lock(&self.shared.features).clone()
     }
@@ -1832,6 +1869,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_deliver_commands_still_start_a_turn_by_default() {
+        let command: CtlCommand = serde_json::from_value(serde_json::json!({
+            "Deliver": {"root":"/s/opener.jsonl","title":"Background","text":"Done","details":null}
+        }))
+        .unwrap();
+        assert!(matches!(
+            command,
+            CtlCommand::Deliver {
+                trigger_turn: true,
+                kind: DeliverKind::Wait,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn dropping_a_disconnected_client_wakes_maximum_reconnect_backoff() {
         let temp = tempfile::tempdir().unwrap();
         let shared = Arc::new(Shared::default());
@@ -2055,10 +2108,16 @@ mod tests {
         };
         let mut hello = false;
         assert!(worker.line(
-            br#"{"t":"hello","v":1,"features":["tools"],"tools":["ompdeck_wait_session"]}"#,
+            br#"{"t":"hello","v":1,"features":["tools","deliver","deliver_no_wake"],"tools":["ompdeck_wait_session"]}"#,
             &mut hello
         ));
         assert_eq!(client.tools(), ["ompdeck_wait_session"]);
+        assert!(
+            client
+                .features()
+                .iter()
+                .any(|feature| feature == "deliver_no_wake")
+        );
         assert!(worker.line(
             br#"{"t":"tool","id":1,"name":"notify","args":{"title":"old"},"root":null}"#,
             &mut hello,
@@ -2069,9 +2128,19 @@ mod tests {
         worker.reset();
         assert!(!client.connected());
         assert!(client.tools().is_empty());
+        assert!(client.features().is_empty());
         assert!(client.take_tool_requests().is_empty());
         hello = false;
-        assert!(worker.line(br#"{"t":"hello","v":1,"features":["tools"]}"#, &mut hello));
+        assert!(worker.line(
+            br#"{"t":"hello","v":1,"features":["tools","deliver"]}"#,
+            &mut hello
+        ));
+        assert!(
+            !client
+                .features()
+                .iter()
+                .any(|feature| feature == "deliver_no_wake")
+        );
         assert!(
             client.tools().is_empty(),
             "older extensions have no tool names"
@@ -2121,21 +2190,36 @@ mod tests {
             ),
             (
                 CtlCommand::Deliver {
+                    kind: DeliverKind::Wait,
                     root: "/s/opener.jsonl".into(),
                     title: "Background wait: child".into(),
                     text: "Finished".into(),
                     details: None,
+                    trigger_turn: true,
                 },
-                serde_json::json!({"rid":7,"t":"deliver","root":"/s/opener.jsonl","title":"Background wait: child","text":"Finished"}),
+                serde_json::json!({"rid":7,"t":"deliver","root":"/s/opener.jsonl","title":"Background wait: child","text":"Finished","customType":"ompdeck-wait"}),
             ),
             (
                 CtlCommand::Deliver {
+                    kind: DeliverKind::Watch,
                     root: "/s/opener.jsonl".into(),
                     title: "Child".into(),
                     text: "Reply".into(),
                     details: Some(serde_json::json!({"session":"s-1234abcd"})),
+                    trigger_turn: true,
                 },
-                serde_json::json!({"rid":7,"t":"deliver","root":"/s/opener.jsonl","title":"Child","text":"Reply","details":{"session":"s-1234abcd"}}),
+                serde_json::json!({"rid":7,"t":"deliver","root":"/s/opener.jsonl","title":"Child","text":"Reply","details":{"session":"s-1234abcd"},"customType":"ompdeck-watch"}),
+            ),
+            (
+                CtlCommand::Deliver {
+                    kind: DeliverKind::Message,
+                    root: "/s/opener.jsonl".into(),
+                    title: "Peer message".into(),
+                    text: "Read this later".into(),
+                    details: None,
+                    trigger_turn: false,
+                },
+                serde_json::json!({"rid":7,"t":"deliver","root":"/s/opener.jsonl","title":"Peer message","text":"Read this later","triggerTurn":false,"customType":"ompdeck-message"}),
             ),
             (
                 CtlCommand::AnswerUi {

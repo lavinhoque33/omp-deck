@@ -673,6 +673,7 @@ impl Engine {
                 .into_iter()
                 .map(|path| self.orchestration_node(&path, None, &mut HashSet::new()))
                 .collect(),
+            watches: self.cross_session_watches(),
         }
     }
     fn orchestration_node(
@@ -784,6 +785,35 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_rows_participate_in_orchestration_publication() {
+        let mut state = State::default();
+        let mut view = OrchestrationView::default();
+        assert!(state.view_changed(view.clone()));
+        let end = crate::gateway::protocol::OrchEnd {
+            session_path: PathBuf::from("/session.jsonl"),
+            title: "Session".into(),
+            target: None,
+            model: None,
+            thinking: None,
+            status: TabStatus::Idle,
+            live: false,
+            ref_: "1234abcd".into(),
+        };
+        view.watches.push(crate::gateway::protocol::OrchWatch {
+            id: "watch-1".into(),
+            watcher: end.clone(),
+            watched: end,
+            since_unix_ms: 1,
+            background: true,
+            next: true,
+        });
+        assert!(state.view_changed(view.clone()));
+        assert!(!state.view_changed(view.clone()));
+        view.watches.clear();
+        assert!(state.view_changed(view));
+    }
 
     fn node(path: &str) -> OrchNode {
         OrchNode {

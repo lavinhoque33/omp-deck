@@ -514,6 +514,7 @@ impl Engine {
                                 self.deliver_child_message(
                                     index,
                                     CtlCommand::Deliver {
+                                        kind: deck_core::ctl::DeliverKind::Wait,
                                         root: group.root.clone(),
                                         title: format!(
                                             "Fan-out {id}: {} needs your attention",
@@ -521,6 +522,7 @@ impl Engine {
                                         ),
                                         text: String::new(),
                                         details: None,
+                                        trigger_turn: true,
                                     },
                                 );
                                 entry.attention = true;
@@ -647,6 +649,7 @@ impl Engine {
                 self.deliver_child_message(
                     index,
                     CtlCommand::Deliver {
+                        kind: deck_core::ctl::DeliverKind::Wait,
                         root: group.root.clone(),
                         title: format!(
                             "Fan-out {id} finished ({done}/{} done)",
@@ -654,6 +657,7 @@ impl Engine {
                         ),
                         text,
                         details: Some(serde_json::json!({"fan_out":id})),
+                        trigger_turn: true,
                     },
                 );
                 for e in &group.entries {

@@ -1501,6 +1501,13 @@ impl Engine {
                 });
                 self.finish_journal(&key, Outcome::Done(Box::new(Done::Unit)));
             }
+            Mutation::StopWatch { id: watch } => {
+                self.accepted(conn, id, &key);
+                match self.stop_cross_watch(&watch) {
+                    Ok(()) => self.finish_journal(&key, Outcome::Done(Box::new(Done::Unit))),
+                    Err(error) => self.finish_journal(&key, Outcome::Failed(error.to_string())),
+                }
+            }
             Mutation::CancelJob(target) => {
                 let applied = self
                     .jobs

@@ -12,14 +12,14 @@ import { execFile } from "node:child_process";
 import { Type } from "@sinclair/typebox";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-type ToolName = "open_session" | "notify" | "show_changes" | "request_review" | "sessions" | "send_prompt" | "wait_session" | "answer_question" | "finish_worktree" | "report" | "fan_out";
+type ToolName = "open_session" | "notify" | "show_changes" | "request_review" | "sessions" | "send_prompt" | "wait_session" | "answer_question" | "finish_worktree" | "report" | "fan_out" | "watch_session" | "message_session";
 type ToolResult = { content: { type: "text"; text: string }[]; details?: Record<string, unknown>; isError?: boolean };
 interface ToolClient {
   data: { buf: string; snapshots: boolean; tools: boolean };
   write(line: string): unknown;
   destroy?(): void;
 }
-const TOOL_NAMES: ToolName[] = ["open_session", "notify", "show_changes", "request_review", "sessions", "send_prompt", "wait_session", "answer_question", "finish_worktree", "report", "fan_out"];
+const TOOL_NAMES: ToolName[] = ["open_session", "notify", "show_changes", "request_review", "sessions", "send_prompt", "wait_session", "answer_question", "finish_worktree", "report", "fan_out", "watch_session", "message_session"];
 const toolProcess = globalThis as typeof globalThis & { __ompdeckTools?: string[] };
 const toolResult = (text: string, isError = false, details?: Record<string, unknown>): ToolResult =>
   ({ content: [{ type: "text", text }], ...(isError ? { isError: true } : {}), ...(details ? { details } : {}) });
@@ -77,11 +77,20 @@ function toolArgError(name: ToolName, args: Record<string, unknown>): string | u
       if (typeof args.prompt !== "string" || Buffer.byteLength(args.prompt) === 0) return "prompt must contain 1 to 16384 bytes";
       return bytes("prompt", 16 * 1024);
     }
-    if (name === "wait_session") {
-      if (args.background !== undefined && typeof args.background !== "boolean") return "background must be a boolean";
-      const maximum = args.background === true ? 86400 : 3600;
-      if (args.timeout_seconds !== undefined && (typeof args.timeout_seconds !== "number" || !Number.isInteger(args.timeout_seconds) || args.timeout_seconds < 1 || args.timeout_seconds > maximum)) return `timeout_seconds must be an integer from 1 to ${maximum}`;
-    }
+  }
+  if (name === "watch_session" || name === "message_session") {
+    if (typeof args.session !== "string" || !args.session.trim()) return "session must be a non-empty ref or session id";
+  }
+  if (name === "wait_session" || name === "watch_session") {
+    if (args.background !== undefined && typeof args.background !== "boolean") return "background must be a boolean";
+    const maximum = args.background === true ? 86400 : 3600;
+    if (args.timeout_seconds !== undefined && (typeof args.timeout_seconds !== "number" || !Number.isInteger(args.timeout_seconds) || args.timeout_seconds < 1 || args.timeout_seconds > maximum)) return `timeout_seconds must be an integer from 1 to ${maximum}`;
+    if (name === "watch_session" && args.next !== undefined && typeof args.next !== "boolean") return "next must be a boolean";
+  }
+  if (name === "message_session") {
+    const length = typeof args.text === "string" ? Buffer.byteLength(args.text) : 0;
+    if (length < 1 || length > 8192) return "text must contain 1 to 8192 bytes";
+    if (args.wake !== undefined && typeof args.wake !== "boolean") return "wake must be a boolean";
   }
   if (name === "report") {
     if (typeof args.text !== "string" || Buffer.byteLength(args.text) < 1 || Buffer.byteLength(args.text) > 4096) return "text must contain 1 to 4096 bytes";
@@ -361,18 +370,18 @@ export default async function ompdeckCtl(api: any) {
           },
           sessions: {
             label: "List OmpDeck sessions", approval: "read",
-            description: "Check up to 30 OmpDeck sessions, including parallel sessions you opened: title, directory, busy/idle/needs attention/exited status, model, whether a tab is open, last reply (up to 300 characters), and whether this session opened it.",
+            description: "Check up to 30 OmpDeck sessions: each row has a stable ref for ompdeck_watch_session or ompdeck_message_session, title, directory, busy/idle/needs attention/exited status, model, open-tab state and last reply (up to 300 characters). Rows identify sessions you opened; their handles work with child-session tools.",
             parameters: Type.Object({}),
           },
           send_prompt: {
             label: "Send prompt to OmpDeck session", approval: "exec",
             description: "Send a prompt to a session you opened with ompdeck_open_session (by its handle). mode send needs the session idle; follow_up queues after the current turn; steer interrupts it.",
-            parameters: Type.Object({ session: Type.String({ description: "Session handle returned by ompdeck_open_session; at most 32 bytes." }), prompt: Type.String({ description: "Prompt text, 1 to 16 KiB." }), mode: Type.Optional(Type.Union([Type.Literal("send"), Type.Literal("follow_up"), Type.Literal("steer")])) }),
+            parameters: Type.Object({ session: Type.String({ description: "Handle of a session you opened with ompdeck_open_session; at most 32 bytes." }), prompt: Type.String({ description: "Prompt text, 1 to 16 KiB." }), mode: Type.Optional(Type.Union([Type.Literal("send"), Type.Literal("follow_up"), Type.Literal("steer")])) }),
           },
           wait_session: {
             label: "Wait for OmpDeck session", approval: "read",
             description: "Wait until a session you opened finishes the turn of the last prompt you gave it (default 600 s, max 3600) and return its final reply. Returns early if it needs the user's attention or exits. background: true returns immediately and the result arrives later as a message; you can keep working. Background waits have no timeout by default, or an explicit timeout of up to 86400 seconds.",
-            parameters: Type.Object({ session: Type.String({ description: "Session handle returned by ompdeck_open_session; at most 32 bytes." }), timeout_seconds: Type.Optional(Type.Integer({ description: "Wait timeout in seconds: 1 to 3600 normally (default 600), or 1 to 86400 with background true (no default timeout)." })), background: Type.Optional(Type.Boolean({ description: "Return immediately and receive the result later as a message; default false." })) }),
+            parameters: Type.Object({ session: Type.String({ description: "Handle of a session you opened with ompdeck_open_session; at most 32 bytes." }), timeout_seconds: Type.Optional(Type.Integer({ description: "Wait timeout in seconds: 1 to 3600 normally (default 600), or 1 to 86400 with background true (no default timeout)." })), background: Type.Optional(Type.Boolean({ description: "Return immediately and receive the result later as a message; default false." })) }),
           },
           answer_question: {
             label: "Answer OmpDeck child question", approval: "exec",
@@ -416,6 +425,25 @@ export default async function ompdeckCtl(api: any) {
               cwd: Type.Optional(Type.String({ description: "Absolute existing project directory; defaults to this session's directory." })),
               forward_questions: Type.Optional(Type.Boolean({ description: "Forward child questions as messages; default true." })),
               timeout_seconds: Type.Optional(Type.Integer({ description: "Initial-turn timeout per child, 1 to 86400 seconds; no timeout by default." })),
+            }),
+          },
+          watch_session: {
+            label: "Watch OmpDeck session", approval: "read",
+            description: "Read-only watch of any session by its ref from ompdeck_sessions, not just sessions you opened. If busy, wait for its current turn to end; if idle, return its last reply immediately. next: true waits for the next turn to start and end. Returns early on attention, exit or timeout. background: true returns immediately and delivers the result later as a message.",
+            parameters: Type.Object({
+              session: Type.String({ description: "Any session's ref from ompdeck_sessions (last 8 hex digits), full session id, or unique id prefix of at least 8 hex digits." }),
+              next: Type.Optional(Type.Boolean({ description: "Wait for the next turn to start and end; default false." })),
+              background: Type.Optional(Type.Boolean({ description: "Return immediately and receive the result later as a message; default false." })),
+              timeout_seconds: Type.Optional(Type.Integer({ description: "1 to 3600 seconds normally (default 600); 1 to 86400 with background true (no timeout by default)." })),
+            }),
+          },
+          message_session: {
+            label: "Message OmpDeck session", approval: "exec",
+            description: "Send a message to another running session by its ref from ompdeck_sessions. By default this wakes its agent to act on the message; it can reply with ompdeck_message_session to your ref. wake: false delivers without starting a turn. Never changes the target's composer draft.",
+            parameters: Type.Object({
+              session: Type.String({ description: "Target session's ref from ompdeck_sessions (last 8 hex digits), full session id, or unique id prefix of at least 8 hex digits." }),
+              text: Type.String({ description: "Message text, 1 byte to 8 KiB." }),
+              wake: Type.Optional(Type.Boolean({ description: "Wake the target agent to act on the message; default true." })),
             }),
           },
         } as const;
@@ -1199,19 +1227,23 @@ export default async function ompdeckCtl(api: any) {
           }
         }
       }
-      async function deliver(client: ToolClient, command: Record<string, unknown>): Promise<{ ok: boolean; error?: string; code?: string }> {
-        if (!client.data.tools) return { ok: false, error: "not a tools client" };
+      async function deliver(command: Record<string, unknown>): Promise<{ ok: boolean; error?: string; code?: string }> {
         const title = command.title, text = command.text, details = command.details;
         if (typeof title !== "string") return { ok: false, error: "title must be a string of at most 200 characters" };
         let titleChars = 0;
         for (const _char of title) if (++titleChars > 200) return { ok: false, error: "title must be at most 200 characters" };
         if (typeof text !== "string" || Buffer.byteLength(text) > 40 * 1024) return { ok: false, error: "text must be a string of at most 40960 bytes" };
         if (details !== undefined && !object(details)) return { ok: false, error: "details must be an object" };
+        if (command.triggerTurn !== undefined && typeof command.triggerTurn !== "boolean") return { ok: false, error: "triggerTurn must be a boolean" };
+        const customType = command.customType === undefined ? "ompdeck-wait" : command.customType;
+        if (customType !== "ompdeck-wait" && customType !== "ompdeck-watch" && customType !== "ompdeck-message") return { ok: false, error: "customType must be ompdeck-wait, ompdeck-watch or ompdeck-message" };
         try {
           if (!sameRoot(command)) return { ok: false, error: "session changed", code: "root_mismatch" };
+          // omp's aside mode starts an idle turn even when triggerTurn is false. nextTurn
+          // retains passive messages without starting/draining a turn, including while busy.
           await api.sendMessage(
-            { customType: "ompdeck-wait", content: `${title}\n\n${text}`, display: true, details: { title, ...details } },
-            { deliverAs: "aside", triggerTurn: true },
+            { customType, content: `${title}\n\n${text}`, display: true, details: { title, ...details } },
+            { deliverAs: command.triggerTurn === false ? "nextTurn" : "aside", triggerTurn: command.triggerTurn !== false },
           );
           return { ok: true };
         } catch (error) {
@@ -1224,7 +1256,7 @@ export default async function ompdeckCtl(api: any) {
       const onOpen = (s: any) => {
         s.data = { buf: "", snapshots: true, tools: false }; clients.add(s);
         const tools = toolProcess.__ompdeckTools ?? [];
-        write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid, ui_hook: uiState.hook, ...(tools.length ? { features: ["tools", "deliver"], tools } : {}) }) + "\n" + JSON.stringify(snapshot()) + "\n");
+        write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid, ui_hook: uiState.hook, ...(tools.length ? { features: ["tools", "deliver", "deliver_no_wake"], tools } : {}) }) + "\n" + JSON.stringify(snapshot()) + "\n");
       };
       const onData = (s: any, chunk: any) => {
         const st = s.data; if (!st) return;
@@ -1251,7 +1283,7 @@ export default async function ompdeckCtl(api: any) {
             continue;
           }
           if (cmd.t === "deliver") {
-            deliver(s, cmd).then(result => reply(s, cmd.rid, result));
+            deliver(cmd).then(result => reply(s, cmd.rid, result));
             continue;
           }
           let p: Promise<any>; try { p = handle(cmd); } catch (e: any) { p = Promise.reject(e); }

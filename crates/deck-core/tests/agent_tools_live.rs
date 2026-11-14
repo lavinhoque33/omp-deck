@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use support::fake_model::{self as fm, Reply};
 use support::{Live, TURN, wait_for};
 
-const ALL: &str = "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report,fan_out";
+const ALL: &str = "open_session,notify,show_changes,request_review,sessions,send_prompt,wait_session,answer_question,finish_worktree,report,fan_out,watch_session,message_session";
 const RESULT: &str = "Posted: verified round trip";
 const DELIVERED_IDLE: &str = "DELIVERED-IDLE: the child finished.";
 const DELIVERED_BUSY: &str = "DELIVERED-BUSY: the child finished during this tool.";
@@ -249,7 +249,10 @@ fn advertises_tools_and_round_trips_notify_with_args_and_root() {
     let Some(live) = start("tools-notify", Some(ALL)) else {
         return;
     };
-    assert_eq!(live.client().features(), ["tools", "deliver"]);
+    assert_eq!(
+        live.client().features(),
+        ["tools", "deliver", "deliver_no_wake"]
+    );
     subscribe(&live, true);
     let second = live.another_client();
     wait_for("the second client", TURN, || {
@@ -740,12 +743,14 @@ fn deliver_to_an_idle_main_session_starts_a_turn_with_the_message() {
     let wrong_text = "WRONG-ROOT-MUST-NOT-BE-DELIVERED";
     let rejected = live.ctl(
         CtlCommand::Deliver {
+            kind: deck_core::ctl::DeliverKind::Wait,
             root: live
                 .session_file()
                 .with_file_name("wrong-conversation.jsonl"),
             title: "Wrong conversation".into(),
             text: wrong_text.into(),
             details: None,
+            trigger_turn: true,
         },
         TURN,
     );
@@ -753,10 +758,12 @@ fn deliver_to_an_idle_main_session_starts_a_turn_with_the_message() {
     assert_eq!(rejected.code.as_deref(), Some("root_mismatch"));
     let reply = live.ctl(
         CtlCommand::Deliver {
+            kind: deck_core::ctl::DeliverKind::Wait,
             root: live.session_file(),
             title: "Background wait: Child (s-1234abcd)".into(),
             text: DELIVERED_IDLE.into(),
             details: Some(json!({"session":"s-1234abcd","outcome":"completed"})),
+            trigger_turn: true,
         },
         TURN,
     );
@@ -814,10 +821,12 @@ fn deliver_during_a_slow_tool_waits_for_the_boundary_without_aborting_it() {
     let before = live.model.count();
     let reply = live.ctl(
         CtlCommand::Deliver {
+            kind: deck_core::ctl::DeliverKind::Wait,
             root: live.session_file(),
             title: "Background wait: Child".into(),
             text: DELIVERED_BUSY.into(),
             details: None,
+            trigger_turn: true,
         },
         TURN,
     );
@@ -880,21 +889,11 @@ fn deliver_during_a_slow_tool_waits_for_the_boundary_without_aborting_it() {
 }
 
 #[test]
-fn deliver_rejects_non_tools_connections_and_oversized_payloads() {
+fn deliver_rejects_oversized_payloads_on_snapshots_only_connections() {
     let Some(live) = start("tools-del-refuse", Some("wait_session")) else {
         return;
     };
-    let denied = live.ctl(
-        CtlCommand::Deliver {
-            root: live.session_file(),
-            title: "Background".into(),
-            text: "Result".into(),
-            details: None,
-        },
-        TURN,
-    );
-    assert_eq!(denied.error.as_deref(), Some("not a tools client"));
-    subscribe(&live, true);
+    subscribe(&live, false);
     for (title, text, details, reason) in [
         (
             "x".repeat(201),
@@ -917,10 +916,12 @@ fn deliver_rejects_non_tools_connections_and_oversized_payloads() {
     ] {
         let reply = live.ctl(
             CtlCommand::Deliver {
+                kind: deck_core::ctl::DeliverKind::Wait,
                 root: live.session_file(),
                 title,
                 text,
                 details,
+                trigger_turn: true,
             },
             TURN,
         );
@@ -1619,4 +1620,466 @@ fn fan_out_rejects_task_and_group_limits_without_dispatching() {
             "invalid fan-out dispatched: {args}"
         );
     }
+}
+
+#[test]
+fn cross_session_tools_are_gated_and_forward_refs_and_options() {
+    let Some(live) = start("peer-tools", Some("watch_session,message_session")) else {
+        return;
+    };
+    assert_eq!(
+        live.client().tools(),
+        ["ompdeck_watch_session", "ompdeck_message_session"]
+    );
+    subscribe(&live, true);
+    for (name, args) in [
+        ("watch_session", json!({"session":"01234567"})),
+        (
+            "watch_session",
+            json!({"session":"01234567-89ab-cdef-0123-456789abcdef","next":true,"background":false,"timeout_seconds":3600}),
+        ),
+        (
+            "watch_session",
+            json!({"session":"0123456789abcdef","next":true,"background":true,"timeout_seconds":86400}),
+        ),
+        (
+            "watch_session",
+            json!({"session":"01234567","next":false,"background":true}),
+        ),
+        (
+            "watch_session",
+            json!({"session":"01234567","timeout_seconds":1}),
+        ),
+        (
+            "message_session",
+            json!({"session":"01234567","text":"Peer has finished."}),
+        ),
+        (
+            "message_session",
+            json!({"session":"01234567-89ab-cdef-0123-456789abcdef","text":"Read this later.","wake":false}),
+        ),
+        (
+            "message_session",
+            json!({"session":"0123456789abcdef","text":"é".repeat(4096),"wake":true}),
+        ),
+        ("message_session", json!({"session":"01234567","text":"x"})),
+    ] {
+        let before = live.model.count();
+        let entry_start = live.entries().len();
+        let full_name = format!("ompdeck_{name}");
+        live.send(&format!(
+            "agent-tool {}",
+            json!({"name":full_name,"args":args})
+        ));
+        let request = request(live.client());
+        assert_eq!(request.name, name);
+        assert_eq!(request.args, args);
+        assert_eq!(request.root, Some(live.session_file()));
+        let model = live.model.find(before, fm::has_tools).unwrap();
+        let tools: Vec<_> = fm::tool_names(&model)
+            .into_iter()
+            .filter(|name| name.starts_with("ompdeck_"))
+            .collect();
+        assert_eq!(tools, ["ompdeck_watch_session", "ompdeck_message_session"]);
+        let text = if name == "watch_session" {
+            "Peer (01234567): completed; final reply."
+        } else {
+            "Message delivered to Peer (01234567)."
+        };
+        assert!(
+            live.ctl(
+                CtlCommand::ToolResult {
+                    id: request.id,
+                    ok: true,
+                    text: text.into(),
+                    details: None,
+                },
+                TURN
+            )
+            .ok
+        );
+        next_model_result(&live, before, text);
+        assert_eq!(
+            tool_result(&live, &full_name, entry_start)["isError"],
+            false
+        );
+        wait_for("the cross-session call to finish", TURN, || {
+            live.main_idle().then_some(())
+        });
+    }
+}
+
+#[test]
+fn cross_session_tool_short_names_gate_each_tool_independently() {
+    for (tag, policy, expected) in [
+        ("peer-off", "sessions", "ompdeck_sessions"),
+        ("peer-watch", "watch_session", "ompdeck_watch_session"),
+        ("peer-msg", "message_session", "ompdeck_message_session"),
+    ] {
+        let Some(live) = start(tag, Some(policy)) else {
+            return;
+        };
+        assert_eq!(live.client().tools(), [expected]);
+        let before = live.model.count();
+        live.send("List no tools; just respond.");
+        let model = wait_for("the enabled tool schemas", TURN, || {
+            live.model.find(before, fm::has_tools)
+        });
+        let tools: Vec<_> = fm::tool_names(&model)
+            .into_iter()
+            .filter(|name| name.starts_with("ompdeck_"))
+            .collect();
+        assert_eq!(tools, [expected]);
+        wait_for("the tool visibility turn to finish", TURN, || {
+            live.main_idle().then_some(())
+        });
+    }
+}
+
+#[test]
+fn cross_session_tools_reject_invalid_arguments_without_dispatching() {
+    let Some(live) = start("peer-limits", Some("watch_session,message_session")) else {
+        return;
+    };
+    subscribe(&live, true);
+    for (name, args, reason) in [
+        ("watch_session", json!({"session":""}), "session"),
+        ("watch_session", json!({"session":"  "}), "session"),
+        (
+            "watch_session",
+            json!({"session":"01234567","timeout_seconds":0}),
+            "timeout_seconds",
+        ),
+        (
+            "watch_session",
+            json!({"session":"01234567","timeout_seconds":3601}),
+            "timeout_seconds",
+        ),
+        (
+            "watch_session",
+            json!({"session":"01234567","background":true,"timeout_seconds":86401}),
+            "timeout_seconds",
+        ),
+        (
+            "watch_session",
+            json!({"session":"01234567","next":"sometimes"}),
+            "next",
+        ),
+        (
+            "watch_session",
+            json!({"session":"01234567","background":"sometimes"}),
+            "background",
+        ),
+        (
+            "message_session",
+            json!({"session":"","text":"Hello"}),
+            "session",
+        ),
+        (
+            "message_session",
+            json!({"session":"01234567","text":""}),
+            "text",
+        ),
+        (
+            "message_session",
+            json!({"session":"01234567","text":"é".repeat(4097)}),
+            "text",
+        ),
+        (
+            "message_session",
+            json!({"session":"01234567","text":"Hello","wake":"sometimes"}),
+            "wake",
+        ),
+    ] {
+        let before = live.model.count();
+        let entry_start = live.entries().len();
+        let full_name = format!("ompdeck_{name}");
+        live.send(&format!(
+            "agent-tool {}",
+            json!({"name":full_name,"args":args})
+        ));
+        let result = tool_result(&live, &full_name, entry_start);
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(result.to_string().contains(reason), "{result}");
+        next_model_result(&live, before, reason);
+        wait_for("the refused cross-session call", TURN, || {
+            live.main_idle().then_some(())
+        });
+        assert!(
+            live.client().take_tool_requests().is_empty(),
+            "invalid {name} dispatched: {args}"
+        );
+    }
+}
+
+#[test]
+fn deliver_without_trigger_turn_is_retained_without_waking_an_idle_agent() {
+    let Some(live) = start("peer-quiet", Some("message_session")) else {
+        return;
+    };
+    assert!(
+        live.client()
+            .features()
+            .iter()
+            .any(|feature| feature == "deliver_no_wake")
+    );
+    subscribe(&live, false);
+    let before = live.model.count();
+    let text = "QUIET-PEER-MESSAGE: read this on your next turn.";
+    let reply = live.ctl(
+        CtlCommand::Deliver {
+            kind: deck_core::ctl::DeliverKind::Message,
+            root: live.session_file(),
+            title: "Message from Peer (01234567)".into(),
+            text: text.into(),
+            details: None,
+            trigger_turn: false,
+        },
+        TURN,
+    );
+    assert!(reply.ok, "{reply:?}");
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        assert_eq!(
+            live.model.count(),
+            before,
+            "passive delivery started a model request"
+        );
+        assert!(live.main_idle(), "passive delivery woke the agent");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    live.send("Read the peer message now.");
+    let request = wait_for(
+        "the user's next turn to see the passive message",
+        TURN,
+        || {
+            live.model.find(before, |request| {
+                fm::has_tools(request)
+                    && fm::messages(request)
+                        .iter()
+                        .any(|message| fm::text(message).contains(text))
+            })
+        },
+    );
+    assert!(
+        fm::messages(&request)
+            .iter()
+            .any(|message| fm::text(message).contains("Read the peer message now."))
+    );
+    wait_for("the user-requested turn to finish", TURN, || {
+        live.main_idle().then_some(())
+    });
+    wait_for("the passive message to be retained", TURN, || {
+        live.entries()
+            .iter()
+            .any(|entry| {
+                entry["type"] == "custom_message"
+                    && entry["customType"] == "ompdeck-message"
+                    && entry["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains(text))
+            })
+            .then_some(())
+    });
+}
+
+#[test]
+fn passive_delivery_during_a_tool_does_not_interrupt_or_start_another_turn() {
+    let Some(live) = start("peer-busy", Some("notify,message_session")) else {
+        return;
+    };
+    assert!(
+        live.client()
+            .features()
+            .iter()
+            .any(|feature| feature == "deliver_no_wake")
+    );
+    subscribe(&live, true);
+    live.send("deliver-busy");
+    let pending = request(live.client());
+    assert_eq!(pending.name, "notify");
+    let before = live.model.count();
+    let text = "QUIET-BUSY-PEER-MESSAGE: only read on the next user turn.";
+    assert!(
+        live.ctl(
+            CtlCommand::Deliver {
+                kind: deck_core::ctl::DeliverKind::Message,
+                root: live.session_file(),
+                title: "Peer message".into(),
+                text: text.into(),
+                details: None,
+                trigger_turn: false,
+            },
+            TURN
+        )
+        .ok
+    );
+    assert!(
+        live.client()
+            .take_tool_requests()
+            .iter()
+            .all(|event| *event != ToolEvent::Cancel(pending.id))
+    );
+    let result = "The current tool finished; keep the passive message queued.";
+    assert!(
+        live.ctl(
+            CtlCommand::ToolResult {
+                id: pending.id,
+                ok: true,
+                text: result.into(),
+                details: None,
+            },
+            TURN
+        )
+        .ok
+    );
+    let current = next_model_result(&live, before, result);
+    assert!(
+        fm::messages(&current)
+            .iter()
+            .all(|message| !fm::text(message).contains(text))
+    );
+    wait_for("the original turn to finish", TURN, || {
+        live.main_idle().then_some(())
+    });
+    let after = live.model.count();
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        assert_eq!(
+            live.model.count(),
+            after,
+            "passive delivery drained into a new turn"
+        );
+        assert!(live.main_idle());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    live.send("Read the queued peer message now.");
+    let request = wait_for(
+        "the next user turn to receive the queued peer message",
+        TURN,
+        || {
+            live.model.find(after, |request| {
+                fm::has_tools(request)
+                    && fm::messages(request)
+                        .iter()
+                        .any(|message| fm::text(message).contains(text))
+            })
+        },
+    );
+    assert!(
+        fm::messages(&request)
+            .iter()
+            .any(|message| fm::text(message).contains("Read the queued peer message now."))
+    );
+    wait_for("the queued-message user turn to finish", TURN, || {
+        live.main_idle().then_some(())
+    });
+}
+
+#[test]
+fn snapshots_only_client_delivers_but_cannot_complete_another_clients_tool() {
+    let Some(live) = start("snap-deliver", Some("notify")) else {
+        return;
+    };
+    subscribe(&live, false);
+    let owner = live.another_client();
+    wait_for("the tools owner to connect", TURN, || {
+        owner.connected().then_some(())
+    });
+    let rid = owner.send(CtlCommand::Subscribe {
+        snapshots: false,
+        tools: true,
+    });
+    wait_for("the owner subscription", TURN, || {
+        owner
+            .take_replies()
+            .into_iter()
+            .find(|(id, reply)| *id == rid && reply.ok)
+    });
+    let wrong_text = "WRONG-SNAPSHOT-ROOT-MUST-NOT-BE-DELIVERED";
+    let rejected = live.ctl(
+        CtlCommand::Deliver {
+            kind: deck_core::ctl::DeliverKind::Message,
+            root: live.session_file().with_file_name("wrong-session.jsonl"),
+            title: "Wrong root".into(),
+            text: wrong_text.into(),
+            details: None,
+            trigger_turn: true,
+        },
+        TURN,
+    );
+    assert!(!rejected.ok);
+    assert_eq!(rejected.code.as_deref(), Some("root_mismatch"));
+
+    let before = live.model.count();
+    let text = "SNAPSHOTS-ONLY-DELIVERY: accepted without owning any tool requests.";
+    let reply = live.ctl(
+        CtlCommand::Deliver {
+            kind: deck_core::ctl::DeliverKind::Message,
+            root: live.session_file(),
+            title: "Message from another session".into(),
+            text: text.into(),
+            details: None,
+            trigger_turn: true,
+        },
+        TURN,
+    );
+    assert!(reply.ok, "{reply:?}");
+    wait_for(
+        "the snapshots-only delivery to reach the model",
+        TURN,
+        || {
+            live.model.find(before, |request| {
+                fm::has_tools(request)
+                    && fm::messages(request)
+                        .iter()
+                        .any(|message| fm::text(message).contains(text))
+            })
+        },
+    );
+    wait_for("the delivered-message turn to finish", TURN, || {
+        live.main_idle().then_some(())
+    });
+
+    let before = live.model.count();
+    live.send("notify");
+    let pending = request(&owner);
+    assert_eq!(pending.name, "notify");
+    assert!(
+        live.client().take_tool_requests().is_empty(),
+        "snapshots-only client stole a tool request"
+    );
+    let wrong_result = "SNAPSHOTS-ONLY-CLIENT-MUST-NOT-COMPLETE-THE-TOOL";
+    let denied = live.ctl(
+        CtlCommand::ToolResult {
+            id: pending.id,
+            ok: true,
+            text: wrong_result.into(),
+            details: None,
+        },
+        TURN,
+    );
+    assert!(!denied.ok);
+    assert_eq!(denied.error.as_deref(), Some("no such request"));
+    let text = "The owning tools client completed its request.";
+    let rid = owner.send(CtlCommand::ToolResult {
+        id: pending.id,
+        ok: true,
+        text: text.into(),
+        details: None,
+    });
+    let (_, reply) = wait_for("the owner's tool-result ACK", TURN, || {
+        owner.take_replies().into_iter().find(|(id, _)| *id == rid)
+    });
+    assert!(reply.ok, "{reply:?}");
+    let model = next_model_result(&live, before, text);
+    assert!(
+        fm::messages(&model)
+            .iter()
+            .all(|message| !fm::text(message).contains(wrong_result)
+                && !fm::text(message).contains(wrong_text))
+    );
+    wait_for("the owning client's tool turn to finish", TURN, || {
+        live.main_idle().then_some(())
+    });
 }

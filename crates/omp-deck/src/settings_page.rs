@@ -1567,30 +1567,30 @@ fn agent_tools_card(
         );
         ui.add_space(10.0);
         type Field = fn(&mut AgentTools) -> &mut bool;
-        let rows: [(&str, &str, Field); 11] = [
+        let rows: [(&str, &str, Field); 13] = [
             (
                 "Open sessions",
-                "Start a parallel omp session in a new tab or split, optionally with a prompt",
+                "Lets the agent start a parallel omp session in a new tab or split, optionally with a prompt",
                 |t| &mut t.open_session,
             ),
             (
                 "Notifications",
-                "Post a message to the bell (and a desktop pop-up) when it needs you",
+                "Lets the agent post a message to the bell (and a desktop pop-up) when it needs you",
                 |t| &mut t.notify,
             ),
             (
                 "Show changes",
-                "Open the Changes panel on its session, optionally at one file",
+                "Lets the agent open the Changes panel on its session, optionally at one file",
                 |t| &mut t.show_changes,
             ),
             (
                 "Request review",
-                "Ask you to review its changes in the Changes panel and wait for your comments",
+                "Lets the agent ask you to review its changes in the Changes panel and wait for your comments",
                 |t| &mut t.request_review,
             ),
             (
                 "List sessions",
-                "See the open sessions: title, folder, status, model and last reply",
+                "Lets the agent see the open sessions: title, folder, status, model, last reply and the short ref other tools take",
                 |t| &mut t.sessions,
             ),
             (
@@ -1622,6 +1622,16 @@ fn agent_tools_card(
                 "Let agents fan out parallel sessions",
                 "Lets the agent start up to 8 parallel sessions at once (each in its own worktree by default) and collect their results",
                 |t| &mut t.fan_out,
+            ),
+            (
+                "Let agents watch any session",
+                "Lets the agent wait for any session's turn to end and read its reply; read-only, it never types into or changes that session",
+                |t| &mut t.watch_session,
+            ),
+            (
+                "Let sessions message each other",
+                "Lets one session's agent start turns in another by sending it a message (never touches its composer)",
+                |t| &mut t.message_session,
             ),
         ];
         for (i, (title, sub, field)) in rows.into_iter().enumerate() {

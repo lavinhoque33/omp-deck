@@ -141,6 +141,7 @@ pub(crate) enum Fin {
     AgentChildren(agent_tools::children::WorkerResult),
     OrchestrationStats(agent_tools::children::orchestration::StatsUpdate),
     Checkpoints(checkpoints::Update),
+    CrossSession(agent_tools::children::cross_sessions::Update),
     AgentTool {
         request: u64,
         result: Result<String, String>,
@@ -749,6 +750,7 @@ impl Engine {
             Fin::AgentChildren(result) => self.on_child_worker(result),
             Fin::OrchestrationStats(update) => self.on_orchestration_stats(update),
             Fin::Checkpoints(update) => self.on_checkpoint_update(update),
+            Fin::CrossSession(update) => self.on_cross_session_update(update),
             Fin::AgentTool { request, result } => match result {
                 Ok(text) => self.finish_agent_tool(request, true, text),
                 Err(text) => self.finish_agent_tool(request, false, text),

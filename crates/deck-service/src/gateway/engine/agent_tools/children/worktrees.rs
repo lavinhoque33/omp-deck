@@ -355,10 +355,12 @@ impl Engine {
                     self.deliver_child_message(
                         index,
                         CtlCommand::Deliver {
+                            kind: deck_core::ctl::DeliverKind::Wait,
                             root: root.clone(),
                             title: title.clone(),
                             text,
                             details: None,
+                            trigger_turn: true,
                         },
                     );
                 }

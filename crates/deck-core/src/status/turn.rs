@@ -16,7 +16,7 @@ use super::{Part, TurnOutcome, turn_outcome};
 const REPLY_CHARS: usize = 32 * 1024;
 const READ_BYTES: usize = 64 * 1024;
 
-/// The prompt's own turn, not a later human/agent turn in the same session file.
+/// An attributed turn, not a later human/agent turn in the same session file.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TurnScan {
     pub prompt_seen: bool,
@@ -24,6 +24,12 @@ pub struct TurnScan {
     pub reply: Option<String>,
     pub reply_more: usize,
     pub later_prompt: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SkippedTurn {
+    AwaitingStart,
+    Active,
 }
 
 /// Reads complete appended JSONL entries with bounded memory; incomplete lines remain on disk
@@ -35,10 +41,14 @@ pub struct TurnWatch {
     prompt: Option<String>,
     exact: bool,
     cap: usize,
+    custom_turns: bool,
+    pending_custom: bool,
+    skip_current: Option<SkippedTurn>,
     scan: TurnScan,
 }
 
 impl TurnWatch {
+    /// Attribute a user-prompt turn. Delivery/custom messages never start attribution.
     pub fn new(path: PathBuf, from: u64, prompt: Option<String>) -> TurnWatch {
         let cap = prompt
             .as_deref()
@@ -51,8 +61,39 @@ impl TurnWatch {
             prompt,
             exact: false,
             cap,
+            custom_turns: false,
+            pending_custom: false,
+            skip_current: None,
             scan: TurnScan::default(),
         }
+    }
+
+    /// Attribute the first user- or custom-prompted turn after `from`.
+    ///
+    /// omp persists both waking deliveries and passive custom context as `custom_message`.
+    /// A custom entry is therefore only a candidate until an assistant response confirms a
+    /// turn actually ran. Custom asides inside an already attributed turn do not split it.
+    pub fn any_turn(path: PathBuf, from: u64) -> TurnWatch {
+        let mut watch = Self::new(path, from, None);
+        watch.custom_turns = true;
+        watch
+    }
+
+    /// Observe the next turn of a target that is already busy at `from`.
+    ///
+    /// Current-turn assistant entries and custom asides are ignored until its terminal
+    /// assistant entry. A new user entry is itself an unambiguous next-turn boundary.
+    /// Set `first_start_pending` only when the current turn's initiating entry has not
+    /// yet been persisted: its first user/custom-prompted start then belongs to the
+    /// skipped turn. Entries after that boundary are retained even in the same poll.
+    pub fn next_turn(path: PathBuf, from: u64, first_start_pending: bool) -> TurnWatch {
+        let mut watch = Self::any_turn(path, from);
+        watch.skip_current = Some(if first_start_pending {
+            SkippedTurn::AwaitingStart
+        } else {
+            SkippedTurn::Active
+        });
+        watch
     }
 
     /// Whether the current attribution exactly matches the requested prompt.
@@ -122,29 +163,81 @@ impl TurnWatch {
         Ok(self.scan.clone())
     }
 
+    fn attribute_prompt(&mut self, matches: bool) {
+        if !self.scan.prompt_seen || (!self.exact && matches) {
+            self.scan = TurnScan {
+                prompt_seen: true,
+                ..TurnScan::default()
+            };
+            self.exact = matches;
+        } else {
+            self.scan.later_prompt = true;
+        }
+    }
+
+    fn observe_custom(&mut self) {
+        if !self.scan.later_prompt && (!self.scan.prompt_seen || self.scan.end.is_some()) {
+            self.pending_custom = true;
+        }
+    }
+
+    fn skip_current_entry(&mut self, entry: &Entry) -> bool {
+        let Some(state) = self.skip_current else {
+            return false;
+        };
+        if entry.kind.as_deref() == Some("message")
+            && let Some(message) = &entry.message
+        {
+            match message.role.as_deref() {
+                Some("user") => {
+                    if matches!(state, SkippedTurn::AwaitingStart) {
+                        self.skip_current = Some(SkippedTurn::Active);
+                    } else {
+                        self.skip_current = None;
+                        return false;
+                    }
+                }
+                Some("assistant") => {
+                    self.skip_current =
+                        (message.stop.as_deref() == Some("toolUse")).then_some(SkippedTurn::Active);
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
     fn apply(&mut self, entry: Entry) {
+        if self.skip_current_entry(&entry) {
+            return;
+        }
+        if entry.kind.as_deref() == Some("custom_message") && self.custom_turns {
+            self.observe_custom();
+            return;
+        }
         if entry.kind.as_deref() != Some("message") {
             return;
         }
         let Some(message) = entry.message else { return };
         match message.role.as_deref() {
             Some("user") => {
+                self.pending_custom = false;
                 let matches = self.prompt.as_deref().is_none_or(|prompt| {
                     let wanted = prompt.trim();
                     message.content.trimmed_chars == wanted.chars().count()
                         && message.content.after_leading.trim_end() == wanted
                 });
-                if !self.scan.prompt_seen || (!self.exact && matches) {
-                    self.scan = TurnScan {
-                        prompt_seen: true,
-                        ..TurnScan::default()
-                    };
-                    self.exact = matches;
-                } else {
-                    self.scan.later_prompt = true;
-                }
+                self.attribute_prompt(matches);
             }
-            Some("assistant") if self.scan.prompt_seen && !self.scan.later_prompt => {
+            Some("custom") if self.custom_turns => self.observe_custom(),
+            Some("assistant") => {
+                if self.pending_custom {
+                    self.pending_custom = false;
+                    self.attribute_prompt(true);
+                }
+                if !self.scan.prompt_seen || self.scan.later_prompt {
+                    return;
+                }
                 if message.content.chars > 0 {
                     self.scan.reply_more = message.content.chars.saturating_sub(REPLY_CHARS);
                     let mut reply = message.content.prefix;
@@ -518,6 +611,26 @@ mod tests {
     use serde_json::{Value, json};
     use std::io::Write;
 
+    // AgentSession persists custom-role prompts through appendCustomMessageEntry. Also handle
+    // the custom-role message envelope; neither shape records triggerTurn.
+    fn delivery(custom_type: &str, envelope: bool) -> Value {
+        let message = json!({
+            "role":"custom", "customType":custom_type,
+            "content":"Delivery title\n\nTask finished.", "display":true,
+            "details":{"title":"Delivery title"}, "attribution":"agent",
+            "timestamp":1794668400000u64
+        });
+        if envelope {
+            json!({"type":"message","id":"delivery","parentId":null,
+                "timestamp":"2026-11-14T15:00:00.000Z","message":message})
+        } else {
+            json!({"type":"custom_message","id":"delivery","parentId":null,
+                "timestamp":"2026-11-14T15:00:00.000Z","customType":custom_type,
+                "content":message["content"],"display":true,"details":message["details"],
+                "attribution":"agent"})
+        }
+    }
+
     fn user(text: &str) -> Value {
         json!({"type":"message","message":{"role":"user","content":text}})
     }
@@ -536,6 +649,279 @@ mod tests {
         for entry in entries {
             serde_json::to_writer(&mut file, entry).unwrap();
             file.write_all(b"\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn next_turn_skips_current_asides_and_terminal_outcomes_before_the_next_user() {
+        for kind in ["ompdeck-wait", "ompdeck-watch", "ompdeck-message"] {
+            for envelope in [false, true] {
+                for reason in ["stop", "error", "aborted"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("session.jsonl");
+                    append(&path, &[user("Current turn")]);
+                    let from = std::fs::metadata(&path).unwrap().len();
+                    let mut watch = TurnWatch::next_turn(path.clone(), from, false);
+                    append(
+                        &path,
+                        &[
+                            delivery(kind, envelope),
+                            assistant("toolUse", Some("Current progress")),
+                            delivery(kind, envelope),
+                        ],
+                    );
+                    assert_eq!(watch.poll().unwrap(), TurnScan::default());
+                    append(&path, &[assistant(reason, Some("Current final reply"))]);
+                    assert_eq!(watch.poll().unwrap(), TurnScan::default());
+                    append(&path, &[delivery(kind, envelope)]);
+                    assert_eq!(
+                        watch.poll().unwrap(),
+                        TurnScan::default(),
+                        "passive context alone is not the next turn"
+                    );
+                    append(
+                        &path,
+                        &[user("Next turn"), assistant("stop", Some("Next reply"))],
+                    );
+                    let scan = watch.poll().unwrap();
+                    assert!(scan.prompt_seen);
+                    assert!(watch.matched_exactly());
+                    assert_eq!(scan.end, Some(TurnOutcome::Completed));
+                    assert_eq!(scan.reply.as_deref(), Some("Next reply"));
+                    assert!(!scan.later_prompt);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn next_user_after_a_persisted_start_is_observed_without_an_old_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        append(&path, &[user("Already persisted current start")]);
+        let from = std::fs::metadata(&path).unwrap().len();
+        let mut watch = TurnWatch::next_turn(path.clone(), from, false);
+        append(
+            &path,
+            &[user("Next start"), assistant("stop", Some("Next final"))],
+        );
+        let scan = watch.poll().unwrap();
+        assert_eq!(scan.end, Some(TurnOutcome::Completed));
+        assert_eq!(scan.reply.as_deref(), Some("Next final"));
+        assert!(!scan.later_prompt);
+    }
+
+    #[test]
+    fn next_turn_skips_a_late_first_user_without_discarding_a_batched_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-yet-persisted.jsonl");
+        let mut watch = TurnWatch::next_turn(path.clone(), 0, true);
+        append(
+            &path,
+            &[
+                json!({"type":"session","id":"fresh","timestamp":"2026-11-14T15:00:00.000Z"}),
+                delivery("ompdeck-message", false),
+                user("First start arrives late"),
+                delivery("ompdeck-watch", true),
+                assistant("toolUse", Some("First progress")),
+                assistant("stop", Some("First final")),
+                user("Next start in the same batch"),
+                assistant("toolUse", Some("Next progress")),
+                assistant("stop", Some("Next final")),
+                user("A later unrelated start"),
+                assistant("stop", Some("Must not replace next final")),
+            ],
+        );
+        let scan = watch.poll().unwrap();
+        assert!(scan.prompt_seen);
+        assert!(watch.matched_exactly());
+        assert_eq!(scan.end, Some(TurnOutcome::Completed));
+        assert_eq!(scan.reply.as_deref(), Some("Next final"));
+        assert!(scan.later_prompt);
+        assert_eq!(watch.poll().unwrap(), scan);
+    }
+
+    #[test]
+    fn next_turn_skips_a_late_first_custom_turn_and_retains_a_batched_custom_turn() {
+        for kind in ["ompdeck-wait", "ompdeck-watch", "ompdeck-message"] {
+            for envelope in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("not-yet-persisted.jsonl");
+                let mut watch = TurnWatch::next_turn(path.clone(), 0, true);
+                append(
+                    &path,
+                    &[
+                        delivery(kind, envelope),
+                        assistant("toolUse", Some("First progress")),
+                        delivery(kind, envelope),
+                        assistant("stop", Some("First final")),
+                        delivery(kind, envelope),
+                        assistant("toolUse", Some("Next progress")),
+                        assistant("stop", Some("Next custom final")),
+                    ],
+                );
+                let scan = watch.poll().unwrap();
+                assert!(scan.prompt_seen);
+                assert_eq!(scan.end, Some(TurnOutcome::Completed));
+                assert_eq!(scan.reply.as_deref(), Some("Next custom final"));
+                assert!(!scan.later_prompt);
+            }
+        }
+    }
+
+    #[test]
+    fn next_turn_keeps_a_partial_next_start_across_the_current_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        append(&path, &[user("Current start")]);
+        let from = std::fs::metadata(&path).unwrap().len();
+        let mut watch = TurnWatch::next_turn(path.clone(), from, false);
+        append(&path, &[assistant("stop", Some("Current final"))]);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        serde_json::to_writer(&mut file, &user("Next start")).unwrap();
+        file.flush().unwrap();
+        assert_eq!(watch.poll().unwrap(), TurnScan::default());
+        file.write_all(b"\n").unwrap();
+        file.flush().unwrap();
+        append(&path, &[assistant("stop", Some("Next final"))]);
+        let scan = watch.poll().unwrap();
+        assert_eq!(scan.end, Some(TurnOutcome::Completed));
+        assert_eq!(scan.reply.as_deref(), Some("Next final"));
+        assert!(!scan.later_prompt);
+    }
+
+    #[test]
+    fn any_turn_follows_all_delivery_kinds_and_both_persisted_shapes() {
+        for kind in ["ompdeck-wait", "ompdeck-watch", "ompdeck-message"] {
+            for envelope in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("session.jsonl");
+                append(&path, &[user("old"), assistant("stop", Some("old reply"))]);
+                let from = std::fs::metadata(&path).unwrap().len();
+                append(&path, &[delivery(kind, envelope)]);
+                let mut watch = TurnWatch::any_turn(path.clone(), from);
+                assert_eq!(watch.poll().unwrap(), TurnScan::default());
+                append(
+                    &path,
+                    &[assistant("toolUse", Some("Working on the delivery"))],
+                );
+                let progress = watch.poll().unwrap();
+                assert!(progress.prompt_seen);
+                assert!(watch.matched_exactly());
+                assert_eq!(progress.end, None);
+                assert_eq!(progress.reply.as_deref(), Some("Working on the delivery"));
+                append(&path, &[assistant("stop", Some("Delivery handled"))]);
+                let complete = watch.poll().unwrap();
+                assert_eq!(complete.end, Some(TurnOutcome::Completed));
+                assert_eq!(complete.reply.as_deref(), Some("Delivery handled"));
+                assert!(!complete.later_prompt);
+                append(&path, &[delivery(kind, envelope)]);
+                assert_eq!(
+                    watch.poll().unwrap(),
+                    complete,
+                    "custom context alone is not another turn"
+                );
+                append(
+                    &path,
+                    &[assistant("stop", Some("A later delivery's reply"))],
+                );
+                let later = watch.poll().unwrap();
+                assert!(later.later_prompt);
+                assert_eq!(later.reply, complete.reply);
+                assert_eq!(later.end, complete.end);
+            }
+        }
+    }
+
+    #[test]
+    fn passive_custom_context_waits_for_a_real_turn_and_does_not_split_it() {
+        for kind in ["ompdeck-wait", "ompdeck-watch", "ompdeck-message"] {
+            for envelope in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("session.jsonl");
+                append(&path, &[delivery(kind, envelope)]);
+                let mut watch = TurnWatch::any_turn(path.clone(), 0);
+                assert_eq!(watch.poll().unwrap(), TurnScan::default());
+                assert_eq!(watch.poll().unwrap(), TurnScan::default());
+                assert!(!watch.matched_exactly());
+                append(
+                    &path,
+                    &[
+                        user("Now do the task"),
+                        delivery(kind, envelope),
+                        assistant("toolUse", Some("Working")),
+                        delivery(kind, envelope),
+                        assistant("stop", Some("User-started turn finished")),
+                    ],
+                );
+                let complete = watch.poll().unwrap();
+                assert!(complete.prompt_seen);
+                assert!(!complete.later_prompt);
+                assert_eq!(complete.end, Some(TurnOutcome::Completed));
+                assert_eq!(
+                    complete.reply.as_deref(),
+                    Some("User-started turn finished")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_exact_and_fallback_waits_do_not_start_on_deliveries() {
+        for kind in ["ompdeck-wait", "ompdeck-watch", "ompdeck-message"] {
+            for envelope in [false, true] {
+                for prompt in [None, Some("wanted".into())] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("session.jsonl");
+                    append(
+                        &path,
+                        &[
+                            delivery(kind, envelope),
+                            assistant("stop", Some("Not the requested turn")),
+                        ],
+                    );
+                    let mut watch = TurnWatch::new(path.clone(), 0, prompt);
+                    assert_eq!(watch.poll().unwrap(), TurnScan::default());
+                    assert!(!watch.matched_exactly());
+                    append(
+                        &path,
+                        &[user("wanted"), assistant("stop", Some("Requested reply"))],
+                    );
+                    let complete = watch.poll().unwrap();
+                    assert!(watch.matched_exactly());
+                    assert_eq!(complete.end, Some(TurnOutcome::Completed));
+                    assert_eq!(complete.reply.as_deref(), Some("Requested reply"));
+                    assert!(!complete.later_prompt);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_turns_preserve_error_and_abort_outcomes() {
+        for (reason, error, expected) in [
+            (
+                "error",
+                Some("Provider failed"),
+                TurnOutcome::Error(Some("Provider failed".into())),
+            ),
+            ("aborted", None, TurnOutcome::Aborted),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let mut end = assistant(reason, Some("Last reply"));
+            if let Some(error) = error {
+                end["message"]["errorMessage"] = json!(error);
+            }
+            append(&path, &[delivery("ompdeck-message", false), end]);
+            let mut watch = TurnWatch::any_turn(path, 0);
+            let scan = watch.poll().unwrap();
+            assert!(scan.prompt_seen);
+            assert_eq!(scan.end, Some(expected));
+            assert_eq!(scan.reply.as_deref(), Some("Last reply"));
         }
     }
 

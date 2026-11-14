@@ -20,6 +20,7 @@ use crate::inject::ComposeMode;
 use crate::statusfmt::Activity;
 
 mod background;
+pub(in crate::gateway) mod cross_sessions;
 use background::{BackgroundWatch, OpenerSource};
 mod questions;
 use questions::QuestionWatch;
@@ -261,7 +262,26 @@ impl Waiter {
         background: bool,
         now: Instant,
     ) -> Self {
-        let file = child.file.clone();
+        Self::from_file(
+            handle,
+            child.file.clone(),
+            baseline,
+            seconds,
+            until,
+            background,
+            now,
+        )
+    }
+
+    fn from_file(
+        handle: String,
+        file: Option<PathBuf>,
+        baseline: Option<Baseline>,
+        seconds: Option<u64>,
+        until: Option<Instant>,
+        background: bool,
+        now: Instant,
+    ) -> Self {
         let watch = file.as_ref().zip(baseline.as_ref()).map(|(file, last)| {
             TurnWatch::new(file.clone(), last.offset, Some(last.prompt.clone()))
         });
@@ -448,6 +468,7 @@ impl super::AgentTools {
             .values()
             .any(|pending| &pending.target.key == key)
             || self.reply_acks.iter().any(|(target, _)| &target.key == key)
+            || self.cross_sessions.needs_controller(key)
             || self
                 .deferred_deliveries
                 .iter()
@@ -726,6 +747,9 @@ impl Engine {
             self.agent_tools
                 .children
                 .background_capacity(&handle, &root)?;
+            if child.background.is_none() && self.cross_background_count(&root) >= BACKGROUND_CAP {
+                return Err("Too many background waits".to_owned());
+            }
         }
         let key = child.key.clone();
         if let Action::Wait { baseline, .. } = &mut action {
@@ -1184,6 +1208,7 @@ impl Engine {
 
     pub(in crate::gateway::engine) fn child_operation_finished(&mut self, request: u64) {
         self.cancel_child_finish_request(request);
+        self.cancel_cross_session_request(request);
         self.agent_tools.children.answers.remove(&request);
         let Some(operation) = self.agent_tools.operations.remove(&request) else {
             return;
@@ -1205,13 +1230,13 @@ impl Engine {
     }
 
     fn release_idle_child_attachment(&mut self, key: &SessionKey) {
-        if self.agent_tools.release_child_ownership(key) {
+        if !self.cross_controller_needed(key) && self.agent_tools.release_child_ownership(key) {
             self.release_agent_child_attach(key);
         }
     }
 
     pub(in crate::gateway::engine) fn agent_child_attach_needed(&self, key: &SessionKey) -> bool {
-        self.agent_tools.controller_needed(key)
+        self.agent_tools.controller_needed(key) || self.cross_controller_needed(key)
     }
 
     pub(in crate::gateway::engine) fn agent_tool_reply_done(
@@ -1689,10 +1714,12 @@ mod tests {
             generation: 1,
         };
         let command = deck_core::ctl::CtlCommand::Deliver {
+            kind: deck_core::ctl::DeliverKind::Wait,
             root: PathBuf::from("/opener.jsonl"),
             title: "Fan-out finished".into(),
             text: "Combined result".into(),
             details: None,
+            trigger_turn: true,
         };
         assert!(
             tools

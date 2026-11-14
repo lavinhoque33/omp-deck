@@ -60,6 +60,7 @@ impl App {
                     .info(&self.ctx, "That session is not running anymore."),
             },
             OrchAction::StopAll(nodes) => self.confirm_stop_children(nodes),
+            OrchAction::StopWatch { id, title } => self.stop_watch(id, title),
         }
     }
 
@@ -169,6 +170,16 @@ impl App {
             },
             PendingConfirm::StopChildren(kills),
         ));
+    }
+
+    /// Ends a watch; the row leaves with the next tree the gateway publishes.
+    fn stop_watch(&mut self, id: String, title: String) {
+        self.gw.mutate(Mutation::StopWatch { id }, move |app, r| {
+            if let Err(e) = r {
+                app.toasts
+                    .error(&app.ctx, format!("Could not stop watching “{title}”: {e}"));
+            }
+        });
     }
 
     pub(super) fn execute_stop_children(&mut self, kills: Vec<(String, String)>) {
