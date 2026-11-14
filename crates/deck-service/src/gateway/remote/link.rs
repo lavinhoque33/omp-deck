@@ -44,6 +44,26 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// TLS, WebSocket upgrade and the relay's hello answer.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Match the relay defaults (`deck-relay/src/config.rs`): pings every 25 s and a
+/// 75 s inbound-idle limit. Three missed relay pings mean the path is no longer live.
+const RELAY_SILENCE: Duration = Duration::from_secs(75);
+/// Independent gateway traffic keeps NAT mappings and the relay's inbound-idle timer alive.
+const RELAY_KEEPALIVE: Duration = Duration::from_secs(25);
+
+#[derive(Clone, Copy)]
+struct Timing {
+    silence: Duration,
+    keepalive: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            silence: RELAY_SILENCE,
+            keepalive: RELAY_KEEPALIVE,
+        }
+    }
+}
 /// Bytes tungstenite may hold unwritten for a relay that stopped reading; past it a send fails
 /// and the link is lost (instead of queueing without bound).
 const MAX_WRITE_BUFFER: usize = 4 * 1024 * 1024;
@@ -184,6 +204,26 @@ impl Link {
         invite: Option<Invite>,
         events: Box<dyn Fn(Event) + Send>,
     ) -> io::Result<Link> {
+        Self::start_with_timing(
+            relay,
+            identity,
+            epochs,
+            tokens,
+            invite,
+            events,
+            Timing::default(),
+        )
+    }
+
+    fn start_with_timing(
+        relay: RelayConfig,
+        identity: Keypair,
+        epochs: Arc<Mutex<Epochs>>,
+        tokens: Vec<Hash>,
+        invite: Option<Invite>,
+        events: Box<dyn Fn(Event) + Send>,
+        timing: Timing,
+    ) -> io::Result<Link> {
         let (cmds, rx) = std::sync::mpsc::channel();
         let (done_tx, done) = std::sync::mpsc::channel();
         let shared = Arc::new(Shared {
@@ -204,6 +244,7 @@ impl Link {
             pace: Pace::new(Instant::now()),
             next_peer: 0,
             serial: 0,
+            timing,
         };
         let thread = std::thread::Builder::new()
             .name("gateway-relay".into())
@@ -339,6 +380,7 @@ struct Worker {
     next_peer: PeerId,
     /// The last admission serial handed out ([`Event::Opened`]).
     serial: u64,
+    timing: Timing,
 }
 
 /// What one device's turn in a flush did.
@@ -617,22 +659,45 @@ impl Worker {
         }
         loop {
             match conn.ws.read() {
-                Ok(Message::Binary(b)) => {
-                    let msg = match FromRelay::decode(&b) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            return Some(lost(format!("undecodable relay message: {e}"), true));
+                Ok(message) => {
+                    conn.last_read = Instant::now();
+                    match message {
+                        Message::Binary(b) => {
+                            let msg = match FromRelay::decode(&b) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    return Some(lost(
+                                        format!("undecodable relay message: {e}"),
+                                        true,
+                                    ));
+                                }
+                            };
+                            if let Err(e) = self.relayed(conn, msg) {
+                                return Some(lost(e, true));
+                            }
                         }
-                    };
-                    if let Err(e) = self.relayed(conn, msg) {
-                        return Some(lost(e, true));
+                        Message::Close(frame) => return Some(closed_by_relay(frame, true)),
+                        Message::Text(_) => return Some(lost("the relay sent text".into(), true)),
+                        _ => {}
                     }
                 }
-                Ok(Message::Close(frame)) => return Some(closed_by_relay(frame, true)),
-                Ok(Message::Text(_)) => return Some(lost("the relay sent text".into(), true)),
-                Ok(_) => {}
                 Err(e) if would_block(&e) => break,
                 Err(e) => return Some(lost(format!("relay connection: {e}"), true)),
+            }
+        }
+        // Drain buffered frames first: a suspended gateway may have missed wall-clock
+        // deadlines while the relay kept sending healthy traffic.
+        let now = Instant::now();
+        if now.duration_since(conn.last_read) >= self.timing.silence {
+            return Some(lost(
+                "the relay stopped answering; reconnecting".into(),
+                true,
+            ));
+        }
+        if now.duration_since(conn.last_ping) >= self.timing.keepalive {
+            conn.last_ping = now;
+            if let Err(error) = conn.write_frame(Message::Ping(Default::default())) {
+                return Some(lost(error, true));
             }
         }
         if let Err(e) = self.flush_devices(conn) {
@@ -941,14 +1006,19 @@ struct Conn<S: Read + Write = MaybeTlsStream<TcpStream>> {
     /// Frame bytes queued since the write buffer was last seen empty: at least what tungstenite
     /// still holds unwritten (it has no accessor for that), never less.
     unflushed: usize,
+    last_read: Instant,
+    last_ping: Instant,
 }
 
 impl<S: Read + Write> Conn<S> {
     fn new(ws: WebSocket<S>) -> Conn<S> {
+        let now = Instant::now();
         Conn {
             ws,
             peers: HashMap::new(),
             unflushed: 0,
+            last_read: now,
+            last_ping: now,
         }
     }
 
@@ -964,8 +1034,12 @@ impl<S: Read + Write> Conn<S> {
         let bytes = msg
             .encode()
             .map_err(|e| format!("encoding a relay message: {e}"))?;
-        let len = bytes.len() + FRAME_HEADER;
-        match self.ws.send(Message::binary(bytes)) {
+        self.write_frame(Message::binary(bytes))
+    }
+
+    fn write_frame(&mut self, message: Message) -> Result<(), String> {
+        let len = message.len() + FRAME_HEADER;
+        match self.ws.send(message) {
             Ok(()) => {
                 self.unflushed = 0;
                 Ok(())
@@ -1376,6 +1450,7 @@ mod tests {
             pace: Pace::new(Instant::now()),
             next_peer: 0,
             serial: 0,
+            timing: Timing::default(),
         };
         Routed {
             worker,
@@ -1415,6 +1490,84 @@ mod tests {
         fn events(&self) -> Vec<Event> {
             self.events.try_iter().collect()
         }
+    }
+
+    fn control_frame(message: Message) -> Vec<u8> {
+        let mut ws = WebSocket::from_raw_socket(
+            io::Cursor::new(Vec::new()),
+            tungstenite::protocol::Role::Server,
+            None,
+        );
+        ws.send(message).unwrap();
+        ws.into_inner().into_inner()
+    }
+
+    #[test]
+    fn a_silent_would_block_relay_is_lost_within_the_read_limit() {
+        let mut r = routed(Keypair::generate().unwrap(), usize::MAX);
+        r.worker.timing = Timing {
+            silence: Duration::from_secs(30),
+            keepalive: Duration::from_millis(10),
+        };
+        r.wire.lock().unwrap().stuck = true;
+        let now = Instant::now();
+        r.conn.last_read = now;
+        r.conn.last_ping = now - r.worker.timing.keepalive;
+        assert!(
+            r.worker.pump(&mut r.conn).is_none(),
+            "a blocked ping is not itself a loss"
+        );
+        r.conn.last_read = Instant::now() - r.worker.timing.silence;
+        let end = r.worker.pump(&mut r.conn);
+        assert!(matches!(end, Some(End::Lost { reason, up: true })
+            if reason == "the relay stopped answering; reconnecting"));
+        assert!(r.wire.lock().unwrap().writes > 0);
+    }
+
+    #[test]
+    fn buffered_relay_pings_refresh_silence_before_the_deadline_check() {
+        let mut r = routed(Keypair::generate().unwrap(), usize::MAX);
+        r.worker.timing.silence = Duration::from_millis(200);
+        for _ in 0..4 {
+            // A paused gateway drains buffered traffic before judging wall-clock silence.
+            r.conn.last_read = Instant::now() - r.worker.timing.silence * 2;
+            r.wire
+                .lock()
+                .unwrap()
+                .inbound
+                .extend(control_frame(Message::Ping(Default::default())));
+            assert!(r.worker.pump(&mut r.conn).is_none());
+            assert!(r.conn.last_read.elapsed() < r.worker.timing.silence);
+        }
+    }
+
+    #[test]
+    fn gateway_keepalive_pings_follow_the_interval_and_flush_blocked_writes() {
+        let mut r = routed(Keypair::generate().unwrap(), usize::MAX);
+        r.worker.timing.keepalive = Duration::from_secs(5);
+        let count = |wire: &Arc<Mutex<Wire>>| {
+            let mut ws = WebSocket::from_raw_socket(
+                io::Cursor::new(wire.lock().unwrap().outbound.clone()),
+                tungstenite::protocol::Role::Server,
+                None,
+            );
+            let mut pings = 0;
+            while let Ok(message) = ws.read() {
+                if matches!(message, Message::Ping(_)) {
+                    pings += 1;
+                }
+            }
+            pings
+        };
+        r.conn.last_ping -= r.worker.timing.keepalive;
+        r.rounds(1);
+        assert_eq!(count(&r.wire), 1);
+        r.rounds(1);
+        assert_eq!(count(&r.wire), 1);
+        r.conn.last_ping -= r.worker.timing.keepalive;
+        r.rounds(1);
+        assert_eq!(count(&r.wire), 2);
+        assert_eq!(r.conn.unflushed, 0);
     }
 
     fn device_hello() -> DeviceHello {
@@ -1904,3 +2057,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "link_half_open.rs"]
+mod half_open;

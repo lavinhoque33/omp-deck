@@ -291,6 +291,11 @@ Gateway (`crates/deck-service/src/gateway/remote/` + `engine/remote.rs`):
 - Stopping the link (relay change/clear, mode Off) never blocks the engine: it signals the thread and cuts an
   unconnected socket; the bounded join runs on a `gateway-relay-stop` thread (only `Engine::shutdown` waits); a link
   generation filters late events of a stopped link.
+- Link liveness (fix 2026-11-14, after a real 3 h outage: the relay closed an idle gateway at 75 s, the close never
+  arrived, the non-blocking reader kept seeing `WouldBlock` and the link stayed "up"): the gateway sends a WebSocket
+  Ping every 25 s while up and treats 75 s without any frame read from the relay (three missed relay pings) as lost
+  ("the relay stopped answering; reconnecting"), judged only after draining what is readable so a paused gateway
+  (swap/suspend) first reads what queued meanwhile; reconnect uses the normal backoff (restarted, the link was up).
 - An authentic application message from a device on a pairing session closes it with `close::APP_PROTOCOL` (4002);
   the token set reaches the relay unacknowledged, so a device connecting within milliseconds of `PairingStarted` may
   be refused once and retries. Wire-library logging (`tungstenite`, `tokio_tungstenite`, `rustls`, `tokio_rustls`) is
