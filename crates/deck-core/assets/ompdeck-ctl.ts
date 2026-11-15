@@ -14,10 +14,14 @@ import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 type ToolName = "open_session" | "notify" | "show_changes" | "request_review" | "sessions" | "send_prompt" | "wait_session" | "answer_question" | "finish_worktree" | "report" | "fan_out" | "watch_session" | "message_session";
 type ToolResult = { content: { type: "text"; text: string }[]; details?: Record<string, unknown>; isError?: boolean };
+type OutgoingLine = { bytes: Buffer; offset: number };
+type ClientWriter = { queue: OutgoingLine[]; bytes: number; closed: boolean; snapshot?: OutgoingLine };
 interface ToolClient {
-  data: { buf: string; snapshots: boolean; tools: boolean };
-  write(line: string): unknown;
+  data: { buf: string; snapshots: boolean; tools: boolean; writer: ClientWriter };
+  write(bytes: Uint8Array): number | boolean;
+  readonly writableLength?: number;
   destroy?(): void;
+  terminate?(): void;
 }
 const TOOL_NAMES: ToolName[] = ["open_session", "notify", "show_changes", "request_review", "sessions", "send_prompt", "wait_session", "answer_question", "finish_worktree", "report", "fan_out", "watch_session", "message_session"];
 const toolProcess = globalThis as typeof globalThis & { __ompdeckTools?: string[] };
@@ -303,6 +307,54 @@ export default async function ompdeckCtl(api: any) {
       const mainIdle = (): boolean | null => { try { return typeof mainCtx.isIdle === "function" ? !!mainCtx.isIdle() : null; } catch { return null; } };
       const mainLeaf = (): string | null => { try { return mainCtx.sessionManager.getLeafId?.() ?? null; } catch { return null; } };
 
+      const MAX_BACKLOG = 64 * 1024 * 1024;
+      const disconnect = (s: ToolClient) => {
+        // Bun may not emit close after an error/destroy; settle tools synchronously, idempotently.
+        onClose(s);
+        try { if (PIPE) s.destroy?.(); else s.terminate?.(); } catch {}
+      };
+      const drain = (s: ToolClient) => {
+        const writer = s.data.writer;
+        if (writer.closed) return;
+        try {
+          while (writer.queue.length) {
+            const entry = writer.queue[0];
+            const tail = entry.bytes.subarray(entry.offset);
+            const written = s.write(tail);
+            // node:net owns its buffer even when write returns false; Bun owns no unsent bytes.
+            if (typeof written === "number") {
+              if (written < 0) { disconnect(s); return; }
+              entry.offset += written;
+              writer.bytes -= written;
+              if (written > 0 && writer.snapshot === entry) writer.snapshot = undefined;
+              if (entry.offset < entry.bytes.length) return; // only drain may resume this tail
+            } else {
+              writer.bytes -= tail.length;
+              if (writer.snapshot === entry) writer.snapshot = undefined;
+            }
+            writer.queue.shift();
+            if ((s.writableLength ?? 0) + writer.bytes > MAX_BACKLOG) { disconnect(s); return; }
+          }
+        } catch { disconnect(s); }
+      };
+      const write = (s: ToolClient, line: string, snapshot = false) => {
+        const writer = s.data.writer;
+        if (writer.closed) return;
+        const bytes = Buffer.from(line);
+        const queued = snapshot ? writer.snapshot : undefined;
+        const wasEmpty = writer.queue.length === 0;
+        if (queued) {
+          writer.bytes += bytes.length - queued.bytes.length;
+          queued.bytes = bytes; // only untouched snapshots can be coalesced
+        } else {
+          const entry = { bytes, offset: 0 };
+          writer.queue.push(entry);
+          writer.bytes += bytes.length;
+          if (snapshot) writer.snapshot = entry;
+        }
+        if (writer.bytes + (s.writableLength ?? 0) > MAX_BACKLOG) { disconnect(s); return; }
+        if (wasEmpty) drain(s); // never retry a blocked socket until its drain notification
+      };
       // Only this main-session factory registers tools. Subagent factories never see these definitions.
       type PendingTool = { owner?: ToolClient; message: unknown; finish(result: ToolResult): void };
       const pendingTools = new Map<number, PendingTool>();
@@ -313,9 +365,9 @@ export default async function ompdeckCtl(api: any) {
         if (!owner) return;
         for (const entry of pendingTools.values()) {
           if (entry.owner) continue;
+          if (!clients.has(owner)) break;
           entry.owner = owner;
-          try { owner.write(JSON.stringify(entry.message) + "\n"); }
-          catch { entry.finish(toolResult("OmpDeck disconnected", true)); }
+          write(owner, JSON.stringify(entry.message) + "\n");
         }
       };
       const executeTool = async (name: ToolName, args: Record<string, unknown>, signal: AbortSignal | undefined, context: ExtensionContext): Promise<ToolResult> => {
@@ -328,7 +380,7 @@ export default async function ompdeckCtl(api: any) {
         const { promise, resolve } = Promise.withResolvers<ToolResult>();
         const abort = () => {
           const owner = pendingTools.get(id)?.owner;
-          if (owner) { try { owner.write(JSON.stringify({ t: "tool_cancel", id }) + "\n"); } catch {} }
+          if (owner) write(owner, JSON.stringify({ t: "tool_cancel", id }) + "\n");
           finish(cancelled);
         };
         const timer = setTimeout(() => {
@@ -621,14 +673,13 @@ export default async function ompdeckCtl(api: any) {
         } catch (e) { log("snapshot failed: " + e); }
         return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache, model: mainModel(), account: mainAccount(), progress: mainProgress(), pendingUi: [...pendingUi.values()].map(p => p.summary) };
       };
-      const write = (c: any, l: string) => { try { c.write(l); } catch {} };
       let lastSnapshot = "";
       const push = (m: unknown) => {
         if (!clients.size) return;
         let l: string; try { l = JSON.stringify(m) + "\n"; } catch { return; }
         if (l === lastSnapshot) return;
         lastSnapshot = l;
-        for (const c of clients) if (c.data.snapshots) write(c, l);
+        for (const c of clients) if (c.data.snapshots) write(c, l, true);
       };
       const schedule = () => { if (pending) return; pending = setTimeout(() => { pending = undefined; push(snapshot()); }, 50); };
 
@@ -1254,9 +1305,10 @@ export default async function ompdeckCtl(api: any) {
 
       // ---- endpoint ----
       const onOpen = (s: any) => {
-        s.data = { buf: "", snapshots: true, tools: false }; clients.add(s);
+        s.data = { buf: "", snapshots: true, tools: false, writer: { queue: [], bytes: 0, closed: false } }; clients.add(s);
         const tools = toolProcess.__ompdeckTools ?? [];
-        write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid, ui_hook: uiState.hook, ...(tools.length ? { features: ["tools", "deliver", "deliver_no_wake"], tools } : {}) }) + "\n" + JSON.stringify(snapshot()) + "\n");
+        write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid, ui_hook: uiState.hook, ...(tools.length ? { features: ["tools", "deliver", "deliver_no_wake"], tools } : {}) }) + "\n");
+        write(s, JSON.stringify(snapshot()) + "\n", true);
       };
       const onData = (s: any, chunk: any) => {
         const st = s.data; if (!st) return;
@@ -1269,7 +1321,7 @@ export default async function ompdeckCtl(api: any) {
           if (cmd.t === "subscribe") {
             if (typeof cmd.snapshots !== "boolean" || typeof cmd.tools !== "boolean") { reply(s, cmd.rid, { ok: false, error: "bad subscription" }); continue; }
             st.snapshots = cmd.snapshots; st.tools = cmd.tools;
-            if (st.snapshots) write(s, JSON.stringify(snapshot()) + "\n");
+            if (st.snapshots) write(s, JSON.stringify(snapshot()) + "\n", true);
             reply(s, cmd.rid, { ok: true });
             dispatchTools();
             continue;
@@ -1291,6 +1343,13 @@ export default async function ompdeckCtl(api: any) {
         }
       };
       const onClose = (s: ToolClient) => {
+        const writer = s.data?.writer;
+        if (writer) {
+          writer.closed = true;
+          writer.queue.length = 0;
+          writer.bytes = 0;
+          writer.snapshot = undefined;
+        }
         clients.delete(s);
         for (const entry of pendingTools.values()) if (entry.owner === s) entry.finish(toolResult("OmpDeck disconnected", true));
       };
@@ -1393,7 +1452,7 @@ export default async function ompdeckCtl(api: any) {
         try {
           bun = Bun.listen<object>({
             unix: sockPath,
-            socket: { open: onOpen, close: onClose, error: onClose, data: onData },
+            socket: { open: onOpen, close: onClose, error: disconnect, data: onData, drain },
           });
         } catch (e) { log("listen failed: " + e); unlock(); return; }
         server = { stop() { try { bun.stop(true); } catch {} } };

@@ -2083,3 +2083,101 @@ fn snapshots_only_client_delivers_but_cannot_complete_another_clients_tool() {
         live.main_idle().then_some(())
     });
 }
+
+/// The real ask UI supplies >1 MiB of state, without a test-only extension or registry records.
+/// This exceeds Unix socket buffers even when the ctl worker is already reading.
+#[test]
+fn large_snapshot_preserves_utf8_and_the_following_tool_round_trip() {
+    const TEXT: &str = "界";
+    let Some(live) = Live::start_with_tools(
+        "ctl-large",
+        |request| {
+            if !fm::has_tools(request) {
+                return Reply::text("Side request");
+            }
+            let tools = fm::after_last_user(request)
+                .iter()
+                .filter(|message| fm::role(message) == "tool")
+                .count();
+            match tools {
+                0 => {
+                    let block = format!("<pre>{}</pre>", TEXT.repeat(6000));
+                    let section = format!(
+                        "<fieldset><legend>Large state</legend>{}</fieldset>",
+                        block.repeat(35)
+                    );
+                    Reply::tool_call(
+                        "ask",
+                        &json!({"html":format!(
+                            "<form>{section}{section}<label><input type=\"radio\" name=\"pick\" value=\"yes\"> yes</label></form>"
+                        )}),
+                    )
+                }
+                1 => Reply::tool_call(
+                    "ompdeck_notify",
+                    &json!({"title":"After the large snapshot"}),
+                ),
+                _ => Reply::text("Large snapshot round trip finished."),
+            }
+        },
+        |_| {},
+        |_| None,
+        Some("notify"),
+    ) else {
+        eprintln!("skipping: OMPDECK_TEST_OMP is not set");
+        return;
+    };
+    subscribe(&live, true);
+    live.send("large-snapshot");
+    let snapshot = wait_for("an intact snapshot larger than 1 MiB", TURN, || {
+        let snapshot = live.client().latest()?;
+        let bytes = serde_json::to_vec(snapshot.as_ref()).unwrap().len();
+        (bytes >= 1024 * 1024 && !snapshot.pending_ui.is_empty()).then_some(snapshot)
+    });
+    let bytes = serde_json::to_vec(snapshot.as_ref()).unwrap().len();
+    eprintln!("intact ctl snapshot: {bytes} bytes");
+    let form = snapshot.pending_ui[0].form.as_ref().expect("real ask form");
+    let text: Vec<_> = form
+        .sections
+        .iter()
+        .flat_map(|section| &section.blocks)
+        .filter_map(|block| match block {
+            deck_core::ctl::UiFormBlock::Pre { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text.len(), 70);
+    let expected = TEXT.repeat(6000);
+    assert!(text.iter().all(|text| **text == expected));
+    let answer = live.ctl(
+        CtlCommand::AnswerUi {
+            id: snapshot.pending_ui[0].id,
+            value: json!({"fields":[{"checked":[0],"other":null}]}),
+            root: snapshot.session_file.clone().expect("session root"),
+            pid: Some(snapshot.pid),
+        },
+        TURN,
+    );
+    assert!(answer.ok, "{answer:?}");
+    let request = request(live.client());
+    assert_eq!(request.name, "notify");
+    assert!(request.connection >= 1);
+    let after = live.model.count();
+    let rid = live.client().send_on(
+        request.connection,
+        CtlCommand::ToolResult {
+            id: request.id,
+            ok: true,
+            text: RESULT.into(),
+            details: None,
+        },
+    );
+    let reply = wait_for("the connection-fenced result acknowledgement", TURN, || {
+        live.client()
+            .take_replies()
+            .into_iter()
+            .find_map(|(id, reply)| (id == rid).then_some(reply))
+    });
+    assert!(reply.ok, "{reply:?}");
+    next_model_result(&live, after, RESULT);
+}

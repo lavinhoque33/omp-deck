@@ -16,6 +16,28 @@ use deck_core::usage::OAuthIdentity;
 
 const HELLO: &str = r#"{"t":"hello","v":1,"pid":4242}"#;
 
+#[test]
+fn extension_writer_preserves_bytes_order_coalescing_and_backlog_limit() {
+    let bun = std::env::var_os("OMPDECK_TEST_BUN").unwrap_or_else(|| "bun".into());
+    let output = match std::process::Command::new(bun)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/ctl_writer.ts"))
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping: Bun is not installed (set OMPDECK_TEST_BUN)");
+            return;
+        }
+        Err(error) => panic!("starting Bun writer regression: {error}"),
+    };
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn snapshot_line(pid: u32, agents: &str) -> String {
     let agents = agents.replace('\n', "");
     format!(
@@ -223,6 +245,7 @@ fn tool_pushes_and_desired_subscription_survive_reconnect() {
         [
             deck_core::ctl::ToolEvent::Request(deck_core::ctl::ToolRequest {
                 id: 9,
+                connection: 1,
                 name: "notify".into(),
                 args: serde_json::json!({"title":"Done"}),
                 root: Some("/s/main.jsonl".into()),
@@ -248,6 +271,85 @@ fn tool_pushes_and_desired_subscription_survive_reconnect() {
         serde_json::from_str::<serde_json::Value>(&line).unwrap(),
         serde_json::json!({"rid":0,"t":"subscribe","snapshots":false,"tools":true})
     );
+}
+
+#[test]
+fn send_on_refuses_old_connections_even_when_tool_ids_restart() {
+    use deck_core::ctl::ToolEvent;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = fake(tmp.path());
+    let client = CtlClient::spawn(tmp.path().to_owned(), || {});
+    let mut s = srv.accept();
+    say(&mut s, HELLO);
+    let take_request = || {
+        let mut request = None;
+        wait_for("a connection-stamped tool request", || {
+            request = client.take_tool_requests().into_iter().find_map(|event| {
+                if let ToolEvent::Request(request) = event {
+                    Some(request)
+                } else {
+                    None
+                }
+            });
+            request.is_some()
+        });
+        request.unwrap()
+    };
+    let tool = r#"{"t":"tool","id":1,"name":"notify","args":{},"root":null}"#;
+    say(&mut s, tool);
+    let first = take_request();
+    assert_eq!(first.connection, 1);
+    drop(s);
+    wait_for("disconnect", || !client.connected());
+    let offline = client.send_on(
+        first.connection,
+        CtlCommand::ToolResult {
+            id: first.id,
+            ok: true,
+            text: "offline".into(),
+            details: None,
+        },
+    );
+    let mut replies = Vec::new();
+    wait_for("offline refusal", || {
+        replies.extend(client.take_replies());
+        replies
+            .iter()
+            .any(|(id, reply)| *id == offline && !reply.ok)
+    });
+    let mut s = srv.accept();
+    say(&mut s, HELLO);
+    say(&mut s, tool);
+    let second = take_request();
+    assert_eq!(second.id, first.id);
+    assert_eq!(second.connection, 2);
+    let result = |text: &str| CtlCommand::ToolResult {
+        id: 1,
+        ok: true,
+        text: text.into(),
+        details: None,
+    };
+    let stale = client.send_on(first.connection, result("stale"));
+    let current = client.send_on(second.connection, result("current"));
+    let mut line = String::new();
+    BufReader::new(s.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+        serde_json::json!({"t":"tool_result","rid":current,"id":1,"ok":true,"text":"current"})
+    );
+    say(
+        &mut s,
+        &format!(r#"{{"t":"reply","rid":{current},"ok":true}}"#),
+    );
+    wait_for("stale refusal and current acknowledgement", || {
+        replies.extend(client.take_replies());
+        replies.iter().any(|(id, reply)| {
+            *id == stale && !reply.ok && reply.error.as_deref() == Some("connection changed")
+        }) && replies.iter().any(|(id, reply)| *id == current && reply.ok)
+    });
 }
 
 #[test]

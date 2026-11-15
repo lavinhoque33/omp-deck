@@ -5229,3 +5229,43 @@ own Settings toggle.
 - Smoke (`~/omp-deck-tools-smoke/94*`, `95`, `96*`): two GUI-opened sessions, A background-watches B → Watches card
   (Background badge, hover buttons) → B's turn ends → A gets "Watch: Worker B (2a62879c) completed" and acts; Stop watching
   → "Stopped by the user"; B messages A → A wakes with "Message from Worker B (2a62879c)"; Settings shows 13 tool toggles.
+
+## ctl stream integrity + tool-result routing (user, 2026-11-14)
+
+Cause (reproduced): on Unix the extension serves ctl with `Bun.listen`, whose `socket.write` is unbuffered and
+non-blocking: it returns the bytes written and **drops the rest** (omp 18.20.2 embeds Bun 1.4.4; a 1 MiB write returned
+219 264 bytes and the remainder never arrived; `drain` fired). The extension ignored the return value, so a snapshot
+larger than the socket send buffer (a long session's `agents` list, ~220 KB) was cut without its newline; the next
+line (a `tool` request) was glued on, the gateway dropped the unparsable line, and the tool call waited forever (seen:
+a background `ompdeck_watch_session` never registered, `ctl: oversized line dropped` in gateway.log).
+
+- **Extension (`deck-core/assets/ompdeck-ctl.ts`)**: every byte to a ctl client goes through one per-connection writer
+  (hello + first snapshot, snapshots, replies, `tool`, `tool_cancel`). Unix: encode the line to bytes, write, keep the
+  unsent tail in a per-connection FIFO, resume it from the socket's `drain` handler; while the FIFO is non-empty new
+  lines are only appended (order preserved). A queued snapshot that has not started sending is replaced by the newer
+  one (state, latest wins); hello, replies, `tool`, `tool_cancel` are never dropped or reordered. A connection whose
+  backlog exceeds 64 MiB (client not reading) is destroyed (its pending tools resolve "OmpDeck disconnected" as today).
+  Windows (`net` sockets buffer internally) uses the same writer API; pass-through is fine there.
+- **deck-core `ctl.rs`**: `ToolRequest.connection: u64` = the client's connection serial (incremented on every accepted
+  `hello`, first connection = 1). `CtlClient::send_on(connection: u64, cmd: CtlCommand) -> u64` queues like `send`, but
+  the worker writes it only on that connection; otherwise the reply is `ok:false` "connection changed" (a stale
+  `tool_result` can never reach another omp process whose tool ids restart at 1).
+- **deck-service**: a pending agent tool remembers its request's `connection`; every `tool_result` (finish, route
+  rejection, expiry, `stop_agent_tools`) is sent with `send_on(connection, …)` over the managed session's current live
+  link (looked up by `target.key`), **regardless of the controller generation**. The generation/root fence still decides
+  whether a request is valid (expiry "OmpDeck request expired or the session ended", "The session changed"), but it no
+  longer suppresses the reply. No link / not connected: nothing can be sent; the extension already resolves the call
+  "OmpDeck disconnected" on close (see "As built (agent tools)": buffered tool events are cleared on reset).
+
+### As built (ctl writer, 2026-11-14)
+- Extension: per-client byte FIFO resumed from Bun's `drain`, not-yet-started snapshot coalescing, 64 MiB backlog →
+  disconnect. `ToolRequest.connection` / `CtlClient::send_on` implemented in `ctl.rs`.
+- Bun 1.4.4 (embedded in omp 18.20.2) observed: first write = 219 264, next = 0, received = 219 264, `drain` fired once,
+  write after terminate = −1.
+- Live gate `deck-core/tests/agent_tools_live.rs::large_snapshot_preserves_utf8_and_the_following_tool_round_trip`:
+  a 1 263 450-byte UTF-8 `ask` form in the snapshot, then a tool round trip. The pre-fix asset fails (timeout, 62 s);
+  the fixed one passes (4 s).
+- Gateway: `Pending.connection`; every result path (finish, rejections, expiry, `stop_agent_tools`) uses `send_on`;
+  `reply_acks` retention is keyed by session key + connected link, no longer by generation. Live gate
+  `deck-service/tests/tool_result_routing.rs::pending_tool_generation_change_still_returns_exactly_once`
+  (`OMPDECK_TEST_OMP`): it fails with the old generation fence.

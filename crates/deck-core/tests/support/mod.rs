@@ -199,6 +199,10 @@ impl Live {
         let data = live.root.join("data");
         let key_file = data.join("ctl.key");
         let ext = install_extension(&data).expect("install ctl extension");
+        // Replay regressions against a separately saved extension without mutating the worktree.
+        if let Some(source) = std::env::var_os("OMPDECK_TEST_CTL_ASSET") {
+            std::fs::copy(source, &ext).expect("override ctl extension");
+        }
         prepare_ctl_dir(&ctl).expect("ctl dir");
         let mut launch_env = env;
         launch_env.extend(

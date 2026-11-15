@@ -2059,6 +2059,7 @@ mod tests {
             super::super::Pending {
                 target: target.clone(),
                 tool_id: 7,
+                connection: 1,
                 root: Some(PathBuf::from("nested-opener.jsonl")),
                 deadline: None,
                 review: None,

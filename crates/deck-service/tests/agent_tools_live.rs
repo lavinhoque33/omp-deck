@@ -1210,30 +1210,6 @@ fn exercise_forwarded_child_questions() {
     }
 }
 
-/// Make the selected real binary visible to both fixture admission and Omp::detect.
-fn test_omp_override() -> Option<tempfile::TempDir> {
-    let binary = std::env::var_os("OMPDECK_TEST_OMP")?;
-    let binary = std::fs::canonicalize(binary).expect("OMPDECK_TEST_OMP must name a real binary");
-    assert!(binary.is_file(), "OMPDECK_TEST_OMP must name a file");
-    let dir = tempfile::tempdir().expect("omp override directory");
-    let target = dir
-        .path()
-        .join(if cfg!(windows) { "omp.exe" } else { "omp" });
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&binary, &target).expect("link selected omp");
-    #[cfg(windows)]
-    std::fs::copy(&binary, &target).expect("copy selected omp");
-    let mut paths = vec![dir.path().to_path_buf()];
-    paths.extend(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    ));
-    // SAFETY: the sole test calls this before any fixture/model/gateway threads start.
-    unsafe {
-        std::env::set_var("PATH", std::env::join_paths(paths).expect("override PATH"));
-    }
-    Some(dir)
-}
-
 fn fixture_git(repo: &Path, args: &[&str]) -> String {
     let output = ProcessCommand::new("git")
         .current_dir(repo)
@@ -2916,7 +2892,7 @@ fn exercise_unrelated_session_watch_and_messages() {
 #[test]
 fn real_agent_tools_notify_list_review_and_require_a_window() {
     // Sandbox owns process-wide HOME/XDG variables: keep all scenarios in one test.
-    let _omp_override = test_omp_override();
+    let _omp_override = support::test_omp_override();
     exercise_notify_list_review_and_require_a_window();
     exercise_open_wait_send_follow_up_draft_and_stale_handle();
     exercise_background_wait_idle_and_busy_delivery();

@@ -909,6 +909,8 @@ pub struct CtlReply {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolRequest {
     pub id: u64,
+    /// Client connection serial at receipt; first accepted hello is connection 1.
+    pub connection: u64,
     /// Short name, without the `ompdeck_` prefix.
     pub name: String,
     pub args: serde_json::Value,
@@ -1453,6 +1455,7 @@ impl Default for Subscription {
 #[derive(Default)]
 struct Shared {
     connected: AtomicBool,
+    connection: AtomicU64,
     ui_hook: AtomicBool,
     shutdown: AtomicBool,
     next_id: AtomicU64,
@@ -1469,7 +1472,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 enum WorkerMessage {
-    Command(u64, CtlCommand),
+    Command(u64, Option<u64>, CtlCommand),
     Shutdown,
 }
 
@@ -1554,14 +1557,30 @@ impl CtlClient {
     /// Queued; the reply arrives via [`take_replies`](Self::take_replies) (and `on_update` fires).
     /// Not connected → the reply is `ok: false`. Returns the request id.
     pub fn send(&self, cmd: CtlCommand) -> u64 {
-        if let CtlCommand::Subscribe { snapshots, tools } = &cmd {
+        self.queue(None, cmd)
+    }
+
+    /// Queue only for the connection that produced a [`ToolRequest`]. A different connection
+    /// receives no bytes and yields an `ok: false` reply with "connection changed".
+    pub fn send_on(&self, connection: u64, cmd: CtlCommand) -> u64 {
+        self.queue(Some(connection), cmd)
+    }
+
+    fn queue(&self, connection: Option<u64>, cmd: CtlCommand) -> u64 {
+        if let CtlCommand::Subscribe { snapshots, tools } = &cmd
+            && connection.is_none()
+        {
             *lock(&self.shared.subscription) = Subscription {
                 snapshots: *snapshots,
                 tools: *tools,
             };
         }
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        if self.commands.send(WorkerMessage::Command(id, cmd)).is_err() {
+        if self
+            .commands
+            .send(WorkerMessage::Command(id, connection, cmd))
+            .is_err()
+        {
             lock(&self.shared.replies).push((id, failure("control client stopped")));
         }
         id
@@ -1635,7 +1654,7 @@ impl Worker {
     /// Sleeps up to `d` while rejecting commands (nothing is connected). False = shutdown.
     fn wait(&mut self, d: Duration) -> bool {
         match self.commands.recv_timeout(d) {
-            Ok(WorkerMessage::Command(id, _)) => {
+            Ok(WorkerMessage::Command(id, _, _)) => {
                 lock(&self.shared.replies).push((id, failure("not connected")));
                 (self.on_update)();
                 !self.stopping()
@@ -1679,14 +1698,24 @@ impl Worker {
                 return Exit::Shutdown;
             }
             while let Ok(message) = self.commands.try_recv() {
-                let WorkerMessage::Command(id, cmd) = message else {
+                let WorkerMessage::Command(id, connection, cmd) = message else {
                     return Exit::Shutdown;
                 };
                 if !hello {
                     lock(&self.shared.replies).push((id, failure("not connected")));
                     (self.on_update)();
+                } else if connection
+                    .is_some_and(|serial| serial != self.shared.connection.load(Ordering::Relaxed))
+                {
+                    lock(&self.shared.replies).push((id, failure("connection changed")));
+                    (self.on_update)();
                 } else if stream.write_all(&encode(id, &cmd)).is_ok() {
                     self.pending.insert(id);
+                    if let CtlCommand::Subscribe { snapshots, tools } = cmd
+                        && connection.is_some()
+                    {
+                        *lock(&self.shared.subscription) = Subscription { snapshots, tools };
+                    }
                 } else {
                     lock(&self.shared.replies).push((id, failure("write failed")));
                     return Exit::Disconnected;
@@ -1792,6 +1821,7 @@ impl Worker {
                     log::warn!("ctl: unsupported protocol version {v}");
                     return false;
                 }
+                self.shared.connection.fetch_add(1, Ordering::Relaxed);
                 self.shared.ui_hook.store(ui_hook, Ordering::Release);
                 *lock(&self.shared.features) = features;
                 *lock(&self.shared.tools) = tools;
@@ -1824,6 +1854,7 @@ impl Worker {
             } if *hello => {
                 lock(&self.shared.tool_requests).push(ToolEvent::Request(ToolRequest {
                     id,
+                    connection: self.shared.connection.load(Ordering::Relaxed),
                     name,
                     args,
                     root,
@@ -2153,6 +2184,7 @@ mod tests {
             client.take_tool_requests(),
             [ToolEvent::Request(ToolRequest {
                 id: 2,
+                connection: 2,
                 name: "sessions".into(),
                 args: serde_json::json!({}),
                 root: None,

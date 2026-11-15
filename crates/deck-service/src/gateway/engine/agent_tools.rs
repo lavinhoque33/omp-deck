@@ -34,6 +34,8 @@ pub(super) struct AgentTools {
 struct Pending {
     target: SessionTarget,
     tool_id: u64,
+    // The extension's pending call belongs to this socket, not a controller generation.
+    connection: u64,
     root: Option<PathBuf>,
     deadline: Option<Instant>,
     review: Option<ServerEvent>,
@@ -150,11 +152,11 @@ impl Engine {
             }
         }
         let sessions = &self.sess;
+        // A generation change expires a request, not the acknowledgement of its verdict.
         self.agent_tools.reply_acks.retain(|(target, _)| {
             sessions.find(&target.key).is_some_and(|i| {
                 let m = &sessions.managed[i];
-                m.ctl.target() == target
-                    && m.live.as_ref().is_some_and(|link| link.client.connected())
+                m.live.as_ref().is_some_and(|link| link.client.connected())
             })
         });
         self.agent_tools
@@ -221,20 +223,31 @@ impl Engine {
         })
     }
 
-    fn tool_result(&mut self, target: &SessionTarget, id: u64, ok: bool, text: String) {
+    fn tool_result(
+        &mut self,
+        target: &SessionTarget,
+        connection: u64,
+        id: u64,
+        ok: bool,
+        text: String,
+    ) {
         if let Some(i) = self.sess.find(&target.key) {
             let m = &self.sess.managed[i];
-            if m.ctl.target() == target
-                && let Some(link) = &m.live
-            {
-                let rid = link.client.send(CtlCommand::ToolResult {
-                    id,
-                    ok,
-                    text,
-                    details: None,
-                });
+            // Path/generation changes still owe the original connection its result.
+            if let Some(link) = &m.live {
+                let rid = link.client.send_on(
+                    connection,
+                    CtlCommand::ToolResult {
+                        id,
+                        ok,
+                        text,
+                        details: None,
+                    },
+                );
                 // Keep a tool-only issuer attached until the extension received its result.
-                self.agent_tools.reply_acks.push((target.clone(), rid));
+                self.agent_tools
+                    .reply_acks
+                    .push((m.ctl.target().clone(), rid));
             }
         }
     }
@@ -247,7 +260,7 @@ impl Engine {
         if p.review.is_some() {
             self.to_guis(&ServerEvent::AgentReviewCancel { request });
         }
-        self.tool_result(&p.target, p.tool_id, ok, text);
+        self.tool_result(&p.target, p.connection, p.tool_id, ok, text);
     }
 
     fn route_agent_tool(&mut self, target: SessionTarget, req: ToolRequest, now: Instant) {
@@ -265,12 +278,19 @@ impl Engine {
             req.root.as_deref(),
         ) || m.exited()
         {
-            self.tool_result(&target, req.id, false, "The session changed".to_owned());
+            self.tool_result(
+                &target,
+                req.connection,
+                req.id,
+                false,
+                "The session changed".to_owned(),
+            );
             return;
         }
         if req.name != "fan_out" && self.agent_tools.at_capacity(&target) {
             self.tool_result(
                 &target,
+                req.connection,
                 req.id,
                 false,
                 "too many pending OmpDeck requests".to_owned(),
@@ -283,6 +303,7 @@ impl Engine {
             if let Err(error) = getrandom::fill(&mut bytes) {
                 self.tool_result(
                     &target,
+                    req.connection,
                     req.id,
                     false,
                     format!("Cannot identify OmpDeck request: {error}"),
@@ -301,6 +322,7 @@ impl Engine {
             Pending {
                 target: target.clone(),
                 tool_id: req.id,
+                connection: req.connection,
                 root: req.root,
                 deadline: None,
                 review: None,
@@ -678,15 +700,16 @@ impl Engine {
             }
             if let Some(i) = self.sess.find(&pending.target.key) {
                 let m = &self.sess.managed[i];
-                if m.ctl.target() == &pending.target
-                    && let Some(link) = &m.live
-                {
-                    let id = link.client.send(CtlCommand::ToolResult {
-                        id: pending.tool_id,
-                        ok: false,
-                        text: "OmpDeck is shutting down".to_owned(),
-                        details: None,
-                    });
+                if let Some(link) = &m.live {
+                    let id = link.client.send_on(
+                        pending.connection,
+                        CtlCommand::ToolResult {
+                            id: pending.tool_id,
+                            ok: false,
+                            text: "OmpDeck is shutting down".to_owned(),
+                            details: None,
+                        },
+                    );
                     acknowledgements.entry(i).or_insert_with(Vec::new).push(id);
                 }
             }
@@ -885,6 +908,7 @@ mod tests {
                 Pending {
                     target: t.clone(),
                     tool_id: id,
+                    connection: 1,
                     root: None,
                     deadline: None,
                     review: Some(ServerEvent::AgentReviewRequest {
