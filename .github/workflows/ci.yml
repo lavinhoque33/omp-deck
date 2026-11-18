@@ -22,7 +22,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install system dependencies
         run: |
-          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt
+          # APT falls back per download; keep the independent mirror first.
+          printf '%s\tpriority:%s\n' \
+            'https://mirrors.edge.kernel.org/ubuntu' 1 \
+            'https://archive.ubuntu.com/ubuntu' 2 | sudo tee /etc/apt/apt-mirrors.txt
           sudo apt-get --error-on=any update
           sudo apt-get install -y --no-install-recommends \
             tmux pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev \

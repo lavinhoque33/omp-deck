@@ -711,7 +711,7 @@ mod tests {
         child.file = Some(old.clone());
         child.relocation = Some(ChildRelocation {
             old,
-            destination: destination.clone(),
+            destination: canonical(&destination),
             until: now + DELIVERY,
             delivered: true,
             new: None,

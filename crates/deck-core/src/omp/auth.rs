@@ -552,6 +552,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_answer(dir.path(), 42, "old").unwrap();
         let path = dir.path().join("answer-42.json");
+        // Windows MoveFileEx cannot replace an open destination. The helper closes its read
+        // before consuming the answer; only Unix guarantees an old reader survives replacement.
+        #[cfg(unix)]
         let previous = File::open(&path).unwrap();
         write_answer(dir.path(), 42, "\"secret\"\n").unwrap();
         let current: Value = serde_json::from_reader(File::open(&path).unwrap()).unwrap();
@@ -568,8 +571,6 @@ mod tests {
                 json!({"value":"old"})
             );
         }
-        #[cfg(not(unix))]
-        drop(previous);
         let names: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())

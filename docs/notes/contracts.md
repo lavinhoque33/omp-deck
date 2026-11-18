@@ -1782,8 +1782,9 @@ Facts + user decisions: `docs/notes/wave14.md`. New workspace deps (root `Cargo.
   an update from an older GUI. A same-version bundle may be downloaded to align that GUI, but downloads
   older than the running gateway are refused. The phone's Updates feed still offers only releases newer
   than the gateway, so it never advertises a same-version reinstall or downgrade.
-- Linux CI/release package setup uses an independent HTTPS Ubuntu archive mirror with Ubuntu's normal
-  signature checks; `apt-get update` fails on any index error. A workflow-only repair after tagging may
+- Linux CI/release package setup uses the independent HTTPS Ubuntu mirror first, with APT's
+  per-download fallback to Canonical's archive and normal Ubuntu signature checks.
+  `apt-get update` fails on any remaining index error. A workflow-only repair after tagging may
   use the dry run's Linux-only recovery input and reuse already-passed platforms whose application
   sources are identical. The version tag stays immutable; publication waits for every normal platform
   gate and the complete checksummed payload set.

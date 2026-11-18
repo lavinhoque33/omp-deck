@@ -543,6 +543,9 @@ mod tests {
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).expect("temporary repo");
         git(&repo, &["init", "-q"]);
+        // The fixture asserts exact LF bytes after checkout, independent of the host Git config.
+        git(&repo, &["config", "--local", "core.autocrlf", "false"]);
+        git(&repo, &["config", "--local", "core.eol", "lf"]);
         fs::write(repo.join("tracked"), "before\n").expect("tracked file");
         git(&repo, &["add", "--", "tracked"]);
         git(

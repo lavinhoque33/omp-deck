@@ -1114,10 +1114,9 @@ mod tests {
         append(&path, &[user("work")]);
         let mut watch = TurnWatch::new(path.clone(), 0, None);
         watch.poll().unwrap();
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
+        // An append-only Windows handle lacks the write access required by set_len.
+        let mut file = File::options().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
         file.write_all(b"{\"half\":").unwrap();
         watch.poll().unwrap();
         file.set_len(watch.line_start).unwrap();
