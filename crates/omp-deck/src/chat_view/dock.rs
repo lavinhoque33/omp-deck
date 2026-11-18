@@ -516,7 +516,7 @@ fn working(cx: &Cx, ui: &mut Ui, n: &SNode) {
     egui::Frame::new()
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.set_width(w - 12.0);
+            ui.set_width((w - 12.0).max(0.0));
             ui.spacing_mut().item_spacing.x = 8.0;
             let tx = Tx {
                 font: ink.label(12.0),
@@ -524,23 +524,38 @@ fn working(cx: &Cx, ui: &mut Ui, n: &SNode) {
                 line: None,
             };
             cx.with_tx(tx, || {
-                let kids: Vec<&SNode> = cx.snap.kids(n).filter(|c| !blank(cx, c)).collect();
-                // Everything but the stop control on the left, the control at the right edge.
-                let (stop, rest): (Vec<&SNode>, Vec<&SNode>) = kids
-                    .into_iter()
-                    .partition(|c| c.role() == "omp.working.stop");
+                let stop = cx
+                    .snap
+                    .kids(n)
+                    .find(|c| c.role() == "omp.working.stop" && !blank(cx, c));
+                let w = ui.available_width();
+                let gap = ui.spacing().item_spacing.x;
+                let stop_w = stop.map_or(0.0, |c| {
+                    render::measure_child(cx, ui, ("working-stop", &c.id), c).min(w)
+                });
+                // The status fills only the space that remains after reserving Stop.
+                let status_w = if stop.is_some() {
+                    (w - stop_w - gap).max(0.0)
+                } else {
+                    w
+                };
                 ui.horizontal(|ui| {
-                    for c in &rest {
-                        if c.kind == "spacer" {
-                            continue;
-                        }
-                        render::node(cx, ui, c);
+                    let h = ui.spacing().interact_size.y;
+                    ui.allocate_ui_with_layout(
+                        vec2(status_w, h),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.set_min_width(status_w);
+                            for c in cx.snap.kids(n) {
+                                if c.role() != "omp.working.stop" && c.kind != "spacer" {
+                                    render::node(cx, ui, c);
+                                }
+                            }
+                        },
+                    );
+                    if let Some(stop) = stop {
+                        render::bounded_child(cx, ui, stop, stop_w);
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        for c in &stop {
-                            render::node(cx, ui, c);
-                        }
-                    });
                 });
             });
         });

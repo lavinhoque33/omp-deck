@@ -3474,6 +3474,8 @@ cards; composer floats detached from the bottom edge with a shadow. Visual langu
 the running tool glows (animated, respects reduce-motion), glass-like elevated composer with a gradient outline.
 Type: prose 15 px / 1.6 (proportional UI face), mono 12.5–13 px (terminal font), labels ≥ 11 px; measure ≤ ~880 px
 centered; Blueprint by default but colors come from the active style (all 18 styles, light included).
+The composer shares the transcript's width. On the working line, reserve space for Stop and
+elide long status text before layout so it cannot displace the Todo chip or widen the composer.
 Default view stays **Terminal**; chat is opt-in (user).
 
 ### Step 2 as built (2026-11-02)

@@ -1263,11 +1263,16 @@ pub fn spin(cx: &Cx, ui: &mut Ui, d: f32, color: Color32) -> Response {
 
 fn shimmer(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let text = text::node_plain(n);
-    shimmer_text(cx, ui, &text, cx.ink.label(13.0));
+    let wrap = if n.role() == "omp.working.label" {
+        TextWrapMode::Truncate
+    } else {
+        TextWrapMode::Extend
+    };
+    shimmer_text(cx, ui, &text, cx.ink.label(13.0), wrap);
 }
 
 /// Text with a highlight sweeping through it (a steady accent when motion is reduced).
-pub fn shimmer_text(cx: &Cx, ui: &mut Ui, text: &str, font: FontId) {
+fn shimmer_text(cx: &Cx, ui: &mut Ui, text: &str, font: FontId, wrap: TextWrapMode) {
     let ink = cx.ink;
     let mut job = LayoutJob::default();
     let chars: Vec<char> = text.chars().collect();
@@ -1298,11 +1303,7 @@ pub fn shimmer_text(cx: &Cx, ui: &mut Ui, text: &str, font: FontId) {
             },
         );
     }
-    ui.add(
-        egui::Label::new(job)
-            .wrap_mode(TextWrapMode::Extend)
-            .selectable(false),
-    );
+    ui.add(egui::Label::new(job).wrap_mode(wrap).selectable(false));
 }
 
 fn progress(cx: &Cx, ui: &mut Ui, n: &SNode) {

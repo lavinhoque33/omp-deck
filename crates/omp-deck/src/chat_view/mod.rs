@@ -1207,6 +1207,72 @@ mod tests {
     }
 
     #[test]
+    fn long_working_status_with_todos_does_not_widen_the_chat_composer() {
+        use serde_json::json;
+
+        let status = "Waiting for background job playlist sync; agent ".repeat(6);
+        let working = json!({"id":"working","k":"row","p":{"role":"omp.working"},"c":[
+            {"id":"spinner","k":"spinner"},
+            {"id":"label","k":"shimmer","p":{"role":"omp.working.label","spans":[{"t":status}]}},
+            {"id":"stop","k":"row","p":{"role":"omp.working.stop","actions":{"click":"interrupt"}},"c":[
+                {"id":"stop-text","k":"text","p":{"spans":[{"t":"Stop current job"}]}}
+            ]}
+        ]});
+        let todo = json!({"id":"todo","k":"checklist","p":{"role":"omp.hud.todo","mode":"hud","phases":[
+            {"items":[{"status":"active","text":"Verify playlist order and playback after reconnecting"}]}
+        ]}});
+        let dock = json!({"id":"dock","k":"col","c":[
+            {"id":"activity","k":"row","p":{"role":"omp.hud.activity"},"c":[
+                {"id":"status","k":"col","p":{"role":"omp.hud.status"},"c":[working]},
+                todo
+            ]},
+            {"id":"composer","k":"col","p":{"role":"omp.editor"},"c":[
+                {"id":"input","k":"editor","p":{"text":"","placeholder":"Compose a reply"}}
+            ]}
+        ]});
+        let frame = json!([["del", "dock"], ["add", "dock", "s:1", null, dock]]);
+        let mut h = Harness::with_frames("working-status-width", &[frame]);
+        h.width = 1488.0;
+        h.wait_for("working status frame", |doc| {
+            doc.surface("s:1").and_then(|s| s.last_seq()) == Some(64)
+        });
+        let out = h.settle();
+        let galleys = galleys(&out);
+        let label = galleys.iter().find(|(_, _, text)| *text == status).unwrap();
+        let stop = galleys
+            .iter()
+            .find(|(_, _, text)| text == "Stop current job")
+            .unwrap();
+        let todo = galleys
+            .iter()
+            .find(|(_, _, text)| text.starts_with("Todo 0/1"))
+            .unwrap();
+        assert!(
+            label.0.x + label.1.x <= stop.0.x + 1.0,
+            "status overlaps Stop"
+        );
+        assert!(
+            stop.0.x + stop.1.x < todo.0.x,
+            "Stop overlaps the Todo chip"
+        );
+
+        let column = transcript::column_width(h.width);
+        let left = (h.width - column) * 0.5;
+        let composer = text_at(&out, "Compose a reply")[0];
+        let right = boxes(&out)
+            .into_iter()
+            .filter(|r| (r.left() - left).abs() <= 1.0 && r.contains(composer))
+            .map(|r| r.right())
+            .max_by(f32::total_cmp)
+            .expect("composer frame");
+        assert!(
+            (right - (left + column)).abs() <= 1.0,
+            "composer right edge {right} should match chat column at {}",
+            left + column
+        );
+    }
+
+    #[test]
     fn irc_body_has_header_clearance_and_the_entire_tool_card_has_warning_outline() {
         let mut h = Harness::with_frames("irc-body-chrome", &[visual_ops("irc")]);
         h.hide_duplicates = true;
