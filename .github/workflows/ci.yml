@@ -7,8 +7,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: '1.100.0'
 
 jobs:
   check:
@@ -22,8 +27,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             tmux pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev \
             libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
@@ -67,23 +73,30 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build host and app
+        id: build
+        # Keep test failures visible even when lint fails; downstream smokes require this build.
+        if: ${{ !cancelled() }}
         run: cargo build -p deck-host -p deck-service -p omp-deck
 
       # conpty.dll + OpenConsole.exe next to omp-deck-host.exe so the host (and the tests that spawn it)
       # sideload the pinned ConPTY instead of the inbox one.
       - name: Fetch ConPTY
+        id: conpty
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: ./packaging/windows/fetch-conpty.ps1 -OutDir target/debug -Arch x64
 
       # A hung test must fail the step with the test names (libtest warns after 60 s), not eat the job.
       - name: Run cargo test --workspace --no-fail-fast
+        if: ${{ !cancelled() && steps.conpty.outcome == 'success' }}
         timeout-minutes: 25
         run: cargo test --workspace --no-fail-fast
 
@@ -97,10 +110,11 @@ jobs:
 
       # Needs the runner's interactive desktop: shows a tagged toast, then withdraws it by tag and by group.
       - name: Toast withdraw (WinRT)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.conpty.outcome == 'success' }}
         run: cargo test -p omp-deck -- --ignored windows_toast --nocapture
 
       - name: Install omp
+        id: install-omp
         if: ${{ !cancelled() }}
         run: |
           & ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary
@@ -111,7 +125,7 @@ jobs:
           & (Join-Path $ompDir 'omp.exe') --version
 
       - name: Live control over the named pipe (real omp)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-omp.outcome == 'success' }}
         run: |
           $env:OMPDECK_TEST_OMP = Join-Path $env:LOCALAPPDATA 'omp\omp.exe'
           cargo test -p deck-core --test ctl_live -- --nocapture
@@ -119,7 +133,7 @@ jobs:
       # The mobile R4 gate: paired devices drive a real omp session through an in-test relay with the
       # GUI client gone (skipped in the workspace run above, which has no omp yet).
       - name: Remote device gate through the relay (real omp)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.conpty.outcome == 'success' && steps.install-omp.outcome == 'success' }}
         timeout-minutes: 10
         run: |
           cargo test -p deck-service --test remote_device -- --nocapture 2>&1 | Tee-Object -Variable out
@@ -128,7 +142,7 @@ jobs:
           if (($out | Out-String) -match 'skipped: omp is not installed') { throw "remote_device skipped: omp is not on PATH" }
 
       - name: Host smoke (omp in ConPTY)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.conpty.outcome == 'success' && steps.install-omp.outcome == 'success' }}
         run: |
           $ErrorActionPreference = 'Stop'
           $host_exe = (Resolve-Path 'target/debug/omp-deck-host.exe').Path
@@ -156,7 +170,7 @@ jobs:
           if ($ls -match '(?m)\be2e\b') { throw "e2e still listed after kill" }
 
       - name: GUI screenshot (restored omp tab through the host)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.conpty.outcome == 'success' && steps.install-omp.outcome == 'success' }}
         run: |
           $ErrorActionPreference = 'Stop'
           $env:PATH = (Join-Path $env:LOCALAPPDATA 'omp') + ';' + $env:PATH

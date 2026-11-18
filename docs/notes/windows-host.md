@@ -16,6 +16,15 @@ cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc --ke
 - Before the port: deck-term 6 errors (arboard Linux ext traits, `tty::Options.escape_args`, `Pty::file()`),
   deck-core 58 (all `std::os::unix::*`). egui/eframe/arboard/rusqlite/ureq/alacritty/polling compile for msvc.
 
+## Named pipe abort
+
+An attach read timeout aborts both halves and the server must see EOF even if the client
+still holds a writer clone. `CancelIoEx` cancels pending I/O but does not close a client
+handle. Abort takes the handle shared by the clones and cancels outstanding I/O; operations
+already submitted keep the handle alive until their `OVERLAPPED` has settled. Server-side
+normal shutdown still flushes before disconnecting. The `timeout_aborts_silent_and_partially_consumed_connections`
+test checks peer EOF without first dropping the client halves.
+
 ## Runtime Unix assumptions to replace (compile fine, break on Windows)
 `sh -c` installer (`omp.rs:315`), `xdg-open` (`app.rs:2659`), kdialog/zenity picker (`transfer.rs`),
 `fc-match` (`deck-term/fonts.rs`, `omp-deck/ui_fonts.rs`), `/proc` (`tmux.rs`, `ctl.rs`, `ompdeck-ctl.ts`,

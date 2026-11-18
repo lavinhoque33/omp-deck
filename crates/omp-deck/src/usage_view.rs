@@ -977,8 +977,8 @@ fn heatmap(ui: &mut Ui, hm: &Heatmap) {
             );
             last_label_x = x;
         }
-        for row in 0..7 {
-            let Some(level) = hm.cells[row][week] else {
+        for (row, cells) in hm.cells.iter().enumerate() {
+            let Some(level) = cells[week] else {
                 continue;
             };
             let r = Rect::from_min_size(pos2(x, origin.y + step * row as f32), vec2(cs, cs));

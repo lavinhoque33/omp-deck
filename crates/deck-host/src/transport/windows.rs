@@ -418,7 +418,9 @@ fn new_event() -> io::Result<OwnedHandle> {
 }
 
 struct Pipe {
-    handle: Arc<OwnedHandle>,
+    // Serialize starting I/O with closing. A pending operation keeps its own handle reference
+    // until GetOverlappedResult has settled, so abort can take the shared handle without reuse.
+    handle: Mutex<Option<Arc<OwnedHandle>>>,
     server: bool,
     closed: AtomicBool,
 }
@@ -436,7 +438,7 @@ impl Stream {
     fn new(handle: Arc<OwnedHandle>, server: bool) -> Result<Stream> {
         Ok(Stream {
             pipe: Arc::new(Pipe {
-                handle,
+                handle: Mutex::new(Some(handle)),
                 server,
                 closed: AtomicBool::new(false),
             }),
@@ -463,34 +465,51 @@ impl Stream {
         Ok(())
     }
 
-    /// Ends the connection. Server side: data already written is flushed to the client, then
-    /// the pipe is disconnected (pending reads on clones fail). Client side: pending reads are
-    /// cancelled and report end of stream.
+    /// Ends the connection. The server first flushes data already written to the client.
     pub fn shutdown(&self) {
-        let h = raw(&self.pipe.handle);
-        self.pipe.closed.store(true, Ordering::Release);
-        // SAFETY: valid handle owned by `self.pipe`.
-        unsafe {
-            if self.pipe.server {
+        if !self.pipe.server {
+            self.abort();
+            return;
+        }
+        let handle = {
+            let handle = self
+                .pipe
+                .handle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.pipe.closed.store(true, Ordering::Release);
+            handle.clone()
+        };
+        if let Some(handle) = handle {
+            let h = raw(&handle);
+            // SAFETY: the handle remains valid through flush and disconnect.
+            unsafe {
                 FlushFileBuffers(h);
                 DisconnectNamedPipe(h);
-            } else {
-                CancelIoEx(h, null());
             }
         }
     }
 
-    /// Ends the connection now, discarding unread data and without waiting for the peer
-    /// (unlike the server-side [`Stream::shutdown`], whose flush waits until the client read
-    /// everything): pending reads and writes on every clone are cancelled and fail.
+    /// Ends the connection without waiting for the peer. Cancels pending I/O and releases the
+    /// handle once that I/O settles, even if callers still hold Stream clones.
     pub fn abort(&self) {
-        let h = raw(&self.pipe.handle);
-        self.pipe.closed.store(true, Ordering::Release);
-        // SAFETY: valid handle owned by `self.pipe`.
-        unsafe {
-            CancelIoEx(h, null());
-            if self.pipe.server {
-                DisconnectNamedPipe(h);
+        let handle = {
+            let mut handle = self
+                .pipe
+                .handle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.pipe.closed.store(true, Ordering::Release);
+            handle.take()
+        };
+        if let Some(handle) = handle {
+            let h = raw(&handle);
+            // SAFETY: valid handle, also retained by any pending operation until it settles.
+            unsafe {
+                CancelIoEx(h, null());
+                if self.pipe.server {
+                    DisconnectNamedPipe(h);
+                }
             }
         }
     }
@@ -507,13 +526,25 @@ impl Stream {
         &self,
         event: &OwnedHandle,
         timeout_ms: u32,
-        start: impl FnOnce(*mut OVERLAPPED) -> i32,
+        start: impl FnOnce(HANDLE, *mut OVERLAPPED) -> i32,
     ) -> io::Result<usize> {
-        let h = raw(&self.pipe.handle);
+        let handle = self
+            .pipe
+            .handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(pipe) = handle
+            .as_ref()
+            .filter(|_| !self.pipe.closed.load(Ordering::Acquire))
+        else {
+            return Ok(0);
+        };
+        let h = raw(pipe);
         // SAFETY: OVERLAPPED is plain old data.
         let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
         ov.hEvent = raw(event);
-        if start(&mut ov) == 0 {
+        let _in_flight;
+        if start(h, &mut ov) == 0 {
             // SAFETY: no preconditions.
             let code = unsafe { GetLastError() };
             if code != ERROR_IO_PENDING {
@@ -522,6 +553,10 @@ impl Stream {
                 }
                 return Err(io::Error::from_raw_os_error(code as i32));
             }
+            // Let abort cancel this operation while we wait. The handle cannot be closed and
+            // reused until our GetOverlappedResult returns.
+            _in_flight = Arc::clone(pipe);
+            drop(handle);
             // SAFETY: valid event handle.
             let waited = unsafe { WaitForSingleObject(raw(event), timeout_ms) };
             if waited != WAIT_OBJECT_0 {
@@ -558,12 +593,11 @@ impl Read for Stream {
             return Ok(0);
         }
         let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
-        let h = raw(&self.pipe.handle);
         let timeout = self.timeout_ms.load(Ordering::Relaxed);
         let ptr = buf.as_mut_ptr();
         // SAFETY: buf is valid for `len` bytes until `overlapped` returns (it waits for
         // completion or cancellation).
-        self.overlapped(&self.read_event, timeout, |ov| unsafe {
+        self.overlapped(&self.read_event, timeout, |h, ov| unsafe {
             ReadFile(h, ptr, len, null_mut(), ov)
         })
     }
@@ -575,10 +609,9 @@ impl Write for Stream {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
-        let h = raw(&self.pipe.handle);
         let ptr = buf.as_ptr();
         // SAFETY: buf is valid for `len` bytes until `overlapped` returns.
-        let n = self.overlapped(&self.write_event, INFINITE, |ov| unsafe {
+        let n = self.overlapped(&self.write_event, INFINITE, |h, ov| unsafe {
             WriteFile(h, ptr, len, null_mut(), ov)
         })?;
         if n == 0 && !buf.is_empty() {

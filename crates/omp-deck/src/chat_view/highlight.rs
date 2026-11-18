@@ -407,11 +407,11 @@ fn highlight(
     }
 
     let mut buf = String::new();
-    for i in start..total {
+    for (i, text) in src.lines.iter().enumerate().take(total).skip(start) {
         if i > start && i % CHECKPOINT_EVERY == 0 && stop() {
             break;
         }
-        let text = src.lines[i].as_str();
+        let text = text.as_str();
         let reset = reset_at(i);
         if reset {
             parse = ParseState::new(syntax);
