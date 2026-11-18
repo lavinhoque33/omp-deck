@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -192,6 +192,31 @@ pub fn ctl_env_with_key(dir: &Path, key_file: &Path) -> io::Result<Vec<(&'static
 /// Where the per-user ctl secret lives by default: `<config dir>/ctl.key`.
 pub fn default_key_file() -> PathBuf {
     crate::config::config_dir().join("ctl.key")
+}
+
+/// Read the endpoint's hello without subscribing or sending a command. `None` means the
+/// endpoint did not establish a compatible connection, not that it lacks the feature.
+pub fn probe_feature(dir: &Path, feature: &str) -> Option<bool> {
+    let mut stream = os::connect(dir, &default_key_file()).ok()?;
+    let deadline = Instant::now() + POLL;
+    let mut line = [0; 4096];
+    let mut len = 0;
+    while len < line.len() && Instant::now() < deadline {
+        let count = stream.read(&mut line[len..]).ok()?;
+        if count == 0 {
+            break;
+        }
+        if let Some(end) = memchr::memchr(b'\n', &line[len..len + count]) {
+            return match serde_json::from_slice(&line[..len + end]).ok()? {
+                WireMsg::Hello { v, features, .. } if v == PROTOCOL_VERSION => {
+                    Some(features.iter().any(|f| f == feature))
+                }
+                _ => None,
+            };
+        }
+        len += count;
+    }
+    None
 }
 
 /// Capability token of one pipe: `hex(sha256(secret || pipe name))`. A pipe has no owner or mode
@@ -699,6 +724,11 @@ pub enum CtlCommand {
     Subscribe {
         snapshots: bool,
         tools: bool,
+    },
+    /// Let omp verify quiescence and shut down through its normal session teardown.
+    ParkIdle {
+        root: PathBuf,
+        expires_at: u64,
     },
     /// Complete an extension tool request. `details`, when present, must be a JSON object.
     ToolResult {
@@ -1316,6 +1346,9 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
         CtlCommand::Subscribe { snapshots, tools } => {
             serde_json::json!({"rid": rid, "t": "subscribe", "snapshots": snapshots, "tools": tools})
         }
+        CtlCommand::ParkIdle { root, expires_at } => {
+            serde_json::json!({"rid": rid, "t": "park_idle", "root": root, "expiresAt": expires_at})
+        }
         CtlCommand::ToolResult {
             id,
             ok,
@@ -1537,6 +1570,13 @@ impl CtlClient {
     /// legacy `deliver` alone only guarantees waking delivery.
     pub fn features(&self) -> Vec<String> {
         lock(&self.shared.features).clone()
+    }
+
+    /// The serial of the connection that advertised `feature`, for use with `send_on`.
+    pub fn connection_with_feature(&self, feature: &str) -> Option<u64> {
+        let features = lock(&self.shared.features);
+        (self.connected() && features.iter().any(|f| f == feature))
+            .then(|| self.shared.connection.load(Ordering::Relaxed))
     }
 
     /// Registered full tool names advertised by the extension; empty while offline.

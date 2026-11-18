@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use deck_core::mux::session_name_for;
 use deck_core::mux::{Mux, MuxKind, PaneStatus};
@@ -14,6 +14,22 @@ use deck_core::mux::{Mux, MuxKind, PaneStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::statusfmt::Activity;
+
+/// How often to recheck a live ctl endpoint, including one reloaded or replaced under its name.
+const PARK_CAPABILITY_TTL: Duration = Duration::from_secs(30);
+/// Bound the added scan time even when many sockets aren't answering.
+const PARK_PROBE_BUDGET: Duration = Duration::from_millis(50);
+
+/// Why a detached Running row is, or is not, counting down to an automatic park.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParkingStatus {
+    Countdown { deadline_unix_ms: u64 },
+    Checking,
+    Stopping,
+    Unsupported,
+    WaitingForIdle,
+    NotScheduled,
+}
 
 /// Outcome of [`RunningSnapshot::resolve`]; both variants are the name `attach_or_create` gets.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +63,11 @@ pub struct RunningSnapshot {
     activities: HashMap<String, Activity>,
     /// Live sessions whose live-control endpoint exists (a background fork may use it).
     pub ctl: HashSet<String>,
+    #[serde(skip)]
+    /// Recent hello results, used only by the gateway to build the published view.
+    pub(super) park_capabilities: HashMap<String, bool>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(super) parking: HashMap<String, ParkingStatus>,
 }
 
 impl RunningSnapshot {
@@ -68,6 +89,8 @@ impl RunningSnapshot {
             held,
             activities: HashMap::new(),
             ctl: HashSet::new(),
+            park_capabilities: HashMap::new(),
+            parking: HashMap::new(),
         }
     }
 
@@ -83,6 +106,11 @@ impl RunningSnapshot {
             .get(name)
             .copied()
             .unwrap_or(Activity::Unknown)
+    }
+
+    /// Status from the gateway's scheduler, independent of the backend run status.
+    pub fn parking_of(&self, name: &str) -> Option<&ParkingStatus> {
+        self.parking.get(name)
     }
 
     /// Records which backend each live session belongs to.
@@ -171,6 +199,7 @@ struct Inner {
     latest: Option<Arc<RunningSnapshot>>,
     stop: bool,
     poke: bool,
+    probe_parking: bool,
     /// Control keys that must survive pruning (open tabs, launches in flight).
     ctl_keep: HashSet<String>,
 }
@@ -217,16 +246,18 @@ impl RunningMonitor {
         let thread = std::thread::Builder::new()
             .name("running-monitor".into())
             .spawn(move || {
+                let mut park_cache = HashMap::new();
                 loop {
-                    {
-                        // Clear before scanning: pokes arriving mid-scan stay set and
-                        // make the wait below return immediately.
+                    // Clear before scanning: pokes arriving mid-scan stay set and make the
+                    // wait below return immediately.
+                    let probe_parking = {
                         let mut guard = lock(&worker);
                         if guard.stop {
                             return;
                         }
                         guard.poke = false;
-                    }
+                        guard.probe_parking
+                    };
                     let mut snap = poll(&muxes, &sessions_root);
                     snap.ctl = snap
                         .alive
@@ -234,6 +265,29 @@ impl RunningMonitor {
                         .filter(|n| ctl_endpoint_exists(&deck_core::ctl::ctl_dir(&ctl_ns, n)))
                         .cloned()
                         .collect();
+                    if probe_parking {
+                        park_cache.retain(|name, _| snap.ctl.contains(name));
+                        let now = Instant::now();
+                        for name in &snap.ctl {
+                            if park_cache.get(name).is_none_or(|(until, _)| now >= *until)
+                                && now.elapsed() < PARK_PROBE_BUDGET
+                            {
+                                let feature = deck_core::ctl::probe_feature(
+                                    &deck_core::ctl::ctl_dir(&ctl_ns, name),
+                                    "park_idle",
+                                );
+                                park_cache
+                                    .insert(name.clone(), (now + PARK_CAPABILITY_TTL, feature));
+                            }
+                            if let Some((until, Some(supported))) = park_cache.get(name)
+                                && now < *until
+                            {
+                                snap.park_capabilities.insert(name.clone(), *supported);
+                            }
+                        }
+                    } else {
+                        park_cache.clear();
+                    }
                     // An empty answer may be a failed query: never prune on it, a running
                     // omp's socket would be lost.
                     if !snap.alive.is_empty() {
@@ -281,6 +335,15 @@ impl RunningMonitor {
 
     pub fn latest(&self) -> Option<Arc<RunningSnapshot>> {
         lock(&self.shared).latest.clone()
+    }
+
+    pub(super) fn probe_parking(&self, enabled: bool) {
+        let mut guard = lock(&self.shared);
+        if guard.probe_parking != enabled {
+            guard.probe_parking = enabled;
+            guard.poke = true;
+            self.shared.cv.notify_all();
+        }
     }
 
     /// Control keys of tabs and launches that the next prune must keep.

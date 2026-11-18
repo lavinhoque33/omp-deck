@@ -162,6 +162,27 @@ impl Registry {
     }
 }
 
+impl Engine {
+    /// Parking the opener must not discard its delivery route while an OmpDeck child is live.
+    pub(in crate::gateway::engine) fn has_live_parking_child(&self, opener: &SessionKey) -> bool {
+        let running = self.running.latest();
+        self.agent_tools.children.entries.values().any(|child| {
+            &child.opener.key == opener
+                && !child.invalidated
+                && (child.background.is_some()
+                    || child.attaching
+                    || self
+                        .sess
+                        .find(&child.key)
+                        .is_some_and(|i| !self.sess.managed[i].exited())
+                    || child.attach.mux_name.as_deref().is_none_or(|name| {
+                        self.running.is_blind()
+                            || running.as_ref().is_none_or(|snap| snap.is_alive(name))
+                    }))
+        })
+    }
+}
+
 #[derive(Deserialize)]
 struct SendArgs {
     session: String,

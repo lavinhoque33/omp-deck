@@ -5,11 +5,12 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use deck_core::mux::session_name_for;
 use deck_core::sessions::SessionEntry;
 use deck_service::backend::kind_label;
+use deck_service::gateway::running::ParkingStatus;
 use deck_service::status::TabStatus;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Align2, CursorIcon, Id, Rect, Sense, Stroke, Ui, pos2, vec2};
@@ -466,6 +467,22 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
     });
     let tab = row.tab.and_then(|i| input.tabs.get(i));
     let status = status_of(input, row);
+    // The local tab strip may already show a tab that the gateway snapshot predates.
+    let parking = row
+        .tab
+        .is_none()
+        .then(|| input.running.parking_of(&row.name))
+        .flatten();
+    let countdown_ms = match parking {
+        Some(ParkingStatus::Countdown { deadline_unix_ms }) => {
+            let now_ms = input
+                .now
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            deadline_unix_ms.saturating_sub(now_ms)
+        }
+        _ => 0,
+    };
     let label = match (entry, tab) {
         (Some(e), _) => e.label(),
         (None, Some(t)) => t.label(input.labels),
@@ -532,7 +549,12 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
         }
         let ic = pos2(pill.left() + 13.0, pill.center().y);
         if !tabs::paint_status(ui, ic, STATUS_SIZE, status) {
-            theme::glow_dot(p, ic, 3.0, pal.ok, theme::GLOW_REST);
+            let color = if countdown_ms > 0 {
+                Hue::Violet.color(pal)
+            } else {
+                pal.ok
+            };
+            theme::glow_dot(p, ic, 3.0, color, theme::GLOW_REST);
         }
         // Right side. Tabbed rows: accent window marker at rest, keys on hover. Tab-less
         // rows: dashed attach pill at rest, the Attach key on hover.
@@ -683,7 +705,19 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
             }
         }
     });
-    hover_card(&resp, pal, row, label, status, entry, cwd, input, progress);
+    hover_card(
+        &resp,
+        pal,
+        row,
+        label,
+        status,
+        entry,
+        cwd,
+        input,
+        progress,
+        parking,
+        countdown_ms,
+    );
 }
 
 #[expect(
@@ -700,6 +734,8 @@ fn hover_card(
     cwd: Option<&Path>,
     input: &SidebarInput<'_>,
     progress: Option<&deck_core::ctl::Progress>,
+    parking: Option<&ParkingStatus>,
+    countdown_ms: u64,
 ) {
     const KEY_W: f32 = 76.0;
     let mut head = card::Header::new(ICON_TERMINAL, label).tone(tips::status_tone(pal, status));
@@ -730,6 +766,50 @@ fn hover_card(
             if open_tab {
                 card::kv(ui, KEY_W, "Tab", |ui| {
                     badge::show(ui, Some(ICON_APP_WINDOW), "open", Hue::Blue, tips::VALUE);
+                });
+            }
+            if let Some(parking) = parking {
+                card::kv(ui, KEY_W, "Auto-park", |ui| {
+                    let violet = Hue::Violet.color(pal);
+                    let amber = Hue::Amber.color(pal);
+                    let (text, color) = match parking {
+                        ParkingStatus::Countdown { .. } if countdown_ms > 0 => {
+                            // Tick at the next displayed second boundary, including the deadline.
+                            let next_ms = (countdown_ms - 1) % 1000 + 1;
+                            ui.ctx()
+                                .request_repaint_after(Duration::from_millis(next_ms));
+                            let secs = countdown_ms.div_ceil(1000);
+                            (
+                                format!("Eligible to park in {}m {:02}s", secs / 60, secs % 60),
+                                violet,
+                            )
+                        }
+                        ParkingStatus::Countdown { .. } | ParkingStatus::Checking => (
+                            "Checking whether it’s safe to park…".into(),
+                            pal.text_strong,
+                        ),
+                        ParkingStatus::Stopping => ("Parking session…".into(), violet),
+                        ParkingStatus::Unsupported => (
+                            "Won’t park: this session uses an older control extension.".into(),
+                            amber,
+                        ),
+                        ParkingStatus::WaitingForIdle => (
+                            "Waiting for the session to be safe to park.".into(),
+                            pal.text_strong,
+                        ),
+                        ParkingStatus::NotScheduled => (
+                            "Open and detach this session to schedule parking.".into(),
+                            amber,
+                        ),
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(text)
+                                .size(tips::VALUE + 1.0)
+                                .color(color),
+                        )
+                        .wrap(),
+                    );
                 });
             }
             if let Some(p) = progress {

@@ -407,6 +407,7 @@ struct Published {
 #[derive(Default)]
 struct Dirty {
     controllers: bool,
+    parking: bool,
     usage: bool,
     app: bool,
     backup: bool,
@@ -548,6 +549,7 @@ impl Engine {
                 move || w(),
             )
         };
+        running.probe_parking(cfg.park_idle_sessions);
         let status = {
             let w = wake.clone();
             StatusWatcher::spawn(root.agent_dir(), move || w())
@@ -1356,6 +1358,10 @@ impl Engine {
             self.dirty.gateway = true;
             self.registration_at = None;
         }
+        if old.park_idle_sessions != self.cfg.park_idle_sessions {
+            self.running.probe_parking(self.cfg.park_idle_sessions);
+            self.dirty.parking = true;
+        }
         self.sync_mobile_link();
         self.changed(Topic::Settings);
     }
@@ -1378,7 +1384,7 @@ impl Engine {
             (None, None) => true,
             _ => false,
         };
-        if !same_running {
+        if std::mem::take(&mut self.dirty.parking) || !same_running {
             self.published.running = running;
             self.changed(Topic::Running);
         }
@@ -1440,12 +1446,7 @@ impl Engine {
                 root_exists: self.sessions_watch.root_exists(),
                 groups: self.sessions_watch.latest().unwrap_or_default(),
             }),
-            Topic::Running => TopicValue::Running(
-                self.running
-                    .latest()
-                    .map(|s| (*s).clone())
-                    .unwrap_or_default(),
-            ),
+            Topic::Running => TopicValue::Running(self.running_view()),
             Topic::Controllers => TopicValue::Controllers(self.controller_infos()),
             Topic::Notifications => TopicValue::Notifications(self.inbox_view()),
             Topic::Status => TopicValue::Status(Box::new(

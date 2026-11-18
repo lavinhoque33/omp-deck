@@ -293,6 +293,7 @@ settings! {
     ProjectSync(project_sync: Vec<SyncRow>) = Device,
     ProjectSyncInterval(project_sync_interval: SyncInterval) = Shared,
     SessionBackend(session_backend: BackendChoice) = Device,
+    ParkIdleSessions(park_idle_sessions: bool) = Device,
     WorktreeBases(worktree_bases: BTreeMap<PathBuf, String>) = Device,
     RemovedWorktrees(removed_worktrees: BTreeMap<PathBuf, RemovedWorktree>) = Device,
     ParkedBranches(parked_branches: Vec<ParkedBranch>) = Device,

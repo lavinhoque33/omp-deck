@@ -366,6 +366,7 @@ impl SettingsState {
 pub struct SettingsInput<'a> {
     pub font_size: f32,
     pub session_view: deck_core::config::SessionView,
+    pub park_idle_sessions: bool,
     pub font_range: (f32, f32),
     pub font_default: f32,
     /// App-wide scale (egui zoom, 1.0 = 100 %).
@@ -443,6 +444,7 @@ pub enum SettingsAction {
     /// Where new sessions run (Unix: tmux or the OmpDeck host).
     SessionBackend(BackendChoice),
     SessionView(deck_core::config::SessionView),
+    ParkIdleSessions(bool),
     /// The project sync page.
     Sync(SyncAction),
     Notify(NotifyAction),
@@ -1476,6 +1478,17 @@ fn general_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<Setti
                     });
                 if view != input.session_view {
                     actions.push(SettingsAction::SessionView(view));
+                }
+            },
+        );
+        setting_row(
+            ui,
+            "Park idle detached sessions",
+            "After 5 minutes detached, park idle saved sessions and skip any doing live work. Reopening starts a fresh process with the saved conversation.",
+            |ui| {
+                let mut on = input.park_idle_sessions;
+                if toggle(ui, &mut on).changed() {
+                    actions.push(SettingsAction::ParkIdleSessions(on));
                 }
             },
         );

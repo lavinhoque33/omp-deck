@@ -267,6 +267,16 @@ impl Engine {
         let managed = |t: &crate::controller::SessionTarget| {
             self.sess.find(&t.key).map(|i| &self.sess.managed[i])
         };
+        if !matches!(
+            op,
+            Mutation::Stop(_) | Mutation::Kill(_) | Mutation::Restart { .. }
+        ) && op
+            .target()
+            .and_then(managed)
+            .is_some_and(|m| m.parking_in_flight())
+        {
+            return refused("the detached session is parking; reopen it after omp exits");
+        }
         if uses_lane(op)
             && let Some(busy) = self.backup_lane.job()
         {
@@ -327,6 +337,10 @@ impl Engine {
             Mutation::SessionRename { title, .. } if title.trim().is_empty() => {
                 refused("a session needs a title")
             }
+            Mutation::Ctl {
+                command: deck_core::ctl::CtlCommand::ParkIdle { .. },
+                ..
+            } => refused("only the gateway can park a detached session"),
             Mutation::Ctl { target, .. } => match managed(target) {
                 Some(m) if m.ctl_key.is_none() => refused("this session runs without live control"),
                 _ => None,

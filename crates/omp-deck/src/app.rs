@@ -2252,6 +2252,7 @@ impl App {
         let input = SettingsInput {
             font_size: self.cfg.font_size,
             session_view: self.cfg.session_view,
+            park_idle_sessions: self.cfg.park_idle_sessions,
             font_range: (MIN_FONT, MAX_FONT),
             font_default: DEFAULT_FONT,
             ui_scale: self.cfg.ui_scale,
@@ -2327,6 +2328,10 @@ impl App {
                 SettingsAction::SessionBackend(v) => self.set_session_backend(v),
                 SettingsAction::SessionView(v) => {
                     self.cfg.session_view = v;
+                    self.dirty = true;
+                }
+                SettingsAction::ParkIdleSessions(v) => {
+                    self.cfg.park_idle_sessions = v;
                     self.dirty = true;
                 }
                 SettingsAction::NativeDecorations(v) => self.set_native_decorations(v),

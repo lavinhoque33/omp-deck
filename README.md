@@ -86,8 +86,8 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
   Open, focus, middle-click close, reopen the last closed tab. Each tab shows omp's state: a
   spinner while the agent works and an amber "!" badge with a tinted tab when it waits for your input,
   also on background tabs. Right-clicking a tab (or its Running dock row) shows "Close tab" plus the
-  session's full sidebar menu. Closing a tab only detaches; "Stop session process" stops omp.
-  Tabs re-attach to their live sessions on the next launch.
+  session's full sidebar menu. Closing a tab detaches; "Stop session process" stops omp.
+  Tabs re-attach to their live sessions on the next launch. Optional idle parking is described below.
 
   </details>
 
@@ -401,6 +401,16 @@ Each omp tab runs in a session that lives outside the app, so it survives closin
 On Linux, Settings → OmpDeck → **Session backend** chooses Auto (tmux if installed, else the host), tmux or
 OmpDeck host for new tabs; running sessions keep their backend. If neither is available, omp runs directly in
 the tab, a banner says so, and sessions end with the tab.
+
+**Park idle detached sessions** (Settings → OmpDeck → General → Sessions) is off by default
+and applies only to this device. While the gateway is running, it asks omp to exit normally
+after five minutes detached and idle. Reopening a parked session starts a fresh omp process
+on the same saved conversation. OmpDeck skips sessions with unsaved work, queued input,
+pending extension dialogs, live jobs or child agents, or retained eval state. Sessions
+without compatible live control keep running. In the sidebar’s **Running** dock, a violet
+LED marks an active countdown. Hover the row to see the time until it is eligible to park
+in violet, or an amber explanation when the session is not scheduled to park. Parking does
+not change the gateway’s lifetime.
 
 `omp-deck-host ls|info <name>|dump <name>|kill <name>` inspect and stop host sessions from a shell.
 

@@ -11,6 +11,10 @@ import * as os from "node:os";
 import { execFile } from "node:child_process";
 import { Type } from "@sinclair/typebox";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { readSessionHeaderId } from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import type { cfgWorktreeOnExit } from "@oh-my-pi/pi-coding-agent/task/settings";
 
 type ToolName = "open_session" | "notify" | "show_changes" | "request_review" | "sessions" | "send_prompt" | "wait_session" | "answer_question" | "finish_worktree" | "report" | "fan_out" | "watch_session" | "message_session";
 type ToolResult = { content: { type: "text"; text: string }[]; details?: Record<string, unknown>; isError?: boolean };
@@ -248,6 +252,13 @@ export default async function ompdeckCtl(api: any) {
     } catch (e) { log("internal import failed: " + e); return; }
     // Optional: only fork_at needs it; without it that op answers with an error.
     try { ({ SessionManager } = await import("@oh-my-pi/pi-coding-agent/session/session-manager")); } catch (e) { log("session-manager import failed: " + e); }
+    // Static imports would fail the entire extension on older omp; only parking depends on these exports.
+    let readParkHeader: typeof readSessionHeaderId | undefined;
+    let worktreeOnExit: typeof cfgWorktreeOnExit | undefined;
+    try {
+      ({ readSessionHeaderId: readParkHeader } = await import("@oh-my-pi/pi-coding-agent/session/session-loader"));
+      ({ cfgWorktreeOnExit: worktreeOnExit } = await import("@oh-my-pi/pi-coding-agent/task/settings"));
+    } catch (e) { log("parking API import failed: " + e); }
     // Optional: the /context breakdown. Literal specifiers; a missing module just omits `context` from snapshots.
     let contextRuntime: any, contextUsage: any;
     try { contextRuntime = await import("@oh-my-pi/pi-coding-agent/session/context-usage-runtime"); } catch (e) { log("context-usage-runtime import failed: " + e); }
@@ -269,6 +280,18 @@ export default async function ompdeckCtl(api: any) {
     if (!AgentLifecycleManager || !AgentRegistry || typeof sessionFileBelongsToRoot !== "function") { log("internal API missing"); return; }
 
     const isMain = (ctx: any) => ctx?.agent?.kind === "main";
+    // The standalone omp binary does not export its kernel registry. Observe the built-in
+    // kernel entry points from startup and veto parking for the rest of the process after use.
+    const rememberEval = (event: { toolName: string }) => {
+      if (event.toolName === "eval") G.__ompdeckUsedEval = true;
+    };
+    let parkEvalHooks = false;
+    try {
+      api.on("tool_call", rememberEval);
+      api.on("tool_execution_start", rememberEval);
+      api.on("user_python", () => { G.__ompdeckUsedEval = true; });
+      parkEvalHooks = true;
+    } catch (e) { log("parking eval hooks failed: " + e); }
     if (process.env.OMPDECK_CHECKPOINTS === "1") {
       let checkpointed = false;
       const readOnly: Record<string, true> = { read: true, grep: true, glob: true, find: true, ast_grep: true, web_search: true, security_scan: true, ask: true, wait: true, todo: true, think: true, yield: true, goal: true };
@@ -689,7 +712,7 @@ export default async function ompdeckCtl(api: any) {
       // Internal omp API: a member that is not a function is skipped and `uiHook` stays false (the gateway then lists no requests).
       // `formDialog` (omp >= 18.18, the html `ask`) is optional: when absent it is neither wrapped nor counted.
       type PendingEntry = { summary: any; resolve: (v: any) => void; form?: any };
-      const uiState = (G.__ompdeckUi ??= { pending: new Map<number, PendingEntry>(), seq: 0, hook: false, onChange: () => {} });
+      const uiState = (G.__ompdeckUi ??= { pending: new Map<number, PendingEntry>(), seq: 0, hook: false, dialogs: 0, parkHooks: new WeakSet<object>(), onChange: () => {} });
       const pendingUi: Map<number, PendingEntry> = uiState.pending;
       uiState.onChange = schedule;
       // formDialog(html, opts): the parsed form stays with the entry (option values and validation never leave the extension).
@@ -815,12 +838,26 @@ export default async function ompdeckCtl(api: any) {
               else pendingUi.set(id, { summary: { id, ...summarize(m, args) }, resolve: remote });
             } catch (e) { log("ui summarize failed: " + e); }
             uiState.onChange();
-            return Promise.race([new Promise<any>(r => r(orig.apply(ui, call))), remoteP]).finally(() => { pendingUi.delete(id); ac.abort(); uiState.onChange(); });
+            uiState.dialogs++;
+            return Promise.race([(async () => orig.apply(ui, call))(), remoteP]).finally(() => {
+              uiState.dialogs--;
+              pendingUi.delete(id); ac.abort(); uiState.onChange();
+            });
           };
           if (m !== "formDialog") wrapped++;
         }
         // A partial wrap would hide the requests of the skipped members, so only a complete one reports a hook.
         uiState.hook = wrapped === Object.keys(sigAt).length;
+        // Custom extension modals cannot be answered remotely, but must still veto parking.
+        const custom = ui.custom;
+        if (uiState.hook && typeof custom === "function") {
+          ui.custom = async (...args: unknown[]) => {
+            uiState.dialogs++;
+            try { return await custom.apply(ui, args); }
+            finally { uiState.dialogs--; }
+          };
+          uiState.parkHooks.add(ui);
+        }
       };
 
       // fork_at: omp's AgentSession.#zr: a cut at a tool-calling assistant (or inside its batch) extends over the matching toolResults so no call is left unpaired.
@@ -1303,11 +1340,163 @@ export default async function ompdeckCtl(api: any) {
       }
       const reply = (s: any, rid: any, r: any) => { let l: string; try { l = JSON.stringify({ t: "reply", rid, ...r }) + "\n"; } catch { l = JSON.stringify({ t: "reply", rid, ok: false, error: "unserializable reply" }) + "\n"; } write(s, l); };
 
+      type ParkCommand = { rid: number; root: string; expiresAt: number };
+      const parkTimeValid = (cmd: ParkCommand) => Date.now() < cmd.expiresAt;
+      let parkInFlight = false;
+      let activeCommands = 0, commandGeneration = 0;
+
+      function parkReadiness(ctx: ExtensionContext, session: AgentSession, root: string): string | undefined {
+        if (mainCtx !== ctx || rootFile() !== root || mainSession() !== session || session.sessionManager !== ctx.sessionManager) {
+          return "session changed";
+        }
+        if (!parkEvalHooks || typeof worktreeOnExit?.get !== "function" || ctx.mode !== "tui" || ctx.hasUI !== true
+          || typeof ctx.shutdown !== "function" || typeof session.waitForIdle !== "function"
+          || typeof session.getGoalModeState !== "function" || !uiState.parkHooks.has(ctx.ui)) {
+          return "parking safety APIs unavailable";
+        }
+        // Normal TUI shutdown can prompt about, or remove, owned worktrees. Never request that on a background park.
+        if (worktreeOnExit.get(session.settings) !== "keep") return "worktree exit policy is not keep";
+        if (ctx.isIdle?.() !== true || ctx.hasPendingMessages?.() !== false || session.queuedMessageCount !== 0
+          || session.isStreaming !== false || session.hasAdmittedSubmission !== false || session.isDisposed !== false
+          || session.isAborting !== false || session.isRetrying !== false || session.isCompacting !== false
+          || session.hasPostPromptWork !== false || session.isBashRunning !== false || session.hasPendingBashMessages !== false
+          || session.isEvalRunning !== false || session.hasPendingPythonMessages !== false
+          || session.agent?.peekSteeringQueue?.()?.length !== 0 || session.agent?.peekFollowUpQueue?.()?.length !== 0
+          || session.agent?.peekUndeliveredQueuedMessages?.()?.length !== 0 || session.yieldQueue?.has?.() !== false) {
+          return "session has active or queued work";
+        }
+        if (ctx.ui.getEditorText?.() !== "") return "session editor has a draft or is unavailable";
+        if (typeof ctx.getPendingPlanReview !== "function" || ctx.getPendingPlanReview() !== undefined
+          || uiState.dialogs !== 0 || pendingUi.size !== 0 || pendingTools.size !== 0) {
+          return "session has a pending dialog, review, or tool call";
+        }
+        const goal = session.getGoalModeState();
+        if (goal !== undefined && (goal?.mode !== "active" || !["complete", "dropped"].includes(goal?.goal?.status))) {
+          return "session has an ongoing goal";
+        }
+        // Inspect the job manager directly: the wake predicate can miss suppressed deliveries.
+        if (!("asyncJobManager" in session)) return "async job safety API unavailable";
+        const jobs = session.asyncJobManager;
+        if (jobs !== undefined) {
+          const all = jobs?.getAllJobs?.(), delivery = jobs?.getDeliveryState?.();
+          if (!Array.isArray(all) || delivery?.queued !== 0 || delivery.delivering !== false
+            || all.some(job => !["completed", "failed", "cancelled"].includes(job?.status) || !Number.isFinite(job.endTime))) {
+            return "session has running async jobs or pending results";
+          }
+        }
+        if (G.__ompdeckUsedEval) return "process has used eval or Python";
+        if ((registry.list() as AgentRef[]).some(ref =>
+          ref.kind !== "main" && (ref.session !== null || !["parked", "aborted"].includes(ref.status)))) {
+          return "process has a live child agent";
+        }
+      }
+
+      async function parkIdle(s: ToolClient, raw: unknown): Promise<void> {
+        const deny = (reason: string) => reply(s, object(raw) ? raw.rid : undefined, { ok: false, code: "park_refused", error: reason });
+        if (!object(raw) || typeof raw.rid !== "number" || !Number.isSafeInteger(raw.rid)
+          || typeof raw.expiresAt !== "number" || !Number.isSafeInteger(raw.expiresAt)
+          || typeof raw.root !== "string") return deny("invalid parking request");
+        const cmd: ParkCommand = { rid: raw.rid, root: raw.root, expiresAt: raw.expiresAt };
+        if (!parkTimeValid(cmd)) return deny("parking request expired");
+        if (parkInFlight || activeCommands !== 0) return deny("another control command is in progress");
+        if (!sameRoot(cmd) || !cmd.root.endsWith(".jsonl")) return deny("session changed or has no saved journal");
+        parkInFlight = true;
+        let accepted = false;
+        try {
+          const ctx: ExtensionContext = mainCtx;
+          const session: AgentSession | undefined = mainSession();
+          const readHeader = readParkHeader, root = cmd.root;
+          if (!session || !readHeader) return deny("parking safety APIs unavailable");
+          const sm = session.sessionManager;
+          const generation = commandGeneration;
+          const unavailable = () => !parkTimeValid(cmd) ? "parking request expired"
+            : G.__ompdeckCtl?.close !== close || s.data.writer.closed || activeCommands !== 0 || commandGeneration !== generation
+              ? "control request superseded"
+            : parkReadiness(ctx, session, root);
+          let error = unavailable();
+          if (error) return deny(error);
+          if (typeof sm.flush !== "function" || typeof sm.getEntry !== "function") return deny("journal safety APIs unavailable");
+          await session.waitForIdle();
+          error = unavailable();
+          if (error) return deny(error);
+          await sm.flush();
+          error = unavailable();
+          if (error) return deny(error);
+          const leaf = sm.getLeafId?.(), id = sm.getSessionId?.();
+          if (typeof id !== "string" || !id || typeof leaf !== "string" || !leaf
+            || sm.getLeafEntry?.()?.id !== leaf || sm.isSessionOnDisk?.() !== true) {
+            return deny("session has no durable journal leaf");
+          }
+          const before = fs.lstatSync(root, { bigint: true });
+          const size = Number(before.size);
+          if (!before.isFile() || size === 0 || !Number.isSafeInteger(size)) return deny("session journal is not a regular file");
+          if (await readHeader(root) !== id) return deny("session journal has no matching header");
+          error = unavailable();
+          if (error) return deny(error);
+
+          // flush() drains pending writes, but a bare branch move changes only the in-memory
+          // leaf. Verify the on-disk replay leaf using just the last record, not a full reload.
+          const tail = Buffer.allocUnsafe(Math.min(size, 1024 * 1024));
+          const file = await fs.promises.open(root, "r");
+          try {
+            const { bytesRead } = await file.read(tail, 0, tail.length, size - tail.length);
+            if (bytesRead !== tail.length) return deny("session journal changed while reading");
+          } finally { await file.close(); }
+          let end = tail.length;
+          while (end > 0) {
+            const byte = tail[end - 1];
+            if (byte !== 0x0a && byte !== 0x0d && byte !== 0x09 && byte !== 0x20) break;
+            end--;
+          }
+          const separator = end > 0 ? tail.lastIndexOf(0x0a, end - 1) : -1;
+          if (separator < 0) return deny("session journal has no verifiable final record");
+          const last: unknown = JSON.parse(tail.toString("utf8", separator + 1, end));
+          if (!object(last) || typeof last.id !== "string") return deny("session journal has no valid final entry");
+          const recorded = sm.getEntry(last.id);
+          if (!recorded || recorded.type !== last.type || recorded.parentId !== last.parentId
+            || (last.activeLeafId === undefined ? last.id : last.activeLeafId) !== leaf) {
+            return deny("session journal does not restore the current leaf");
+          }
+          await session.waitForIdle();
+          const jobs = session.asyncJobManager;
+          if (jobs) {
+            // Public job listings intentionally hide foreground-backed jobs, even if an
+            // aborted bash tool released its foreground wait before the process exited.
+            if (typeof jobs.waitForAll !== "function") return deny("async job settlement API unavailable");
+            const { promise, resolve } = Promise.withResolvers<boolean>();
+            const deadline = setImmediate(() => resolve(false));
+            try {
+              if (!await Promise.race([jobs.waitForAll().then(() => true), promise])) return deny("async jobs are still settling");
+            } finally { clearImmediate(deadline); }
+          }
+          const after = fs.lstatSync(root, { bigint: true });
+          if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size
+            || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs
+            || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs
+            || sm.getLeafId() !== leaf || sm.getSessionId() !== id) return deny("session journal changed during parking");
+          error = unavailable();
+          if (error) return deny(error);
+          if (!parkTimeValid(cmd)) return deny("parking request expired");
+
+          // No await between the final fence, queuing the reply, and requesting normal shutdown.
+          // A reply accepts the request, not process exit or successful teardown. The TUI
+          // request itself also checks its private pending-submission slot at the settled boundary.
+          if (s.data.writer.queue.length !== 0 || s.writableLength) return deny("control socket is backpressured");
+          reply(s, cmd.rid, { ok: true });
+          if (s.data.writer.closed) return;
+          accepted = true;
+          ctx.shutdown();
+        } catch (e) {
+          log("parking failed: " + e);
+          if (!accepted) deny("could not verify safe session shutdown");
+        } finally { parkInFlight = false; }
+      }
+
       // ---- endpoint ----
       const onOpen = (s: any) => {
         s.data = { buf: "", snapshots: true, tools: false, writer: { queue: [], bytes: 0, closed: false } }; clients.add(s);
         const tools = toolProcess.__ompdeckTools ?? [];
-        write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid, ui_hook: uiState.hook, ...(tools.length ? { features: ["tools", "deliver", "deliver_no_wake"], tools } : {}) }) + "\n");
+        write(s, JSON.stringify({ t: "hello", v: 1, pid: process.pid, ui_hook: uiState.hook, features: tools.length ? ["tools", "deliver", "deliver_no_wake", "park_idle"] : ["park_idle"], ...(tools.length ? { tools } : {}) }) + "\n");
         write(s, JSON.stringify(snapshot()) + "\n", true);
       };
       const onData = (s: any, chunk: any) => {
@@ -1334,12 +1523,15 @@ export default async function ompdeckCtl(api: any) {
             reply(s, cmd.rid, { ok: true });
             continue;
           }
-          if (cmd.t === "deliver") {
-            deliver(cmd).then(result => reply(s, cmd.rid, result));
+          if (cmd.t === "park_idle") {
+            void parkIdle(s, cmd);
             continue;
           }
-          let p: Promise<any>; try { p = handle(cmd); } catch (e: any) { p = Promise.reject(e); }
-          p.then(r => reply(s, cmd.rid, r), e => reply(s, cmd.rid, { ok: false, error: String(e?.message ?? e) }));
+          commandGeneration++;
+          activeCommands++;
+          const p = cmd.t === "deliver" ? deliver(cmd) : handle(cmd);
+          p.then(r => reply(s, cmd.rid, r), e => reply(s, cmd.rid, { ok: false, error: String(e?.message ?? e) }))
+            .finally(() => { activeCommands--; });
         }
       };
       const onClose = (s: ToolClient) => {
@@ -1479,7 +1671,11 @@ export default async function ompdeckCtl(api: any) {
         tick = setInterval(() => { if (!clients.size) return; if (modelKey() !== contextKey) recompute(); schedule(); }, 1000); // safety net for isStreaming/mainIdle and progress changes without events
         try { offProgress = api.events.on("task:subagent:progress", schedule); } catch (e) { log("progress listener failed: " + e); }
         G.__ompdeckCtl = {
-          setCtx(c: any) { mainCtx = c; schedule(); },
+          setCtx(c: any) {
+            mainCtx = c;
+            try { wrapUi(c.ui); } catch (e) { log("ui hook failed: " + e); uiState.hook = false; }
+            schedule();
+          },
           recompute,
           schedule,
           close,

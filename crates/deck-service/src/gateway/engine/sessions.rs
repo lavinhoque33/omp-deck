@@ -26,6 +26,7 @@ use crate::gateway::protocol::{
     ModelFactsView, Outcome, Refusal, Role, ScreenView, ServerEvent, SessionRole, SwitchInfo, Tool,
     Topic, TopicValue, ViewEnd, ViewRole, Welcome,
 };
+use crate::gateway::running::{ParkingStatus, RunningSnapshot};
 use crate::gateway::server::{SideItem, ViewSide};
 use crate::host_remote::HostRemote;
 use crate::statusfmt::Activity;
@@ -50,6 +51,27 @@ const LIVE_CWD_EVERY: Duration = Duration::from_secs(3);
 const CRUMB_SLACK: Duration = Duration::from_secs(2);
 /// How often a fresh session's reported (not yet written) file is looked for.
 const FILE_RECHECK: Duration = Duration::from_secs(1);
+const PARK_IDLE_AFTER: Duration = Duration::from_secs(5 * 60);
+const PARK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+struct ParkDeadline {
+    at: Instant,
+    unix_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+enum Parking {
+    Detached { deadline: Option<ParkDeadline> },
+    Requested { id: u64, until: Instant },
+    Stopping { until: Instant },
+}
+
+impl Parking {
+    fn in_flight(self) -> bool {
+        matches!(self, Self::Requested { .. } | Self::Stopping { .. })
+    }
+}
 
 /// Where a launch learns the backend that already holds its session name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +165,8 @@ pub(super) struct Managed {
     spawned_ms: u64,
     /// A journaled close waiting for the controller to settle.
     closing: Option<RequestKey>,
+    /// Set only for a deliberately detached backend session.
+    parking: Option<Parking>,
     /// The view owning focus, geometry, palette and the clipboard.
     controlling: Option<u64>,
     copy: Option<CopyWatch>,
@@ -173,6 +197,26 @@ impl Managed {
                         .latest()
                         .is_some_and(|snapshot| snapshot.main_idle == Some(false))
             })
+    }
+
+    pub(super) fn parking_in_flight(&self) -> bool {
+        self.parking.is_some_and(Parking::in_flight)
+    }
+
+    fn supports_parking(&self) -> bool {
+        self.role == SessionRole::Session
+            && self.mux.is_some()
+            && self.copy.is_none()
+            && !self.exited()
+            && self
+                .live
+                .as_ref()
+                .is_some_and(|link| link.client.connection_with_feature("park_idle").is_some())
+    }
+
+    fn matches_launch(&self, spec: &LaunchSpec, name: Option<&str>) -> bool {
+        (spec.session_path.is_some() && self.ctl.session_path() == spec.session_path.as_deref())
+            || (name.is_some() && self.mux_name.as_deref() == name)
     }
 
     /// The launch created the session with the control extension.
@@ -607,6 +651,9 @@ impl Engine {
         if current.as_ref() != Some(&target) {
             return Err(current);
         }
+        if self.sess.managed[i].parking_in_flight() {
+            return Err(current);
+        }
         let notify: deck_term::OutputNotify = {
             let weak: Weak<ViewSide> = Arc::downgrade(&side);
             Arc::new(move || {
@@ -616,6 +663,8 @@ impl Engine {
             })
         };
         let m = &mut self.sess.managed[i];
+        m.parking = None;
+        self.dirty.parking |= self.cfg.park_idle_sessions;
         if m.agent_child.take().is_some() {
             self.sess.manifest_dirty = true;
         }
@@ -721,6 +770,12 @@ impl Engine {
             }
             if !others {
                 m.ctl.terminal().set_visible(false);
+                if self.cfg.park_idle_sessions {
+                    self.dirty.parking = true;
+                    if m.supports_parking() {
+                        m.parking = Some(Parking::Detached { deadline: None });
+                    }
+                }
             }
         }
         self.dirty.controllers = true;
@@ -850,6 +905,7 @@ impl Engine {
         self.follow_session_files();
         self.poll_copies(now);
         self.drive_live(now);
+        self.poll_parking(now);
         self.update_status_target();
         self.step_agent_tools(now);
         self.poll_agent_child_attaches(now);
@@ -1002,12 +1058,172 @@ impl Engine {
             }
         }
         for i in done.into_iter().rev() {
-            let key = self.sess.managed[i].closing.clone();
+            let key = self.sess.managed[i].closing.take();
             let session = self.remove_session(i, ViewEnd::Closed, now);
+            log::debug!("closed {session}");
             if let Some(key) = key {
                 self.job_finished(key, Ok(Done::Unit));
             }
-            log::debug!("closed {session}");
+        }
+    }
+
+    /// Combine backend inventory with scheduler state only when publishing Running.
+    pub(super) fn running_view(&self) -> RunningSnapshot {
+        let mut snap = self
+            .running
+            .latest()
+            .as_deref()
+            .cloned()
+            .unwrap_or_default();
+        if !self.cfg.park_idle_sessions {
+            return snap;
+        }
+        snap.parking
+            .extend(snap.park_capabilities.drain().map(|(name, supported)| {
+                let status = if supported {
+                    ParkingStatus::NotScheduled
+                } else {
+                    ParkingStatus::Unsupported
+                };
+                (name, status)
+            }));
+        for m in &self.sess.managed {
+            let Some(name) = m.mux_name.as_deref().filter(|n| snap.is_alive(n)) else {
+                continue;
+            };
+            if snap.owner_of(name) != m.mux.as_ref().map(Mux::kind) {
+                continue;
+            }
+            if self
+                .views
+                .values()
+                .any(|v| v.target.key == m.ctl.target().key)
+            {
+                snap.parking.remove(name);
+                continue;
+            }
+            if let Some(state) = m.parking {
+                let status = match state {
+                    Parking::Detached {
+                        deadline: Some(due),
+                    } => ParkingStatus::Countdown {
+                        deadline_unix_ms: due.unix_ms,
+                    },
+                    Parking::Detached { deadline: None } => ParkingStatus::WaitingForIdle,
+                    Parking::Requested { .. } => ParkingStatus::Checking,
+                    Parking::Stopping { .. } => ParkingStatus::Stopping,
+                };
+                snap.parking.insert(name.to_owned(), status);
+            }
+        }
+        snap
+    }
+
+    fn poll_parking(&mut self, now: Instant) {
+        for i in (0..self.sess.managed.len()).rev() {
+            let m = &self.sess.managed[i];
+            let Some(parking) = m.parking else {
+                continue;
+            };
+            let target = m.ctl.target();
+            let viewed = self.views.values().any(|v| v.target.key == target.key);
+            if m.exited() {
+                // Backend teardown follows PTY exit. Don't let a concurrent reopen attach to
+                // that dying backend (or start a second writer for the same journal).
+                let gone = m.mux_name.as_ref().is_some_and(|name| {
+                    self.running
+                        .latest()
+                        .is_some_and(|snap| !snap.is_alive(name))
+                });
+                if gone {
+                    self.remove_session(i, ViewEnd::Closed, now);
+                    self.waker.now();
+                } else {
+                    self.running.poke();
+                    self.wake_within(CLOSE_POLL);
+                }
+                continue;
+            }
+            match parking {
+                Parking::Requested { until, .. } | Parking::Stopping { until } => {
+                    if now < until {
+                        self.wake_within(until - now);
+                    }
+                    continue;
+                }
+                Parking::Detached { .. } => {}
+            }
+            if !self.cfg.park_idle_sessions {
+                // Disabling parking must not cancel work this controller already accepted.
+                self.sess.managed[i].parking = None;
+                self.dirty.parking = true;
+                continue;
+            }
+            let ready = !self.stopping
+                && self.barrier.is_none()
+                && !viewed
+                && m.ctl.terminal().accepts_input()
+                && m.ctl.activity() == Activity::Idle
+                && !m.checkpoint_pending_command()
+                && !self.checkpoint_restore_busy(target)
+                && !self.checkpoint_deferred_pending(target)
+                && !self.has_live_parking_child(&target.key)
+                && self.sess.launching.is_none()
+                && m.ctl.session_path().is_some()
+                && m.live.as_ref().is_some_and(|link| {
+                    link.client.latest().is_some_and(|snapshot| {
+                        snapshot.main_idle == Some(true)
+                            && snapshot.session_file.as_deref() == m.ctl.session_path()
+                            && snapshot.pending_ui.is_empty()
+                    })
+                });
+            let Parking::Detached { deadline } = parking else {
+                continue;
+            };
+            let m = &mut self.sess.managed[i];
+            if !ready {
+                if deadline.is_some() {
+                    m.parking = Some(Parking::Detached { deadline: None });
+                    self.dirty.parking = true;
+                }
+                continue;
+            }
+            let due = deadline.unwrap_or_else(|| ParkDeadline {
+                at: now + PARK_IDLE_AFTER,
+                unix_ms: crate::gateway::unix_ms() + PARK_IDLE_AFTER.as_millis() as u64,
+            });
+            if now < due.at {
+                if deadline.is_none() {
+                    m.parking = Some(Parking::Detached {
+                        deadline: Some(due),
+                    });
+                    self.dirty.parking = true;
+                }
+                self.wake_within(due.at - now);
+                continue;
+            }
+            let (Some(link), Some(root)) = (m.live.as_ref(), m.ctl.session_path()) else {
+                continue;
+            };
+            let Some(connection) = link.client.connection_with_feature("park_idle") else {
+                m.parking = Some(Parking::Detached { deadline: None });
+                self.dirty.parking = true;
+                continue;
+            };
+            let expires_at = crate::gateway::unix_ms() + PARK_REQUEST_TIMEOUT.as_millis() as u64;
+            let id = link.client.send_on(
+                connection,
+                CtlCommand::ParkIdle {
+                    root: root.to_path_buf(),
+                    expires_at,
+                },
+            );
+            // Reopens wait briefly for the normal exit. A lost reply does not prove refusal,
+            // so reaching this deadline fails the reopen rather than attaching to a dying omp.
+            let until = now + PARK_REQUEST_TIMEOUT + CTL_CONNECT;
+            m.parking = Some(Parking::Requested { id, until });
+            self.dirty.parking = true;
+            self.wake_within(until - now);
         }
     }
 
@@ -1015,6 +1231,7 @@ impl Engine {
     /// their record (or Cancelled), its views end with `end`.
     fn remove_session(&mut self, i: usize, end: ViewEnd, now: Instant) -> SessionKey {
         let mut m = self.sess.managed.remove(i);
+        self.dirty.parking |= self.cfg.park_idle_sessions;
         let target = m.ctl.target().clone();
         let driven = m.ctl.drive(now);
         let delivered = driven
@@ -1094,6 +1311,13 @@ impl Engine {
     /// killed first when asked to.
     pub(super) fn begin_close(&mut self, i: usize, key: RequestKey, kill_direct: bool) {
         let m = &mut self.sess.managed[i];
+        if self.cfg.park_idle_sessions && m.supports_parking() {
+            // The frontend drops its own view. Retain accepted work and any other views.
+            m.parking = Some(Parking::Detached { deadline: None });
+            self.dirty.parking = true;
+            self.job_finished(key, Ok(Done::Unit));
+            return;
+        }
         if kill_direct && m.is_direct() && !m.exited() {
             m.ctl.terminal_mut().kill();
         }
@@ -1449,6 +1673,27 @@ impl Engine {
                 }
             }
             for (rid, reply) in link.client.take_replies() {
+                if let Some(Parking::Requested { id, until }) = m.parking
+                    && id == rid
+                {
+                    self.dirty.parking = true;
+                    if reply.ok {
+                        m.parking = Some(Parking::Stopping { until });
+                    } else if reply.code.as_deref() == Some("park_refused")
+                        || matches!(
+                            reply.error.as_deref(),
+                            Some("not connected" | "connection changed" | "control client stopped")
+                        )
+                    {
+                        log::debug!(
+                            "parking {key}: {}",
+                            reply.error.as_deref().unwrap_or("refused")
+                        );
+                        m.parking = Some(Parking::Detached { deadline: None });
+                        self.waker.now();
+                    }
+                    continue;
+                }
                 replies.push((
                     key.clone(),
                     rid,
@@ -1776,6 +2021,7 @@ impl Engine {
             .enumerate()
             .filter(|(_, m)| {
                 m.exited()
+                    && m.parking.is_none()
                     && (m.ctl.session_path() == Some(path)
                         || (name.is_some() && m.mux_name.as_deref() == name))
             })
@@ -1787,20 +2033,51 @@ impl Engine {
         }
     }
 
-    fn existing_for(
-        &self,
-        spec: &LaunchSpec,
-        name: Option<&str>,
-    ) -> Option<(SessionTarget, SessionView)> {
-        self.sess
+    /// Reuse a live controller, or queue a reopen behind an in-flight graceful shutdown.
+    /// Returns only jobs that still need a new controller.
+    fn reuse_launch(&mut self, mut job: LaunchJob, name: Option<&str>) -> Option<LaunchJob> {
+        if job.spec.copy_of.is_some() {
+            return Some(job);
+        }
+        let name = name.or(job.spec.mux_name.as_deref());
+        let Some(m) = self
+            .sess
             .managed
-            .iter()
-            .find(|m| {
-                (spec.session_path.is_some()
-                    && m.ctl.session_path() == spec.session_path.as_deref())
-                    || (name.is_some() && m.mux_name.as_deref() == name)
-            })
-            .map(|m| (m.ctl.target().clone(), m.view))
+            .iter_mut()
+            .find(|m| m.matches_launch(&job.spec, name))
+        else {
+            return Some(job);
+        };
+        if m.parking_in_flight() || (m.parking.is_some() && m.exited()) {
+            if matches!(m.parking, Some(Parking::Requested { until, .. } | Parking::Stopping { until }) if Instant::now() >= until)
+            {
+                if let Some(key) = job.key {
+                    self.job_failed(key, GatewayError::Refused(
+                        "omp has not confirmed parking; wait for it to exit or stop it explicitly".to_owned(),
+                    ));
+                }
+                return None;
+            }
+            if job.spec.session_path.is_none()
+                && let Some(path) = m.ctl.session_path()
+            {
+                job.spec.session_path = Some(path.to_path_buf());
+                job.spec.argv = omp_argv(Some(path));
+            }
+            self.sess.launches.push_back(job);
+            return None;
+        }
+        // The reopen has arrived even if its view has not connected yet.
+        self.dirty.parking |= m.parking.take().is_some();
+        let view = m.view;
+        let target = m.ctl.target().clone();
+        if job.agent_child.is_none() {
+            self.adopt_agent_child_attach(&target.key);
+        }
+        if let Some(key) = job.key {
+            self.job_finished(key, Ok(Done::Session(target, view)));
+        }
+        None
     }
 
     /// Attach an existing child only for the lifetime of its outstanding tool operations.
@@ -1883,21 +2160,16 @@ impl Engine {
         let Some(snap) = self.running.latest() else {
             return;
         };
-        while let Some(mut job) = self.sess.launches.pop_front() {
+        for _ in 0..self.sess.launches.len() {
+            let Some(job) = self.sess.launches.pop_front() else {
+                break;
+            };
             if job.abandoned_agent_attach(|key| self.agent_child_attach_needed(key)) {
                 continue;
             }
-            if job.spec.copy_of.is_none()
-                && let Some((t, view)) = self.existing_for(&job.spec, job.spec.mux_name.as_deref())
-            {
-                if job.agent_child.is_none() {
-                    self.adopt_agent_child_attach(&t.key);
-                }
-                if let Some(key) = job.key.take() {
-                    self.job_finished(key, Ok(Done::Session(t, view)));
-                }
+            let Some(job) = self.reuse_launch(job, None) else {
                 continue;
-            }
+            };
             let mut name = job.spec.mux_name.clone();
             if !job.exact
                 && let Some(pref) = name.as_deref()
@@ -1923,18 +2195,9 @@ impl Engine {
             if job.restore && name.is_none() {
                 continue;
             }
-            if job.spec.copy_of.is_none()
-                && let Some(n) = name.as_deref()
-                && let Some((t, view)) = self.existing_for(&job.spec, Some(n))
-            {
-                if job.agent_child.is_none() {
-                    self.adopt_agent_child_attach(&t.key);
-                }
-                if let Some(key) = job.key.take() {
-                    self.job_finished(key, Ok(Done::Session(t, view)));
-                }
+            let Some(job) = self.reuse_launch(job, name.as_deref()) else {
                 continue;
-            }
+            };
             let wants_ctl = self.ctl_ext.is_some() && job.spec.role == SessionRole::Session;
             let ctl_key = wants_ctl.then(|| {
                 name.clone().unwrap_or_else(|| {
@@ -2070,6 +2333,7 @@ impl Engine {
                     ctl_key,
                     spawned_ms: crate::gateway::unix_ms(),
                     closing: None,
+                    parking: None,
                     controlling: None,
                     copy,
                     live: None,

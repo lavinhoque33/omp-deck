@@ -113,6 +113,8 @@ pub struct AppConfig {
     pub project_sync_interval: SyncInterval,
     /// Which session backend new tabs use (live sessions keep theirs until closed).
     pub session_backend: BackendChoice,
+    /// Stop idle, detached omp processes; their saved sessions can be reopened.
+    pub park_idle_sessions: bool,
     /// Worktree path → base branch recorded when OmpDeck created / moved a session into it;
     /// pruned when the worktree is removed.
     pub worktree_bases: BTreeMap<PathBuf, String>,
@@ -357,6 +359,7 @@ impl Default for AppConfig {
             project_sync: Vec::new(),
             project_sync_interval: SyncInterval::default(),
             session_backend: BackendChoice::default(),
+            park_idle_sessions: false,
             worktree_bases: BTreeMap::new(),
             notify: NotifyConfig::default(),
             agent_tools: AgentTools::default(),
