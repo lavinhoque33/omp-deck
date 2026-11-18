@@ -374,8 +374,9 @@ impl<'a> TerminalView<'a> {
         );
 
         // File drops (winit on X11/Windows, the app's bridge on Wayland) paste the paths like
-        // Konsole/kitty. The view under the pointer takes them; the focused one when the
-        // platform reports no pointer position during the drag.
+        // Konsole/kitty. The view under the pointer takes them; the one holding keyboard focus
+        // within the window when the platform reports no pointer position during the drag. Not
+        // `focused`: the window itself is unfocused during a drop (the drag source keeps it).
         let drop = ui.input(|i| {
             let dropped = input::encode_dropped_paths(i.raw.dropped_files.iter().map(|f| f.path()));
             let hovering = !i.raw.hovered_files.is_empty();
@@ -387,7 +388,7 @@ impl<'a> TerminalView<'a> {
             && (if has_pos {
                 response.contains_pointer()
             } else {
-                focused
+                ui.memory(|m| m.has_focus(response.id))
             })
         {
             drop_hover = hovering;

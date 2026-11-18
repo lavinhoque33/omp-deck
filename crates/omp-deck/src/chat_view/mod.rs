@@ -390,6 +390,8 @@ impl<'a> ChatView<'a> {
             if plan.paste {
                 term.paste_clipboard();
             }
+        }
+        if exit.is_none() {
             route_dropped_files(ui, term, &response);
         }
         // omp's "open transcript" for a subagent, once the session surface shows its composer:
@@ -670,13 +672,24 @@ fn draw_session(
 }
 
 /// Files dropped on the chat paste their paths into the composer like the terminal view does.
+/// The view under the pointer takes them, else the one holding keyboard focus within the window.
+/// The window itself is not focused during a drop (the drag source keeps it on X11), so
+/// `Response::has_focus`, which also requires window focus, would drop every file.
 fn route_dropped_files(ui: &Ui, term: &mut Terminal, response: &egui::Response) {
-    let dropped =
-        ui.input(|i| input::encode_dropped_paths(i.raw.dropped_files.iter().map(|f| f.path())));
+    let (dropped, pos) = ui.input(|i| {
+        let dropped = input::encode_dropped_paths(i.raw.dropped_files.iter().map(|f| f.path()));
+        (dropped, i.pointer.hover_pos())
+    });
     if dropped.is_empty() || term.input_held() {
         return;
     }
-    let _ = response;
+    let ours = match pos {
+        Some(p) => response.rect.contains(p),
+        None => ui.memory(|m| m.has_focus(response.id)),
+    };
+    if !ours {
+        return;
+    }
     match term.paste_bytes(&dropped) {
         Some(bytes) => term.write(&bytes),
         None => term.write(dropped.as_bytes()),
@@ -708,6 +721,10 @@ mod tests {
         hide_duplicates: bool,
         agents: Vec<AgentMeta>,
         width: f32,
+        /// Whether the window has keyboard focus (false while another app drags files in).
+        window_focused: bool,
+        /// Files dropped in the next frame.
+        dropped: Vec<PathBuf>,
         /// The redirects the view reported, in order.
         redirects: Vec<Redirect>,
     }
@@ -855,6 +872,8 @@ mod tests {
                 hide_duplicates: false,
                 agents: Vec::new(),
                 width: 900.0,
+                window_focused: true,
+                dropped: Vec::new(),
                 redirects: Vec::new(),
             };
             let until = Instant::now() + Duration::from_secs(10);
@@ -882,8 +901,12 @@ mod tests {
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(self.width, 700.0))),
                 events,
-                focused: true,
+                focused: self.window_focused,
                 time: Some(self.time),
+                dropped_files: std::mem::take(&mut self.dropped)
+                    .into_iter()
+                    .map(|p| Arc::new(Dropped(p)) as egui::DroppedFileHandle)
+                    .collect(),
                 ..Default::default()
             };
             self.time += 0.05;
@@ -992,6 +1015,40 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// A file dropped from another application.
+    #[derive(Debug)]
+    struct Dropped(PathBuf);
+
+    impl egui::DroppedFile for Dropped {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            Err("unused".into())
+        }
+    }
+
+    #[test]
+    fn a_file_dropped_while_the_drag_source_holds_window_focus_reaches_the_composer() {
+        // On X11 (Cinnamon + Nemo) the file manager keeps keyboard focus through the whole drag:
+        // the drop lands on an unfocused window, with the pointer over the chat.
+        let mut h = Harness::new("drop-unfocused");
+        h.focus();
+        h.window_focused = false;
+        h.frame(vec![Event::WindowFocused(false)]);
+        let path = PathBuf::from("/tmp/a dropped file.png");
+        h.dropped = vec![path.clone()];
+        h.frame(vec![Event::PointerMoved(pos2(450.0, 300.0))]);
+        let want = input::encode_dropped_paths([path.as_path()]);
+        let typed = h.typed(want.as_bytes());
+        assert!(
+            typed.windows(want.len()).any(|w| w == want.as_bytes()),
+            "the dropped path never reached omp: {:?}",
+            String::from_utf8_lossy(&typed)
+        );
     }
 
     /// Text shapes `text` among the painted shapes: their positions.
