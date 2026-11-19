@@ -2902,8 +2902,8 @@ styles through the palette; per-style character kept where it fits.
   **"Running sessions"** (expanded by default; egui memory is not persisted, so defaults apply every launch) are
   pinned above the scope chip, headers in the UI font (`theme::font`, never `label_font`). Running sessions = every
   name in `RunningSnapshot.alive` (hidden when empty or `blind`): status (tab status, else `activity_of`), title via
-  the session file's entry, else the mux name, folder, tab marker. Order (`running::order`, tested): tab-strip order,
-  then newest session file, then unmapped by name; per-folder scope applies. Click: activate the tab, else
+  the session file's entry, else the mux name, folder, tab marker. Order: see "Running lists ordered by recency"
+  (superseded: tab-strip order, then newest session file); per-folder scope applies. Click: activate the tab, else
   `Open(entry)`, else `SidebarAction::AttachRunning { name, title }` (attaches the existing mux session, never starts
   omp). Menus: `tab_menu` / `session_menu`; unmapped rows Open + Stop (`StopRunning` → the usual confirm).
 - **Close buttons**: every modal/window header ✕ is `card::close_button` (26 / 14) or `card::close_button_sized`
@@ -3978,8 +3978,8 @@ indicator for open tabs), and reorder them to move the open tabbed ones to the t
   55 % of the sidebar]; `AppConfig.running_dock_collapsed` folds it to the grab strip + header. Both persist through the
   settings service like `sidebar_width`.
 - Rows (28 px, inset 8): status glyph 14 (Attention badge / Busy spinner / Exited / Bell / idle `ok` glow dot), label
-  12, faint folder 10 (max ~64 px). **Order: rows with a tab first (tab-strip order), then the rest newest session file
-  first, unlisted last by name** (today's `running::order`, kept).
+  12, faint folder 10 (max ~64 px). **Order: superseded by "Running lists ordered by recency"** (active first, then
+  most recent; tabs no longer lead).
   - With a tab: accent window marker at rest; hover → view-switch + **close tab ✕** (detach, as the old Open-tabs row);
     middle-click closes the tab; the active tab's row is selected (accent wash + border).
   - Without a tab: dashed "attach" pill (play icon in `ok`) at rest; hover → Attach (play) key.
@@ -5329,3 +5329,54 @@ the dock. Four live gates failed; two were product bugs.
   the placeholder); the ask is awaited as `omp.ask.card` or `omp.editor.ask`.
 - `agent_tools_live` (deck-service): the todo progress mirror is a 50 ms-debounced snapshot push that omp's idle
   signal can overtake; the test waits for `(3, 3)` instead of asserting it on the first idle read.
+
+## Running lists ordered by recency (user, 2026-11-19)
+
+Request: order the Running entries (sidebar dock, phone Sessions screen) by how recent each is, busy ones above
+running-but-idle ones. Replaces "tabbed sessions first (strip order)" on the desktop and "managed first, desktop views
+first" on the phone.
+
+### One rule, every client
+1. **Active first**: rows whose omp is in a turn (`Busy` or `Attention`; a question is a turn waiting on the user)
+   before every other row.
+2. **Newest first** by the session's *recency instant* (below); rows without one last.
+3. Ties: desktop by mux session name; phone stable over its pre-order (managed sessions in `live` feed order, then
+   the other processes newest-started first, then id). The pre-order is deterministic on purpose: it is the whole
+   order below the active split when an older gateway sends no recency (review 2026-11-19: kept, the `running`
+   feed's own order is not a contract).
+
+### Recency instant (gateway-owned: `RunningSnapshot::recent_of(name) -> Option<SystemTime>`)
+The metric is the last write to the session's `.jsonl` (omp appends every message and tool result), made stable for
+running turns: a busy session writes continuously, so sorting busy rows by mtime would reshuffle them every poll.
+- While the poller sees the session **active** (activity `Busy`/`Attention`, as `Activity::derive` gives it): the
+  instant the turn was first seen, **held until the turn ends** (`Busy` ↔ `Attention` flips keep it). A turn the
+  poller witnessed starting (the session was listed inactive before) takes the poll's wall clock; a session first
+  seen already active (gateway start) takes its files' newest mtime, else the wall clock.
+- Otherwise: the newest mtime of the session files it holds (`RunningSnapshot::files_of`). A session holding no
+  readable file keeps its previous instant, except that the end of a turn and the first sight set the wall clock.
+- So busy rows order by turn start (latest started on top), idle rows by turn end (latest finished on top), and the
+  snapshot changes only on transitions and on writes to idle sessions (never per poll of a busy one).
+- State lives in the poller thread (`gateway/running.rs`), dropped for names no longer alive. `recent` is part of the
+  snapshot's equality, so a change publishes `Topic::Running`.
+- Cadence: the poller runs every 3 s (`engine/mod.rs` `POLL_INTERVAL`). A managed session's own status flips at
+  once, so the engine pokes the poller when a managed session's active class flips (verify 2026-11-19: without it a
+  newly busy row sat below an older busy one for up to 3 s). Tab-less sessions get status and recency from the same
+  snapshot, so they never disagree. Turns first seen in one poll share an instant (name order between them).
+- Accepted limits: a wall clock stepping backwards between two turn starts can order those two turns wrongly until
+  one ends; another process writing to a held session file moves an idle row (it is the file-mtime metric).
+
+### Desktop (`omp-deck` `sidebar/running.rs`)
+Group by the status the row shows (`status_of`: the tab's own status, else the snapshot's activity): `Busy` and
+`Attention` are active. Key = `input.running.recent_of(name)`. The row cache key covers each row's active flag and
+recency, so a turn starting or ending re-sorts without a session rescan. Strip order no longer matters.
+
+### Phone (`RunningView`, additive, no gate; the decoder ignores unknown fields, older gateways omit them)
+- `RunningView.recent_unix_ms?: u64` = `recent_of(name)`; `RunningView.activity?: Activity` (`idle`/`busy`/
+  `attention`; omitted when unknown). Both `skip_serializing_if` none: `api-s4.json` stays byte-identical.
+- `runningRows` (pwa `fleet/logic.ts`): one list under the rule above. A managed row's active flag is its
+  `LiveSession` status (`busy` / `attention`), an unmanaged row's is `RunningView.activity`; recency comes from the
+  matching `RunningView` (managed rows match by `live.key`). Rows without one (direct sessions, older gateway) last.
+- An unmanaged row shows the working / needs-input indicator when `activity` says so (it sorts with the busy rows,
+  so it must look busy).
+
+Not changed: the session manager's Running view and the phone's Processes screen (sortable / by RAM).

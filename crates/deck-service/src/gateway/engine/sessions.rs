@@ -471,6 +471,11 @@ fn open_terminal(
     }
 }
 
+fn turn_boundary(previous: Activity, current: Activity) -> bool {
+    let active = |activity| matches!(activity, Activity::Busy | Activity::Attention);
+    active(previous) != active(current)
+}
+
 /// A controller event to deliver, with the record it refers to.
 struct Delivered {
     target: SessionTarget,
@@ -926,10 +931,13 @@ impl Engine {
         let mut observe: Vec<usize> = Vec::new();
         let mut wake: Option<Duration> = None;
         let mut changed = false;
+        let mut running_changed = false;
         for (i, m) in self.sess.managed.iter_mut().enumerate() {
             let tick = m.ctl.tick(now);
             let activity = m.ctl.activity();
             if tick.terminal.title_changed.is_some() || activity != m.published_activity {
+                running_changed |=
+                    m.mux_name.is_some() && turn_boundary(m.published_activity, activity);
                 if m.published_activity == Activity::Busy
                     && activity == Activity::Idle
                     && let Some(path) = m.ctl.session_path()
@@ -970,6 +978,10 @@ impl Engine {
                 let d = t.saturating_duration_since(now);
                 wake = Some(wake.map_or(d, |w| w.min(d)));
             }
+        }
+        if running_changed {
+            // Stamp the boundary without waiting for the next periodic backend poll.
+            self.running.poke();
         }
         for path in checkpoint_turns {
             self.refresh_checkpoints(&path);
@@ -2852,6 +2864,30 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn running_repolls_only_at_turn_boundaries() {
+        use Activity::{Attention, Busy, Idle, Unknown};
+
+        let mut previous = Unknown;
+        for (current, repoll) in [
+            (Idle, false),
+            (Busy, true),
+            (Busy, false),
+            (Attention, false),
+            (Busy, false),
+            (Idle, true),
+            (Attention, true),
+            (Unknown, true),
+        ] {
+            assert_eq!(
+                turn_boundary(previous, current),
+                repoll,
+                "{previous:?} -> {current:?}"
+            );
+            previous = current;
+        }
+    }
 
     #[test]
     fn a_ui_answer_reply_becomes_answered_gone_or_refused() {

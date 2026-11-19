@@ -416,7 +416,7 @@ function RunningSection({
                   else nav.push({ kind: 'running' });
                 }}
               >
-                {row.live === null ? <span className="dot" aria-label="Running" /> : <Indicator live={row.live} />}
+                <Indicator live={row.live} processActivity={row.activity ?? 'unknown'} />
                 <span className="copy">
                   <b>{row.title}</b>
                   <small>{row.live === null ? `Running · ${row.session === null ? 'Process details' : 'Open session'}` : `${shortModel(row.live.model)} · ${statusLabel(row.live)}`}</small>
@@ -571,12 +571,13 @@ function ProjectGroup({
   );
 }
 
-function Indicator({ live }: { live: api.LiveSession | null }): ReactNode {
+function Indicator({ live, processActivity }: { live: api.LiveSession | null; processActivity?: api.Activity }): ReactNode {
+  const state = live?.status.state ?? processActivity;
   let status: ReactNode;
-  if (live === null) status = <span className="dot idle" aria-label="Not running" />;
-  else if (live.status.state === 'attention') status = <span className="warn" aria-label="Needs input">⚠</span>;
-  else if (live.busy || live.status.state === 'busy') status = <span className="busy" aria-label="Working" />;
-  else if (live.status.state === 'exited') status = <span className="dot off" aria-label="Exited" />;
+  if (state === undefined) status = <span className="dot idle" aria-label="Not running" />;
+  else if (state === 'attention') status = <span className="warn" aria-label="Needs input">⚠</span>;
+  else if (live?.busy || state === 'busy') status = <span className="busy" aria-label="Working" />;
+  else if (state === 'exited') status = <span className="dot off" aria-label="Exited" />;
   else status = <span className="dot" aria-label="Running" />;
   return <span className="session-indicator">{status}<ProgressCount progress={live?.progress} /></span>;
 }

@@ -190,12 +190,15 @@ export function forksOf(entries: readonly api.InventoryView[], id: string): api.
 export interface RunningRow {
   key: string;
   live: api.LiveSession | null;
+  active: boolean;
+  recent: number | null;
+  activity: api.Activity | null;
   session: string | null;
   title: string;
   display: string;
 }
 
-/** Managed sessions first (desktop views first), then other live backend processes. */
+/** Live sessions and backend processes, active first and newest first, with stable ties. */
 export function runningRows(live: readonly api.LiveSession[], running: readonly api.RunningView[]): RunningRow[] {
   const byKey = new Map(live.map((entry) => [entry.live.key, entry]));
   const represented = new Set<string>();
@@ -210,12 +213,14 @@ export function runningRows(live: readonly api.LiveSession[], running: readonly 
     rows.push({
       key: entry.live.key,
       live: entry,
+      active: entry.busy || entry.status.state === 'busy' || entry.status.state === 'attention',
+      recent: process?.recent_unix_ms ?? null,
+      activity: null,
       session: entry.session,
       title: entry.title ?? (entry.label || 'New session'),
       display: entry.display,
     });
   }
-  rows.sort((a, b) => Number(b.live?.desktop_controlled) - Number(a.live?.desktop_controlled));
   const remaining = running
     .filter((entry) => !represented.has(entry.id) && (entry.live === null || byKey.get(entry.live.key)?.status.state !== 'exited'))
     .sort((a, b) => (b.started_unix_ms ?? 0) - (a.started_unix_ms ?? 0) || a.id.localeCompare(b.id));
@@ -223,12 +228,15 @@ export function runningRows(live: readonly api.LiveSession[], running: readonly 
     rows.push({
       key: entry.id,
       live: null,
+      active: entry.activity === 'busy' || entry.activity === 'attention',
+      recent: entry.recent_unix_ms ?? null,
+      activity: entry.activity ?? null,
       session: entry.sessions[0] ?? null,
       title: entry.title ?? (entry.sessions.length > 0 ? 'Running session' : 'Unmapped process'),
       display: entry.display ?? 'No working folder',
     });
   }
-  return rows;
+  return rows.sort((a, b) => Number(b.active) - Number(a.active) || (b.recent ?? -1) - (a.recent ?? -1));
 }
 
 /** A running mux session no session file maps to (a bare tool, or omp before its first save). */

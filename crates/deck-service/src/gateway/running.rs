@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use deck_core::mux::session_name_for;
 use deck_core::mux::{Mux, MuxKind, PaneStatus};
@@ -61,6 +61,9 @@ pub struct RunningSnapshot {
     /// title (`Activity::Unknown` is not stored). Only state changes alter the snapshot, not
     /// spinner frames.
     activities: HashMap<String, Activity>,
+    /// When each live session was last recent, for ordering (see [`Self::recent_of`]).
+    #[serde(default)]
+    recent: HashMap<String, SystemTime>,
     /// Live sessions whose live-control endpoint exists (a background fork may use it).
     pub ctl: HashSet<String>,
     #[serde(skip)]
@@ -88,6 +91,7 @@ impl RunningSnapshot {
             owners: HashMap::new(),
             held,
             activities: HashMap::new(),
+            recent: HashMap::new(),
             ctl: HashSet::new(),
             park_capabilities: HashMap::new(),
             parking: HashMap::new(),
@@ -106,6 +110,28 @@ impl RunningSnapshot {
             .get(name)
             .copied()
             .unwrap_or(Activity::Unknown)
+    }
+
+    /// Records each live session's recency instant.
+    pub fn with_recent(mut self, recent: HashMap<String, SystemTime>) -> Self {
+        self.recent = recent;
+        self
+    }
+
+    /// When live session `name` was last recent, the key every Running list sorts by (newest
+    /// first, below the active/idle split): while a turn runs (Busy or Attention) the instant
+    /// the turn was first seen, held until it ends; otherwise the last write to the session
+    /// files it holds. `None` when the poller could not tell.
+    pub fn recent_of(&self, name: &str) -> Option<SystemTime> {
+        self.recent.get(name).copied()
+    }
+
+    /// Changes that can invalidate the phone's cached backend detail, independently of recency.
+    pub(in crate::gateway) fn same_detail_inputs(&self, other: &Self) -> bool {
+        self.alive == other.alive
+            && self.owners == other.owners
+            && self.files == other.files
+            && self.activities == other.activities
     }
 
     /// Status from the gateway's scheduler, independent of the backend run status.
@@ -195,6 +221,63 @@ impl RunningSnapshot {
 }
 
 #[derive(Default)]
+struct Recency {
+    seen: HashMap<String, Seen>,
+}
+
+struct Seen {
+    active: bool,
+    at: SystemTime,
+}
+
+impl Recency {
+    fn step(
+        &mut self,
+        snap: &RunningSnapshot,
+        now: SystemTime,
+        mtime: &dyn Fn(&Path) -> Option<SystemTime>,
+    ) -> HashMap<String, SystemTime> {
+        // Like ctl pruning, don't treat an empty answer (possibly a failed query) as evidence
+        // that the sessions ended. Publish no recency for it; reconcile on the next nonempty poll.
+        if snap.alive.is_empty() {
+            return HashMap::new();
+        }
+        self.seen.retain(|name, _| snap.alive.contains(name));
+        let mut recent = HashMap::with_capacity(snap.alive.len());
+        for name in &snap.alive {
+            let active = matches!(snap.activity_of(name), Activity::Busy | Activity::Attention);
+            let previous = self.seen.get_mut(name);
+            let at = match (active, previous.as_deref()) {
+                (true, Some(seen)) => {
+                    if seen.active {
+                        seen.at
+                    } else {
+                        now
+                    }
+                }
+                (_, seen) => snap
+                    .files_of(name)
+                    .iter()
+                    .filter_map(|path| mtime(path))
+                    .max()
+                    .unwrap_or(match seen {
+                        Some(Seen { active: false, at }) => *at,
+                        _ => now,
+                    }),
+            };
+            let next = Seen { active, at };
+            if let Some(previous) = previous {
+                *previous = next;
+            } else {
+                self.seen.insert(name.clone(), next);
+            }
+            recent.insert(name.clone(), at);
+        }
+        recent
+    }
+}
+
+#[derive(Default)]
 struct Inner {
     latest: Option<Arc<RunningSnapshot>>,
     stop: bool,
@@ -247,6 +330,7 @@ impl RunningMonitor {
             .name("running-monitor".into())
             .spawn(move || {
                 let mut park_cache = HashMap::new();
+                let mut recency = Recency::default();
                 loop {
                     // Clear before scanning: pokes arriving mid-scan stay set and make the
                     // wait below return immediately.
@@ -258,7 +342,11 @@ impl RunningMonitor {
                         guard.poke = false;
                         guard.probe_parking
                     };
-                    let mut snap = poll(&muxes, &sessions_root);
+                    let snap = poll(&muxes, &sessions_root);
+                    let recent = recency.step(&snap, SystemTime::now(), &|path| {
+                        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+                    });
+                    let mut snap = snap.with_recent(recent);
                     snap.ctl = snap
                         .alive
                         .iter()
@@ -470,6 +558,141 @@ mod tests {
                 .map(|(n, f)| ((*n).to_owned(), f.iter().map(PathBuf::from).collect()))
                 .collect(),
         )
+    }
+
+    fn recency_snap(activities: &[(&str, Activity)], files: &[(&str, &[&str])]) -> RunningSnapshot {
+        let names: Vec<_> = activities.iter().map(|(name, _)| *name).collect();
+        snap(files, &names).with_activities(
+            activities
+                .iter()
+                .map(|(name, activity)| ((*name).to_owned(), *activity))
+                .collect(),
+        )
+    }
+
+    fn time(seconds: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn busy_recency_ignores_continuing_file_writes() {
+        let mut recency = Recency::default();
+        let busy = recency_snap(
+            &[("a", Activity::Busy), ("b", Activity::Busy)],
+            &[("a", &["a.jsonl"]), ("b", &["b.jsonl"])],
+        );
+        let first = recency.step(&busy, time(10), &|path| {
+            Some(if path == Path::new("a.jsonl") {
+                time(1)
+            } else {
+                time(2)
+            })
+        });
+        assert!(first["a"] < first["b"]);
+        for now in 11..30 {
+            let reads = std::cell::Cell::new(0);
+            let current = recency.step(&busy, time(now), &|path| {
+                reads.set(reads.get() + 1);
+                Some(if path == Path::new("a.jsonl") {
+                    time(now)
+                } else {
+                    time(now - 1)
+                })
+            });
+            assert_eq!(current, first);
+            assert_eq!(reads.get(), 0);
+        }
+    }
+
+    #[test]
+    fn a_witnessed_turn_start_takes_now_and_its_end_takes_newest_mtime() {
+        let mut recency = Recency::default();
+        let files: &[(&str, &[&str])] = &[
+            ("a", &["a.jsonl"]),
+            ("b", &["b.jsonl", "missing.jsonl", "b-fork.jsonl"]),
+        ];
+        let one_busy = recency_snap(&[("a", Activity::Busy), ("b", Activity::Idle)], files);
+        let both_busy = recency_snap(&[("a", Activity::Busy), ("b", Activity::Busy)], files);
+        let before = recency.step(&one_busy, time(10), &|path| match path.to_str() {
+            Some("a.jsonl") => Some(time(2)),
+            Some("b.jsonl") => Some(time(1)),
+            _ => None,
+        });
+        assert!(before["b"] < before["a"]);
+
+        let during = recency.step(&both_busy, time(20), &|_| panic!("no mtime lookup"));
+        assert_eq!(during["b"], time(20));
+        assert!(during["b"] > during["a"]);
+
+        let after = recency.step(&one_busy, time(30), &|path| match path.to_str() {
+            Some("b.jsonl") => Some(time(23)),
+            Some("b-fork.jsonl") => Some(time(28)),
+            Some("missing.jsonl") => None,
+            _ => panic!("only look up files for the idle session"),
+        });
+        assert_eq!(after["a"], before["a"]);
+        assert_eq!(after["b"], time(28));
+        let later = recency.step(&one_busy, time(40), &|path| {
+            (path == Path::new("b-fork.jsonl")).then(|| time(36))
+        });
+        assert_eq!(later["b"], time(36), "idle writes move the row");
+    }
+
+    #[test]
+    fn attention_is_part_of_the_same_turn() {
+        let mut recency = Recency::default();
+        let mut busy = recency_snap(&[("a", Activity::Busy)], &[("a", &["a.jsonl"])]);
+        let first = recency.step(&busy, time(10), &|_| Some(time(4)));
+        assert_eq!(first["a"], time(4), "turn already active on first sight");
+        busy.activities.insert("a".into(), Activity::Attention);
+        assert_eq!(recency.step(&busy, time(20), &|_| Some(time(17))), first);
+        busy.activities.insert("a".into(), Activity::Busy);
+        assert_eq!(recency.step(&busy, time(30), &|_| Some(time(25))), first);
+    }
+
+    #[test]
+    fn fileless_idle_recency_holds_until_a_turn_ends() {
+        let mut recency = Recency::default();
+        let idle = recency_snap(&[("a", Activity::Idle)], &[]);
+        let busy = recency_snap(&[("a", Activity::Busy)], &[]);
+        let no_file = |_: &Path| None;
+        let first = recency.step(&idle, time(10), &no_file);
+        assert_eq!(first["a"], time(10));
+        assert_eq!(recency.step(&idle, time(20), &no_file), first);
+        assert_eq!(recency.step(&busy, time(30), &no_file)["a"], time(30));
+        let ended = recency.step(&idle, time(40), &no_file);
+        assert_eq!(ended["a"], time(40));
+        assert_eq!(recency.step(&idle, time(50), &no_file), ended);
+    }
+
+    #[test]
+    fn absent_names_are_forgotten_on_a_nonempty_poll() {
+        let mut recency = Recency::default();
+        let both = recency_snap(&[("a", Activity::Busy), ("b", Activity::Idle)], &[]);
+        let only_b = recency_snap(&[("b", Activity::Idle)], &[]);
+        let no_file = |_: &Path| None;
+        let first = recency.step(&both, time(10), &no_file);
+        assert_eq!(first["a"], time(10), "no file on first sight");
+        assert_eq!(
+            recency.step(&only_b, time(20), &no_file),
+            HashMap::from([("b".to_owned(), time(10))]),
+        );
+        let restarted = recency.step(&both, time(30), &no_file);
+        assert_eq!(restarted["a"], time(30));
+        assert_eq!(restarted["b"], first["b"]);
+    }
+
+    #[test]
+    fn an_empty_poll_does_not_restart_turns() {
+        let mut recency = Recency::default();
+        let busy = recency_snap(&[("a", Activity::Busy)], &[("a", &["a.jsonl"])]);
+        let first = recency.step(&busy, time(10), &|_| Some(time(5)));
+        assert!(
+            recency
+                .step(&RunningSnapshot::default(), time(20), &|_| None)
+                .is_empty(),
+        );
+        assert_eq!(recency.step(&busy, time(30), &|_| Some(time(25))), first);
     }
 
     #[test]

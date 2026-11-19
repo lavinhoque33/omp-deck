@@ -188,6 +188,8 @@ Types not defined here are v1 types. `Id`s are strings. The class determines the
 - `Item::ToolResult.images` and `Item::User.images`: `Vec<ImageRef { blob, mime, bytes }>`, fetched with `blob`.
 - `SessionSummary.stub: bool`.
 - `LiveSession.pending_ui: Vec<UiRequestView>` (see below).
+- `RunningView.recent_unix_ms?: u64` and `RunningView.activity?: Activity` (omitted when unknown): the Running
+  section's order (active first, then most recent; `contracts.md` "Running lists ordered by recency").
 
 ### New types (sketch; exact Rust in `api.rs`)
 

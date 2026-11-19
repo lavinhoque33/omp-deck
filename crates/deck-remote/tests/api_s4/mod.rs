@@ -1287,6 +1287,8 @@ fn feeds() -> Vec<(&'static str, Event)> {
         memory_bytes: None,
         processes: None,
         live: None,
+        recent_unix_ms: None,
+        activity: None,
     };
     let agent = |id: &str, status: AgentStatus| AgentView {
         id: s(id),
@@ -2141,6 +2143,48 @@ fn additive_fields_are_omitted_when_empty_and_default_when_absent() {
     let decoded: Welcome = serde_json::from_value(value).unwrap();
     assert!(decoded.push_key.is_empty());
     assert!(!json_text(&decoded).contains("push_key"));
+}
+
+#[test]
+fn running_recency_and_activity_are_additive() {
+    let legacy = json!({
+        "id": RUNNING,
+        "sessions": [],
+        "project": null,
+        "display": null,
+        "title": null,
+        "backend": "host",
+        "started_unix_ms": null,
+        "pid": null,
+        "memory_bytes": null,
+        "processes": null,
+        "live": null,
+    });
+    let row: RunningView = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(row.recent_unix_ms, None);
+    assert_eq!(row.activity, None);
+    assert_eq!(serde_json::to_value(&row).unwrap(), legacy);
+
+    for (activity, wire) in [
+        (Activity::Idle, "idle"),
+        (Activity::Busy, "busy"),
+        (Activity::Attention, "attention"),
+    ] {
+        let current = RunningView {
+            recent_unix_ms: Some(AT),
+            activity: Some(activity),
+            ..row.clone()
+        };
+        let mut expected = legacy.clone();
+        expected["recent_unix_ms"] = json!(AT);
+        expected["activity"] = json!(wire);
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            serde_json::from_value::<RunningView>(encoded).unwrap(),
+            current
+        );
+    }
 }
 
 /// Out-of-range parameters parse but fail [`Op::check`] (answered `bad_request`).

@@ -193,11 +193,46 @@ describe('running', () => {
       process('unmapped', { started_unix_ms: 1 }),
     ]);
     expect(rows.map((row) => [row.key, row.session])).toEqual([
-      ['fresh', null], ['k', 'saved'], ['unmanaged', 'other'], ['unmapped', null],
+      ['k', 'saved'], ['fresh', null], ['unmanaged', 'other'], ['unmapped', null],
     ]);
-    expect(rows[0]?.live?.desktop_controlled).toBe(true);
+    expect(rows[1]?.live?.desktop_controlled).toBe(true);
     expect(rows[2]?.title).toBe('Detached');
     expect(rows[3]?.title).toBe('Unmapped process');
+  });
+
+  test('orders active and idle sessions by recency regardless of management', () => {
+    const idle = live({ live: { key: 'managed-idle', generation: 1 } });
+    const busy = live({ live: { key: 'managed-busy', generation: 1 }, status: { state: 'busy' } });
+    const attention = live({ live: { key: 'managed-attention', generation: 1 }, status: { state: 'attention' } });
+    const rows = runningRows([idle, busy, attention], [
+      process('idle-unknown', { started_unix_ms: 500 }),
+      process('unmanaged-idle', { started_unix_ms: 100, recent_unix_ms: 60, activity: 'idle' }),
+      process('unmanaged-newest-idle', { started_unix_ms: 1, recent_unix_ms: 80, activity: 'idle' }),
+      process('idle-process', { live: idle.live, recent_unix_ms: 70, activity: 'busy' }),
+      process('busy-process', { live: busy.live, recent_unix_ms: 20, activity: 'idle' }),
+      process('attention-process', { live: attention.live, recent_unix_ms: 40 }),
+      process('unmanaged-busy', { recent_unix_ms: 50, activity: 'busy' }),
+      process('unmanaged-attention', { recent_unix_ms: 20, activity: 'attention' }),
+      process('active-unknown', { activity: 'busy' }),
+      process('idle-at-epoch', { recent_unix_ms: 0 }),
+    ]);
+    expect(rows.map(({ key }) => key)).toEqual([
+      'unmanaged-busy', 'managed-attention', 'managed-busy', 'unmanaged-attention', 'active-unknown',
+      'unmanaged-newest-idle', 'managed-idle', 'unmanaged-idle', 'idle-at-epoch', 'idle-unknown',
+    ]);
+    expect(rows.find(({ key }) => key === 'unmanaged-attention')?.activity).toBe('attention');
+  });
+
+  test('without running-feed activity or recency, active managed rows lead and ties preserve input order', () => {
+    const idle = live({ live: { key: 'idle', generation: 1 } });
+    const desktop = live({ live: { key: 'desktop', generation: 1 }, desktop_controlled: true });
+    const busy = live({ live: { key: 'busy', generation: 1 }, busy: true });
+    const attention = live({ live: { key: 'attention', generation: 1 }, status: { state: 'attention' } });
+    const rows = runningRows([idle, desktop, busy, attention], [
+      process('old', { started_unix_ms: 1 }),
+      process('new', { started_unix_ms: 2 }),
+    ]);
+    expect(rows.map(({ key }) => key)).toEqual(['busy', 'attention', 'idle', 'desktop', 'new', 'old']);
   });
 
   test('fresh and direct sessions stay available without backend discovery', () => {

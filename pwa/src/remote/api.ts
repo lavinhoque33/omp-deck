@@ -1050,6 +1050,10 @@ export interface RunningView {
   memory_bytes: number | null;
   processes: number | null;
   live: LiveRef | null;
+  /** Recency instant in Unix milliseconds, absent from older gateways or when unknown. */
+  recent_unix_ms?: number;
+  /** Session activity, absent from older gateways or when unknown. */
+  activity?: Activity;
 }
 
 export interface InventoryStats {
@@ -1849,6 +1853,8 @@ const runningView = struct<RunningView>({
   memory_bytes: nullable(u64),
   processes: nullable(u32),
   live: nullable(liveRef),
+  recent_unix_ms: optional(u64),
+  activity: optional(oneOf(['idle', 'busy', 'attention'])),
 });
 const inventoryView = struct<InventoryView>({
   id: str,

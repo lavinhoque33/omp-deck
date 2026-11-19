@@ -1,7 +1,6 @@
 //! The Running dock pinned to the sidebar's bottom: every session still alive in the session
 //! backends (tmux or the OmpDeck host), with or without an open tab. A grab strip resizes it,
-//! the header folds it; rows with a tab come first in strip order.
-use std::cmp::Ordering;
+//! the header folds it; sessions in a turn come first, each group newest first.
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -49,23 +48,24 @@ pub(super) struct Row {
     tab: Option<usize>,
     /// `(group, session)` in the sessions snapshot: the session file it holds open.
     loc: Option<(usize, usize)>,
-    /// That file's mtime.
-    modified: Option<SystemTime>,
+    /// The status it shows is `Busy` or `Attention` (omp is in a turn).
+    active: bool,
+    /// The gateway's recency instant (`RunningSnapshot::recent_of`).
+    recent: Option<SystemTime>,
 }
 
-/// Sessions with a tab first (strip order), then the rest newest-first by session file; sessions
-/// without a listed file last, by name.
+/// Whether a row showing `status` sorts with the sessions in a turn.
+fn is_active(status: TabStatus) -> bool {
+    matches!(status, TabStatus::Busy | TabStatus::Attention)
+}
+
+/// Sessions in a turn first, then newest recency instant first (none last), then by name.
 fn order(rows: &mut [Row]) {
-    rows.sort_by(|a, b| match (a.tab, b.tab) {
-        (Some(x), Some(y)) => x.cmp(&y),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => match (a.modified, b.modified) {
-            (Some(x), Some(y)) => y.cmp(&x).then_with(|| a.name.cmp(&b.name)),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => a.name.cmp(&b.name),
-        },
+    rows.sort_by(|a, b| {
+        b.active
+            .cmp(&a.active)
+            .then(b.recent.cmp(&a.recent))
+            .then_with(|| a.name.cmp(&b.name))
     });
 }
 
@@ -97,14 +97,17 @@ impl RunningCache {
     }
 }
 
-/// What the rows depend on besides the sessions snapshot: which sessions live and hold which
-/// files (order independent), and the tab strip's session names and folders.
+/// What the rows depend on besides the sessions snapshot: which sessions live, hold which files,
+/// are in a turn and how recent they are (order independent), and the tab strip's session names,
+/// folders and turn flags. Allocates nothing: it runs every frame.
 fn fingerprint(input: &SidebarInput<'_>) -> u64 {
     let snap = input.running;
     let live = snap.alive.iter().fold(0u64, |acc, name| {
         let mut h = DefaultHasher::new();
         name.hash(&mut h);
         snap.files_of(name).hash(&mut h);
+        snap.recent_of(name).hash(&mut h);
+        is_active(TabStatus::of(None, snap.activity_of(name), false)).hash(&mut h);
         acc.wrapping_add(h.finish())
     });
     let mut h = DefaultHasher::new();
@@ -112,6 +115,8 @@ fn fingerprint(input: &SidebarInput<'_>) -> u64 {
     for t in input.tabs {
         t.mux_name().hash(&mut h);
         t.cwd.as_path().hash(&mut h);
+        // The strip position only feeds the bell, never a turn.
+        is_active(t.status(false)).hash(&mut h);
     }
     h.finish()
 }
@@ -131,7 +136,8 @@ fn build(input: &SidebarInput<'_>) -> Vec<Row> {
             name: name.clone(),
             tab: tab_of.get(name.as_str()).copied(),
             loc: None,
-            modified: None,
+            active: false,
+            recent: snap.recent_of(name),
         })
         .collect();
     if let Some(groups) = input.groups {
@@ -164,10 +170,7 @@ fn build(input: &SidebarInput<'_>) -> Vec<Row> {
             }
         }
         for (row, f) in rows.iter_mut().zip(found) {
-            if let Some((loc, modified)) = f {
-                row.loc = Some(loc);
-                row.modified = Some(modified);
-            }
+            row.loc = f.map(|(loc, _)| loc);
         }
     }
     if let Some(scope) = input.scope {
@@ -184,6 +187,9 @@ fn build(input: &SidebarInput<'_>) -> Vec<Row> {
             };
             cwd.is_some_and(|c| folder_scope::contains(scope, c))
         });
+    }
+    for row in &mut rows {
+        row.active = is_active(status_of(input, row));
     }
     order(&mut rows);
     rows
@@ -829,39 +835,173 @@ fn hover_card(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::collections::{BTreeMap, HashSet};
 
-    fn row(name: &str, tab: Option<usize>, age: Option<u64>) -> Row {
+    use deck_core::config::SessionView;
+    use deck_core::sessions::SessionsRoot;
+    use deck_service::gateway::running::RunningSnapshot;
+    use deck_service::statusfmt::Activity;
+
+    use crate::progress_view::ProgressIndex;
+    use crate::sidebar::BackupMenu;
+    use crate::worktree_ui::ParkView;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn row(name: &str, tab: Option<usize>, active: bool, recent: Option<u64>) -> Row {
         Row {
             name: name.to_owned(),
             tab,
-            loc: age.map(|_| (0, 0)),
-            modified: age.map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s)),
+            loc: None,
+            active,
+            recent: recent.map(at),
         }
     }
 
+    fn names(rows: &[Row]) -> Vec<&str> {
+        rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    /// `alive` sessions (no files) with the given activities and recency instants.
+    fn snapshot(
+        alive: &[&str],
+        activities: &[(&str, Activity)],
+        recent: &[(&str, u64)],
+    ) -> RunningSnapshot {
+        RunningSnapshot::new(
+            alive.iter().map(|n| (*n).to_owned()).collect(),
+            HashMap::new(),
+        )
+        .with_activities(
+            activities
+                .iter()
+                .map(|(n, a)| ((*n).to_owned(), *a))
+                .collect(),
+        )
+        .with_recent(
+            recent
+                .iter()
+                .map(|(n, s)| ((*n).to_owned(), at(*s)))
+                .collect(),
+        )
+    }
+
+    /// Runs `f` with a sidebar input over `running` (no tabs, no sessions listing, no scope).
+    fn with_input<R>(running: &RunningSnapshot, f: impl FnOnce(&SidebarInput<'_>) -> R) -> R {
+        let root = SessionsRoot::at("/nonexistent");
+        let busy = HashSet::new();
+        let labels = HashMap::new();
+        let tab_activity = HashMap::new();
+        let progress = ProgressIndex::default();
+        let finishing = HashMap::new();
+        let removed = BTreeMap::new();
+        let parkable = HashSet::new();
+        let input = SidebarInput {
+            groups: None,
+            running,
+            root: &root,
+            root_exists: false,
+            active_path: None,
+            active_cwd: None,
+            now: at(1_000),
+            refreshing: false,
+            can_stop: true,
+            default_view: SessionView::Terminal,
+            host_available: true,
+            omp_available: true,
+            busy: &busy,
+            generation: 1,
+            open_paths: &[],
+            scope: None,
+            recent: &[],
+            picker_available: false,
+            picking: false,
+            tabs: &[],
+            labels: &labels,
+            active_tab: 0,
+            tab_activity: &tab_activity,
+            progress: &progress,
+            dock_height: 0.0,
+            dock_collapsed: false,
+            backup: BackupMenu {
+                place: "Google Drive",
+                off: None,
+            },
+            finishing: &finishing,
+            removed: &removed,
+            parked: ParkView {
+                records: &[],
+                states: &[],
+                parkable: &parkable,
+            },
+        };
+        f(&input)
+    }
+
     #[test]
-    fn tabs_first_in_strip_order_then_newest_file_then_unmapped_by_name() {
+    fn turns_first_regardless_of_tabs_then_newest_then_unknown_then_name() {
         let mut rows = vec![
-            row("omp-z", None, None),
-            row("omp-old", None, Some(10)),
-            row("omp-b", Some(2), Some(1)),
-            row("omp-new", None, Some(99)),
-            row("omp-a", Some(0), None),
-            row("omp-c", None, None),
+            row("omp-tab-idle", Some(0), false, Some(500)),
+            row("omp-idle-none", None, false, None),
+            row("omp-busy-old", None, true, Some(10)),
+            row("omp-idle-new", None, false, Some(900)),
+            row("omp-ask-new", Some(1), true, Some(50)),
+            row("omp-busy-none", None, true, None),
+            row("omp-idle-b", None, false, Some(300)),
+            row("omp-idle-a", None, false, Some(300)),
         ];
         order(&mut rows);
-        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
-            names,
-            ["omp-a", "omp-b", "omp-new", "omp-old", "omp-c", "omp-z"]
+            names(&rows),
+            [
+                "omp-ask-new",
+                "omp-busy-old",
+                "omp-busy-none",
+                "omp-idle-new",
+                "omp-tab-idle",
+                "omp-idle-a",
+                "omp-idle-b",
+                "omp-idle-none",
+            ]
         );
     }
 
     #[test]
-    fn equal_mtimes_fall_back_to_the_name() {
-        let mut rows = vec![row("omp-b", None, Some(5)), row("omp-a", None, Some(5))];
-        order(&mut rows);
-        assert_eq!(rows[0].name, "omp-a");
+    fn a_turn_starting_or_a_newer_instant_resorts_the_cached_rows() {
+        let idle = snapshot(
+            &["omp-a", "omp-b", "omp-c"],
+            &[("omp-a", Activity::Idle), ("omp-b", Activity::Busy)],
+            &[("omp-a", 100), ("omp-b", 50), ("omp-c", 200)],
+        );
+        let mut cache = RunningCache::default();
+        let before = with_input(&idle, |i| names(cache.sync(i)).join(","));
+        assert_eq!(before, "omp-b,omp-c,omp-a");
+
+        // omp-a starts a turn: same sessions, no rescan, yet it joins the active group, newest.
+        let turn = snapshot(
+            &["omp-a", "omp-b", "omp-c"],
+            &[("omp-a", Activity::Busy), ("omp-b", Activity::Busy)],
+            &[("omp-a", 300), ("omp-b", 50), ("omp-c", 200)],
+        );
+        let after = with_input(&turn, |i| names(cache.sync(i)).join(","));
+        assert_eq!(after, "omp-a,omp-b,omp-c");
+
+        // Back to idle, then only an instant moves (an idle session wrote): the key changes and
+        // the rows follow without anything else differing.
+        let back = with_input(&idle, |i| names(cache.sync(i)).join(","));
+        assert_eq!(back, before);
+        let wrote = snapshot(
+            &["omp-a", "omp-b", "omp-c"],
+            &[("omp-a", Activity::Idle), ("omp-b", Activity::Busy)],
+            &[("omp-a", 400), ("omp-b", 50), ("omp-c", 200)],
+        );
+        assert_ne!(
+            with_input(&idle, fingerprint),
+            with_input(&wrote, fingerprint)
+        );
+        let rows = with_input(&wrote, |i| names(cache.sync(i)).join(","));
+        assert_eq!(rows, "omp-b,omp-a,omp-c");
     }
 }

@@ -1233,17 +1233,17 @@ impl Engine {
             return;
         }
         let moved = match (&s.running_seen, &snap) {
-            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+            (Some(a), Some(b)) => !Arc::ptr_eq(a, b) && !a.same_detail_inputs(b),
             (None, None) => false,
             _ => true,
         };
+        s.running_seen = snap;
         let due = s.running_at.is_none_or(|at| now >= at + RUNNING_EVERY);
         if !(moved || due || s.running.is_none()) {
             let wait = (s.running_at.unwrap_or(now) + RUNNING_EVERY).saturating_duration_since(now);
             self.wake_within(wait);
             return;
         }
-        s.running_seen = snap;
         s.running_busy = true;
         let ctx = self.job_ctx();
         self.spawn_worker("device-running", move || {
@@ -1623,6 +1623,7 @@ impl Engine {
         let groups = self.groups();
         let canon = &self.devices.canon;
         let epoch = self.epoch.to_hex();
+        let running = self.running.latest();
         detail
             .sessions
             .iter()
@@ -1658,6 +1659,14 @@ impl Engine {
                         .iter()
                         .find(|m| m.mux_name.as_deref() == Some(r.name.as_str()))
                         .map(|m| live_ref(m.ctl.target())),
+                    recent_unix_ms: running
+                        .as_ref()
+                        .and_then(|snap| snap.recent_of(&r.name))
+                        .map(unix_ms),
+                    activity: running
+                        .as_ref()
+                        .map(|snap| super::activity(snap.activity_of(&r.name)))
+                        .filter(|a| *a != api::Activity::Unknown),
                 }
             })
             .collect()

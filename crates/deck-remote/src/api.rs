@@ -16,13 +16,13 @@
 //! **Slice-4 additions** (`docs/notes/mobile-pwa.md`, "Wire additions"): new ops, feeds and
 //! types follow the same conventions. A device sends a new feed, optional request field, enum
 //! value or record kind only when [`Welcome::features`] lists [`FEATURE_S4`]; the gateway sends
-//! a new enum variant, `Event` or `Item` type only to a device that announced it. Fields added
-//! to R5 structs after the freeze ([`Welcome::push_key`], [`SessionSummary::stub`],
-//! [`LiveSession::pending_ui`], and `images`, `args_value` and `details` of [`Item`]) are the
-//! one exception to "`None` is written as `null`": they are omitted when empty, absent or
-//! `false` (`#[serde(default, skip_serializing_if = …)]`), so every R5 message still encodes
-//! byte-identically (`tests/vectors/api-v1.json`), and a reader takes a missing one as empty.
-//! The slice-4 vectors are `tests/vectors/api-s4.json`.
+//! a new enum variant, `Event` or `Item` type only to a device that announced it. Additive
+//! fields on existing types ([`Welcome::push_key`], [`SessionSummary::stub`],
+//! [`LiveSession::pending_ui`], `images`, `args_value` and `details` of [`Item`], and
+//! [`RunningView::recent_unix_ms`] and [`RunningView::activity`]) are the exception to "`None`
+//! is written as `null`": they are omitted when empty, absent or `false`
+//! (`#[serde(default, skip_serializing_if = …)]`), so the frozen messages still encode
+//! byte-identically (`tests/vectors/api-v1.json`, `tests/vectors/api-s4.json`).
 //!
 //! **HTML forms** (omp 18.18's `ask`, `docs/notes/contracts.md` "omp 18.18 HTML-form `ask` on
 //! the phone"): gated by [`FEATURE_FORM`] the same way. The gateway lists a [`UiKind::Form`]
@@ -2896,6 +2896,12 @@ pub struct RunningView {
     pub processes: Option<u32>,
     /// The live session when the gateway controls it.
     pub live: Option<LiveRef>,
+    /// Turn start while active; otherwise the last write to an open session file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_unix_ms: Option<u64>,
+    /// Activity reported by omp; absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Activity>,
 }
 
 /// Statistics read from a session file.

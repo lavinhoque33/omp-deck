@@ -13,6 +13,7 @@ import {
   decodeEvent,
   decodeReply,
   decodeWelcome,
+  type Event,
   FEATURE_S4,
   MAX_ACTIVITY_DAYS,
   MAX_INVENTORY_LIMIT,
@@ -28,6 +29,7 @@ import {
   type Request,
   RequestBuilder,
   requestJson,
+  type RunningView,
 } from '../src/remote/api.ts';
 import { utf8 } from '../src/remote/bytes.ts';
 
@@ -205,6 +207,33 @@ describe('slice-4 gateway messages validate', () => {
         reset: true,
       },
     });
+  });
+
+  test('the running feed preserves recency and activity only when sent', () => {
+    const legacy: RunningView = {
+      id: 'r-0123456789abcdef',
+      sessions: ['s'],
+      project: null,
+      display: null,
+      title: null,
+      backend: 'host',
+      started_unix_ms: null,
+      pid: null,
+      memory_bytes: null,
+      processes: null,
+      live: null,
+    };
+    const event: Event = {
+      type: 'feed',
+      feed: { feed: 'running' },
+      value: {
+        feed: 'running',
+        sessions: [legacy, { ...legacy, id: 'r-fedcba9876543210', recent_unix_ms: 123, activity: 'attention' }],
+        server_bytes: null,
+        truncated: false,
+      },
+    };
+    expect(decodeEvent(utf8(JSON.stringify(event)))).toEqual(event);
   });
 
   test('the device feed carries the desktop’s Android config only when present; absent stays absent, and an unknown sibling is ignored', () => {
