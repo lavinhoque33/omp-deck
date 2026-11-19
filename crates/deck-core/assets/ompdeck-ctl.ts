@@ -1002,9 +1002,13 @@ export default async function ompdeckCtl(api: any) {
         let resolver: any;
         try { resolver = await import("@oh-my-pi/pi-coding-agent/config/model-resolver"); } catch (e) { log("model-resolver import failed: " + e); return UNSUPPORTED; }
         const fn = (o: any, k: string) => typeof o?.[k] === "function";
-        if (!fn(resolver, "resolveCliModel") || !fn(resolver, "getModelMatchPreferences") || !fn(sess, "setModelTemporary")
-          || !fn(sess, "resolveTemporaryModelThinkingLevel") || !fn(sess, "getContextUsage") || !sess.modelRegistry || !sess.settings) {
-          log("switch_model: an omp internal is missing");
+        const missing = [
+          ...["resolveCliModel", "getModelMatchPreferences"].filter(k => !fn(resolver, k)).map(k => `resolver.${k}`),
+          ...["setModelTemporary", "getContextUsage"].filter(k => !fn(sess, k)).map(k => `session.${k}`),
+          ...["modelRegistry", "settings"].filter(k => !sess[k]).map(k => `session.${k}`),
+        ];
+        if (missing.length > 0) {
+          log("switch_model: omp internals missing: " + missing.join(", "));
           return UNSUPPORTED;
         }
         let resolved: any;
@@ -1029,8 +1033,13 @@ export default async function ompdeckCtl(api: any) {
           if (typeof tokens !== "number" || Number.isNaN(tokens)) return UNSUPPORTED;
           if (tokens > window) return { ok: false, error: "needs_compact" };
         }
-        let level: any;
-        try { level = resolved.thinkingLevel ?? sess.resolveTemporaryModelThinkingLevel(model); } catch (e) { log("thinking level lookup failed: " + e); return UNSUPPORTED; }
+        // The level without a `:level` suffix. omp <= 18.18 `#applySessionModel` borrowed the suffix of a role naming the
+        // model (`resolveTemporaryModelThinkingLevel`); omp 19.0 removed that method: it passes the suffix as is and
+        // `setModelTemporary(model, undefined)` carries the session's level over, clamped to the model.
+        let level: any = resolved.thinkingLevel;
+        if (level === undefined && fn(sess, "resolveTemporaryModelThinkingLevel")) {
+          try { level = sess.resolveTemporaryModelThinkingLevel(model); } catch (e) { log("thinking level lookup failed: " + e); return UNSUPPORTED; }
+        }
         try { await sess.setModelTemporary(model, level); } catch (e: any) { return { ok: false, error: String(e?.message ?? e) }; }
         refreshNow();
         const key = `${model.provider}/${model.id}`;

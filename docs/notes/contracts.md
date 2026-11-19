@@ -3830,7 +3830,9 @@ draft and never touches it (text, caret, pasted blocks, images stay).
     settings: sess.settings, preferences: getModelMatchPreferences(sess.settings)})`; no model → error
     `Unknown model: <selector>` (resolver `warning` → `CtlReply.message`); **over context** (`contextWindow > 0 &&
     getContextUsage().tokens > contextWindow`) → `ok:false, error:"needs_compact"` without changing anything;
-    else `level = resolved.thinkingLevel ?? sess.resolveTemporaryModelThinkingLevel(model)`,
+    else `level = resolved.thinkingLevel`, and on omp ≤ 18.18 `?? sess.resolveTemporaryModelThinkingLevel(model)`
+    (omp 19.0 removed that method: `/switch` passes the suffix as is and `setModelTemporary(model, undefined)` carries
+    the session's level over, clamped to the model; the method is therefore optional, never a reason for `unsupported`),
     `await sess.setModelTemporary(model, level)` (thrown error → error text). Reply `value`: `{model:"provider/id",
     thinking}`; `message`: `Session-only model: provider/id` (+ warning).
   - `CtlCommand::SetEffort { level: String }` — `resolveThinkingArgument(sess, level)` (error → its text), then
