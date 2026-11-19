@@ -1,0 +1,7 @@
+# The one toolchain pin: local builds, CI and release all use it (`rustup toolchain install` in the
+# workflows). A floating `stable` turned every CI run red when a new release added clippy lints;
+# bump this deliberately, together with the fixes the new version asks for.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,47 @@
+name: Audit
+
+# RustSec advisories (policy in deny.toml) and the PWA's npm advisories. An advisory published
+# after a commit is not a regression of that commit, so this is not a per-push gate: it runs daily,
+# when the audit policy or the PWA's dependencies change, and in release.yml before every release.
+# (Cargo.lock is not a trigger: every version bump rewrites it.)
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  push:
+    branches: ['**']
+    paths:
+      - 'deny.toml'
+      - 'pwa/bun.lock'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'pwa/bun.lock'
+      - '.github/workflows/audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check advisories
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: PWA dependency audit
+        working-directory: pwa
+        run: |
+          bun install --frozen-lockfile
+          bun audit

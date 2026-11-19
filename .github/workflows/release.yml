@@ -49,7 +49,8 @@ jobs:
             libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
             desktop-file-utils dpkg-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain pinned in rust-toolchain.toml, the same one CI uses.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -236,9 +237,9 @@ jobs:
           }
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}

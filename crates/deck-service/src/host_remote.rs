@@ -936,15 +936,18 @@ mod tests {
         assert!(ns.has("omp-early"), "the backend still survives detach");
     }
 
-    /// `omp-deck-host` next to the test binaries, when the workspace build produced it.
+    /// `omp-deck-host` of this build, when the workspace build produced it: in the profile
+    /// directory, an ancestor of the test executable (`<profile>/deps/` up to cargo 1.99,
+    /// `<profile>/build/<pkg>/<hash>/out/` since 1.100).
     #[cfg(unix)]
     fn host_exe() -> Option<PathBuf> {
-        let deps = std::env::current_exe().ok()?;
-        let exe = deps
-            .parent()?
-            .parent()?
-            .join(format!("omp-deck-host{}", std::env::consts::EXE_SUFFIX));
-        exe.is_file().then_some(exe)
+        let name = format!("omp-deck-host{}", std::env::consts::EXE_SUFFIX);
+        let me = std::env::current_exe().ok()?;
+        me.ancestors()
+            .skip(1)
+            .take(5)
+            .map(|dir| dir.join(&name))
+            .find(|exe| exe.is_file())
     }
 
     #[cfg(unix)]

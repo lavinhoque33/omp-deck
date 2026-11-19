@@ -17,14 +17,16 @@ impl Drop for Cleanup {
     }
 }
 
+/// `omp-deck-host` of this build: in the profile directory, an ancestor of the test executable
+/// (`<profile>/deps/` up to cargo 1.99, `<profile>/build/<pkg>/<hash>/out/` since 1.100).
 fn host_exe() -> Option<PathBuf> {
-    let profile_dir = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .parent()?
-        .to_path_buf();
-    let exe = profile_dir.join(format!("omp-deck-host{}", std::env::consts::EXE_SUFFIX));
-    exe.is_file().then_some(exe)
+    let name = format!("omp-deck-host{}", std::env::consts::EXE_SUFFIX);
+    let me = std::env::current_exe().ok()?;
+    me.ancestors()
+        .skip(1)
+        .take(5)
+        .map(|dir| dir.join(&name))
+        .find(|exe| exe.is_file())
 }
 
 #[test]

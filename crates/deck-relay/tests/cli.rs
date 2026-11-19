@@ -56,6 +56,25 @@ fn enroll_list_remove() {
     assert_eq!(out.status.code(), Some(1));
 }
 
+/// Room ids are random base64url, so one in 64 starts with '-': it is an id, not an option.
+#[test]
+fn remove_takes_a_room_id_that_starts_with_a_dash() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().to_str().unwrap();
+    let id = "-ktHILlzs9AZH7rZ66Anjg";
+    let record = serde_json::json!([{
+        "room": id, "secret_sha256": "0".repeat(64), "label": "", "created": 1,
+    }]);
+    std::fs::write(dir.path().join("rooms.json"), record.to_string()).unwrap();
+
+    let out = relay(&["remove", "--state-dir", state, id]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(stdout(&relay(&["list", "--state-dir", state])), "");
+    // An option-shaped argument that is no room id stays a usage error.
+    let out = relay(&["remove", "--state-dir", state, "--nope"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
+
 #[test]
 fn usage_errors_help_and_version() {
     assert_eq!(relay(&["list"]).status.code(), Some(2));

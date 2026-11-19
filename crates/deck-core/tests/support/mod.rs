@@ -8,7 +8,7 @@
 #[path = "../../../deck-service/tests/support/fake_model.rs"]
 pub mod fake_model;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use deck_core::ctl::{
@@ -42,25 +42,30 @@ pub fn wait_for<T>(what: &str, timeout: Duration, mut f: impl FnMut() -> Option<
     }
 }
 
-/// `omp-deck-host` next to the test binaries, built when `cargo test` did not.
+/// `omp-deck-host` of this build, built when `cargo test` did not: in the profile directory, an
+/// ancestor of the test executable (`<profile>/deps/` up to cargo 1.99,
+/// `<profile>/build/<pkg>/<hash>/out/` since 1.100).
 fn ensure_host_exe() {
-    let exe = format!("omp-deck-host{}", std::env::consts::EXE_SUFFIX);
-    let profile_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent()?.parent().map(Path::to_path_buf))
-        .expect("test executable dir");
-    let beside = profile_dir.join(&exe);
-    if !beside.is_file() {
+    let name = format!("omp-deck-host{}", std::env::consts::EXE_SUFFIX);
+    let me = std::env::current_exe().expect("test executable");
+    let find = || {
+        me.ancestors()
+            .skip(1)
+            .take(5)
+            .map(|dir| dir.join(&name))
+            .find(|exe| exe.is_file())
+    };
+    let exe = find().unwrap_or_else(|| {
         let status = std::process::Command::new(env!("CARGO"))
             .args(["build", "-p", "deck-host", "--bin", "omp-deck-host"])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .status()
             .expect("run cargo build");
         assert!(status.success(), "cargo build -p deck-host");
-    }
-    assert!(beside.is_file(), "{} exists", beside.display());
+        find().expect("omp-deck-host in the test profile after building it")
+    });
     // SAFETY: set once, before this process starts any thread that reads the environment.
-    unsafe { std::env::set_var(deck_host::HOST_EXE_ENV, &beside) };
+    unsafe { std::env::set_var(deck_host::HOST_EXE_ENV, &exe) };
 }
 
 /// Every node of the open inline surface, depth first, as `(id, kind, props)`.

@@ -2,9 +2,9 @@
 //! `--resume <session>` inside the OmpDeck host, and the real ctl client (socket on Unix, token
 //! pipe on Windows) must receive hello + a snapshot naming that session.
 //!
-//! Runs only when `OMPDECK_TEST_OMP=<path to omp>` is set, and needs the `omp-deck-host` binary
-//! next to the test executable's profile dir (`cargo build -p deck-host`); otherwise it returns
-//! early with a note. Everything lives in a temp sandbox: HOME, `PI_*` and `XDG_*` point there.
+//! Runs only when `OMPDECK_TEST_OMP=<path to omp>` is set (otherwise it returns early with a note)
+//! and then needs the `omp-deck-host` binary in the test profile dir (`cargo build -p deck-host`).
+//! Everything lives in a temp sandbox: HOME, `PI_*` and `XDG_*` point there.
 //! No prompt is sent, so no model is called.
 
 use std::fs;
@@ -33,14 +33,16 @@ impl Drop for Cleanup {
     }
 }
 
+/// `omp-deck-host` of this build: in the profile directory, an ancestor of the test executable
+/// (`<profile>/deps/` up to cargo 1.99, `<profile>/build/<pkg>/<hash>/out/` since 1.100).
 fn host_exe() -> Option<PathBuf> {
-    let profile_dir = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .parent()?
-        .to_path_buf();
-    let exe = profile_dir.join(format!("omp-deck-host{}", std::env::consts::EXE_SUFFIX));
-    exe.is_file().then_some(exe)
+    let name = format!("omp-deck-host{}", std::env::consts::EXE_SUFFIX);
+    let me = std::env::current_exe().ok()?;
+    me.ancestors()
+        .skip(1)
+        .take(5)
+        .map(|dir| dir.join(&name))
+        .find(|exe| exe.is_file())
 }
 
 /// A VT replay as plain text: escape sequences dropped, one line per screen row.
@@ -86,12 +88,9 @@ fn live_omp_serves_a_snapshot_of_its_session_through_the_host() {
         eprintln!("skipping: OMPDECK_TEST_OMP is not set");
         return;
     };
-    let Some(host_exe) = host_exe() else {
-        eprintln!(
-            "skipping: omp-deck-host not built next to the test profile (cargo build -p deck-host)"
-        );
-        return;
-    };
+    // Asked to run live: a missing host is a failure, never a silent pass.
+    let host_exe = host_exe()
+        .expect("omp-deck-host is not built in the test profile (cargo build -p deck-host)");
     // SAFETY: this file holds a single test, so nothing else reads or writes the environment.
     unsafe { std::env::set_var("OMP_DECK_HOST_EXE", &host_exe) };
 

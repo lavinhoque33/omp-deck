@@ -251,7 +251,7 @@ fn advertises_tools_and_round_trips_notify_with_args_and_root() {
     };
     assert_eq!(
         live.client().features(),
-        ["tools", "deliver", "deliver_no_wake"]
+        ["tools", "deliver", "deliver_no_wake", "park_idle"]
     );
     subscribe(&live, true);
     let second = live.another_client();
@@ -427,7 +427,8 @@ fn unset_launch_policy_exposes_no_ompdeck_tools() {
     let Some(live) = start("tools-unset", None) else {
         return;
     };
-    assert!(live.client().features().is_empty());
+    // Parking is not an agent tool: it is offered with or without a tool policy.
+    assert_eq!(live.client().features(), ["park_idle"]);
     let before = live.model.count();
     live.send("ordinary turn");
     let model = wait_for("the main request", TURN, || {

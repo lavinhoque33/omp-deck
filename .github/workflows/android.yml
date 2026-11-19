@@ -2,6 +2,8 @@ name: Android
 
 on:
   push:
+    # Not on release tags: release.yml builds and tests the signed APK for the tag.
+    branches: ['**']
     paths:
       - 'android/**'
       - 'pwa/**'

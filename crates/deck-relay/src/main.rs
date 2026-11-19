@@ -119,6 +119,11 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "-h" | "--help" | "help" => return Err(String::new()),
             s if s.starts_with('-') => {
                 let Some(&(name, limit)) = LIMIT_FLAGS.iter().find(|(f, _)| *f == s) else {
+                    // Room ids are random base64url: one in 64 starts with '-'.
+                    if a.command.is_some() && rooms::parse_room_id(s).is_some() {
+                        a.positional.push(arg);
+                        continue;
+                    }
                     return Err(format!("unknown option {s}"));
                 };
                 let v = value(name)?;
