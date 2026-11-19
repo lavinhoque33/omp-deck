@@ -11,6 +11,16 @@
 //! Enter. Direct hotkeys are a single key. Stop is `Esc`, then — only if omp still works after
 //! 650 ms — one more `Esc`. Jobs of one tab are strictly serialized with a pause between them.
 //!
+//! Text that starts at the cursor in the composer's first cell is ambiguous on the grid: omp ≥ 19
+//! draws its prediction of the next message there as ghost text over an empty buffer, exactly as
+//! a one-row draft with the cursor at its start looks ([`composer::maybe_hint`]; the ghost's
+//! colour is the theme's, and neither Ctrl+C nor any key removes it). The injector then asks omp
+//! itself ([`Env::editor`]: live control's `editor_state`) and takes only an answer to a question
+//! about the same picture, asked after the job began or after its own Ctrl+C. One changed picture
+//! gets a fresh question; without a matching answer within [`EDITOR_TIMEOUT`] per question the
+//! text is a draft (confirm before clearing; stall if it remains after clearing). After the
+//! injector's own paste such text is never the paste: omp leaves the cursor behind what it inserts.
+//!
 //! After the paste every step waits for omp's screen to show the previous one took effect, never a
 //! fixed delay: omp reads `ESC` + `\r` arriving within its 75 ms escape timeout as Alt+Enter, and a
 //! stall anywhere on the way (OmpDeck's PTY thread, the tmux server, ConPTY) delivered the old timed
@@ -46,7 +56,8 @@
 //!
 //! TSP sessions ([`Env::tsp`] set, chat view): omp's composer is not on the grid, so every step
 //! observes the TSP document instead ([`TspComposer`]: the dock's sendable `editor` in focus, an
-//! `omp.editor.ask*` dialog or a lost focus reading as [`Composer::Missing`], attachments as chips,
+//! `omp.editor.ask*` dialog or a lost focus (omp ≥ 19's ask card holding the keys) reading as
+//! [`Composer::Missing`], attachments as chips,
 //! the autocomplete overlay as the popup). A slash command and a plain [`ComposeMode::Send`] go as
 //! one [`Write::Send`] (the `send` event, when the program's hello lists it) after the same
 //! confirm → Ctrl+C → composer-reads-empty steps as on the grid (so a displaced draft never lands
@@ -75,6 +86,9 @@ const SHOW_TIMEOUT: Duration = Duration::from_secs(3);
 /// The rows below the composer must hold still this long before the popup check: omp opens its
 /// autocomplete popup asynchronously, a frame or two after it draws the text.
 const SETTLE: Duration = Duration::from_millis(150);
+/// omp's answer about its editor buffer ([`Env::editor`]) gets this long before the grid's
+/// reading stands (a draft, to be confirmed).
+const EDITOR_TIMEOUT: Duration = Duration::from_secs(1);
 /// Minimum gap between an `Esc` and the next byte.
 const AFTER_ESC: Duration = Duration::from_millis(150);
 /// The popup must be seen closing within this time after its `Esc`.
@@ -247,6 +261,10 @@ pub struct Env<'a> {
     pub last_ctrl_c: Option<Instant>,
     /// The visible grid; only inspected when a slash job starts.
     pub screen: &'a dyn Fn() -> ScreenText,
+    /// omp's own word on whether its editor buffer is empty, from a question asked at or after
+    /// the given instant (an older answer says nothing about now). Only consulted while the
+    /// grid shows text that may be omp's ghost prediction ([`composer::maybe_hint`]).
+    pub editor: &'a dyn Fn(Instant) -> Editor,
     /// The exact bytes the terminal's own paste sends for a text under its current modes
     /// (`deck_term::Terminal::paste_bytes`); `None` when omp has not enabled bracketed paste.
     /// Only [`Payload::Text`] jobs use it.
@@ -255,6 +273,17 @@ pub struct Env<'a> {
     /// whose omp speaks TSP has no composer on its grid: the document is the only place that says
     /// what the composer holds, whether a dialog took it, and where `send` goes.
     pub tsp: Option<&'a dyn Fn() -> TspComposer>,
+}
+
+/// What omp says of its editor buffer ([`Env::editor`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Editor {
+    /// Nobody to ask (no live control, an older extension, a refusal).
+    Unknown,
+    /// Asked; no answer yet.
+    Asked,
+    Empty,
+    Text,
 }
 
 /// One piece of input for the tab's terminal.
@@ -320,7 +349,8 @@ pub struct Poll {
     /// The jobs that left the injector during this poll, in order.
     pub ended: Vec<Ended>,
     /// Drop the user's keyboard/paste input to the terminal for this long from now: bytes were
-    /// written, or a job with written bytes still waits for its next step.
+    /// written, a job with written bytes waits for its next step, or a job waits for omp to say
+    /// whether its editor is empty.
     pub hold_for: Option<Duration>,
 }
 
@@ -402,8 +432,19 @@ struct Active {
     stage: Stage,
     /// A byte of this job already reached the PTY.
     wrote: bool,
+    /// An editor question is pending; hold input without claiming that any bytes were written.
+    waiting_for_editor: bool,
     /// omp was idle when the job started: it must stay idle until the final Enter.
     started_idle: bool,
+    /// The question for the current ambiguous composer picture, if any.
+    editor_check: Option<EditorCheck>,
+}
+
+struct EditorCheck {
+    asked_from: Instant,
+    draft: String,
+    /// One picture change gets a fresh timeout, but repeated changes must end the wait.
+    retried: bool,
 }
 
 #[derive(Default)]
@@ -574,7 +615,9 @@ impl Injector {
             self.last_write = Some(env.now);
         }
         out.hold_for = match &self.active {
-            Some(a) if a.wrote => Some(out.wake_in.unwrap_or_default() + HOLD_TAIL),
+            Some(a) if a.wrote || a.waiting_for_editor => {
+                Some(out.wake_in.unwrap_or_default() + HOLD_TAIL)
+            }
             None if !out.writes.is_empty() => Some(HOLD_TAIL),
             _ => None,
         };
@@ -611,7 +654,9 @@ impl Injector {
                 job,
                 stage: Stage::Start,
                 wrote: false,
+                waiting_for_editor: false,
                 started_idle: env.activity == Activity::Idle,
+                editor_check: None,
             });
             return true;
         }
@@ -638,9 +683,21 @@ fn write(a: &mut Active, out: &mut Poll, w: Write) {
     out.writes.push(w);
 }
 
+/// How a step reads grid text that may be omp's own ghost ([`composer::maybe_hint`]).
+#[derive(Clone, Copy)]
+enum Hint {
+    /// Nothing of ours is in the editor yet: flag ambiguous text for live control to resolve.
+    Check,
+    /// Our paste is on its way: omp leaves the cursor behind what it inserts, so text that
+    /// starts at the cursor is not the paste and the composer does not show it yet.
+    NotThePaste,
+}
+
 /// What the job's step sees of omp's composer: the grid's, or the TSP document's.
 struct Obs {
     composer: Composer,
+    /// The grid alone could not tell this draft from omp's ghost.
+    ambiguous: bool,
     /// What sits below/over the composer: the rows under it (`None` = no composer found), or
     /// (TSP) one marker row while the autocomplete popup is open. Compared with
     /// [`composer::rows_below_changed`].
@@ -652,11 +709,12 @@ struct Obs {
     tsp: Option<TspComposer>,
 }
 
-fn observe(env: &Env<'_>) -> Obs {
+fn observe(env: &Env<'_>, hint: Hint) -> Obs {
     if let Some(tsp) = env.tsp {
         let t = tsp();
         return Obs {
             composer: t.state.clone(),
+            ambiguous: false,
             below: Some(if t.popup {
                 vec!["autocomplete".to_owned()]
             } else {
@@ -668,17 +726,93 @@ fn observe(env: &Env<'_>) -> Obs {
         };
     }
     let screen = (env.screen)();
-    let composer = composer::inspect(&screen);
+    let mut composer = composer::inspect(&screen);
+    let ambiguous = if matches!(composer, Composer::Draft(_)) && composer::maybe_hint(&screen) {
+        match hint {
+            Hint::Check => true,
+            Hint::NotThePaste => {
+                composer = Composer::Empty;
+                false
+            }
+        }
+    } else {
+        false
+    };
     Obs {
         below: composer::rows_below(&screen),
         shape: match &composer {
-            Composer::Draft(d) => d.clone(),
+            Composer::Draft(d) if matches!(hint, Hint::NotThePaste) => d.clone(),
             _ => String::new(),
         },
         visible: matches!(composer, Composer::Draft(_)),
         composer,
+        ambiguous,
         tsp: None,
     }
+}
+
+/// Trust an editor answer only for the ambiguous text we saw when we asked. On failure the
+/// draft read from the grid stands. A second mismatch falls back rather than extending the wait.
+fn check_editor(a: &mut Active, obs: &mut Obs, env: &Env<'_>) -> Option<Duration> {
+    a.waiting_for_editor = false;
+    let Composer::Draft(draft) = &obs.composer else {
+        a.editor_check = None;
+        return None;
+    };
+    if !obs.ambiguous {
+        a.editor_check = None;
+        return None;
+    }
+
+    let now = env.now;
+    let check = a.editor_check.get_or_insert_with(|| EditorCheck {
+        asked_from: now,
+        draft: draft.clone(),
+        retried: false,
+    });
+    let mut remaining = (check.asked_from + EDITOR_TIMEOUT).saturating_duration_since(now);
+    if remaining.is_zero() {
+        return None;
+    }
+
+    let mut answer = (env.editor)(check.asked_from);
+    if matches!(answer, Editor::Empty | Editor::Text) && check.draft != *draft {
+        if check.retried {
+            return None;
+        }
+        check.asked_from = now;
+        check.draft.clone_from(draft);
+        check.retried = true;
+        remaining = EDITOR_TIMEOUT;
+        answer = (env.editor)(now);
+        // A cached answer can have the same timestamp as this poll. Only an actual new
+        // question can make the changed picture safe.
+        if answer != Editor::Asked {
+            return None;
+        }
+    }
+    match answer {
+        Editor::Asked => {
+            a.waiting_for_editor = true;
+            Some(SCREEN_POLL.min(remaining))
+        }
+        Editor::Empty => {
+            obs.composer = Composer::Empty;
+            None
+        }
+        Editor::Text | Editor::Unknown => None,
+    }
+}
+
+fn confirm_draft(a: &mut Active, out: &mut Poll, draft: String) -> Step {
+    a.editor_check = None;
+    out.confirm = Some(Confirm {
+        id: a.id,
+        label: a.job.label.clone(),
+        draft,
+    });
+    a.stage = Stage::AwaitConfirm;
+    Step::Blocked
 }
 
 /// The text a job submits as one TSP `send` event, when the program accepts it: a slash command
@@ -745,7 +879,7 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             let Some(bytes) = (env.paste)(first) else {
                 return Step::Dropped(End::NoPaste);
             };
-            let obs = observe(env);
+            let obs = observe(env, Hint::NotThePaste);
             if obs.composer == Composer::Missing {
                 return Step::Dropped(End::DialogOpen);
             }
@@ -762,7 +896,10 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             Step::Wait(SCREEN_POLL)
         }
         (Payload::Slash(_) | Payload::Text { .. }, Stage::Start) => {
-            let obs = observe(env);
+            let mut obs = observe(env, Hint::Check);
+            if let Some(wait) = check_editor(a, &mut obs, env) {
+                return Step::Wait(wait);
+            }
             let atomic = atomic_text(&a.job.payload, obs.tsp.as_ref()).is_some();
             if !atomic
                 && let Payload::Text { attach, text, .. } = &a.job.payload
@@ -772,15 +909,7 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             }
             match obs.composer {
                 Composer::Missing => Step::Dropped(End::DialogOpen),
-                Composer::Draft(draft) => {
-                    out.confirm = Some(Confirm {
-                        id: a.id,
-                        label: a.job.label.clone(),
-                        draft,
-                    });
-                    a.stage = Stage::AwaitConfirm;
-                    Step::Blocked
-                }
+                Composer::Draft(draft) => confirm_draft(a, out, draft),
                 Composer::Empty => {
                     a.stage = Stage::Cleared(now);
                     Step::Continue
@@ -818,6 +947,7 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
                 _ => {
                     write(a, out, CTRL_C_KEY);
                     *ctrl_c = Some(now);
+                    a.editor_check = None;
                     a.stage = Stage::Cleared(now + AFTER_CLEAR);
                     wait_until(now + AFTER_CLEAR)
                 }
@@ -828,7 +958,13 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             if now < until {
                 return wait_until(until);
             }
-            let obs = observe(env);
+            let mut obs = observe(env, Hint::Check);
+            let deadline = until + SHOW_TIMEOUT;
+            if now < deadline
+                && let Some(wait) = check_editor(a, &mut obs, env)
+            {
+                return Step::Wait(wait.min(deadline - now));
+            }
             if let Some(text) = atomic_text(&a.job.payload, obs.tsp.as_ref()) {
                 if text.trim().is_empty() {
                     return Step::Dropped(End::Aborted);
@@ -862,14 +998,16 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
                 );
                 return Step::Done;
             }
-            // Pasting onto a draft omp has not cleared yet would submit the two of them as one.
+            // Never re-open confirmation after Ctrl+C. If the grid still reads as a draft, wait
+            // for proof that it cleared; pasting onto it could submit both drafts as one.
             if obs.composer != Composer::Empty {
-                return if now >= until + SHOW_TIMEOUT {
+                return if now >= deadline {
                     Step::Stalled
                 } else {
                     Step::Wait(SCREEN_POLL)
                 };
             }
+            a.editor_check = None;
             let baseline = obs.below.unwrap_or_default();
             let (bytes, attaching) = match &a.job.payload {
                 Payload::Slash(text) => ([PASTE_START, text.as_bytes(), PASTE_END].concat(), false),
@@ -948,7 +1086,7 @@ fn after_attach(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
     else {
         return Step::Done;
     };
-    let obs = observe(env);
+    let obs = observe(env, Hint::NotThePaste);
     let shown = obs.visible && obs.shape != *before;
     if !shown {
         return if now >= *at + SHOW_TIMEOUT {
@@ -996,7 +1134,7 @@ fn after_paste(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
     else {
         return Step::Done;
     };
-    let obs = observe(env);
+    let obs = observe(env, Hint::NotThePaste);
     if !shows_paste(&a.job.payload, &obs) {
         return if now >= *at + SHOW_TIMEOUT {
             Step::Stalled
@@ -1054,7 +1192,7 @@ fn after_escape(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
     if now < due {
         return Step::Wait(due - now);
     }
-    if observe(env)
+    if observe(env, Hint::NotThePaste)
         .below
         .is_some_and(|rows| composer::rows_below_changed(popup, &rows))
     {
@@ -1069,6 +1207,8 @@ fn after_escape(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     const ALT_SHIFT: Mods = Mods::new(true, true, false);
@@ -1138,6 +1278,18 @@ mod tests {
         status: String,
         /// omp redraws the status line on the paste (a git count refreshed on input).
         redraw_status_on_paste: bool,
+        /// omp's prediction of the next message (omp ≥ 19): ghost text behind the cursor while
+        /// the buffer is a strict prefix of it, the empty buffer included.
+        ghost: Option<&'static str>,
+        /// The draft is shown with the cursor moved to its start.
+        homed: bool,
+        /// Live control: omp answers a question about its editor buffer this many ms after it
+        /// was asked (`None`: nobody to ask).
+        control: Option<u64>,
+        /// The question under way: when asked, whether the buffer was empty then, answer due.
+        question: Cell<Option<(Instant, bool, Instant)>>,
+        /// omp's last answer: when asked, whether the buffer was empty.
+        answer: Cell<Option<(Instant, bool)>>,
     }
 
     impl Fixture {
@@ -1156,6 +1308,11 @@ mod tests {
                 enter_into_popup: false,
                 status: STATUS.to_owned(),
                 redraw_status_on_paste: false,
+                ghost: None,
+                homed: false,
+                control: None,
+                question: Cell::new(None),
+                answer: Cell::new(None),
             }
         }
 
@@ -1168,19 +1325,59 @@ mod tests {
                 below.extend(POPUP);
             }
             below.push(&self.status);
-            rail_screen(&self.draft, &below)
+            let typed = self.draft.chars().count();
+            let ghost = self
+                .ghost
+                .filter(|g| g.len() > self.draft.len() && g.starts_with(&self.draft));
+            let mut screen = rail_screen(ghost.unwrap_or(&self.draft), &below);
+            if ghost.is_some() {
+                screen.cursor_col = 2 + typed;
+            } else if self.homed {
+                screen.cursor_col = 2;
+            }
+            screen
         }
 
         fn poll(&mut self, inj: &mut Injector, ms: u64) -> Poll {
             let screen = self.screen();
             let f = move || screen.clone();
             let paste_ok = self.paste_ok;
+            let now = self.base + Duration::from_millis(ms);
+            let (control, empty) = (self.control, self.draft.is_empty());
+            let (question, answer) = (&self.question, &self.answer);
+            let editor = |since: Instant| {
+                let Some(delay) = control else {
+                    return Editor::Unknown;
+                };
+                if let Some((asked, said, due)) = question.get()
+                    && now >= due
+                {
+                    answer.set(Some((asked, said)));
+                    question.set(None);
+                }
+                match answer.get() {
+                    Some((asked, said)) if asked >= since => {
+                        if said {
+                            Editor::Empty
+                        } else {
+                            Editor::Text
+                        }
+                    }
+                    _ => {
+                        if question.get().is_none_or(|(asked, ..)| asked < since) {
+                            question.set(Some((now, empty, now + Duration::from_millis(delay))));
+                        }
+                        Editor::Asked
+                    }
+                }
+            };
             let p = inj.poll(&Env {
-                now: self.base + Duration::from_millis(ms),
+                now,
                 activity: self.activity,
                 last_ctrl_c: self.last_ctrl_c,
                 screen: &f,
                 paste: &|t| paste_ok.then(|| [PASTE_START, t.as_bytes(), PASTE_END].concat()),
+                editor: &editor,
                 tsp: None,
             });
             for w in &p.writes {
@@ -1196,6 +1393,8 @@ mod tests {
             if !self.react {
                 return;
             }
+            // Whatever edits the buffer leaves the cursor behind the edit.
+            self.homed = false;
             match w {
                 Write::Bytes(b) => {
                     let inner = &b[PASTE_START.len()..b.len() - PASTE_END.len()];
@@ -1402,6 +1601,283 @@ mod tests {
         }
         assert_eq!(writes, vec![CTRL_C_KEY]);
         assert_eq!(stalled, vec!["Compact".to_owned()]);
+    }
+
+    /// omp ≥ 19 shows its prediction of the next message as ghost text in an empty composer after
+    /// every turn; Ctrl+C does not remove it. Taken for a draft, every command asked "Clear your
+    /// unsent message?" and then stalled on a composer that never read empty.
+    #[test]
+    fn omps_ghost_prediction_is_no_draft_once_omp_says_its_buffer_is_empty() {
+        let mut fx = Fixture::new();
+        fx.ghost = Some("run the tests and commit");
+        fx.control = Some(20);
+        fx.paste_opens_popup = false;
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Move", "/move /repo", Requires::Idle));
+        let mut confirms = 0;
+        let mut writes = Vec::new();
+        for t in (0..3_000).step_by(10) {
+            let p = fx.poll(&mut inj, t);
+            confirms += usize::from(p.confirm.is_some());
+            writes.extend(p.writes.into_iter().map(|w| (t, w)));
+        }
+        assert_eq!(confirms, 0);
+        assert_eq!(keys(&writes), vec![paste("/move /repo"), ENTER_KEY]);
+        // Nothing is written before omp answered.
+        assert!(at(&writes, &paste("/move /repo")) >= 20);
+        assert!(fx.draft.is_empty() && !inj.is_busy());
+    }
+
+    #[test]
+    fn an_empty_editor_answer_cannot_authorize_pasting_onto_a_new_homed_draft() {
+        let mut fx = Fixture::new();
+        fx.ghost = Some("run the tests and commit");
+        fx.control = Some(20);
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+
+        assert!(fx.poll(&mut inj, 0).writes.is_empty());
+        let (asked, empty, _) = fx.question.take().unwrap();
+        fx.answer.set(Some((asked, empty)));
+        fx.draft = "my own words".into();
+        fx.homed = true;
+
+        let checking = fx.poll(&mut inj, 30);
+        assert!(checking.writes.is_empty());
+        assert!(checking.confirm.is_none());
+        let checked = fx.poll(&mut inj, 60);
+        assert!(checked.writes.is_empty());
+        assert_eq!(checked.confirm.unwrap().draft, "my own words");
+    }
+
+    #[test]
+    fn the_picture_fence_is_renewed_after_the_injectors_ctrl_c() {
+        let mut fx = Fixture::new();
+        fx.ghost = Some("run the tests and commit");
+        fx.control = Some(20);
+        fx.draft = "old draft".into();
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+        assert_eq!(fx.poll(&mut inj, 0).confirm.unwrap().draft, "old draft");
+        inj.answer(true);
+        assert_eq!(fx.poll(&mut inj, 0).writes, [CTRL_C_KEY]);
+
+        let cleared = AFTER_CLEAR.as_millis() as u64;
+        assert!(fx.poll(&mut inj, cleared).writes.is_empty());
+        let (asked, empty, _) = fx.question.take().unwrap();
+        assert_eq!(asked, fx.base + AFTER_CLEAR);
+        assert!(empty);
+        fx.answer.set(Some((asked, empty)));
+        fx.draft = "new draft".into();
+        fx.homed = true;
+
+        let deadline = (AFTER_CLEAR + SHOW_TIMEOUT).as_millis() as u64;
+        for t in ((cleared + 30)..deadline).step_by(30) {
+            let p = fx.poll(&mut inj, t);
+            assert!(p.writes.is_empty() && p.confirm.is_none() && p.ended.is_empty());
+        }
+        let stalled = fx.poll(&mut inj, deadline);
+        assert!(stalled.writes.is_empty() && stalled.confirm.is_none());
+        assert_eq!(stalled.stalled(), ["Compact"]);
+        assert!(!inj.is_busy());
+    }
+
+    #[test]
+    fn a_ghost_without_live_control_stalls_after_one_confirmation_and_clear() {
+        let mut fx = Fixture::new();
+        fx.ghost = Some("run the tests and commit");
+        fx.control = None;
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+
+        let first = fx.poll(&mut inj, 0);
+        assert!(first.writes.is_empty());
+        assert_eq!(first.confirm.unwrap().draft, "run the tests and commit");
+        inj.answer(true);
+        let clear = fx.poll(&mut inj, 0);
+        assert_eq!(clear.writes, [CTRL_C_KEY]);
+        assert!(clear.confirm.is_none());
+
+        let deadline = (AFTER_CLEAR + SHOW_TIMEOUT).as_millis() as u64;
+        for t in (30..deadline).step_by(30) {
+            let p = fx.poll(&mut inj, t);
+            assert!(p.writes.is_empty() && p.confirm.is_none() && p.ended.is_empty());
+        }
+        let stalled = fx.poll(&mut inj, deadline);
+        assert!(stalled.writes.is_empty() && stalled.confirm.is_none());
+        assert_eq!(stalled.stalled(), ["Compact"]);
+        assert!(!inj.is_busy());
+    }
+
+    #[test]
+    fn a_changed_picture_gets_a_fresh_timeout_but_a_second_change_confirms() {
+        let mut fx = Fixture::new();
+        fx.ghost = Some("run the tests and commit");
+        fx.control = Some(900);
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+        assert!(fx.poll(&mut inj, 0).writes.is_empty());
+
+        fx.draft = "first draft".into();
+        fx.homed = true;
+        for t in [900, 1_000] {
+            let waiting = fx.poll(&mut inj, t);
+            assert!(waiting.writes.is_empty() && waiting.confirm.is_none());
+            assert_eq!(waiting.hold_for, Some(waiting.wake_in.unwrap() + HOLD_TAIL));
+        }
+
+        fx.draft = "second draft".into();
+        let checked = fx.poll(&mut inj, 1_800);
+        assert!(checked.writes.is_empty());
+        assert_eq!(checked.confirm.unwrap().draft, "second draft");
+        assert!(checked.hold_for.is_none());
+        assert!(fx.question.get().is_none());
+    }
+
+    #[test]
+    fn editor_wait_holds_input_but_does_not_count_as_written() {
+        for draft in ["", "my own words"] {
+            let mut fx = Fixture::new();
+            fx.ghost = Some("run the tests and commit");
+            fx.control = Some(50);
+            fx.paste_opens_popup = false;
+            fx.draft = draft.into();
+            fx.homed = true;
+            let mut inj = Injector::default();
+            let id = inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+
+            for t in [0, 30] {
+                let waiting = fx.poll(&mut inj, t);
+                assert!(waiting.writes.is_empty());
+                assert_eq!(waiting.hold_for, Some(waiting.wake_in.unwrap() + HOLD_TAIL));
+                assert!(!inj.has_written(id));
+            }
+
+            let resolved = fx.poll(&mut inj, 60);
+            if draft.is_empty() {
+                assert_eq!(resolved.writes, vec![paste("/compact")]);
+                assert_eq!(
+                    resolved.hold_for,
+                    Some(resolved.wake_in.unwrap() + HOLD_TAIL)
+                );
+                assert!(inj.has_written(id));
+                fx.poll(&mut inj, 90);
+                let submitted = fx.poll(&mut inj, 240);
+                assert_eq!(submitted.writes, vec![ENTER_KEY]);
+                assert_eq!(submitted.hold_for, Some(HOLD_TAIL));
+                assert!(fx.poll(&mut inj, 390).hold_for.is_none());
+            } else {
+                assert_eq!(resolved.confirm.unwrap().draft, draft);
+                assert!(resolved.hold_for.is_none());
+                assert!(!inj.has_written(id));
+            }
+        }
+    }
+
+    /// A real one-row draft with the cursor at its start is the same picture on the grid: omp
+    /// says it holds text, and the user is asked as for any draft. After the Ctrl+C the ghost
+    /// takes the draft's place; only an answer asked after the Ctrl+C lets the paste through.
+    #[test]
+    fn a_draft_with_the_cursor_at_its_start_is_still_confirmed() {
+        let mut fx = Fixture::new();
+        fx.ghost = Some("run the tests and commit");
+        fx.control = Some(20);
+        fx.paste_opens_popup = false;
+        fx.draft = "my own words".into();
+        fx.homed = true;
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+        let mut confirm = None;
+        for t in (0..200).step_by(10) {
+            let p = fx.poll(&mut inj, t);
+            assert!(p.writes.is_empty());
+            confirm = confirm.or(p.confirm);
+        }
+        assert_eq!(confirm.map(|c| c.draft), Some("my own words".to_owned()));
+        inj.answer(true);
+        let mut writes = Vec::new();
+        for t in (200..4_000).step_by(10) {
+            writes.extend(fx.poll(&mut inj, t).writes.into_iter().map(|w| (t, w)));
+        }
+        assert_eq!(
+            keys(&writes),
+            vec![CTRL_C_KEY, paste("/compact"), ENTER_KEY]
+        );
+        assert!(at(&writes, &paste("/compact")) >= 200 + 650 + 20);
+    }
+
+    /// An answer is only good for the job that asked: the buffer may have changed since.
+    #[test]
+    fn an_answer_from_an_earlier_job_is_asked_again() {
+        let mut fx = Fixture::new();
+        fx.ghost = Some("run the tests and commit");
+        fx.control = Some(20);
+        fx.paste_opens_popup = false;
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Context", "/context", Requires::Any));
+        let mut t = 0;
+        while inj.is_busy() {
+            fx.poll(&mut inj, t);
+            t += 10;
+        }
+        fx.draft = "typed meanwhile".into();
+        fx.homed = true;
+        inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+        let mut confirm = None;
+        for t in (t..t + 2_000).step_by(10) {
+            let p = fx.poll(&mut inj, t);
+            assert!(p.writes.is_empty());
+            confirm = confirm.or(p.confirm);
+        }
+        assert_eq!(confirm.map(|c| c.draft), Some("typed meanwhile".to_owned()));
+    }
+
+    /// Without omp's word (no live control, or no answer in time) the grid's reading stands.
+    #[test]
+    fn without_an_answer_text_at_the_cursor_is_confirmed_as_a_draft() {
+        for control in [None, Some(3_600_000)] {
+            let mut fx = Fixture::new();
+            fx.ghost = Some("run the tests and commit");
+            fx.control = control;
+            let mut inj = Injector::default();
+            inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+            let mut asked_at = None;
+            for t in (0..2_000).step_by(10) {
+                let p = fx.poll(&mut inj, t);
+                assert!(p.writes.is_empty());
+                if p.confirm.is_some() {
+                    assert!(p.hold_for.is_none());
+                    asked_at = asked_at.or(Some(t));
+                }
+            }
+            let expected = if control.is_some() {
+                EDITOR_TIMEOUT.as_millis() as u64
+            } else {
+                0
+            };
+            assert_eq!(asked_at, Some(expected), "{control:?}");
+        }
+    }
+
+    /// The ghost still on screen after our paste is not the paste: a prompt is not submitted
+    /// before omp shows it (an Enter could land in a popup the paste opens).
+    #[test]
+    fn the_ghost_is_never_taken_for_the_pasted_text() {
+        let mut fx = Fixture::new();
+        fx.ghost = Some("run the tests and commit");
+        fx.control = Some(20);
+        fx.react = false; // the paste is stuck on its way to omp
+        let mut inj = Injector::default();
+        inj.push(Job::text("Send", "something else", true));
+        let mut writes = Vec::new();
+        let mut stalled = Vec::new();
+        for t in (0..6_000).step_by(10) {
+            let p = fx.poll(&mut inj, t);
+            stalled.extend(p.stalled());
+            writes.extend(p.writes);
+        }
+        assert_eq!(writes, vec![paste("something else")]);
+        assert_eq!(stalled, vec!["Send".to_owned()]);
     }
 
     #[test]
@@ -2152,6 +2628,7 @@ mod tests {
                 last_ctrl_c: None,
                 screen: &|| ScreenText::default(),
                 paste: &|t| Some([PASTE_START, t.as_bytes(), PASTE_END].concat()),
+                editor: &|_| Editor::Unknown,
                 tsp: Some(&tsp),
             });
             for w in &p.writes {

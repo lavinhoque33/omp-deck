@@ -21,7 +21,8 @@
 //!           ────────────────────────
 //! ```
 //! An empty composer shows a dim hint (`⇧⇥ to change thinking effort`) far to the right of the
-//! cursor row; it is separated from the cursor by a run of blanks.
+//! cursor row; it is separated from the cursor by a run of blanks. Since omp 19.0 it may instead
+//! show a prediction of the next message as ghost text right at the cursor ([`maybe_hint`]).
 
 use deck_term::ScreenText;
 use deck_tsp::document::{Document, NodeRef};
@@ -43,28 +44,53 @@ const SCAN: usize = 80;
 const HINT_GAP: &str = "   ";
 
 pub fn inspect(screen: &ScreenText) -> Composer {
-    let Some(region) = find(screen) else {
-        return Composer::Missing;
-    };
+    match text_rows(screen) {
+        None => Composer::Missing,
+        Some(rows) if rows.is_empty() => Composer::Empty,
+        Some(rows) => Composer::Draft(
+            rows.iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ↵ "),
+        ),
+    }
+}
+
+/// Whether everything the composer shows could be omp's own inline hint instead of typed text:
+/// one row of text that starts at the cursor, with the cursor in the composer's first cell.
+///
+/// omp draws its inline hints from the end of the buffer on. Since 19.0 one of them is a
+/// prediction of the user's next message (`composer.predictions`, on by default): ghost text
+/// where typed text would be, over an **empty** buffer after every completed turn, and Ctrl+C
+/// does not remove it. A real one-row draft with the cursor moved to its start reads the same on
+/// the grid — the ghost differs only by a theme-defined colour (`dim`), which has no reference
+/// on screen — so only omp can say which of the two it is
+/// (`deck_core::ctl::CtlCommand::EditorState`). [`inspect`] reads both as a draft.
+pub fn maybe_hint(screen: &ScreenText) -> bool {
+    matches!(text_rows(screen).as_deref(), Some([(row, _)]) if *row == screen.cursor_row)
+        && find(screen).is_some_and(|region| screen.cursor_col <= region.prefix_cells)
+}
+
+/// The composer's non-blank rows (screen row, text without the frame and without the
+/// empty-composer hint); `None` without a composer.
+fn text_rows(screen: &ScreenText) -> Option<Vec<(usize, String)>> {
+    let region = find(screen)?;
     let text = |r: &Row| {
         let mut t = r.text.trim_end().to_owned();
         // The hint is only drawn while the composer is empty, i.e. the cursor sits at the very start.
         if r.row == screen.cursor_row && screen.cursor_col <= region.prefix_cells {
             t = cut_hint(&t);
         }
-        t.trim().to_owned()
+        (r.row, t.trim().to_owned())
     };
-    let rows: Vec<String> = region
-        .rows
-        .iter()
-        .map(text)
-        .filter(|t| !t.is_empty())
-        .collect();
-    if rows.is_empty() {
-        Composer::Empty
-    } else {
-        Composer::Draft(rows.join(" ↵ "))
-    }
+    Some(
+        region
+            .rows
+            .iter()
+            .map(text)
+            .filter(|(_, t)| !t.is_empty())
+            .collect(),
+    )
 }
 
 /// The screen rows below the composer — omp's autocomplete popup while it is open, else the status
@@ -395,8 +421,11 @@ fn pi(s: &ScreenText, r: usize) -> Option<Region> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TspComposer {
     /// [`Composer::Missing`] when no sendable `editor` stands in the dock or the cursor is not
-    /// in it: an `omp.editor.ask*` (ask, approval) replaces the composer, any other dialog
-    /// takes its focus, or [`Self::viewing`] redirects input to a subagent. Otherwise its text.
+    /// in it: an `omp.editor.ask*` (approval; an ask before omp 19) replaces the composer, a
+    /// dialog takes its focus, or [`Self::viewing`] redirects input to a subagent. omp ≥ 19's
+    /// ask is a card in the transcript that leaves the composer in the dock: the composer is
+    /// missing while the card holds the keys and addressable once omp gives them back (a
+    /// message sent from it skips the questions, a slash command does not). Otherwise its text.
     pub state: Composer,
     /// `(surface id, editor id)` of the sendable editor.
     pub target: Option<(String, String)>,
@@ -708,6 +737,32 @@ mod tests {
         );
     }
 
+    /// omp 19.0.0 `band`, as captured: the ghost prediction over an empty buffer (cursor column
+    /// 3), with `ru` typed (column 5), and a real draft with the cursor moved to its start.
+    #[test]
+    fn text_at_the_cursor_in_the_first_cell_may_be_omps_hint() {
+        let ghost = with(SPLASH, &[BAND_STATUS, "╰─ run the tests and commit"], &[]);
+        let draft = Composer::Draft("run the tests and commit".to_owned());
+        // The grid alone reads a draft; a homed real draft is the same picture.
+        assert_eq!(inspect(&st(ghost.clone(), 7, 3)), draft);
+        assert!(maybe_hint(&st(ghost.clone(), 7, 3)));
+        // Typed text before the cursor is a draft for certain, whatever follows it.
+        assert_eq!(inspect(&st(ghost.clone(), 7, 5)), draft);
+        assert!(!maybe_hint(&st(ghost, 7, 5)));
+        // omp's hints take one row; a second row is the user's.
+        let two = with(SPLASH, &["▎ line one", "▎ line two"], &[STATUS]);
+        assert!(!maybe_hint(&st(two.clone(), 6, 2)));
+        assert!(!maybe_hint(&st(two, 7, 2)));
+        // Nothing to doubt in an empty composer, nor without one.
+        let empty = with(SPLASH, &[BAND_STATUS, &hinted("╰─", "")], &[]);
+        assert!(!maybe_hint(&st(empty, 7, 3)));
+        assert!(!maybe_hint(&st(with(SPLASH, &["plain output"], &[]), 6, 0)));
+        // The other shapes carry their own first cell.
+        let rail = with(SPLASH, &["▎ run the tests and commit"], &[STATUS]);
+        assert!(maybe_hint(&st(rail.clone(), 6, 2)));
+        assert!(!maybe_hint(&st(rail, 6, 4)));
+    }
+
     /// An inserted multi-paragraph review (omp 18.12.6 `band`, as shown by a real tab): the blank
     /// line of the draft is a bare empty row without the `   ` indent.
     #[test]
@@ -921,9 +976,15 @@ mod tests {
         assert_eq!(draft.state, Composer::Draft("first ↵ second".to_owned()));
 
         // An editor that cannot send (omp is not wired yet) is no composer; nor is one that does
-        // not hold the cursor (an overlay took the focus).
-        for (ed, focus) in [(editor("", false), Some("ed")), (editor("", true), None)] {
-            let c = of(serde_json::json!([ed]), none.clone(), focus);
+        // not hold the cursor: an overlay took the focus, or omp ≥ 19's ask card holds the keys
+        // (no focus while on its option lists, its own field while one is typed in).
+        let field = serde_json::json!({"id": "1d", "k": "input", "p": {"text": ""}});
+        for (dock, focus) in [
+            (serde_json::json!([editor("", false)]), Some("ed")),
+            (serde_json::json!([editor("", true)]), None),
+            (serde_json::json!([editor("", true), field]), Some("1d")),
+        ] {
+            let c = of(dock, none.clone(), focus);
             assert_eq!((c.state, c.target), (Composer::Missing, None));
         }
         // An ask dialog replaces the composer, whatever else the dock holds.

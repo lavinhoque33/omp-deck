@@ -156,3 +156,49 @@ hello/ack harness and replays them through a fake omp.
   final reply in full.
 - The phone answers it through the ctl extension's `formDialog` wrap, not TSP (`docs/notes/mobile-pwa.md`
   "HTML-form ask").
+
+## The ask card (omp 19+, `packages/tui/src/native/ask-card.ts`, `html-form/dialog.ts`, `overlays/ask-dialog.ts`)
+- omp 19 no longer puts an ask in the composer's place. The questions are one **card at the end of `main`** (omp's
+  `nativeTail`: after the transcript blocks, before nothing), and the normal sendable `omp.editor` stays in the dock
+  with the placeholder "Answer above, or type here to skip the questions". `omp.editor.ask.approval` (approvals)
+  is unchanged and still stands in the dock.
+- Tree: `col omp.ask.card` > `row omp.ask.card.head` (`text omp.ask.card.tag` "ask", `text omp.ask.card.progress`
+  "4 of 6 answered") > `col omp.ask.card.body` > optional `text omp.ask.skip` > `row omp.actions` (Cancel, Note
+  (only while an option list holds the keys), Submit; `action` `cancel`/`note`/`submit`).
+- Body: `col omp.ask.intro` (context: `omp.ask.text`, `table omp.ask.table`, `code omp.ask.pre`, `col
+  omp.ask.bullets`), then one node per question or fieldset. The question omp's focus is on is **open**: `col
+  omp.ask.open` > `text omp.ask.legend`, `col omp.ask.field` > `text omp.ask.label` + (`list omp.ask.options` of
+  `item omp.ask.option`/`omp.ask.check` | `input` | `col omp.field` > `editor`). Every other question is a **fold**:
+  `col omp.ask.fold` (`actions.click: open:<n>`, `title`) > `row omp.ask.fold.head` (`omp.ask.fold.mark` ✓/○/!,
+  `omp.ask.fold.question`) over a summary: `row omp.ask.pills` of `button omp.ask.pill` (`pick:<q>:<i>`, chosen =
+  `on` + `icon: check`; `omp.ask.pill.more` = `+N`), `text omp.ask.fold.answer`, or `text omp.ask.fold.well` (an
+  empty field's placeholder); `text omp.ask.error` when invalid. A fieldset with several fields is `col
+  omp.ask.group` of folds, or an `omp.ask.open` holding its folds plus the one live field.
+- Focus: the surface `focus` is `null` while an option list holds the keys, the `input`/`editor` id while a field is
+  typed in, and the composer's editor once omp gives it the keys (a draft in the composer when the ask arrives,
+  Ctrl+C in a field, Tab past the last stop, a click). A composer draft that is a plain message **skips** the
+  questions when sent: the body gets `mark: "drop"`, `omp.ask.skip` warns, the composer shows `omp.composer.mode`
+  "skips ask" and `omp.composer.skip` "Skip & send". A slash command does not skip (verified: `/rename` during a
+  pending ask is delivered and the card stays).
+- Events (verified live on 19.0.0): `action open:<n>` on the fold id, `action pick:<q>:<i>` on the pill id,
+  `select` on the options list, the action bar's `action`s. Enter picks the focused option and moves on; Enter on
+  the last stop submits.
+- Activity: omp reports `blocked` over OSC 7501 while the card stands (the dock keeps its `omp.working` row), so
+  `Activity::Attention` comes from the run status; `TspFacts.asking` (dock `omp.editor.ask*`) only covers approvals
+  and omp < 19.
+- Injection: `TspComposer::of` needs no card rule. While the card holds the keys the editor is not the surface
+  focus → `Composer::Missing` (insert refused as `DialogOpen`; idle-only commands are refused for `Attention`
+  first). Once omp focuses the composer it is addressable like any other time, which matches omp: only
+  `Requires::Any` jobs (model/effort switch, `/rename`, insert) get through, none of them skips the ask.
+- Chat view: `chat_view/ask_card.rs` (framed like the pre-19 dialog, open question on an accent rail, folds as
+  click targets under their own pills, scroll-reveal of the active `omp.ask.field` incl. its label). Fixture
+  `crates/omp-deck/src/chat_view/ask-card.json` (recorded from 19.0.0 with the form of `ask-form.json`): cases
+  `initial`, `check`, `select`, `number`, `text_typed`, `textarea`, `skip`.
+- **Keys follow omp's focus** (the composer no longer always owns them): `Snap::holds_keys(id)` = surface focus is
+  that id, or focus is `null` and the id is the composer and no ask (card or dock dialog) is pending (every ordinary
+  recorded state has `focus: null`). Only the field holding the keys draws a caret, takes slash-command interception
+  (`redirect::intercept`) and selection-replacing typing. A press in an editable field that lacks the keys sends TSP
+  `focus {sf, id}` (omp: `focusFromPointer`) before its caret edit; within a frame, input before the press is routed
+  first, then the Focus, then the rest with the pressed field as the effective focus (`holds_keys_after`). The
+  context menu's Paste sends Focus for its target first. Verified live on 19.0.0 (Xvfb): form ↔ composer clicks,
+  `/settings` + Enter in a focused field, selection isolation, menu Paste.

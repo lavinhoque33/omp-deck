@@ -1167,6 +1167,11 @@ export default async function ompdeckCtl(api: any) {
 
       async function handle(cmd: any): Promise<any> {
         if (cmd.t === "list") return { ok: true, snapshot: snapshot() };
+        // Whether omp's own editor buffer is empty: the grid cannot tell a ghost prediction over an empty buffer from a draft with the cursor at its start.
+        if (cmd.t === "editor_state") {
+          if (typeof mainCtx.ui?.getEditorText !== "function") return { ok: false, error: "editor unavailable" };
+          return { ok: true, value: { empty: mainCtx.ui.getEditorText() === "" } };
+        }
         if (cmd.t === "refresh_provider") {
           if (typeof cmd.provider !== "string" || !cmd.provider) return { ok: false, error: "provider is required" };
           if (typeof mainCtx.modelRegistry?.refreshProvider !== "function") return { ok: false, error: "provider refresh unavailable" };

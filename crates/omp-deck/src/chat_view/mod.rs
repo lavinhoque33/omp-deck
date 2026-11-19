@@ -14,6 +14,7 @@
 //! Split panes keep the composer facts since the shared bar follows only the focused pane.
 
 mod ansi;
+mod ask_card;
 mod code;
 mod ctx;
 mod dock;
@@ -336,12 +337,46 @@ impl<'a> ChatView<'a> {
         {
             loc.sel = None;
         }
-        if focused && exit.is_none() {
-            let events: Vec<Event> = ui.input(|i| i.events.clone());
-            let modifiers = ui.input(|i| i.modifiers);
+        // A press in a field without omp's keys moves them there (Tern's focus follows the
+        // pointer) before anything typed after it in this frame; what came before still goes to
+        // the field that had them. The fields are where they were drawn last frame.
+        let events: Vec<Event> = if exit.is_none() {
+            ui.input(|i| i.events.clone())
+        } else {
+            Vec::new()
+        };
+        let press = field_press(&events, loc.fields.as_slice(), |pos| {
+            rect.contains(pos) && ctx.layer_id_at(pos).is_none_or(|l| l == ui.layer_id())
+        })
+        .filter(|(_, id)| !snap.holds_keys(id));
+        loc.fields.clear();
+        loc.focus_sent = press.as_ref().map(|(_, id)| id.clone());
+        let split = press.as_ref().map_or(events.len(), |(at, _)| *at);
+        let modifiers = ui.input(|i| i.modifiers);
+        // `moved`: the field the segment's press asked omp to focus; what follows the press is
+        // that field's, though the snapshot still shows the focus before it.
+        let mut route = |events: &[Event], moved: Option<&str>| {
+            if let Some(id) = moved
+                && let Err(r) = term.send_tsp(&events::focus_field(snap.sf.as_str(), id))
+            {
+                refused.get_or_insert(r);
+            }
+            if !focused {
+                return;
+            }
+            // The composer's selection is what typing replaces only while the composer has
+            // omp's keys; elsewhere the keys belong to the field that has them. A press that
+            // moved the keys ends it either way (one in the composer starts a new selection).
+            let mut idle = None;
+            let sel = if moved.is_none() && snap.composer().is_some_and(|c| snap.holds_keys(&c.id))
+            {
+                &mut loc.sel
+            } else {
+                &mut idle
+            };
             let plan = select::plan(
-                &events,
-                &mut loc.sel,
+                events,
+                sel,
                 snap.sf.as_str(),
                 snap.can_edit,
                 loc.tsel.has_selection(),
@@ -379,18 +414,21 @@ impl<'a> ChatView<'a> {
                 }
             }
             if plan.send.is_empty()
-                && let Some((r, clear)) = redirect::intercept(snap, &mut keys, &mut loc.swallowed)
+                && let Some((r, clear)) =
+                    redirect::intercept(snap, &mut keys, &mut loc.swallowed, moved)
             {
                 if let Some(Err(e)) = clear.as_ref().map(|c| term.send_tsp(c)) {
                     refused.get_or_insert(e);
                 }
-                redirected = redirected.or(Some(r));
+                redirected.get_or_insert(r);
             }
             term.route_keyboard(&keys, modifiers);
             if plan.paste {
                 term.paste_clipboard();
             }
-        }
+        };
+        route(&events[..split], None);
+        route(&events[split..], press.as_ref().map(|(_, id)| id.as_str()));
         if exit.is_none() {
             route_dropped_files(ui, term, &response);
         }
@@ -526,6 +564,32 @@ impl<'a> ChatView<'a> {
             focus,
         }
     }
+}
+
+/// The frame's first primary press, when it lands (where `here` allows) on a field drawn last
+/// frame: its index in `events` and the field's id.
+fn field_press(
+    events: &[Event],
+    fields: &[(String, Rect)],
+    here: impl Fn(egui::Pos2) -> bool,
+) -> Option<(usize, String)> {
+    let (at, pos) = events.iter().enumerate().find_map(|(i, e)| match e {
+        Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            ..
+        } => Some((i, *pos)),
+        _ => None,
+    })?;
+    if !here(pos) {
+        return None;
+    }
+    fields
+        .iter()
+        .rev()
+        .find(|(_, r)| r.contains(pos))
+        .map(|(id, _)| (at, id.clone()))
 }
 
 /// Terminal grid for the pane: columns from `column` px (the conversation column, or the body of
@@ -721,6 +785,7 @@ mod tests {
         hide_duplicates: bool,
         agents: Vec<AgentMeta>,
         width: f32,
+        height: f32,
         /// Whether the window has keyboard focus (false while another app drags files in).
         window_focused: bool,
         /// Files dropped in the next frame.
@@ -872,6 +937,7 @@ mod tests {
                 hide_duplicates: false,
                 agents: Vec::new(),
                 width: 900.0,
+                height: 700.0,
                 window_focused: true,
                 dropped: Vec::new(),
                 redirects: Vec::new(),
@@ -899,7 +965,10 @@ mod tests {
                 events.insert(0, Event::ModifiersChanged(self.modifiers));
             }
             let raw = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(self.width, 700.0))),
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    vec2(self.width, self.height),
+                )),
                 events,
                 focused: self.window_focused,
                 time: Some(self.time),
@@ -3638,28 +3707,30 @@ mod tests {
         serde_json::Value::Array(ops)
     }
 
+    /// Whether `shape` paints a galley `want`; asserts each such galley lies inside `clip`.
+    fn fully_visible(shape: &Shape, clip: Rect, want: &str) -> bool {
+        match shape {
+            Shape::Text(t) if t.galley.text() == want => {
+                let bounds = Rect::from_min_size(t.pos, t.galley.size());
+                assert!(
+                    clip.expand(0.5).contains_rect(bounds),
+                    "{want:?} is clipped: {bounds:?} outside {clip:?}"
+                );
+                true
+            }
+            Shape::Vec(v) => {
+                let mut found = false;
+                for s in v {
+                    found |= fully_visible(s, clip, want);
+                }
+                found
+            }
+            _ => false,
+        }
+    }
+
     #[test]
     fn a_completed_ask_answer_and_the_following_reply_are_not_clipped() {
-        fn fully_visible(shape: &Shape, clip: Rect, want: &str) -> bool {
-            match shape {
-                Shape::Text(t) if t.galley.text() == want => {
-                    let bounds = Rect::from_min_size(t.pos, t.galley.size());
-                    assert!(
-                        clip.expand(0.5).contains_rect(bounds),
-                        "{want:?} is clipped: {bounds:?} outside {clip:?}"
-                    );
-                    true
-                }
-                Shape::Vec(v) => {
-                    let mut found = false;
-                    for s in v {
-                        found |= fully_visible(s, clip, want);
-                    }
-                    found
-                }
-                _ => false,
-            }
-        }
         for width in [900.0, 360.0] {
             let mut h = Harness::with_frames(&format!("ask-answer-{width}"), &[ask_answer_ops()]);
             h.width = width;
@@ -3688,10 +3759,11 @@ mod tests {
             serde_json::from_str(include_str!("ask-form.json")).expect("ask form fixture");
         let case = &fixture["cases"][case];
         let node = &case["node"];
-        let mut ops = vec![serde_json::json!(["add", node["id"], "dock", null, node])];
-        if !case["focus"].is_null() {
-            ops.push(serde_json::json!(["focus", case["focus"]]));
-        }
+        // The recorded focus, none included: the session's composer had it before the ask.
+        let ops = vec![
+            serde_json::json!(["add", node["id"], "dock", null, node]),
+            serde_json::json!(["focus", case["focus"]]),
+        ];
         Harness::with_frames(name, &[serde_json::Value::Array(ops)])
     }
 
@@ -3809,5 +3881,606 @@ mod tests {
             none.0.x > sqlite.0.x + sqlite.1.x,
             "the next column starts after it"
         );
+    }
+
+    /// The transcript ending in case `case` of `ask-card.json`: omp 19.0.0's ask card, recorded.
+    fn ask_card(name: &str, case: &str) -> Harness {
+        Harness::with_frames(name, &[ask_card_ops(case, false)])
+    }
+
+    /// The ops that put case `case`'s card at the transcript's end (`replace`: in place of the
+    /// card there) and give the surface its focus.
+    fn ask_card_ops(case: &str, replace: bool) -> serde_json::Value {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("ask-card.json")).expect("ask card fixture");
+        let case = &fixture["cases"][case];
+        let node = &case["node"];
+        let mut ops = Vec::new();
+        if replace {
+            ops.push(serde_json::json!(["del", node["id"]]));
+        }
+        ops.push(serde_json::json!(["add", node["id"], "main", null, node]));
+        // The recorded focus, none included: the session's composer had it before the ask.
+        ops.push(serde_json::json!(["focus", case["focus"]]));
+        serde_json::Value::Array(ops)
+    }
+
+    /// What the TSP `action` events the child received address, in order: `(id, act)`.
+    fn actions(typed: &[u8]) -> Vec<(String, String)> {
+        sent(typed, "action")
+            .into_iter()
+            .map(|e| {
+                let s = |k: &str| e[k].as_str().unwrap_or_default().to_owned();
+                (s("id"), s("act"))
+            })
+            .collect()
+    }
+
+    /// The card is the transcript's last item, not the composer's replacement: nothing of it was
+    /// drawn before omp 19 support (an unknown column of folds and pills).
+    #[test]
+    fn every_question_answer_and_summary_of_an_ask_card_is_painted() {
+        let mut h = ask_card("ask-card-initial", "initial");
+        h.height = 1600.0;
+        show_until(&mut h, "Submit");
+        let out = h.settle();
+        let painted: Vec<String> = galleys(&out).into_iter().map(|g| g.2).collect();
+        for want in [
+            "4 of 6 answered",
+            "Pick the storage setup for the service. Context below.",
+            // The open question: its legend and every answer.
+            "Database",
+            "SQLite: one file, no new service, simplest operations by far for a single box deployment",
+            "Postgres: shared across instances, needs ops",
+            "MySQL (not supported)",
+            "Other…",
+            // The folded ones: question over summary (pills, a typed answer, a placeholder).
+            "Languages",
+            "Rust",
+            "Go",
+            "Region",
+            "United States",
+            "Pool size",
+            "4",
+            "Project name",
+            "my-service",
+            "Notes",
+            "Anything else",
+            "Cancel",
+            "Note",
+            "Submit",
+        ] {
+            assert!(painted.iter().any(|p| p == want), "{want:?} in {painted:?}");
+        }
+        // The mark of a fold stands on its question's line, before it.
+        let all = galleys(&out);
+        let notes = all.iter().find(|g| g.2 == "Notes").expect("Notes");
+        assert!(
+            all.iter().any(|g| g.2 == "○"
+                && g.0.x < notes.0.x
+                && (g.0.y + g.1.y - notes.0.y - notes.1.y).abs() < 1.0),
+            "the mark beside {notes:?} in {all:?}"
+        );
+    }
+
+    /// A fold is one click target that opens its question, laid under its summary: the pills in
+    /// it pick their answer and must not open the question as well.
+    #[test]
+    fn clicking_an_ask_card_fold_opens_it_and_its_pill_only_picks() {
+        let mut h = ask_card("ask-card-fold", "initial");
+        h.height = 1600.0;
+        show_until(&mut h, "Submit");
+        let out = h.settle();
+        click_at(
+            &mut h,
+            centre_of(&out, "Pool size").expect("Pool size fold"),
+        );
+        let typed = h.typed(b"open:3");
+        assert_eq!(
+            actions(&typed),
+            [("1b.body/g2/q3".to_owned(), "open:3".to_owned())]
+        );
+        let out = h.settle();
+        click_at(&mut h, centre_of(&out, "Go").expect("Go pill"));
+        let typed = h.typed(b"pick:1:1");
+        assert_eq!(
+            actions(&typed),
+            [
+                ("1b.body/g2/q3".to_owned(), "open:3".to_owned()),
+                ("1b.body/g1/g1.summary/p1".to_owned(), "pick:1:1".to_owned()),
+            ]
+        );
+    }
+
+    /// The open question's answers are omp's option list: a click selects the row (a checkbox
+    /// toggles), addressed to the list.
+    #[test]
+    fn clicking_an_answer_of_an_ask_cards_open_question_selects_it() {
+        let mut h = ask_card("ask-card-check", "check");
+        show_until(&mut h, "Submit");
+        let out = h.settle();
+        click_at(&mut h, centre_of(&out, "Go").expect("Go row"));
+        let typed = h.typed(b"f1/o1");
+        assert_eq!(
+            sent(&typed, "select"),
+            [
+                serde_json::json!({"ev": "select", "sf": "s:1", "id": "1b.body/g1/q1/f1",
+                "item": "1b.body/g1/q1/f1/o1"})
+            ]
+        );
+        assert!(sent(&typed, "activate").is_empty());
+        assert!(actions(&typed).is_empty(), "no fold opened");
+    }
+
+    /// A typed answer shows in its field; a draft in the composer dims the questions under a
+    /// warning naming the key that goes back to them (omp sends it as icons, never drawn), and
+    /// the card still submits.
+    #[test]
+    fn an_ask_cards_typed_answer_shows_and_with_a_draft_it_warns_and_still_submits() {
+        let mut h = ask_card("ask-card-typed", "text_typed");
+        let out = show_until(&mut h, "skip words");
+        assert!(centre_of(&out, "skip words").is_some(), "the typed answer");
+
+        let mut h = ask_card("ask-card-skip", "skip");
+        show_until(&mut h, "Submit");
+        let out = h.settle();
+        assert!(
+            centre_of(
+                &out,
+                "⚠ Sending your message skips these questions · Shift+Tab answers them"
+            )
+            .is_some(),
+            "the warning in {:?}",
+            galleys(&out)
+        );
+        click_at(&mut h, centre_of(&out, "Submit").expect("Submit"));
+        assert_eq!(
+            actions(&h.typed(b"submit")),
+            [("1b.actions/submit".to_owned(), "submit".to_owned())]
+        );
+    }
+
+    /// The view follows the transcript's end; a card taller than the view showed only its action
+    /// bar, the open question scrolled off the top. omp asks for it to be revealed.
+    #[test]
+    fn an_ask_card_taller_than_the_view_shows_its_open_question() {
+        let mut h = ask_card("ask-card-reveal", "initial");
+        h.height = 520.0;
+        show_until(&mut h, "Submit");
+        let out = h.settle();
+        let mut seen = None;
+        for s in &out.shapes {
+            let mut stack = vec![&s.shape];
+            while let Some(shape) = stack.pop() {
+                match shape {
+                    Shape::Text(t) if t.galley.text() == "Database" => {
+                        seen = Some((Rect::from_min_size(t.pos, t.galley.size()), s.clip_rect));
+                    }
+                    Shape::Vec(v) => stack.extend(v),
+                    _ => {}
+                }
+            }
+        }
+        let (legend, clip) = seen.expect("the open question's legend is painted");
+        assert!(
+            clip.contains_rect(legend) && legend.top() >= clip.top() + TOP_FADE,
+            "{legend:?} is in view, clear of the top fade ({clip:?})"
+        );
+        assert!(h.local(|l| l.ask_hold), "following waits for the answer");
+    }
+
+    /// omp moves its focus between the fields of one open fieldset (Pool size, then Notes): the
+    /// open question stays the same node, and revealing it showed its top (the folds above the
+    /// field), leaving the newly focused field below the view.
+    #[test]
+    fn moving_the_focus_within_an_ask_cards_fieldset_brings_the_new_field_into_view() {
+        let mut h = Harness::with_frames_later(
+            "ask-card-move",
+            &[ask_card_ops("number", false)],
+            &[ask_card_ops("textarea", true)],
+        );
+        h.height = 420.0;
+        show_until(&mut h, "Submit");
+        h.settle();
+        h.release_later();
+        h.wait_for("the focus moved to Notes", |d| {
+            d.surface("s:1").and_then(|s| s.focus()) == Some("1e.input")
+        });
+        let out = h.settle();
+        let view = h.view();
+        let all = galleys(&out);
+        // The field's label and its (empty) editor, clear of the top fade and of the dock's.
+        for want in ["Notes", "Anything else"] {
+            let (pos, size, _) = all
+                .iter()
+                .find(|g| g.2 == want)
+                .unwrap_or_else(|| panic!("{want:?} is painted"));
+            assert!(
+                pos.y >= view.top() + TOP_FADE && pos.y + size.y <= view.bottom() - FADE,
+                "{want:?} at {pos:?} {size:?} is in view ({view:?})"
+            );
+        }
+    }
+
+    /// omp's keys stay where its focus is; Tern moves the focus to the field a press lands in.
+    /// The composer drew itself focused whatever omp's focus, and a click in it only moved its
+    /// caret: what was typed next went on into the card's field.
+    #[test]
+    fn clicking_the_composer_takes_omps_keys_from_an_ask_cards_field() {
+        let mut h = ask_card("ask-card-composer-click", "text_typed");
+        show_until(&mut h, "skip words");
+        let out = h.settle();
+        click_at(
+            &mut h,
+            centre_of(&out, "“Fake title”").expect("the composer's placeholder"),
+        );
+        let typed = h.typed(b"\"ev\":\"edit\"");
+        assert_eq!(
+            sent(&typed, "focus"),
+            [serde_json::json!({"ev": "focus", "sf": "s:1", "id": "3.line/input"})]
+        );
+        assert!(actions(&typed).is_empty(), "no card action");
+        // The keys move first, then the caret.
+        let text = String::from_utf8_lossy(&typed);
+        let at = |ev: &str| text.find(&format!("\"ev\":\"{ev}\"")).expect(ev);
+        assert!(at("focus") < at("edit"), "{text:?}");
+    }
+
+    /// A click in the field that has omp's keys only places the caret; one in a field without
+    /// them (the card's, while a draft holds the keys) moves them there.
+    #[test]
+    fn a_click_asks_omp_for_the_focus_only_in_a_field_without_it() {
+        let mut h = ask_card("ask-card-composer-keys", "skip");
+        show_until(&mut h, "Submit");
+        let out = h.settle();
+        click_at(
+            &mut h,
+            centre_of(&out, "“Fake title”").expect("the composer's placeholder"),
+        );
+        let typed = h.typed(b"\"ev\":\"edit\"");
+        assert!(
+            sent(&typed, "focus").is_empty(),
+            "the composer has the keys"
+        );
+        let out = h.settle();
+        click_at(
+            &mut h,
+            centre_of(&out, "skip words").expect("the card's field"),
+        );
+        let typed = h.typed(b"\"id\":\"1d\"");
+        assert_eq!(
+            sent(&typed, "focus"),
+            [serde_json::json!({"ev": "focus", "sf": "s:1", "id": "1d"})]
+        );
+    }
+
+    /// One caret, where omp's keys go: in the card's field while it has omp's focus, none in the
+    /// composer (which drew one whenever it was the composer).
+    #[test]
+    fn the_composer_draws_no_caret_while_an_ask_cards_field_has_omps_focus() {
+        let mut h = ask_card("ask-card-caret", "text_typed");
+        show_until(&mut h, "skip words");
+        h.settle();
+        let chat = h.id;
+        h.ctx.memory_mut(|m| m.request_focus(chat));
+        h.frame(vec![]);
+        let out = h.frame(vec![]);
+        let (pos, size, _) = galleys(&out)
+            .into_iter()
+            .find(|g| g.2 == "skip words")
+            .expect("the card's field");
+        let ime = out
+            .platform_output
+            .ime
+            .expect("the focused field tells the platform where its caret is");
+        let caret = ime.cursor_rect;
+        assert!(
+            caret.center().y > pos.y && caret.center().y < pos.y + size.y,
+            "the caret {caret:?} is on the field's line at {pos:?} {size:?}"
+        );
+        assert_eq!(h.caret(), caret, "the last caret drawn is the field's");
+    }
+
+    /// The characters a galley of `text` draws (an elided galley keeps its job's text but draws
+    /// fewer glyphs and an ellipsis), with its position and size.
+    fn drawn(out: &egui::FullOutput, text: &str) -> Option<(String, Rect)> {
+        fn walk(shape: &Shape, text: &str) -> Option<(String, Rect)> {
+            match shape {
+                Shape::Text(t) if t.galley.text() == text => Some((
+                    t.galley
+                        .rows
+                        .iter()
+                        .flat_map(|r| r.row.glyphs.iter().map(|g| g.chr))
+                        .collect(),
+                    Rect::from_min_size(t.pos, t.galley.size()),
+                )),
+                Shape::Vec(v) => v.iter().find_map(|s| walk(s, text)),
+                _ => None,
+            }
+        }
+        out.shapes.iter().find_map(|s| walk(&s.shape, text))
+    }
+
+    /// omp leads a draft that skips the ask with a `skips ask` chip on the composer's line. The
+    /// editor beside it measured as wide as the whole line, so the two shrank in proportion and
+    /// the chip lost its end (`skips a…`).
+    #[test]
+    fn the_composers_skips_ask_chip_is_painted_in_full() {
+        let mut ops = ask_card_ops("skip", false);
+        let ops_list = ops.as_array_mut().expect("ops");
+        // omp 19's composer line in the `skip` state: the mode chip, then the draft.
+        ops_list.push(
+            serde_json::json!(["add", "3.line/mode", "3.line", "3.line/input", {
+            "id": "3.line/mode", "k": "row", "p": {
+                "role": "omp.composer.mode", "tone": "warning", "gap": "xs", "align": "center",
+                "title": "Sending this message skips the questions above"},
+            "c": [{"id": "3.line/mode/label", "k": "text", "p": {
+                "spans": [{"t": "skips ask", "s": "warning"}], "wrap": "none"}}]}]),
+        );
+        ops_list.push(serde_json::json!(["set", "3.line/input", {
+            "text": "Keep this draft", "cursor": 15}]));
+        let mut h = Harness::with_frames("ask-card-skip-chip", &[ops]);
+        show_until(&mut h, "skips ask");
+        let out = h.settle();
+        let (chars, chip) = drawn(&out, "skips ask").expect("the chip is painted");
+        assert_eq!(chars, "skips ask", "the chip is drawn whole");
+        // The draft keeps the rest of the line, right of the chip.
+        let (_, draft) = drawn(&out, "Keep this draft").expect("the draft is painted");
+        assert!(draft.left() >= chip.right(), "{draft:?} {chip:?}");
+    }
+
+    /// A text field beside the composer (as an ask card's), added to `main`.
+    fn side_field() -> serde_json::Value {
+        serde_json::json!(["add", "side-field", "main", null,
+            {"id": "side-field", "k": "input", "p": {"text": "", "placeholder": "Answer"}}])
+    }
+
+    /// `/settings` left in the composer is not what Enter submits while another field has omp's
+    /// keys: the Enter is that field's (it answered nothing and opened Settings).
+    #[test]
+    fn enter_with_a_redirecting_command_in_the_composer_is_the_focused_fields() {
+        let frames = [serde_json::json!([side_field(), ["focus", "side-field"]])];
+        let mut h = ready("rd-elsewhere", "typed-settings", &frames);
+        let (edits, plain) = press_enter(&mut h);
+        assert!(h.redirects.is_empty(), "{:?}", h.redirects);
+        assert!(edits.is_empty(), "the composer is left alone: {edits:?}");
+        assert!(plain.contains('\r'), "omp got the Enter: {plain:?}");
+    }
+
+    /// A selection made in the composer is not what typing replaces once omp's keys moved to
+    /// another field (the composer's text is unchanged, so the selection outlives the move).
+    #[test]
+    fn typing_after_the_keys_left_the_composer_does_not_replace_its_selection() {
+        let mut h = Harness::with_frames_later(
+            "sel-elsewhere",
+            &[serde_json::json!([
+                ["set", "3.line/input", {"text": "hello world", "cursor": 11}],
+                side_field()
+            ])],
+            &[serde_json::json!([["focus", "side-field"]])],
+        );
+        h.wait_for("the composer text", |d| {
+            d.surfaces().iter().any(|s| {
+                s.node("3.line/input")
+                    .is_some_and(|n| n.props().get("text").is_some_and(|t| t == "hello world"))
+            })
+        });
+        h.focus();
+        let out = h.settle();
+        let (pos, size, _) = galleys(&out)
+            .into_iter()
+            .find(|g| g.2 == "hello world")
+            .expect("the composer draws its text");
+        let y = pos.y + size.y / 2.0;
+        h.frame(pointer(pos2(pos.x + 1.0, y), None));
+        h.frame(pointer(pos2(pos.x + 1.0, y), Some(true)));
+        h.frame(pointer(pos2(pos.x + size.x * 0.4, y), None));
+        h.frame(pointer(pos2(pos.x + size.x * 0.4, y), Some(false)));
+        assert!(h.local(|l| l.sel.as_ref().is_some_and(|s| !s.is_empty())));
+        h.release_later();
+        h.wait_for("the keys moved to the side field", |d| {
+            d.surface("s:1").and_then(|s| s.focus()) == Some("side-field")
+        });
+        h.frame(vec![]);
+        let (edits, plain) = barrier(&mut h);
+        assert!(
+            !edits.iter().any(|e| e["text"] == "z"),
+            "the selection was replaced: {edits:?}"
+        );
+        assert!(plain.contains('z'), "the typing reached omp: {plain:?}");
+    }
+
+    /// A press in the composer and typing in the same frame: the keys move before the typing,
+    /// so it lands in the composer and not in the card's field that had them.
+    #[test]
+    fn typing_in_the_frame_of_a_press_follows_the_focus_it_moves() {
+        let mut h = ask_card("ask-card-press-type", "text_typed");
+        show_until(&mut h, "skip words");
+        let out = h.settle();
+        let at = centre_of(&out, "“Fake title”").expect("the composer's placeholder");
+        h.frame(pointer(at, None));
+        let mut events = pointer(at, Some(true));
+        events.extend([
+            Event::Key {
+                key: Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            Event::Text("z".into()),
+        ]);
+        h.frame(events);
+        h.frame(pointer(at, Some(false)));
+        h.typed(b"\"ev\":\"focus\"");
+        let typed = h.typed(b"z");
+        assert_eq!(
+            sent(&typed, "focus"),
+            [serde_json::json!({"ev": "focus", "sf": "s:1", "id": "3.line/input"})]
+        );
+        let text = String::from_utf8_lossy(&typed);
+        let focus_at = text.find("\"ev\":\"focus\"").expect("the focus event");
+        assert!(
+            !plain_input(text[..focus_at].as_bytes()).contains('z'),
+            "the typing went ahead of the focus: {text:?}"
+        );
+        assert!(plain_input(text[focus_at..].as_bytes()).contains('z'));
+    }
+
+    /// The menu's Paste goes where the menu was opened: a composer without omp's keys gets them
+    /// first (the clipboard reaches omp as typing does, into whatever field has the keys).
+    #[test]
+    fn the_menus_paste_moves_omps_keys_to_its_field_first() {
+        let mut h = ask_card("ask-card-menu-paste", "text_typed");
+        // The menu's caption is set in the app style's `Section` text style.
+        crate::theme::apply(
+            &h.ctx,
+            deck_core::config::UiStyle::ALL[0],
+            deck_core::config::Density::Comfortable,
+            deck_core::config::UiFont::Auto,
+            true,
+        );
+        show_until(&mut h, "skip words");
+        let out = h.settle();
+        let at = centre_of(&out, "“Fake title”").expect("the composer's placeholder");
+        let secondary = |pressed| {
+            vec![Event::PointerButton {
+                pos: at,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }]
+        };
+        h.frame(pointer(at, None));
+        h.frame(secondary(true));
+        h.frame(secondary(false));
+        let out = h.frame(vec![]);
+        let to = centre_of(&out, "Paste").expect("the menu offers Paste");
+        h.frame(pointer(to, None));
+        h.frame(pointer(to, Some(true)));
+        h.frame(pointer(to, Some(false)));
+        h.frame(vec![]);
+        assert_eq!(
+            sent(&h.typed(b"\"ev\":\"focus\""), "focus"),
+            [serde_json::json!({"ev": "focus", "sf": "s:1", "id": "3.line/input"})]
+        );
+    }
+
+    /// One frame: a press at `at`, then `then` (keys typed after it).
+    fn press_then(h: &mut Harness, at: Pos2, then: Vec<Event>) {
+        h.frame(pointer(at, None));
+        let mut events = pointer(at, Some(true));
+        events.extend(then);
+        h.frame(events);
+        h.frame(pointer(at, Some(false)));
+    }
+
+    fn z_typed() -> Vec<Event> {
+        vec![
+            Event::Key {
+                key: Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            Event::Text("z".into()),
+        ]
+    }
+
+    /// `/settings` in the composer: an Enter in the frame of a press that moves omp's keys is
+    /// the field's the press moved them to (away from the composer: omp's; onto it: OmpDeck's
+    /// Settings), not the one the snapshot still shows focused.
+    #[test]
+    fn enter_in_the_frame_of_a_focus_moving_press_follows_the_new_focus() {
+        // Away: the composer has the keys, the press lands in the side field.
+        let mut h = ready(
+            "rd-press-away",
+            "typed-settings",
+            &[serde_json::json!([side_field()])],
+        );
+        let out = h.settle();
+        h.redirects.clear();
+        let field = centre_of(&out, "Answer").expect("the side field");
+        press_then(&mut h, field, submit());
+        let (edits, plain) = barrier(&mut h);
+        assert!(h.redirects.is_empty(), "{:?}", h.redirects);
+        assert!(
+            !edits.iter().any(|e| e["id"] == "j.line/input"),
+            "the composer was cleared: {edits:?}"
+        );
+        assert!(plain.contains('\r'), "omp got the Enter: {plain:?}");
+
+        // Onto: the side field has the keys, the press lands in the composer.
+        let frames = [serde_json::json!([side_field(), ["focus", "side-field"]])];
+        let mut h = ready("rd-press-onto", "typed-settings", &frames);
+        let out = h.settle();
+        h.redirects.clear();
+        let composer = centre_of(&out, "/settings").expect("the composer's text");
+        press_then(&mut h, composer, submit());
+        let (_, plain) = barrier(&mut h);
+        assert_eq!(h.redirects, [Redirect::OmpSettings { page: None }]);
+        assert!(!plain.contains('\r'), "omp got the Enter: {plain:?}");
+    }
+
+    /// A selection in the composer and typing in the frame of a press that moves omp's keys:
+    /// the typing is the newly focused field's, never a replacement of the selection (away from
+    /// the composer the keys are another field's; onto it, the press starts a new selection).
+    #[test]
+    fn typing_in_the_frame_of_a_focus_moving_press_leaves_the_composers_selection() {
+        for (name, later) in [
+            ("sel-press-away", None),
+            (
+                "sel-press-onto",
+                Some(serde_json::json!([["focus", "side-field"]])),
+            ),
+        ] {
+            let mut h = Harness::with_frames_later(
+                name,
+                &[serde_json::json!([
+                    ["set", "3.line/input", {"text": "hello world", "cursor": 11}],
+                    side_field()
+                ])],
+                &later.iter().cloned().collect::<Vec<_>>(),
+            );
+            h.wait_for("the composer text", |d| {
+                d.surfaces().iter().any(|s| {
+                    s.node("3.line/input")
+                        .is_some_and(|n| n.props().get("text").is_some_and(|t| t == "hello world"))
+                })
+            });
+            h.focus();
+            let out = h.settle();
+            let (pos, size, _) = galleys(&out)
+                .into_iter()
+                .find(|g| g.2 == "hello world")
+                .expect("the composer draws its text");
+            let y = pos.y + size.y / 2.0;
+            h.frame(pointer(pos2(pos.x + 1.0, y), None));
+            h.frame(pointer(pos2(pos.x + 1.0, y), Some(true)));
+            h.frame(pointer(pos2(pos.x + size.x * 0.4, y), None));
+            h.frame(pointer(pos2(pos.x + size.x * 0.4, y), Some(false)));
+            assert!(h.local(|l| l.sel.as_ref().is_some_and(|s| !s.is_empty())));
+            let at = if later.is_some() {
+                h.release_later();
+                h.wait_for("the keys moved to the side field", |d| {
+                    d.surface("s:1").and_then(|s| s.focus()) == Some("side-field")
+                });
+                h.frame(vec![]);
+                // Right of the selected word: the press keeps clear of the selection.
+                pos2(pos.x + size.x * 0.9, y)
+            } else {
+                let out = h.settle();
+                centre_of(&out, "Answer").expect("the side field")
+            };
+            press_then(&mut h, at, z_typed());
+            let typed = h.typed(b"z");
+            assert!(
+                !edits(&typed).iter().any(|e| e["text"] == "z"),
+                "{name}: the selection was replaced: {:?}",
+                edits(&typed)
+            );
+            assert!(plain_input(&typed).contains('z'), "{name}: {typed:?}");
+        }
     }
 }

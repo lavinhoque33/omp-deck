@@ -1563,7 +1563,8 @@ fn exercise_worktree_report_progress_and_finish() {
             return None;
         };
         let info = controllers.into_iter().find(|info| info.target == child)?;
-        assert_eq!(info.progress.as_ref().map(|p| p.counts()), Some((3, 3)));
+        // The todo mirror is a debounced live-control push; omp's idle signal can overtake it.
+        (info.progress.as_ref().map(|p| p.counts()) == Some((3, 3))).then_some(())?;
         info.session_path
     });
     prompt(&gui, &opener, "WT-PARENT-FINISH");

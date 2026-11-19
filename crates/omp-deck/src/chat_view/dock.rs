@@ -11,6 +11,7 @@ use egui::{
 use serde_json::Value;
 
 use super::ctx::{Claim, Cx, Tx};
+use super::events;
 use super::glyphs;
 use super::paint;
 use super::render::{self, blank};
@@ -153,6 +154,11 @@ fn ask_body(cx: &Cx, ui: &mut Ui, n: &SNode) {
         line: Some(21.0),
     };
     cx.with_tx(tx, || render::children(cx, ui, n));
+}
+
+/// omp ≥ 19's ask card (in the transcript), framed as the dock's ask dialog was.
+pub fn ask_panel(cx: &Cx, ui: &mut Ui, n: &SNode) {
+    panel(cx, ui, Panel::Ask, &|ui| ask_body(cx, ui, n));
 }
 
 /// Wording of the banner of an exited process (the terminal tab shows the same).
@@ -710,43 +716,66 @@ fn focus_exit(cx: &Cx, ui: &mut Ui, exit: &SNode) {
 
 // ---- editor ---------------------------------------------------------------------------------
 
-/// `editor`/`input` nodes outside the composer (hook inputs, previews, and an ask form's live
-/// field: omp describes the focused text field as its editor, so the caret shows there).
+/// `editor`/`input` nodes outside the composer (hook inputs, previews, and an ask's text field:
+/// omp describes the focused text field as its editor, so the caret shows there).
 pub fn editor_node(cx: &Cx, ui: &mut Ui, n: &SNode) {
-    if in_ask(cx, n) {
-        let rect = ask_box(cx, ui, true, |ui| {
-            editor_box(cx, ui, n);
-        })
-        .rect;
-        // omp makes this the live field (the Other row, a clicked well): bring it into the
-        // form's scroller once, as a focused option row does.
-        let live = cx.snap.focus.as_deref() == Some(n.id.as_str());
-        let key = ui.scope_id().with(("ask-live", n.id.as_str()));
-        if !ui.is_sizing_pass() && ui.data(|d| d.get_temp::<bool>(key)) != Some(live) {
-            ui.data_mut(|d| d.insert_temp(key, live));
-            if live {
-                ui.scroll_to_rect(rect, None);
+    match ask_host(cx, n) {
+        Some(AskHost::Dialog) => {
+            let rect = ask_box(cx, ui, true, |ui| {
+                editor_box(cx, ui, n);
+            })
+            .rect;
+            // omp makes this the live field (the Other row, a clicked well): bring it into the
+            // form's scroller once, as a focused option row does.
+            let live = cx.snap.focus.as_deref() == Some(n.id.as_str());
+            let key = ui.scope_id().with(("ask-live", n.id.as_str()));
+            if !ui.is_sizing_pass() && ui.data(|d| d.get_temp::<bool>(key)) != Some(live) {
+                ui.data_mut(|d| d.insert_temp(key, live));
+                if live {
+                    ui.scroll_to_rect(rect, None);
+                }
             }
         }
-    } else {
-        editor_box(cx, ui, n);
+        // The card brings its live field into view itself, label included (`ask_card::open`).
+        // The field looks live only while it has omp's focus: a draft in the composer takes it.
+        Some(AskHost::Card) => {
+            let live = cx.snap.focus.as_deref() == Some(n.id.as_str());
+            ask_box(cx, ui, live, |ui| {
+                editor_box(cx, ui, n);
+            });
+        }
+        None => {
+            editor_box(cx, ui, n);
+        }
     }
 }
 
-/// `n` lies inside an ask/approval dialog of the dock.
-fn in_ask(cx: &Cx, n: &SNode) -> bool {
+/// The kind of ask a node lies in.
+#[derive(Clone, Copy)]
+pub enum AskHost {
+    /// The dock's ask/approval dialog (omp < 19).
+    Dialog,
+    /// The transcript's ask card (omp ≥ 19).
+    Card,
+}
+
+/// The ask `n` lies in, if any.
+pub fn ask_host(cx: &Cx, n: &SNode) -> Option<AskHost> {
     let mut cur = n;
     while let Some(p) = cx.snap.parent_of(&cur.id) {
         if p.role().starts_with("omp.editor.ask") {
-            return true;
+            return Some(AskHost::Dialog);
+        }
+        if p.role() == "omp.ask.card" {
+            return Some(AskHost::Card);
         }
         cur = p;
     }
-    false
+    None
 }
 
 /// The input frame of an ask form's text field: accented while it is the live field.
-fn ask_box(cx: &Cx, ui: &mut Ui, live: bool, body: impl FnOnce(&mut Ui)) -> Response {
+pub fn ask_box(cx: &Cx, ui: &mut Ui, live: bool, body: impl FnOnce(&mut Ui)) -> Response {
     let ink = cx.ink;
     egui::Frame::new()
         .fill(ink.chip())
@@ -896,9 +925,8 @@ pub fn editor_box(cx: &Cx, ui: &mut Ui, n: &SNode) -> Response {
         Sense::click_and_drag() - Sense::FOCUSABLE
     };
     let (rect, resp) = ui.allocate_exact_size(vec2(width, h), sense);
-    let is_focus = cx.focused
-        && (cx.snap.focus.as_deref() == Some(n.id.as_str())
-            || cx.snap.composer().is_some_and(|c| c.id == n.id));
+    // The caret shows where omp sends the keys: a card's field or the composer, never both.
+    let is_focus = cx.focused && cx.snap.holds_keys(&n.id);
     let cursor16 = n.num("cursor").map_or(utf16_len(text), |c| c as usize);
     let anchor16 = n.num("anchor").map_or(cursor16, |c| c as usize);
     let (cur, anc) = (utf16_to_char(text, cursor16), utf16_to_char(text, anchor16));
@@ -995,6 +1023,8 @@ pub fn editor_box(cx: &Cx, ui: &mut Ui, n: &SNode) -> Response {
         }
     }
     if !readonly && ui.is_visible() {
+        let shown_at = rect.intersect(ui.clip_rect());
+        cx.loc(|l| l.fields.push(&n.id, shown_at));
         select_by_pointer(cx, ui, n, &resp, &galley, origin, (anc, cur_sel));
     }
     if !readonly {
@@ -1027,7 +1057,8 @@ fn raw_index(text: &str, shown: usize) -> usize {
 }
 
 /// Mouse selection in the composer. A press anchors a selection that follows the drag (double and
-/// triple click take a word and a line, shift extends); a click without a drag places omp's caret.
+/// triple click take a word and a line, shift extends) and gives the field omp's keys if another
+/// had them; a click without a drag places omp's caret.
 /// Releasing a selection moves omp's caret to its moving end (`edit` with no text), which is what
 /// typing, deleting and pasting over the selection then address (`select::plan`).
 fn select_by_pointer(
@@ -1053,6 +1084,12 @@ fn select_by_pointer(
         && ui.input(|i| i.pointer.primary_pressed())
         && let Some(p) = resp.hover_pos()
     {
+        // A press in a field without omp's keys moves them there (Tern's focus follows the
+        // pointer), before the caret edit of the click. Input routing does it, ahead of what was
+        // typed after the press, for a field it knew from last frame.
+        if !cx.snap.holds_keys(&n.id) && cx.loc(|l| l.focus_sent.as_deref() != Some(&n.id)) {
+            cx.send(events::focus_field(cx.sf(), &n.id));
+        }
         let ci = at(p);
         let anchor = if ui.input(|i| i.modifiers.shift) {
             shown.0

@@ -144,6 +144,9 @@ pub(super) struct LiveLink {
     subscribed: Option<(bool, bool)>,
     tools: bool,
     probe_deadline: Instant,
+    /// [`CtlCommand::EditorState`] questions under way (request id, when sent), see
+    /// [`Engine::ask_editors`].
+    editor: Vec<(u64, Instant)>,
 }
 
 pub(super) struct Managed {
@@ -905,6 +908,7 @@ impl Engine {
         self.follow_session_files();
         self.poll_copies(now);
         self.drive_live(now);
+        self.ask_editors(now);
         self.poll_parking(now);
         self.update_status_target();
         self.step_agent_tools(now);
@@ -1585,7 +1589,29 @@ impl Engine {
             subscribed: None,
             tools: false,
             probe_deadline: Instant::now() + Duration::from_secs(10),
+            editor: Vec::new(),
         });
+    }
+
+    /// Relays each controller's question about omp's editor buffer
+    /// ([`SessionController::editor_question`]) over live control; without a connected link
+    /// nobody can say, and the controller hears that at once. The answer returns through
+    /// [`drive_live`](Self::drive_live).
+    fn ask_editors(&mut self, now: Instant) {
+        for m in &mut self.sess.managed {
+            let Some(since) = m.ctl.editor_question() else {
+                continue;
+            };
+            match m.live.as_mut().filter(|link| link.client.connected()) {
+                Some(link) => {
+                    if !link.editor.iter().any(|(_, sent)| *sent >= since) {
+                        link.editor
+                            .push((link.client.send(CtlCommand::EditorState), now));
+                    }
+                }
+                None => m.ctl.editor_answered(now, None),
+            }
+        }
     }
 
     fn drive_live(&mut self, now: Instant) {
@@ -1673,6 +1699,12 @@ impl Engine {
                 }
             }
             for (rid, reply) in link.client.take_replies() {
+                if let Some(at) = link.editor.iter().position(|(id, _)| *id == rid) {
+                    let (_, sent) = link.editor.swap_remove(at);
+                    m.ctl.editor_answered(sent, reply.editor_empty());
+                    self.waker.now();
+                    continue;
+                }
                 if let Some(Parking::Requested { id, until }) = m.parking
                     && id == rid
                 {

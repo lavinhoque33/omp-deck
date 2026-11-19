@@ -869,6 +869,11 @@ pub enum CtlCommand {
         agents: Vec<DeleteTarget>,
         keep_running: bool,
     },
+    /// Whether the main session's editor buffer is empty, straight from omp (`ctx.ui.
+    /// getEditorText()`): a terminal grid shows omp's ghost prediction (omp ≥ 19) over an empty
+    /// buffer exactly like a one-row draft with the cursor at its start. Answer:
+    /// [`CtlReply::editor_empty`]; an older extension replies `unknown cmd`.
+    EditorState,
 }
 
 /// How much of the branch left behind by [`CtlCommand::Navigate`] omp summarises into the new
@@ -933,6 +938,18 @@ pub struct CtlReply {
     /// omp's own status text for the user ("Already at this point", "Saved … — 2 advisors active.").
     #[serde(default)]
     pub message: Option<String>,
+}
+
+impl CtlReply {
+    /// [`CtlCommand::EditorState`]'s answer; `None` when the extension could not say (refused,
+    /// not connected, older extension).
+    pub fn editor_empty(&self) -> Option<bool> {
+        self.value
+            .as_ref()
+            .filter(|_| self.ok)?
+            .get("empty")?
+            .as_bool()
+    }
 }
 
 /// An agent's request for OmpDeck, attributed to its session file at execution time.
@@ -1462,6 +1479,7 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
             serde_json::json!({"rid": rid, "t": "delete_agents", "root": root,
                 "agents": agents, "keepRunning": keep_running})
         }
+        CtlCommand::EditorState => serde_json::json!({"rid": rid, "t": "editor_state"}),
     };
     let mut line = v.to_string().into_bytes();
     line.push(b'\n');
@@ -2384,6 +2402,31 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&line).unwrap(),
             serde_json::json!({"rid": 9, "t": "refresh_provider", "provider": "zai"})
         );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encode(4, &CtlCommand::EditorState))
+                .unwrap(),
+            serde_json::json!({"rid": 4, "t": "editor_state"})
+        );
+    }
+
+    /// Only an accepted answer says anything: an older extension's `unknown cmd` refusal, or a
+    /// reply without the fact, leaves the question open (the injector then confirms the draft).
+    #[test]
+    fn only_an_accepted_editor_state_reply_says_whether_the_buffer_is_empty() {
+        let reply = |json: &str| serde_json::from_str::<CtlReply>(json).unwrap();
+        assert_eq!(
+            reply(r#"{"rid":1,"ok":true,"value":{"empty":true}}"#).editor_empty(),
+            Some(true)
+        );
+        assert_eq!(
+            reply(r#"{"rid":1,"ok":true,"value":{"empty":false}}"#).editor_empty(),
+            Some(false)
+        );
+        assert_eq!(
+            reply(r#"{"rid":1,"ok":false,"error":"unknown cmd"}"#).editor_empty(),
+            None
+        );
+        assert_eq!(reply(r#"{"rid":1,"ok":true}"#).editor_empty(), None);
     }
 
     #[test]

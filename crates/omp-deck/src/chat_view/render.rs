@@ -18,7 +18,7 @@ use super::snap::SNode;
 use super::style::LABEL;
 use super::text::{self, Base};
 use super::tsel::{RunOpts, Sep};
-use super::{ansi, code, dock, layer, md, page, tools, transcript};
+use super::{ansi, ask_card, code, dock, layer, md, page, tools, transcript};
 
 /// Spacing step of `gap`/`size` props (px).
 pub fn step(name: Option<&str>) -> f32 {
@@ -68,6 +68,7 @@ pub fn node(cx: &Cx, ui: &mut Ui, n: &SNode) {
     cx.in_node(n.ord, || {
         if transcript::role_node(cx, ui, n)
             || dock::role_node(cx, ui, n)
+            || ask_card::role_node(cx, ui, n)
             || page::role_node(cx, ui, n)
         {
             return;
@@ -508,7 +509,14 @@ fn grow_of(c: &SNode) -> f32 {
     if (c.kind == "spacer" && c.flag("grow")) || c.role() == "omp.ask.summary" {
         return 1.0;
     }
-    c.num("grow").filter(|g| *g > 0.0).unwrap_or(0.0) as f32
+    match c.num("grow").filter(|g| *g > 0.0) {
+        Some(g) => g as f32,
+        // A text field fills its line (it lays out at the whole width it is given), so it takes
+        // the room its siblings leave: measured, it asked for all of it and squeezed them (the
+        // composer's `skips ask` chip read `skips a…`).
+        None if matches!(c.kind.as_str(), "editor" | "input") => 1.0,
+        None => 0.0,
+    }
 }
 
 /// A child's width on a line: its `basis` plus its `grow / growth` part of the line's `spare` px.
@@ -1022,7 +1030,7 @@ pub fn para_galley(
     (resp, clicked)
 }
 
-fn text_node(cx: &Cx, ui: &mut Ui, n: &SNode) {
+pub fn text_node(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let tx = cx.tx();
     let tone = n.tone().map(|t| cx.ink.tone(t)).unwrap_or(tx.color);
     let mut base = Base::new(tx.font.clone(), tone, cx.ink);

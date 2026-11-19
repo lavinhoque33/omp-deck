@@ -63,6 +63,14 @@ pub fn action_value(sf: &str, id: &str, act: &str, value: Option<&str>) -> Event
     }
 }
 
+/// The reader pressed into the editor or input `id`, which lacks omp's keys: omp focuses it.
+pub fn focus_field(sf: &str, id: &str) -> Event {
+    Event::Focus {
+        sf: sf.to_owned(),
+        id: id.to_owned(),
+    }
+}
+
 /// The subagent omp's chat is retargeted at (the `omp.composer.agent` text of the composer's
 /// `omp.composer.focus` row), `None` while it shows the main session.
 pub fn viewing(snap: &Snap) -> Option<&str> {

@@ -139,6 +139,8 @@ pub fn show(cx: &Cx, ui: &mut Ui, rect: Rect, id: Id, end_pad: f32) -> bool {
         cx.loc(|l| l.follow = false);
     }
     let follow = cx.loc(|l| l.follow);
+    // A revealed ask card suspends following while it waits (see `Local::ask_hold`).
+    let held = cx.loc(|l| l.ask_hold);
     // The reader is scrolling this frame (wheel, or a drag on the scrollbar strip).
     let scrolling = auto != 0.0
         || ui.input(|i| {
@@ -157,7 +159,7 @@ pub fn show(cx: &Cx, ui: &mut Ui, rect: Rect, id: Id, end_pad: f32) -> bool {
     let mut area = ScrollArea::vertical()
         .id_salt(id.with("scroll"))
         .auto_shrink([false, false])
-        .stick_to_bottom(follow);
+        .stick_to_bottom(follow && !held);
     if auto != 0.0 {
         let at = cx.loc(|l| l.tsel.scroll_y);
         area = area.vertical_scroll_offset((at + auto).max(0.0));
@@ -224,6 +226,30 @@ pub fn show(cx: &Cx, ui: &mut Ui, rect: Rect, id: Id, end_pad: f32) -> bool {
             ui.scroll_to_rect(marker, Some(Align::BOTTOM));
             moved = true;
         }
+        // An ask card's open question, brought into view top first when the band above the
+        // floating dock does not show it whole (omp's `reveal: start`); a question taller than
+        // the band shows its top. Not animated: the view must be off the end this frame, or
+        // following would take it back. The reader's own scrolling wins.
+        if let Some(r) = cx.loc(|l| l.reveal.take())
+            && !scrolling
+        {
+            let clip = ui.clip_rect();
+            // Clear of the fade the transcript melts into at its top edge.
+            let r = Rect::from_min_max(
+                pos2(r.left(), r.top() - super::TOP_FADE - 4.0),
+                pos2(r.right(), r.bottom() + 12.0),
+            );
+            let below = r.bottom() > clip.bottom() - end_pad + 0.5 && r.top() > clip.top() + 0.5;
+            if r.top() < clip.top() - 0.5 || below {
+                ui.scroll_to_rect_animation(
+                    r,
+                    Some(Align::TOP),
+                    egui::style::ScrollAnimation::none(),
+                );
+                cx.loc(|l| l.ask_hold = true);
+                moved = true;
+            }
+        }
     });
     cx.loc(|l| l.tsel.scroll_y = out.state.clamped_offset().y);
     if moved {
@@ -236,14 +262,24 @@ pub fn show(cx: &Cx, ui: &mut Ui, rect: Rect, id: Id, end_pad: f32) -> bool {
         cx.loc(|l| l.follow = at_end || l.frame == 0);
     }
     cx.loc(|l| l.frame += 1);
+    // A revealed ask card's hold ends with the reader's scrolling, at the end, and once the ask
+    // is answered (the card is no longer the last item; the next card reveals afresh).
+    let ask_last = items.last().is_some_and(|it| it.role() == "omp.ask.card");
+    let held = cx.loc(|l| {
+        l.ask_hold &= !(user || at_end || !ask_last);
+        if !ask_last {
+            l.revealed = None;
+        }
+        l.ask_hold
+    });
     // egui keeps a scroll area stuck to the end only while the content does not grow by more than
     // a pixel within a frame; a streamed reply arrives in chunks of many lines, which unsticks
     // it. Following means being at the end, so go back there until the content settles.
-    if chases(cx.loc(|l| l.follow), at_end, user) {
+    if chases(cx.loc(|l| l.follow) && !held, at_end, user) {
         cx.loc(|l| l.chase = true);
         ui.ctx().request_repaint();
     }
-    !cx.loc(|l| l.follow) && !at_end
+    (!cx.loc(|l| l.follow) || held) && !at_end
 }
 
 /// Whether the view must scroll back to the end: it follows, is not there, and the reader is not
@@ -294,6 +330,7 @@ pub fn jump_pill(cx: &Cx, ui: &mut Ui, x: f32, bottom: f32) {
         cx.loc(|l| {
             l.follow = true;
             l.jump = true;
+            l.ask_hold = false;
         });
         ui.ctx().request_repaint();
     }

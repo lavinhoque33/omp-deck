@@ -242,3 +242,10 @@ export default async function ompdeckCtl(api: any) {
 - `registry.get("Main").status` showed `running` while the main session was idle, so don't use the registry for the main agent's busy state. Use `ctx.isIdle()` (`mainIdle` in the snapshot), which I did not cross-check against a real streaming turn.
 - A running agent's `streaming` was `true` and `activity` stayed `null` unless the agent used a tool or set an intent. `activity` was `running bash` only for the tool-using agent.
 - Not tested: plugins/`--plugin-dir`, `--inspect` as a flag, `/move` and `/wt` session switches, and extension behaviour if the user's real config also loads extensions that register the same events.
+
+## Later ops (as built; the authoritative list is `deck-core/assets/ompdeck-ctl.ts` + `ctl.rs` `CtlCommand`)
+
+- `editor_state` (0.33.5, omp 19): `{rid, t: "editor_state"}` → `{ok: true, value: {empty: boolean}}` from
+  `ctx.ui.getEditorText() === ""` on the main session's UI context; `{ok: false, error: "editor unavailable"}` when the
+  host omp lacks `getEditorText`. Read-only, no hello feature flag (an older loaded extension answers `unknown cmd`).
+  Used only by the injector to tell omp 19's prediction ghost from a draft (`contracts.md` "omp 19 parity").

@@ -4,11 +4,11 @@
 //! document and submits through the `send` event. On a TSP host session, owned the gateway's way
 //! (a headless terminal joining the host, no view attached):
 //! - a prompt reaches the model and the turn runs;
-//! - a slash command (`/rename`) takes effect (omp's placeholder quotes the new title);
+//! - a slash command (`/rename`) takes effect (omp shows the new title);
 //! - an insert keeps omp's draft; a prompt over a draft asks first, and a "clear" answer sends only
 //!   the prompt while declining leaves the draft alone;
 //! - an idle-only command is refused while a turn runs, steering gets through, Stop ends the turn;
-//! - while an `ask` question holds the composer, commands that need it are refused.
+//! - while an `ask` question holds the keys, commands that need the composer are refused.
 //!
 //! Private HOME/XDG tree and own `omp-deck-test-*` namespace; skipped when omp is not installed.
 
@@ -158,13 +158,30 @@ fn draft(doc: &Value) -> Option<String> {
     Some(editor(doc)?["p"]["text"].as_str()?.to_owned())
 }
 
-/// The composer's placeholder as plain text (omp quotes the session title in it).
-fn placeholder(doc: &Value) -> String {
-    match &editor(doc).map(|e| &e["p"]["placeholder"]) {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(spans)) => spans.iter().filter_map(|s| s["t"].as_str()).collect(),
-        _ => String::new(),
+/// Whether omp shows its session renamed to `title`: quoted in the composer's placeholder, or in
+/// the rename's status toast. omp ≥ 19 shows its prediction of the next message as ghost text
+/// in the placeholder's place, whenever one arrived.
+fn renamed(doc: &Value, title: &str) -> bool {
+    fn toast(n: &Value, title: &str) -> bool {
+        (n["p"]["role"] == "omp.toast.status"
+            && n["p"]["text"].as_str().is_some_and(|t| t.contains(title)))
+            || n["c"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|c| toast(c, title)))
     }
+    let placeholder = match editor(doc).map(|e| &e["p"]["placeholder"]) {
+        Some(Value::String(s)) => s.contains(title),
+        Some(Value::Array(spans)) => spans
+            .iter()
+            .filter_map(|s| s["t"].as_str())
+            .collect::<String>()
+            .contains(title),
+        _ => false,
+    };
+    placeholder
+        || doc["surfaces"]
+            .as_array()
+            .is_some_and(|s| s.iter().any(|s| toast(&s["root"], title)))
 }
 
 /// Whether the dock holds a node with `role`.
@@ -402,15 +419,12 @@ fn injected_commands_reach_a_tsp_session() {
     );
     assert!(!has_role(&rig.peek(), "omp.working"));
 
-    // (d) A slash command takes effect: omp quotes the new session title in the composer's
-    // placeholder.
+    // (d) A slash command takes effect: omp shows the new session title.
     let d = rig.run(Command::Action(Action::Rename("Renamed Chat".to_owned())));
     assert_eq!(d, Delivery::Delivered, "the rename was delivered");
-    wait_for("the new title in the placeholder", TURN, || {
+    wait_for("the new title on screen", TURN, || {
         rig.ctl.tick(Instant::now());
-        placeholder(&rig.peek())
-            .contains("Renamed Chat")
-            .then_some(())
+        renamed(&rig.peek(), "Renamed Chat").then_some(())
     });
     assert_eq!(draft(&rig.peek()).as_deref(), Some(""));
 
@@ -495,14 +509,17 @@ fn injected_commands_reach_a_tsp_session() {
         (draft(&rig.peek()).as_deref() == Some("")).then_some(())
     });
 
-    // (g) An `ask` holds the composer: the question is an attention state, a prompt is refused
-    // for it, and an insert (which needs the composer, not an idle omp) as a dialog.
+    // (g) An `ask` holds the keys: the question is an attention state, a prompt is refused for
+    // it, and an insert (which needs the composer, not an idle omp) as a dialog. omp ≥ 19 shows
+    // the questions as a card at the transcript's end and keeps its composer, without the focus;
+    // before, the ask stood in the composer's place.
     rig.run(Command::Prompt {
         text: "ASK-MARK ask me".to_owned(),
     });
     rig.wait_activity(Activity::Attention);
-    wait_for("the ask dialog in the dock", TURN, || {
-        has_role(&rig.peek(), "omp.editor.ask").then_some(())
+    wait_for("the ask on screen", TURN, || {
+        let doc = rig.peek();
+        (has_role(&doc, "omp.ask.card") || has_role(&doc, "omp.editor.ask")).then_some(())
     });
     let n = model.count();
     assert_eq!(
@@ -667,11 +684,11 @@ fn gateway_commands_reach_a_chat_session_that_has_a_view_attached() {
         (gateway_activity(&client, &target.key) == Some(Activity::Idle)).then_some(())
     });
 
-    // A slash command: omp quotes the new title in the composer's placeholder.
+    // A slash command: omp shows the new title.
     let d = submit(Command::Action(Action::Rename("View Renamed".to_owned())));
     assert_eq!(d, Delivery::Delivered);
-    wait_for("the new title in the placeholder", TURN, || {
-        placeholder(&peek()).contains("View Renamed").then_some(())
+    wait_for("the new title on screen", TURN, || {
+        renamed(&peek(), "View Renamed").then_some(())
     });
     wait_for("the view to receive the new title", TURN, || {
         seen("View Renamed").then_some(())

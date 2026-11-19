@@ -447,6 +447,33 @@ impl Snap {
         self.find(dock, &|n| n.kind == "editor" && n.flag("sendable"))
             .or_else(|| self.find(dock, &|n| n.kind == "editor" && !n.flag("readonly")))
     }
+
+    /// Whether omp's keys go to the editor or input `id`: the surface's focus is on it, or omp
+    /// names no focus (as in an ordinary idle or busy session) and `id` is the composer while no
+    /// ask waits for an answer (then the ask's option list holds the keys).
+    pub fn holds_keys(&self, id: &str) -> bool {
+        match self.focus.as_deref() {
+            Some(f) => f == id,
+            None => self.composer().is_some_and(|c| c.id == id) && !self.ask_pending(),
+        }
+    }
+
+    /// [`Snap::holds_keys`] once omp has been asked to focus `moved` (in this frame, so the
+    /// snapshot does not show it yet).
+    pub fn holds_keys_after(&self, id: &str, moved: Option<&str>) -> bool {
+        moved.map_or_else(|| self.holds_keys(id), |m| m == id)
+    }
+
+    /// Whether an ask waits for an answer: omp ≥ 19's card in the transcript, or older omp's ask
+    /// dialog in the dock.
+    pub fn ask_pending(&self) -> bool {
+        self.region("main")
+            .is_some_and(|m| self.kids(m).any(|c| c.role() == "omp.ask.card"))
+            || self.region("dock").is_some_and(|d| {
+                self.find(d, &|c| c.role().starts_with("omp.editor.ask"))
+                    .is_some()
+            })
+    }
 }
 
 #[cfg(test)]

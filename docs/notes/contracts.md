@@ -3486,7 +3486,8 @@ Default view stays **Terminal**; chat is opt-in (user).
   `HostInfo.tsp_facts`; `Terminal::run_state()`; `Mux::pane_status() -> PaneStatus { title, run_state, tsp_facts }`
   replaces `pane_titles`; `RunningSession.{run_state, tsp_facts}`. One precedence everywhere:
   `Activity::derive(run_state, title, tsp_facts)` / `Activity::of_terminal(&Terminal)` = OSC 7501 report > `π` title
-  > TSP document (dock `omp.working` ⇒ Busy, `omp.editor.ask*` ⇒ Attention, sendable composer ⇒ Idle) > Unknown;
+  > TSP document (dock `omp.working` ⇒ Busy, `omp.editor.ask*` ⇒ Attention, sendable composer ⇒ Idle) > Unknown
+  (omp ≥ 19's ask is a transcript card, not a dock role: its Attention comes from the report's `blocked`);
   Working ⇒ Busy, Blocked ⇒ Attention, Idle/Done/Error ⇒ Idle. tmux sessions keep titles (tmux drops unknown OSC).
   Gate: `deck-service/tests/tsp_run_state_live.rs`.
 - **Launch**: `Backends::for_launch`; `Mutation::Restart { target, view: Option<SessionView> }`, `Done::Session(target,
@@ -5274,3 +5275,57 @@ a background `ompdeck_watch_session` never registered, `ctl: oversized line drop
   `reply_acks` retention is keyed by session key + connected link, no longer by generation. Live gate
   `deck-service/tests/tool_result_routing.rs::pending_tool_generation_change_still_returns_exactly_once`
   (`OMPDECK_TEST_OMP`): it fails with the old generation fence.
+
+## omp 19 parity (0.33.5, 2026-11-19)
+
+Cause: omp 19.0.0 (a) predicts the user's next message and draws it as ghost text in the empty composer
+(`composer.predictions`, on by default), (b) redesigned `ask` as a card in the transcript that leaves the composer in
+the dock. Four live gates failed; two were product bugs.
+
+### Injection vs the prediction ghost (terminal view)
+- Symptom: every injected command on a tmux/grid tab after a turn read the ghost as an unsent draft → "Clear your
+  unsent message?" → Ctrl+C (which does not remove a ghost) → composer never reads empty → `Stalled`/`Aborted`
+  (worktree `/move`, model switch, compact, …).
+- The grid cannot decide: the ghost is drawn in the theme's `dim` colour (no on-screen reference; text is the
+  terminal default in 96 of 100 bundled themes) with the cursor in the composer's first cell — the same picture as a
+  one-row draft with the cursor at its start. So OmpDeck **asks omp**, and only for that one ambiguous picture.
+- `composer::maybe_hint(&ScreenText) -> bool`: exactly one non-blank composer row, it is the cursor row, cursor at or
+  before the first text cell.
+- ctl op `editor_state` (extension `ompdeck-ctl.ts`): reply `{ok: true, value: {empty: bool}}` from
+  `ctx.ui.getEditorText() === ""`; `{ok: false, error: "editor unavailable"}` without that API. No hello feature flag:
+  an older loaded extension answers `unknown cmd`, which reads as "nobody could say".
+  `CtlCommand::EditorState`, `CtlReply::editor_empty() -> Option<bool>`.
+- `inject::Env.editor: &dyn Fn(Instant) -> Editor` (`Unknown | Asked | Empty | Text`): "what does omp say of its
+  buffer, asked at or after this instant". Fences (review finding: an answer must never outlive a user edit):
+  - time: only answers asked after the job began, and after its own Ctrl+C (`EditorCheck.asked_from`);
+  - picture: an answer counts only for the ambiguous draft text the question was about (`EditorCheck.draft`); one
+    changed picture gets a fresh question with a fresh `EDITOR_TIMEOUT` (1 s), a second change falls back;
+  - input: while the job waits for omp's answer the user's input is held (`Active.waiting_for_editor` →
+    `Poll.hold_for`) without counting as written bytes.
+  Fallback (unknown, unanswered, timeout, fence failed): the grid's reading — draft → confirm before clearing; after
+  the injector's own Ctrl+C an ambiguous picture without a matching `Empty` never asks again and the job stalls at
+  `SHOW_TIMEOUT` (no confirm loop on tabs without live control). After the injector's own paste an ambiguous
+  picture is never the paste (omp leaves the cursor behind inserted text), so Enter is never sent on a ghost alone.
+- `SessionController::editor_question() -> Option<Instant>` / `editor_answered(asked, Option<bool>)`: the controller
+  has no channel to omp besides the terminal; its owner relays. The gateway engine (`sessions.rs` `ask_editors`, after
+  `drive_live`) sends `EditorState` on the session's connected live link (one in flight per question) and feeds the
+  reply back; without a connected link it answers `None` at once.
+- User rule kept: commands still travel through the terminal; ctl is only asked a fact. omp's predictions are not
+  disabled for OmpDeck sessions.
+- Residual limits: a tab without live control (legacy session, extension older than this release still loaded)
+  keeps the old behaviour on omp 19 (confirm, then stall while a ghost shows). With a typed prefix of the ghost the
+  confirm text includes the ghost's tail.
+
+### The ask card (chat view)
+- Facts and roles: `docs/notes/tsp.md` "The ask card". No injector change: the composer reads `Missing` while the card
+  holds the keys (focus rule), and is addressable when omp focuses it.
+- `chat_view/ask_card.rs` draws the card natively; the pre-19 dock dialog (`omp.editor.ask`) is kept for omp < 19.
+- The transcript brings the open question into view when the card arrives or omp opens another question
+  (`Local.reveal`); while that holds the view away from the end, following is suspended (`Local.ask_hold`) until
+  the reader scrolls, the end is reached or the card is gone.
+
+### Live gates (test-only changes)
+- `tsp_inject_live`: the rename is observed in the placeholder **or** the `omp.toast.status` toast (a ghost replaces
+  the placeholder); the ask is awaited as `omp.ask.card` or `omp.editor.ask`.
+- `agent_tools_live` (deck-service): the todo progress mirror is a 50 ms-debounced snapshot push that omp's idle
+  signal can overtake; the test waits for `(3, 3)` instead of asserting it on the first idle read.

@@ -164,6 +164,15 @@ pub struct Local {
     /// Following, but not at the end (the content grew): scroll back there next frame unless
     /// the reader is scrolling.
     pub chase: bool,
+    /// An ask card's open question to bring into view (screen rect), set when omp opens another
+    /// one; the transcript scrolls to it once (omp's `reveal: start`).
+    pub reveal: Option<Rect>,
+    /// The id of the ask card's open question last brought into view.
+    pub revealed: Option<String>,
+    /// Following is suspended while a revealed ask card waits for its answer: chasing the end
+    /// would scroll its open question back out of view. Cleared by the reader's scrolling, by
+    /// reaching the end, and once the card is no longer the transcript's last item.
+    pub ask_hold: bool,
     /// [`Snap::resets`](super::snap::Snap::resets) the transcript last followed the end for.
     pub resets_seen: u64,
     /// A tiny galley laid out every frame: when egui hands out another one, its galley cache or
@@ -200,6 +209,11 @@ pub struct Local {
     pub sel: Option<ComposerSel>,
     /// Keys whose press the selection took (their releases never reach omp).
     pub swallowed: Vec<egui::Key>,
+    /// The editable fields drawn last frame (id, visible screen rect): a press on one that lacks
+    /// omp's keys is resolved when the frame's input is routed, before what was typed after it.
+    pub fields: Fields,
+    /// The field this frame's input routing already asked omp to focus.
+    pub focus_sent: Option<String>,
     /// The transcript's text selection (see [`super::tsel`]).
     pub tsel: super::tsel::Tsel,
     /// A secondary click this frame; cards and the composer claim it by their rect.
@@ -218,6 +232,39 @@ pub struct Local {
     pub pickers: HashMap<String, super::layer::PickerItems>,
     /// Scratch of the transcript's prefix sums (reused between frames).
     pub offsets: Vec<f32>,
+}
+
+/// The editable fields drawn in a frame, in draw order: the entries (and their id strings) are
+/// reused from frame to frame, so redrawing the same fields allocates nothing.
+#[derive(Default)]
+pub struct Fields {
+    list: Vec<(String, Rect)>,
+    len: usize,
+}
+
+impl Fields {
+    /// Starts a new frame's list.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn push(&mut self, id: &str, rect: Rect) {
+        match self.list.get_mut(self.len) {
+            Some((s, r)) => {
+                if s != id {
+                    s.clear();
+                    s.push_str(id);
+                }
+                *r = rect;
+            }
+            None => self.list.push((id.to_owned(), rect)),
+        }
+        self.len += 1;
+    }
+
+    pub fn as_slice(&self) -> &[(String, Rect)] {
+        &self.list[..self.len]
+    }
 }
 
 /// Where the rows of a run of text end.

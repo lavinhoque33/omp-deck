@@ -296,7 +296,9 @@ impl RunStateScanner {
 /// TSP).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TspFacts {
-    /// An `ask` or approval stands in the composer's place (dock role `omp.editor.ask*`).
+    /// An approval (or, before omp 19, an `ask`) stands in the composer's place (dock role
+    /// `omp.editor.ask*`). omp ≥ 19's ask is a card in the transcript beside a working row; its
+    /// run-state report (`blocked`) says so, and a held report outranks these facts.
     pub asking: bool,
     /// The dock shows the working row (role `omp.working`): a turn runs.
     pub working: bool,

@@ -154,10 +154,11 @@ impl Activity {
         )
     }
 
-    /// omp's state from what its TSP document shows: an `ask` or approval in the dock (which
-    /// stands in the composer's place) wants the user; a working row is a running turn; a
-    /// sendable composer is idle. Anything else (a full-screen page, no composer yet)
-    /// claims nothing.
+    /// omp's state from what its TSP document shows: an approval (before omp 19 also an `ask`)
+    /// in the composer's place wants the user; a working row is a running turn; a sendable
+    /// composer is idle. Anything else (a full-screen page, no composer yet) claims nothing.
+    /// omp ≥ 19's ask card is not read here: an ask opens mid-turn, where omp's run-state
+    /// report already says `blocked`.
     pub fn from_tsp_facts(facts: &TspFacts) -> Activity {
         if facts.asking {
             Activity::Attention

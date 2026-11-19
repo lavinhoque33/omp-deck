@@ -150,13 +150,18 @@ fn is_modifier_key(key: Key) -> bool {
 ///
 /// A frame that edits the text in a way the keys do not show (Backspace, arrows, shortcuts
 /// before the Enter) is left alone: omp opens the screen and [`catch_layer`] closes it.
+///
+/// `moved`: the field omp was asked to focus earlier in this frame (the snapshot does not show
+/// it yet).
 pub fn intercept(
     snap: &Snap,
     keys: &mut Vec<Event>,
     swallowed: &mut Vec<Key>,
+    moved: Option<&str>,
 ) -> Option<(Redirect, Option<TspEvent>)> {
     let composer = snap.composer()?;
-    if !snap.can_edit || !composer.flag("sendable") {
+    // The Enter submits the composer only while it has omp's keys (an ask card's field may).
+    if !snap.can_edit || !composer.flag("sendable") || !snap.holds_keys_after(&composer.id, moved) {
         return None;
     }
     // Plain typing: a key press followed by its text, or text alone (IME, paste is not typing).

@@ -31,6 +31,7 @@
 //! ready composer, running turn or ask. Expiry writes nothing: an initial screen/dialog refuses
 //! input; otherwise it stalls. Later missing composers still refuse input as genuine dialogs.
 
+use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -45,7 +46,9 @@ use deck_term::{InputMeta, ScreenText, Terminal, TerminalEvents};
 use serde::{Deserialize, Serialize};
 
 use crate::composer::TspComposer;
-use crate::inject::{ComposeMode, End, Env, HOLD_TAIL, Injector, Job, JobId, Requires, Write};
+use crate::inject::{
+    ComposeMode, Editor, End, Env, HOLD_TAIL, Injector, Job, JobId, Requires, Write,
+};
 use crate::model_switch::{Change, FRESH_TIMEOUT, Pending, SWITCH_TIMEOUT, plan_switch};
 use crate::session_actions::{self, Action, ActionCtx};
 use crate::status::TabStatus;
@@ -620,6 +623,33 @@ struct Unacked {
     checkpoint: u64,
 }
 
+/// The injector's question to omp about its editor buffer ([`Env::editor`]) and omp's last
+/// answer. The controller has no channel to omp besides the terminal: its owner relays both over
+/// live control ([`SessionController::editor_question`], [`SessionController::editor_answered`]).
+#[derive(Default)]
+struct EditorAsk {
+    /// An answer asked at or after this instant is wanted.
+    wanted: Cell<Option<Instant>>,
+    /// When the last answer was asked, and what omp said (`None`: nobody could say).
+    answer: Option<(Instant, Option<bool>)>,
+}
+
+impl EditorAsk {
+    fn read(&self, since: Instant) -> Editor {
+        match self.answer {
+            Some((asked, said)) if asked >= since => match said {
+                Some(true) => Editor::Empty,
+                Some(false) => Editor::Text,
+                None => Editor::Unknown,
+            },
+            _ => {
+                self.wanted.set(Some(since));
+                Editor::Asked
+            }
+        }
+    }
+}
+
 pub struct SessionController {
     terminal: Terminal,
     target: SessionTarget,
@@ -649,6 +679,7 @@ pub struct SessionController {
     viewers: Vec<Arc<ViewSlot>>,
     /// The snapshot last published to `viewers`.
     published: Option<Arc<SessionSnapshot>>,
+    editor: EditorAsk,
 }
 
 impl SessionController {
@@ -676,6 +707,7 @@ impl SessionController {
             events: Vec::new(),
             viewers: Vec::new(),
             published: None,
+            editor: EditorAsk::default(),
         }
     }
 
@@ -1391,6 +1423,7 @@ impl SessionController {
             activity,
             last_ctrl_c: term.last_ctrl_c(),
             screen: &screen,
+            editor: &|since| self.editor.read(since),
             paste: &paste,
             tsp: handle.live().then_some(&tsp as &dyn Fn() -> TspComposer),
         });
@@ -1503,6 +1536,23 @@ impl SessionController {
             self.events = events;
         }
         true
+    }
+
+    /// The injector met text in omp's composer that the grid cannot tell from omp's own ghost
+    /// prediction (`composer::maybe_hint`) and waits for omp's word: the owner asks omp whether
+    /// its editor buffer is empty (`deck_core::ctl::CtlCommand::EditorState`), at or after the
+    /// returned instant, and reports with [`editor_answered`](Self::editor_answered).
+    pub fn editor_question(&self) -> Option<Instant> {
+        self.editor.wanted.get()
+    }
+
+    /// omp's answer to a question sent at `asked`; `None` when nobody could say (no live control,
+    /// an older extension, a refusal) — the grid's reading then stands.
+    pub fn editor_answered(&mut self, asked: Instant, empty: Option<bool>) {
+        if self.editor.wanted.get().is_some_and(|since| asked >= since) {
+            self.editor.wanted.set(None);
+        }
+        self.editor.answer = Some((asked, empty));
     }
 
     /// The view is closing: drops every request that has not written a byte. True once nothing

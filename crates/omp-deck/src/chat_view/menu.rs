@@ -214,6 +214,10 @@ fn composer(cx: &Cx, ui: &mut Ui, id: &str) {
     )
     .clicked()
     {
+        // The clipboard goes in as typing does, wherever omp's keys are: they move here first.
+        if !cx.snap.holds_keys(id) {
+            cx.send(super::events::focus_field(cx.sf(), id));
+        }
         // The pasted text replaces the selection: delete it first, then paste at omp's caret.
         if let Some(s) = sel.as_ref().filter(|_| editable) {
             cx.send(s.replace(cx.sf(), ""));

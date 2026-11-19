@@ -25,6 +25,15 @@ Observed in the sandbox (200×40): with `rail` the status line is the last non-e
  pi · [med] Opus 5.5 · [T] stw/proj · @ feat/status *1 +1 ?1 · ctx: 0.9%/1M [A]       (ascii symbols, preset default)
 ```
 With `band`/`box` and `contextLine=embedded` the context % is drawn **inside the rule** (`──5%────╎┃────1M─`) and the row sits above the editor. I did not capture the `box`/`rule`/`claude` shapes individually; their placement above is from the bundle (UNVERIFIED live).
+
+**omp ≥ 19: prediction ghost in the composer** (`composer.predictions`, default on; verified on 19.0.0 in tmux). After
+a turn omp draws its guess of the next message in the *empty* composer: theme colour `dim`, cursor in the first cell,
+buffer empty (`ctx.ui.getEditorText() === ""`). Tab/→ accepts it, typing a matching prefix keeps the tail, Ctrl+C and
+Esc do **not** remove it. On the grid this is the same picture as a one-row draft with the cursor at its start, so a
+scraper cannot call the composer empty or drafted from the cells; OmpDeck's injector asks omp over live control
+(`editor_state`, `contracts.md` "omp 19 parity"). Under TSP the ghost is the editor's `ghost` property and replaces
+the placeholder text; `text` stays empty.
+
 Real unicode/default/rail, colours via `capture-pane -e` (24-bit SGR from theme `dark-terminal`):
 ```
  π · ◑ Opus 5.5 · 🗑 stw/proj · ⑂ feat/status *1 +1 ?2 · ◫ 0.9%/1M ⟲
