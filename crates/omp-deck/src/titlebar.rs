@@ -1267,11 +1267,13 @@ mod tests {
             tabs: TabBarInput {
                 tabs: &tabs,
                 labels: &labels,
+                bookmarked_paths: &Default::default(),
                 active: 0,
                 scroll_to_active: false,
                 reviews: &[],
                 menu: crate::sidebar::MenuEnv {
                     groups: &[],
+                    bookmarks: &Default::default(),
                     omp_available: true,
                     can_stop: true,
                     default_view: deck_core::config::SessionView::Terminal,

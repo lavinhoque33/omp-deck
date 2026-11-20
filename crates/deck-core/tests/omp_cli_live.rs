@@ -98,15 +98,17 @@ fn entries(file: &Path) -> Vec<Value> {
 #[test]
 fn pins_round_trip_through_omp_and_the_pin_reader() {
     let Some(sb) = Sandbox::new() else { return };
+    // A custom sessions root can differ from the headless omp's default agent directory.
+    let store = sb.root.path().join("custom-agent");
+    std::fs::create_dir(&store).unwrap();
+    sb.omp.set_pinned(&store, "sess-a", true).unwrap();
+    sb.omp.set_pinned(&store, "sess-b", true).unwrap();
+    sb.omp.set_pinned(&store, "sess-a", true).unwrap(); // already pinned: no-op
     assert!(deck_core::pins::read(&sb.agent()).is_empty());
-    sb.omp.set_pinned("sess-a", true).unwrap();
-    sb.omp.set_pinned("sess-b", true).unwrap();
-    sb.omp.set_pinned("sess-a", true).unwrap(); // already pinned: no-op
-    let pins = deck_core::pins::read(&sb.agent());
-    assert_eq!(pins.len(), 2);
+    let pins = deck_core::pins::read(&store);
     assert!(pins.contains("sess-a") && pins.contains("sess-b"));
-    sb.omp.set_pinned("sess-a", false).unwrap();
-    let pins = deck_core::pins::read(&sb.agent());
+    sb.omp.set_pinned(&store, "sess-a", false).unwrap();
+    let pins = deck_core::pins::read(&store);
     assert_eq!(pins.into_iter().collect::<Vec<_>>(), ["sess-b"]);
 }
 

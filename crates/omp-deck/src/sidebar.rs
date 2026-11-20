@@ -8,14 +8,14 @@ use std::time::{Duration, SystemTime};
 
 use crate::icons::Icon;
 use crate::icons::{
-    ICON_ARCHIVE_RESTORE, ICON_ARROW_LEFT_RIGHT, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT,
-    ICON_CHEVRONS_DOWN_UP, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_STOP, ICON_CLOUD, ICON_CLOUD_UPLOAD,
-    ICON_COLUMNS_2, ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES, ICON_FOCUS,
-    ICON_FOLDER, ICON_FOLDER_GIT_2, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X,
-    ICON_GIT_BRANCH, ICON_GIT_BRANCH_PLUS, ICON_GIT_MERGE, ICON_HARD_DRIVE, ICON_HISTORY,
-    ICON_KEY_ROUND, ICON_LIST_TREE, ICON_MESSAGES_SQUARE, ICON_PLAY, ICON_PLUS, ICON_POWER,
-    ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_ROWS_2, ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL,
-    ICON_TRASH_2, ICON_X,
+    ICON_ARCHIVE_RESTORE, ICON_ARROW_LEFT_RIGHT, ICON_BOOKMARK, ICON_CHEVRON_DOWN,
+    ICON_CHEVRON_RIGHT, ICON_CHEVRONS_DOWN_UP, ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_STOP, ICON_CLOUD,
+    ICON_CLOUD_UPLOAD, ICON_COLUMNS_2, ICON_COPY, ICON_EXTERNAL_LINK, ICON_FILE_TEXT, ICON_FILES,
+    ICON_FOCUS, ICON_FOLDER, ICON_FOLDER_GIT_2, ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT,
+    ICON_FOLDER_X, ICON_GIT_BRANCH, ICON_GIT_BRANCH_PLUS, ICON_GIT_MERGE, ICON_HARD_DRIVE,
+    ICON_HISTORY, ICON_KEY_ROUND, ICON_LIST_TREE, ICON_MESSAGES_SQUARE, ICON_PLAY, ICON_PLUS,
+    ICON_POWER, ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_ROWS_2, ICON_SEARCH, ICON_SEARCH_X,
+    ICON_TERMINAL, ICON_TRASH_2, ICON_X,
 };
 use deck_core::config::{ParkedBranch, RemovedWorktree, SessionView};
 use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot, abbreviate_home};
@@ -191,6 +191,11 @@ pub enum SidebarAction {
         name: String,
         label: String,
     },
+    /// Bookmark (`pinned: true`) or un-bookmark the session `id` through omp's session pins.
+    Bookmark {
+        id: String,
+        pinned: bool,
+    },
 }
 
 /// The project backup entries of the context menus: named after the active destination,
@@ -265,6 +270,10 @@ pub struct SidebarInput<'a> {
     pub removed: &'a BTreeMap<PathBuf, RemovedWorktree>,
     /// Parked branches: their sessions carry a chip and the continue actions.
     pub parked: ParkView<'a>,
+    /// Bookmarked (pinned) session ids: their rows lead each project's list.
+    pub bookmarks: &'a HashSet<String>,
+    /// Changes whenever `bookmarks` does (part of the row-order cache key).
+    pub bookmark_revision: u64,
 }
 
 /// Which project groups are open. A group is open while filtering, else by its user override,
@@ -423,10 +432,13 @@ impl AgeCache {
     }
 }
 
-/// The nesting of worktree groups, valid for one `(data stamp, scope)`.
+/// `(data stamp, scope, removed worktree count, bookmark revision)`.
+type LayoutKey = ((u64, usize), Option<PathBuf>, usize, u64);
+
+/// The nesting of worktree groups with bookmarked rows first, valid for one [`LayoutKey`].
 #[derive(Default)]
 struct LayoutCache {
-    key: Option<((u64, usize), Option<PathBuf>, usize)>,
+    key: Option<LayoutKey>,
     families: Vec<Family>,
 }
 
@@ -437,16 +449,30 @@ impl LayoutCache {
         scope: Option<&Path>,
         groups: &[ProjectGroup],
         removed: &BTreeMap<PathBuf, RemovedWorktree>,
+        (bookmarks, revision): (&HashSet<String>, u64),
     ) -> &[Family] {
-        let fresh = self
-            .key
-            .as_ref()
-            .is_some_and(|(s, sc, n)| *s == stamp && sc.as_deref() == scope && *n == removed.len());
+        let fresh = self.key.as_ref().is_some_and(|(s, sc, n, rev)| {
+            *s == stamp && sc.as_deref() == scope && *n == removed.len() && *rev == revision
+        });
         if !fresh {
             self.families = worktree_ui::layout(groups, scope, removed);
-            self.key = Some((stamp, scope.map(Path::to_path_buf), removed.len()));
+            bookmarks_first(&mut self.families, groups, bookmarks);
+            self.key = Some((stamp, scope.map(Path::to_path_buf), removed.len(), revision));
         }
         &self.families
+    }
+}
+
+/// Moves each family's bookmarked rows (its own and its worktrees' sessions) ahead of the rest;
+/// both partitions keep their order (the sort is stable).
+fn bookmarks_first(families: &mut [Family], groups: &[ProjectGroup], bookmarks: &HashSet<String>) {
+    if bookmarks.is_empty() {
+        return;
+    }
+    for family in families {
+        family
+            .rows
+            .sort_by_key(|r| !bookmarks.contains(&groups[r.group].sessions[r.session].id));
     }
 }
 
@@ -812,7 +838,13 @@ fn show_groups(
         }),
     );
     let visible = filter_cache.sync(stamp, &query, groups);
-    let families = layout_cache.sync(stamp, input.scope, groups, input.removed);
+    let families = layout_cache.sync(
+        stamp,
+        input.scope,
+        groups,
+        input.removed,
+        (input.bookmarks, input.bookmark_revision),
+    );
     let age_key = (
         stamp,
         input
@@ -878,8 +910,8 @@ impl Pass<'_> {
     }
 }
 
-/// One project: its header and its rows (its own sessions and those of its worktrees, newest
-/// first); false when nothing of it shows.
+/// One project: its header and its rows (its own sessions and those of its worktrees,
+/// bookmarks first, running first within each section, then newest first); false when nothing shows.
 fn show_group(
     ui: &mut Ui,
     pass: &Pass<'_>,
@@ -1046,6 +1078,7 @@ fn show_group(
                 running: input.running.is_running(&entry.id, &entry.path)
                     || input.open_paths.contains(&entry.path.as_path()),
                 chip,
+                bookmarked: input.bookmarks.contains(&entry.id),
             })
         })
         .collect();
@@ -1063,7 +1096,7 @@ fn show_group(
         let w = ui.available_width();
         let mut top = ui.cursor().top();
         let mut rects = Vec::with_capacity(n);
-        for row in &shown_rows {
+        for row in ledger_order(&shown_rows) {
             let h = row_h()
                 + if row.chip.is_some() {
                     chip_line_h()
@@ -1074,7 +1107,7 @@ fn show_group(
             top += h + 2.0;
         }
         paint_rail(ui, &geom, &hdr.rect, &rects);
-        for (k, row) in shown_rows.iter().enumerate() {
+        for (k, row) in ledger_order(&shown_rows).enumerate() {
             let age = ages.get(pass.age_key, input.now, row.entry);
             session_row(ui, row, age, &geom, k + 1 == n, input, out);
         }
@@ -1090,6 +1123,20 @@ struct LedgerRow<'a> {
     selected: bool,
     running: bool,
     chip: Option<RowChip<'a>>,
+    /// The session is bookmarked (omp session pin).
+    bookmarked: bool,
+}
+
+/// The cached list is already split by bookmark and ordered by recency. Use the same live
+/// flag as the row indicator, so attach, detach and process exit need no separate sort cache.
+fn ledger_order<'a>(rows: &'a [LedgerRow<'a>]) -> impl Iterator<Item = &'a LedgerRow<'a>> {
+    let (marked, unmarked) = rows.split_at(rows.partition_point(|r| r.bookmarked));
+    [marked, unmarked].into_iter().flat_map(|section| {
+        section
+            .iter()
+            .filter(|r| r.running)
+            .chain(section.iter().filter(|r| !r.running))
+    })
 }
 
 /// A worktree action's hover button as the row needs it every frame: the icon and whether it is
@@ -1901,7 +1948,6 @@ fn session_row(
                 .collect()
         })
         .unwrap_or_default();
-    let work_slots = slots.len();
     let view_offer = row_view_action(
         input.default_view,
         input
@@ -1918,7 +1964,7 @@ fn session_row(
         .find(|t| t.session_path() == Some(entry.path.as_path()))
         .and_then(|t| view_switch_reason(t, other_view, input.host_available));
     let mut slots = slots;
-    if view_offer.is_some() {
+    let view_slot = view_offer.map(|_| {
         slots.push((
             Slot {
                 icon: view_icon(other_view),
@@ -1926,7 +1972,22 @@ fn session_row(
             },
             KeyTone::Plain,
         ));
-    }
+        slots.len() - 1
+    });
+    // The bookmark toggle: the leftmost key (the same action and gating as the context menu's).
+    let bookmarked = row.bookmarked;
+    let bookmark_slot = slots.len();
+    slots.push((
+        Slot {
+            icon: ICON_BOOKMARK,
+            enabled: input.omp_available,
+        },
+        if bookmarked {
+            KeyTone::Accent
+        } else {
+            KeyTone::Plain
+        },
+    ));
     let pill = geom.row_box(&rect);
     let stub_y = geom.stub_y(&rect, two_line);
     let btn_rects: Vec<Rect> = (0..slots.len())
@@ -2029,7 +2090,23 @@ fn session_row(
         } else {
             pill.right() - 8.0 - age.size().x - 6.0 - prog_w
         };
-        text_right = text_right.max(text_left + 20.0);
+        // Bookmarked: an amber bookmark glyph leads the title.
+        let title_left = if bookmarked {
+            paint_icon(
+                p,
+                pos2(text_left + 5.0, stub_y),
+                Align2::CENTER_CENTER,
+                ICON_BOOKMARK,
+                11.0,
+                Hue::Amber
+                    .color(pal)
+                    .gamma_multiply(if removed_wt { 0.5 } else { 1.0 }),
+            );
+            text_left + 14.0
+        } else {
+            text_left
+        };
+        text_right = text_right.max(title_left + 20.0);
         let mut job =
             LayoutJob::simple_singleline(entry.label().to_owned(), theme::font(12.0), title_c);
         if removed_wt {
@@ -2037,12 +2114,12 @@ fn session_row(
                 s.format.strikethrough = Stroke::new(1.0, pal.weak);
             });
         }
-        job.wrap.max_width = (text_right - text_left).max(10.0);
+        job.wrap.max_width = (text_right - title_left).max(10.0);
         job.wrap.max_rows = 1;
         job.wrap.break_anywhere = true;
         let galley = p.layout_job(job);
         p.galley(
-            pos2(text_left, stub_y - galley.size().y / 2.0),
+            pos2(title_left, stub_y - galley.size().y / 2.0),
             galley,
             title_c,
         );
@@ -2094,8 +2171,14 @@ fn session_row(
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
         let _ = btn.clone().on_hover_ui(|ui| {
-            if k == work_slots {
+            if Some(k) == view_slot {
                 ui.label(view_why.unwrap_or(view_label));
+            } else if k == bookmark_slot {
+                if input.omp_available {
+                    ui.label(bookmark_label(bookmarked));
+                } else {
+                    ui.label(format!("{} — {BOOKMARK_OFF}", bookmark_label(bookmarked)));
+                }
             } else if let Some(act) = row_acts(&env, entry).get(k) {
                 ui.label(act.button_tip());
             }
@@ -2107,7 +2190,10 @@ fn session_row(
         .find(|(k, b)| b.clicked() && slots[*k].0.enabled)
         .map(|(k, _)| k);
     if let Some(k) = clicked {
-        if k == work_slots {
+        if k == bookmark_slot {
+            out.actions.push(bookmark_action(&entry.id, bookmarked));
+            out.interacted = true;
+        } else if Some(k) == view_slot {
             out.actions.push(
                 match input
                     .tabs
@@ -2241,6 +2327,9 @@ fn row_hover_card(
             card::kv(ui, KEY_W, "Id", |ui| tips::id_badge(ui, &entry.id));
             card::kv(ui, KEY_W, "Folder", |ui| tips::path(ui, &entry.cwd));
             card::kv(ui, KEY_W, "File", |ui| tips::path(ui, &entry.path));
+            card::kv(ui, KEY_W, "Bookmark", |ui| {
+                bookmark_status(ui, pal, row.bookmarked);
+            });
             if let Some(chip) = &row.chip {
                 card::kv(ui, KEY_W, "Branch", |ui| match chip.wt {
                     RowWorktree::Live(w) => {
@@ -2501,10 +2590,12 @@ pub struct MenuEnv<'a> {
     /// Worktrees (by folder) that were sent the finish prompt and are being waited for.
     pub finishing: &'a HashMap<PathBuf, crate::worktree_ui::FinishMark>,
     pub parked: ParkView<'a>,
+    /// Bookmarked (pinned) session ids.
+    pub bookmarks: &'a HashSet<String>,
 }
 
 impl MenuEnv<'_> {
-    fn entry(&self, path: &Path) -> Option<&SessionEntry> {
+    pub(crate) fn entry(&self, path: &Path) -> Option<&SessionEntry> {
         self.groups
             .iter()
             .flat_map(|g| &g.sessions)
@@ -2534,6 +2625,7 @@ impl SidebarInput<'_> {
             live_tabs: self.open_paths,
             finishing: self.finishing,
             parked: self.parked,
+            bookmarks: self.bookmarks,
         }
     }
 }
@@ -2650,6 +2742,45 @@ fn split_items(ui: &mut Ui, out: &mut SidebarOutput, action: impl Fn(Side) -> Si
     }
 }
 
+/// Why the bookmark toggle is disabled (pins are kept by omp).
+const BOOKMARK_OFF: &str = "omp was not found";
+
+/// The bookmark toggle's label for a session that is (not) bookmarked.
+fn bookmark_label(bookmarked: bool) -> &'static str {
+    if bookmarked {
+        "Remove bookmark"
+    } else {
+        "Bookmark session"
+    }
+}
+
+/// The action that flips the bookmark of session `id`.
+fn bookmark_action(id: &str, bookmarked: bool) -> SidebarAction {
+    SidebarAction::Bookmark {
+        id: id.to_owned(),
+        pinned: !bookmarked,
+    }
+}
+
+/// A hover card's bookmark value: an amber badge, or a faint "not bookmarked".
+fn bookmark_status(ui: &mut Ui, pal: &Palette, bookmarked: bool) {
+    if bookmarked {
+        badge::show(
+            ui,
+            Some(ICON_BOOKMARK),
+            "bookmarked",
+            Hue::Amber,
+            tips::VALUE,
+        );
+    } else {
+        ui.label(
+            RichText::new("not bookmarked")
+                .size(tips::VALUE + 1.0)
+                .color(pal.weak),
+        );
+    }
+}
+
 fn session_menu(
     ui: &mut Ui,
     entry: &SessionEntry,
@@ -2693,6 +2824,27 @@ fn session_menu(
     }
     if menu_item(ui, ICON_LIST_TREE, "Session tree…", None, true, false).clicked() {
         out.actions.push(SidebarAction::Tree(entry.clone()));
+        ui.close();
+    }
+    let bookmarked = env.bookmarks.contains(&entry.id);
+    if menu_item(
+        ui,
+        ICON_BOOKMARK,
+        bookmark_label(bookmarked),
+        None,
+        env.omp_available,
+        false,
+    )
+    .on_hover_text(if bookmarked {
+        "Stop listing this session first in its project"
+    } else {
+        "List this session first in its project"
+    })
+    .on_disabled_hover_text(BOOKMARK_OFF)
+    .clicked()
+    {
+        out.actions.push(bookmark_action(&entry.id, bookmarked));
+        out.interacted = true;
         ui.close();
     }
     ui.separator();
@@ -2933,6 +3085,7 @@ mod tests {
         let busy = HashSet::new();
         let finishing = HashMap::new();
         let parkable = HashSet::new();
+        let bookmarks = HashSet::new();
         let (records, states) = ([], []);
         let env = MenuEnv {
             groups: &[],
@@ -2953,6 +3106,7 @@ mod tests {
                 states: &states,
                 parkable: &parkable,
             },
+            bookmarks: &bookmarks,
         };
         let rec = ParkedBranch {
             primary: PathBuf::from("/p/repo"),
@@ -2998,6 +3152,7 @@ mod tests {
         };
         let busy = HashSet::new();
         let parkable = HashSet::new();
+        let bookmarks = HashSet::new();
         let (records, states) = ([], []);
         for own in [true, false] {
             let finishing = HashMap::from([(
@@ -3023,6 +3178,7 @@ mod tests {
                     states: &states,
                     parkable: &parkable,
                 },
+                bookmarks: &bookmarks,
             };
             let acts = live_acts(&env, &wt);
             assert_eq!(acts[0].label, "Cancel finishing");
@@ -3301,6 +3457,138 @@ mod tests {
         assert_eq!(open_set(&ex, &groups), [false, false]);
         ex.set_all(groups.iter().map(|g| g.cwd.as_path()), true);
         assert_eq!(open_set(&ex, &groups), [true, true]);
+    }
+
+    fn dated(cwd: &str, sessions: &[(&str, u64)], worktree: Option<Worktree>) -> ProjectGroup {
+        ProjectGroup {
+            cwd: PathBuf::from(cwd),
+            display: cwd.into(),
+            sessions: sessions
+                .iter()
+                .map(|(id, secs)| SessionEntry {
+                    id: (*id).into(),
+                    path: PathBuf::from(format!("{cwd}/{id}.jsonl")),
+                    cwd: PathBuf::from(cwd),
+                    title: Some((*id).into()),
+                    first_prompt: None,
+                    modified: SystemTime::UNIX_EPOCH + Duration::from_secs(*secs),
+                })
+                .collect(),
+            worktree,
+        }
+    }
+
+    fn row_ids<'a>(groups: &'a [ProjectGroup], rows: &[&Row]) -> Vec<&'a str> {
+        rows.iter()
+            .map(|r| groups[r.group].sessions[r.session].id.as_str())
+            .collect()
+    }
+
+    fn family_ids<'a>(groups: &'a [ProjectGroup], families: &[Family]) -> Vec<Vec<&'a str>> {
+        families
+            .iter()
+            .map(|f| row_ids(groups, &f.rows.iter().collect::<Vec<_>>()))
+            .collect()
+    }
+
+    #[test]
+    fn bookmarked_rows_lead_each_project_including_worktree_sessions() {
+        let wt = Worktree {
+            path: PathBuf::from("/wt/a"),
+            primary: PathBuf::from("/repo"),
+            branch: Some("a".into()),
+        };
+        let groups = vec![
+            dated("/repo", &[("r-new", 50), ("r-old", 10)], None),
+            dated("/wt/a", &[("w-mid", 30), ("w-old", 5)], Some(wt)),
+            dated("/other", &[("o-1", 40)], None),
+        ];
+        let stamp = (1, groups.as_ptr() as usize);
+        let removed = BTreeMap::new();
+        let mut cache = LayoutCache::default();
+        let mut sync = |marks: &[&str], rev: u64| {
+            let marks: HashSet<String> = marks.iter().map(|m| (*m).to_owned()).collect();
+            family_ids(
+                &groups,
+                cache.sync(stamp, None, &groups, &removed, (&marks, rev)),
+            )
+        };
+        let plain = [vec!["o-1"], vec!["r-new", "w-mid", "r-old", "w-old"]];
+        assert_eq!(sync(&[], 0), plain);
+        // Bookmarks lead, from the project and its worktree alike; both partitions keep their
+        // newest-first order and the projects keep theirs.
+        assert_eq!(
+            sync(&["w-old", "r-old"], 1),
+            [vec!["o-1"], vec!["r-old", "w-old", "r-new", "w-mid"]]
+        );
+        assert_eq!(
+            sync(&["w-mid"], 2),
+            [vec!["o-1"], vec!["w-mid", "r-new", "r-old", "w-old"]]
+        );
+        assert_eq!(sync(&[], 3), plain);
+    }
+
+    #[test]
+    fn running_sessions_lead_within_each_bookmark_section() {
+        let g = dated(
+            "/repo",
+            &[
+                ("pin", 10),
+                ("live-pin", 5),
+                ("new", 50),
+                ("live", 30),
+                ("older-live", 20),
+            ],
+            None,
+        );
+        let mut rows: Vec<_> = g
+            .sessions
+            .iter()
+            .map(|e| LedgerRow {
+                entry: e,
+                bookmarked: e.id.contains("pin"),
+                running: e.id.contains("live"),
+                selected: false,
+                chip: None,
+            })
+            .collect();
+        let ids = |rows: &[LedgerRow<'_>]| {
+            ledger_order(rows)
+                .map(|r| r.entry.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&rows), ["live-pin", "pin", "live", "older-live", "new"]);
+        rows[3].running = false;
+        assert_eq!(ids(&rows), ["live-pin", "pin", "older-live", "new", "live"]);
+    }
+
+    #[test]
+    fn filtering_keeps_bookmarked_rows_first() {
+        let wt = Worktree {
+            path: PathBuf::from("/wt/a"),
+            primary: PathBuf::from("/repo"),
+            branch: Some("a".into()),
+        };
+        let groups = vec![
+            dated("/repo", &[("r-new", 50), ("r-old", 10)], None),
+            dated("/wt/a", &[("w-mid", 30), ("w-old", 5)], Some(wt)),
+        ];
+        let stamp = (1, groups.as_ptr() as usize);
+        let marks = HashSet::from(["w-old".to_owned()]);
+        let mut layout = LayoutCache::default();
+        let families = layout.sync(stamp, None, &groups, &BTreeMap::new(), (&marks, 1));
+        let mut filter = FilterCache::default();
+        let visible = filter.sync(stamp, "old", &groups);
+        let shown: Vec<&Row> = families[0]
+            .rows
+            .iter()
+            .filter(|r| {
+                visible
+                    .get(r.group)
+                    .is_some_and(|v| v.binary_search(&(r.session as u32)).is_ok())
+            })
+            .collect();
+        assert_eq!(row_ids(&groups, &shown), ["w-old", "r-old"]);
     }
 }
 

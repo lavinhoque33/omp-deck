@@ -284,11 +284,13 @@ impl Omp {
             .unwrap_or_else(|| Err(SessError::Failed("omp produced no result".into())))
     }
 
-    /// Pins or unpins session `id` in omp's `session-pins.json` (a no-op when already so).
+    /// Pins or unpins session `id` in the given agent dir (also for a custom sessions root).
     /// omp locks and atomically replaces the file; read it with [`crate::pins::read`].
-    pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<(), SessError> {
-        self.sess_one(json!({"op": "set_pinned", "id": id, "pinned": pinned}))
-            .map(drop)
+    pub fn set_pinned(&self, agent_dir: &Path, id: &str, pinned: bool) -> Result<(), SessError> {
+        self.sess_one(json!({
+            "op": "set_pinned", "id": id, "pinned": pinned, "agentDir": path_text(agent_dir)?
+        }))
+        .map(drop)
     }
 
     /// Renames a session that is not open in this process, like omp's resume picker: a user

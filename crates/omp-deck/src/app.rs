@@ -391,8 +391,9 @@ pub struct App {
     active: usize,
     closed: ReopenStack<ClosedTab>,
     labels: HashMap<PathBuf, String>,
-    /// Revision of the sessions topic `labels` was built from.
-    labels_gen: Option<u64>,
+    bookmarked_paths: HashSet<PathBuf>,
+    /// Session and bookmark revisions reflected in the path lookups above.
+    session_cache_key: Option<(u64, u64)>,
     /// Revision of the controllers topic the tabs last took their records from.
     controllers_rev: u64,
     filter: String,
@@ -643,7 +644,8 @@ impl App {
             active: 0,
             closed: ReopenStack::new(20),
             labels: HashMap::new(),
-            labels_gen: None,
+            bookmarked_paths: HashSet::new(),
+            session_cache_key: None,
             controllers_rev: 0,
             filter: String::new(),
             scope,
@@ -792,6 +794,7 @@ impl App {
                     // One-shot loads (models, omp settings) are asked again of the gateway linked
                     // now: one sent to a previous gateway may have died with it.
                     self.omp_ready = false;
+                    self.load_pins();
                     let gui = deck_service::gateway::GATEWAY_VERSION;
                     if !self.told_old_gateway && deck_core::selfupdate::is_newer(gui, &w.version) {
                         self.told_old_gateway = true;
@@ -1410,17 +1413,30 @@ impl App {
     }
 
     fn refresh_sessions_cache(&mut self) {
-        let revision = self.gw.revision(&Topic::Sessions);
-        if self.labels_gen == Some(revision) {
+        let key = (
+            self.gw.revision(&Topic::Sessions),
+            self.sessions.model.bookmark_revision(),
+        );
+        if self.session_cache_key == Some(key) {
             return;
         }
-        self.labels_gen = Some(revision);
+        let sessions_changed = self.session_cache_key.is_none_or(|old| old.0 != key.0);
+        self.session_cache_key = Some(key);
         self.root_exists = self.gw.sessions_root_exists();
-        self.labels.clear();
+        if sessions_changed {
+            self.labels.clear();
+        }
+        self.bookmarked_paths.clear();
+        let bookmarks = self.sessions.model.bookmarks();
         if let Some(groups) = self.gw.groups() {
             for g in groups.iter() {
                 for e in &g.sessions {
-                    self.labels.insert(e.path.clone(), e.label().to_owned());
+                    if sessions_changed {
+                        self.labels.insert(e.path.clone(), e.label().to_owned());
+                    }
+                    if bookmarks.contains(&e.id) {
+                        self.bookmarked_paths.insert(e.path.clone());
+                    }
                 }
             }
         }
@@ -1611,6 +1627,7 @@ impl App {
     }
 
     fn refresh_sessions(&mut self) {
+        self.load_pins();
         self.gw.mutate(Mutation::RefreshSessions, |_, result| {
             if let Err(e) = result {
                 log::debug!("the session refresh was refused: {e}");
@@ -1847,6 +1864,7 @@ impl App {
             tabs: TabBarInput {
                 tabs: &self.tabs,
                 labels: &self.labels,
+                bookmarked_paths: &self.bookmarked_paths,
                 active: self.active,
                 scroll_to_active: self.scroll_to_active,
                 modal_open: self.modal_open(),
@@ -1859,6 +1877,7 @@ impl App {
                 reviews: &review_uids,
                 menu: MenuEnv {
                     groups: groups.as_deref().map_or(&[][..], Vec::as_slice),
+                    bookmarks: self.sessions.model.bookmarks(),
                     omp_available: omp_found,
                     can_stop: self.backends_available(),
                     default_view: self.cfg.session_view,
@@ -2032,6 +2051,8 @@ impl App {
         let place = self.backup_place();
         let input = SidebarInput {
             groups: groups_ref,
+            bookmarks: self.sessions.model.bookmarks(),
+            bookmark_revision: self.sessions.model.bookmark_revision(),
             running: snap,
             root: &self.root,
             root_exists: self.root_exists,
@@ -2120,6 +2141,7 @@ impl App {
     fn apply_sidebar_action(&mut self, action: SidebarAction) {
         match action {
             SidebarAction::Open(entry) => self.open_session(&entry),
+            SidebarAction::Bookmark { id, pinned } => self.pin_session(id, pinned),
             SidebarAction::OpenView(entry, view) => self.open_session_view(&entry, view),
             SidebarAction::SwitchView { uid, view } => self.request_switch_view(uid, view),
             SidebarAction::NewView(cwd, view) => {

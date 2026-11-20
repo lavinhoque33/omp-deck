@@ -112,7 +112,6 @@ impl App {
         let hub = &mut self.sessions;
         hub.mode = crate::running_model::HubMode::Resume;
         hub.view.resume.open(source, project);
-        self.load_pins();
         if let Some(src) = source.foreign() {
             self.load_foreign(src);
         }
@@ -135,8 +134,10 @@ impl App {
 
     /// Reads omp's pins again.
     pub(in crate::app) fn load_pins(&mut self) {
-        self.gw.query(Query::SessionPins, |app, r| match r {
-            Ok(Answer::SessionPins(pins)) => {
+        self.sessions.pins_request += 1;
+        let request = self.sessions.pins_request;
+        self.gw.query(Query::SessionPins, move |app, r| match r {
+            Ok(Answer::SessionPins(pins)) if app.sessions.pins_request == request => {
                 app.sessions
                     .model
                     .set_pins(pins.into_iter().collect::<HashSet<_>>());
@@ -171,7 +172,7 @@ impl App {
                 Ok(_) => app.load_pins(),
                 Err(e) => app
                     .toasts
-                    .error(&app.ctx, format!("Could not change the pin: {e}")),
+                    .error(&app.ctx, format!("Could not change the bookmark: {e}")),
             });
     }
 

@@ -7,7 +7,7 @@
 // A request without a line means failure (an omp-internal specifier below no longer resolves, or omp died).
 //
 // Requests (`op`):
-//   set_pinned        {id, pinned}                       -> {pinned}
+//   set_pinned        {id, pinned, agentDir}             -> {pinned}
 //   rename_session    {file, title}                      -> {title}          error "busy" when a live omp owns the session
 //   set_label         {file, entryId, label|null}        -> {leaf}           same lease rule; unknown entry -> its message
 //   foreign_sessions  {source:"claude"|"codex"}          -> {sessions:[{source,id,path,cwd,title?,created,modified,messageCount?,firstMessage?}]}
@@ -67,7 +67,6 @@ export default async function ompdeckSess(_api: any) {
   // Imports are lazy and per op: one omp-internal specifier drifting must only fail the ops that need it.
   const storage = async () => import("@oh-my-pi/pi-coding-agent/session/session-storage");
   const manager = async () => (await import("@oh-my-pi/pi-coding-agent/session/session-manager")).SessionManager;
-  const utils = async () => import("@oh-my-pi/pi-utils");
 
   // WATCHDOG.yml access: omp's own advisor/config is not importable from an extension, see ompdeck-advisor.ts.
   const advisor = async () => import("./ompdeck-advisor.ts");
@@ -77,7 +76,7 @@ export default async function ompdeckSess(_api: any) {
       const id = str(r.id, "id");
       if (typeof r.pinned !== "boolean") throw new Error("pinned is required");
       const pins = await import("@oh-my-pi/pi-coding-agent/session/session-pins");
-      await pins.setSessionPinned(id, r.pinned, (await utils()).getAgentDir());
+      await pins.setSessionPinned(id, r.pinned, str(r.agentDir, "agentDir"));
       return { pinned: r.pinned };
     },
 
