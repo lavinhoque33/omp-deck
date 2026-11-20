@@ -3735,8 +3735,10 @@ rewind, `/login`, `/marketplace`. (The agent hub was kept here too; Wave 22 redi
   Primary action **Resume here** = inject `/resume <file stem>` into the origin tab (omp's `/resume` takes an id or
   file-name prefix, never a path — verified live; aborts a running turn in omp → `Rejected::Busy`, confirm, retry with
   `force` = stop, wait ≤ 10 s for idle, then send); secondary **Open in new tab** (today's behavior).
-- **Pin/Unpin** (omp's `session-pins.json`, read by OmpDeck; written only through omp: helper `setSessionPinned`), pinned
-  sessions sort first in the session manager (and in resume mode).
+- **Session bookmarks** are omp pins keyed by session ID: read `session-pins.json` from the sessions root's parent;
+  mutate only through omp's `setSessionPinned` in that same directory. Sidebar families (including worktrees)
+  list bookmarks first. Tabs show the mark, not a new order.
+  Session Manager → Bookmarks spans projects and supports the ordinary search filters; Resume keeps its existing pin shortcuts.
 - **Rename** (live: `/rename <title>` into its tab; closed: helper `renameSessionTitle`, lease-checked).
 - **Foreign sources** Claude Code / Codex: list via helper (`createForeignSessionStore(src).list()`), pick → import
   (`persistForeignSession`, fresh omp id) → Resume here / Open in new tab.
@@ -3948,6 +3950,9 @@ indicator for open tabs), and reorder them to move the open tabbed ones to the t
   New chat/terminal session. Same actions, gates, tooltips, menu and hover card as today.
 
 ### Session rows (the "ledger")
+- **Order**: project headers are alphabetical by folder name (ASCII case-insensitive), then full path. Within a
+  project, bookmarks lead; within each bookmark section, running sessions lead, with newest file mtime first
+  and file path breaking ties. The running marker and the ordering use the same live state, including detached sessions.
 - **Rail**: a 1 px vertical line drops from the centre of the expanded header's folder glyph through all its rows;
   colour `rail = mix(panel, weak, 0.62)` (plain `stroke` vanishes at 1 px). Each row hangs off it by a 17 px horizontal
   **stub** at the row's first-line centre; the last row uses a rounded elbow (└, radius 5) instead of rail + stub.

@@ -1,5 +1,5 @@
 //! Resume mode of the session manager (omp's `/resume` picker, natively): the sessions of the
-//! current project — pinned first, then newest — or every project, or a Claude Code / Codex
+//! current project — bookmarked first, then newest — or every project, or a Claude Code / Codex
 //! source to import from. The primary action resumes the pick into the tab the manager was
 //! opened from; the secondary one opens it in a tab of its own. Every row carries its actions as
 //! hover buttons and in a context menu.
@@ -17,10 +17,13 @@ use egui::{
     RichText, Sense, Sides, Stroke, StrokeKind, Ui, pos2, vec2,
 };
 
-use super::{FOOT_H, SessionsAction, ViewInput, ViewState, lay, pane, row_key, row_key_action};
+use super::{
+    FOOT_H, SessionsAction, ViewInput, ViewState, bookmark_action, bookmark_tip, lay, pane,
+    row_key, row_key_action,
+};
 use crate::icons::{
-    ICON_CORNER_DOWN_RIGHT, ICON_EXTERNAL_LINK, ICON_HISTORY, ICON_INFO, ICON_PENCIL, ICON_PLAY,
-    ICON_SEARCH, ICON_STAR, ICON_TRASH_2, Icon,
+    ICON_BOOKMARK, ICON_CORNER_DOWN_RIGHT, ICON_EXTERNAL_LINK, ICON_HISTORY, ICON_INFO,
+    ICON_PENCIL, ICON_PLAY, ICON_SEARCH, ICON_TRASH_2, Icon,
 };
 use crate::resume_model::{Flow, ForeignLoad, Pick, ResumeState, Source, Then};
 use crate::sessions_model::{Model, Row, plural};
@@ -35,7 +38,7 @@ const OMP_ROW_H: f32 = 52.0;
 const FOREIGN_ROW_H: f32 = 66.0;
 const BTN: f32 = 26.0;
 const BTN_STEP: f32 = 30.0;
-/// Left gutter of a row: the pin star.
+/// Left gutter of a row: the bookmark.
 const GUTTER: f32 = 34.0;
 
 /// The picked list entry, resolved.
@@ -201,9 +204,10 @@ fn resume_tip(input: &ViewInput<'_>) -> String {
 
 // --------------------------------------------------------------------- keys
 
-/// Keyboard of resume mode: arrows move the pick, Enter resumes, Ctrl+R renames, Alt+K pins,
-/// Alt+Shift+K unpins, Ctrl+D deletes, Esc clears the filter, then closes. The filter box keeps
-/// its focus meanwhile; the keys it would use itself (arrows, Enter) are taken first.
+/// Keyboard of resume mode: arrows move the pick, Enter resumes, Ctrl+R renames, Alt+K
+/// bookmarks, Alt+Shift+K removes the bookmark, Ctrl+D deletes, Esc clears the filter, then
+/// closes. The filter box keeps its focus meanwhile; the keys it would use itself (arrows,
+/// Enter) are taken first.
 pub(super) fn keys(
     ctx: &egui::Context,
     model: &Model,
@@ -555,7 +559,7 @@ fn foreign_list(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tone {
     Plain,
-    /// A toggled-on state (a pinned star).
+    /// A toggled-on state (a bookmarked session).
     Lit,
     Primary,
     Danger,
@@ -708,14 +712,14 @@ fn omp_row(
             tone: Tone::Danger,
         },
         Slot {
-            icon: ICON_STAR,
-            tip: if row.pinned {
-                "Unpin (Alt+Shift+K)"
-            } else {
-                "Pin to the top (Alt+K)"
-            },
+            icon: ICON_BOOKMARK,
+            tip: bookmark_tip(row),
             enabled: can,
-            tone: if row.pinned { Tone::Lit } else { Tone::Plain },
+            tone: if row.bookmarked {
+                Tone::Lit
+            } else {
+                Tone::Plain
+            },
         },
         Slot {
             icon: ICON_PENCIL,
@@ -755,12 +759,12 @@ fn omp_row(
             ]
         };
         let p = ui.painter();
-        if row.pinned {
+        if row.bookmarked {
             paint_icon(
                 p,
                 pos2(inner.left() + GUTTER / 2.0 + 2.0, inner.center().y),
                 Align2::CENTER_CENTER,
-                ICON_STAR,
+                ICON_BOOKMARK,
                 15.0,
                 pal.accent,
             );
@@ -800,7 +804,7 @@ fn omp_row(
         }
         if row.live.running {
             let at = pos2(inner.left() + GUTTER - 10.0, top + g[0].size().y / 2.0);
-            if !row.pinned {
+            if !row.bookmarked {
                 p.circle_filled(at, 3.0, pal.ok);
             }
         }
@@ -808,10 +812,7 @@ fn omp_row(
     let path = row.path().to_path_buf();
     let action = clicked.and_then(|k| match k {
         0 => Some(SessionsAction::Delete(vec![path.clone()])),
-        1 => Some(SessionsAction::Pin {
-            id: row.entry.id.clone(),
-            pinned: !row.pinned,
-        }),
+        1 => Some(bookmark_action(row, !row.bookmarked)),
         2 => Some(SessionsAction::Rename(path.clone())),
         3 => Some(SessionsAction::Open(path.clone())),
         4 => Some(SessionsAction::ResumeHere(path.clone())),
@@ -903,19 +904,13 @@ fn omp_menu(ui: &mut Ui, row: &Row, env: &Env<'_>, out: &mut Vec<SessionsAction>
         send(ui, SessionsAction::Open(path.clone()));
     }
     ui.separator();
-    let (label, shortcut) = if row.pinned {
-        ("Unpin", "Alt+Shift+K")
+    let (label, shortcut) = if row.bookmarked {
+        ("Remove bookmark", "Alt+Shift+K")
     } else {
-        ("Pin to the top", "Alt+K")
+        ("Bookmark", "Alt+K")
     };
-    if menu_item(ui, ICON_STAR, label, Some(shortcut), can, false).clicked() {
-        send(
-            ui,
-            SessionsAction::Pin {
-                id: row.entry.id.clone(),
-                pinned: !row.pinned,
-            },
-        );
+    if menu_item(ui, ICON_BOOKMARK, label, Some(shortcut), can, false).clicked() {
+        send(ui, bookmark_action(row, !row.bookmarked));
     }
     if menu_item(
         ui,
@@ -1127,8 +1122,8 @@ fn footer(
                             &[
                                 ("Enter", "resume"),
                                 ("Ctrl+R", "rename"),
-                                ("Alt+K", "pin"),
-                                ("Alt+Shift+K", "unpin"),
+                                ("Alt+K", "bookmark"),
+                                ("Alt+Shift+K", "remove bookmark"),
                                 ("Ctrl+D", "delete"),
                             ],
                         );

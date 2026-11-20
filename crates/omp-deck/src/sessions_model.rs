@@ -56,8 +56,8 @@ pub enum Badge {
     /// Fork of the session with this label (`None` = the parent is not in the store).
     Fork(Option<String>),
     FolderMissing,
-    /// Pinned in omp's `session-pins.json`.
-    Pinned,
+    /// Bookmarked (omp's session pins, `session-pins.json`).
+    Bookmarked,
     Stub,
 }
 
@@ -73,7 +73,7 @@ impl Badge {
             Badge::Fork(Some(p)) => Owned(format!("Fork of {p}")),
             Badge::Fork(None) => Borrowed("Fork"),
             Badge::FolderMissing => Borrowed("Folder missing"),
-            Badge::Pinned => Borrowed("Pinned"),
+            Badge::Bookmarked => Borrowed("Bookmarked"),
             Badge::Stub => Borrowed("Stub"),
         }
     }
@@ -89,7 +89,7 @@ impl Badge {
             Badge::Aborted => "Aborted",
             Badge::Fork(_) => "Fork",
             Badge::FolderMissing => "No folder",
-            Badge::Pinned => "Pinned",
+            Badge::Bookmarked => "Bookmarked",
             Badge::Stub => "Stub",
         }
     }
@@ -130,8 +130,8 @@ pub struct Row {
     /// Memory of the process tree running the session (from the Running poll).
     pub ram: Option<TreeMemory>,
     pub badges: Vec<Badge>,
-    /// Pinned in omp (`session-pins.json`, keyed by session id).
-    pub pinned: bool,
+    /// Bookmarked: omp's session pins (`session-pins.json`, keyed by session id).
+    pub bookmarked: bool,
     pub cells: Cells,
     /// Laid-out cell text, reused across frames (see [`crate::paint_cache`]).
     pub paint: std::cell::RefCell<crate::paint_cache::PaintCache>,
@@ -192,11 +192,26 @@ pub struct Filter {
     pub missing: bool,
     pub not_running: bool,
     pub running: bool,
+    /// Only bookmarked sessions.
+    pub bookmarked: bool,
 }
 
 impl Filter {
+    /// A search criterion (text or chip) is set; the Bookmarks collection is not one.
     pub fn is_active(&self) -> bool {
-        *self != Filter::default()
+        *self
+            != Filter {
+                bookmarked: self.bookmarked,
+                ..Filter::default()
+            }
+    }
+
+    /// Drops the search criteria; the Bookmarks collection stays as it is.
+    pub fn clear(&mut self) {
+        *self = Filter {
+            bookmarked: self.bookmarked,
+            ..Filter::default()
+        };
     }
 
     /// Off → first step → … → last step → off.
@@ -236,6 +251,9 @@ impl Filter {
             return false;
         }
         if self.running && !row.live.running {
+            return false;
+        }
+        if self.bookmarked && !row.bookmarked {
             return false;
         }
         !(self.not_running && row.live.running)
@@ -336,7 +354,7 @@ fn status_rank(row: &Row) -> u8 {
             Badge::InTab => 3,
             Badge::FolderMissing => 2,
             Badge::Stub => 1,
-            Badge::Fork(_) | Badge::Pinned => 0,
+            Badge::Fork(_) | Badge::Bookmarked => 0,
         });
     }
     rank
@@ -389,10 +407,10 @@ fn cmp_rows(a: &Row, b: &Row, sort: Sort) -> Ordering {
         Column::Activity => by_key(Some(a.activity()), Some(b.activity()), d, |x, y| x.cmp(y)),
         Column::Status => by_key(Some(status_rank(a)), Some(status_rank(b)), d, u8::cmp),
     };
-    // Pinned sessions come first whatever the column (omp's resume list does the same); ties:
-    // most recent activity first, then the path (a stable, total order).
-    b.pinned
-        .cmp(&a.pinned)
+    // Bookmarked sessions come first whatever the column (omp's resume list does the same with
+    // its pins); ties: most recent activity first, then the path (a stable, total order).
+    b.bookmarked
+        .cmp(&a.bookmarked)
         .then(main)
         .then_with(|| b.activity().cmp(&a.activity()))
         .then_with(|| a.entry.path.cmp(&b.entry.path))
@@ -457,8 +475,12 @@ pub struct Model {
     /// Display name of a project (worktrees show their branch); others are `~`-abbreviated.
     labels: HashMap<PathBuf, String>,
     errors: HashMap<PathBuf, String>,
-    /// Ids of the pinned sessions.
-    pins: HashSet<String>,
+    /// Ids of the bookmarked sessions (omp's session pins).
+    bookmarks: HashSet<String>,
+    /// Bumped whenever [`Model::set_pins`] changes the bookmarks.
+    bookmark_rev: u64,
+    /// Every bookmarked session in the store (whatever the scope and filters).
+    bookmark_totals: Totals,
     pub filter: Filter,
     pub sort: Sort,
     /// Project the table is scoped to (`None` = all projects).
@@ -488,7 +510,9 @@ impl Default for Model {
             ram: HashMap::new(),
             labels: HashMap::new(),
             errors: HashMap::new(),
-            pins: HashSet::new(),
+            bookmarks: HashSet::new(),
+            bookmark_rev: 0,
+            bookmark_totals: Totals::default(),
             filter: Filter::default(),
             sort: Sort::default(),
             scope: None,
@@ -582,7 +606,7 @@ impl Model {
                     .unwrap_or(StatsSlot::Pending),
                 live: self.live.get(&entry.path).copied().unwrap_or_default(),
                 ram: self.ram.get(&entry.path).copied(),
-                pinned: self.pins.contains(&entry.id),
+                bookmarked: self.bookmarks.contains(&entry.id),
                 entry,
                 badges: Vec::new(),
                 cells: Cells::default(),
@@ -598,6 +622,7 @@ impl Model {
             .enumerate()
             .map(|(i, r)| (r.entry.path.clone(), i))
             .collect();
+        self.bookmark_totals = self.count_bookmarks();
         let alive = keep;
         self.sel.set.retain(|p| alive.contains(p));
         if self.sel.anchor.as_ref().is_some_and(|a| !alive.contains(a)) {
@@ -663,21 +688,79 @@ impl Model {
         self.cells_stale = true;
     }
 
-    /// The pinned session ids (omp's `session-pins.json`). Rows are re-flagged and re-sorted.
+    /// The bookmarked session ids (omp's session pins, `session-pins.json`). Rows are re-flagged
+    /// and re-sorted; under the Bookmarks filter, rows that lose their bookmark leave the
+    /// selection at once.
     pub fn set_pins(&mut self, pins: HashSet<String>) {
-        if pins == self.pins {
+        if pins == self.bookmarks {
             return;
         }
-        self.pins = pins;
+        self.bookmarks = pins;
+        self.bookmark_rev += 1;
         for r in &mut self.rows {
-            r.pinned = self.pins.contains(&r.entry.id);
+            r.bookmarked = self.bookmarks.contains(&r.entry.id);
         }
+        self.bookmark_totals = self.count_bookmarks();
+        self.prune_selection();
         self.cells_stale = true;
         self.view_stale = true;
     }
 
+    /// The bookmarked session ids.
+    pub fn bookmarks(&self) -> &HashSet<String> {
+        &self.bookmarks
+    }
+
+    /// Revision of [`Model::bookmarks`]: changes exactly when the set does.
+    pub fn bookmark_revision(&self) -> u64 {
+        self.bookmark_rev
+    }
+
+    /// The bookmarked sessions of the store (count and size), whatever the scope and filters.
+    pub fn bookmark_totals(&self) -> Totals {
+        self.bookmark_totals
+    }
+
+    /// The Bookmarks collection on or off (the search criteria stay); the selection and the
+    /// detail pane keep only what stays listed.
+    pub fn set_bookmark_filter(&mut self, on: bool) {
+        if self.filter.bookmarked == on {
+            return;
+        }
+        self.filter.bookmarked = on;
+        self.prune_selection();
+        self.view_stale = true;
+    }
+
+    fn count_bookmarks(&self) -> Totals {
+        self.rows
+            .iter()
+            .filter(|r| r.bookmarked)
+            .fold(Totals::default(), |t, r| Totals {
+                count: t.count + 1,
+                bytes: t.bytes + r.entry.total_bytes(),
+            })
+    }
+
+    /// In the Bookmarks collection a row without a bookmark is no longer listed: it leaves the
+    /// selection (bulk actions never reach sessions the table hides) and the detail pane.
+    fn prune_selection(&mut self) {
+        if !self.filter.bookmarked {
+            return;
+        }
+        let (rows, index) = (&self.rows, &self.index);
+        let kept = |p: &PathBuf| index.get(p).is_some_and(|&i| rows[i].bookmarked);
+        self.sel.set.retain(kept);
+        if self.sel.anchor.as_ref().is_some_and(|a| !kept(a)) {
+            self.sel.anchor = None;
+        }
+        if self.detail.as_ref().is_some_and(|d| !kept(d)) {
+            self.detail = None;
+        }
+    }
+
     /// Indices into [`Model::rows`] of the sessions the resume list shows: those of `scope`
-    /// (`None` = every project) that match `text`, pinned first, then the most recently active
+    /// (`None` = every project) that match `text`, bookmarked first, then the most recently active
     /// (omp's resume picker order). Call after [`Model::prepare`].
     pub fn resume_order(&self, scope: Option<&Path>, text: &str) -> Vec<usize> {
         let filter = Filter {
@@ -1006,8 +1089,8 @@ pub fn compact_model(id: &str) -> String {
 
 fn badges(r: &Row, fork: Option<Option<String>>) -> Vec<Badge> {
     let mut out = Vec::new();
-    if r.pinned {
-        out.push(Badge::Pinned);
+    if r.bookmarked {
+        out.push(Badge::Bookmarked);
     }
     if r.live.running {
         out.push(Badge::Running);
@@ -1698,7 +1781,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_lists_pinned_sessions_first_then_the_newest() {
+    fn resume_lists_bookmarked_sessions_first_then_the_newest() {
         let mut m = model(vec![
             entry("new", "/p", 1, 10),
             entry("old", "/p", 9, 10),
@@ -1708,21 +1791,21 @@ mod tests {
         assert_eq!(
             resume_titles(&m, None, ""),
             ["new", "mid", "old", "older"],
-            "newest first without pins"
+            "newest first without bookmarks"
         );
         m.set_pins(HashSet::from(["id-older".to_owned(), "id-old".to_owned()]));
         m.prepare(now());
         assert_eq!(
             resume_titles(&m, None, ""),
             ["old", "older", "new", "mid"],
-            "the pinned two first (newest of them first), then the rest newest first"
+            "the bookmarked two first (newest of them first), then the rest newest first"
         );
         m.set_pins(HashSet::new());
         m.prepare(now());
         assert_eq!(
             resume_titles(&m, None, "")[0],
             "new",
-            "unpinning restores the order"
+            "removing the bookmarks restores the order"
         );
     }
 
@@ -1749,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_sessions_stay_on_top_whatever_the_sort_column() {
+    fn bookmarked_sessions_stay_on_top_whatever_the_sort_column() {
         let mut m = model(vec![
             entry("big", "/p", 1, 9_000),
             entry("small", "/p", 2, 10),
@@ -1761,8 +1844,137 @@ mod tests {
         let row = m
             .rows()
             .iter()
-            .find(|r| r.pinned)
-            .map(|r| r.badges.contains(&Badge::Pinned));
-        assert_eq!(row, Some(true), "the Pinned badge marks the row");
+            .find(|r| r.bookmarked)
+            .map(|r| r.badges.contains(&Badge::Bookmarked));
+        assert_eq!(row, Some(true), "the Bookmarked badge marks the row");
+    }
+
+    #[test]
+    fn bookmark_revision_moves_only_when_the_set_changes() {
+        let mut m = model(vec![entry("a", "/p", 1, 10), entry("b", "/p", 2, 10)]);
+        assert_eq!(m.bookmark_revision(), 0);
+        assert!(m.bookmarks().is_empty());
+        m.set_pins(HashSet::from(["id-a".to_owned()]));
+        assert_eq!(m.bookmark_revision(), 1);
+        assert_eq!(m.bookmarks(), &HashSet::from(["id-a".to_owned()]));
+        m.set_pins(HashSet::from(["id-a".to_owned()]));
+        assert_eq!(m.bookmark_revision(), 1, "the same set again is no change");
+        m.set_pins(HashSet::new());
+        assert_eq!(m.bookmark_revision(), 2);
+    }
+
+    #[test]
+    fn bookmarks_filter_follows_membership_updates() {
+        let mut m = model(vec![
+            entry("a", "/p", 1, 10),
+            entry("b", "/q", 2, 20),
+            entry("c", "/p", 3, 40),
+        ]);
+        m.set_bookmark_filter(true);
+        m.prepare(now());
+        assert!(names(&m).is_empty(), "no bookmarks: nothing listed");
+        assert_eq!(m.bookmark_totals(), Totals::default());
+
+        m.set_pins(HashSet::from(["id-b".to_owned(), "id-c".to_owned()]));
+        assert_eq!(
+            m.bookmark_totals(),
+            Totals {
+                count: 2,
+                bytes: 60
+            },
+            "counted across every project, before the next frame"
+        );
+        m.prepare(now());
+        assert_eq!(names(&m), ["b", "c"], "bookmarks of every project");
+
+        m.toggle_all_visible();
+        assert_eq!(m.selection_totals().count, 2);
+        m.set_pins(HashSet::from(["id-c".to_owned()]));
+        assert_eq!(
+            m.selection_totals(),
+            Totals {
+                count: 1,
+                bytes: 40
+            },
+            "a removed bookmark leaves the selection at once"
+        );
+        m.prepare(now());
+        assert_eq!(names(&m), ["c"]);
+        assert_eq!(m.header_check(), Check::All);
+
+        m.set_pins(HashSet::from(["id-a".to_owned(), "id-c".to_owned()]));
+        m.prepare(now());
+        assert_eq!(names(&m), ["a", "c"], "a new bookmark is listed at once");
+        assert_eq!(m.header_check(), Check::Some);
+
+        m.set_bookmark_filter(false);
+        m.prepare(now());
+        assert_eq!(
+            names(&m),
+            ["a", "c", "b"],
+            "every session again, bookmarks first"
+        );
+    }
+
+    #[test]
+    fn bookmarking_without_the_filter_keeps_the_selection() {
+        let mut m = model(vec![entry("a", "/p", 1, 10), entry("b", "/p", 2, 10)]);
+        m.toggle_all_visible();
+        m.set_pins(HashSet::from(["id-b".to_owned()]));
+        m.set_pins(HashSet::new());
+        assert_eq!(m.selection_totals().count, 2);
+        m.set_bookmark_filter(true);
+        assert!(
+            m.sel.is_empty(),
+            "turning the filter on drops the hidden rows"
+        );
+    }
+
+    #[test]
+    fn removing_a_bookmark_closes_its_hidden_detail() {
+        let mut m = model(vec![entry("a", "/p", 1, 10), entry("b", "/p", 2, 10)]);
+        m.set_pins(HashSet::from(["id-a".to_owned(), "id-b".to_owned()]));
+        m.set_bookmark_filter(true);
+        m.detail = Some(PathBuf::from("/s/b.jsonl"));
+        m.set_pins(HashSet::from(["id-b".to_owned()]));
+        assert_eq!(
+            m.detail.as_deref(),
+            Some(Path::new("/s/b.jsonl")),
+            "a still bookmarked session keeps its details"
+        );
+        m.set_pins(HashSet::from(["id-a".to_owned()]));
+        assert_eq!(m.detail, None, "the now hidden session's details close");
+
+        m.set_bookmark_filter(false);
+        m.detail = Some(PathBuf::from("/s/b.jsonl"));
+        m.set_pins(HashSet::new());
+        assert!(
+            m.detail.is_some(),
+            "outside Bookmarks the session stays listed"
+        );
+    }
+
+    #[test]
+    fn clearing_the_search_keeps_the_bookmarks_collection() {
+        let mut f = Filter {
+            text: "x".to_owned(),
+            stubs: true,
+            bookmarked: true,
+            ..Filter::default()
+        };
+        assert!(f.is_active());
+        f.clear();
+        assert!(f.bookmarked);
+        assert!(!f.is_active(), "the collection alone is no search");
+    }
+
+    #[test]
+    fn rescans_recount_the_bookmarks() {
+        let mut m = model(vec![entry("a", "/p", 1, 10), entry("b", "/p", 2, 10)]);
+        m.set_pins(HashSet::from(["id-a".to_owned(), "id-b".to_owned()]));
+        assert_eq!(m.bookmark_totals().count, 2);
+        m.forget(Path::new("/s/a.jsonl"));
+        assert_eq!(m.bookmark_totals().count, 1);
+        assert!(m.rows()[0].bookmarked, "a rescanned row keeps its bookmark");
     }
 }

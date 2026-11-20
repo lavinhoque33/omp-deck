@@ -1,6 +1,6 @@
 //! Tab model, pure tab helpers, and the tab-strip widget (drawn inside the title bar).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -15,8 +15,8 @@ use deck_term::Terminal;
 
 use crate::badge::{self, Hue};
 use crate::icons::{
-    ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_MESSAGES_SQUARE, ICON_SPARKLES,
-    ICON_TERMINAL, ICON_X, Icon,
+    ICON_BOOKMARK, ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_MESSAGES_SQUARE,
+    ICON_SPARKLES, ICON_TERMINAL, ICON_X, Icon,
 };
 use crate::titlebar::strip_omp_prefix;
 use crate::{card, tips};
@@ -537,6 +537,8 @@ pub struct TabBarInput<'a> {
     pub reviews: &'a [u64],
     /// The agents dashboard covers the terminals: no tab counts as seen.
     pub dashboard: bool,
+    /// Session files bookmarked (pinned) in omp's session pins: marked in the strip.
+    pub bookmarked_paths: &'a HashSet<PathBuf>,
 }
 
 /// Height of a tab's hit area (the full bar height); the pill is painted inset.
@@ -550,6 +552,8 @@ const MAX_TEXT_W: f32 = 170.0;
 const CLOSE_W: f32 = 20.0;
 /// Room for the "review requested" badge after a tab's title.
 const REVIEW_BADGE_W: f32 = 22.0;
+/// Room for the bookmark mark / toggle before the ✕ (session tabs with a session file).
+const BOOKMARK_W: f32 = 20.0;
 const ICON_W: f32 = 16.0;
 
 /// Draws the tab strip (horizontal, scrollable); returns the requested action (at most one per frame).
@@ -635,8 +639,27 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
     let slant = skin::tab_slant(pill_h);
     let review = input.reviews.contains(&tab.uid);
     let badge_w = if review { REVIEW_BADGE_W } else { 0.0 };
-    let width =
-        slant + 12.0 + ICON_W + 8.0 + galley.size().x + badge_w + 6.0 + CLOSE_W + 6.0 + slant;
+    // Reserve the toggle's space only for listed sessions; an unmapped tab has no id to bookmark.
+    let session_path = tab
+        .session_path()
+        .filter(|p| tab.role == TabRole::Session && input.labels.contains_key(*p));
+    let bookmarked = session_path.is_some_and(|p| input.bookmarked_paths.contains(p));
+    let mark_w = if session_path.is_some() {
+        BOOKMARK_W + 2.0
+    } else {
+        0.0
+    };
+    let width = slant
+        + 12.0
+        + ICON_W
+        + 8.0
+        + galley.size().x
+        + badge_w
+        + mark_w
+        + 6.0
+        + CLOSE_W
+        + 6.0
+        + slant;
     let (rect, resp) = ui.allocate_exact_size(vec2(width, tab_hit_h()), Sense::click());
     if input.scroll_to_active && active {
         ui.scroll_to_rect(rect.expand2(vec2(12.0, 0.0)), None);
@@ -648,10 +671,22 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
         vec2(CLOSE_W, CLOSE_W),
     );
     let close = ui.interact(close_rect, resp.id.with("close"), Sense::click());
+    let mark = session_path
+        .filter(|_| input.menu.omp_available || bookmarked)
+        .map(|_| {
+            let r = egui::Rect::from_center_size(
+                pos2(close_rect.left() - 2.0 - BOOKMARK_W / 2.0, inner.center().y),
+                vec2(BOOKMARK_W, BOOKMARK_W),
+            );
+            ui.interact(r, resp.id.with("bookmark"), Sense::click())
+        });
+    let mark_hovered = mark.as_ref().is_some_and(|m| m.hovered());
 
     let ctx = ui.ctx().clone();
-    // The ✕ is a widget on top of the tab and takes the hover from it: count either as the tab's.
-    let hovered = resp.hovered() || close.hovered();
+    // The ✕ and the bookmark toggle are widgets on top of the tab and take the hover from it:
+    // count either as the tab's.
+    let hovered = resp.hovered() || close.hovered() || mark_hovered;
+    let can_bookmark = session_path.is_some() && input.menu.omp_available;
     let hov = ctx.animate_bool_with_time(resp.id.with("hov"), hovered, 0.12);
     let sel = ctx.animate_bool_with_time(resp.id.with("sel"), active, 0.18);
     if ui.is_rect_visible(rect) {
@@ -714,6 +749,27 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
                 pal.warn,
             );
         }
+        // Bookmark: always marked when bookmarked; offered as a toggle while the tab is hovered.
+        if let Some(m) = &mark {
+            let c = m.rect.center();
+            let mh = ctx.animate_bool_with_time(m.id.with("hov"), m.hovered(), 0.1);
+            let offer = if can_bookmark { hov } else { 0.0 };
+            if can_bookmark {
+                p.circle_filled(
+                    c,
+                    BOOKMARK_W / 2.0,
+                    theme::hover_fill(pal).gamma_multiply(mh),
+                );
+            }
+            let col = if bookmarked {
+                Hue::Amber.color(pal)
+            } else {
+                theme::mix(pal.weak, pal.text_strong, mh).gamma_multiply(offer)
+            };
+            if bookmarked || offer > 0.01 {
+                paint_icon(p, c, Align2::CENTER_CENTER, ICON_BOOKMARK, 13.0, col);
+            }
+        }
         // Close ✕: visible on hover and for the active tab.
         let vis = hov.max(sel * 0.8);
         if vis > 0.01 {
@@ -736,16 +792,43 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
 
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     if !input.modal_open {
-        hover_card(&resp, pal, tab, title, status);
+        hover_card(&resp, pal, tab, title, status, bookmarked);
+    }
+    // The bookmark slot is part of the tab for the context menu and middle-click close.
+    let menu_resp = match &mark {
+        Some(m) => resp.union(m.clone()),
+        None => resp.clone(),
+    };
+    let mark_middle = mark.as_ref().is_some_and(|m| m.middle_clicked());
+    let mut mark_clicked = false;
+    if let Some(m) = mark
+        && can_bookmark
+    {
+        let m = m.on_hover_cursor(CursorIcon::PointingHand);
+        let m = if input.modal_open {
+            m
+        } else {
+            m.on_hover_text(if bookmarked {
+                "Remove bookmark"
+            } else {
+                "Bookmark session"
+            })
+        };
+        mark_clicked = m.clicked();
     }
 
     let mut action = None;
-    if close.clicked() || (resp.middle_clicked() && !close.hovered()) {
+    if close.clicked() || mark_middle || (resp.middle_clicked() && !close.hovered()) {
         action = Some(TabAction::Close(i));
-    } else if resp.clicked() && !close.hovered() {
+    } else if mark_clicked && let Some(entry) = session_path.and_then(|p| input.menu.entry(p)) {
+        action = Some(TabAction::Menu(SidebarAction::Bookmark {
+            id: entry.id.clone(),
+            pinned: !bookmarked,
+        }));
+    } else if resp.clicked() && !close.hovered() && !mark_hovered {
         action = Some(TabAction::Activate(i));
     }
-    theme::context_menu(&resp, 230.0, |ui| {
+    theme::context_menu(&menu_resp, 230.0, |ui| {
         let mut out = SidebarOutput::default();
         sidebar::tab_menu(ui, i, tab, &input.menu, &mut out);
         if let Some(a) = out.actions.pop() {
@@ -757,7 +840,14 @@ fn show_tab(ui: &mut Ui, input: &TabBarInput<'_>, i: usize, tab: &Tab) -> Option
 
 /// Hover card of a tab (the tab strip and the sidebar's "Open tabs" rows): title and live state
 /// in the header, folder / session file / model / backend session in the body.
-pub fn hover_card(resp: &egui::Response, pal: &Palette, tab: &Tab, title: &str, status: TabStatus) {
+pub fn hover_card(
+    resp: &egui::Response,
+    pal: &Palette,
+    tab: &Tab,
+    title: &str,
+    status: TabStatus,
+    bookmarked: bool,
+) {
     const KEY_W: f32 = 76.0;
     let exit = tab.terminal().exit_code();
     let mut head =
@@ -772,6 +862,15 @@ pub fn hover_card(resp: &egui::Response, pal: &Palette, tab: &Tab, title: &str, 
         &head,
         |ui| {
             tips::status_badge(ui, status, exit);
+            if bookmarked {
+                badge::show(
+                    ui,
+                    Some(ICON_BOOKMARK),
+                    "bookmarked",
+                    Hue::Amber,
+                    tips::VALUE,
+                );
+            }
         },
         |ui| {
             card::kv(ui, KEY_W, "Folder", |ui| tips::path(ui, &tab.cwd));

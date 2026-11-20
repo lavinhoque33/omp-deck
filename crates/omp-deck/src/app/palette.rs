@@ -567,6 +567,20 @@ impl App {
             )),
         );
         add(
+            "session.bookmark",
+            if entry
+                .as_ref()
+                .is_some_and(|e| self.sessions.model.bookmarks().contains(&e.id))
+            {
+                "Session: Remove bookmark"
+            } else {
+                "Session: Bookmark session"
+            },
+            None,
+            ICON_BOOKMARK,
+            entry_why.or(need(omp, NEED_OMP)),
+        );
+        add(
             "session.copy_path",
             "Session: Copy session path",
             None,
@@ -797,6 +811,13 @@ impl App {
             "View: Session manager",
             Some("Ctrl+Shift+S"),
             ICON_HARD_DRIVE,
+            None,
+        );
+        add(
+            "view.bookmarks",
+            "View: Manage session bookmarks",
+            None,
+            ICON_BOOKMARK,
             None,
         );
         add(
@@ -1370,6 +1391,12 @@ impl App {
                 Some(e) => self.apply_sidebar_action(SidebarAction::Tree(e)),
                 None => self.open_tree_active(),
             },
+            "session.bookmark" => {
+                if let Some(e) = entry {
+                    let pinned = !self.sessions.model.bookmarks().contains(&e.id);
+                    self.pin_session(e.id, pinned);
+                }
+            }
             "session.copy_path" => {
                 if let Some(e) = entry {
                     let text = e.path.to_string_lossy().into_owned();
@@ -1455,6 +1482,10 @@ impl App {
             }
             "view.usage" => self.toggle_usage(),
             "view.sessions" => self.toggle_sessions(),
+            "view.bookmarks" => {
+                self.open_sessions(None);
+                self.sessions.model.set_bookmark_filter(true);
+            }
             "view.dashboard" => self.toggle_dashboard(false),
             "agents.orchestration" => {
                 self.open_dashboard(false, crate::dashboard::DashTab::Orchestration)

@@ -756,6 +756,9 @@ fn hover_card(
             }
             if let Some(e) = entry {
                 card::kv(ui, KEY_W, "File", |ui| tips::path(ui, &e.path));
+                card::kv(ui, KEY_W, "Bookmark", |ui| {
+                    super::bookmark_status(ui, pal, input.bookmarks.contains(&e.id));
+                });
             }
             card::kv(ui, KEY_W, "Session", |ui| tips::mono(ui, &row.name));
             if let Some(b) = backend {

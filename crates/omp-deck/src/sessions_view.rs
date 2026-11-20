@@ -20,17 +20,17 @@ use egui::{
 use crate::app::human_size;
 use crate::col_alloc::{self, CELL_PAD};
 use crate::icons::{
-    ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHECK, ICON_CIRCLE_STOP, ICON_COINS,
-    ICON_COPY, ICON_CPU, ICON_EXTERNAL_LINK, ICON_FOLDER, ICON_FOLDER_INPUT, ICON_FOLDER_OPEN,
-    ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_HARD_DRIVE, ICON_INFO, ICON_MESSAGES_SQUARE,
-    ICON_MINUS, ICON_PENCIL, ICON_REFRESH_CW, ICON_SEARCH, ICON_SPARKLES, ICON_STAR, ICON_TRASH_2,
-    ICON_X, Icon,
+    ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_BOOKMARK, ICON_CHECK, ICON_CIRCLE_STOP,
+    ICON_COINS, ICON_COPY, ICON_CPU, ICON_EXTERNAL_LINK, ICON_FOLDER, ICON_FOLDER_INPUT,
+    ICON_FOLDER_OPEN, ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_HARD_DRIVE, ICON_INFO,
+    ICON_MESSAGES_SQUARE, ICON_MINUS, ICON_PENCIL, ICON_REFRESH_CW, ICON_SEARCH, ICON_SPARKLES,
+    ICON_TRASH_2, ICON_X, Icon,
 };
 use crate::resume_model::{ResumeState, Source, Then};
 use crate::running_model::{HubMode, RunModel};
 use crate::sessions_model::{
-    Badge, Check, Column, Filter, Model, Project, Row, StatsSlot, compact, plural,
-    split_project_label, utc_stamp,
+    Badge, Check, Column, Model, Project, Row, StatsSlot, compact, plural, split_project_label,
+    utc_stamp,
 };
 use crate::sidebar::format_age;
 use crate::theme::{self, Palette};
@@ -114,7 +114,7 @@ pub enum SessionsAction {
     OpenFolder(PathBuf),
     /// Reveal the session file in the file manager (opens its folder).
     Reveal(PathBuf),
-    /// Pin or unpin the session `id` in omp.
+    /// Bookmark the session `id` (`pinned: true`) or remove its bookmark — omp's session pins.
     Pin {
         id: String,
         pinned: bool,
@@ -228,19 +228,20 @@ pub fn show(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowKey {
     Rename,
-    Pin,
-    Unpin,
+    Bookmark,
+    RemoveBookmark,
     Delete,
 }
 
-/// Ctrl+R renames, Alt+K pins, Alt+Shift+K unpins, Ctrl+D deletes (omp's defaults). The shifted
-/// chord is taken first so Alt+Shift+K is never read as Alt+K.
+/// Ctrl+R renames, Alt+K bookmarks, Alt+Shift+K removes the bookmark, Ctrl+D deletes (omp's
+/// rename / pin / unpin / delete defaults). The shifted chord is taken first so Alt+Shift+K is
+/// never read as Alt+K.
 fn row_key(ctx: &egui::Context) -> Option<RowKey> {
     ctx.input_mut(|i| {
         if i.consume_key(Modifiers::ALT | Modifiers::SHIFT, Key::K) {
-            Some(RowKey::Unpin)
+            Some(RowKey::RemoveBookmark)
         } else if i.consume_key(Modifiers::ALT, Key::K) {
-            Some(RowKey::Pin)
+            Some(RowKey::Bookmark)
         } else if i.consume_key(Modifiers::COMMAND, Key::R) {
             Some(RowKey::Rename)
         } else if i.consume_key(Modifiers::COMMAND, Key::D) {
@@ -258,12 +259,28 @@ fn row_key_action(key: RowKey, row: &Row, input: &ViewInput<'_>) -> Option<Sessi
     }
     let idle = input.op.is_none();
     match key {
-        RowKey::Pin | RowKey::Unpin => Some(SessionsAction::Pin {
-            id: row.entry.id.clone(),
-            pinned: key == RowKey::Pin,
-        }),
+        RowKey::Bookmark | RowKey::RemoveBookmark => {
+            Some(bookmark_action(row, key == RowKey::Bookmark))
+        }
         RowKey::Rename => idle.then(|| SessionsAction::Rename(row.path().to_path_buf())),
         RowKey::Delete => idle.then(|| SessionsAction::Delete(vec![row.path().to_path_buf()])),
+    }
+}
+
+/// Bookmark `row` (`on`) or remove its bookmark.
+fn bookmark_action(row: &Row, on: bool) -> SessionsAction {
+    SessionsAction::Pin {
+        id: row.entry.id.clone(),
+        pinned: on,
+    }
+}
+
+/// Hover text of a bookmark toggle on `row`.
+fn bookmark_tip(row: &Row) -> &'static str {
+    if row.bookmarked {
+        "Remove the bookmark (Alt+Shift+K)"
+    } else {
+        "Bookmark: listed first and under Bookmarks (Alt+K)"
     }
 }
 
@@ -422,7 +439,7 @@ fn header(
                 HubMode::Sessions => {
                     let t = model.scope_totals();
                     let mut text = format!("{} sessions · {}", t.count, human_size(t.bytes));
-                    if model.filter.is_active() {
+                    if model.filter.is_active() || model.filter.bookmarked {
                         text.push_str(&format!(" · {} shown", model.visible().len()));
                     }
                     ui.label(RichText::new(text).size(13.0).color(pal.weak));
@@ -566,7 +583,7 @@ fn filter_row(ui: &mut Ui, model: &mut Model, st: &mut ViewState) {
                 .on_hover_cursor(CursorIcon::PointingHand)
                 .clicked()
         {
-            *f = Filter::default();
+            f.clear();
         }
     });
     if model.filter != before {
@@ -582,26 +599,47 @@ fn projects_pane(ui: &mut Ui, model: &mut Model) {
     ui.add_space(6.0);
     let all = model.rows().len();
     let all_bytes: u64 = model.projects().iter().map(|p| p.bytes).sum();
-    let mut pick: Option<Option<PathBuf>> = None;
+    let marks = model.bookmark_totals();
+    let bookmarks_on = model.filter.bookmarked;
+    // `(scope, the Bookmarks collection)`: every pick leaves or enters it.
+    let mut pick: Option<(Option<PathBuf>, bool)> = None;
+    // The two collections stay above the scrolled project list, always in view.
+    ui.spacing_mut().item_spacing.y = 4.0;
+    if project_row(
+        ui,
+        ICON_HARD_DRIVE,
+        "All projects",
+        all,
+        all_bytes,
+        model.scope.is_none() && !bookmarks_on,
+        false,
+        None,
+    )
+    .clicked()
+    {
+        pick = Some((None, false));
+    }
+    if project_row(
+        ui,
+        ICON_BOOKMARK,
+        "Bookmarks",
+        marks.count,
+        marks.bytes,
+        bookmarks_on,
+        false,
+        None,
+    )
+    .on_hover_text("Every bookmarked session, across projects")
+    .clicked()
+    {
+        pick = Some((None, true));
+    }
+    ui.separator();
     egui::ScrollArea::vertical()
         .id_salt("sessions-projects")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
-            if project_row(
-                ui,
-                ICON_HARD_DRIVE,
-                "All projects",
-                all,
-                all_bytes,
-                model.scope.is_none(),
-                false,
-                None,
-            )
-            .clicked()
-            {
-                pick = Some(None);
-            }
             for p in model.projects() {
                 let on = model.scope.as_ref() == Some(&p.cwd);
                 let icon = if p.missing {
@@ -621,12 +659,13 @@ fn projects_pane(ui: &mut Ui, model: &mut Model) {
                 )
                 .clicked()
                 {
-                    pick = Some(Some(p.cwd.clone()));
+                    pick = Some((Some(p.cwd.clone()), false));
                 }
             }
         });
-    if let Some(scope) = pick {
+    if let Some((scope, bookmarks)) = pick {
         model.scope = scope;
+        model.set_bookmark_filter(bookmarks);
         model.mark_view_dirty();
     }
 }
@@ -735,6 +774,10 @@ struct Laid {
 }
 
 pub(crate) const CHECK_W: f32 = 30.0;
+/// The bookmark toggle after the checkbox.
+const MARK_W: f32 = 26.0;
+/// Everything before the first column: the checkbox and the bookmark toggle.
+const LEAD_W: f32 = CHECK_W + MARK_W;
 const TITLE_MIN: f32 = 160.0;
 /// The Model and Status columns stop growing here; their cells clip beyond it.
 const MODEL_MAX: f32 = 130.0;
@@ -933,7 +976,7 @@ fn measure_layout(p: &Painter, model: &Model, pal: &Palette, avail: f32) -> Laid
             drop: c.drop,
         })
         .collect();
-    let alloc = col_alloc::allocate(&specs, 0, CHECK_W, avail, TITLE_MIN);
+    let alloc = col_alloc::allocate(&specs, 0, LEAD_W, avail, TITLE_MIN);
     let mut out = Laid {
         cols: Vec::with_capacity(cols.len()),
         widths: Vec::with_capacity(cols.len()),
@@ -986,11 +1029,32 @@ fn table_pane(
             table_header(ui, model, cols, widths, total_w);
             ui.add_space(4.0);
             if model.visible().is_empty() {
+                if model.filter.bookmarked && model.bookmark_totals().count == 0 {
+                    empty_state(
+                        ui,
+                        ICON_BOOKMARK,
+                        pal.accent,
+                        "No bookmarks yet",
+                        "Bookmark a session with the bookmark beside its checkbox, the Bookmark \
+                         button of its details or Alt+K: it is listed here and first everywhere.",
+                    );
+                    ui.vertical_centered(|ui| {
+                        if ui.link("Show every session").clicked() {
+                            model.set_bookmark_filter(false);
+                        }
+                    });
+                    return;
+                }
                 ui.add_space(30.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("No sessions match").color(pal.weak));
+                    let what = if model.filter.bookmarked {
+                        "No bookmarked sessions match"
+                    } else {
+                        "No sessions match"
+                    };
+                    ui.label(RichText::new(what).color(pal.weak));
                     if model.filter.is_active() && ui.link("Clear the filters").clicked() {
-                        model.filter = Filter::default();
+                        model.filter.clear();
                         model.mark_view_dirty();
                     }
                 });
@@ -1028,7 +1092,19 @@ fn table_header(ui: &mut Ui, model: &mut Model, cols: &[Col], widths: &[f32], to
     {
         model.toggle_all_visible();
     }
-    let mut x = rect.left() + CHECK_W;
+    // The rows' bookmark gutter.
+    let mark_rect = Rect::from_min_size(pos2(check_rect.right(), rect.top()), vec2(MARK_W, HEAD_H));
+    paint_icon(
+        ui.painter(),
+        mark_rect.center(),
+        Align2::CENTER_CENTER,
+        ICON_BOOKMARK,
+        14.0,
+        pal.weak,
+    );
+    ui.interact(mark_rect, Id::unique("sessions-head-mark"), Sense::hover())
+        .on_hover_text("Bookmarked — click a row's bookmark to add or remove it");
+    let mut x = rect.left() + LEAD_W;
     for (c, &w) in cols.iter().zip(widths) {
         let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(w, HEAD_H));
         x += w;
@@ -1118,9 +1194,14 @@ fn table_rows(
                 let inner = rect.shrink2(vec2(0.0, 1.0));
                 let check_rect = Rect::from_min_size(inner.min, vec2(CHECK_W, inner.height()));
                 let check = ui.interact(check_rect, resp.id.with("check"), Sense::click());
+                let mark_rect = Rect::from_min_size(
+                    pos2(check_rect.right(), inner.top()),
+                    vec2(MARK_W, inner.height()),
+                );
+                let mark = ui.interact(mark_rect, resp.id.with("mark"), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(
                     resp.id.with("hov"),
-                    resp.hovered() || check.hovered(),
+                    resp.hovered() || check.hovered() || mark.hovered(),
                     0.08,
                 );
                 if ui.is_rect_visible(rect) {
@@ -1139,6 +1220,14 @@ fn table_rows(
                     }
                     let state = if selected { Check::All } else { Check::None };
                     paint_checkbox(p, check_rect.center(), state, check.hovered(), pal);
+                    paint_bookmark(
+                        p,
+                        mark_rect,
+                        row.bookmarked,
+                        hov,
+                        mark.hovered() && input.omp,
+                        pal,
+                    );
                     paint_row(
                         ui,
                         row,
@@ -1152,17 +1241,31 @@ fn table_rows(
                 }
                 if check.clicked() {
                     check_click = Some(pos);
+                } else if mark.clicked() {
+                    if input.omp {
+                        out.push(bookmark_action(row, !row.bookmarked));
+                    }
                 } else if resp.clicked() {
                     detail_click = Some(row.path().to_path_buf());
                 }
                 if resp.double_clicked() && input.omp {
                     out.push(SessionsAction::Open(row.path().to_path_buf()));
                 }
+                if mark.hovered() {
+                    let _ = mark
+                        .on_hover_cursor(if input.omp {
+                            CursorIcon::PointingHand
+                        } else {
+                            CursorIcon::NotAllowed
+                        })
+                        .on_hover_text(bookmark_tip(row));
+                    continue;
+                }
                 let pointer = ui.input(|i| i.pointer.hover_pos());
                 if let Some(at) = pointer
                     && inner.contains(at)
                 {
-                    let col = column_at(inner.left() + CHECK_W, cols, widths, at.x);
+                    let col = column_at(inner.left() + LEAD_W, cols, widths, at.x);
                     row_tip(&resp, row, col, model.error(row.path()));
                 }
             }
@@ -1249,7 +1352,7 @@ fn paint_row(
     let p = ui.painter();
     let mut cache = row.paint.borrow_mut();
     let g = cache.get(key, || row_galleys(p, row, pal));
-    let mut x = rect.left() + CHECK_W;
+    let mut x = rect.left() + LEAD_W;
     for (c, &w) in cols.iter().zip(widths) {
         let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(w, rect.height()));
         x += w;
@@ -1345,7 +1448,7 @@ pub(crate) fn galley_cell(p: &Painter, rect: Rect, g: &Arc<Galley>, right: bool)
 fn badge_color(b: &Badge, pal: &Palette) -> Color32 {
     match b {
         Badge::Running => pal.ok,
-        Badge::InTab | Badge::Pinned => pal.accent,
+        Badge::InTab | Badge::Bookmarked => pal.accent,
         Badge::Busy | Badge::Aborted => pal.warn,
         Badge::Error | Badge::FolderMissing => pal.danger,
         Badge::Fork(_) | Badge::Stub => pal.weak,
@@ -1612,9 +1715,39 @@ fn badge_hue(b: &Badge) -> crate::badge::Hue {
         Badge::Aborted => Hue::Orange,
         Badge::Fork(_) => Hue::Violet,
         Badge::FolderMissing => Hue::Orange,
-        Badge::Pinned => Hue::Amber,
+        Badge::Bookmarked => Hue::Amber,
         Badge::Stub => Hue::Teal,
     }
+}
+
+/// The bookmark toggle in `rect`: lit when `on`, otherwise faint while the row is hovered
+/// (`row_hov`) and full when the toggle itself is (`hovered`); nothing on a quiet row.
+fn paint_bookmark(p: &Painter, rect: Rect, on: bool, row_hov: f32, hovered: bool, pal: &Palette) {
+    let ink = if on {
+        pal.accent
+    } else if hovered {
+        pal.text_strong
+    } else if row_hov > 0.0 {
+        pal.weak.gamma_multiply(row_hov)
+    } else {
+        return;
+    };
+    if hovered {
+        p.rect_stroke(
+            Rect::from_center_size(rect.center(), vec2(22.0, 22.0)),
+            theme::rad(5, 7),
+            Stroke::new(1.5, theme::hover_stroke(pal)),
+            StrokeKind::Inside,
+        );
+    }
+    paint_icon(
+        p,
+        rect.center(),
+        Align2::CENTER_CENTER,
+        ICON_BOOKMARK,
+        15.0,
+        ink,
+    );
 }
 
 pub(crate) fn paint_checkbox(
@@ -1994,15 +2127,16 @@ fn detail_buttons(
         {
             out.push(SessionsAction::Open(path.clone()));
         }
-        let pin_label = if row.pinned { "Unpin" } else { "Pin" };
-        if action_button(ui, ICON_STAR, pin_label, input.omp, false)
-            .on_hover_text("Pinned sessions come first (Alt+K pins, Alt+Shift+K unpins)")
+        let label = if row.bookmarked {
+            "Remove bookmark"
+        } else {
+            "Bookmark"
+        };
+        if action_button(ui, ICON_BOOKMARK, label, input.omp, false)
+            .on_hover_text(bookmark_tip(row))
             .clicked()
         {
-            out.push(SessionsAction::Pin {
-                id: row.entry.id.clone(),
-                pinned: !row.pinned,
-            });
+            out.push(bookmark_action(row, !row.bookmarked));
         }
         if action_button(ui, ICON_PENCIL, "Rename…", input.omp && idle, false)
             .on_hover_text("Rename the session (Ctrl+R)")

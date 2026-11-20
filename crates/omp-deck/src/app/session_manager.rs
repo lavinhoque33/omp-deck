@@ -149,7 +149,9 @@ struct Op {
 #[derive(Default)]
 pub(super) struct SessionHub {
     pub(super) open: bool,
-    model: Model,
+    pub(super) model: Model,
+    /// Ignore stale pin reads if an opening/refresh overlaps a completed bookmark edit.
+    pins_request: u64,
     view: ViewState,
     /// Id of the latest inventory read; older statistics answers are dropped.
     generation: u64,
@@ -231,6 +233,7 @@ impl App {
         hub.asked.clear();
         hub.generation += 1;
         self.gw.subscribe(Topic::Inventory);
+        self.load_pins();
     }
 
     pub(super) fn close_sessions(&mut self) {

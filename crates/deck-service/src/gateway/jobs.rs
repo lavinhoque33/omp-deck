@@ -695,7 +695,7 @@ pub fn usage_reset_spend(
 
 pub fn session_pin(ctx: &JobCtx, id: &str, pinned: bool) -> Result<Done, GatewayError> {
     ctx.omp()?
-        .set_pinned(id, pinned)
+        .set_pinned(&ctx.root.agent_dir(), id, pinned)
         .map(|()| Done::Unit)
         .map_err(sess_failed)
 }

@@ -67,8 +67,10 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
 
   <details><summary>More</summary>
 
-  Every omp session grouped by project (only the active tab's project is expanded; the rest stay collapsed until you
-  open them), newest first: each session hangs off its project folder on a branch line, with its title, relative age
+  Projects stay alphabetical by folder name, even while agents in different projects produce output. Only the
+  active tab's project expands automatically. Within each project, bookmarks come first; within the bookmarked
+  and unbookmarked sections, running sessions come first, then the rest, newest activity first in each.
+  Each session hangs off its project folder on a branch line, with its title, relative age
   and a status marker on the branch (running, the tab's working spinner or needs-input badge), worktree branches on a
   second line. The folder scope sits at the top with the filter box; a resizable, collapsible **Running** dock at the
   bottom lists every live session (tabbed ones first, with a window marker; ✕ or middle-click closes the tab, a
@@ -136,6 +138,7 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
 
   </details>
 
+- **Session bookmarks**: Click the bookmark on a sidebar row or session tab, or right-click and choose **Bookmark session**. Open **Session manager → Bookmarks** (`Ctrl+Shift+S`) to find, open or remove bookmarks across projects. These are the same pins used by omp’s `/resume`.
 - **Session manager**: Sort, filter, move or delete sessions and inspect or kill selected running processes.
 
   <details><summary>More</summary>

@@ -5,6 +5,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::time::SystemTime;
 
 use deck_core::config::{ParkedBranch, RemovedWorktree};
@@ -46,13 +47,17 @@ impl Family {
     }
 }
 
-fn modified(groups: &[ProjectGroup], r: &Row) -> SystemTime {
-    groups[r.group].sessions[r.session].modified
+fn folder_sort_name(path: &Path) -> impl Iterator<Item = u8> + '_ {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .as_encoded_bytes()
+        .iter()
+        .map(u8::to_ascii_lowercase)
 }
 
 /// Folds the sessions of every worktree group (and of every removed worktree) into the family of
 /// its primary checkout (a synthetic header when the primary has no sessions). Rows are ordered
-/// newest first, families by their newest row.
+/// newest first; project headers are alphabetical by folder name, independent of activity.
 ///
 /// Per-folder scope: a repository inside the scope brings all its worktrees along, wherever they
 /// live (omp keeps them under its own managed folder). A worktree whose repository is outside
@@ -107,9 +112,18 @@ pub fn layout(
         families[fi].rows.extend(own_rows(gi));
     }
     for f in &mut families {
-        f.rows.sort_by_key(|r| Reverse(modified(groups, r)));
+        f.rows.sort_unstable_by_key(|r| {
+            let e = &groups[r.group].sessions[r.session];
+            (Reverse(e.modified), &e.path)
+        });
     }
-    families.sort_by_key(|f| Reverse(f.rows.first().map(|r| modified(groups, r))));
+    families.sort_unstable_by(|a, b| {
+        let a = &a.group(groups).cwd;
+        let b = &b.group(groups).cwd;
+        folder_sort_name(a)
+            .cmp(folder_sort_name(b))
+            .then_with(|| a.cmp(b))
+    });
     families
 }
 
@@ -407,11 +421,11 @@ mod tests {
         assert_eq!(
             heads(&groups, &fam),
             [
+                ("/p/other".to_owned(), vec!["/p/other".to_owned()]),
                 (
                     "/p/repo".to_owned(),
                     vec!["/wt/b".to_owned(), "/wt/a".to_owned(), "/p/repo".to_owned()]
                 ),
-                ("/p/other".to_owned(), vec!["/p/other".to_owned()]),
             ]
         );
     }
@@ -487,11 +501,11 @@ mod tests {
         assert_eq!(
             heads(&groups, &fam),
             [
+                ("/p/plain".to_owned(), vec!["/p/plain".to_owned()]),
                 (
                     "/p/repo".to_owned(),
                     vec!["/wt/gone".to_owned(), "/p/repo".to_owned()]
                 ),
-                ("/p/plain".to_owned(), vec!["/p/plain".to_owned()]),
             ]
         );
         let none = ParkView {
