@@ -6,6 +6,7 @@
 //! * [`AgentsScanner`] / [`TranscriptReader`] are the synchronous cores of the two watchers.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 pub mod activity;
@@ -31,8 +32,11 @@ pub enum AgentStatus {
     Interrupted,
 }
 
+/// An immutable row shared across roster revisions, including the fleet and live overlays.
+pub type AgentSummary = Arc<AgentRow>;
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AgentSummary {
+pub struct AgentRow {
     /// File stem, e.g. "CoreStatus" or "M2cCore.M2cSaveService".
     pub id: String,
     /// `None` = spawned by the main session.
@@ -54,7 +58,7 @@ pub struct AgentSummary {
     /// Preamble stripped, `# Target` section preferred, ≤ 1000 chars.
     pub task_gist: String,
     /// Full assignment text (≤ 64 KiB).
-    pub task: String,
+    pub task: Arc<str>,
     pub status: AgentStatus,
     /// Last errorMessage for Failed/Aborted.
     pub error: Option<String>,
@@ -84,7 +88,7 @@ pub struct AgentsTarget {
 pub struct AgentsSnapshot {
     pub session: PathBuf,
     /// Parent before child, newest first among siblings.
-    pub agents: Vec<AgentSummary>,
+    pub agents: Arc<Vec<AgentSummary>>,
 }
 
 /// An image carried by a transcript message. `blob` is the first 16 hex digits of SHA-256 over

@@ -1080,7 +1080,7 @@ fn tab_bar(ui: &mut Ui, st: &mut PopupState, a: &AgentSummary, out: &mut Vec<Pop
                                     .clicked()
                             {
                                 out.push(PopupAction::Copy {
-                                    text: a.task.clone(),
+                                    text: a.task.to_string(),
                                     what: "assignment",
                                 });
                             }
@@ -1185,7 +1185,7 @@ mod tests {
     #[test]
     fn facts_skip_unknowns_and_format_values() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
-        let a = AgentSummary {
+        let a = Arc::new(deck_core::agents::AgentRow {
             id: "A".into(),
             parent_id: None,
             depth: 0,
@@ -1196,7 +1196,7 @@ mod tests {
             model_role: None,
             thinking: None,
             task_gist: String::new(),
-            task: String::new(),
+            task: Arc::from(""),
             status: AgentStatus::Done,
             error: None,
             current: None,
@@ -1209,7 +1209,7 @@ mod tests {
             cost: 0.5,
             context_tokens: None,
             output_path: None,
-        };
+        });
         let f = facts(&a, now);
         let get = |k: &str| f.iter().find(|(l, _)| *l == k).map(|(_, v)| v.as_str());
         assert_eq!(get("Cost"), Some("$0.50"));

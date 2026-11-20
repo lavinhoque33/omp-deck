@@ -194,9 +194,9 @@ impl Entry {
         let scanned = self.scanner.scan(self.target.owner_alive).agents;
         let busy = scanned.iter().any(|a| a.status == AgentStatus::Running);
         self.due = Instant::now() + if busy { BUSY_INTERVAL } else { IDLE_INTERVAL };
-        let agents_changed = scanned != *self.agents;
+        let agents_changed = !Arc::ptr_eq(&scanned, &self.agents);
         if agents_changed {
-            self.agents = Arc::new(scanned);
+            self.agents = scanned;
         }
         if self.view.is_some() && !stats_changed && !agents_changed {
             return false;

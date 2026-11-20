@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use deck_core::agents::{AgentSummary, AgentsSnapshot};
+use deck_core::agents::AgentsSnapshot;
 use deck_core::config::SessionView;
 use deck_core::ctl::LiveSnapshot;
 use deck_core::fleet::FleetSnapshot;
@@ -56,8 +56,7 @@ const NOTE_H: f32 = 32.0;
 
 /// One session's subagents: the snapshot built from the fleet, its formatted view and the rows.
 pub struct SessionAgents {
-    /// The fleet's list this snapshot was copied from: same `Arc` = unchanged.
-    src: Arc<Vec<AgentSummary>>,
+    /// Shares the fleet's agent list: the same `Arc` = unchanged.
     snap: Arc<AgentsSnapshot>,
     pub view: AgentsView,
     pub rows: RowsState,
@@ -250,13 +249,12 @@ impl DashState {
             let fresh = || {
                 Arc::new(AgentsSnapshot {
                     session: s.session.clone(),
-                    agents: s.agents.as_ref().clone(),
+                    agents: Arc::clone(&s.agents),
                 })
             };
             match self.sessions.get_mut(&s.session) {
                 Some(sa) => {
-                    if !Arc::ptr_eq(&sa.src, &s.agents) {
-                        sa.src = Arc::clone(&s.agents);
+                    if !Arc::ptr_eq(&sa.snap.agents, &s.agents) {
                         sa.snap = fresh();
                     }
                 }
@@ -264,7 +262,6 @@ impl DashState {
                     self.sessions.insert(
                         s.session.clone(),
                         SessionAgents {
-                            src: Arc::clone(&s.agents),
                             snap: fresh(),
                             view: AgentsView::default(),
                             rows: RowsState::default(),
@@ -1774,12 +1771,12 @@ fn note_strip(ui: &mut Ui, rect: Rect, text: &str, ctl: &CtlView<'_>) -> bool {
 mod tests {
     use super::*;
     use crate::dashboard_model::{CardSrc, Extra};
-    use deck_core::agents::AgentStatus;
+    use deck_core::agents::{AgentRow, AgentStatus, AgentSummary};
     use deck_core::config::{Density, UiFont, UiStyle};
     use deck_core::fleet::FleetSession;
 
     fn agent(id: &str, parent: Option<&str>, status: AgentStatus) -> AgentSummary {
-        AgentSummary {
+        Arc::new(AgentRow {
             id: id.to_owned(),
             parent_id: parent.map(str::to_owned),
             depth: usize::from(parent.is_some()),
@@ -1790,7 +1787,7 @@ mod tests {
             model_role: None,
             thinking: None,
             task_gist: format!("work on {id}"),
-            task: String::new(),
+            task: Arc::from(""),
             status,
             error: None,
             current: None,
@@ -1803,7 +1800,7 @@ mod tests {
             cost: 0.0,
             context_tokens: None,
             output_path: None,
-        }
+        })
     }
 
     struct Harness {

@@ -299,6 +299,32 @@ fn incremental_tail_waits_for_partial_lines_and_survives_inode_replace() {
 }
 
 #[test]
+fn unchanged_rows_survive_sidecar_and_lineage_changes() {
+    let (d, session) = store();
+    let dir = d.path().join("sess");
+    let mut scanner = AgentsScanner::new(session);
+    let before = scanner.scan(true);
+    append(
+        &dir.join("DoneAgent.jsonl"),
+        b"{\"type\":\"title\",\"title\":\"renamed\"}\n",
+    );
+    assert!(Arc::ptr_eq(&before.agents, &scanner.scan(true).agents));
+
+    // No transcript appended: the parent disappears, and another agent gains a kill marker.
+    fs::remove_file(dir.join("RunningAgent.jsonl")).unwrap();
+    fs::write(dir.join("FailedAgent.jsonl.tombstone"), b"").unwrap();
+    let after = scanner.scan(true);
+    assert_eq!(find(&after, "RunningAgent.Helper").depth, 0);
+    assert_eq!(find(&before, "RunningAgent.Helper").depth, 1);
+    assert_eq!(find(&after, "FailedAgent").status, AgentStatus::Aborted);
+    assert_eq!(find(&before, "FailedAgent").status, AgentStatus::Failed);
+    assert!(Arc::ptr_eq(
+        find(&before, "DoneAgent"),
+        find(&after, "DoneAgent")
+    ));
+}
+
+#[test]
 fn malformed_and_truncated_lines_never_break_a_scan() {
     let (d, session) = store();
     let path = d.path().join("sess/FailedAgent.jsonl");
@@ -641,6 +667,24 @@ fn agents_watcher_publishes_changes_and_stops_on_drop() {
             .filter(|s| s.session.ends_with("empty.jsonl"))
     });
     assert!(snap.agents.is_empty());
+    // Return to a warm target: only new bytes and sidecars should affect its old rows.
+    let failed = d.path().join("sess/FailedAgent.md");
+    fs::write(&failed, b"recovered output").unwrap();
+    append(
+        &d.path().join("sess/Fresh.jsonl"),
+        b"{\"type\":\"thinking_level_change\",\"thinkingLevel\":\"new\"}\n",
+    );
+    watcher.set_target(Some(AgentsTarget {
+        session: session.clone(),
+        owner_alive: true,
+    }));
+    let returned = wait_for(|| watcher.latest().filter(|s| s.session == session));
+    assert_eq!(find(&returned, "Fresh").thinking.as_deref(), Some("new"));
+    assert_eq!(
+        find(&returned, "FailedAgent").output_path.as_ref(),
+        Some(&failed)
+    );
+    assert_eq!(find(&returned, "RunningAgent").status, AgentStatus::Running);
     watcher.set_target(None);
     assert!(watcher.latest().is_none());
     drop(watcher);

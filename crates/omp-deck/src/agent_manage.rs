@@ -488,11 +488,13 @@ fn skipped_text(outcome: &DeleteOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deck_core::agents::AgentRow;
     use deck_core::ctl::SkippedAgent;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn agent(id: &str, parent: Option<&str>, status: AgentStatus) -> AgentSummary {
-        AgentSummary {
+        Arc::new(AgentRow {
             id: id.to_owned(),
             parent_id: parent.map(str::to_owned),
             depth: 0,
@@ -503,7 +505,7 @@ mod tests {
             model_role: None,
             thinking: None,
             task_gist: String::new(),
-            task: String::new(),
+            task: Arc::from(""),
             status,
             error: None,
             current: None,
@@ -516,14 +518,13 @@ mod tests {
             cost: 0.0,
             context_tokens: None,
             output_path: None,
-        }
+        })
     }
 
     fn advisor(id: &str, parent: Option<&str>) -> AgentSummary {
-        AgentSummary {
-            advisor: true,
-            ..agent(id, parent, AgentStatus::Done)
-        }
+        let mut a = agent(id, parent, AgentStatus::Done);
+        Arc::make_mut(&mut a).advisor = true;
+        a
     }
 
     fn ids(plan: &Plan) -> Vec<&str> {
