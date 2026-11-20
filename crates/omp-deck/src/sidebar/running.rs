@@ -908,6 +908,8 @@ mod tests {
         let parkable = HashSet::new();
         let input = SidebarInput {
             groups: None,
+            bookmarks: &HashSet::new(),
+            bookmark_revision: 0,
             running,
             root: &root,
             root_exists: false,
