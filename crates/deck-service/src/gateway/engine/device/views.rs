@@ -1236,7 +1236,7 @@ mod tests {
     #[test]
     fn agents_list_parents_before_children_newest_first() {
         let at = |s: u64| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
-        let mk = |id: &str, parent: Option<&str>, created: u64| AgentSummary {
+        let mk = |id: &str, parent: Option<&str>, created: u64| deck_core::agents::AgentRow {
             id: id.to_owned(),
             parent_id: parent.map(str::to_owned),
             depth: usize::from(parent.is_some()),
@@ -1247,7 +1247,7 @@ mod tests {
             thinking: None,
             model_role: None,
             task_gist: String::new(),
-            task: String::new(),
+            task: "".into(),
             status: deck_core::agents::AgentStatus::Done,
             error: None,
             current: None,
@@ -1262,10 +1262,10 @@ mod tests {
             output_path: None,
         };
         let list = vec![
-            mk("A", None, 1),
-            mk("A.x", Some("A"), 5),
-            mk("B", None, 2),
-            mk("A.y", Some("A"), 6),
+            mk("A", None, 1).into(),
+            mk("A.x", Some("A"), 5).into(),
+            mk("B", None, 2).into(),
+            mk("A.y", Some("A"), 6).into(),
         ];
         let order: Vec<&str> = agent_order(&list).iter().map(|a| a.id.as_str()).collect();
         assert_eq!(order, ["B", "A", "A.y", "A.x"]);

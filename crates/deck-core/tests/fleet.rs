@@ -148,7 +148,7 @@ fn reports_stats_and_agents_in_target_order_and_follows_appended_lines() {
     let fb = find(&snap, &b).unwrap();
     assert_eq!(fb.last_reply.as_deref(), Some("other again"));
     assert!((fb.cost - 1.5).abs() < 1e-9);
-    assert_eq!(*find(&snap, &c).unwrap().agents, expected.agents);
+    assert_eq!(find(&snap, &c).unwrap().agents, expected.agents);
 
     let before = Arc::clone(&snap);
     // Appended lines are picked up incrementally.

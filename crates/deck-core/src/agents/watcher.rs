@@ -1,5 +1,7 @@
 //! Background thread behind the Agent Hub panel.
 
+use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -10,6 +12,10 @@ use crate::status::lock;
 
 const BUSY_INTERVAL: Duration = Duration::from_secs(1);
 const IDLE_INTERVAL: Duration = Duration::from_secs(3);
+// Park folds and offsets, never watcher threads or open files. The byte budget is shared by
+// all inactive sessions; a scanner too large to admit simply starts cold on its next visit.
+const WARM_SESSIONS: usize = 3;
+const WARM_BYTES: usize = 8 * 1024 * 1024;
 
 struct Control {
     target: Option<AgentsTarget>,
@@ -95,8 +101,41 @@ impl Drop for AgentsWatcher {
     }
 }
 
+#[derive(Default)]
+struct Scanners {
+    active: Option<AgentsScanner>,
+    warm: VecDeque<(AgentsScanner, usize)>, // newest first
+}
+
+impl Scanners {
+    fn follow(&mut self, session: &Path) -> &mut AgentsScanner {
+        if self.active.as_ref().is_some_and(|s| s.session() != session) {
+            let next = self
+                .warm
+                .iter()
+                .position(|(s, _)| s.session() == session)
+                .and_then(|i| self.warm.remove(i));
+            if let Some(previous) = self.active.take() {
+                let bytes = previous.cache_weight();
+                if bytes <= WARM_BYTES {
+                    let mut total = bytes + self.warm.iter().map(|(_, size)| size).sum::<usize>();
+                    while self.warm.len() >= WARM_SESSIONS || total > WARM_BYTES {
+                        if let Some((_, evicted)) = self.warm.pop_back() {
+                            total -= evicted;
+                        }
+                    }
+                    self.warm.push_front((previous, bytes));
+                }
+            }
+            self.active = next.map(|(scanner, _)| scanner);
+        }
+        self.active
+            .get_or_insert_with(|| AgentsScanner::new(session.to_owned()))
+    }
+}
+
 fn run(shared: &Shared, on_update: &dyn Fn()) {
-    let mut scanner: Option<AgentsScanner> = None;
+    let mut scanners = Scanners::default();
     let mut seen_generation = u64::MAX;
     let mut next = Instant::now();
     loop {
@@ -127,19 +166,10 @@ fn run(shared: &Shared, on_update: &dyn Fn()) {
         };
         seen_generation = generation;
         let Some(target) = target else {
-            scanner = None;
+            scanners = Scanners::default();
             continue;
         };
-        if scanner
-            .as_ref()
-            .is_none_or(|s| s.session() != target.session)
-        {
-            scanner = Some(AgentsScanner::new(target.session.clone()));
-        }
-        let Some(scanner) = scanner.as_mut() else {
-            continue;
-        };
-        let snapshot = scanner.scan(target.owner_alive);
+        let snapshot = scanners.follow(&target.session).scan(target.owner_alive);
         let busy = snapshot
             .agents
             .iter()
@@ -152,7 +182,10 @@ fn run(shared: &Shared, on_update: &dyn Fn()) {
                 false
             } else {
                 let mut latest = lock(&shared.latest);
-                if latest.as_deref() == Some(&snapshot) {
+                if latest
+                    .as_ref()
+                    .is_some_and(|old| Arc::ptr_eq(&old.agents, &snapshot.agents))
+                {
                     false
                 } else {
                     *latest = Some(Arc::new(snapshot));
@@ -163,5 +196,35 @@ fn run(shared: &Shared, on_update: &dyn Fn()) {
         if changed {
             on_update();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+
+    #[test]
+    fn oversized_partial_transcript_is_not_kept_after_switching_tabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("one.jsonl");
+        fs::create_dir(session.with_extension("")).unwrap();
+        let mut file = fs::File::create(session.with_extension("").join("worker.jsonl")).unwrap();
+        file.write_all(b"{\"type\":\"session_init\",\"task\":\"example\"}\n")
+            .unwrap();
+        // Simulate a large tool result whose terminating newline hasn't arrived.
+        file.set_len((WARM_BYTES + 1024) as u64).unwrap();
+        drop(file);
+        let mut scanners = Scanners::default();
+        let current = scanners.follow(&session).scan(true);
+        let old_row = Arc::downgrade(&current.agents[0]);
+        drop(current);
+        scanners.follow(&dir.path().join("two.jsonl"));
+        assert!(
+            old_row.upgrade().is_none(),
+            "inactive scanner exceeded the warm budget"
+        );
+        assert_eq!(scanners.follow(&session).scan(true).agents[0].id, "worker");
     }
 }

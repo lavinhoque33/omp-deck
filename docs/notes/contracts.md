@@ -1836,7 +1836,9 @@ Recon facts with file:line evidence: `docs/notes/wave15.md`.
   - `FleetSnapshot { sessions: Vec<FleetSession> }` in target order; `FleetSession { session: PathBuf, model:
     Option<String>, thinking: Option<String>, context_tokens: Option<u64>, input_tokens: u64, output_tokens: u64,
     cost: f64, last_reply: Option<String> /* ≤ 400 chars, whitespace collapsed */, last_turn_failed: bool,
-    agents: Vec<AgentSummary>, git: Option<GitInfo> }` (reuse the existing types; field names may follow them).
+    agents: Arc<Vec<AgentSummary>>, git: Option<GitInfo> }`. The active tab's `AgentsSnapshot` uses the same roster
+    type. `AgentSummary = Arc<AgentRow>`; immutable rows and assignment text are shared across revisions. The wire
+    format stays an array of row objects. An unchanged scan returns the same roster allocation.
 - No writes anywhere; real sessions root read-only as always.
 
 ### deck-term

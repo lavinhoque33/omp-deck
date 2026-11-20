@@ -2,7 +2,7 @@
 //! the byte-level helpers used to prefilter lines before any JSON parsing.
 
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use memchr::{memchr, memchr_iter, memmem};
@@ -13,6 +13,15 @@ use crate::platform::{self, FileId};
 const MAX_READ: u64 = 8 * 1024 * 1024;
 /// A single line longer than this (no newline inside) is dropped instead of buffered.
 const MAX_LINE: usize = 48 * 1024 * 1024;
+
+/// Retained allocation estimate, allowing for allocator metadata and rounding.
+pub(super) fn allocation_weight(bytes: usize) -> usize {
+    if bytes == 0 {
+        0
+    } else {
+        bytes.saturating_add(64)
+    }
+}
 
 /// What one [`LineTail::poll`] produced.
 pub(crate) struct Chunk {
@@ -34,6 +43,8 @@ pub(crate) struct LineTail {
     pending: Vec<u8>,
     /// Inside an over-long line: drop bytes up to the next newline.
     skipping: bool,
+    /// A replacement was observed but has not been reported to the consumer yet.
+    reset_pending: bool,
 }
 
 impl LineTail {
@@ -44,7 +55,16 @@ impl LineTail {
             offset: 0,
             pending: Vec::new(),
             skipping: false,
+            reset_pending: false,
         }
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn heap_weight(&self) -> usize {
+        allocation_weight(self.path.capacity()) + allocation_weight(self.pending.capacity())
     }
 
     /// Positions a fresh tail at `max(0, len − window)`, skipping the first partial line so
@@ -96,17 +116,18 @@ impl LineTail {
         let md = file.metadata()?;
         let id = platform::file_identity(&file)?;
         let len = md.len();
-        let mut reset = false;
         if self.id != Some(id) || len < self.offset {
-            reset = self.id.is_some() || self.offset > 0;
+            // Latch the reset until a successful poll, including if a truncated file
+            // grows past the old offset before a failed read can be retried.
+            self.reset_pending |= self.id.is_some() || self.offset > 0;
             self.id = Some(id);
             self.offset = 0;
-            self.pending.clear();
+            self.pending = Vec::new();
             self.skipping = false;
         }
         if len <= self.offset {
             return Ok(Chunk {
-                reset,
+                reset: std::mem::take(&mut self.reset_pending),
                 data: Vec::new(),
                 more: false,
             });
@@ -115,6 +136,7 @@ impl LineTail {
         file.seek(SeekFrom::Start(self.offset))?;
         let mut fresh = Vec::new();
         file.take(want).read_to_end(&mut fresh)?;
+        let reset = std::mem::take(&mut self.reset_pending);
         self.offset += fresh.len() as u64;
         let more = self.offset < len;
         if self.skipping {
@@ -146,7 +168,7 @@ impl LineTail {
                 self.path.display(),
                 self.pending.len()
             );
-            self.pending.clear();
+            self.pending = Vec::new();
             self.skipping = true;
         }
         Ok(Chunk { reset, data, more })

@@ -187,6 +187,16 @@ Caveats:
 
 ## 4. Live-update rules
 
+OmpDeck's active-tab and fleet scanners check each transcript and its sidecars, but reuse rows whose
+visible fields did not change. Owner exit and the five-second output grace period still affect status
+without an append. Assignment text is shared between the reader and its row; an update to one agent
+does not copy the other agents' assignments.
+
+The active-tab watcher keeps up to three inactive scanners under one estimated 8 MiB heap budget
+(least recently used first to evict). They do not poll or hold files open. Returning to a warm tab checks
+file identities, tails and sidecars before publishing. Oversized or evicted sessions start cold; clearing
+the active target drops the cache. This changes OmpDeck's footprint, not the lifetime of omp's agents.
+
 - **Append-only with `O_APPEND`.** `FileSessionStorageWriter` (`session-storage.ts:207+`) keeps an fd and writes each entry synchronously. Sandbox entries appeared at their own timestamps (`tool_execution_start` before the tool ran).
 - **Whole entries only.** Assistant messages are written at message end, with no streaming deltas. Expect gaps during long generations.
 - **Title slot.** Line 1 is a fixed 256-byte `title` record (`SESSION_TITLE_SLOT_BYTES = 256`, session-title-slot.ts) overwritten in place when the title changes. Skip it when tailing; it never changes the file's length.

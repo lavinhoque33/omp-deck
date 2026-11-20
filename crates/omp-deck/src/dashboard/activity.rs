@@ -751,7 +751,7 @@ mod tests {
     }
 
     fn agent(id: &str, parent: Option<&str>) -> AgentSummary {
-        AgentSummary {
+        std::sync::Arc::new(deck_core::agents::AgentRow {
             id: id.to_owned(),
             parent_id: parent.map(str::to_owned),
             depth: 0,
@@ -762,7 +762,7 @@ mod tests {
             model_role: None,
             thinking: None,
             task_gist: String::new(),
-            task: String::new(),
+            task: std::sync::Arc::from(""),
             status: deck_core::agents::AgentStatus::Done,
             error: None,
             current: None,
@@ -775,7 +775,7 @@ mod tests {
             cost: 0.0,
             context_tokens: None,
             output_path: None,
-        }
+        })
     }
 
     fn rows() -> Vec<ActivityRow> {

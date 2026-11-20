@@ -421,7 +421,7 @@ pub fn aggregate(agents: &[AgentSummary], now: SystemTime) -> Vec<Metric> {
 
 /// The file-inferred snapshot with the live registry laid over it: omp knows what is running,
 /// idle between turns, parked or killed, and what tool a running agent is in. Unchanged → the
-/// same `Arc` (no copy).
+/// same `Arc` (no copy); changed → a new list sharing every untouched row with `base`.
 pub fn overlay(base: &Arc<AgentsSnapshot>, live: &LiveSnapshot) -> Arc<AgentsSnapshot> {
     let by_id: HashMap<&str, &LiveAgent> = live.agents.iter().map(|l| (l.id.as_str(), l)).collect();
     let mut edits: Vec<(usize, AgentStatus, Option<String>)> = Vec::new();
@@ -462,12 +462,16 @@ pub fn overlay(base: &Arc<AgentsSnapshot>, live: &LiveSnapshot) -> Arc<AgentsSna
     if edits.is_empty() {
         return Arc::clone(base);
     }
-    let mut snap = (**base).clone();
+    let mut agents = Vec::clone(&base.agents);
     for (i, status, current) in edits {
-        snap.agents[i].status = status;
-        snap.agents[i].current = current;
+        let row = Arc::make_mut(&mut agents[i]);
+        row.status = status;
+        row.current = current;
     }
-    Arc::new(snap)
+    Arc::new(AgentsSnapshot {
+        session: base.session.clone(),
+        agents: Arc::new(agents),
+    })
 }
 
 /// Roster + header totals for the current snapshot.
@@ -577,7 +581,7 @@ impl AgentsView {
         }
         if let Some(s) = &self.snap {
             let ages = rebuilt || self.age_bucket != Some(age_bucket);
-            for (card, a) in self.cards.iter_mut().zip(&s.agents) {
+            for (card, a) in self.cards.iter_mut().zip(s.agents.iter()) {
                 if ages {
                     card.age = agent_age(a, now);
                 }
@@ -685,10 +689,11 @@ impl AgentsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deck_core::agents::AgentRow;
     use std::path::PathBuf;
 
     fn agent(id: &str, parent: Option<&str>, status: AgentStatus, secs: u64) -> AgentSummary {
-        AgentSummary {
+        Arc::new(AgentRow {
             id: id.to_owned(),
             parent_id: parent.map(str::to_owned),
             depth: 0,
@@ -699,7 +704,7 @@ mod tests {
             model_role: None,
             thinking: None,
             task_gist: format!("do {id}"),
-            task: String::new(),
+            task: Arc::from(""),
             status,
             error: None,
             current: None,
@@ -712,7 +717,7 @@ mod tests {
             cost: 0.0091,
             context_tokens: None,
             output_path: None,
-        }
+        })
     }
 
     fn fixture() -> (Vec<AgentSummary>, Vec<String>) {
@@ -789,7 +794,7 @@ mod tests {
     fn without_a_running_agent_tree_order_is_the_snapshot_order() {
         let mut a = mixed();
         for x in &mut a {
-            x.status = AgentStatus::Done;
+            Arc::make_mut(x).status = AgentStatus::Done;
         }
         let v = visible(&a, |_| None, true, &HashSet::new());
         assert_eq!(v, (0..a.len()).collect::<Vec<_>>());
@@ -823,13 +828,15 @@ mod tests {
     #[test]
     fn a_status_change_rebuilds_the_view_so_the_order_is_recomputed() {
         let base = Arc::new(AgentsSnapshot {
-            agents: mixed()
-                .into_iter()
-                .map(|mut x| {
-                    x.status = AgentStatus::Done;
-                    x
-                })
-                .collect(),
+            agents: Arc::new(
+                mixed()
+                    .into_iter()
+                    .map(|mut x| {
+                        Arc::make_mut(&mut x).status = AgentStatus::Done;
+                        x
+                    })
+                    .collect(),
+            ),
             ..AgentsSnapshot::default()
         });
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
@@ -865,6 +872,7 @@ mod tests {
         );
         // Equal status and activity: by id.
         for x in &mut a {
+            let x = Arc::make_mut(x);
             x.status = AgentStatus::Done;
             x.last_activity = None;
             x.created = None;
@@ -891,27 +899,29 @@ mod tests {
     #[test]
     fn the_context_bar_needs_tokens_and_the_models_window() {
         let mut a = agent("X", None, AgentStatus::Done, 1);
-        a.model = Some("anthropic/claude-x:high".to_owned());
-        a.context_tokens = Some(50_000);
+        let row = Arc::make_mut(&mut a);
+        row.model = Some("anthropic/claude-x:high".to_owned());
+        row.context_tokens = Some(50_000);
         let windows: HashMap<String, u64> = [("anthropic/claude-x".to_owned(), 200_000)].into();
         let c = ctx_use(&a, &windows).expect("window known");
         assert_eq!(c.tip, "Context 50K / 200K");
         assert!((c.frac - 0.25).abs() < 1e-6);
         // The window unknown, the tokens unknown, or over the window (clamped).
         assert_eq!(ctx_use(&a, &HashMap::new()), None);
-        a.context_tokens = None;
+        Arc::make_mut(&mut a).context_tokens = None;
         assert_eq!(ctx_use(&a, &windows), None);
-        a.context_tokens = Some(900_000);
+        Arc::make_mut(&mut a).context_tokens = Some(900_000);
         assert_eq!(ctx_use(&a, &windows).map(|c| c.frac), Some(1.0));
     }
 
     #[test]
     fn a_new_catalogue_rebuilds_the_cards_once() {
         let mut a = agent("X", None, AgentStatus::Done, 1);
-        a.model = Some("anthropic/claude-x".to_owned());
-        a.context_tokens = Some(1000);
+        let row = Arc::make_mut(&mut a);
+        row.model = Some("anthropic/claude-x".to_owned());
+        row.context_tokens = Some(1000);
         let snap = Arc::new(AgentsSnapshot {
-            agents: vec![a],
+            agents: Arc::new(vec![a]),
             ..AgentsSnapshot::default()
         });
         let mut v = AgentsView::default();
@@ -932,8 +942,11 @@ mod tests {
     fn the_aggregate_sums_cost_time_requests_and_tokens() {
         let mut a = agent("A", None, AgentStatus::Done, 1);
         let mut b = agent("B", None, AgentStatus::Done, 2);
-        (a.cost, a.requests, a.tokens, a.duration) = (0.5, 3, 1000, Some(Duration::from_secs(30)));
-        (b.cost, b.requests, b.tokens, b.duration) = (0.25, 4, 500, Some(Duration::from_secs(45)));
+        let (a_row, b_row) = (Arc::make_mut(&mut a), Arc::make_mut(&mut b));
+        (a_row.cost, a_row.requests, a_row.tokens, a_row.duration) =
+            (0.5, 3, 1000, Some(Duration::from_secs(30)));
+        (b_row.cost, b_row.requests, b_row.tokens, b_row.duration) =
+            (0.25, 4, 500, Some(Duration::from_secs(45)));
         let text: Vec<String> = aggregate(&[a, b], SystemTime::UNIX_EPOCH)
             .into_iter()
             .map(|m| m.text)
@@ -961,7 +974,7 @@ mod tests {
         assert_eq!(c.total(), 5);
         let snap = Arc::new(AgentsSnapshot {
             session: PathBuf::from("/x.jsonl"),
-            agents: a,
+            agents: Arc::new(a),
         });
         let mut v = AgentsView::default();
         assert!(v.update(Some(&snap), None, SystemTime::UNIX_EPOCH));
@@ -1012,11 +1025,11 @@ mod tests {
     #[test]
     fn running_agents_show_elapsed_time_others_their_recorded_duration() {
         let mut a = agent("X", None, AgentStatus::Running, 100);
-        a.duration = Some(Duration::from_secs(1));
+        Arc::make_mut(&mut a).duration = Some(Duration::from_secs(1));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(165);
         assert_eq!(live_duration(&a, now), Some(Duration::from_secs(65)));
         assert!(metrics(&a, now).iter().any(|m| m.text == "1m 05s"));
-        a.status = AgentStatus::Done;
+        Arc::make_mut(&mut a).status = AgentStatus::Done;
         assert_eq!(live_duration(&a, now), Some(Duration::from_secs(1)));
     }
 
@@ -1024,7 +1037,7 @@ mod tests {
     fn view_refreshes_running_metrics_every_second_and_idle_views_do_not() {
         let mk = |status| {
             Arc::new(AgentsSnapshot {
-                agents: vec![agent("X", None, status, 100)],
+                agents: Arc::new(vec![agent("X", None, status, 100)]),
                 ..AgentsSnapshot::default()
             })
         };
@@ -1049,9 +1062,9 @@ mod tests {
     #[test]
     fn search_text_has_model_and_full_task_text() {
         let mut a = agent("X", None, AgentStatus::Done, 1);
-        a.task = "Refactor the Frobnicator module".to_owned();
+        Arc::make_mut(&mut a).task = Arc::from("Refactor the Frobnicator module");
         let snap = Arc::new(AgentsSnapshot {
-            agents: vec![a],
+            agents: Arc::new(vec![a]),
             ..AgentsSnapshot::default()
         });
         let mut v = AgentsView::default();
@@ -1088,7 +1101,7 @@ mod tests {
     fn live_state_overrides_file_inference_for_matching_ids_only() {
         let (agents, _) = fixture();
         let base = Arc::new(AgentsSnapshot {
-            agents,
+            agents: Arc::new(agents),
             ..AgentsSnapshot::default()
         });
         let live = live_of(vec![
@@ -1110,12 +1123,17 @@ mod tests {
         // Not in the live list: untouched.
         assert_eq!(by("Beta.Leaf").expect("Leaf").status, AgentStatus::Failed);
         assert_eq!(shown.agents.len(), base.agents.len());
+        // Rows the overlay did not change are the base's own (no copy).
+        for (b, s) in base.agents.iter().zip(shown.agents.iter()) {
+            let edited = b.id == "Beta" || b.id == "Alpha";
+            assert_eq!(Arc::ptr_eq(b, s), !edited, "{}", b.id);
+        }
     }
 
     #[test]
     fn file_running_agent_that_omp_reports_idle_is_not_running() {
         let base = Arc::new(AgentsSnapshot {
-            agents: vec![agent("A", None, AgentStatus::Running, 1)],
+            agents: Arc::new(vec![agent("A", None, AgentStatus::Running, 1)]),
             ..AgentsSnapshot::default()
         });
         let shown = overlay(
@@ -1128,7 +1146,7 @@ mod tests {
     #[test]
     fn revived_agent_that_is_idle_is_no_longer_shown_aborted() {
         let base = Arc::new(AgentsSnapshot {
-            agents: vec![agent("A", None, AgentStatus::Aborted, 1)],
+            agents: Arc::new(vec![agent("A", None, AgentStatus::Aborted, 1)]),
             ..AgentsSnapshot::default()
         });
         let idle = overlay(
@@ -1146,7 +1164,7 @@ mod tests {
     #[test]
     fn overlay_without_changes_shares_the_snapshot() {
         let base = Arc::new(AgentsSnapshot {
-            agents: vec![agent("A", None, AgentStatus::Done, 1)],
+            agents: Arc::new(vec![agent("A", None, AgentStatus::Done, 1)]),
             ..AgentsSnapshot::default()
         });
         let live = live_of(vec![live_agent("A", LiveStatus::Idle, None)]);
@@ -1156,10 +1174,10 @@ mod tests {
     #[test]
     fn view_marks_live_agents_and_counts_the_overlaid_status() {
         let base = Arc::new(AgentsSnapshot {
-            agents: vec![
+            agents: Arc::new(vec![
                 agent("A", None, AgentStatus::Done, 1),
                 agent("B", None, AgentStatus::Done, 2),
-            ],
+            ]),
             ..AgentsSnapshot::default()
         });
         let mut v = AgentsView::default();
@@ -1186,7 +1204,7 @@ mod tests {
     #[test]
     fn identical_live_content_does_not_rebuild() {
         let base = Arc::new(AgentsSnapshot {
-            agents: vec![agent("A", None, AgentStatus::Done, 1)],
+            agents: Arc::new(vec![agent("A", None, AgentStatus::Done, 1)]),
             ..AgentsSnapshot::default()
         });
         let mut v = AgentsView::default();
