@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use deck_core::omp::{
     AdvisorDoc, AdvisorEntry, AdvisorScope, ForeignSource, Omp, PluginScope, SessError,
 };
+use deck_core::usage::{AccountPolicy, OAuthIdentity};
 use serde_json::{Value, json};
 
 struct Sandbox {
@@ -471,4 +472,175 @@ fn usage_resets_of_a_store_without_accounts_is_empty_and_spending_is_refused() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("No stored account"), "{err}");
+}
+
+const ACCOUNT_GLOBAL: &str = include_str!("fixtures/omp/accounts-global.yml");
+const ACCOUNT_PROJECT: &str = include_str!("fixtures/omp/accounts-project.yml");
+const CODEX: &str = "openai-codex";
+
+fn account(id: &str) -> OAuthIdentity {
+    OAuthIdentity::new(None, Some(id), None, None).unwrap()
+}
+
+fn effective_policies(sb: &Sandbox, cwd: &Path) -> Value {
+    let out = std::process::Command::new(&sb.exe)
+        .args(["config", "get", "auth.accountPolicies", "--json"])
+        .current_dir(cwd)
+        .env("HOME", sb.home())
+        .env("USERPROFILE", sb.home())
+        .env("PI_CODING_AGENT_DIR", sb.agent())
+        .env_remove("PI_CONFIG_FILES")
+        .env("XDG_CONFIG_HOME", sb.home().join(".config"))
+        .env("XDG_DATA_HOME", sb.home().join(".local/share"))
+        .env("XDG_CACHE_HOME", sb.home().join(".cache"))
+        .env("XDG_STATE_HOME", sb.home().join(".local/state"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice::<Value>(&out.stdout).unwrap()["value"].take()
+}
+
+#[test]
+fn prefer_account_preserves_order_fields_and_native_scope() {
+    let Some(sb) = Sandbox::new() else { return };
+    let global_file = sb.agent().join("config.yml");
+    let project = sb.proj();
+    let project_file = project.join(".omp/config.yml");
+    let sibling = sb.home().join("sibling");
+    std::fs::write(&global_file, ACCOUNT_GLOBAL).unwrap();
+    std::fs::create_dir_all(project.join(".omp")).unwrap();
+    std::fs::write(&project_file, ACCOUNT_PROJECT).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+
+    let global_before = effective_policies(&sb, &sibling);
+    assert_eq!(effective_policies(&sb, &project), global_before);
+    let full_identity = OAuthIdentity::new(
+        Some("second@example.invalid"),
+        Some("second"),
+        None,
+        Some("team-b"),
+    )
+    .unwrap();
+    let project_policies = sb
+        .omp
+        .prefer_account(CODEX, &full_identity, Some(&project))
+        .unwrap();
+    let mut promoted = global_before[2].clone();
+    promoted["priority"] = json!(20);
+    assert_eq!(
+        project_policies,
+        json!([
+            promoted,
+            global_before[0],
+            global_before[1],
+            global_before[3]
+        ])
+    );
+    assert_eq!(effective_policies(&sb, &project), project_policies);
+    assert_eq!(
+        std::fs::read_to_string(&global_file).unwrap(),
+        ACCOUNT_GLOBAL
+    );
+    let raw_project = std::fs::read_to_string(&project_file).unwrap();
+    assert!(raw_project.contains("usageReservePct: 12"), "{raw_project}");
+    assert!(
+        raw_project.contains("unpausedProviders: []"),
+        "{raw_project}"
+    );
+    assert!(raw_project.contains("customExtension:"), "{raw_project}");
+
+    let saved_global = sb.omp.prefer_account(CODEX, &account("new"), None).unwrap();
+    assert_eq!(
+        saved_global[0],
+        json!({"provider": CODEX, "account": {"accountId": "new"}, "priority": 20})
+    );
+    assert_eq!(
+        &saved_global.as_array().unwrap()[1..],
+        global_before.as_array().unwrap().as_slice()
+    );
+    assert_eq!(effective_policies(&sb, &sibling), saved_global);
+    assert_eq!(effective_policies(&sb, &project), project_policies);
+    assert_eq!(std::fs::read_to_string(&project_file).unwrap(), raw_project);
+
+    // A project with existing policies keeps editing its snapshot, not the new global array.
+    let promoted_again = sb
+        .omp
+        .prefer_account(CODEX, &account("first"), Some(&project))
+        .unwrap();
+    let mut first = global_before[0].clone();
+    first["priority"] = json!(21);
+    assert_eq!(
+        promoted_again,
+        json!([
+            first,
+            project_policies[0],
+            project_policies[2],
+            project_policies[3]
+        ])
+    );
+    assert_eq!(effective_policies(&sb, &project), promoted_again);
+    assert_eq!(effective_policies(&sb, &sibling), saved_global);
+
+    // First preference in a project with no .omp yet uses the new global snapshot.
+    assert!(!sibling.join(".omp").exists());
+    let sibling_policies = sb
+        .omp
+        .prefer_account("anthropic", &account("other"), Some(&sibling))
+        .unwrap();
+    assert_eq!(sibling_policies.as_array().unwrap().len(), 6);
+    assert_eq!(sibling_policies[2]["account"]["accountId"], "other");
+    assert_eq!(effective_policies(&sb, &sibling), sibling_policies);
+    assert_eq!(effective_policies(&sb, &project), promoted_again);
+}
+
+#[test]
+fn prefer_account_and_order_editor_both_update_only_the_global_layer() {
+    let Some(sb) = Sandbox::new() else { return };
+    std::fs::write(sb.agent().join("config.yml"), ACCOUNT_GLOBAL).unwrap();
+    let overlay = sb.home().join("overlay.yml");
+    let overlay_text =
+        "auth:\n  accountPolicies: [{provider: overlay-only, account: {accountId: x}}]\n";
+    std::fs::write(&overlay, overlay_text).unwrap();
+    let omp = sb.omp.clone().with_env("PI_CONFIG_FILES", &overlay);
+    let other = AccountPolicy {
+        provider: "anthropic".into(),
+        account: account("advanced-edit"),
+        priority: Some(51),
+        reserve_pct: None,
+        reclaim_above_pct: None,
+    };
+    std::thread::scope(|s| {
+        let prefer = s.spawn(|| omp.prefer_account(CODEX, &account("click-preferred"), None));
+        let edit = omp.set_account_policies("anthropic", std::slice::from_ref(&other));
+        prefer.join().unwrap().unwrap();
+        edit.unwrap();
+    });
+
+    let actual = effective_policies(&sb, &sb.proj());
+    assert_eq!(actual[0]["account"]["accountId"], "click-preferred");
+    assert_eq!(actual[0]["priority"], 20);
+    assert_eq!(actual[2]["reservePct"], 15);
+    assert_eq!(actual[2]["reclaimAbovePct"], 55);
+    assert_eq!(actual[4], serde_json::to_value(other).unwrap());
+    assert_eq!(actual.as_array().unwrap().len(), 5);
+    assert_eq!(std::fs::read_to_string(overlay).unwrap(), overlay_text);
+}
+
+#[test]
+fn prefer_account_refuses_invalid_project_yaml_without_touching_it() {
+    let Some(sb) = Sandbox::new() else { return };
+    let dir = sb.proj().join(".omp");
+    let file = dir.join("config.yml");
+    std::fs::create_dir(&dir).unwrap();
+    let broken = "auth: [missing end";
+    std::fs::write(&file, broken).unwrap();
+    let result = sb
+        .omp
+        .prefer_account(CODEX, &account("first"), Some(&sb.proj()));
+    assert!(result.unwrap_err().to_string().contains("invalid YAML"));
+    assert_eq!(std::fs::read_to_string(file).unwrap(), broken);
 }

@@ -1,0 +1,6 @@
+retry:
+  usageReservePct: 12
+auth:
+  unpausedProviders: []
+customExtension:
+  enabled: true

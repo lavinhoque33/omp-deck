@@ -8,10 +8,12 @@
 mod stored;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use deck_core::ctl::LiveAccount;
-use deck_core::usage::{AccountPolicy, Heatmap, LimitStatus, PolicyState};
+use deck_core::sessions::abbreviate_home;
+use deck_core::usage::{AccountPolicy, Heatmap, LimitStatus, OAuthIdentity, PolicyState};
 use deck_service::gateway::protocol::OmpAccountsView;
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{
@@ -21,14 +23,15 @@ use egui::{
 
 use crate::icons::{
     ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT,
-    ICON_CIRCLE_ALERT, ICON_GAUGE, ICON_KEY_ROUND, ICON_LIST_TREE, ICON_LOCK, ICON_REFRESH_CW,
-    ICON_SPARKLES, ICON_TERMINAL, ICON_X, Icon,
+    ICON_CIRCLE_ALERT, ICON_FOLDER, ICON_GAUGE, ICON_KEY_ROUND, ICON_LIST_TREE, ICON_LOCK,
+    ICON_REFRESH_CW, ICON_SPARKLES, ICON_TERMINAL, ICON_X, Icon,
 };
 use crate::theme::{self, Palette};
 use crate::usage_fmt::{long_date, money, requests};
 use crate::usage_state::{
-    AccountGroup, AccountRow, ActivityView, CARD_ROWS, CardView, DetailBlock, DraftRow, KeyGroup,
-    Load, ModelRow, NoDataWarning, QuotaRow, Summary, Tile, account_policies, merged_draft,
+    AccountGroup, AccountRow, ActivityView, CARD_ROWS, CardPage, CardView, DetailBlock, DraftRow,
+    KeyGroup, Load, ModelRow, NoDataWarning, QuotaRow, Serving, Summary, Tile, account_policies,
+    identity_label, merged_draft,
 };
 use crate::widgets::{DraftButton, DraftKind, Spin, empty_state, icon_text, paint_icon, stepper};
 
@@ -91,6 +94,8 @@ pub struct ViewInput<'a> {
     pub global_reserve: u32,
     /// omp's providers and stored accounts (`None` until the gateway sends them).
     pub accounts: Option<&'a OmpAccountsView>,
+    /// The focused session tab's project (its working directory): where "Prefer here" applies.
+    pub project: Option<&'a Path>,
     /// The view owns the keyboard (false while a dialog over it has it).
     pub keys: bool,
 }
@@ -123,6 +128,15 @@ pub enum UsageAction {
     },
     /// Open the login wizard, preselecting a login or store id.
     Login(Option<String>),
+    /// Put `account` (named `label`) first among `provider`'s accounts (`name`) in omp's account
+    /// order: globally, or for `project` only.
+    Prefer {
+        provider: String,
+        name: String,
+        account: OAuthIdentity,
+        label: String,
+        project: Option<PathBuf>,
+    },
     /// Log out the stored credential `credential_id` (omp's login id `provider`; the app asks
     /// first, naming `label` of `name`).
     Logout {
@@ -538,12 +552,12 @@ fn quotas(ui: &mut Ui, input: &ViewInput<'_>, out: &mut Vec<UsageAction>) {
             for c in active {
                 let col = usize::from(heights[1] < heights[0]);
                 heights[col] += c.weight;
-                provider_card(&mut cols[col], c, false, None);
+                provider_card(&mut cols[col], c, input.session);
             }
         });
     } else {
         for c in active {
-            provider_card(ui, c, false, None);
+            provider_card(ui, c, input.session);
         }
     }
     if !summary.untouched.is_empty() {
@@ -627,34 +641,25 @@ fn unavailable_row(ui: &mut Ui, text: &str) {
 }
 
 /// One provider: status dot + name, then up to four window rows and the extras. A provider with
-/// several accounts shows one account at a time: the full card pages through them, the compact
-/// one shows [`shown_page`] for `account`.
-pub fn provider_card(ui: &mut Ui, c: &CardView, compact: bool, account: Option<&LiveAccount>) {
+/// several accounts shows one account at a time, paging through them; the page of the account
+/// the focused tab's session is confirmed on says so.
+fn provider_card(ui: &mut Ui, c: &CardView, account: Option<&LiveAccount>) {
     let pal = Palette::of_ui(ui);
-    let frame = if compact {
-        Frame::NONE
-    } else {
-        card_frame(pal)
-    };
-    let (index, in_use) = shown_page(ui.ctx(), c, account);
+    let picked = ui
+        .ctx()
+        .data(|d| d.get_temp::<String>(picked_page(&c.provider)));
+    let index = c.page_index(picked.as_deref());
     let Some(page) = c.pages.get(index) else {
         return;
     };
     let paged = c.pages.len() > 1;
     let mut turn_to: Option<usize> = None;
-    frame.show(ui, |ui| {
+    card_frame(pal).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.spacing_mut().item_spacing.y = if compact { 3.0 } else { 5.0 };
+        ui.spacing_mut().item_spacing.y = 5.0;
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 7.0;
-            let (rect, _) = ui.allocate_exact_size(vec2(10.0, 16.0), Sense::hover());
-            ui.painter()
-                .circle_filled(rect.center(), 4.0, status_color(pal, page.status));
-            ui.label(theme::strong(&c.name).size(14.5).color(pal.text_strong));
-            if let Some(a) = &c.accounts {
-                ui.label(RichText::new(a).small().color(pal.weak));
-            }
-            if paged && !compact {
+            card_title(ui, c, page.status);
+            if paged {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     let last = c.pages.len() - 1;
@@ -672,52 +677,20 @@ pub fn provider_card(ui: &mut Ui, c: &CardView, compact: bool, account: Option<&
                 });
             }
         });
-        if paged {
-            let who = match (compact, in_use) {
-                (_, true) if account.is_some_and(|a| a.pinned) => {
-                    format!("{} · pinned", page.account)
-                }
-                (_, true) => format!("{} · in use", page.account),
-                (true, false) => format!("{} · {} / {}", page.account, index + 1, c.pages.len()),
-                (false, false) => page.account.clone(),
-            };
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(icon_text(ICON_KEY_ROUND, 12.0, pal.weak));
-                ui.add(egui::Label::new(RichText::new(who).small().color(pal.text)).truncate());
-            });
+        if c.in_use(account) == Some(index) {
+            in_use_line(ui, page, account);
+        } else if !page.account.is_empty() {
+            account_line(ui, &page.account);
         }
-        if page.unlimited {
-            ui.label(RichText::new("Unlimited").small().color(pal.weak));
-        }
-        for w in page.rows.iter().take(CARD_ROWS) {
-            window_row(ui, w, compact);
-        }
-        let more = if compact {
-            &page.more_compact
-        } else {
-            &page.more_full
-        };
-        if let Some(text) = more {
-            ui.label(RichText::new(text).small().color(pal.weak));
-        }
-        if let Some(r) = &page.reset_credits {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(icon_text(ICON_SPARKLES, 13.0, pal.accent));
-                ui.add(egui::Label::new(RichText::new(r).small().color(pal.text)).truncate());
-            });
-        }
+        page_body(ui, page, false);
         for a in &c.unavailable {
             unavailable_row(ui, a);
         }
-        if !compact {
-            for a in &page.daybreak {
-                ui.label(RichText::new(a).small().color(pal.weak));
-            }
-            for n in &page.notes {
-                ui.add(egui::Label::new(RichText::new(n).small().color(pal.weak)).truncate());
-            }
+        for a in &page.daybreak {
+            ui.label(RichText::new(a).small().color(pal.weak));
+        }
+        for n in &page.notes {
+            ui.add(egui::Label::new(RichText::new(n).small().color(pal.weak)).truncate());
         }
     });
     if let Some(p) = turn_to.and_then(|i| c.pages.get(i)) {
@@ -727,24 +700,116 @@ pub fn provider_card(ui: &mut Ui, c: &CardView, compact: bool, account: Option<&
     }
 }
 
-/// Memory key of the account last picked in a card's pager (its label, so a reorder keeps it).
-fn picked_page(provider: &str) -> Id {
-    Id::unique(("usage-account", provider))
+/// The status-bar hover's card of one provider: the page of the account the focused tab's
+/// session uses ([`CardView::serving`]); when that is not known, every account's page, none
+/// presented as the tab's, and why.
+fn compact_card(ui: &mut Ui, c: &CardView, account: Option<&LiveAccount>) {
+    let pal = Palette::of_ui(ui);
+    let serving = c.serving(account);
+    let shown: Vec<&CardPage> = match serving.page() {
+        Some(i) => c.pages.get(i).into_iter().collect(),
+        None => c.pages.iter().collect(),
+    };
+    let Some(first) = shown.first() else {
+        return;
+    };
+    let status = match serving.page() {
+        Some(_) => first.status,
+        None => LimitStatus::Unknown,
+    };
+    ui.vertical(|ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 3.0;
+        ui.horizontal(|ui| card_title(ui, c, status));
+        if matches!(serving, Serving::InUse(_)) {
+            in_use_line(ui, first, account);
+        }
+        if let Some(note) = serving.note(c) {
+            ui.add(egui::Label::new(RichText::new(note).small().color(pal.weak)).wrap());
+        }
+        for page in shown {
+            if serving.page().is_none() && !page.account.is_empty() {
+                account_line(ui, &page.account);
+            }
+            page_body(ui, page, true);
+        }
+        for a in &c.unavailable {
+            unavailable_row(ui, a);
+        }
+    });
 }
 
-/// The page a card shows in the status bar: that of `account` (the OAuth account the focused omp
-/// session uses) when one matches, else the one last picked in the pager, else the first; and
-/// whether it is the session's.
-pub fn shown_page(
-    ctx: &egui::Context,
-    c: &CardView,
-    account: Option<&LiveAccount>,
-) -> (usize, bool) {
-    if let Some(i) = c.in_use(account) {
-        return (i, true);
+/// Status dot, provider name and `2 accounts` (inside a horizontal layout).
+fn card_title(ui: &mut Ui, c: &CardView, status: LimitStatus) {
+    let pal = Palette::of_ui(ui);
+    ui.spacing_mut().item_spacing.x = 7.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(10.0, 16.0), Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), 4.0, status_color(pal, status));
+    ui.label(theme::strong(&c.name).size(14.5).color(pal.text_strong));
+    if let Some(a) = &c.accounts {
+        ui.label(RichText::new(a).small().color(pal.weak));
     }
-    let picked = ctx.data(|d| d.get_temp::<String>(picked_page(&c.provider)));
-    (c.page_index(picked.as_deref()), false)
+}
+
+/// `🔑 me@example.test · in use` (or `· pinned`) on the page of the account the session is
+/// confirmed on; an unnamed page is named by the session's identity.
+fn in_use_line(ui: &mut Ui, page: &CardPage, account: Option<&LiveAccount>) {
+    let who = if page.account.is_empty() {
+        account
+            .and_then(|a| a.identity.as_ref())
+            .map_or("", identity_label)
+    } else {
+        &page.account
+    };
+    let how = if account.is_some_and(|a| a.pinned) {
+        "pinned"
+    } else {
+        "in use"
+    };
+    account_line(ui, &format!("{who} · {how}"));
+}
+
+/// `🔑 me@example.test · in use`.
+fn account_line(ui: &mut Ui, who: &str) {
+    let pal = Palette::of_ui(ui);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(icon_text(ICON_KEY_ROUND, 12.0, pal.weak));
+        ui.add(egui::Label::new(RichText::new(who).small().color(pal.text)).truncate());
+    });
+}
+
+/// One account's windows, the overflow count and its banked resets.
+fn page_body(ui: &mut Ui, page: &CardPage, compact: bool) {
+    let pal = Palette::of_ui(ui);
+    if page.unlimited {
+        ui.label(RichText::new("Unlimited").small().color(pal.weak));
+    }
+    for w in page.rows.iter().take(CARD_ROWS) {
+        window_row(ui, w, compact);
+    }
+    let more = if compact {
+        &page.more_compact
+    } else {
+        &page.more_full
+    };
+    if let Some(text) = more {
+        ui.label(RichText::new(text).small().color(pal.weak));
+    }
+    if let Some(r) = &page.reset_credits {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(icon_text(ICON_SPARKLES, 13.0, pal.accent));
+            ui.add(egui::Label::new(RichText::new(r).small().color(pal.text)).truncate());
+        });
+    }
+}
+
+/// Memory key of the account last picked in a card's pager (its label, so a reorder keeps it).
+/// Browsing only: the status bar never takes it for the tab's account.
+fn picked_page(provider: &str) -> Id {
+    Id::unique(("usage-account", provider))
 }
 
 /// A small previous/next chevron of a card's account pager.
@@ -863,7 +928,7 @@ pub fn hover(resp: &egui::Response, summary: &Summary, account: Option<&LiveAcco
                     ui.painter().rect_filled(rect, 0, pal.stroke);
                 }
                 first = false;
-                provider_card(ui, c, true, account);
+                compact_card(ui, c, account);
             }
             if first {
                 ui.label(RichText::new("Nothing used yet").small().color(pal.weak));
@@ -1263,6 +1328,10 @@ among the rest, the higher one here goes first. A session keeps its account unti
 its reserve, or a higher account has more than its reclaim level left. A pinned tab stays on its \
 account until that is rate-limited.";
 
+const PREFER_NOTE: &str = "\"Prefer everywhere\" moves an account to the top of omp's global \
+order (every project without its own); reserves, reclaim levels and the other accounts' order \
+stay as they are, and no tab is pinned.";
+
 const KEYS_NOTE: &str = "omp chooses among API keys by itself on every request: used-up or \
 rate-limited keys are skipped and, where omp measures quotas, the key with more room left goes \
 first. Account order and pinning only work for OAuth logins.";
@@ -1305,6 +1374,26 @@ fn accounts(ui: &mut Ui, st: &mut ViewState, input: &ViewInput<'_>, out: &mut Ve
     // The routing note is about OAuth accounts; API-key groups carry their own.
     if !summary.accounts.is_empty() {
         ui.add(egui::Label::new(RichText::new(ROUTING_NOTE).small().color(pal.weak)).wrap());
+        ui.add(egui::Label::new(RichText::new(PREFER_NOTE).small().color(pal.weak)).wrap());
+        if let Some(p) = input.project {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(icon_text(ICON_FOLDER, 12.0, pal.warn));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "Order shown is global. \"Prefer here\" overrides it for {} by \
+                             writing that project's omp config, which then names accounts (email \
+                             or account id, never tokens): keep it out of commits you share.",
+                            abbreviate_home(p)
+                        ))
+                        .small()
+                        .color(pal.text),
+                    )
+                    .wrap(),
+                );
+            });
+        }
     }
     for g in &summary.accounts {
         account_group(ui, st, input, g, out);
@@ -1383,10 +1472,11 @@ fn account_group(
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.label(theme::strong(&g.name).size(14.5).color(pal.text_strong));
+            // `omp usage` runs gateway-wide: a project's own order is not reflected here.
             let mode = if g.has_policies {
-                "your order"
+                "global order · yours"
             } else {
-                "omp's automatic order"
+                "global order · omp's automatic"
             };
             ui.label(RichText::new(mode).small().color(pal.weak));
             if g.has_policies {
@@ -1410,32 +1500,35 @@ fn account_group(
             }
         });
         if let Some(s) = session {
-            let shown = g
-                .rows
-                .iter()
-                .find(|r| r.identity.same_account(&s.identity))
-                .map_or_else(
-                    || s.identity.email.clone().unwrap_or_default(),
-                    |r| r.label.clone(),
-                );
-            let how = if s.pinned {
-                "pinned: it stays there until that account is rate-limited"
-            } else {
-                "chosen by omp"
+            let text = match &s.identity {
+                Some(id) => {
+                    let shown = g
+                        .rows
+                        .iter()
+                        .find(|r| r.identity.same_account(id))
+                        .map_or(identity_label(id), |r| r.label.as_str());
+                    let how = if s.pinned {
+                        "pinned: it stays there until that account is rate-limited"
+                    } else {
+                        "chosen by omp"
+                    };
+                    format!("Focused tab: {shown} · {how}")
+                }
+                None => "Focused tab: no confirmed account · omp selects one by the account \
+                         order when it needs one"
+                    .to_owned(),
             };
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(icon_text(ICON_TERMINAL, 12.0, pal.weak));
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("Focused tab: {shown} · {how}"))
-                            .small()
-                            .color(pal.text),
-                    )
-                    .truncate(),
-                );
+                ui.add(egui::Label::new(RichText::new(text).small().color(pal.text)).truncate());
             });
         }
+        let prefer = PreferCell {
+            saving,
+            draft_open: rows != original,
+            project: input.project.map(|p| (p, abbreviate_home(p))),
+        };
         let n = rows.len();
         let mut swap: Option<usize> = None;
         for (i, draft) in rows.iter_mut().enumerate() {
@@ -1458,6 +1551,7 @@ fn account_group(
                         if let Some(s) = session {
                             pin_cell(ui, s, row, pin_busy, out);
                         }
+                        prefer.show(ui, g, row, out);
                         for p in row.pills.iter().rev() {
                             ui.label(
                                 RichText::new(format!("{} {}", p.tag, p.text))
@@ -1574,7 +1668,10 @@ fn pin_cell(
     out: &mut Vec<UsageAction>,
 ) {
     let pal = Palette::of_ui(ui);
-    let in_use = row.identity.same_account(&s.identity);
+    let in_use = s
+        .identity
+        .as_ref()
+        .is_some_and(|id| row.identity.same_account(id));
     let small = |t: &str| egui::Button::new(RichText::new(t).small());
     if in_use && s.pinned {
         let unpin = ui
@@ -1610,6 +1707,72 @@ fn pin_cell(
                 .on_hover_text("Pinned");
         }
         ui.label(text);
+    }
+}
+
+/// "Prefer everywhere" / "Prefer here" on one account of a group: one click puts it first in
+/// omp's global order, or in the focused tab's project's own order.
+struct PreferCell<'a> {
+    saving: bool,
+    /// Unsaved moves or levels: a write now would race the draft.
+    draft_open: bool,
+    /// The focused session tab's project and how it is named.
+    project: Option<(&'a Path, String)>,
+}
+
+impl PreferCell<'_> {
+    /// Inside a right-to-left layout: "Prefer here" first, so it lands right of "everywhere".
+    fn show(&self, ui: &mut Ui, g: &AccountGroup, row: &AccountRow, out: &mut Vec<UsageAction>) {
+        // omp refuses a rule that cannot single the account out.
+        if row.key.is_none() {
+            return;
+        }
+        let small = |t: &str| egui::Button::new(RichText::new(t).small());
+        let blocked = if self.saving {
+            Some("Writing omp's config…")
+        } else if self.draft_open {
+            Some("Save or discard the order you are editing first")
+        } else {
+            None
+        };
+        let mut push = |project: Option<&Path>| {
+            out.push(UsageAction::Prefer {
+                provider: g.provider.clone(),
+                name: g.name.clone(),
+                account: row.identity.clone(),
+                label: row.label.clone(),
+                project: project.map(Path::to_path_buf),
+            });
+        };
+        if let Some((path, shown)) = &self.project {
+            let here = ui.add_enabled(blocked.is_none(), small("Prefer here"));
+            let here = match blocked {
+                Some(why) => here.on_disabled_hover_text(why),
+                None => here.on_hover_text(format!(
+                    "Make {} the first {} account for {shown} only, in that project's omp \
+                     config (account identity, never tokens; it overrides the global order \
+                     there). Reserves, reclaim levels and the other accounts' order are kept; no \
+                     tab is pinned.",
+                    row.label, g.name
+                )),
+            };
+            if here.clicked() {
+                push(Some(*path));
+            }
+        }
+        let everywhere = ui.add_enabled(blocked.is_none(), small("Prefer everywhere"));
+        let everywhere = match blocked {
+            Some(why) => everywhere.on_disabled_hover_text(why),
+            None => everywhere.on_hover_text(format!(
+                "Make {} the first {} account in omp's global config, for every project \
+                 without its own order. Reserves, reclaim levels and the other accounts' order \
+                 are kept; no tab is pinned.",
+                row.label, g.name
+            )),
+        };
+        if everywhere.clicked() {
+            push(None);
+        }
     }
 }
 

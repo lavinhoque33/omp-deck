@@ -158,6 +158,17 @@ const KNOWN_SECRET_KEYS: &[&str] = &[
     "images.urls.credentials",
 ];
 
+const ACCOUNT_POLICIES_KEY: &str = "auth.accountPolicies";
+// Gateway jobs may overlap. Serialize account-policy read/modify/write with both the advanced
+// account-order editor and direct changes to the same key in omp Settings.
+static ACCOUNT_POLICIES_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_account_policies() -> Result<std::sync::MutexGuard<'static, ()>, OmpError> {
+    ACCOUNT_POLICIES_WRITE
+        .lock()
+        .map_err(|_| failed("Account policy update lock is unavailable"))
+}
+
 /// omp's `/settings` tab order, then anything unknown, then `internal`.
 const TAB_ORDER: &[(&str, &str)] = &[
     ("appearance", "Appearance"),
@@ -1120,6 +1131,9 @@ impl Omp {
     /// Returns the saved value (secrets: `Value::Null`; their stdout is never returned or logged).
     pub fn set_setting(&self, setting: &Setting, value: &Value) -> Result<Value, OmpError> {
         let encoded = encode_value(&setting.kind, value)?;
+        let _account_policies = (setting.key == ACCOUNT_POLICIES_KEY)
+            .then(lock_account_policies)
+            .transpose()?;
         self.set_encoded(&setting.key, &encoded, setting.secret)
     }
 
@@ -1129,6 +1143,8 @@ impl Omp {
         }
         if secret {
             log::debug!("omp config set {key} (secret, value not logged)");
+        } else if key == ACCOUNT_POLICIES_KEY {
+            log::debug!("omp config set {key} (account identities not logged)");
         } else {
             log::debug!("omp config set {key} = {encoded}");
         }
@@ -1152,10 +1168,65 @@ impl Omp {
         provider: &str,
         policies: &[crate::usage::AccountPolicy],
     ) -> Result<Value, OmpError> {
-        const KEY: &str = "auth.accountPolicies";
-        let current = self.get_setting(KEY)?;
-        let next = crate::usage::replace_account_policies(&current, provider, policies);
-        self.set_encoded(KEY, &next.to_string(), false)
+        let _write = lock_account_policies()?;
+        // `config get` reads the effective value, not the layer `config set` writes. Use an
+        // empty cwd and no CLI overlays so this also reads the global layer on older omp.
+        let cwd = tempfile::tempdir()?;
+        let mut cmd = self.command(&[
+            "config".as_ref(),
+            "get".as_ref(),
+            ACCOUNT_POLICIES_KEY.as_ref(),
+            "--json".as_ref(),
+        ]);
+        cmd.current_dir(cwd.path()).env_remove("PI_CONFIG_FILES");
+        let out = self.finish(cmd, None)?;
+        let current = serde_json::from_str::<Map<String, Value>>(out.stdout.trim())
+            .map_err(|_| OmpError::Parse("invalid global account policy response".into()))?;
+        let next = crate::usage::replace_account_policies(
+            current.get("value").unwrap_or(&Value::Null),
+            provider,
+            policies,
+        );
+        self.set_encoded(ACCOUNT_POLICIES_KEY, &next.to_string(), false)
+    }
+
+    /// Makes one OAuth account first in omp's order, retaining all other policies and fields.
+    /// `account` is the full identity of the selected account, not just its shortest selector.
+    /// `None` writes the user's global policy array. `Some(cwd)` writes the native project
+    /// override, seeded from the global array only if the project has no policy of its own.
+    /// Returns the saved array. This does not pin a credential to a session.
+    pub fn prefer_account(
+        &self,
+        provider: &str,
+        account: &crate::usage::OAuthIdentity,
+        project: Option<&Path>,
+    ) -> Result<Value, OmpError> {
+        let project = project.map(std::path::absolute).transpose()?;
+        let project = project
+            .as_deref()
+            .map(|path| {
+                path.to_str()
+                    .ok_or_else(|| failed("Project path is not valid UTF-8"))
+            })
+            .transpose()?;
+        let _write = lock_account_policies()?;
+        let mut saved = self
+            .sess_one(serde_json::json!({
+                "op": "prefer_account",
+                "provider": provider,
+                "account": account,
+                "project": project,
+            }))
+            .map_err(|error| match error {
+                SessError::Io(error) => OmpError::Spawn(error),
+                _ => failed(error.to_string()),
+            })?;
+        match saved.get_mut("value") {
+            Some(value) if value.is_array() => Ok(value.take()),
+            _ => Err(OmpError::Parse(
+                "omp did not return the saved account policies".into(),
+            )),
+        }
     }
 
     /// `omp config reset <key> --json`.
@@ -1163,6 +1234,9 @@ impl Omp {
         if key.is_empty() || key.starts_with('-') {
             return Err(failed(format!("Invalid setting key: {key}")));
         }
+        let _account_policies = (key == ACCOUNT_POLICIES_KEY)
+            .then(lock_account_policies)
+            .transpose()?;
         self.run(&["config", "reset", key, "--json"], None)?;
         Ok(())
     }

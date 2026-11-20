@@ -140,14 +140,16 @@ fn date_of(iso: &str) -> String {
     }
 }
 
-/// Whether the focused tab's session uses `a`: the stored account of its provider that is the
-/// account the session runs on.
+/// Whether the focused tab's session uses `a`: the stored account of its provider that omp
+/// selected for the session (none before its first request).
 fn in_use(a: &ResetAccount, session: Option<&LiveAccount>) -> bool {
     session.is_some_and(|s| {
         s.provider == a.provider
-            && s.credentials
-                .iter()
-                .any(|c| c.id == a.credential_id && c.identity.same_account(&s.identity))
+            && s.identity.as_ref().is_some_and(|id| {
+                s.credentials
+                    .iter()
+                    .any(|c| c.id == a.credential_id && c.identity.same_account(id))
+            })
     })
 }
 
@@ -212,7 +214,7 @@ mod tests {
     fn live(provider: &str, running: &str, stored: &[(&str, &str)]) -> LiveAccount {
         LiveAccount {
             provider: provider.to_owned(),
-            identity: identity(running),
+            identity: Some(identity(running)),
             pinned: false,
             credentials: stored
                 .iter()
@@ -330,6 +332,14 @@ mod tests {
             "the same credential id of another provider is not it"
         );
         assert!(rows(&list, None).iter().all(|r| !r.in_use));
+        let unchosen = LiveAccount {
+            identity: None,
+            ..session
+        };
+        assert!(
+            rows(&list, Some(&unchosen)).iter().all(|r| !r.in_use),
+            "before its first request no stored account is the session's"
+        );
     }
 
     #[test]

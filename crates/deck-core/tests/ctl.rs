@@ -995,7 +995,7 @@ fn session_account_is_parsed_and_absent_empty_or_malformed_is_none() {
     say(
         &mut s,
         &with(
-            r#"{"provider":"anthropic","email":"me@x.test","accountId":null,"orgId":"org-1","pinned":true,
+            r#"{"provider":"anthropic","activeCredentialId":"c1","pinned":true,
                 "credentials":[{"credentialId":"c1","email":"me@x.test","orgId":"org-1"},
                                {"credentialId":"","email":"ghost@x.test"},{"email":"no-id@x.test"},
                                {"credentialId":"c2","accountId":"acc-2"}]}"#,
@@ -1011,7 +1011,7 @@ fn session_account_is_parsed_and_absent_empty_or_malformed_is_none() {
         account(),
         Some(LiveAccount {
             provider: "anthropic".into(),
-            identity: me.clone(),
+            identity: Some(me.clone()),
             pinned: true,
             credentials: vec![
                 LiveCredential {
@@ -1035,24 +1035,42 @@ fn session_account_is_parsed_and_absent_empty_or_malformed_is_none() {
     wait_for("blank identity", || {
         client.latest().is_some_and(|s| s.account.is_none())
     });
-    say(&mut s, &with(r#"{"provider":"p","projectId":"proj"}"#));
-    wait_for("project only", || {
-        account().is_some_and(|a| a.identity.project_id.as_deref() == Some("proj"))
+    // Older live extensions put their first stored login at the top level before selection.
+    say(
+        &mut s,
+        &with(
+            r#"{"provider":"p","projectId":"proj","credentials":[{"credentialId":"1","projectId":"proj"}]}"#,
+        ),
+    );
+    wait_for("fresh session: pinnable but not selected", || {
+        account().is_some_and(|a| {
+            a.identity.is_none() && a.credentials[0].identity.project_id.as_deref() == Some("proj")
+        })
     });
     say(&mut s, &with(r#"{"email":"me@x.test"}"#));
     wait_for("no provider", || account().is_none());
     assert_eq!(client.latest().unwrap().pid, 9);
-    say(&mut s, &with(r#"{"provider":"p","accountId":"a"}"#));
-    wait_for("account again", || account().is_some());
+    say(
+        &mut s,
+        &with(
+            r#"{"provider":"p","activeCredentialId":"2","credentials":[{"credentialId":"1","email":"first@x.test"},{"credentialId":"2","accountId":"second"}]}"#,
+        ),
+    );
+    wait_for("resolved to second stored account", || {
+        account()
+            .and_then(|a| a.identity)
+            .is_some_and(|id| id.account_id.as_deref() == Some("second"))
+    });
     say(&mut s, &with(r#"{"provider":"p","email":7}"#));
     wait_for("wrong type", || account().is_none());
 
     // null (api-key provider) and an older extension without the field
-    say(&mut s, &with(r#"{"provider":"p","accountId":"a"}"#));
+    let stored = with(r#"{"provider":"p","credentials":[{"credentialId":"1","accountId":"a"}]}"#);
+    say(&mut s, &stored);
     wait_for("account again", || account().is_some());
     say(&mut s, &with("null"));
     wait_for("null account", || account().is_none());
-    say(&mut s, &with(r#"{"provider":"p","accountId":"a"}"#));
+    say(&mut s, &stored);
     wait_for("account again", || account().is_some());
     say(&mut s, &snapshot_line(9, ""));
     wait_for("no field", || account().is_none());

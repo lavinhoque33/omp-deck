@@ -1075,12 +1075,10 @@ shape, stats.db schema, extension imports, timings).
   `NN% left`; coloured by status). Since 0.26.1 segment priority is Ctx, Usage, Git, Cost, Tokens, Path (path elided from
   the front as `…/last/folders` into the leftover width, dropped below its last folder); hidden when there are no reports.
   Hover: compact per-provider cards (bars = remaining,
-  `resets in …`). Click, ⋯ menu "Usage…", app menu, Ctrl+Shift+U → **Usage view**. A multi-account provider shows
-  one account in the chip and in the hover, both from `usage_view::shown_page`: the page whose report matches the
-  focused tab's `LiveSnapshot.account` (`CardView::in_use`, same provider only; labelled `email · in use`, or
-  `email · pinned` when the session is pinned), else the page last picked in the Usage view's pager (labelled
-  `email · i / N`), else the first.
-  `BarView::set_account` bumps `rev`; the segment-width cache also keys on the shown page.
+  `resets in …`). Click, ⋯ menu "Usage…", app menu, Ctrl+Shift+U → **Usage view**. On multi-account
+  providers the chip must distinguish the credential omp actually selected for the focused tab from
+  an account the user happens to be browsing in Overview. Never use a remembered page or the first
+  login as evidence of selection. Changing the focused tab or its selected account invalidates the chip.
 - **Usage view** (modal like the session tree): header "Usage" + "Updated Xs ago" + refresh;
   tabs **Overview** (stats strip: Tightest quota, Past year, Last 30 days + sparkline, Busiest day;
   provider cards with remaining bars, `NN% left`, `resets in`, resets banked, unavailable accounts,
@@ -1135,6 +1133,15 @@ reservePct, reserveSource: "global"|"override", reclaimAbovePct?, state: "eligib
   when `provider` is not the main session's model provider, while streaming, or for an unknown credential;
   `credentialId` mapped back to omp's own id, then `session.pinCurrentProviderOAuthAccount(id)`; `null` →
   `authStorage.sessions.clear(provider, sessionId)`. Reply `{ok}`; a snapshot follows at once.
+- `Mutation::PreferAccount { provider, account, project }` changes native `auth.accountPolicies`
+  priority without a session pin. Global applies to projects that inherit it; project applies to the
+  focused tab's cwd. Project settings replace the whole policy array, not one provider: the initial
+  override inherits the other entries at that moment, not subsequent global edits. Review project
+  config before sharing: selectors can include account emails or identifiers, never OAuth tokens.
+- The live-control extension identifies a selection by the `active` row of `authStorage.oauth.accounts`
+  (`activeCredentialId` in the ctl snapshot). `LiveAccount.identity` is optional independently of the list
+  of pinnable credentials. `authStorage.oauth.identity` is unsuitable here: before credential resolution
+  it can return the first stored login even though no credential has been selected for this session.
 - omp-deck: `usage_state::AccountGroup` (providers with ≥ 2 OAuth accounts or with policies; rows = label, identity,
   key, quota pills, reason, policy state, own reserve, reclaim) in `Summary.accounts`; `merged_draft(group, draft)`
   keeps a draft's order/values across refreshes (accounts gone drop out, new ones append; same-identity accounts by
@@ -1145,7 +1152,8 @@ reservePct, reserveSource: "global"|"override", reclaimAbovePct?, state: "eligib
   without usage), labelled as the Overview pager labels them. omp's `auth.accountPolicies` and `/session pin` cover
   OAuth credentials only (API keys: per-request pick, used-up/blocked skipped, usage-ranked where measured), so these
   are listed read-only.
-- Accounts tab (`usage_view::accounts`): routing note; one card per group: "your order" / "omp's automatic order",
+- Accounts tab (`usage_view::accounts`): routing note; one card per group with the global priority order,
+  **Prefer everywhere** / **Prefer here** shortcuts for uniquely identifiable OAuth accounts,
   "Reset to automatic" (only with policies), the focused tab's account and whether it is pinned; per row ↑/↓,
   rank, label (weak with a tooltip when it has no key), `inside reserve`/`used up` badge, no-usage reason, quota
   pills, and Reserve (stepper, "default" = `retry.usageReservePct`, ✕ back to default) / Reclaim above (off, or a
@@ -4518,7 +4526,7 @@ first run, palette + app menu; phone later. Agent → OmpDeck tools follow as a 
   Try again. The browser opens automatically once per job this window started. Closing the wizard during a login
   cancels it. Subscribes `Topic::OmpAccounts` only while shown.
 - **Usage → Accounts**: "Add account…" header button → wizard; per provider with stored accounts (from
-  `OmpAccountsView`) rows with label, detail, type badge (OAuth / API key), Active badge, and the usage state merged
+  `OmpAccountsView`) rows with label, detail, type badge (OAuth / API key), and the usage state merged
   from the usage view (unavailable / disabled reason). Row actions as hover buttons **and** context menu: "Log in
   again" (wizard preselected) on unavailable/disabled rows, "Log out…" (confirm: omp removes the stored credential;
   env/config keys stay) → `OmpLogout`. Env-only providers show the env var, no Log out. Existing usage content stays.

@@ -132,10 +132,16 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
 
   omp's `/usage` as a native view (Ctrl+Shift+U or the status-bar usage chip): remaining quota
   per provider and window with reset times, a year of activity as a heatmap, and top models by cost.
-  The chip itself shows the selected model's provider: its 5-hour and weekly quota as two colored pills.
-  The **Accounts** tab sets the order omp uses a provider's OAuth logins in (omp's `auth.accountPolicies`: priority,
-  reserve and reclaim levels) and pins the focused tab's session to one of them, like omp's `/session pin`. A provider
-  with several API keys is listed with each key's quota; omp picks among API keys by itself (no order or pin).
+  The status-bar quota chip follows the account omp selected for the focused tab, not the last account
+  viewed in Usage. When several accounts could apply and the active account is unknown, the chip does
+  not guess from login order.
+  In **Accounts**, click **Prefer everywhere** for the global default or **Prefer here** for the
+  focused tab’s project. These change omp’s persistent OAuth priority, not the tab’s pin. omp still checks quota, reserve and eligibility;
+  a healthy existing session does not necessarily switch. A project override stores a copy of the policy
+  list in `.omp/config.yml` (account identifiers, never tokens); review it before sharing that file.
+  Remove the project’s `auth.accountPolicies` override to inherit future global order changes again.
+  Use the order, reserve and reclaim controls for finer tuning, or **Pin** to choose an account for this
+  session. For providers with several API keys, omp chooses the key itself (no order or pin).
 
   </details>
 

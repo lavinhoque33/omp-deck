@@ -2,15 +2,18 @@
 //! schedule and the `omp usage` runs (see `Topic::Usage`); the window adopts its view, reads the
 //! activity statistics on demand and sends the manual refresh.
 
+use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
 use deck_core::ctl::CtlCommand;
-use deck_core::usage::{ACTIVITY_DAYS, AccountPolicy};
+use deck_core::sessions::abbreviate_home;
+use deck_core::usage::{ACTIVITY_DAYS, AccountPolicy, OAuthIdentity};
 use deck_service::gateway::protocol::{Answer, Done, Mutation, Query, Topic};
 use egui::{Key, Modifiers};
 
 use super::{App, PendingConfirm};
 use crate::confirm::Confirm;
+use crate::tabs::TabRole;
 use crate::usage_state::UsageEvent;
 use crate::usage_view::{self, UsageAction, ViewInput};
 
@@ -151,6 +154,10 @@ impl App {
         let now = Instant::now();
         let live = self.live_snapshot();
         let accounts = self.gw.accounts();
+        let project = match self.tabs.get(self.active) {
+            Some(t) if t.role == TabRole::Session => Some(t.cwd.clone()),
+            _ => None,
+        };
         let input = ViewInput {
             load: self.usage.load(),
             summary: self.usage.summary(),
@@ -164,6 +171,7 @@ impl App {
             // omp's own default when the catalog has not been read.
             global_reserve: self.omp_usage_reserve.unwrap_or(10),
             accounts: accounts.as_deref(),
+            project: project.as_deref(),
             keys: self.accounts.wizard.is_none() && self.confirm.is_none(),
         };
         let actions = usage_view::show(ctx, &mut self.usage_ui, &input);
@@ -189,6 +197,13 @@ impl App {
                     name,
                     policies,
                 } => self.save_account_policies(provider, name, policies),
+                UsageAction::Prefer {
+                    provider,
+                    name,
+                    account,
+                    label,
+                    project,
+                } => self.prefer_account(provider, name, account, label, project),
                 UsageAction::Pin {
                     provider,
                     credential,
@@ -261,6 +276,52 @@ impl App {
                         &app.ctx,
                         format!(
                             "Account order not saved: {}",
+                            crate::summary::strip_context(&e)
+                        ),
+                    ),
+                }
+                app.ctx.request_repaint();
+            },
+        );
+    }
+
+    /// Puts one OAuth account first in `provider`'s `auth.accountPolicies`, globally or for
+    /// `project` only (omp's project config), keeping the other accounts' order, reserves and
+    /// reclaim levels; then re-reads omp's usage. No tab is pinned.
+    fn prefer_account(
+        &mut self,
+        provider: String,
+        name: String,
+        account: OAuthIdentity,
+        label: String,
+        project: Option<PathBuf>,
+    ) {
+        let scope = match &project {
+            Some(p) => abbreviate_home(p),
+            None => "all projects".to_owned(),
+        };
+        self.usage_ui.saving = Some(provider.clone());
+        self.gw.mutate(
+            Mutation::PreferAccount {
+                provider: provider.clone(),
+                account,
+                project,
+            },
+            move |app, result| {
+                app.usage_ui.saving = None;
+                match result {
+                    Ok(_) => {
+                        app.usage_ui.saved(provider, app.usage.summary());
+                        app.toasts.success(
+                            &app.ctx,
+                            format!("{name}: {label} is preferred for {scope}"),
+                        );
+                        app.start_usage_fetch();
+                    }
+                    Err(e) => app.toasts.error(
+                        &app.ctx,
+                        format!(
+                            "{label} not made preferred for {scope}: {}",
                             crate::summary::strip_context(&e)
                         ),
                     ),
