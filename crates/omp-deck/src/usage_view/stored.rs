@@ -183,8 +183,10 @@ fn group_card(
     });
 }
 
-/// One stored account: label and detail, type and Active badges, the usage issue merged in;
-/// "Log in again" / "Log out…" as hover buttons and in the context menu.
+/// One stored account: label and detail, type badge, the usage issue merged in; "Log in again"
+/// / "Log out…" as hover buttons and in the context menu. No "active" badge: the inventory is
+/// read without a session, so which account a tab uses is only told by the Accounts page's
+/// focused-tab line.
 fn account_row(
     ui: &mut Ui,
     g: &StoreGroup<'_>,
@@ -265,9 +267,6 @@ fn account_row(
         if relog && icon_button(&mut right, ICON_LOG_IN, "Log in again", false).clicked() {
             out.push(UsageAction::Login(Some(g.login_id.to_owned())));
         }
-    }
-    if a.active {
-        badge::show(&mut right, None, "Active", Hue::Green, 10.5);
     }
     match issue {
         Some(x) if x.disabled => {

@@ -636,7 +636,8 @@ pub struct UiFormOption {
 pub struct LiveAccount {
     /// omp's provider id (`anthropic`).
     pub provider: String,
-    pub identity: crate::usage::OAuthIdentity,
+    /// None until omp selects a credential. A stored login is not evidence of usage.
+    pub identity: Option<crate::usage::OAuthIdentity>,
     /// Chosen with `/session pin` (or [`CtlCommand::PinAccount`]): omp no longer re-ranks it.
     pub pinned: bool,
     /// The provider's stored OAuth accounts (`authStorage.oauth.accounts`), in omp's order.
@@ -1081,13 +1082,7 @@ impl From<WireProgress> for Progress {
 struct WireAccount {
     provider: String,
     #[serde(default)]
-    email: Option<String>,
-    #[serde(default)]
-    account_id: Option<String>,
-    #[serde(default)]
-    project_id: Option<String>,
-    #[serde(default)]
-    org_id: Option<String>,
+    active_credential_id: Option<String>,
     #[serde(default)]
     pinned: bool,
     #[serde(default)]
@@ -1297,40 +1292,41 @@ impl From<WireSnapshot> for LiveSnapshot {
                 }
             },
             account: match w.account {
-                Some(Lenient::Ok(a)) => {
-                    let identity = crate::usage::OAuthIdentity::new(
-                        a.email.as_deref(),
-                        a.account_id.as_deref(),
-                        a.project_id.as_deref(),
-                        a.org_id.as_deref(),
-                    );
-                    identity
-                        .filter(|_| !a.provider.is_empty())
-                        .map(|identity| LiveAccount {
-                            provider: a.provider,
-                            identity,
-                            pinned: a.pinned,
-                            credentials: a
-                                .credentials
-                                .into_iter()
-                                .filter_map(|c| match c {
-                                    Lenient::Ok(c) if !c.credential_id.is_empty() => {
-                                        let identity = crate::usage::OAuthIdentity::new(
-                                            c.email.as_deref(),
-                                            c.account_id.as_deref(),
-                                            c.project_id.as_deref(),
-                                            c.org_id.as_deref(),
-                                        )?;
-                                        Some(LiveCredential {
-                                            id: c.credential_id,
-                                            identity,
-                                        })
-                                    }
-                                    _ => None,
-                                })
-                                .collect(),
+                Some(Lenient::Ok(a)) if !a.provider.is_empty() => {
+                    let credentials: Vec<_> = a
+                        .credentials
+                        .into_iter()
+                        .filter_map(|c| {
+                            let Lenient::Ok(c) = c else { return None };
+                            if c.credential_id.is_empty() {
+                                return None;
+                            }
+                            let identity = crate::usage::OAuthIdentity::new(
+                                c.email.as_deref(),
+                                c.account_id.as_deref(),
+                                c.project_id.as_deref(),
+                                c.org_id.as_deref(),
+                            )?;
+                            Some(LiveCredential {
+                                id: c.credential_id,
+                                identity,
+                            })
                         })
+                        .collect();
+                    let active = a.active_credential_id.and_then(|id| {
+                        credentials
+                            .iter()
+                            .find(|c| c.id == id)
+                            .map(|c| c.identity.clone())
+                    });
+                    (!credentials.is_empty()).then_some(LiveAccount {
+                        provider: a.provider,
+                        pinned: active.is_some() && a.pinned,
+                        identity: active,
+                        credentials,
+                    })
                 }
+                Some(Lenient::Ok(_)) => None,
                 None => None,
                 Some(Lenient::Bad(_)) => {
                     log::debug!("ctl: ignored malformed account");

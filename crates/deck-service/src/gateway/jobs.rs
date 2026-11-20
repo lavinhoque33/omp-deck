@@ -642,6 +642,18 @@ pub fn account_policies(
         .map_err(failed)
 }
 
+pub fn prefer_account(
+    ctx: &JobCtx,
+    provider: &str,
+    account: &deck_core::usage::OAuthIdentity,
+    project: Option<&Path>,
+) -> Result<Done, GatewayError> {
+    ctx.omp()?
+        .prefer_account(provider, account, project)
+        .map(Done::Setting)
+        .map_err(failed)
+}
+
 /// `omp plugin enable|disable`; `cwd` is the project a project-scope change belongs to.
 pub fn plugin_enable(
     ctx: &JobCtx,

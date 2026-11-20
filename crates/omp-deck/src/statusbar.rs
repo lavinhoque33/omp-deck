@@ -28,7 +28,7 @@ use crate::agent_model::Counts;
 use crate::badge::{self, Badge, Hue};
 use crate::cost_tip::{self, CostTip};
 use crate::ctx_tip::{self, CtxTip};
-use crate::usage_state::{CardView, Chip, CredentialIssue, PillKind, QuotaPill, Summary};
+use crate::usage_state::{CardView, Chip, CredentialIssue, PillKind, QuotaPill, Serving, Summary};
 use crate::usage_view;
 use crate::{card, tips};
 use deck_core::usage::LimitStatus;
@@ -745,16 +745,10 @@ const SEGS: [Seg; 7] = [
     Seg::Path,
 ];
 
-type SegKey = (
-    u64,
-    Option<usize>,
-    u32,
-    deck_core::config::UiFont,
-    &'static str,
-);
+type SegKey = (u64, u32, deck_core::config::UiFont, &'static str);
 
 /// Real widths (the chip, without the spacing before it) of every segment for one view
-/// revision, usage chip page and pixel density.
+/// revision and pixel density.
 #[derive(Clone, Copy)]
 struct SegWidths {
     key: SegKey,
@@ -794,8 +788,6 @@ fn text_width(ui: &Ui, s: &str) -> f32 {
 fn seg_widths(ui: &mut Ui, ink: &Ink, v: &BarView) -> SegWidths {
     let key = (
         v.rev,
-        // The pager's pick lives in egui memory, outside `rev`.
-        usage_chip_card(ui.ctx(), v).map(|(_, i)| i),
         ui.ctx().pixels_per_point().to_bits(),
         theme::ui_font(),
         // The label face (mono or the UI font) follows the style.
@@ -1191,38 +1183,47 @@ fn login_button(ui: &mut Ui) -> bool {
     .clicked()
 }
 
-/// The selected model's provider card and the page the usage chip shows
-/// ([`usage_view::shown_page`]: the session's account, else the Usage view's pick).
-fn usage_chip_card<'a>(ctx: &egui::Context, v: &'a BarView) -> Option<(&'a CardView, usize)> {
+/// The selected model's provider card and which of its pages is the tab's
+/// ([`CardView::serving`]: the account omp selected for the session, never the Usage view's pick).
+fn usage_chip_card(v: &BarView) -> Option<(&CardView, Serving<'_>)> {
     let (provider, _) = v.model_selector.as_deref()?.split_once('/')?;
     let card = v.usage.as_deref()?.card_of(provider)?;
-    Some((
-        card,
-        usage_view::shown_page(ctx, card, v.account.as_ref()).0,
-    ))
+    Some((card, card.serving(v.account.as_ref())))
 }
 
 /// The usage chip's content: the selected model's provider quota (for a provider with several
 /// accounts, the one the session uses, as the hover) as one pill per window (5 h, weekly), each
-/// in its own colour; a provider without a measurable window falls back to the tightest quota
-/// overall, named so it is not mistaken for the selected provider's.
+/// in its own colour. A provider with several accounts whose account for this tab is not known
+/// says so instead of showing another account's numbers; a provider without a measurable window
+/// falls back to the tightest quota overall, named so it is not mistaken for the selected
+/// provider's.
 fn usage_chip_content(ui: &mut Ui, pal: &Palette, v: &BarView, c: &Chip) {
     ui.label(icon_text(ICON_GAUGE, ICON_PX, pal.weak));
-    let pills = usage_chip_card(ui.ctx(), v)
-        .and_then(|(card, i)| card.pages.get(i))
-        .map(|p| p.pills.as_slice())
-        .filter(|p| !p.is_empty());
-    if let Some(pills) = pills {
-        for p in pills {
-            quota_pill(ui, pal, p);
+    if let Some((card, serving)) = usage_chip_card(v) {
+        if let Some(text) = serving.chip_text(card) {
+            let text: &str = &text;
+            Badge::new(ui.painter(), None, &[(text, pal.weak)], pal.weak, SMALL_PX).show(ui);
+            return;
         }
-        return;
+        let pills = serving
+            .page()
+            .and_then(|i| card.pages.get(i))
+            .map(|p| p.pills.as_slice())
+            .filter(|p| !p.is_empty());
+        if let Some(pills) = pills {
+            for p in pills {
+                quota_pill(ui, pal, p);
+            }
+            return;
+        }
     }
     let tint = match c.status {
         LimitStatus::Ok => Hue::Teal.color(pal),
         s => usage_view::status_color(pal, s),
     };
-    let who = c.tight.split(" · ").next().unwrap_or_default();
+    // `Anthropic · b@x.test · Claude 7 Day` → `Anthropic · b@x.test`: the provider and, where it
+    // has several, the account the figure is about.
+    let who = c.tight.rsplit_once(" · ").map_or("", |(who, _)| who);
     let parts: &[(&str, Color32)] = if who.is_empty() {
         &[(&c.text, tint)]
     } else {
@@ -2909,6 +2910,7 @@ mod layout_tests {
     struct Shown {
         ctx: bool,
         usage: bool,
+        quota_percentages: Vec<u8>,
         git: bool,
         progress: bool,
         cost: bool,
@@ -3072,6 +3074,10 @@ mod layout_tests {
             Shown {
                 ctx: has("17.3%/1M"),
                 usage: has("5h") && has("wk"),
+                quota_percentages: info
+                    .iter()
+                    .filter_map(|t| t.strip_suffix("% left")?.parse().ok())
+                    .collect(),
                 git: has(BRANCH),
                 cost: has("$7.00"),
                 tokens: has("50K"),
@@ -3100,6 +3106,78 @@ mod layout_tests {
         );
         // The usage chip carries both windows.
         assert!(rig.view.usage.as_ref().is_some_and(|u| u.chip.is_some()));
+    }
+
+    /// The chip shows an account's quota only when omp confirmed that account for the tab: never
+    /// the first login, the Usage view's pager pick, the preferred account or the lone report of
+    /// a snapshot that does not know the tab's account (a fresh tab after reordering showed the
+    /// first stored login's quota as its own).
+    #[test]
+    fn usage_chip_shows_only_the_account_the_tab_runs_on() {
+        const TWO: &str = r#"{"generatedAt":1,"reports":[
+          {"provider":"anthropic","limits":[{"label":"Claude 5 Hour","window":{"id":"5h","durationMs":18000000},
+            "amount":{"usedFraction":0.9,"unit":"percent"},"status":"warning"}],
+           "metadata":{"email":"first@x.test"}},
+          {"provider":"anthropic","limits":[{"label":"Claude 5 Hour","window":{"id":"5h","durationMs":18000000},
+            "amount":{"usedFraction":0.1,"unit":"percent"},"status":"ok"}],
+           "metadata":{"email":"second@x.test"}}]}"#;
+        let mut rig = Rig::new(WORKTREE);
+        let usage = deck_core::usage::UsageSnapshot::parse(TWO).expect("fixture parses");
+        rig.view
+            .set_usage(Some(&Arc::new(Summary::build(&usage, 0))));
+        let account = |email: Option<&str>| LiveAccount {
+            provider: "anthropic".into(),
+            identity: email
+                .and_then(|e| deck_core::usage::OAuthIdentity::new(Some(e), None, None, None)),
+            pinned: false,
+            credentials: Vec::new(),
+        };
+        let shown = |v: &BarView| {
+            let (card, serving) = usage_chip_card(v).expect("anthropic card");
+            (
+                serving.page(),
+                serving.chip_text(card).map(|t| t.into_owned()),
+            )
+        };
+
+        rig.view.set_account(None);
+        assert_eq!(shown(&rig.view), (None, Some("2 accounts".to_owned())));
+        rig.view.set_account(Some(&account(None)));
+        assert_eq!(
+            shown(&rig.view),
+            (None, Some("account not confirmed".to_owned())),
+            "no confirmed account yet"
+        );
+        rig.view.set_account(Some(&account(Some("second@x.test"))));
+        assert_eq!(shown(&rig.view), (Some(1), None));
+        assert_eq!(rig.shown(1470.0).quota_percentages, [90]);
+        rig.view.set_account(Some(&account(Some("first@x.test"))));
+        assert_eq!(shown(&rig.view), (Some(0), None));
+        assert_eq!(rig.shown(1470.0).quota_percentages, [10]);
+        // Neither missing live control nor a not-yet-selected credential may borrow these numbers.
+        for a in [None, Some(account(None))] {
+            rig.view.set_account(a.as_ref());
+            assert!(rig.shown(1470.0).quota_percentages.is_empty());
+        }
+
+        // A snapshot that lists one account (`omp usage` and the live state are read apart).
+        let mut rig = Rig::new(WORKTREE);
+        rig.view
+            .set_account(Some(&account(Some("other@example.test"))));
+        assert_eq!(
+            shown(&rig.view),
+            (None, Some("other@example.test · no usage".to_owned())),
+            "the lone report is not the tab's account"
+        );
+        rig.view
+            .set_account(Some(&account(Some("me@example.test"))));
+        assert_eq!(shown(&rig.view), (Some(0), None));
+        rig.view.set_account(None);
+        assert_eq!(
+            shown(&rig.view),
+            (Some(0), None),
+            "nothing contradicts the one account"
+        );
     }
 
     #[test]

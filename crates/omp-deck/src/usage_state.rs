@@ -5,6 +5,7 @@
 //! The gateway owns the fetch schedule (see `app/usage.rs` for the window's side); this module is
 //! pure state.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -163,7 +164,7 @@ pub struct QuotaRow {
 /// What a provider card shows for one account (or for the provider when it has one report).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CardPage {
-    /// The account (`me@example.test`); empty on a single-page card.
+    /// The account (`me@example.test`); empty on the single page of a single-account provider.
     pub account: String,
     pub status: LimitStatus,
     pub unlimited: bool,
@@ -174,7 +175,7 @@ pub struct CardPage {
     pub reset_credits: Option<String>,
     pub daybreak: Vec<String>,
     pub notes: Vec<String>,
-    /// Whose report the page shows; `None` on a single-page card.
+    /// Whose report the page shows; `None` only on the page of a provider without a report.
     pub identity: Option<ReportIdentity>,
     /// The status-bar chip's pills for this account (empty: no measurable window).
     pub pills: Vec<QuotaPill>,
@@ -238,6 +239,9 @@ pub struct CardView {
     pub name: String,
     /// `2 accounts` on a single-page card whose provider also has accounts without usage.
     pub accounts: Option<String>,
+    /// The provider's usable credentials (reports and accounts without usage): past one, which
+    /// of them a tab runs on must be known before a page is presented as the tab's.
+    pub account_count: usize,
     /// One page per account that reported usage, each with that account's own numbers; a
     /// single page (unnamed) when the provider has at most one report. Never empty.
     pub pages: Vec<CardPage>,
@@ -248,10 +252,91 @@ pub struct CardView {
     pub weight: f32,
 }
 
+/// Which page of a card is the focused tab's: the status-bar chip and its hover present a page
+/// as the tab's only when the tab's live account state confirms it, never the pager's pick, the
+/// first login, the preferred account or the only report of a snapshot that may be incomplete
+/// (`omp usage` and the live state are read independently).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Serving<'a> {
+    /// No live account state for the tab and the snapshot knows one account: its one page.
+    /// Also a session without a confirmed account whose provider stores a single login that
+    /// the lone report matches.
+    Only,
+    /// The one page whose report matches the account omp selected for the tab's session.
+    InUse(usize),
+    /// omp has not confirmed an account for the session (an older extension sends no evidence;
+    /// omp selects one by the account order when it first needs one).
+    NotChosen,
+    /// The session runs on this account and no usage report matches it.
+    Unmeasured(&'a OAuthIdentity),
+    /// The session's account matches several reports: none is reliably its own.
+    Ambiguous,
+    /// Several accounts and no live account state for the tab (no live control, another
+    /// provider's, or API keys, which omp picks per request).
+    Unknown,
+}
+
+impl Serving<'_> {
+    /// The page the chip presents as the tab's.
+    pub fn page(self) -> Option<usize> {
+        match self {
+            Serving::Only => Some(0),
+            Serving::InUse(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// The chip's text while no page is the tab's (`None` when one is).
+    pub fn chip_text(self, card: &CardView) -> Option<Cow<'static, str>> {
+        match self {
+            Serving::Only | Serving::InUse(_) => None,
+            Serving::NotChosen => Some(Cow::Borrowed("account not confirmed")),
+            Serving::Unmeasured(id) => {
+                Some(Cow::Owned(format!("{} · no usage", identity_label(id))))
+            }
+            Serving::Ambiguous => Some(Cow::Borrowed("account unclear")),
+            Serving::Unknown => Some(Cow::Owned(format!("{} accounts", card.account_count))),
+        }
+    }
+
+    /// The hover card's explanation while no page is the tab's.
+    pub fn note(self, card: &CardView) -> Option<String> {
+        let name = &card.name;
+        match self {
+            Serving::Only | Serving::InUse(_) => None,
+            Serving::NotChosen => Some(format!(
+                "omp has not confirmed which {name} account this tab uses; it selects one by \
+                 its account order (global, or the project's own) when it needs one."
+            )),
+            Serving::Unmeasured(id) => Some(format!(
+                "This tab uses {}; omp has no {name} usage report for it.",
+                identity_label(id)
+            )),
+            Serving::Ambiguous => Some(format!(
+                "This tab's {name} account matches several usage reports, so none is shown as \
+                 its own."
+            )),
+            Serving::Unknown => Some(format!("Which {name} account this tab uses is not known.")),
+        }
+    }
+}
+
 impl CardView {
     fn build(c: &ProviderCard, snap: &UsageSnapshot) -> CardView {
         let pages: Vec<CardPage> = if c.per_account.is_empty() {
-            vec![CardPage::build(c, String::new(), None)]
+            // The lone report keeps whose it is: the snapshot may not list every stored account,
+            // so the tab's live account must still be matched against it. Named only when the
+            // provider shows several accounts.
+            let lone = snap.reports.iter().find(|r| r.provider == c.provider);
+            let label = lone
+                .filter(|_| c.accounts > 1)
+                .and_then(|r| r.metadata.identity())
+                .unwrap_or_default();
+            vec![CardPage::build(
+                c,
+                label.to_owned(),
+                lone.map(ReportIdentity::of),
+            )]
         } else {
             c.per_account
                 .iter()
@@ -272,6 +357,7 @@ impl CardView {
             name: c.name.clone(),
             accounts: (pages.len() == 1 && c.accounts > 1)
                 .then(|| format!("{} accounts", c.accounts)),
+            account_count: c.accounts.max(pages.len()),
             weight: tallest + pager + unavailable.len() as f32 + 2.0,
             pages,
             unavailable,
@@ -286,16 +372,63 @@ impl CardView {
             .unwrap_or(0)
     }
 
-    /// The page of the account an omp session uses, when `account` is this provider's and one
-    /// page's report matches it (omp's `limitMatchesActiveAccount`); single-page cards: `None`.
+    /// The page of the account omp selected for a session, when exactly one page's report
+    /// matches it (omp's `limitMatchesActiveAccount`).
     pub fn in_use(&self, account: Option<&LiveAccount>) -> Option<usize> {
-        let account = account.filter(|a| a.provider == self.provider)?;
-        self.pages.iter().position(|p| {
-            p.identity
-                .as_ref()
-                .is_some_and(|id| id.matches(&account.identity))
-        })
+        match self.serving(account) {
+            Serving::InUse(i) => Some(i),
+            _ => None,
+        }
     }
+
+    /// Which page is the tab's, given the session's live account state. Live evidence wins over
+    /// the snapshot: a selected account that matches no report, or several, is never given
+    /// another account's page.
+    pub fn serving<'a>(&self, account: Option<&'a LiveAccount>) -> Serving<'a> {
+        let Some(live) = account.filter(|a| a.provider == self.provider) else {
+            return if self.account_count <= 1 {
+                Serving::Only
+            } else {
+                Serving::Unknown
+            };
+        };
+        let matching = |id: &OAuthIdentity| {
+            let mut hits = self
+                .pages
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.identity.as_ref().is_some_and(|r| r.matches(id)));
+            match (hits.next(), hits.next()) {
+                (Some((i, _)), None) => Ok(i),
+                (None, _) => Err(false),
+                (Some(_), Some(_)) => Err(true),
+            }
+        };
+        match &live.identity {
+            Some(id) => match matching(id) {
+                Ok(i) => Serving::InUse(i),
+                Err(false) => Serving::Unmeasured(id),
+                Err(true) => Serving::Ambiguous,
+            },
+            // No confirmed account: only a provider with a single stored login, which the lone
+            // report matches, can have no other.
+            None => match live.credentials.as_slice() {
+                [only] if self.account_count <= 1 && matching(&only.identity) == Ok(0) => {
+                    Serving::Only
+                }
+                _ => Serving::NotChosen,
+            },
+        }
+    }
+}
+
+/// How an OAuth identity is named: its email, else its account, project or org id.
+pub fn identity_label(id: &OAuthIdentity) -> &str {
+    [&id.email, &id.account_id, &id.project_id, &id.org_id]
+        .into_iter()
+        .filter_map(|v| v.as_deref())
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or("an unnamed account")
 }
 
 fn unavailable_accounts(snap: &UsageSnapshot) -> impl Iterator<Item = &UnavailableAccount> {
@@ -1518,11 +1651,11 @@ mod tests {
 
         let session = |provider: &str, email: Option<&str>, account_id: Option<&str>| LiveAccount {
             provider: provider.into(),
-            identity: deck_core::usage::OAuthIdentity {
+            identity: Some(deck_core::usage::OAuthIdentity {
                 email: email.map(Into::into),
                 account_id: account_id.map(Into::into),
                 ..Default::default()
-            },
+            }),
             pinned: false,
             credentials: Vec::new(),
         };
@@ -1544,6 +1677,34 @@ mod tests {
             None
         );
         assert_eq!(c.in_use(None), None);
+
+        // What the status-bar chip presents as the tab's: only the account omp selected.
+        assert_eq!(
+            c.serving(Some(&session("anthropic", None, Some("ACC-B")))),
+            Serving::InUse(1)
+        );
+        let unchosen = LiveAccount {
+            identity: None,
+            ..session("anthropic", None, None)
+        };
+        let s = c.serving(Some(&unchosen));
+        assert_eq!(
+            (s, s.page()),
+            (Serving::NotChosen, None),
+            "without a confirmed account neither the first login nor the preferred one is the tab's"
+        );
+        assert_eq!(s.chip_text(c).as_deref(), Some("account not confirmed"));
+        let other = session("anthropic", Some("c@x.test"), None);
+        let s = c.serving(Some(&other));
+        assert_eq!(s, Serving::Unmeasured(other.identity.as_ref().unwrap()));
+        assert_eq!(s.chip_text(c).as_deref(), Some("c@x.test · no usage"));
+        for s in [
+            c.serving(None),
+            c.serving(Some(&session("openai-codex", Some("a@x.test"), None))),
+        ] {
+            assert_eq!(s, Serving::Unknown);
+            assert_eq!(s.chip_text(c).as_deref(), Some("3 accounts"));
+        }
         let wk = |i: usize| {
             c.pages[i]
                 .pills
@@ -1556,6 +1717,132 @@ mod tests {
             (vec!["10% left"], vec!["90% left"]),
             "chip pills per account"
         );
+    }
+
+    #[test]
+    fn a_lone_report_among_several_accounts_is_the_tabs_only_when_it_matches() {
+        let s = Summary::build(
+            &snap(
+                r#"{"generatedAt":1,"reports":[
+                {"provider":"anthropic","limits":[{"label":"Claude 7 Day","window":{"id":"7d"},
+                  "amount":{"usedFraction":0.4,"unit":"percent"},"status":"ok"}],
+                 "metadata":{"email":"a@x.test"}}],
+                "accountsWithoutUsage":[{"provider":"anthropic","email":"b@x.test","reason":"HTTP 500"}]}"#,
+            ),
+            0,
+        );
+        let c = &s.cards[0];
+        assert_eq!(
+            (c.pages.len(), c.pages[0].account.as_str(), c.account_count),
+            (1, "a@x.test", 2),
+            "the measured account is named"
+        );
+        let on = |email: &str| LiveAccount {
+            provider: "anthropic".into(),
+            identity: OAuthIdentity::new(Some(email), None, None, None),
+            pinned: false,
+            credentials: Vec::new(),
+        };
+        assert_eq!(c.serving(Some(&on("a@x.test"))), Serving::InUse(0));
+        let b = on("b@x.test");
+        assert_eq!(
+            c.serving(Some(&b)),
+            Serving::Unmeasured(b.identity.as_ref().unwrap()),
+            "the other account's numbers are not this tab's"
+        );
+        assert_eq!(c.serving(None), Serving::Unknown);
+
+        let one = Summary::build(&snap(ONE), 0);
+        let a = one.cards.iter().find(|c| c.name == "Anthropic").unwrap();
+        assert_eq!(
+            a.serving(None),
+            Serving::Only,
+            "a single account needs no session"
+        );
+    }
+
+    /// `omp usage` and the live state are read independently: a snapshot that lists one account
+    /// must not give its numbers to a tab whose live state names another, or has several stored
+    /// logins and no confirmed one.
+    #[test]
+    fn an_incomplete_snapshot_never_lends_its_lone_report_to_another_account() {
+        let s = Summary::build(&snap(ONE), 0);
+        let c = s.cards.iter().find(|c| c.name == "Anthropic").unwrap();
+        assert_eq!(c.account_count, 1, "the snapshot knows one account");
+        assert!(
+            c.pages[0].identity.is_some(),
+            "the lone report keeps whose it is"
+        );
+        assert_eq!(c.pages[0].account, "", "and stays unnamed");
+        let id = |e: &str| OAuthIdentity::new(Some(e), None, None, None).unwrap();
+        let cred = |n: &str, e: &str| deck_core::ctl::LiveCredential {
+            id: n.into(),
+            identity: id(e),
+        };
+        let live = |identity: Option<OAuthIdentity>, credentials| LiveAccount {
+            provider: "anthropic".into(),
+            identity,
+            pinned: false,
+            credentials,
+        };
+
+        let theirs = live(Some(id("new@example.test")), Vec::new());
+        let s = c.serving(Some(&theirs));
+        assert_eq!(
+            (s, s.page()),
+            (Serving::Unmeasured(theirs.identity.as_ref().unwrap()), None),
+            "a live account the snapshot does not know is not the measured one"
+        );
+        assert_eq!(
+            c.serving(Some(&live(Some(id("ME@example.test")), Vec::new()))),
+            Serving::InUse(0)
+        );
+        let two = vec![cred("1", "me@example.test"), cred("2", "new@example.test")];
+        assert_eq!(
+            c.serving(Some(&live(None, two))),
+            Serving::NotChosen,
+            "two stored logins and no confirmed one: not the measured account"
+        );
+        assert_eq!(
+            c.serving(Some(&live(None, vec![cred("1", "me@example.test")]))),
+            Serving::Only,
+            "the single stored login is the measured one"
+        );
+        assert_eq!(
+            c.serving(Some(&live(None, vec![cred("1", "new@example.test")]))),
+            Serving::NotChosen,
+            "a single stored login the report does not match"
+        );
+    }
+
+    #[test]
+    fn an_account_matching_several_reports_is_shown_as_none_of_them() {
+        let s = Summary::build(
+            &snap(
+                r#"{"generatedAt":1,"reports":[
+                {"provider":"anthropic","limits":[{"label":"Claude 7 Day","window":{"id":"7d"},
+                  "amount":{"usedFraction":0.9,"unit":"percent"},"status":"warning"}],
+                 "metadata":{"email":"a@x.test","orgId":"org-1"}},
+                {"provider":"anthropic","limits":[{"label":"Claude 7 Day","window":{"id":"7d"},
+                  "amount":{"usedFraction":0.1,"unit":"percent"},"status":"ok"}],
+                 "metadata":{"email":"b@x.test","orgId":"org-1"}}]}"#,
+            ),
+            0,
+        );
+        let c = &s.cards[0];
+        let org_only = LiveAccount {
+            provider: "anthropic".into(),
+            identity: OAuthIdentity::new(None, None, None, Some("org-1")),
+            pinned: false,
+            credentials: Vec::new(),
+        };
+        let s = c.serving(Some(&org_only));
+        assert_eq!(
+            (s, s.page()),
+            (Serving::Ambiguous, None),
+            "no fallback to the first"
+        );
+        assert_eq!(s.chip_text(c).as_deref(), Some("account unclear"));
     }
 
     #[test]

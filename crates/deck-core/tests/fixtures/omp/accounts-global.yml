@@ -1,0 +1,21 @@
+startup:
+  setupWizard: false
+collab:
+  autoStart: off
+auth:
+  accountPolicies:
+    - provider: openai-codex
+      account: { accountId: first }
+      priority: 19
+    - provider: anthropic
+      account: { email: anthropic@example.invalid }
+      priority: 7
+    - provider: openai-codex
+      account: { accountId: second, orgId: team-b }
+      priority: 3
+      reservePct: 15
+      reclaimAbovePct: 55
+      future: { routingHint: keep }
+    - provider: openai-codex
+      account: { accountId: third }
+      priority: 1

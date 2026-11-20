@@ -555,34 +555,36 @@ export default async function ompdeckCtl(api: any) {
           };
         } catch (e) { log("model state failed: " + e); return null; }
       };
-      // The OAuth account the main session uses for its model's provider: the session's sticky credential, else omp's
-      // default pick (`authStorage.oauth.identity`, what omp's own status line shows). Undefined for api-key providers.
-      // `pinned`: the sticky record is explicit (`/session pin`); `credentials`: the stored accounts it can be pinned to.
+      // oauth.identity() can return the first stored login before any request. Only the
+      // session-sticky row is evidence of selection; keep the other rows available to pin.
       type Identity = { email: string | null; accountId: string | null; projectId: string | null; orgId: string | null };
-      type Account = Identity & { provider: string; pinned: boolean; credentials: (Identity & { credentialId: string })[] };
+      type Account = { provider: string; activeCredentialId: string | null; pinned: boolean; credentials: (Identity & { credentialId: string })[] };
       const idStr = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
-      const identityOf = (v: any): Identity => ({ email: idStr(v?.email), accountId: idStr(v?.accountId), projectId: idStr(v?.projectId), orgId: idStr(v?.orgId) });
-      const providerAccounts = (auth: any, provider: string, sessionId: string): any[] => {
-        const list = typeof auth?.oauth?.accounts === "function" ? auth.oauth.accounts(provider, sessionId) : [];
-        return (Array.isArray(list) ? list : []).filter((a: any) => (typeof a?.credentialId === "string" && a.credentialId) || typeof a?.credentialId === "number");
+      type StoredAccount = Partial<Record<keyof Identity | "active", unknown>> & { credentialId: number | string };
+      type AccountSource = { oauth?: { accounts?(provider: string, sessionId: string): unknown } };
+      const identityOf = (v: StoredAccount): Identity => ({
+        email: idStr(v.email), accountId: idStr(v.accountId), projectId: idStr(v.projectId), orgId: idStr(v.orgId),
+      });
+      const providerAccounts = (auth: AccountSource | undefined, provider: string, sessionId: string): StoredAccount[] => {
+        const list = auth?.oauth?.accounts?.(provider, sessionId);
+        return Array.isArray(list) ? list.filter((a: unknown): a is StoredAccount =>
+          !!a && typeof a === "object" && "credentialId" in a &&
+          (typeof a.credentialId === "number" || (typeof a.credentialId === "string" && a.credentialId !== ""))) : [];
       };
       const mainAccount = (): Account | null => {
         try {
           const sess = mainSession();
           const provider = sess?.model?.provider;
           const auth = sess?.modelRegistry?.authStorage;
-          if (typeof provider !== "string" || !provider || typeof auth?.oauth?.identity !== "function") return null;
-          const id = auth.oauth.identity(provider, sess.sessionId);
-          if (!id) return null;
-          let pinned = false;
-          try { const sticky = auth.sessions?.get?.(provider, sess.sessionId); pinned = sticky?.type === "oauth" && sticky.explicit === true; } catch {}
-          let credentials: Account["credentials"] = [];
-          try {
-            // credentialId is omp's numeric row id: sent as a string, mapped back by pin_account.
-            credentials = providerAccounts(auth, provider, sess.sessionId)
-              .map((a: any) => ({ credentialId: String(a.credentialId), ...identityOf(a) }));
-          } catch (e) { log("account list failed: " + e); }
-          return { provider, ...identityOf(id), pinned, credentials };
+          if (typeof provider !== "string" || !provider) return null;
+          const accounts = providerAccounts(auth, provider, sess.sessionId);
+          if (!accounts.length) return null;
+          const active = accounts.find(a => a.active === true);
+          const pinned = !!active && auth.sessions?.get?.(provider, sess.sessionId)?.explicit === true;
+          return {
+            provider, activeCredentialId: active ? String(active.credentialId) : null, pinned,
+            credentials: accounts.map(a => ({ credentialId: String(a.credentialId), ...identityOf(a) })),
+          };
         } catch (e) { log("account state failed: " + e); return null; }
       };
       const perToolTokens = (sess: any): [string, number][] => {
@@ -1260,7 +1262,7 @@ export default async function ompdeckCtl(api: any) {
             sessions.clear(provider, sess.sessionId);
           } else {
             if (typeof sess.pinCurrentProviderOAuthAccount !== "function") return { ok: false, error: "pinning unavailable" };
-            const target = providerAccounts(sess.modelRegistry?.authStorage, provider, sess.sessionId).find((a: any) => String(a.credentialId) === String(cmd.credentialId));
+            const target = providerAccounts(sess.modelRegistry?.authStorage, provider, sess.sessionId).find(a => String(a.credentialId) === String(cmd.credentialId));
             if (!target || !sess.pinCurrentProviderOAuthAccount(target.credentialId)) return { ok: false, error: "that account is no longer available" };
           }
           schedule();

@@ -1411,6 +1411,12 @@ pub enum Mutation {
         provider: String,
         policies: Vec<deck_core::usage::AccountPolicy>,
     },
+    /// Promote one OAuth identity in omp's global or project account policy, without pinning a tab.
+    PreferAccount {
+        provider: String,
+        account: deck_core::usage::OAuthIdentity,
+        project: Option<PathBuf>,
+    },
     /// Edit one agent definition file if it still has `revision` (see `agent_defs::save`).
     AgentEdit {
         path: PathBuf,
@@ -1800,6 +1806,7 @@ impl Mutation {
             Mutation::OmpSet { .. } => "omp-set",
             Mutation::OmpReset { .. } => "omp-reset",
             Mutation::AccountPolicies { .. } => "account-policies",
+            Mutation::PreferAccount { .. } => "prefer-account",
             Mutation::AgentEdit { .. } => "agent-edit",
             Mutation::AgentCreate { .. } => "agent-create",
             Mutation::AgentCustomize { .. } => "agent-customize",

@@ -1058,6 +1058,23 @@ impl Engine {
                     move |ctx, _, _| jobs::account_policies(ctx, &provider, &policies),
                 );
             }
+            Mutation::PreferAccount {
+                provider,
+                account,
+                project,
+            } => {
+                self.accepted(conn, id, &key);
+                self.job(
+                    key,
+                    "prefer-account",
+                    None,
+                    false,
+                    Post::None,
+                    move |ctx, _, _| {
+                        jobs::prefer_account(ctx, &provider, &account, project.as_deref())
+                    },
+                );
+            }
             Mutation::AgentEdit {
                 path,
                 revision,

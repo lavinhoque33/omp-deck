@@ -14,6 +14,7 @@
 //   import_foreign    {source, id, cwd}                  -> {file}           a fresh omp session id; `cwd` replaces a vanished project dir
 //   advisor_config    {cwd, scope:"project"|"user"}      -> {path, doc}      doc = omp's WatchdogConfigDoc (raw, un-merged)
 //   save_advisor_config {cwd, scope, doc}                -> {path, removed}  an empty doc deletes the file
+//   prefer_account    {provider, account, project:null|cwd} -> {value}  native accountPolicies; no credential writes
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -72,6 +73,11 @@ export default async function ompdeckSess(_api: any) {
   const advisor = async () => import("./ompdeck-advisor.ts");
 
   const ops: Record<string, (r: any) => Promise<any>> = {
+    // Load only for this op: an older omp missing the config helpers must still run session ops.
+    async prefer_account(r) {
+      return (await import("./ompdeck-account-policies.ts")).preferAccount(r);
+    },
+
     async set_pinned(r) {
       const id = str(r.id, "id");
       if (typeof r.pinned !== "boolean") throw new Error("pinned is required");

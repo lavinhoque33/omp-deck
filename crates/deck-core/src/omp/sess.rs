@@ -190,6 +190,25 @@ impl Omp {
             Ok(p) => p,
             Err(e) => return fail_all(e.into()),
         };
+        let account_boot = if requests
+            .iter()
+            .any(|r| r.get("op").and_then(Value::as_str) == Some("prefer_account"))
+        {
+            let overlay = work.path().join("account-policy-boot.yml");
+            // The helper reads raw layers. Do not let the headless agent validate existing
+            // routing rules at startup and exit before the helper can make a preserving edit.
+            if let Err(e) = std::fs::write(
+                work.path().join("ompdeck-account-policies.ts"),
+                include_str!("../../assets/ompdeck-account-policies.ts"),
+            )
+            .and_then(|()| std::fs::write(&overlay, "auth:\n  accountPolicies: []\n"))
+            {
+                return fail_all(e.into());
+            }
+            Some(overlay)
+        } else {
+            None
+        };
         let (req_path, out_path, err_path) = (
             work.path().join("requests"),
             work.path().join("results"),
@@ -209,7 +228,6 @@ impl Omp {
             let mut cmd = std::process::Command::new(&self.program);
             cmd.args(["--mode", "rpc", "--no-session", "--no-extensions", "-e"])
                 .arg(&ext)
-                .current_dir(platform::home_or_root())
                 .env("NO_COLOR", "1")
                 .env("OMPDECK_SESS_REQ", &req_path)
                 .env("OMPDECK_SESS_OUT", &out_path)
@@ -218,6 +236,11 @@ impl Omp {
                 .stderr(std::fs::File::create(&err_path)?);
             for (k, v) in &self.env {
                 cmd.env(k, v);
+            }
+            if let Some(overlay) = &account_boot {
+                cmd.current_dir(work.path()).env("PI_CONFIG_FILES", overlay);
+            } else {
+                cmd.current_dir(platform::home_or_root());
             }
             headless(&mut cmd);
             platform::spawn_killable(cmd)
@@ -278,7 +301,7 @@ impl Omp {
             .collect()
     }
 
-    fn sess_one(&self, request: Value) -> Result<Value, SessError> {
+    pub(super) fn sess_one(&self, request: Value) -> Result<Value, SessError> {
         self.sess_run(&[request])
             .pop()
             .unwrap_or_else(|| Err(SessError::Failed("omp produced no result".into())))
