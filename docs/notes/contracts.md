@@ -3954,8 +3954,9 @@ indicator for open tabs), and reorder them to move the open tabbed ones to the t
 
 ### Session rows (the "ledger")
 - **Order**: project headers are alphabetical by folder name (ASCII case-insensitive), then full path. Within a
-  project, bookmarks lead; within each bookmark section, running sessions lead, with newest file mtime first
-  and file path breaking ties. The running marker and the ordering use the same live state, including detached sessions.
+  project, bookmarks lead. Each bookmark section uses the Running dock's pre-scope rank for mapped live
+  sessions (including out-of-scope worktrees of a scoped primary), then other live tabs, then stopped sessions
+  by file mtime and path. Turn transitions reorder the live rows without waiting for a session rescan.
 - **Rail**: a 1 px vertical line drops from the centre of the expanded header's folder glyph through all its rows;
   colour `rail = mix(panel, weak, 0.62)` (plain `stroke` vanishes at 1 px). Each row hangs off it by a 17 px horizontal
   **stub** at the row's first-line centre; the last row uses a rounded elbow (└, radius 5) instead of rail + stub.

@@ -69,11 +69,12 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
 
   Projects stay alphabetical by folder name, even while agents in different projects produce output. Only the
   active tab's project expands automatically. Within each project, bookmarks come first; within the bookmarked
-  and unbookmarked sections, running sessions come first, then the rest, newest activity first in each.
+  and unbookmarked sections, live sessions follow the Running dock's order (in a turn or waiting for input first,
+  by turn start; then idle, by latest activity). Stopped sessions follow by last file update.
   Each session hangs off its project folder on a branch line, with its title, relative age
   and a status marker on the branch (running, the tab's working spinner or needs-input badge), worktree branches on a
   second line. The folder scope sits at the top with the filter box; a resizable, collapsible **Running** dock at the
-  bottom lists every live session (tabbed ones first, with a window marker; ✕ or middle-click closes the tab, a
+  bottom lists every live session (open tabs have a window marker; ✕ or middle-click closes the tab, a
   tab-less one attaches on click). Background auto-refresh and context menus (open, copy/move to another project,
   copy path/id/resume command, "Restart session" for running sessions, "Stop session process", and "Delete
   session…"). Deleting is permanent: it removes the session file and its subagent transcripts and artifacts

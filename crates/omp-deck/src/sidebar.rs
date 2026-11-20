@@ -432,8 +432,8 @@ impl AgeCache {
     }
 }
 
-/// `(data stamp, scope, removed worktree count, bookmark revision)`.
-type LayoutKey = ((u64, usize), Option<PathBuf>, usize, u64);
+/// `(data stamp, scope, removed worktree count, bookmark revision, running revision)`.
+type LayoutKey = ((u64, usize), Option<PathBuf>, usize, u64, u64);
 
 /// The nesting of worktree groups with bookmarked rows first, valid for one [`LayoutKey`].
 #[derive(Default)]
@@ -450,29 +450,51 @@ impl LayoutCache {
         groups: &[ProjectGroup],
         removed: &BTreeMap<PathBuf, RemovedWorktree>,
         (bookmarks, revision): (&HashSet<String>, u64),
+        live: &running::RunningCache,
     ) -> &[Family] {
-        let fresh = self.key.as_ref().is_some_and(|(s, sc, n, rev)| {
-            *s == stamp && sc.as_deref() == scope && *n == removed.len() && *rev == revision
+        let fresh = self.key.as_ref().is_some_and(|(s, sc, n, rev, run)| {
+            *s == stamp
+                && sc.as_deref() == scope
+                && *n == removed.len()
+                && *rev == revision
+                && *run == live.revision
         });
         if !fresh {
             self.families = worktree_ui::layout(groups, scope, removed);
-            bookmarks_first(&mut self.families, groups, bookmarks);
-            self.key = Some((stamp, scope.map(Path::to_path_buf), removed.len(), revision));
+            order_project_rows(&mut self.families, groups, bookmarks, &live.ranks);
+            self.key = Some((
+                stamp,
+                scope.map(Path::to_path_buf),
+                removed.len(),
+                revision,
+                live.revision,
+            ));
         }
         &self.families
     }
 }
 
-/// Moves each family's bookmarked rows (its own and its worktrees' sessions) ahead of the rest;
-/// both partitions keep their order (the sort is stable).
-fn bookmarks_first(families: &mut [Family], groups: &[ProjectGroup], bookmarks: &HashSet<String>) {
-    if bookmarks.is_empty() {
+/// Keep bookmarks at the top and match the Running dock's activity/recency order inside
+/// each section. The stable sort retains file recency for entries without a live rank.
+fn order_project_rows(
+    families: &mut [Family],
+    groups: &[ProjectGroup],
+    bookmarks: &HashSet<String>,
+    ranks: &HashMap<(usize, usize), usize>,
+) {
+    if bookmarks.is_empty() && ranks.is_empty() {
         return;
     }
     for family in families {
-        family
-            .rows
-            .sort_by_key(|r| !bookmarks.contains(&groups[r.group].sessions[r.session].id));
+        family.rows.sort_by_key(|r| {
+            (
+                !bookmarks.contains(&groups[r.group].sessions[r.session].id),
+                ranks
+                    .get(&(r.group, r.session))
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            )
+        });
     }
 }
 
@@ -824,6 +846,7 @@ fn show_groups(
         active_group: active_cache,
         expansion,
         layout: layout_cache,
+        running,
         ..
     } = cache;
     let stamp = (input.generation, groups.as_ptr() as usize);
@@ -844,6 +867,7 @@ fn show_groups(
         groups,
         input.removed,
         (input.bookmarks, input.bookmark_revision),
+        running,
     );
     let age_key = (
         stamp,
@@ -3510,7 +3534,14 @@ mod tests {
             let marks: HashSet<String> = marks.iter().map(|m| (*m).to_owned()).collect();
             family_ids(
                 &groups,
-                cache.sync(stamp, None, &groups, &removed, (&marks, rev)),
+                cache.sync(
+                    stamp,
+                    None,
+                    &groups,
+                    &removed,
+                    (&marks, rev),
+                    &Default::default(),
+                ),
             )
         };
         let plain = [vec!["o-1"], vec!["r-new", "w-mid", "r-old", "w-old"]];
@@ -3526,6 +3557,40 @@ mod tests {
             [vec!["o-1"], vec!["w-mid", "r-new", "r-old", "w-old"]]
         );
         assert_eq!(sync(&[], 3), plain);
+    }
+
+    #[test]
+    fn project_reorders_when_only_the_running_dock_rank_changes() {
+        let groups = [dated(
+            "/p",
+            &[
+                ("bookmark", 99),
+                ("stopped", 90),
+                ("idle", 80),
+                ("active", 5),
+            ],
+            None,
+        )];
+        let marks = HashSet::from(["bookmark".to_owned()]);
+        let mut cache = LayoutCache::default();
+        let mut live = running::RunningCache::default();
+        let mut sorted = |live: &running::RunningCache| {
+            family_ids(
+                &groups,
+                cache.sync((1, 0), None, &groups, &BTreeMap::new(), (&marks, 1), live),
+            )
+        };
+        live.ranks.extend([((0, 3), 0), ((0, 2), 1)]);
+        assert_eq!(
+            sorted(&live),
+            [vec!["bookmark", "active", "idle", "stopped"]]
+        );
+        live.revision += 1;
+        live.ranks.extend([((0, 2), 0), ((0, 3), 1)]);
+        assert_eq!(
+            sorted(&live),
+            [vec!["bookmark", "idle", "active", "stopped"]]
+        );
     }
 
     #[test]
@@ -3576,7 +3641,14 @@ mod tests {
         let stamp = (1, groups.as_ptr() as usize);
         let marks = HashSet::from(["w-old".to_owned()]);
         let mut layout = LayoutCache::default();
-        let families = layout.sync(stamp, None, &groups, &BTreeMap::new(), (&marks, 1));
+        let families = layout.sync(
+            stamp,
+            None,
+            &groups,
+            &BTreeMap::new(),
+            (&marks, 1),
+            &Default::default(),
+        );
         let mut filter = FilterCache::default();
         let visible = filter.sync(stamp, "old", &groups);
         let shown: Vec<&Row> = families[0]

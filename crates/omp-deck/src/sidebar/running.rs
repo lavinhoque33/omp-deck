@@ -77,6 +77,9 @@ type Key = ((u64, usize), Option<PathBuf>, u64);
 pub(super) struct RunningCache {
     key: Option<Key>,
     rows: Vec<Row>,
+    /// Dock order before folder filtering: a worktree may be outside the scope of its primary.
+    pub(super) ranks: HashMap<(usize, usize), usize>,
+    pub(super) revision: u64,
 }
 
 impl RunningCache {
@@ -90,7 +93,8 @@ impl RunningCache {
             fingerprint(input),
         );
         if self.key.as_ref() != Some(&key) {
-            self.rows = build(input);
+            self.rows = build(input, &mut self.ranks);
+            self.revision += 1;
             self.key = Some(key);
         }
         &self.rows
@@ -121,7 +125,11 @@ fn fingerprint(input: &SidebarInput<'_>) -> u64 {
     h.finish()
 }
 
-fn build(input: &SidebarInput<'_>) -> Vec<Row> {
+fn build(input: &SidebarInput<'_>, ranks: &mut HashMap<(usize, usize), usize>) -> Vec<Row> {
+    ranks.clear();
+    if input.running.blind || input.running.alive.is_empty() {
+        return Vec::new();
+    }
     let snap = input.running;
     let mut tab_of: HashMap<&str, usize> = HashMap::new();
     for (i, t) in input.tabs.iter().enumerate() {
@@ -173,6 +181,15 @@ fn build(input: &SidebarInput<'_>) -> Vec<Row> {
             row.loc = f.map(|(loc, _)| loc);
         }
     }
+    for row in &mut rows {
+        row.active = is_active(status_of(input, row));
+    }
+    order(&mut rows);
+    for (rank, row) in rows.iter().enumerate() {
+        if let Some(loc) = row.loc {
+            ranks.entry(loc).or_insert(rank);
+        }
+    }
     if let Some(scope) = input.scope {
         rows.retain(|r| {
             let cwd = match (r.loc, input.groups) {
@@ -188,10 +205,6 @@ fn build(input: &SidebarInput<'_>) -> Vec<Row> {
             cwd.is_some_and(|c| folder_scope::contains(scope, c))
         });
     }
-    for row in &mut rows {
-        row.active = is_active(status_of(input, row));
-    }
-    order(&mut rows);
     rows
 }
 
@@ -201,14 +214,6 @@ fn status_of(input: &SidebarInput<'_>, row: &Row) -> TabStatus {
         Some((i, tab)) => tab.status(i == input.active_tab),
         None => TabStatus::of(None, input.running.activity_of(&row.name), false),
     }
-}
-/// Whether the dock shows at all: hidden when blind, nothing alive, or nothing in scope.
-fn rows_for<'c>(cache: &'c mut RunningCache, input: &SidebarInput<'_>) -> &'c [Row] {
-    if input.running.blind || input.running.alive.is_empty() {
-        return &[];
-    }
-    let rows = cache.sync(input);
-    if rows.is_empty() { &[] } else { rows }
 }
 
 /// The dock's chrome height: grab strip + header + top border.
@@ -249,7 +254,7 @@ pub(super) fn measure(
     cache: &mut RunningCache,
     sidebar_h: f32,
 ) -> f32 {
-    let rows = rows_for(cache, input);
+    let rows = cache.sync(input);
     dock_height_for(input, rows.len(), sidebar_h)
 }
 
@@ -263,7 +268,7 @@ pub(super) fn show_dock(
     sidebar_h: f32,
     out: &mut SidebarOutput,
 ) {
-    let rows: Vec<Row> = rows_for(cache, input).to_vec();
+    let rows = &cache.rows;
     if rows.is_empty() || height <= 0.0 {
         return;
     }
@@ -390,7 +395,7 @@ pub(super) fn show_dock(
         .show(&mut child, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.add_space(3.0);
-            for row in &rows {
+            for row in rows {
                 running_row(ui, input, row, out);
             }
             ui.add_space(3.0);
