@@ -91,7 +91,7 @@ pub enum OpError {
 #[derive(Debug, Clone)]
 struct Entry {
     k: String,
-    p: Map<String, Value>,
+    p: Arc<Map<String, Value>>,
     parent: Option<String>,
     children: Vec<String>,
     settled: bool,
@@ -142,6 +142,12 @@ impl<'a> NodeRef<'a> {
     }
 
     pub fn props(&self) -> &'a Map<String, Value> {
+        &self.entry.p
+    }
+
+    /// Retains the current property payload without copying its contents. Future document
+    /// edits leave this version intact.
+    pub fn shared_props(&self) -> &'a Arc<Map<String, Value>> {
         &self.entry.p
     }
 
@@ -234,7 +240,7 @@ impl Surface {
             open.id.clone(),
             Entry {
                 k: "col".to_owned(),
-                p: Map::new(),
+                p: Arc::default(),
                 parent: None,
                 children: Vec::new(),
                 settled: false,
@@ -446,7 +452,7 @@ impl Surface {
             id.clone(),
             Entry {
                 k,
-                p: strip_nulls(p),
+                p: Arc::new(strip_nulls(p)),
                 parent: Some(parent.to_owned()),
                 children,
                 settled: false,
@@ -522,11 +528,14 @@ impl Surface {
             }
             Op::Set { id, props } => {
                 let e = self.entry_mut(&id)?;
-                for (k, v) in props {
-                    if v.is_null() {
-                        e.p.remove(&k);
-                    } else {
-                        e.p.insert(k, v);
+                if !props.is_empty() {
+                    let current = Arc::make_mut(&mut e.p);
+                    for (k, v) in props {
+                        if v.is_null() {
+                            current.remove(&k);
+                        } else {
+                            current.insert(k, v);
+                        }
                     }
                 }
                 e.changed = now;
@@ -535,10 +544,11 @@ impl Surface {
             }
             Op::Text { id, mode, text } => {
                 let e = self.entry_mut(&id)?;
-                match (mode, e.p.get_mut("text")) {
+                let props = Arc::make_mut(&mut e.p);
+                match (mode, props.get_mut("text")) {
                     (TextMode::Append, Some(Value::String(s))) => s.push_str(&text),
                     (TextMode::Append, Some(Value::Null) | None) | (TextMode::Replace, _) => {
-                        e.p.insert("text".to_owned(), Value::String(text));
+                        props.insert("text".to_owned(), Value::String(text));
                     }
                     (TextMode::Append, Some(_)) => return Err(OpError::TextNotString(id)),
                 }
@@ -554,7 +564,8 @@ impl Surface {
                     at,
                     end,
                 };
-                match e.p.get_mut("text") {
+                let props = Arc::make_mut(&mut e.p);
+                match props.get_mut("text") {
                     Some(Value::String(s)) => {
                         let (a, b) = utf16_range(
                             s,
@@ -568,7 +579,7 @@ impl Surface {
                         if at != 0 || del != 0 {
                             return Err(bad());
                         }
-                        e.p.insert("text".to_owned(), Value::String(text));
+                        props.insert("text".to_owned(), Value::String(text));
                     }
                     Some(_) => return Err(OpError::TextNotString(id)),
                 }
@@ -1233,7 +1244,7 @@ impl Document {
                         && let Some(e) = surface.nodes.get(&id)
                         && e.k == "toast"
                     {
-                        let mut p = e.p.clone();
+                        let mut p = (*e.p).clone();
                         // The age of a replayed node belongs to its old text.
                         p.remove("age");
                         let node = Node {

@@ -4,10 +4,9 @@
 //!
 //! The terminal's TSP mirror lives behind a mutex the output thread also takes, so the renderer
 //! never draws from it directly: [`Snap::sync`] walks the document once per revision (inside one
-//! short [`deck_term::TspHandle::with`]) and re-copies only nodes whose props changed (their
-//! `changed_at` stamp moved). Every node carries a local generation and a subtree fingerprint, the
-//! keys of the renderer's caches (parsed markdown, measured heights) so nothing is recomputed for
-//! nodes omp did not touch.
+//! short [`deck_term::TspHandle::with`]) and shares immutable node props with the mirror.
+//! Every node carries a local generation and a subtree fingerprint, the keys of the renderer's
+//! caches (parsed markdown, measured heights) so nothing is recomputed for nodes omp did not touch.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,7 +38,7 @@ pub enum Follow {
 pub struct SNode {
     pub id: String,
     pub kind: String,
-    pub props: Props,
+    pub props: Arc<Props>,
     pub children: Vec<String>,
     /// The parent node (`None` for the surface root).
     pub parent: Option<String>,
@@ -203,12 +202,13 @@ impl Snap {
         self.nodes.clear();
         self.order.clear();
         self.next_gen += 1;
+        let props = Arc::default();
         self.nodes.insert(
             "main".to_owned(),
             SNode {
                 id: "main".to_owned(),
                 kind: "col".to_owned(),
-                props: Props::new(),
+                props: Arc::clone(&props),
                 children: ids.to_vec(),
                 parent: None,
                 changed: Instant::now(),
@@ -226,7 +226,7 @@ impl Snap {
                 SNode {
                     id: id.clone(),
                     kind: "md".to_owned(),
-                    props: Props::new(),
+                    props: Arc::clone(&props),
                     children: Vec::new(),
                     parent: Some("main".to_owned()),
                     changed: Instant::now(),
@@ -312,7 +312,7 @@ impl Snap {
         let unchanged = self.nodes.get(id).is_some_and(|old| {
             old.changed == n.changed_at()
                 && old.kind == n.kind()
-                && old.props.len() == n.props().len()
+                && Arc::ptr_eq(&old.props, n.shared_props())
         });
         if !unchanged {
             self.next_gen += 1;
@@ -326,7 +326,7 @@ impl Snap {
                 SNode {
                     id: id.to_owned(),
                     kind: n.kind().to_owned(),
-                    props: n.props().clone(),
+                    props: Arc::clone(n.shared_props()),
                     children,
                     parent: None,
                     changed: n.changed_at(),
@@ -575,6 +575,44 @@ pub(crate) mod tests {
         assert!(s.composer().is_some_and(|c| c.flag("sendable")));
         // Nothing moved: nothing to do.
         assert!(!sync_doc(&mut s, &m));
+    }
+
+    #[test]
+    fn a_snapshot_keeps_its_text_until_the_next_sync_even_at_the_same_receive_time() {
+        use serde_json::json;
+
+        let mut m = fixture_mirror(usize::MAX);
+        let mut s = Snap::default();
+        let now = Instant::now();
+        let apply = |ops: Value, m: &mut Mirror| {
+            let seq = m.document().surface("s:1").unwrap().last_seq().unwrap() + 1;
+            let body = serde_json::json!({"sf": "s:1", "s": seq, "ops": ops});
+            let wire = encode_message(Verb::Frame, &[], &serde_json::to_vec(&body).unwrap());
+            m.feed(&wire, now);
+        };
+        apply(
+            json!([["add", "bench-md", "main", null, {
+                "id": "bench-md", "k": "md", "p": {"text": "old😀", "tone": "info"}
+            }]]),
+            &mut m,
+        );
+        sync_doc(&mut s, &m);
+        apply(
+            json!([
+                ["set", "bench-md", {"tone": null, "role": "answer"}],
+                ["text", "bench-md", "append", "!"],
+                ["splice", "bench-md", 0, 3, "new"]
+            ]),
+            &mut m,
+        );
+        let before = s.nodes.get("bench-md").unwrap();
+        assert_eq!(before.text(), "old😀");
+        assert_eq!(before.tone(), Some("info"));
+        sync_doc(&mut s, &m);
+        let after = s.nodes.get("bench-md").unwrap();
+        assert_eq!(after.text(), "new😀!");
+        assert_eq!(after.tone(), None);
+        assert_eq!(after.role(), "answer");
     }
 
     #[test]

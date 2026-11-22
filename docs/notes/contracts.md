@@ -3459,6 +3459,8 @@ the host after omp's first frames), so it lands in step 2; step 3 is reduced to 
   (all 18; colors from the theme, not omp's palette); omp `tone`s map onto theme colors. Markdown via the existing
   styled markdown renderer where it fits; code/diff/ansi blocks in the terminal font. No allocation per frame per
   node beyond egui layout; cache laid-out jobs by (node id, revision).
+  The renderer's snapshot shares immutable node properties with the terminal mirror; document edits
+  copy on write, so rendering never needs to hold the mirror lock or duplicate settled payloads.
 - Composer = omp's `editor` node rendered natively (text, cursor, selection, placeholder, ghost); keys go to omp as
   PTY bytes; paste through `paste_bytes`; send button/Enter per omp (`submit`); every clickable node sends the
   event its `actions` declare (`toggle`/`select`/`activate`/`action`/`change`); `copy`/`open`/`zoom` local.

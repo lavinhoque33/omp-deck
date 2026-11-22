@@ -2729,10 +2729,12 @@ mod tests {
         image.id = "image-menu".into();
         image.kind = "image".into();
         image.children.clear();
-        image.props = serde_json::from_value(json!({
-            "href": "file:///tmp/sandbox-image.png", "actions": {"menu": ["open"]}
-        }))
-        .expect("image props");
+        image.props = Arc::new(
+            serde_json::from_value(json!({
+                "href": "file:///tmp/sandbox-image.png", "actions": {"menu": ["open"]}
+            }))
+            .expect("image props"),
+        );
         let acts = build_acts(&snap, &image);
         assert_eq!(acts.len(), 1);
         assert_eq!(acts[0].label, "Open");
