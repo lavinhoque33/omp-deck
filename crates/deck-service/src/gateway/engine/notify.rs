@@ -249,7 +249,7 @@ impl Engine {
                             program.args.iter().map(Into::into).collect();
                         args.push("--activate".into());
                         args.push(ticket.into_os_string());
-                        deck_host::launch_detached(&program.program, args).map(reap)
+                        crate::gateway::login_env::launch_app(&program.program, args).map(reap)
                     })
                     .map_err(|e| e.to_string());
             Fin::Activated(result)

@@ -2686,6 +2686,15 @@ file; use omp's normal credential store for unattended fresh-login operation. An
 owner still inherits the native launch environment. Background means a logged-in, awake user
 session, not before login, after logout or while the machine is asleep/offline.
 
+Login-scoped variables (`gateway::login_env::LOGIN_ENV`: `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`,
+`DBUS_SESSION_BUS_ADDRESS`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`) are never part of the startup
+context (an older file's values are skipped by `apply_env`): they change per login (KWin may serve
+`wayland-1`, the X authority file name is random), and a stale `WAYLAND_DISPLAY` broke omp's
+clipboard (`Clipboard is empty` on image paste). A GUI reports its own in `Hello.login_env`; every
+session launch (`prepare`) and every app launch from the gateway sets them from the focused/most
+recent reporting GUI, else from the systemd user manager's `Environment` (D-Bus), else the
+gateway's own; a variable the current login lacks but the gateway inherited is set empty.
+
 ### Notifications, packaging and update
 
 The gateway runs the one canonical notification tracker/inbox while the GUI is closed. Native OS

@@ -1191,6 +1191,11 @@ impl Shared {
             pid: std::process::id(),
             profile: self.profile.clone(),
             attach: None,
+            login_env: if self.role == Role::Gui {
+                crate::gateway::login_env::of_this_process()
+            } else {
+                Vec::new()
+            },
         }
     }
 

@@ -26,6 +26,7 @@ mod engine;
 pub mod jobs;
 pub mod journal;
 pub mod lifetime;
+pub mod login_env;
 pub mod protocol;
 pub mod push;
 pub mod remote;
@@ -187,9 +188,10 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     deck_core::platform::write_private(path, bytes)
 }
 
-/// Environment variables a fresh-login owner needs to find the same omp, roots and desktop
-/// session the GUI saw. Values only, never credentials: tokens/API keys are not listed and stay
-/// in omp's own credential store.
+/// Environment variables a fresh-login owner needs to find the same omp and roots the GUI saw.
+/// Values only, never credentials: tokens/API keys are not listed and stay in omp's own
+/// credential store. Never the login-scoped display/bus variables ([`login_env::LOGIN_ENV`]):
+/// those of the login that enabled the gateway go stale with the next one.
 pub const STARTUP_ENV: &[&str] = &[
     "PATH",
     "HOME",
@@ -212,10 +214,6 @@ pub const STARTUP_ENV: &[&str] = &[
     "XDG_RUNTIME_DIR",
     "XDG_DATA_DIRS",
     "XDG_CONFIG_DIRS",
-    "XDG_CURRENT_DESKTOP",
-    "DISPLAY",
-    "WAYLAND_DISPLAY",
-    "DBUS_SESSION_BUS_ADDRESS",
     "USERPROFILE",
     "APPDATA",
     "LOCALAPPDATA",
@@ -391,13 +389,15 @@ impl StartupContext {
     }
 
     /// Applies the context to this process before any thread starts (supervisor-started
-    /// process): the recorded variables are set, nothing else is removed. An explicit host
-    /// override is restored; otherwise the host is the one next to this executable.
+    /// process): the recorded variables are set, nothing else is removed. Login-scoped variables
+    /// an older context still records are skipped (the current login's reach each child through
+    /// [`login_env::overrides`]). An explicit host override is restored; otherwise the host is
+    /// the one next to this executable.
     ///
     /// # Safety
     /// Mutates the process environment: call only while the process is single-threaded.
     pub unsafe fn apply_env(&self) {
-        for (k, v) in &self.env {
+        for (k, v) in self.env.iter().filter(|(k, _)| !login_env::is_login_var(k)) {
             // SAFETY: the caller guarantees no other thread runs.
             unsafe { std::env::set_var(k, v) };
         }

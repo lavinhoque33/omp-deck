@@ -175,6 +175,8 @@ impl ViewLink {
                 target: self.target.clone(),
                 view: self.view,
             }),
+            // Views carry no login: their control link reported it.
+            login_env: Vec::new(),
         };
         match handshake(&mut stream, &hello, &shared.profile) {
             Handshake::Welcome(w) if w.epoch != self.target.epoch => {

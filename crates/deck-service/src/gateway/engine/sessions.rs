@@ -2258,7 +2258,9 @@ impl Engine {
             tools.report &= job.spec.agent_child;
             let tools = tools.env_value();
             let checkpoints = self.cfg.checkpoints;
+            let gui_login = self.gui_login_env();
             self.spawn_worker("launch", move || {
+                let login = crate::gateway::login_env::overrides(gui_login.as_deref());
                 Fin::Prepared(Box::new(prepare(
                     job,
                     name,
@@ -2269,6 +2271,7 @@ impl Engine {
                     omp,
                     tools,
                     checkpoints,
+                    login,
                 )))
             });
             return;
@@ -2569,7 +2572,8 @@ fn effective_view(
     }
 }
 
-/// Worker: control dir and environment, the resolved argv and the backend launch.
+/// Worker: control dir and environment, the resolved argv and the backend launch. `login` =
+/// the current login's display/bus variables ([`crate::gateway::login_env::overrides`]).
 #[allow(clippy::too_many_arguments)]
 fn prepare(
     mut job: LaunchJob,
@@ -2581,6 +2585,7 @@ fn prepare(
     omp: Option<PathBuf>,
     tools: Option<String>,
     checkpoints: bool,
+    login: Vec<(String, String)>,
 ) -> Prepared {
     let created = match (&mux, &name) {
         (Some(m), Some(n)) => !m.has_session(n),
@@ -2666,6 +2671,7 @@ fn prepare(
         }
         .to_owned(),
     ));
+    env.extend(login);
     let mut argv = job.spec.argv.clone();
     // The detected omp may live outside PATH (`~/.local/bin`).
     if let (Some(first), Some(omp)) = (argv.first_mut(), &omp)
@@ -3134,6 +3140,7 @@ mod tests {
             None,
             None,
             false,
+            Vec::new(),
         );
         assert_eq!(chat.view, SessionView::Chat);
         match chat.launch.expect("launch") {
@@ -3159,6 +3166,7 @@ mod tests {
             None,
             None,
             false,
+            Vec::new(),
         );
         assert_eq!(term.view, SessionView::Terminal);
         assert!(matches!(term.launch, Ok(Launch::Host(s)) if !s.tsp));
@@ -3173,6 +3181,7 @@ mod tests {
             None,
             None,
             false,
+            Vec::new(),
         );
         assert_eq!(tool.view, SessionView::Terminal);
         assert!(matches!(tool.launch, Ok(Launch::Host(s)) if !s.tsp));
@@ -3197,6 +3206,7 @@ mod tests {
             None,
             None,
             false,
+            Vec::new(),
         );
         assert_eq!(p.view, SessionView::Terminal);
         assert!(matches!(p.launch, Ok(Launch::Pty(_))));
@@ -3211,6 +3221,7 @@ mod tests {
             None,
             None,
             false,
+            Vec::new(),
         );
         assert_eq!(p.view, SessionView::Terminal);
         assert!(matches!(p.launch, Ok(Launch::Pty(_))));

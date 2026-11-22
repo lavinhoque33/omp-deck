@@ -344,6 +344,8 @@ struct Conn {
     agents: Option<AgentsTarget>,
     /// When `agents` was set (the most recent wins when several follow one).
     agents_seq: u64,
+    /// A GUI's login-scoped variables from its hello (empty: unknown).
+    login_env: Vec<(String, String)>,
 }
 
 impl Conn {
@@ -878,6 +880,11 @@ impl Engine {
                 fleet: Vec::new(),
                 agents: None,
                 agents_seq: 0,
+                login_env: if hello.role == Role::Gui {
+                    hello.login_env
+                } else {
+                    Vec::new()
+                },
             },
         );
         self.resend_agent_reviews(conn);
@@ -899,6 +906,16 @@ impl Engine {
             self.decline_confirmations(&c.client_id);
         }
         self.dirty.gateway = true;
+    }
+
+    /// The login a connected GUI reported (the focused one, else the most recent): the display
+    /// and bus its sessions use. `None` without a reporting GUI.
+    fn gui_login_env(&self) -> Option<Vec<(String, String)>> {
+        self.conns
+            .values()
+            .filter(|c| c.is(Role::Gui) && !c.login_env.is_empty())
+            .max_by_key(|c| (c.state.focused, c.seq))
+            .map(|c| c.login_env.clone())
     }
 
     /// Queues `reply` on link `conn` (gone links are skipped).

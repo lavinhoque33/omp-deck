@@ -152,6 +152,10 @@ pub struct Hello {
     pub profile: Profile,
     /// `Some` = a frontend link for this session view.
     pub attach: Option<Attach>,
+    /// A GUI's login-scoped variables ([`super::login_env::LOGIN_ENV`]): the display and bus the
+    /// sessions it opens must use. Empty for other roles and older GUIs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub login_env: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

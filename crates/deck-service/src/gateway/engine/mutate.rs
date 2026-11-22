@@ -1989,7 +1989,7 @@ impl Engine {
         self.spawn_worker("launch-gui", move || {
             let mut args: Vec<std::ffi::OsString> = program.args.iter().map(Into::into).collect();
             args.extend(extra);
-            let result = deck_host::launch_detached(&program.program, args)
+            let result = crate::gateway::login_env::launch_app(&program.program, args)
                 .map(super::notify::reap)
                 .map_err(|e| e.to_string());
             Fin::Logged { what, result }

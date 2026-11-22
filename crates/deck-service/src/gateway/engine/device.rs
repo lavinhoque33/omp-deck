@@ -1078,6 +1078,7 @@ impl Engine {
                 fleet: Vec::new(),
                 agents: None,
                 agents_seq: 0,
+                login_env: Vec::new(),
             },
         );
         (conn, out)

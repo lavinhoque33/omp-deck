@@ -264,6 +264,7 @@ impl Link {
             pid: std::process::id(),
             profile: profile.clone(),
             attach: None,
+            login_env: Vec::new(),
         };
         let handshake = (|| -> Result<Welcome, LinkError> {
             let bytes =
