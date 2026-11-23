@@ -443,6 +443,8 @@ pub struct CardAct {
     pub keys: Option<String>,
     pub danger: bool,
     pub disabled: bool,
+    /// A separator comes before it in the context menu (omp's `"-"` entries).
+    pub sep: bool,
     pub what: What,
     /// Key of the "Copied" feedback in `Local.copied`.
     pub flash_key: String,
@@ -463,6 +465,7 @@ impl CardAct {
             keys: None,
             danger: false,
             disabled: false,
+            sep: false,
             flash_key: format!("{}\0{tag}", n.id),
             what,
         }
@@ -506,8 +509,12 @@ struct Offered {
     id: String,
     label: Option<String>,
     keys: Option<String>,
+    /// The Tern icon omp named for the entry.
+    icon: Option<&'static str>,
     danger: bool,
     disabled: bool,
+    /// A separator comes before the entry in the context menu.
+    sep: bool,
 }
 
 /// The actions a card offers, in this order: what omp attached (`tools[]`, then `actions.menu`),
@@ -557,28 +564,58 @@ fn build_acts(snap: &Snap, n: &SNode) -> Vec<CardAct> {
                 disabled: t
                     .get("disabled")
                     .is_some_and(|d| d.as_bool() != Some(false)),
+                ..Offered::default()
             });
         }
     }
+    // `actions.menu` is a list of action names, or omp's own menu: `{id, label, icon?, disabled?}`
+    // entries split by `"-"` separators (a /btw note's). That menu is complete: nothing local is
+    // added to it.
+    let mut curated = false;
+    let mut sep = false;
     for m in n
         .obj("actions")
         .and_then(|a| a.get("menu"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(Value::as_str)
     {
-        offered.push(Offered {
-            id: m.to_owned(),
-            ..Offered::default()
-        });
+        match m {
+            Value::String(s) if s == "-" => sep = true,
+            Value::String(s) => offered.push(Offered {
+                id: s.clone(),
+                sep: std::mem::take(&mut sep),
+                ..Offered::default()
+            }),
+            Value::Object(o) => {
+                let Some(id) = o.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                curated = true;
+                let text = |key: &str| o.get(key).and_then(Value::as_str);
+                offered.push(Offered {
+                    id: id.to_owned(),
+                    label: text("label").map(str::to_owned),
+                    icon: text("icon").and_then(known_icon),
+                    danger: o.get("danger").and_then(Value::as_bool).unwrap_or(false),
+                    disabled: o
+                        .get("disabled")
+                        .is_some_and(|d| d.as_bool() != Some(false)),
+                    sep: std::mem::take(&mut sep),
+                    ..Offered::default()
+                });
+            }
+            _ => {}
+        }
     }
     for Offered {
         id,
         label,
         keys,
+        icon,
         danger,
         disabled,
+        sep,
     } in offered
     {
         let act = match id.as_str() {
@@ -591,7 +628,7 @@ fn build_acts(snap: &Snap, n: &SNode) -> Vec<CardAct> {
                     n,
                     What::Send(id.clone()),
                     &label,
-                    glyph_of(&id),
+                    icon.unwrap_or_else(|| glyph_of(&id)),
                 ))
             }
         };
@@ -602,8 +639,12 @@ fn build_acts(snap: &Snap, n: &SNode) -> Vec<CardAct> {
             a.keys = keys;
             a.danger = danger;
             a.disabled = disabled;
+            a.sep = sep;
             add(&mut acts, a);
         }
+    }
+    if curated {
+        return acts;
     }
     for id in ["open", "copy"] {
         if let Some(a) = local(id, n) {
@@ -620,7 +661,8 @@ fn build_acts(snap: &Snap, n: &SNode) -> Vec<CardAct> {
     acts
 }
 
-/// The Tern icon for an action id omp named (`retry` → refresh, unknown ids get the neutral dot).
+/// The Tern icon for an action id omp named (`retry` → refresh; a prefixed id by its last word,
+/// `btw-branch` → branch; unknown ids get the neutral dot).
 fn glyph_of(id: &str) -> &'static str {
     match id {
         "rerun" | "retry" | "refresh" => "refresh",
@@ -629,8 +671,59 @@ fn glyph_of(id: &str) -> &'static str {
         "edit" => "edit",
         "delete" | "remove" => "trash",
         "expand" | "collapse" => "chev",
-        _ => "dot",
+        "fold" => "chev-up",
+        "copy" => "copy",
+        "branch" => "branch",
+        "history" => "history",
+        "inject" | "send" => "send",
+        "focus" => "message",
+        _ => id
+            .rsplit_once(['-', '.'])
+            .map_or("dot", |(_, last)| glyph_of(last)),
     }
+}
+
+/// Tern icon names omp puts on menu entries that [`glyphs::lucide`] draws, as static names.
+fn known_icon(name: &str) -> Option<&'static str> {
+    const KNOWN: &[&str] = &[
+        "copy",
+        "branch",
+        "history",
+        "stop",
+        "send",
+        "trash",
+        "edit",
+        "refresh",
+        "rewind",
+        "external-link",
+        "open",
+        "check",
+        "x",
+        "chev",
+        "chev-up",
+        "chev-right",
+        "eye",
+        "play",
+        "pause",
+        "plus",
+        "minus",
+        "search",
+        "file-text",
+        "bot",
+        "message",
+        "star",
+        "bookmark",
+        "tag",
+        "flag",
+        "download",
+        "upload",
+        "save",
+        "link",
+        "folder",
+        "terminal",
+        "list",
+    ];
+    KNOWN.iter().find(|k| **k == name).copied()
 }
 
 /// `rerun-last` → `Rerun last`.

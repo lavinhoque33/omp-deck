@@ -202,3 +202,19 @@ hello/ack harness and replays them through a fake omp.
   first, then the Focus, then the rest with the pressed field as the effective focus (`holds_keys_after`). The
   context menu's Paste sends Focus for its target first. Verified live on 19.0.0 (Xvfb): form ↔ composer clicks,
   `/settings` + Enter in a focused field, selection isolation, menu Paste.
+
+## The /btw note (omp 19.1, `packages/tui/src/overlays/btw-note.ts`, `modes/controllers/btw-controller.ts`)
+- Under native rendering omp no longer opens its `omp.overlay.btw` panel (`#i = !ui.nativeRendering && …`); the
+  answer is a note appended to the transcript: `col omp.btw.note` (`.active` while follow-ups go to it; the composer
+  shows `btw Ask about this…`) holding `row omp.btw.note.head` (text `.tag` "btw", md `.question`, `.tools` copy/x
+  icons), `col omp.btw.note.turn` per turn and an optional text `.status`; folded = `row omp.btw.note.folded`
+  (chev icon, text `.topic` led by a `btw` span, spinner while running). Resumed sessions restore notes folded.
+- Gestures: `actions {click: btw-focus | btw-expand, menu: [...], hold: [...]}`; the menu is an array of
+  `{id, label, icon?}` entries split by `"-"`: `btw-copy`, `btw-inject` (steering prompt ready), `btw-stop` (running)
+  or `btw-branch` (complete, no follow-ups; current record only), `btw-history`, then `btw-fold`/`btw-expand`.
+  A pick is an `action {act: <id>}` on the note's id. `/btw` without a question still opens the
+  `omp.overlay.btwHistory` overlay.
+- OmpDeck (`chat_view/btw.rs`): its own block in a hue outside every style's accents (fuchsia, lime where a style's
+  accents are fuchsia-like; test `the_btw_hue_never_matches_a_styles_accents_or_irc`), rail, `BTW` tag, every menu
+  entry as a header button and in the right-click menu (generic: any node's `actions.menu`, `render::claim_menu`).
+  Verified live on 19.1.1 (Xvfb): expand → active, right-click menu, Open in BTW history, fold button.

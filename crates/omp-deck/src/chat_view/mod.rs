@@ -15,6 +15,7 @@
 
 mod ansi;
 mod ask_card;
+mod btw;
 mod code;
 mod ctx;
 mod dock;
@@ -4227,6 +4228,172 @@ mod tests {
         // The draft keeps the rest of the line, right of the chip.
         let (_, draft) = drawn(&out, "Keep this draft").expect("the draft is painted");
         assert!(draft.left() >= chip.right(), "{draft:?} {chip:?}");
+    }
+
+    /// A short label beside a paragraph wider than the line keeps its line: the row lowers the
+    /// widest child first (shrunk in proportion, omp 19's `btw` tag wrapped to `bt` / `w`).
+    #[test]
+    fn a_short_label_keeps_one_line_beside_a_long_paragraph() {
+        let para = "this db setall change to revert the failed updates, is that something \
+            that was already there before this batched report thingy and we fixing it now? "
+            .repeat(3);
+        let row = serde_json::json!(["add", "r", "main", null, {
+            "id": "r", "k": "row", "p": {"gap": "sm", "align": "start"},
+            "c": [
+                {"id": "r/tag", "k": "text", "p": {"spans": [{"t": "btw", "s": "accent"}]}},
+                {"id": "r/q", "k": "md", "p": {"text": para}},
+                {"id": "r/tools", "k": "row", "p": {"gap": "xs", "align": "center"},
+                    "c": [{"id": "r/copy", "k": "icon", "p": {"name": "copy"}},
+                          {"id": "r/x", "k": "icon", "p": {"name": "x"}}]}]}]);
+        let mut h = Harness::with_frames("row-short-label", &[serde_json::json!([row])]);
+        show_until(&mut h, "btw");
+        let out = h.settle();
+        fn rows(shape: &Shape) -> Option<usize> {
+            match shape {
+                Shape::Text(t) if t.galley.text() == "btw" => Some(t.galley.rows.len()),
+                Shape::Vec(v) => v.iter().find_map(rows),
+                _ => None,
+            }
+        }
+        let tag_rows = out.shapes.iter().find_map(|s| rows(&s.shape));
+        assert_eq!(tag_rows, Some(1), "the label is drawn on one line");
+    }
+
+    /// omp 19's `/btw` note (`describe` of its BtwNoteComponent): open, or folded to one line.
+    fn btw_note_ops(folded: bool) -> serde_json::Value {
+        let menu = serde_json::json!([
+            {"id": "btw-copy", "label": "Copy answer", "icon": "copy"},
+            {"id": "btw-branch", "label": "Branch into chat", "icon": "branch"},
+            {"id": "btw-history", "label": "Open in BTW history", "icon": "history"},
+            "-",
+            if folded {
+                serde_json::json!({"id": "btw-expand", "label": "Expand"})
+            } else {
+                serde_json::json!({"id": "btw-fold", "label": "Fold to one line"})
+            }
+        ]);
+        let note = if folded {
+            serde_json::json!({"id": "btw-1", "k": "row", "p": {
+                "role": "omp.btw.note.folded", "gap": "sm", "align": "center",
+                "title": "Show this side answer",
+                "actions": {"click": "btw-expand", "menu": menu, "hold": menu}},
+                "c": [
+                    {"id": "btw-1/chev", "k": "icon", "p": {"name": "chev-r"}},
+                    {"id": "btw-1/topic", "k": "text", "p": {"role": "omp.btw.note.topic",
+                        "spans": [{"t": "btw", "s": "accent"}, {"t": "  "},
+                                  {"t": "Is the setAll bug older?"}],
+                        "truncate": "end", "lines": 1}}]})
+        } else {
+            serde_json::json!({"id": "btw-1", "k": "col", "p": {
+                "role": "omp.btw.note", "gap": "sm",
+                "actions": {"click": "btw-focus", "menu": menu, "hold": menu}},
+                "c": [
+                    {"id": "btw-1/head", "k": "row", "p": {
+                        "role": "omp.btw.note.head", "gap": "sm", "align": "start"},
+                        "c": [
+                            {"id": "btw-1/tag", "k": "text", "p": {
+                                "role": "omp.btw.note.tag",
+                                "spans": [{"t": "btw", "s": "accent"}]}},
+                            {"id": "btw-1/q", "k": "md", "p": {
+                                "role": "omp.btw.note.question",
+                                "text": "Is the setAll bug older?"}},
+                            {"id": "btw-1/tools", "k": "row", "p": {
+                                "role": "omp.btw.note.tools", "gap": "xs"}, "c": [
+                                {"id": "btw-1/copy", "k": "icon", "p": {"name": "copy",
+                                    "actions": {"click": "btw-copy"}}},
+                                {"id": "btw-1/fold", "k": "icon", "p": {"name": "x",
+                                    "actions": {"click": "btw-fold"}}}]}]},
+                    {"id": "btw-1/turn-0", "k": "col", "p": {
+                        "role": "omp.btw.note.turn", "gap": "sm"}, "c": [
+                        {"id": "btw-1/a", "k": "md", "p": {
+                            "text": "Yes, it predates the batch logging."}}]}]})
+        };
+        serde_json::json!([["add", "btw-1", "main", null, note]])
+    }
+
+    /// The `action` events the child got for node `id`, as their `act`s.
+    fn acts_for(typed: &[u8], id: &str) -> Vec<String> {
+        sent(typed, "action")
+            .into_iter()
+            .filter(|e| e["id"] == id)
+            .filter_map(|e| e["act"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// The note is drawn as its own block (the `BTW` tag, the question, the answer), its
+    /// right-click menu lists omp's entries and sends the picked one, and a click on the block
+    /// sends its `btw-focus` (follow-ups go to it).
+    #[test]
+    fn a_btw_note_is_its_own_block_with_omps_menu_and_focus_click() {
+        let mut h = Harness::with_frames("btw-note", &[btw_note_ops(false)]);
+        // The menu's caption is set in the app style's `Section` text style.
+        crate::theme::apply(
+            &h.ctx,
+            deck_core::config::UiStyle::ALL[0],
+            deck_core::config::Density::Comfortable,
+            deck_core::config::UiFont::Auto,
+            true,
+        );
+        h.focus();
+        show_until(&mut h, "BTW");
+        let out = h.settle();
+        for want in [
+            "BTW",
+            "Is the setAll bug older?",
+            "Yes, it predates the batch logging.",
+        ] {
+            assert!(centre_of(&out, want).is_some(), "{want:?} is painted");
+        }
+        assert!(
+            centre_of(&out, "btw").is_none(),
+            "omp's inline tag row is replaced"
+        );
+        let q = centre_of(&out, "Is the setAll bug older?").expect("question");
+        let secondary = |pressed| {
+            vec![Event::PointerButton {
+                pos: q,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }]
+        };
+        h.frame(pointer(q, None));
+        h.frame(secondary(true));
+        h.frame(secondary(false));
+        let out = h.frame(vec![]);
+        for want in ["Copy answer", "Open in BTW history", "Fold to one line"] {
+            assert!(centre_of(&out, want).is_some(), "the menu offers {want:?}");
+        }
+        click_at(
+            &mut h,
+            centre_of(&out, "Branch into chat").expect("menu entry"),
+        );
+        assert_eq!(acts_for(&h.typed(b"btw-branch"), "btw-1"), ["btw-branch"]);
+        let out = h.settle();
+        click_at(
+            &mut h,
+            centre_of(&out, "Yes, it predates the batch logging.").expect("answer"),
+        );
+        assert_eq!(
+            acts_for(&h.typed(b"btw-focus"), "btw-1"),
+            ["btw-branch", "btw-focus"]
+        );
+    }
+
+    /// A folded note is one line that opens on a click (`btw-expand`).
+    #[test]
+    fn a_folded_btw_note_opens_on_a_click() {
+        let mut h = Harness::with_frames("btw-folded", &[btw_note_ops(true)]);
+        h.focus();
+        show_until(&mut h, "BTW");
+        let out = h.settle();
+        assert!(
+            centre_of(&out, "btw").is_none(),
+            "omp's own tag is not repeated"
+        );
+        let topic = centre_of(&out, "Is the setAll bug older?").expect("topic");
+        click_at(&mut h, topic);
+        assert_eq!(acts_for(&h.typed(b"btw-expand"), "btw-1"), ["btw-expand"]);
     }
 
     /// A text field beside the composer (as an ask card's), added to `main`.

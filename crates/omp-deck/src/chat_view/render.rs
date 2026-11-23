@@ -67,6 +67,7 @@ pub fn node(cx: &Cx, ui: &mut Ui, n: &SNode) {
     }
     cx.in_node(n.ord, || {
         if transcript::role_node(cx, ui, n)
+            || super::btw::role_node(cx, ui, n)
             || dock::role_node(cx, ui, n)
             || ask_card::role_node(cx, ui, n)
             || page::role_node(cx, ui, n)
@@ -80,7 +81,8 @@ pub fn node(cx: &Cx, ui: &mut Ui, n: &SNode) {
 /// Wraps `add` so a node with `actions.click` is a button: hover pop, hand cursor, tooltip, event.
 /// Kinds with their own gestures are left alone: a fold's `toggle`, and a list's or tabs'
 /// `select`/`activate`, which belong to the row or tab under the pointer (a wrapper would take
-/// the click and address it to the whole node, which omp ignores).
+/// the click and address it to the whole node, which omp ignores). A node with `actions.menu`
+/// takes a right click over it: the chat's context menu then lists omp's entries.
 fn with_click(cx: &Cx, ui: &mut Ui, n: &SNode, add: impl FnOnce(&mut Ui)) {
     let click = n.click();
     let own = (matches!(
@@ -89,12 +91,22 @@ fn with_click(cx: &Cx, ui: &mut Ui, n: &SNode, add: impl FnOnce(&mut Ui)) {
     ) && click.is_none_or(|c| c == "toggle"))
         || (matches!(n.kind.as_str(), "tabs" | "list" | "picker")
             && click.is_some_and(|c| matches!(c, "select" | "activate")));
-    let (Some(act), false) = (click, own) else {
+    let menu = !matches!(n.kind.as_str(), "tool" | "agent" | "image")
+        && n.obj("actions")
+            .and_then(|a| a.get("menu"))
+            .and_then(Value::as_array)
+            .is_some_and(|m| !m.is_empty());
+    let act = click.filter(|_| !own);
+    if act.is_none() && !menu {
         add(ui);
         return;
-    };
+    }
     let inner = ui.scope(add);
     let rect = inner.response.rect;
+    if menu {
+        claim_menu(cx, n, rect);
+    }
+    let Some(act) = act else { return };
     let id = ui.scope_id().with(("click", n.id.as_str()));
     let resp = ui.interact(rect, id, Sense::click());
     let t = ui
@@ -113,6 +125,16 @@ fn with_click(cx: &Cx, ui: &mut Ui, n: &SNode, add: impl FnOnce(&mut Ui)) {
     {
         cx.click(n, d);
     }
+}
+
+/// A right click inside `rect` claims the chat's context menu for `n` (its `actions.menu`
+/// entries); nodes inside nodes finish first, so the innermost wins.
+pub fn claim_menu(cx: &Cx, n: &SNode, rect: Rect) {
+    cx.loc(|l| {
+        if l.ctx_claim.is_none() && l.ctx_click.is_some_and(|p| rect.contains(p)) {
+            l.ctx_claim = Some(super::ctx::Claim::Card(n.id.clone()));
+        }
+    });
 }
 
 /// Dispatch by kind.
@@ -326,20 +348,30 @@ fn row(cx: &Cx, ui: &mut Ui, n: &SNode) {
         .sum();
     let sum = fixed + growing;
     let grow_total: f32 = kids.iter().map(|c| growth(c)).sum();
+    // Fixed siblings that overflow the line share it by lowering the widest first: a short tag or
+    // icon beside a long paragraph keeps its natural width and the paragraph wraps (shrunk in
+    // proportion, the `btw` tag of a /btw note wrapped to `bt`/`w`).
+    let fixed_cap = (fixed > available).then(|| {
+        cap_for(
+            kids.iter()
+                .zip(&widths)
+                .filter(|(c, _)| growth(c) == 0.0)
+                .map(|(_, w)| *w),
+            available,
+        )
+    });
     for (c, w) in kids.iter().zip(&mut widths) {
         if sum > available {
-            // Exhaust the growing bases before shrinking fixed siblings proportionally.
-            *w *= if growth(c) > 0.0 {
-                if growing > 0.0 {
+            // Exhaust the growing bases before shrinking fixed siblings.
+            if growth(c) > 0.0 {
+                *w *= if growing > 0.0 {
                     ((available - fixed).max(0.0) / growing).min(1.0)
                 } else {
                     0.0
-                }
-            } else if fixed > available {
-                available / fixed
-            } else {
-                1.0
-            };
+                };
+            } else if let Some(cap) = fixed_cap {
+                *w = w.min(cap);
+            }
         } else {
             *w = share(*w, growth(c), grow_total, available - sum);
         }
@@ -360,6 +392,31 @@ fn row(cx: &Cx, ui: &mut Ui, n: &SNode) {
         });
     });
     ui.data_mut(|d| d.insert_temp(key, widths));
+}
+
+/// The common cap that fits `widths` into `budget` when every width above it is lowered to it
+/// (`budget` is below their sum): widths within an even share keep theirs, the rest split what
+/// is left evenly.
+fn cap_for(widths: impl Iterator<Item = f32> + Clone, budget: f32) -> f32 {
+    let budget = budget.max(0.0);
+    let mut cap = budget / widths.clone().count().max(1) as f32;
+    // Each pass keeps the widths within the cap, which only raises it; a pass that keeps none
+    // more is final (at most one pass per width).
+    loop {
+        let (kept, kept_sum) = widths
+            .clone()
+            .filter(|w| *w <= cap)
+            .fold((0usize, 0.0f32), |(n, s), w| (n + 1, s + w));
+        let capped = widths.clone().count() - kept;
+        if capped == 0 {
+            return cap;
+        }
+        let next = (budget - kept_sum) / capped as f32;
+        if next <= cap {
+            return cap;
+        }
+        cap = next;
+    }
 }
 
 /// Role whose children omp's TUI draws one per line at full width (the jobs' tiles of `wait`).
@@ -717,7 +774,7 @@ fn card(cx: &Cx, ui: &mut Ui, n: &SNode) {
 
 /// The convex outline `pts` filled with a left→right gradient `a → b`, as one shape (a painter
 /// call would draw immediately; this one can fill a slot reserved behind content).
-fn gradient_h(pts: &[egui::Pos2], a: Color32, b: Color32) -> egui::Shape {
+pub(super) fn gradient_h(pts: &[egui::Pos2], a: Color32, b: Color32) -> egui::Shape {
     let Some(first) = pts.first() else {
         return egui::Shape::Noop;
     };

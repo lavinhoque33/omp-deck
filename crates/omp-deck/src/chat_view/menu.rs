@@ -1,9 +1,9 @@
 //! The right-click menu of the chat view.
 //!
 //! One menu, opened where the click landed, whose content depends on what was clicked: a tool or
-//! agent card (its actions, see [`tools::card_acts`]), the composer (cut, copy, paste, select all)
-//! or the transcript's text (copy the selection, select all). Every card action is also a hover
-//! button on the card's head.
+//! agent card, or any node carrying omp's own `actions.menu` (a /btw note), with its actions (see
+//! [`tools::card_acts`]), the composer (cut, copy, paste, select all) or the transcript's text
+//! (copy the selection, select all). Every card action is also a hover button on the card's head.
 //!
 //! While an egui popup is up the app holds the terminal's input back (keys meant for the menu must
 //! not reach omp), so a clicked entry first ends that hold ([`Cx::release`]): its events are the
@@ -133,14 +133,25 @@ fn card(cx: &Cx, ui: &mut Ui, id: &str) {
         return;
     };
     let ink = cx.ink;
-    let title = super::text::clean(n.str("name").unwrap_or(n.kind.as_str())).into_owned();
-    ui.label(crate::theme::section_caption(&title, ink.faint()));
-    ui.separator();
+    let title = if n.role_under("omp.btw.note") {
+        Some("Side question")
+    } else {
+        n.str("name")
+            .or_else(|| matches!(n.kind.as_str(), "tool" | "agent").then_some(n.kind.as_str()))
+    };
+    if let Some(title) = title {
+        let title = super::text::clean(title).into_owned();
+        ui.label(crate::theme::section_caption(&title, ink.faint()));
+        ui.separator();
+    }
     if cx.loc(|l| l.tsel.has_selection()) {
         copy_selection(cx, ui);
         ui.separator();
     }
     for act in tools::card_acts(cx, n).iter() {
+        if act.sep {
+            ui.separator();
+        }
         let r = menu_item(
             ui,
             glyph(act.icon),
