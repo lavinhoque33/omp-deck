@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use deck_core::agents::{AgentsTarget, AgentsWatcher, TranscriptWatcher};
+use deck_core::agents::{AgentsTarget, AgentsWatcher, LeafAnchor, TranscriptWatcher};
 use deck_core::changes::Changes;
 use deck_core::fleet::{FleetTarget, FleetWatcher};
 use deck_core::inventory::InventoryEntry;
@@ -36,9 +36,14 @@ pub(super) struct Interest {
     inventory_busy: bool,
     changes: HashMap<PathBuf, ChangesWatch>,
     trees: HashMap<PathBuf, (TreeWatcher, u64)>,
-    transcripts: HashMap<PathBuf, (TranscriptWatcher, u64)>,
+    transcripts: HashMap<PathBuf, TranscriptFollow>,
     fleet: Option<FleetFollow>,
     agents: Option<AgentsFollow>,
+}
+
+struct TranscriptFollow {
+    watcher: TranscriptWatcher,
+    seen: u64,
 }
 
 struct FleetFollow {
@@ -58,6 +63,17 @@ fn same<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,
         _ => false,
+    }
+}
+
+impl Interest {
+    /// Feed a live-control observation in wire order, before publishing its request outcome.
+    pub(super) fn anchor_transcript(&self, file: &Path, anchor: &LeafAnchor) {
+        for (path, follow) in &self.transcripts {
+            if super::spelling::same_spelling(path, file) {
+                follow.watcher.anchor(anchor.clone());
+            }
+        }
     }
 }
 
@@ -92,26 +108,35 @@ impl Engine {
             }
         }
 
-        // Subagent transcripts.
+        // Active session and subagent transcripts. Only the former can have a live anchor.
         self.interest
             .transcripts
             .retain(|p, _| wanted.contains(&Topic::Transcript(p.clone())));
         for t in &wanted {
             let Topic::Transcript(path) = t else { continue };
-            let (w, seen) = self
+            let follow = self
                 .interest
                 .transcripts
                 .entry(path.clone())
                 .or_insert_with(|| {
                     let wake = wake.clone();
-                    (
-                        TranscriptWatcher::spawn(path.clone(), move || wake()),
-                        u64::MAX,
-                    )
+                    let anchor = self
+                        .sess
+                        .managed
+                        .iter()
+                        .find_map(|m| m.initial_leaf_anchor(path));
+                    TranscriptFollow {
+                        watcher: TranscriptWatcher::spawn_anchored(
+                            path.clone(),
+                            anchor,
+                            move || wake(),
+                        ),
+                        seen: u64::MAX,
+                    }
                 });
-            let rev = w.revision();
-            if rev != *seen {
-                *seen = rev;
+            let rev = follow.watcher.revision();
+            if rev != follow.seen {
+                follow.seen = rev;
                 changed.push(t.clone());
             }
         }
@@ -287,12 +312,13 @@ impl Engine {
         self.interest.changes.get(root)?.value.as_ref()
     }
 
-    /// The items of a followed transcript (`None`: not followed yet).
+    /// The coherent epoch and items of a followed transcript (`None`: not followed yet).
     pub(super) fn transcript_of(
         &self,
         path: &Path,
-    ) -> Option<Arc<Vec<deck_core::agents::TranscriptItem>>> {
-        self.interest.transcripts.get(path).map(|(w, _)| w.latest())
+    ) -> Option<(u64, Arc<Vec<deck_core::agents::TranscriptItem>>)> {
+        let watcher = &self.interest.transcripts.get(path)?.watcher;
+        (watcher.revision() != 0).then(|| watcher.latest_with_epoch())
     }
 
     /// The fleet's latest snapshot, while followed.
@@ -326,9 +352,9 @@ impl Engine {
                 },
             },
             Topic::Transcript(path) => match i.transcripts.get(path) {
-                Some((w, _)) => TopicValue::Transcript {
-                    revision: w.revision(),
-                    items: (*w.latest()).clone(),
+                Some(w) => TopicValue::Transcript {
+                    revision: w.watcher.revision(),
+                    items: (*w.watcher.latest()).clone(),
                 },
                 None => TopicValue::Transcript {
                     revision: 0,

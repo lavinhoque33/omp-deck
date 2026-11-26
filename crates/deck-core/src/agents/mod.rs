@@ -19,7 +19,7 @@ mod watcher;
 pub use activity::{ActivityKind, ActivityRow, ActivityStatus, ActivityWatcher, AgentActivity};
 pub use scan::AgentsScanner;
 pub use transcript::{
-    TranscriptReader, TranscriptUpdate, TranscriptWatcher, entry_items, read_blob,
+    LeafAnchor, TranscriptReader, TranscriptUpdate, TranscriptWatcher, entry_items, read_blob,
 };
 pub use watcher::AgentsWatcher;
 

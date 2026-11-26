@@ -18,11 +18,12 @@
 //! value or record kind only when [`Welcome::features`] lists [`FEATURE_S4`]; the gateway sends
 //! a new enum variant, `Event` or `Item` type only to a device that announced it. Additive
 //! fields on existing types ([`Welcome::push_key`], [`SessionSummary::stub`],
-//! [`LiveSession::pending_ui`], `images`, `args_value` and `details` of [`Item`], and
-//! [`RunningView::recent_unix_ms`] and [`RunningView::activity`]) are the exception to "`None`
-//! is written as `null`": they are omitted when empty, absent or `false`
-//! (`#[serde(default, skip_serializing_if = …)]`), so the frozen messages still encode
-//! byte-identically (`tests/vectors/api-v1.json`, `tests/vectors/api-s4.json`).
+//! [`LiveSession::pending_ui`], `images`, `args_value` and `details` of [`Item`],
+//! [`RunningView::recent_unix_ms`], [`RunningView::activity`], and the additive `tree`
+//! request and reply fields) are the exception to "`None` is written as `null`":
+//! they are omitted when empty, absent or `false` (`#[serde(default, skip_serializing_if = …)]`),
+//! so the frozen messages still encode byte-identically (`tests/vectors/api-v1.json`,
+//! `tests/vectors/api-s4.json`).
 //!
 //! **HTML forms** (omp 18.18's `ask`, `docs/notes/contracts.md` "omp 18.18 HTML-form `ask` on
 //! the phone"): gated by [`FEATURE_FORM`] the same way. The gateway lists a [`UiKind::Form`]
@@ -32,6 +33,9 @@
 //! `tests/vectors/api-form.json`.
 //! Live todo/goal progress is additive behind [`FEATURE_PROGRESS`], carried by
 //! [`LiveSession::progress`] and bounded by [`ProgressView::new`] on decode.
+//! Tree navigation is additive behind [`FEATURE_TREE_NAV`]: devices send `tree.at_leaf` only
+//! when the gateway advertises it, and receive [`DoneView::Moved`] only if they announced it.
+//! The `tree` reply's optional pagination fields need no gate. See `tests/vectors/api-treenav.json`.
 //!
 //! A request that is well-formed JSON with a numeric `id` but names an op, feed, session
 //! action type, tagged request value or enum value this gateway does not know (for example
@@ -156,6 +160,8 @@ pub const MAX_UPLOAD_FILE: u64 = 20 << 20;
 pub const MAX_UPLOAD_TOTAL: u64 = 200 << 20;
 /// [`Op::Tree`] `limit` range: `1..=MAX_TREE_LIMIT`.
 pub const MAX_TREE_LIMIT: u32 = 2000;
+/// Bytes of `editor_text` in [`DoneView::Moved`] at most; the gateway cuts at a character boundary.
+pub const MAX_MOVED_TEXT: usize = 64 * 1024;
 /// [`Op::UsageActivity`] `days` range: `1..=MAX_ACTIVITY_DAYS`.
 pub const MAX_ACTIVITY_DAYS: u32 = 371;
 /// [`Feed::Inventory`] `limit` range: `1..=MAX_INVENTORY_LIMIT`.
@@ -177,6 +183,8 @@ pub const MAX_UI_OPTIONS: usize = 50;
 pub const FEATURE_FORM: &str = "form";
 /// Live todo/goal progress on session rows and conversation headers.
 pub const FEATURE_PROGRESS: &str = "progress";
+/// Tree paging around the active leaf and structured `navigate` outcomes.
+pub const FEATURE_TREE_NAV: &str = "tree_nav";
 /// Fields of a [`UiFormView`] at most.
 pub const MAX_FORM_FIELDS: usize = 40;
 /// Sections of a [`UiFormView`] at most.
@@ -1246,6 +1254,11 @@ pub enum Op {
         #[serde(default)]
         cursor: Option<String>,
         limit: u32,
+        /// Without a cursor, the window ends `limit / 2` nodes after the active leaf, clamped
+        /// to the list; without a leaf it starts at the beginning. Sent only to gateways
+        /// that advertise [`FEATURE_TREE_NAV`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        at_leaf: bool,
     },
     /// The sub-folders of dir token `dir` (`None`: the roots): [`Resp::Dir`].
     Browse {
@@ -1349,7 +1362,8 @@ pub enum Op {
         session: String,
         entry: String,
     },
-    /// Moves the live session's leaf to `entry` (idle only).
+    /// Moves the live session's leaf to `entry` (idle only): [`DoneView::Moved`] with
+    /// [`FEATURE_TREE_NAV`], otherwise [`DoneView::Unit`].
     Navigate {
         live: LiveRef,
         entry: String,
@@ -2545,12 +2559,17 @@ pub enum Resp {
         data: String,
         eof: bool,
     },
-    /// `next_cursor`: the next page.
+    /// `next_cursor` (`t-<end>`) starts the next page; `prev_cursor` (`b-<start>`) returns the
+    /// nodes immediately before this page. `total` counts all nodes under the filter.
     Tree {
         nodes: Vec<TreeNode>,
         active_leaf: Option<String>,
         next_cursor: Option<String>,
         truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prev_cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u64>,
     },
     /// `dir`: `None` for the roots listing.
     Dir {
@@ -2648,6 +2667,18 @@ pub enum DoneView {
         handle: u64,
         plan: RestorePlanView,
         truncated: bool,
+    },
+    /// `navigate`, sent only to devices that announced [`FEATURE_TREE_NAV`].
+    Moved {
+        leaf: Option<String>,
+        /// The target was a prompt and the session now stands on its parent.
+        before_prompt: bool,
+        /// The prompt text for the device's composer, or `None` if kept in omp's editor.
+        editor_text: Option<String>,
+        /// Images of that prompt not carried over to the device.
+        dropped_images: u32,
+        /// omp's own status, e.g. "Already at this point" when nothing moved.
+        message: Option<String>,
     },
 }
 
@@ -3839,6 +3870,7 @@ mod tests {
             filter: TreeFilter::All,
             cursor: None,
             limit,
+            at_leaf: false,
         };
         assert!(tree(0).check().is_err());
         assert!(tree(MAX_TREE_LIMIT).check().is_ok());

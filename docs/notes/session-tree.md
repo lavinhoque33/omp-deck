@@ -29,6 +29,13 @@
   - It also becomes durable on a signal exit. I observed omp append `{"type":"custom","customType":"session_exit","data":{"reason":"sighup"...},"parentId":"<in-memory leaf>"}` on kill.
   - A SIGKILL or crash loses it.
   - **A file-only reader therefore cannot know the live leaf. Take the live leaf from the ctl `tree` op (`ctx.sessionManager.getLeafId()`).**
+  - **As built (2026-11-26, contract "Phone tree jumps, branch-aware transcripts, forks that start"):**
+    `deck_core::agents::TranscriptReader` renders only the root → leaf path. It keeps a compact index per entry (id,
+    parent, leaf effect, byte span), re-reads the path's lines by span when the path changes (`TranscriptUpdate.reset`)
+    and appends when the path only grew. The live leaf arrives as `LeafAnchor { leaf, tail }` from the ctl snapshot
+    (`tail` = last journal entry, so the anchor can be folded over later lines) or as `{ leaf, tail: None }` from a
+    navigate reply. Measured on a real 33 MB session with 30 jumps: 6927 entries, 3816 on the active path; the old
+    linear replay produced 6367 items, the branch-aware one 3709 (debug build, 1.57 s → 0.96 s).
 - **Only `branch_summary` is a durable jump.** `branchWithSummary(branchFromId, summary, details, fromExtension)` (`:3598-3613`) sets the leaf and appends `{type:"branch_summary", parentId:<target>, fromId, summary, details, fromExtension}`.
 - **Child order:** `tree()` sorts children by ascending timestamp (`:460`, `:607-640`). It handles `parentId` null, a missing parent, and self-parent by turning the node into a root, so there can be several roots.
 

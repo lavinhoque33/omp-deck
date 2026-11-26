@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  type TreeRow,
   NO_FILTER,
   activeFilters,
   branchProblem,
@@ -17,6 +18,7 @@ import {
   searchTree,
   runningRows,
   selectionTotals,
+  treeMove,
   uptime,
 } from '../src/app/screens/fleet/logic.ts';
 import type { api } from '../src/remote/index.ts';
@@ -282,6 +284,31 @@ describe('tree', () => {
     expect(rows.every((row) => !row.active)).toBe(true);
   });
 
+  test('a mid-file window marks the loaded part of the active path, and prepending reconnects it', () => {
+    const window = nodes.slice(2);
+    const describe = (rows: readonly TreeRow[]) =>
+      rows.map((row) => [row.node.id, row.depth, row.active, row.here]);
+    const windowRows = layoutTree(window, 'c');
+    expect(describe(windowRows)).toEqual([
+      ['b', 0, true, false],
+      ['c', 0, true, true],
+      ['x', 0, false, false],
+      ['y', 0, false, false],
+    ]);
+    expect(searchTree(windowRows, 'TEXT C').find((row) => row.here)?.node.id).toBe('c');
+    expect(searchTree(windowRows, 'TEXT X').some((row) => row.here)).toBe(false);
+    const joined = mergeTreePage(nodes.slice(0, 3), window);
+    expect(joined.map((n) => n.id)).toEqual(['r', 'a', 'b', 'c', 'x', 'y']);
+    expect(describe(layoutTree(joined, 'c'))).toEqual([
+      ['r', 0, true, false],
+      ['a', 0, true, false],
+      ['b', 1, true, false],
+      ['c', 1, true, true],
+      ['x', 1, false, false],
+      ['y', 1, false, false],
+    ]);
+  });
+
   test('deep chains do not overflow the stack', () => {
     const chain = Array.from({ length: 20_000 }, (_, i) => node(`n${i}`, i === 0 ? null : `n${i - 1}`));
     const rows = layoutTree(chain, 'n19999');
@@ -294,6 +321,36 @@ describe('tree', () => {
     expect(searchTree(rows, 'TEXT Y').map((row) => row.node.id)).toEqual(['y']);
     expect(searchTree(rows, '  ').length).toBe(6);
     expect(mergeTreePage([node('a', null)], [node('a', null), node('b', 'a')]).map((n) => n.id)).toEqual(['a', 'b']);
+  });
+
+  test('Go here distinguishes a no-op, a move, and a prompt restored to either editor', () => {
+    const result: Extract<api.DoneView, { type: 'moved' }> = {
+      type: 'moved', leaf: 'c', before_prompt: false, editor_text: null, dropped_images: 0, message: null,
+    };
+    expect(treeMove({ ...result, message: 'Already at this point' }, false)).toEqual({
+      moved: false, notice: 'Already at this point', prefill: null,
+    });
+    expect(treeMove(result, true)).toEqual({
+      moved: true, notice: 'Moved there — new prompts continue from this point', prefill: null,
+    });
+    expect(treeMove({ ...result, before_prompt: true, editor_text: 'Edit me', dropped_images: 1 }, true)).toEqual({
+      moved: true,
+      notice: 'Moved before that prompt — its text is in the composer · 1 image of that prompt was not carried over',
+      prefill: 'Edit me',
+    });
+    expect(treeMove({ ...result, before_prompt: true, leaf: null, editor_text: '', dropped_images: 2 }, true)).toEqual({
+      moved: true,
+      notice: 'Moved before that prompt — its text is in the composer · 2 images of that prompt were not carried over',
+      prefill: '',
+    });
+    expect(treeMove({ ...result, before_prompt: true }, true)).toEqual({
+      moved: true, notice: "Moved before that prompt — its text is in omp's editor on the desktop", prefill: null,
+    });
+    expect(treeMove({ ...result, before_prompt: true, editor_text: 'Edit me', dropped_images: 1 }, false)).toEqual({
+      moved: true,
+      notice: 'Moved before that prompt — its text was not applied because the session is no longer running there · 1 image of that prompt was not carried over',
+      prefill: null,
+    });
   });
 
   test('refusals', () => {

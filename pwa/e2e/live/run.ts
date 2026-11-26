@@ -2,6 +2,7 @@
 // serving dist/, a real gateway and real omp on a scripted model:
 // crates/deck-service/tests/pwa_live_stack.rs), runs ./spec.ts against it with Chromium, and
 // stops the stack. Exit code 1 on any failure; skipped (exit 0) when omp is not installed.
+// `bun run live --tree` runs only the tree/jump/fork gate after pairing and creating a session.
 
 import { runLive } from './spec.ts';
 import { build, requireOmp, type Running, startStack } from './stack.ts';

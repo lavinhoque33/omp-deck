@@ -23,17 +23,20 @@ fn read_all(path: &Path) -> Vec<TranscriptItem> {
 
 /// A message line laid out like omp writes it (`type` first, `role` first in the message);
 /// serde_json's own key order would put them last.
-fn message_line(role: &str, fields: serde_json::Value) -> String {
+fn message_line(role: &str, id: &str, parent: Option<&str>, fields: serde_json::Value) -> String {
     let body = fields.to_string();
     format!(
-        r#"{{"type":"message","id":"x","message":{{"role":"{role}",{}"#,
+        r#"{{"type":"message","id":"{id}","parentId":{},"message":{{"role":"{role}",{}"#,
+        json!(parent),
         body.replacen('{', "", 1) + "}"
     )
 }
 
-fn call_line(args: &serde_json::Value) -> String {
+fn call_line(id: &str, parent: Option<&str>, args: &serde_json::Value) -> String {
     message_line(
         "assistant",
+        id,
+        parent,
         json!({"content": [{"type":"toolCall","id":"c","name":"write","arguments":args}]}),
     )
 }
@@ -95,8 +98,16 @@ fn long_string_leaves_are_cut_and_oversize_args_dropped() {
     let p = write_lines(
         d.path(),
         &[
-            call_line(&json!({"content": long, "n": [1, {"deep": long}]})),
-            call_line(&json!({"a": big, "b": big, "c": big, "d": big, "e": big})),
+            call_line(
+                "a",
+                None,
+                &json!({"content": long, "n": [1, {"deep": long}]}),
+            ),
+            call_line(
+                "b",
+                Some("a"),
+                &json!({"a": big, "b": big, "c": big, "d": big, "e": big}),
+            ),
         ],
     );
     let items = read_all(&p);
@@ -128,17 +139,19 @@ fn long_string_leaves_are_cut_and_oversize_args_dropped() {
 #[test]
 fn oversize_details_are_dropped() {
     let d = tempfile::tempdir().unwrap();
-    let result = |details: serde_json::Value| {
+    let result = |id, parent, details: serde_json::Value| {
         message_line(
             "toolResult",
+            id,
+            parent,
             json!({"toolCallId":"c","toolName":"bash","content":"out","details":details}),
         )
     };
     let p = write_lines(
         d.path(),
         &[
-            result(json!({"ok": "y".repeat(30 * 1024)})),
-            result(json!({"ok": "y".repeat(33 * 1024)})),
+            result("a", None, json!({"ok": "y".repeat(30 * 1024)})),
+            result("b", Some("a"), json!({"ok": "y".repeat(33 * 1024)})),
         ],
     );
     let items = read_all(&p);
@@ -194,6 +207,8 @@ fn image_line(data: &str) -> (String, String) {
         .collect();
     let line = message_line(
         "toolResult",
+        "image",
+        None,
         json!({"content": [{"type": "image", "data": data, "mimeType": "image/png"}]}),
     );
     (line + "\n", id)
@@ -244,7 +259,7 @@ fn read_blob_follows_a_growing_and_a_rewritten_transcript() {
     assert_eq!(found(&b_id), Some(vec![1, 2, 3]));
 
     // Rewritten under the same name and longer than before: every line moved.
-    let note = message_line("user", json!({"content": "x".repeat(4096)}));
+    let note = message_line("user", "note", None, json!({"content": "x".repeat(4096)}));
     fs::write(&p, format!("{note}\n{c}{e}")).unwrap();
     assert_eq!(found(&c_id), Some(vec![4, 5, 6]));
     assert_eq!(found(&e_id), Some(vec![7, 8, 9]));
@@ -261,6 +276,8 @@ fn read_blob_resolves_externalized_images_from_the_blob_store() {
     fs::create_dir_all(d.path().join("agent/blobs")).unwrap();
     let line = message_line(
         "user",
+        "u",
+        None,
         json!({"content":[{"type":"image","data":data,"mimeType":"image/png"}]}),
     );
     let p = sessions.join("s.jsonl");

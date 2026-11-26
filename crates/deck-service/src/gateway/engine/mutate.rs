@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use super::deferred::{ResumePlan, resume_plan};
 use super::lane::NOT_CANCELLABLE;
 use super::sessions::{LaunchJob, Owner};
-use super::{Engine, Fin, JobState, Msg, Sched, lock};
+use super::{Engine, Fin, JobState, Msg, Sched, Sink, lock};
 use crate::controller::{
     Command, Rejected, RequestKey, ServiceEpoch, SessionTarget, Submission, Submitted,
 };
@@ -27,12 +27,15 @@ use deck_core::config::SessionView;
 
 /// Progress events of one job are sent at most this often.
 const PROGRESS_EVERY: Duration = Duration::from_millis(150);
+pub(super) const DEVICE_NAVIGATE_JOB: &str = "device-navigate";
 
 /// What finishing a job also does.
 pub(super) enum Post {
     None,
     /// Rescan the sessions and poll the backends.
     Refresh,
+    /// A device's fork/copy outcome waits until it names a resumable session.
+    RefreshCreated,
     /// Recompute the changes of this repository (when followed).
     Changes(PathBuf),
     /// Release a rollback's session/repository reservations and reload checkpoint/git views.
@@ -118,6 +121,20 @@ fn uses_lane(op: &Mutation) -> bool {
 }
 
 impl Engine {
+    fn is_device(&self, conn: u64) -> bool {
+        self.conns
+            .get(&conn)
+            .is_some_and(|c| matches!(c.sink, Sink::Device(_)))
+    }
+
+    fn created_file_post(&self, conn: u64) -> Post {
+        if self.is_device(conn) {
+            Post::RefreshCreated
+        } else {
+            Post::Refresh
+        }
+    }
+
     /// `work`: the hash deciding "same work" for a repeated key (a device's request in device
     /// terms); `None` hashes `op`.
     pub(super) fn on_mutate(
@@ -568,9 +585,25 @@ impl Engine {
     ) {
         // A model change that ended another way than through its reply (the session closed).
         self.defer.model_changes.remove(&key);
-        let state = self.jobs.remove(&key);
+
         let mut result = result.map(Into::into);
+        if let Some(state) = self.jobs.get_mut(&key)
+            && matches!(state.post, Post::RefreshCreated)
+        {
+            state.post = Post::Refresh;
+            if let Ok(done) = &mut result
+                && let Done::Path(path) = &mut **done
+            {
+                let path = std::mem::take(path);
+                state.post = Post::None;
+                self.sessions_watch.refresh_now();
+                self.running.poke();
+                self.await_created_file(key, path);
+                return;
+            }
+        }
         let mut cancelled = false;
+        let state = self.jobs.remove(&key);
         if let Some(s) = state {
             if self.backup_lane.release(Some(&key)) {
                 self.dirty.backup = true;
@@ -578,7 +611,7 @@ impl Engine {
             cancelled = s.cancel.is_some_and(|c| c.load(Ordering::Relaxed));
             match s.post {
                 Post::None => {}
-                Post::Refresh => {
+                Post::Refresh | Post::RefreshCreated => {
                     self.sessions_watch.refresh_now();
                     self.running.poke();
                 }
@@ -867,13 +900,15 @@ impl Engine {
             Mutation::ForkAt { file, entry_id } => {
                 let running = self.ctl_holder(&file);
                 self.accepted(conn, id, &key);
-                self.job(key, "fork", None, false, Post::Refresh, move |ctx, _, _| {
+                let post = self.created_file_post(conn);
+                self.job(key, "fork", None, false, post, move |ctx, _, _| {
                     jobs::fork_at(ctx, &file, &entry_id, running.as_deref())
                 });
             }
             Mutation::Copy { file, dest_cwd } => {
                 self.accepted(conn, id, &key);
-                self.job(key, "copy", None, false, Post::Refresh, move |ctx, _, _| {
+                let post = self.created_file_post(conn);
+                self.job(key, "copy", None, false, post, move |ctx, _, _| {
                     jobs::copy_session(ctx, &file, &dest_cwd)
                 });
             }
@@ -913,7 +948,14 @@ impl Engine {
                 let Some(i) = index else {
                     return self.vanished(conn, id, key);
                 };
-                self.track(&key, "ctl", Post::None);
+                let label = if matches!(&command, deck_core::ctl::CtlCommand::Navigate { .. })
+                    && self.is_device(conn)
+                {
+                    DEVICE_NAVIGATE_JOB
+                } else {
+                    "ctl"
+                };
+                self.track(&key, label, Post::None);
                 self.accepted(conn, id, &key);
                 self.queue_ctl(i, key, command);
             }

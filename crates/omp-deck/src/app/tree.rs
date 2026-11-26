@@ -577,6 +577,8 @@ impl App {
             root: session.to_path_buf(),
             entry_id: entry,
             summary,
+            // The desktop keeps the prompt in omp's editor (the tab shows it).
+            take_editor: false,
         };
         if self.ctl_command(command, |app, r| app.on_tree_reply(r)) {
             self.tree_busy = Some(TreeBusy {

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deck_core::agents::{AgentStatus, TranscriptItem};
 use deck_core::changes::{ChangedFile, Changes, DiffSide};
@@ -49,6 +49,9 @@ mod views;
 
 pub(super) use s4::DeviceFin;
 
+/// A newly written fork/copy should appear on the requested scan, not after a later file edit.
+const CREATED_FILE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Deleted sessions remembered (file → id) so a deletion's outcome names sessions, not files.
 const DELETED_IDS: usize = 4096;
 /// How deep a subagent transcript is searched for below its session's folder.
@@ -63,6 +66,7 @@ const AGENT_ID_CHARS: usize = 128;
 pub(super) struct Devices {
     /// Files of sessions a device asked to delete, with their ids.
     deleted: HashMap<PathBuf, String>,
+    created: Vec<CreatedFile>,
     /// Canonical forms of the folders and files the projections compare.
     canon: Canon,
     /// Slice-4 sources: caches the s4 feeds and ops read.
@@ -70,6 +74,12 @@ pub(super) struct Devices {
     /// Attachment stores in flight and revocations of their owners: a store racing a
     /// revocation cleans up after itself.
     pub(super) revoked: Arc<crate::attachments::Revocations>,
+}
+
+struct CreatedFile {
+    key: RequestKey,
+    path: PathBuf,
+    deadline: Instant,
 }
 
 /// One device session's engine side.
@@ -121,6 +131,7 @@ struct Cursor {
     sent: usize,
     /// Hash of item `sent - 1` (a rewritten file changes it).
     last: u64,
+    epoch: u64,
 }
 
 impl DeviceConn {
@@ -161,6 +172,11 @@ impl DeviceConn {
     /// The device renders live todo/goal progress ([`api::FEATURE_PROGRESS`]).
     fn progress(&self) -> bool {
         self.features.contains(api::FEATURE_PROGRESS)
+    }
+
+    /// The device understands tree positioning and knows how to receive a moved prompt.
+    fn tree_nav(&self) -> bool {
+        self.features.contains(api::FEATURE_TREE_NAV)
     }
 
     /// `topic` has a new revision: the feeds projected from it are recomputed.
@@ -362,12 +378,19 @@ fn resolve_session<'a>(groups: &'a [ProjectGroup], id: &str) -> Result<&'a Sessi
 }
 
 /// The id of the session stored at `path`.
-fn session_at(groups: &[ProjectGroup], path: &Path) -> Option<String> {
+fn session_at<'a>(groups: &'a [ProjectGroup], path: &Path) -> Option<&'a str> {
     groups
         .iter()
         .flat_map(|g| &g.sessions)
         .find(|s| s.path == path)
-        .map(|s| s.id.clone())
+        .map(|s| s.id.as_str())
+}
+
+/// A file can be opened by the id we send only if that id is unique in the session index.
+fn resumable_session<'a>(groups: &'a [ProjectGroup], path: &Path) -> Option<&'a str> {
+    let id = session_at(groups, path)?;
+    let entry = resolve_session(groups, id).ok()?;
+    (entry.path == path).then_some(id)
 }
 
 /// The inventory group and session of the session file `file` as omp reported it: the same
@@ -1040,6 +1063,7 @@ impl Engine {
             api::FEATURE_S4.to_owned(),
             api::FEATURE_FORM.to_owned(),
             api::FEATURE_PROGRESS.to_owned(),
+            api::FEATURE_TREE_NAV.to_owned(),
         ];
         if self.notify.push.android_configured() {
             // Only with a valid FCM service account: a phone must not offer a registration the
@@ -1121,6 +1145,7 @@ impl Engine {
 
     /// Per step: closed sessions go, permissions are re-read, feeds are recomputed.
     pub(super) fn step_devices(&mut self) {
+        self.step_created_files();
         self.sync_devices();
         self.step_s4_sources(std::time::Instant::now());
         let conns: Vec<u64> = self
@@ -1517,16 +1542,19 @@ impl Engine {
         if out.feed_pending(feed) {
             return;
         }
-        let Some(items) = st.path.as_deref().and_then(|p| self.transcript_of(p)) else {
+        let Some((epoch, items)) = st.path.as_deref().and_then(|p| self.transcript_of(p)) else {
             return;
         };
         let continues = st.cursor.as_ref().is_some_and(|c| {
-            c.sent > 0 && c.sent <= items.len() && item_hash(&items[c.sent - 1]) == c.last
+            c.epoch == epoch
+                && c.sent > 0
+                && c.sent <= items.len()
+                && item_hash(&items[c.sent - 1]) == c.last
         });
         let (start, reset) = match &st.cursor {
             Some(c) if continues => (c.sent, false),
             // Nothing was sent yet and there is still nothing: no new empty value.
-            Some(c) if c.sent == 0 && items.is_empty() => {
+            Some(c) if c.epoch == epoch && c.sent == 0 && items.is_empty() => {
                 st.dirty = false;
                 return;
             }
@@ -1559,6 +1587,7 @@ impl Engine {
         st.cursor = Some(Cursor {
             sent,
             last: sent.checked_sub(1).map_or(0, |i| item_hash(&items[i])),
+            epoch,
         });
         st.dirty = sent < items.len();
         match body {
@@ -1632,7 +1661,11 @@ impl Engine {
             return;
         };
         let id = req.id;
-        let s4 = self.device_conn(conn).is_some_and(DeviceConn::s4);
+        let Some(link) = self.device_conn(conn) else {
+            return;
+        };
+        let s4 = link.s4();
+        let tree_nav = link.tree_nav();
         let gated = match &req.op {
             Op::Subscribe { feed } | Op::Unsubscribe { feed } => s4::s4_feed(feed),
             op => s4::s4_op(op),
@@ -1692,7 +1725,7 @@ impl Engine {
                     seq,
                 };
                 let outcome = match self.journal.lookup(&key) {
-                    Ok(Some(o)) => self.outcome_view(&o, Some(&key), s4),
+                    Ok(Some(o)) => self.outcome_view(&o, Some(&key), s4, tree_nav),
                     Ok(None) => api::OutcomeView::Unknown {},
                     Err(_) => api::OutcomeView::Expired {},
                 };
@@ -2129,18 +2162,55 @@ impl Engine {
 
     // ---- translation of replies and events ----------------------------------------------------
 
-    fn session_of(&self, path: &Path) -> Option<String> {
-        session_at(&self.groups(), path).or_else(|| self.devices.deleted.get(path).cloned())
+    pub(super) fn await_created_file(&mut self, key: RequestKey, path: PathBuf) {
+        self.devices.created.push(CreatedFile {
+            key,
+            path,
+            deadline: Instant::now() + CREATED_FILE_TIMEOUT,
+        });
     }
 
-    /// `key`: the request it answers, when known; `s4`: the device speaks slice 4 (else its
-    /// results are shown as `unit`).
-    fn outcome_view(&self, o: &Outcome, key: Option<&RequestKey>, s4: bool) -> api::OutcomeView {
+    /// Give the session watcher time to index the exact file and unique id that `resume`
+    /// uses. If it cannot list the file in time, the successful copy/fork still stands.
+    /// The session watcher wakes us after publishing its scan.
+    fn step_created_files(&mut self) {
+        if self.devices.created.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let groups = self.groups();
+        let mut i = 0;
+        while let Some(file) = self.devices.created.get(i) {
+            let listed = resumable_session(&groups, &file.path).is_some();
+            if !listed && now < file.deadline {
+                self.soon = Some(self.soon.map_or(file.deadline, |at| at.min(file.deadline)));
+                i += 1;
+                continue;
+            }
+            let CreatedFile { key, path, .. } = self.devices.created.swap_remove(i);
+            self.job_finished(key, Ok(Done::Path(path)));
+        }
+    }
+
+    fn session_of(&self, path: &Path) -> Option<String> {
+        session_at(&self.groups(), path)
+            .map(str::to_owned)
+            .or_else(|| self.devices.deleted.get(path).cloned())
+    }
+
+    /// `key`: the request it answers, when known. Additive results depend on device features.
+    fn outcome_view(
+        &self,
+        o: &Outcome,
+        key: Option<&RequestKey>,
+        s4: bool,
+        tree_nav: bool,
+    ) -> api::OutcomeView {
         use api::OutcomeView as O;
         match o {
             Outcome::Running => O::Running {},
             Outcome::Done(d) => O::Done {
-                result: self.done_view(d, key, s4),
+                result: self.done_view(d, key, s4, tree_nav),
             },
             Outcome::Failed(m) => O::Failed {
                 message: match key {
@@ -2159,7 +2229,13 @@ impl Engine {
         }
     }
 
-    fn done_view(&self, d: &Done, key: Option<&RequestKey>, s4: bool) -> api::DoneView {
+    fn done_view(
+        &self,
+        d: &Done,
+        key: Option<&RequestKey>,
+        s4: bool,
+        tree_nav: bool,
+    ) -> api::DoneView {
         use api::DoneView as D;
         if let Some(v) = s4.then(|| s4::s4_done(self, d, key)).flatten() {
             return v;
@@ -2181,10 +2257,23 @@ impl Engine {
             // open) is no session file.
             Done::Path(p) if p.extension().is_none_or(|e| e != "jsonl") => D::Unit {},
             Done::Path(p) => D::File {
-                session: self.session_of(p),
+                session: resumable_session(&self.groups(), p).map(str::to_owned),
             },
             Done::Moved(m) => D::File {
                 session: self.session_of(&m.new_path),
+            },
+            Done::Navigated {
+                leaf,
+                before_prompt,
+                editor_text,
+                dropped_images,
+                message,
+            } if tree_nav => D::Moved {
+                leaf: leaf.clone(),
+                before_prompt: *before_prompt,
+                editor_text: editor_text.clone(),
+                dropped_images: *dropped_images,
+                message: message.as_deref().map(|m| self.devices.canon.scrub(m)),
             },
             _ => D::Unit {},
         }
@@ -2198,7 +2287,7 @@ impl Engine {
                 duplicate: a.duplicate,
             }),
             Ok(Answer::Outcome(o)) => ReplyResult::Ok(Resp::Outcome {
-                outcome: self.outcome_view(&o, None, d.s4()),
+                outcome: self.outcome_view(&o, None, d.s4(), d.tree_nav()),
             }),
             Ok(Answer::Models(list)) => models_reply(&list, &self.settings.snapshot().config),
             Ok(Answer::Diff(d)) => ReplyResult::Ok(Resp::Diff { diff: diff(&d) }),
@@ -2212,7 +2301,7 @@ impl Engine {
         match ev {
             ServerEvent::Outcome { key, outcome } => Some(Event::Outcome {
                 seq: key.seq,
-                outcome: self.outcome_view(outcome, Some(key), d.s4()),
+                outcome: self.outcome_view(outcome, Some(key), d.s4(), d.tree_nav()),
             }),
             ServerEvent::Progress { key, progress } => Some(Event::Progress {
                 seq: key.seq,
@@ -2337,8 +2426,20 @@ mod tests {
             Err(ApiError::NotFound { .. })
         ));
         assert_eq!(
-            session_at(&g, Path::new("/srv/beta/.sessions/b1.jsonl")).as_deref(),
+            session_at(&g, Path::new("/srv/beta/.sessions/b1.jsonl")),
             Some("b1")
+        );
+        assert_eq!(
+            resumable_session(&g, Path::new("/srv/beta/.sessions/b1.jsonl")),
+            Some("b1")
+        );
+        assert_eq!(
+            resumable_session(&g, Path::new("/srv/beta/.sessions/dup.jsonl")),
+            None
+        );
+        assert_eq!(
+            resumable_session(&g, Path::new("/srv/beta/.sessions/not-listed-yet.jsonl")),
+            None
         );
     }
 

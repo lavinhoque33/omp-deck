@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { Client, ClientError, type PairingStore, type ViewSink } from '../src/app/client.ts';
+import { Client, ClientError, type PairingStore, type ViewSink, composerDraftKey } from '../src/app/client.ts';
 import type { StoredPairing } from '../src/app/keystore.ts';
 import type { Dialer, DialTarget, LinkEvents } from '../src/app/link.ts';
-import { type AppRecord, CLOSE, type api } from '../src/remote/index.ts';
+import { resumeFork } from '../src/app/screens/fleet/common.ts';
+import { type AppRecord, CLOSE, api } from '../src/remote/index.ts';
 
 // ---- fakes ------------------------------------------------------------------------------------
 
@@ -206,7 +207,7 @@ describe('connection', () => {
     expect(client.getState().conn.phase).toBe('connecting');
     expect(last().target.hello.ts).toBe(11);
     expect(store.value?.last).toBe(11);
-    expect(last().target.hello.features).toEqual(['s4', 'form', 'progress']);
+    expect(last().target.hello.features).toEqual(['s4', 'form', 'progress', 'tree_nav']);
     welcome(last());
     expect(client.getState().conn.phase).toBe('online');
     expect(client.getState().welcome?.next_seq).toBe(28);
@@ -449,6 +450,41 @@ describe('requests', () => {
   });
 });
 
+describe('starting a fork', () => {
+  test('resumes the new session and returns the exact live key', async () => {
+    const entry = await connected();
+    let starting = false;
+    const result = resumeFork(client, 'forked', () => { starting = true; });
+    expect(starting).toBe(true);
+    const request = requests(entry).at(-1);
+    expect(request?.op).toEqual({ op: 'resume', session: 'forked' });
+    event(entry, { type: 'outcome', seq: request?.seq, outcome: { state: 'done', result: { type: 'session', live: LIVE } } });
+    expect(await result).toEqual({ session: 'forked', liveKey: LIVE.key });
+  });
+
+  test('opens the stopped fork and reports a start failure', async () => {
+    const entry = await connected();
+    const result = resumeFork(client, 'forked', () => undefined);
+    const seq = requests(entry).at(-1)?.seq;
+    event(entry, { type: 'outcome', seq, outcome: { state: 'failed', message: 'omp could not start' } });
+    expect(await result).toEqual({ session: 'forked', liveKey: null });
+    expect(client.getState().notices.at(-1)).toMatchObject({ tone: 'error', text: 'Start the fork failed: omp could not start' });
+  });
+
+  test('does not try to resume without a session id or the required permission', async () => {
+    await client.start();
+    await settle();
+    const entry = last();
+    welcome(entry, { permissions: { control: false, manage: false } });
+    const starting = () => { throw new Error('must not try to start'); };
+    expect(await resumeFork(client, null, starting)).toBeNull();
+    expect(client.getState().notices).toEqual([]);
+    expect(await resumeFork(client, 'forked', starting)).toEqual({ session: 'forked', liveKey: null });
+    expect(client.getState().notices.at(-1)).toMatchObject({ tone: 'error', text: 'Could not start the fork: this phone is not allowed to resume sessions.' });
+    expect(requests(entry).some(({ op }) => op.op === 'resume')).toBe(false);
+  });
+});
+
 describe('feeds', () => {
   test('follow is reference counted and unsubscribes on the last release', async () => {
     const entry = await connected();
@@ -467,16 +503,93 @@ describe('feeds', () => {
     expect(client.follow({ feed: 'changes', project: 'p16' })).toBeNull();
   });
 
-  test('transcript feeds accumulate appended items and reset', async () => {
+  test('a transcript reset replaces earlier paged history and survives subsequent appends', async () => {
     const entry = await connected();
-    const feed: api.Feed = { feed: 'transcript', session: 's', agent: null, tail: 50 };
+    const feed: api.Feed = { feed: 'transcript', session: 's', agent: null, tail: api.MAX_TAIL };
     client.follow(feed);
-    const user = (text: string) => ({ type: 'user', text, from_agent: false, at_unix_ms: null });
+    const user = (text: string): api.Item => ({ type: 'user', text, from_agent: false, at_unix_ms: null });
     event(entry, { type: 'feed', feed, value: { feed: 'transcript', start: 10, items: [user('a'), user('b')], reset: true } });
     event(entry, { type: 'feed', feed, value: { feed: 'transcript', start: 11, items: [user('B'), user('c')], reset: false } });
     const state = [...client.getState().transcripts.values()][0];
     expect(state?.start).toBe(10);
     expect(state?.items.map((item) => (item.type === 'user' ? item.text : ''))).toEqual(['a', 'B', 'c']);
+    expect(state?.resets).toBe(0);
+    event(entry, { type: 'feed', feed, value: { feed: 'transcript', start: 3, items: [user('new branch')], reset: true } });
+    event(entry, { type: 'feed', feed, value: { feed: 'transcript', start: 4, items: [user('next prompt')], reset: false } });
+    const reset = [...client.getState().transcripts.values()][0];
+    expect(reset?.start).toBe(3);
+    expect(reset?.resets).toBe(1);
+    expect(reset?.items).toEqual([user('new branch'), user('next prompt')]);
+  });
+
+  test('drafts survive on their own generation and are pruned when the controller is reused', async () => {
+    const entry = await connected();
+    const feed = { feed: 'live' } as const;
+    client.follow(feed);
+    const next = { ...LIVE, generation: LIVE.generation + 1 };
+    const other = { ...LIVE, key: 'another-controller' };
+    const seen = (sessions: api.LiveSession[]) =>
+      event(entry, { type: 'feed', feed, value: { feed: 'live', sessions, truncated: false } });
+
+    client.setComposerDraft(LIVE, 'old phone draft', WELCOME.epoch);
+    client.setComposerDraft(other, 'unrelated draft', WELCOME.epoch);
+    seen([liveSession()]);
+    expect(client.getState().composerDrafts.get(composerDraftKey(LIVE))?.text).toBe('old phone draft');
+    expect(client.getState().composerDrafts.has(composerDraftKey(next))).toBe(false);
+
+    seen([{ ...liveSession(), session: 'new-session', live: next }]);
+    seen([]);
+    expect(client.setComposerDraft(LIVE, 'late prefill for the old session', WELCOME.epoch)).toBe(false);
+    expect(client.getState().composerDrafts.has(composerDraftKey(LIVE))).toBe(false);
+    expect(client.getState().composerDrafts.has(composerDraftKey(next))).toBe(false);
+    expect(client.getState().composerDrafts.get(composerDraftKey(other))?.text).toBe('unrelated draft');
+    client.setComposerDraft(next, 'new phone draft', WELCOME.epoch);
+    expect(client.getState().composerDrafts.get(composerDraftKey(next))?.text).toBe('new phone draft');
+  });
+
+  test('a same-epoch reconnect with an empty live feed keeps the generation draft', async () => {
+    const first = await connected();
+    const feed = { feed: 'live' } as const;
+    client.follow(feed);
+    event(first, { type: 'feed', feed, value: { feed: 'live', sessions: [liveSession()], truncated: false } });
+    client.setComposerDraft(LIVE, 'keep this across reconnect', WELCOME.epoch);
+    first.events.closed({ code: CLOSE.GATEWAY_OFFLINE, reason: '', stage: 'session', error: null });
+    await clock.advance(1000);
+    const second = last();
+    welcome(second);
+    event(second, { type: 'feed', feed, value: { feed: 'live', sessions: [], truncated: false } });
+    const key = composerDraftKey(LIVE);
+    expect(client.getState().composerDrafts.get(key)?.text).toBe('keep this across reconnect');
+    event(second, { type: 'feed', feed, value: { feed: 'live', sessions: [liveSession()], truncated: false } });
+    expect(client.getState().composerDrafts.get(key)?.text).toBe('keep this across reconnect');
+  });
+
+  test('a gateway restart drops drafts and accepts reused identities only in the new epoch', async () => {
+    const first = await connected();
+    const feed = { feed: 'live' } as const;
+    client.follow(feed);
+    event(first, { type: 'feed', feed, value: { feed: 'live', sessions: [liveSession()], truncated: false } });
+    client.setComposerDraft(LIVE, 'draft for old gateway', WELCOME.epoch);
+    first.events.closed({ code: CLOSE.GATEWAY_OFFLINE, reason: '', stage: 'session', error: null });
+    await clock.advance(1000);
+    const second = last();
+    const epoch = '112233445566778899aabbccddeeff00';
+    welcome(second, { epoch });
+    expect(client.getState().composerDrafts.size).toBe(0);
+    expect(client.getState().feeds.has('live')).toBe(false);
+    expect(client.setComposerDraft(LIVE, 'late prefill', WELCOME.epoch)).toBe(false);
+    const reused = { key: LIVE.key, generation: 1 };
+    event(second, { type: 'feed', feed, value: { feed: 'live', sessions: [{ ...liveSession(), live: reused, session: 'new-session' }], truncated: false } });
+    expect(client.setComposerDraft(reused, 'new gateway draft', epoch)).toBe(true);
+    expect(client.getState().composerDrafts.get(composerDraftKey(reused))?.text).toBe('new gateway draft');
+  });
+
+  test('stopping the client for a desktop switch clears its drafts and refuses late writes', async () => {
+    await connected();
+    expect(client.setComposerDraft(LIVE, 'old desktop draft', WELCOME.epoch)).toBe(true);
+    client.stop();
+    expect(client.getState().composerDrafts.size).toBe(0);
+    expect(client.setComposerDraft(LIVE, 'late prefill', WELCOME.epoch)).toBe(false);
   });
 
   test('pending confirmations are re-learnt from live and cleared by the answer', async () => {

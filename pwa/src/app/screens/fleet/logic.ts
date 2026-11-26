@@ -334,10 +334,18 @@ export function searchTree(rows: readonly TreeRow[], query: string): TreeRow[] {
   );
 }
 
-/** Merges a further page into the nodes already loaded (a node id appears once). */
-export function mergeTreePage(existing: readonly api.TreeNode[], page: readonly api.TreeNode[]): api.TreeNode[] {
-  const seen = new Set(existing.map((node) => node.id));
-  return [...existing, ...page.filter((node) => !seen.has(node.id))];
+/** Joins two consecutive windows in file order, keeping only the first node with each id. */
+export function mergeTreePage(earlier: readonly api.TreeNode[], later: readonly api.TreeNode[]): api.TreeNode[] {
+  const seen = new Set<string>();
+  const merged: api.TreeNode[] = [];
+  for (const page of [earlier, later]) {
+    for (const node of page) {
+      if (seen.has(node.id)) continue;
+      seen.add(node.id);
+      merged.push(node);
+    }
+  }
+  return merged;
 }
 
 /** Why `fork_at` would be refused for this node, or null when it can be sent. */
@@ -356,6 +364,26 @@ export function navigateRefusal(live: api.LiveSession | null): string | null {
   if (live.busy || live.status.state === 'busy') return 'Only while the session is idle.';
   if (live.status.state === 'attention') return 'omp is waiting for an answer first.';
   return null;
+}
+
+/** What the phone should show and prefill after omp answers a Go here request. */
+export function treeMove(result: Extract<api.DoneView, { type: 'moved' }>, stillRunning: boolean): { moved: boolean; notice: string; prefill: string | null } {
+  if (result.message !== null) return { moved: false, notice: result.message, prefill: null };
+  const prefill = stillRunning ? result.editor_text : null;
+  let notice = !result.before_prompt
+    ? 'Moved there — new prompts continue from this point'
+    : !stillRunning
+      ? 'Moved before that prompt — its text was not applied because the session is no longer running there'
+      : prefill !== null
+        ? 'Moved before that prompt — its text is in the composer'
+        : "Moved before that prompt — its text is in omp's editor on the desktop";
+  if (result.dropped_images > 0) {
+    const count = result.dropped_images;
+    notice += count === 1
+      ? ' · 1 image of that prompt was not carried over'
+      : ` · ${count} images of that prompt were not carried over`;
+  }
+  return { moved: true, notice, prefill };
 }
 
 // ---- worktrees -------------------------------------------------------------------------------------

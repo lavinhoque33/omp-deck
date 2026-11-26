@@ -210,15 +210,21 @@ fn every_model_switch_shows_its_own_toast_though_omp_reuses_one_toast_node() {
         tx.input(&encode_event(&event, InputEncoding::Apc))
             .expect("send the event");
     };
-    // The GUI's model menu: the composer bar's model button opens the picker (a node of the
-    // `layer`), and activating the model's item switches to it and closes the picker.
+    // The GUI's model menu: the composer's model button (role `omp.composer.model`; its id is
+    // generated, e.g. `3.bar/model` or `j.bar/model`) opens the picker (a node of the `layer`), and
+    // activating the model's item switches to it and closes the picker.
     let switch = |model: &str| {
         wait_for("the picker to be closed", TURN, || {
             (!nodes(&peek(&ns)).iter().any(|(_, k, _)| k == "picker")).then_some(())
         });
+        let button = wait_for("the composer's model button", TURN, || {
+            nodes(&peek(&ns))
+                .into_iter()
+                .find_map(|(id, _, p)| (p["role"] == "omp.composer.model").then_some(id))
+        });
         write(Event::Action {
             sf: sf.clone(),
-            id: "3.bar/model".to_owned(),
+            id: button,
             act: "status.model".to_owned(),
             value: None,
             mods: None,

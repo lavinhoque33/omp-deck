@@ -478,17 +478,17 @@ fn transcript_errors_notices_compaction_and_hidden_entries() {
     let p = d.path().join("t.jsonl");
     let big = "x".repeat(40 * 1024);
     let lines = [
-        r#"{"type":"custom_message","customType":"async-result","display":true,"content":"<notice>job done</notice>","details":{}}"#.to_owned(),
-        r#"{"type":"custom_message","customType":"hidden","display":false,"content":"nope"}"#.to_owned(),
-        r#"{"type":"compaction","id":"c","parentId":null,"timestamp":"2026-10-21T10:00:00.000Z","summary":"Goal\nstuff","tokensBefore":9000,"tokensAfter":1200}"#.to_owned(),
-        r#"{"type":"message","id":"d","message":{"role":"developer","content":[{"type":"text","text":"rule injection"}]}}"#.to_owned(),
-        r#"{"type":"message","id":"c","message":{"role":"custom","customType":"eval-state-context","content":"hidden","display":false}}"#.to_owned(),
-        r#"{"type":"credential_pin","id":"p","provider":"anthropic","hash":"h"}"#.to_owned(),
-        r#"{"type":"system-prompt-digest-or-unknown","id":"u"}"#.to_owned(),
+        r#"{"type":"custom_message","id":"n","parentId":null,"customType":"async-result","display":true,"content":"<notice>job done</notice>","details":{}}"#.to_owned(),
+        r#"{"type":"custom_message","id":"h","parentId":"n","customType":"hidden","display":false,"content":"nope"}"#.to_owned(),
+        r#"{"type":"compaction","id":"c","parentId":"h","timestamp":"2026-10-21T10:00:00.000Z","summary":"Goal\nstuff","tokensBefore":9000,"tokensAfter":1200}"#.to_owned(),
+        r#"{"type":"message","id":"d","parentId":"c","message":{"role":"developer","content":[{"type":"text","text":"rule injection"}]}}"#.to_owned(),
+        r#"{"type":"message","id":"e","parentId":"d","message":{"role":"custom","customType":"eval-state-context","content":"hidden","display":false}}"#.to_owned(),
+        r#"{"type":"credential_pin","id":"p","parentId":"e","provider":"anthropic","hash":"h"}"#.to_owned(),
+        r#"{"type":"system-prompt-digest-or-unknown","id":"u","parentId":"p"}"#.to_owned(),
         format!(
-            r#"{{"type":"message","id":"r","message":{{"role":"toolResult","toolCallId":"z","toolName":"bash","content":[{{"type":"text","text":"{big}"}},{{"type":"image","data":"blob:sha256:ab","mimeType":"image/png"}}],"isError":true}}}}"#
+            r#"{{"type":"message","id":"r","parentId":"u","message":{{"role":"toolResult","toolCallId":"z","toolName":"bash","content":[{{"type":"text","text":"{big}"}},{{"type":"image","data":"blob:sha256:ab","mimeType":"image/png"}}],"isError":true}}}}"#
         ),
-        r#"{"type":"message","id":"u2","message":{"role":"user","content":[{"type":"text","text":"steer"}],"attribution":"user","timestamp":1792577000000}}"#.to_owned(),
+        r#"{"type":"message","id":"u2","parentId":"r","message":{"role":"user","content":[{"type":"text","text":"steer"}],"attribution":"user","timestamp":1792577000000}}"#.to_owned(),
     ];
     fs::write(&p, format!("{}\n", lines.join("\n"))).unwrap();
     let items = read_all(&p);
@@ -530,8 +530,8 @@ fn irc_blocks_become_their_own_items() {
     let p = d.path().join("t.jsonl");
     let lines = [
         r#"{"type":"message","id":"s","message":{"role":"user","content":[{"type":"text","text":"[Wait interrupted by message]\n<irc from=\"parent\" agent=\"Main\">\nFYI: **re-read** `a.rs`.\n</irc>"}],"attribution":"agent","steering":true}}"#,
-        r#"{"type":"message","id":"t","message":{"role":"user","content":[{"type":"text","text":"before\n<irc agent=\"Sib\">\none\n</irc>\n<irc agent=\"Sib\">\ntwo\n</irc>\nafter"}],"attribution":"agent"}}"#,
-        r#"{"type":"custom_message","customType":"irc:incoming","display":true,"content":"<irc>\nIncoming IRC message from agent `Main`:\n\nhello\n</irc>"}"#,
+        r#"{"type":"message","id":"t","parentId":"s","message":{"role":"user","content":[{"type":"text","text":"before\n<irc agent=\"Sib\">\none\n</irc>\n<irc agent=\"Sib\">\ntwo\n</irc>\nafter"}],"attribution":"agent"}}"#,
+        r#"{"type":"custom_message","id":"i","parentId":"t","customType":"irc:incoming","display":true,"content":"<irc>\nIncoming IRC message from agent `Main`:\n\nhello\n</irc>"}"#,
     ];
     fs::write(&p, format!("{}\n", lines.join("\n"))).unwrap();
     let irc =
@@ -569,18 +569,18 @@ fn irc_blocks_become_their_own_items() {
 fn transcript_reader_tails_partial_lines_and_resets_on_replace() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("t.jsonl");
-    let user = |t: &str| {
+    let user = |id: &str, parent: &str, t: &str| {
         format!(
-            r#"{{"type":"message","id":"u","message":{{"role":"user","content":[{{"type":"text","text":"{t}"}}],"attribution":"user"}}}}"#
+            r#"{{"type":"message","id":"{id}","parentId":{parent},"message":{{"role":"user","content":[{{"type":"text","text":"{t}"}}],"attribution":"user"}}}}"#
         )
     };
-    fs::write(&p, format!("{}\n", user("one"))).unwrap();
+    fs::write(&p, format!("{}\n", user("u1", "null", "one"))).unwrap();
     let mut r = TranscriptReader::new(p.clone());
     let u = r.refresh().unwrap();
     assert!(!u.reset && u.items.len() == 1);
     assert!(r.refresh().unwrap().items.is_empty());
 
-    let second = user("two");
+    let second = user("u2", r#""u1""#, "two");
     let (a, b) = second.split_at(second.len() - 7);
     append(&p, a.as_bytes());
     assert!(r.refresh().unwrap().items.is_empty(), "no newline yet");
@@ -594,7 +594,12 @@ fn transcript_reader_tails_partial_lines_and_resets_on_replace() {
     let new = d.path().join("new.jsonl");
     fs::write(
         &new,
-        format!("{}\n{}\n{}\n", user("a"), user("b"), user("c")),
+        format!(
+            "{}\n{}\n{}\n",
+            user("a", "null", "a"),
+            user("b", r#""a""#, "b"),
+            user("c", r#""b""#, "c"),
+        ),
     )
     .unwrap();
     fs::rename(&new, &p).unwrap();
@@ -694,12 +699,12 @@ fn agents_watcher_publishes_changes_and_stops_on_drop() {
 fn transcript_watcher_follows_appends_and_bumps_revision() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("t.jsonl");
-    let line = |t: &str| {
+    let line = |id: &str, parent: &str, t: &str| {
         format!(
-            r#"{{"type":"message","id":"u","message":{{"role":"user","content":"{t}","attribution":"user"}}}}"#
+            r#"{{"type":"message","id":"{id}","parentId":{parent},"message":{{"role":"user","content":"{t}","attribution":"user"}}}}"#
         )
     };
-    fs::write(&p, format!("{}\n", line("first"))).unwrap();
+    fs::write(&p, format!("{}\n", line("u1", "null", "first"))).unwrap();
     let hits = Arc::new(AtomicUsize::new(0));
     let h = Arc::clone(&hits);
     let w = TranscriptWatcher::spawn(p.clone(), move || {
@@ -708,7 +713,10 @@ fn transcript_watcher_follows_appends_and_bumps_revision() {
     let items = wait_for(|| Some(w.latest()).filter(|i| i.len() == 1));
     let rev = w.revision();
     assert!(rev >= 1);
-    append(&p, format!("{}\n", line("second")).as_bytes());
+    append(
+        &p,
+        format!("{}\n", line("u2", r#""u1""#, "second")).as_bytes(),
+    );
     let items2 = wait_for(|| Some(w.latest()).filter(|i| i.len() == 2));
     assert!(w.revision() > rev);
     assert_eq!(items.len(), 1, "earlier snapshots are immutable");

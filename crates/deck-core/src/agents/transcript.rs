@@ -1,11 +1,12 @@
-//! Subagent transcript → [`TranscriptItem`]s (docs/notes/agent-hub.md §6), with a live tail.
+//! Active-branch journal transcripts, with a live tail.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -837,50 +838,420 @@ fn map_message(line: &[u8], out: &mut Vec<TranscriptItem>) {
     }
 }
 
+/// The live leaf as of the last entry `tail`, or as of the whole file when `tail` is absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafAnchor {
+    pub leaf: Option<String>,
+    pub tail: Option<String>,
+}
+
+// Visit top-level metadata only; serde skips the message and other fields without materialising
+// them. The newtype borrows ordinary strings and also accepts escaped ones without guessing.
+#[derive(Deserialize)]
+struct EntryId<'a>(#[serde(borrow)] Cow<'a, str>);
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EntryHeader<'a> {
+    #[serde(borrow)]
+    id: Option<EntryId<'a>>,
+    #[serde(borrow)]
+    parent_id: Option<EntryId<'a>>,
+    #[serde(borrow, default, deserialize_with = "present_leaf")]
+    active_leaf_id: Option<Option<EntryId<'a>>>,
+    #[serde(rename = "type", borrow)]
+    kind: Option<EntryId<'a>>,
+}
+
+fn present_leaf<'de: 'a, 'a, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<EntryId<'a>>>, D::Error> {
+    Option::deserialize(deserializer).map(Some)
+}
+
+#[derive(Default)]
+struct Journal {
+    entries: Vec<Entry>,
+    ids: HashMap<Box<str>, usize>,
+    waiting_for_parent: HashMap<Box<str>, Vec<usize>>,
+    last_self: Option<usize>,
+}
+
+struct Entry {
+    parent: Option<usize>,
+    effect: LeafEffect,
+    offset: u64,
+    /// Bytes including the newline; 0 for a line that exceeds the rendering cap.
+    len: usize,
+}
+
+enum LeafEffect {
+    Own,
+    Empty,
+    Other(Box<str>),
+}
+
+impl Journal {
+    fn add(&mut self, header: EntryHeader<'_>, offset: u64, len: usize) {
+        let Some(EntryId(id)) = header.id else { return };
+        // The session header may carry a session UUID, not a journal entry id.
+        if id.is_empty()
+            || header
+                .kind
+                .is_none_or(|k| k.0 == "session" || k.0 == "title")
+            || self.ids.contains_key(id.as_ref())
+        {
+            return;
+        }
+        let index = self.entries.len();
+        let parent = header.parent_id.filter(|p| p.0 != id);
+        let parent_index = parent
+            .as_ref()
+            .and_then(|p| self.ids.get(p.0.as_ref()).copied());
+        if let (Some(EntryId(parent)), None) = (parent, parent_index) {
+            self.waiting_for_parent
+                .entry(parent.into_owned().into_boxed_str())
+                .or_default()
+                .push(index);
+        }
+        let effect = match header.active_leaf_id {
+            Some(None) => LeafEffect::Empty,
+            Some(Some(EntryId(leaf))) if leaf != id => {
+                LeafEffect::Other(leaf.into_owned().into_boxed_str())
+            }
+            _ => {
+                self.last_self = Some(index);
+                LeafEffect::Own
+            }
+        };
+        self.entries.push(Entry {
+            parent: parent_index,
+            effect,
+            offset,
+            len,
+        });
+        if let Some(children) = self.waiting_for_parent.remove(id.as_ref()) {
+            for child in children {
+                // A malformed cyclic chain is rooted rather than looping forever.
+                let mut ancestor = Some(index);
+                while let Some(i) = ancestor {
+                    if i == child {
+                        break;
+                    }
+                    ancestor = self.entries[i].parent;
+                }
+                if ancestor.is_none() {
+                    self.entries[child].parent = Some(index);
+                }
+            }
+        }
+        self.ids.insert(id.into_owned().into_boxed_str(), index);
+    }
+
+    fn leaf(&self) -> Option<usize> {
+        let (index, entry) = self.entries.iter().enumerate().next_back()?;
+        match &entry.effect {
+            LeafEffect::Own => Some(index),
+            LeafEffect::Empty => None,
+            LeafEffect::Other(id) => self.ids.get(id.as_ref()).copied().or(self.last_self),
+        }
+    }
+
+    fn fold(&self, start: usize, mut leaf: Option<usize>) -> Option<usize> {
+        for (index, entry) in self.entries.iter().enumerate().skip(start) {
+            leaf = match &entry.effect {
+                LeafEffect::Own => Some(index),
+                LeafEffect::Empty => None,
+                // An unreadable or missing target cannot replace the last known leaf.
+                LeafEffect::Other(id) => self.ids.get(id.as_ref()).copied().or(leaf),
+            };
+        }
+        leaf
+    }
+}
+
+#[derive(Default)]
+struct Anchors {
+    latest: Option<LeafAnchor>,
+    pending: bool,
+}
+
+impl Anchors {
+    fn set(&mut self, anchor: LeafAnchor) -> bool {
+        // An unpinned navigate reply is a new event even if it names the same leaf.
+        if anchor.tail.is_some() && self.latest.as_ref() == Some(&anchor) {
+            return false;
+        }
+        self.replace(anchor);
+        true
+    }
+
+    fn replace(&mut self, anchor: LeafAnchor) {
+        self.latest = Some(anchor);
+        self.pending = true;
+    }
+
+    fn pending(&self) -> Option<&LeafAnchor> {
+        self.latest.as_ref().filter(|_| self.pending)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActivePath {
+    root: usize,
+    leaf: usize,
+}
+
 /// What a [`TranscriptReader::refresh`] found.
 #[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TranscriptUpdate {
-    /// The file was replaced or shrank: `items` replace everything read before.
+    /// The path changed (or the file was replaced or shrank): `items` replace the previous list.
     pub reset: bool,
-    /// Items for the newly read complete lines.
+    /// Items from the active path, or just its newly appended suffix when not resetting.
     pub items: Vec<TranscriptItem>,
 }
 
-/// Synchronous incremental reader behind [`TranscriptWatcher`]; a half-written last line waits
-/// for its newline, an inode change or shrink starts over.
+/// Synchronous incremental reader behind [`TranscriptWatcher`]. It indexes journal entries,
+/// waits for a partial line's newline, and renders only the active path (or its new suffix).
 pub struct TranscriptReader {
     tail: LineTail,
+    journal: Journal,
+    /// Number of entries when we last reached EOF, or `None` during initial indexing.
+    seen_entries: Option<usize>,
+    leaf: Option<usize>,
+    published: Option<ActivePath>,
+    reset_pending: bool,
+    anchors: Anchors,
 }
 
 impl TranscriptReader {
     pub fn new(path: PathBuf) -> Self {
         TranscriptReader {
             tail: LineTail::new(path),
+            journal: Journal::default(),
+            seen_entries: None,
+            leaf: None,
+            published: None,
+            reset_pending: false,
+            anchors: Anchors::default(),
         }
+    }
+
+    /// Queue the live leaf for the next refresh, once its tail has been read.
+    pub fn anchor(&mut self, anchor: LeafAnchor) {
+        self.anchors.set(anchor);
     }
 
     pub fn refresh(&mut self) -> io::Result<TranscriptUpdate> {
-        let mut update = TranscriptUpdate::default();
+        self.refresh_until(&|| false)
+    }
+
+    fn refresh_until(&mut self, cancelled: &dyn Fn() -> bool) -> io::Result<TranscriptUpdate> {
+        check_cancelled(cancelled)?;
+        let mut file = crate::platform::open_regular_file(self.tail.path())?;
         loop {
-            let chunk = self.tail.poll()?;
+            check_cancelled(cancelled)?;
+            let chunk = self.tail.poll_file(&mut file)?;
             if chunk.reset {
-                update.reset = true;
-                update.items.clear();
+                self.journal = Journal::default();
+                self.leaf = None;
+                self.published = None;
+                self.seen_entries = None;
+                self.reset_pending = true;
+                self.anchors = Anchors::default();
             }
-            for line in tail::lines(&chunk.data) {
-                map_line(line, &mut update.items);
+            if let Some(span) = chunk.skipped {
+                // Index a dropped line without buffering it, so descendants can still reach its
+                // parent. The span reader and tail use this same open file, even across a rename.
+                let header = file.seek(SeekFrom::Start(span.start)).and_then(|_| {
+                    let reader = BufReader::with_capacity(
+                        SCAN_BUF,
+                        CancelRead {
+                            inner: (&mut file).take(span.end - span.start),
+                            cancelled,
+                        },
+                    );
+                    let mut de = serde_json::Deserializer::from_reader(reader);
+                    let header = EntryHeader::deserialize(&mut de)?;
+                    de.end()?;
+                    Ok(header)
+                });
+                if let Err(e) = check_cancelled(cancelled) {
+                    self.tail.rewind(span.start);
+                    return Err(e);
+                }
+                match header {
+                    Ok(header) => self.journal.add(header, span.start, 0),
+                    Err(e) => {
+                        log::debug!("agents: skipping unreadable oversized transcript entry: {e}")
+                    }
+                }
+            }
+            let mut start = 0;
+            for end in memchr::memchr_iter(b'\n', &chunk.data) {
+                let line = &chunk.data[start..end];
+                if !line.is_empty()
+                    && let Some(header) = parse::<EntryHeader>(line, "transcript entry")
+                {
+                    let len = end + 1 - start;
+                    self.journal.add(
+                        header,
+                        chunk.offset + start as u64,
+                        if line.len() <= tail::MAX_LINE { len } else { 0 },
+                    );
+                }
+                start = end + 1;
             }
             if !chunk.more {
-                return Ok(update);
+                break;
             }
         }
+        let entries = self.journal.entries.len();
+        if self.seen_entries != Some(entries) {
+            self.leaf = match self.seen_entries {
+                Some(start) => self.journal.fold(start, self.leaf),
+                None => self.journal.leaf(),
+            };
+            self.seen_entries = Some(entries);
+        }
+        self.apply_anchor();
+        self.render(file, cancelled)
+    }
+
+    fn apply_anchor(&mut self) {
+        let Some(anchor) = self.anchors.pending() else {
+            return;
+        };
+        let start = if let Some(tail) = &anchor.tail {
+            let Some(&index) = self.journal.ids.get(tail.as_str()) else {
+                return;
+            };
+            index + 1
+        } else {
+            self.journal.entries.len()
+        };
+        let leaf = match &anchor.leaf {
+            Some(id) => self.journal.ids.get(id.as_str()).copied().map(Some),
+            None => Some(None),
+        };
+        self.anchors.pending = false;
+        let Some(leaf) = leaf else { return };
+        self.leaf = self.journal.fold(start, leaf);
+    }
+
+    fn render(
+        &mut self,
+        mut file: File,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<TranscriptUpdate> {
+        let mut update = TranscriptUpdate {
+            reset: self.reset_pending,
+            items: Vec::new(),
+        };
+        let old = self.published;
+        let mut at = self.leaf;
+        let mut suffix = Vec::new();
+        // Parent links are immutable except for a missing parent that arrives late. Only the
+        // published root can acquire such a link; in that case the old path cannot be a prefix.
+        let boundary = old
+            .filter(|p| self.journal.entries[p.root].parent.is_none())
+            .map(|p| p.leaf);
+        while let Some(i) = at {
+            if Some(i) == boundary {
+                break;
+            }
+            if suffix.len().is_multiple_of(256) {
+                check_cancelled(cancelled)?;
+            }
+            suffix.push(i);
+            at = self.journal.entries[i].parent;
+        }
+        let root = if at.is_some() {
+            old.map(|p| p.root)
+        } else {
+            update.reset |= old.is_some();
+            suffix.last().copied()
+        };
+        let mut line = Vec::new();
+        let mut pos = None;
+        for (n, i) in suffix.into_iter().rev().enumerate() {
+            let entry = &self.journal.entries[i];
+            if n.is_multiple_of(256) || entry.len > SCAN_BUF {
+                check_cancelled(cancelled)?;
+            }
+            if entry.len == 0 {
+                continue;
+            }
+            line.resize(entry.len, 0);
+            let read = if pos == Some(entry.offset) {
+                file.read_exact(&mut line)
+            } else {
+                file.seek(SeekFrom::Start(entry.offset))
+                    .and_then(|_| file.read_exact(&mut line))
+            };
+            match read {
+                Ok(()) => {
+                    pos = Some(entry.offset + entry.len as u64);
+                    map_line(&line, &mut update.items);
+                }
+                Err(e) => {
+                    pos = None;
+                    log::debug!(
+                        "agents: cannot read transcript entry at {}: {e}",
+                        entry.offset
+                    );
+                }
+            }
+        }
+        check_cancelled(cancelled)?;
+        self.published = root
+            .zip(self.leaf)
+            .map(|(root, leaf)| ActivePath { root, leaf });
+        self.reset_pending = false;
+        Ok(update)
     }
 }
 
+fn check_cancelled(cancelled: &dyn Fn() -> bool) -> io::Result<()> {
+    if cancelled() {
+        Err(io::ErrorKind::Interrupted.into())
+    } else {
+        Ok(())
+    }
+}
+
+struct CancelRead<'a, R> {
+    inner: R,
+    cancelled: &'a dyn Fn() -> bool,
+}
+
+impl<R: Read> Read for CancelRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // serde's byte iterator retries Interrupted. Use a different I/O error to stop the
+        // streaming parse; refresh_until checks cancellation again before using the result.
+        if (self.cancelled)() {
+            return Err(io::Error::other("transcript refresh cancelled"));
+        }
+        self.inner.read(buf)
+    }
+}
+
+#[derive(Default)]
+struct Published {
+    items: Arc<Vec<TranscriptItem>>,
+    epoch: u64,
+}
+
+#[derive(Default)]
+struct Control {
+    anchors: Anchors,
+}
+
 struct Shared {
-    latest: Mutex<Arc<Vec<TranscriptItem>>>,
+    latest: Mutex<Published>,
     revision: AtomicU64,
-    stop: Mutex<bool>,
+    stop: AtomicBool,
+    control: Mutex<Control>,
     wake: Condvar,
 }
 
@@ -892,10 +1263,24 @@ pub struct TranscriptWatcher {
 
 impl TranscriptWatcher {
     pub fn spawn(path: PathBuf, on_update: impl Fn() + Send + 'static) -> TranscriptWatcher {
+        Self::spawn_anchored(path, None, on_update)
+    }
+
+    /// Start with a live anchor already queued, before publishing any items.
+    pub fn spawn_anchored(
+        path: PathBuf,
+        anchor: Option<LeafAnchor>,
+        on_update: impl Fn() + Send + 'static,
+    ) -> TranscriptWatcher {
+        let mut control = Control::default();
+        if let Some(anchor) = anchor {
+            control.anchors.replace(anchor);
+        }
         let shared = Arc::new(Shared {
-            latest: Mutex::new(Arc::new(Vec::new())),
+            latest: Mutex::default(),
             revision: AtomicU64::new(0),
-            stop: Mutex::new(false),
+            stop: AtomicBool::new(false),
+            control: Mutex::new(control),
             wake: Condvar::new(),
         });
         let worker = Arc::clone(&shared);
@@ -912,12 +1297,30 @@ impl TranscriptWatcher {
         TranscriptWatcher { shared, handle }
     }
 
-    /// Full list so far (append-only growth).
+    /// Current root-to-leaf transcript. A branch jump can replace it.
     pub fn latest(&self) -> Arc<Vec<TranscriptItem>> {
-        lock(&self.shared.latest).clone()
+        Arc::clone(&lock(&self.shared.latest).items)
     }
 
-    /// Bumps on every change.
+    /// Bumps on every transcript reset.
+    pub fn epoch(&self) -> u64 {
+        lock(&self.shared.latest).epoch
+    }
+
+    /// Read the reset epoch and the exact snapshot it describes together.
+    pub fn latest_with_epoch(&self) -> (u64, Arc<Vec<TranscriptItem>>) {
+        let latest = lock(&self.shared.latest);
+        (latest.epoch, Arc::clone(&latest.items))
+    }
+
+    /// Queue a live leaf and wake the watcher without waiting for the regular poll.
+    pub fn anchor(&self, anchor: LeafAnchor) {
+        if lock(&self.shared.control).anchors.set(anchor) {
+            self.shared.wake.notify_one();
+        }
+    }
+
+    /// Bumps on initial publication (even if empty) and every subsequent change.
     pub fn revision(&self) -> u64 {
         self.shared.revision.load(Ordering::Acquire)
     }
@@ -925,8 +1328,12 @@ impl TranscriptWatcher {
 
 impl Drop for TranscriptWatcher {
     fn drop(&mut self) {
-        *lock(&self.shared.stop) = true;
-        self.shared.wake.notify_all();
+        {
+            // Use the wake mutex when changing the predicate, so the waiter cannot miss it.
+            let _control = lock(&self.shared.control);
+            self.shared.stop.store(true, Ordering::Relaxed);
+            self.shared.wake.notify_all();
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -935,21 +1342,42 @@ impl Drop for TranscriptWatcher {
 
 fn run(shared: &Shared, path: PathBuf, on_update: &dyn Fn()) {
     let mut reader = TranscriptReader::new(path);
+    let stopped = || shared.stop.load(Ordering::Relaxed);
     let mut warned = false;
+    let mut published = false;
     loop {
-        match reader.refresh() {
+        {
+            let mut control = lock(&shared.control);
+            if stopped() {
+                return;
+            }
+            if let Some(anchor) = control.anchors.pending().cloned() {
+                control.anchors.pending = false;
+                reader.anchors.replace(anchor);
+            }
+        }
+        match reader.refresh_until(&stopped) {
+            _ if stopped() => return,
             Ok(update) => {
                 warned = false;
-                if update.reset || !update.items.is_empty() {
+                if update.reset && reader.anchors.latest.is_none() {
+                    let mut control = lock(&shared.control);
+                    if !control.anchors.pending {
+                        control.anchors.latest = None;
+                    }
+                }
+                if !published || update.reset || !update.items.is_empty() {
                     {
                         let mut latest = lock(&shared.latest);
                         if update.reset {
-                            *latest = Arc::new(update.items);
-                        } else {
-                            Arc::make_mut(&mut latest).extend(update.items);
+                            latest.items = Arc::new(update.items);
+                            latest.epoch += 1;
+                        } else if !update.items.is_empty() {
+                            Arc::make_mut(&mut latest.items).extend(update.items);
                         }
+                        shared.revision.fetch_add(1, Ordering::Release);
                     }
-                    shared.revision.fetch_add(1, Ordering::Release);
+                    published = true;
                     on_update();
                 }
             }
@@ -960,20 +1388,64 @@ fn run(shared: &Shared, path: PathBuf, on_update: &dyn Fn()) {
                 }
             }
         }
-        let mut stop = lock(&shared.stop);
+        let mut control = lock(&shared.control);
         let deadline = std::time::Instant::now() + POLL;
-        while !*stop {
+        while !stopped() && !control.anchors.pending {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 break;
             }
-            stop = shared
+            control = shared
                 .wake
-                .wait_timeout(stop, left)
+                .wait_timeout(control, left)
                 .map_or_else(|e| e.into_inner().0, |(g, _)| g);
         }
-        if *stop {
-            return;
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_can_stop_during_indexing_or_rendering_without_publishing_a_partial_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut file = File::create(&path).unwrap();
+        use std::io::Write as _;
+        const COUNT: usize = 600;
+        for i in 0..COUNT {
+            let parent = i.checked_sub(1).map(|n| n.to_string());
+            writeln!(
+                file,
+                r#"{{"type":"message","id":"{i}","parentId":{},"message":{{"role":"user","content":"prompt"}}}}"#,
+                serde_json::json!(parent),
+            )
+            .unwrap();
         }
+        drop(file);
+
+        // After the pre-open check, stop at the first indexing chunk.
+        let mut reader = TranscriptReader::new(path.clone());
+        let checks = Cell::new(0);
+        let cancel_after = |limit| {
+            checks.set(checks.get() + 1);
+            checks.get() >= limit
+        };
+        let err = reader.refresh_until(&|| cancel_after(2)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(reader.journal.entries.is_empty());
+
+        // Count past indexing and the parent walk, then stop after rendering 256 entries.
+        checks.set(0);
+        let err = reader.refresh_until(&|| cancel_after(7)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(reader.seen_entries, Some(COUNT));
+        assert!(reader.published.is_none());
+        assert_eq!(reader.refresh().unwrap().items.len(), COUNT);
+        assert_eq!(
+            TranscriptReader::new(path).refresh().unwrap().items.len(),
+            COUNT
+        );
     }
 }

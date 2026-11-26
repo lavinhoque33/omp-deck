@@ -2078,6 +2078,14 @@ pub enum Done {
     ProjectRestored(ProjectRestoreReport),
     AppUpdate(AppUpdateView),
     Ctl(deck_core::ctl::CtlReply),
+    /// A phone tree move, kept in memory for recovery by its request key.
+    Navigated {
+        leaf: Option<String>,
+        before_prompt: bool,
+        editor_text: Option<String>,
+        dropped_images: u32,
+        message: Option<String>,
+    },
     /// [`Mutation::KillNames`]: the sessions that failed, with why.
     Killed(Vec<(String, String)>),
     /// [`Mutation::PairingBegin`]: the window's id, the invite (`v1.…`) and the link the QR code

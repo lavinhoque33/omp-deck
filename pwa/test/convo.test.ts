@@ -8,6 +8,7 @@ import {
   composeProblem,
   fileSize,
   followMode,
+  mergeComposerPrefill,
   modesFor,
   phaseOf,
   uploadIds,
@@ -212,6 +213,12 @@ describe('composer', () => {
     upload: 'up-1',
     error: null,
     ...patch,
+  });
+
+  test('a jumped-to prompt goes ahead of the existing phone draft', () => {
+    expect(mergeComposerPrefill('', 'First line\nSecond line')).toBe('First line\nSecond line');
+    expect(mergeComposerPrefill('  A draft\n', 'A prompt')).toBe('A prompt\n\n  A draft\n');
+    expect(mergeComposerPrefill('A draft', '')).toBe('\n\nA draft');
   });
 
   test('modes per phase and following busy/idle', () => {

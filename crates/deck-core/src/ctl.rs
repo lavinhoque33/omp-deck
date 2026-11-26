@@ -375,6 +375,9 @@ pub struct LiveSnapshot {
     pub main_idle: Option<bool>,
     /// The main session's in-memory leaf entry id (`sessionManager.getLeafId()`).
     pub leaf: Option<String>,
+    /// Last entry in journal order; `None` from older extensions or before any entry.
+    #[serde(default)]
+    pub tail: Option<String>,
     pub agents: Vec<LiveAgent>,
     /// The main session's `/context` breakdown; `None` from older extensions or on any failure.
     pub context: Option<ContextBreakdown>,
@@ -779,6 +782,9 @@ pub enum CtlCommand {
         /// Absent in payloads of older senders: no summary.
         #[serde(default)]
         summary: BranchSummary,
+        /// Move a restored prompt to the caller instead of leaving a draft in omp.
+        #[serde(default)]
+        take_editor: bool,
     },
     /// Cancel a running branch summary started by [`CtlCommand::Navigate`] (omp's Esc in the
     /// `/tree` selector → `session.abortBranchSummary()`): the pending navigate answers
@@ -922,6 +928,32 @@ impl DeleteOutcome {
     }
 }
 
+/// Prompt taken from omp by [`CtlCommand::Navigate`], if the extension supplied it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NavigateOutcome {
+    pub editor_text: Option<String>,
+    pub editor_images: u32,
+}
+
+impl NavigateOutcome {
+    pub fn of(reply: &CtlReply) -> NavigateOutcome {
+        let Some(value) = &reply.value else {
+            return Self::default();
+        };
+        Self {
+            editor_text: value
+                .get("editorText")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            editor_images: value
+                .get("editorImages")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or_default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CtlReply {
     pub ok: bool,
@@ -933,6 +965,9 @@ pub struct CtlReply {
     pub new_file: Option<PathBuf>,
     /// `Navigate`: the leaf after the move.
     pub leaf: Option<String>,
+    /// `Navigate` / `ReanswerAsk`: journal tail observed with `leaf`, absent on older extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<String>,
     /// Result payload of commands that return data (`AdvisorConfig`, `TaskModelOverride`).
     #[serde(default)]
     pub value: Option<serde_json::Value>,
@@ -1011,6 +1046,8 @@ enum WireMsg {
         #[serde(default)]
         leaf: Option<String>,
         #[serde(default)]
+        tail: Option<String>,
+        #[serde(default)]
         value: Option<serde_json::Value>,
         #[serde(default)]
         message: Option<String>,
@@ -1027,6 +1064,8 @@ struct WireSnapshot {
     main_idle: Option<bool>,
     #[serde(default)]
     leaf: Option<String>,
+    #[serde(default)]
+    tail: Option<String>,
     #[serde(default)]
     agents: Vec<Lenient<WireAgent>>,
     #[serde(default)]
@@ -1279,6 +1318,7 @@ impl From<WireSnapshot> for LiveSnapshot {
             session_file: w.session_file,
             main_idle: w.main_idle,
             leaf: w.leaf,
+            tail: w.tail,
             agents,
             progress: match w.progress {
                 Some(Lenient::Ok(p)) => Some(p.into()),
@@ -1419,14 +1459,19 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
             root,
             entry_id,
             summary,
+            take_editor,
         } => {
             let (summarize, instructions) = match summary {
                 BranchSummary::None => (false, None),
                 BranchSummary::Summarize => (true, None),
                 BranchSummary::Custom(text) => (true, Some(text)),
             };
-            serde_json::json!({"rid": rid, "t": "navigate", "entryId": entry_id, "root": root,
-                "summarize": summarize, "customInstructions": instructions})
+            let mut value = serde_json::json!({"rid": rid, "t": "navigate", "entryId": entry_id, "root": root,
+                "summarize": summarize, "customInstructions": instructions});
+            if *take_editor {
+                value["takeEditor"] = true.into();
+            }
+            value
         }
         CtlCommand::AbortBranchSummary { root } => {
             serde_json::json!({"rid": rid, "t": "abort_branch_summary", "root": root})
@@ -1506,12 +1551,37 @@ struct Shared {
     ui_hook: AtomicBool,
     shutdown: AtomicBool,
     next_id: AtomicU64,
-    latest: Mutex<Option<Arc<LiveSnapshot>>>,
-    replies: Mutex<Vec<(u64, CtlReply)>>,
+    next_arrival: AtomicU64,
+    latest: Mutex<Option<(u64, Arc<LiveSnapshot>)>>,
+    replies: Mutex<Vec<(u64, (u64, CtlReply))>>,
     features: Mutex<Vec<String>>,
     tools: Mutex<Vec<String>>,
     tool_requests: Mutex<Vec<ToolEvent>>,
     subscription: Mutex<Subscription>,
+}
+
+impl Shared {
+    fn push_reply(&self, id: u64, reply: CtlReply) {
+        let mut replies = lock(&self.replies);
+        replies.push((
+            self.next_arrival.fetch_add(1, Ordering::Relaxed),
+            (id, reply),
+        ));
+    }
+
+    fn publish_snapshot(&self, snapshot: LiveSnapshot) -> bool {
+        let mut latest = lock(&self.latest);
+        let arrival = self.next_arrival.fetch_add(1, Ordering::Relaxed);
+        if let Some((at, previous)) = &mut *latest
+            && **previous == snapshot
+        {
+            *at = arrival;
+            false
+        } else {
+            *latest = Some((arrival, Arc::new(snapshot)));
+            true
+        }
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1529,6 +1599,20 @@ pub struct CtlClient {
     shared: Arc<Shared>,
     commands: Sender<WorkerMessage>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// The latest snapshot and drained replies, with wire order preserved between the two kinds.
+pub struct LiveUpdates {
+    /// The same snapshot [`CtlClient::latest`] would return at the time of the read.
+    pub snapshot: Option<Arc<LiveSnapshot>>,
+    /// Arrival number of that snapshot, even when its content did not change.
+    pub snapshot_arrival: Option<u64>,
+    /// Replies drained in arrival order.
+    pub replies: Vec<(u64, CtlReply)>,
+    /// How many replies arrived before `snapshot`; 0 when there is no snapshot.
+    pub replies_before_snapshot: usize,
+    /// Connection serial of the client; 0 until the first accepted hello.
+    pub connection: u64,
 }
 
 impl CtlClient {
@@ -1593,6 +1677,13 @@ impl CtlClient {
             .then(|| self.shared.connection.load(Ordering::Relaxed))
     }
 
+    /// Serial of the current (or, while offline, the last) connection: 0 before the first hello,
+    /// one more for every later one. The same value as [`LiveUpdates::connection`]; facts learned
+    /// on one connection are stale once it differs.
+    pub fn connection_serial(&self) -> u64 {
+        self.shared.connection.load(Ordering::Acquire)
+    }
+
     /// Registered full tool names advertised by the extension; empty while offline.
     pub fn tools(&self) -> Vec<String> {
         lock(&self.shared.tools).clone()
@@ -1605,7 +1696,14 @@ impl CtlClient {
 
     /// `None` until the first snapshot and after a disconnect.
     pub fn latest(&self) -> Option<Arc<LiveSnapshot>> {
-        lock(&self.shared.latest).clone()
+        lock(&self.shared.latest)
+            .as_ref()
+            .map(|(_, snapshot)| Arc::clone(snapshot))
+    }
+
+    /// Arrival number of the latest snapshot, or `None` until one arrives or after disconnect.
+    pub fn snapshot_arrival(&self) -> Option<u64> {
+        lock(&self.shared.latest).as_ref().map(|(at, _)| *at)
     }
 
     /// Queued; the reply arrives via [`take_replies`](Self::take_replies) (and `on_update` fires).
@@ -1635,13 +1733,47 @@ impl CtlClient {
             .send(WorkerMessage::Command(id, connection, cmd))
             .is_err()
         {
-            lock(&self.shared.replies).push((id, failure("control client stopped")));
+            self.shared
+                .push_reply(id, failure("control client stopped"));
         }
         id
     }
 
     pub fn take_replies(&self) -> Vec<(u64, CtlReply)> {
         std::mem::take(&mut *lock(&self.shared.replies))
+            .into_iter()
+            .map(|(_, reply)| reply)
+            .collect()
+    }
+
+    /// Drain replies and locate the latest snapshot in their arrival order.
+    ///
+    /// A reply is never drained by a later call than a snapshot received after it. Process
+    /// `replies[..replies_before_snapshot]`, the snapshot if new, then the rest of `replies`.
+    pub fn take_updates(&self) -> LiveUpdates {
+        // Hold the replies lock through the snapshot read so no reply can arrive between the
+        // drain and a newer snapshot. Neither publisher ever holds both locks.
+        let mut pending = lock(&self.shared.replies);
+        let replies = std::mem::take(&mut *pending);
+        let latest = lock(&self.shared.latest);
+        let (snapshot, snapshot_arrival, replies_before_snapshot) =
+            latest.as_ref().map_or((None, None, 0), |(at, snapshot)| {
+                (
+                    Some(Arc::clone(snapshot)),
+                    Some(*at),
+                    replies.partition_point(|(seq, _)| seq < at),
+                )
+            });
+        let connection = self.shared.connection.load(Ordering::Relaxed);
+        drop(latest);
+        drop(pending);
+        LiveUpdates {
+            snapshot,
+            snapshot_arrival,
+            replies: replies.into_iter().map(|(_, reply)| reply).collect(),
+            replies_before_snapshot,
+            connection,
+        }
     }
 }
 
@@ -1709,7 +1841,7 @@ impl Worker {
     fn wait(&mut self, d: Duration) -> bool {
         match self.commands.recv_timeout(d) {
             Ok(WorkerMessage::Command(id, _, _)) => {
-                lock(&self.shared.replies).push((id, failure("not connected")));
+                self.shared.push_reply(id, failure("not connected"));
                 (self.on_update)();
                 !self.stopping()
             }
@@ -1729,12 +1861,9 @@ impl Worker {
         let had_snapshot = lock(&self.shared.latest).take().is_some();
         let mut changed = was_connected || had_snapshot;
         if !self.pending.is_empty() {
-            let mut replies = lock(&self.shared.replies);
-            replies.extend(
-                self.pending
-                    .drain()
-                    .map(|id| (id, failure("connection closed"))),
-            );
+            for id in self.pending.drain() {
+                self.shared.push_reply(id, failure("connection closed"));
+            }
             changed = true;
         }
         if changed && !self.stopping() {
@@ -1756,12 +1885,12 @@ impl Worker {
                     return Exit::Shutdown;
                 };
                 if !hello {
-                    lock(&self.shared.replies).push((id, failure("not connected")));
+                    self.shared.push_reply(id, failure("not connected"));
                     (self.on_update)();
                 } else if connection
                     .is_some_and(|serial| serial != self.shared.connection.load(Ordering::Relaxed))
                 {
-                    lock(&self.shared.replies).push((id, failure("connection changed")));
+                    self.shared.push_reply(id, failure("connection changed"));
                     (self.on_update)();
                 } else if stream.write_all(&encode(id, &cmd)).is_ok() {
                     self.pending.insert(id);
@@ -1771,7 +1900,7 @@ impl Worker {
                         *lock(&self.shared.subscription) = Subscription { snapshots, tools };
                     }
                 } else {
-                    lock(&self.shared.replies).push((id, failure("write failed")));
+                    self.shared.push_reply(id, failure("write failed"));
                     return Exit::Disconnected;
                 }
             }
@@ -1885,17 +2014,7 @@ impl Worker {
                 }
             }
             WireMsg::Agents(s) if *hello => {
-                let snap = LiveSnapshot::from(*s);
-                let changed = {
-                    let mut latest = lock(&self.shared.latest);
-                    if latest.as_deref() == Some(&snap) {
-                        false
-                    } else {
-                        *latest = Some(Arc::new(snap));
-                        true
-                    }
-                };
-                if changed {
+                if self.shared.publish_snapshot(LiveSnapshot::from(*s)) {
                     (self.on_update)();
                 }
             }
@@ -1927,6 +2046,7 @@ impl Worker {
                 code,
                 new_file,
                 leaf,
+                tail,
                 value,
                 message,
             } => {
@@ -1937,10 +2057,11 @@ impl Worker {
                         code,
                         new_file,
                         leaf,
+                        tail,
                         value,
                         message,
                     };
-                    lock(&self.shared.replies).push((rid, reply));
+                    self.shared.push_reply(rid, reply);
                     (self.on_update)();
                 }
             }
@@ -2435,6 +2556,7 @@ mod tests {
                 root: "/s/a.jsonl".into(),
                 entry_id: "e1".into(),
                 summary: BranchSummary::None,
+                take_editor: false,
             }
         );
         let new: CtlCommand = serde_json::from_str(
@@ -2444,6 +2566,183 @@ mod tests {
         assert!(
             matches!(new, CtlCommand::Navigate { summary: BranchSummary::Custom(t), .. } if t == "x")
         );
+    }
+
+    #[test]
+    fn navigation_reply_decodes_tail_and_accepts_older_replies() {
+        let shared = Arc::new(Shared::default());
+        let (_tx, commands) = mpsc::channel();
+        let mut worker = Worker {
+            shared: Arc::clone(&shared),
+            commands,
+            dir: PathBuf::new(),
+            key_file: PathBuf::new(),
+            on_update: Box::new(|| {}),
+            pending: [1, 2].into_iter().collect(),
+        };
+        let mut hello = true;
+        assert!(worker.line(
+            br#"{"t":"reply","rid":1,"ok":true,"leaf":"e1","tail":"e7"}"#,
+            &mut hello
+        ));
+        assert!(worker.line(
+            br#"{"t":"reply","rid":2,"ok":true,"leaf":"e1"}"#,
+            &mut hello
+        ));
+        let replies = lock(&shared.replies);
+        assert_eq!(replies[0].1.1.tail.as_deref(), Some("e7"));
+        assert_eq!(replies[1].1.1.tail, None);
+    }
+
+    #[test]
+    fn navigate_takes_editor_only_when_requested() {
+        let render = |take_editor| {
+            serde_json::from_slice::<serde_json::Value>(&encode(
+                42,
+                &CtlCommand::Navigate {
+                    root: "/s/a.jsonl".into(),
+                    entry_id: "e1".into(),
+                    summary: BranchSummary::None,
+                    take_editor,
+                },
+            ))
+            .unwrap()
+        };
+        let legacy = serde_json::json!({
+            "rid": 42, "t": "navigate", "root": "/s/a.jsonl", "entryId": "e1",
+            "summarize": false, "customInstructions": null
+        });
+        assert_eq!(render(false), legacy);
+        let mut taking = legacy;
+        taking["takeEditor"] = true.into();
+        assert_eq!(render(true), taking);
+
+        let reply = |value| CtlReply {
+            ok: true,
+            value,
+            ..CtlReply::default()
+        };
+        assert_eq!(
+            NavigateOutcome::of(&reply(None)),
+            NavigateOutcome::default()
+        );
+        let value = Some(serde_json::json!({"editorText":"", "editorImages": 2}));
+        assert_eq!(
+            NavigateOutcome::of(&reply(value)),
+            NavigateOutcome {
+                editor_text: Some(String::new()),
+                editor_images: 2
+            },
+        );
+    }
+
+    #[test]
+    fn ctl_updates_keep_wire_order_relative_to_latest_snapshot() {
+        let shared = Arc::new(Shared::default());
+        let (commands, rx) = mpsc::channel();
+        let client = CtlClient {
+            shared: Arc::clone(&shared),
+            commands,
+            thread: None,
+        };
+        let mut worker = Worker {
+            shared,
+            commands: rx,
+            dir: PathBuf::new(),
+            key_file: PathBuf::new(),
+            on_update: Box::new(|| {}),
+            pending: (1..=6).collect(),
+        };
+        assert_eq!(client.take_updates().connection, 0);
+        let mut hello = false;
+        assert!(worker.line(br#"{"t":"hello","v":1}"#, &mut hello));
+        let mut arrive = |messages: &[&str]| {
+            for line in messages {
+                assert!(worker.line(line.as_bytes(), &mut hello));
+            }
+        };
+        let updates = |tail: Option<&str>, ids: &[u64], before| {
+            let got = client.take_updates();
+            assert_eq!(got.snapshot.as_ref().and_then(|s| s.tail.as_deref()), tail);
+            assert_eq!(got.snapshot.is_some(), tail.is_some());
+            assert_eq!(got.snapshot_arrival, client.snapshot_arrival());
+            assert_eq!(got.connection, 1);
+            assert_eq!(got.replies.iter().map(|r| r.0).collect::<Vec<_>>(), ids);
+            assert_eq!(got.replies_before_snapshot, before);
+            if let Some(got) = got.snapshot {
+                assert!(Arc::ptr_eq(&got, &client.latest().unwrap()));
+            }
+        };
+        arrive(&[r#"{"t":"reply","rid":1,"ok":true}"#]);
+        updates(None, &[1], 0);
+        arrive(&[
+            r#"{"t":"agents","tail":"a"}"#,
+            r#"{"t":"reply","rid":2,"ok":true}"#,
+        ]);
+        updates(Some("a"), &[2], 0);
+        arrive(&[
+            r#"{"t":"reply","rid":3,"ok":true}"#,
+            r#"{"t":"agents","tail":"b"}"#,
+        ]);
+        updates(Some("b"), &[3], 1);
+        let prev_snapshot = client.latest().unwrap();
+        let prev_arrival = client.snapshot_arrival().unwrap();
+        arrive(&[
+            r#"{"t":"reply","rid":4,"ok":true}"#,
+            r#"{"t":"agents","tail":"b"}"#,
+            r#"{"t":"reply","rid":5,"ok":true}"#,
+        ]);
+        assert!(Arc::ptr_eq(&prev_snapshot, &client.latest().unwrap()));
+        assert!(client.snapshot_arrival().unwrap() > prev_arrival);
+        updates(Some("b"), &[4, 5], 1);
+        arrive(&[r#"{"t":"reply","rid":6,"ok":true}"#]);
+        updates(Some("b"), &[6], 0);
+        updates(Some("b"), &[], 0);
+    }
+
+    #[test]
+    fn taking_updates_cannot_see_a_snapshot_ahead_of_its_reply() {
+        const TOTAL: u32 = 2_000;
+        let shared = Arc::new(Shared::default());
+        let (commands, _rx) = mpsc::channel();
+        let client = CtlClient {
+            shared: Arc::clone(&shared),
+            commands,
+            thread: None,
+        };
+        let start = std::sync::Barrier::new(2);
+        thread::scope(|threads| {
+            // Each snapshot's pid identifies the reply that must already have been seen.
+            threads.spawn(|| {
+                start.wait();
+                for pid in 1..=TOTAL {
+                    shared.push_reply(u64::from(pid), CtlReply::default());
+                    shared.publish_snapshot(LiveSnapshot {
+                        pid,
+                        ..LiveSnapshot::default()
+                    });
+                }
+            });
+            start.wait();
+            let mut seen = 0;
+            loop {
+                let got = client.take_updates();
+                let (before, after) = got.replies.split_at(got.replies_before_snapshot);
+                if let Some((rid, _)) = before.last() {
+                    seen = *rid;
+                }
+                if let Some(snapshot) = got.snapshot {
+                    assert!(seen >= u64::from(snapshot.pid));
+                    if snapshot.pid == TOTAL {
+                        break;
+                    }
+                }
+                if let Some((rid, _)) = after.last() {
+                    seen = *rid;
+                }
+                thread::yield_now();
+            }
+        });
     }
 
     #[test]

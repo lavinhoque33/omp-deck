@@ -1,17 +1,30 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  type Screen,
   deepLinkEntries,
   desktopFromHash,
   historyEntry,
   isBaseEntry,
   linkFromHash,
   routeFromHash,
+  ownsTopScreen,
   routeFromHistory,
   startRoute,
   syncedEntry,
 } from '../src/app/nav.ts';
 import { navigateForDesktop } from '../src/push.ts';
 import { ROUTES } from './smoke/routes.ts';
+
+test('a navigation completion only belongs to the mounted originating route at the top', () => {
+  const origin: Screen = { kind: 'tree', session: 's-1', title: 'Tree' };
+  const other: Screen = { kind: 'manager' };
+  expect(ownsTopScreen(true, origin, origin)).toBe(true);
+  expect(ownsTopScreen(false, origin, origin)).toBe(false);
+  expect(ownsTopScreen(true, origin, other)).toBe(false);
+  expect(ownsTopScreen(true, origin, { ...origin })).toBe(false);
+  expect(ownsTopScreen(true, origin, undefined)).toBe(false);
+  expect(ownsTopScreen(true, undefined, undefined)).toBe(false);
+});
 
 describe('routeFromHash', () => {
   test('the notification deep link opens the conversation', () => {

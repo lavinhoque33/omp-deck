@@ -68,6 +68,13 @@ export class SmokeGateway {
   readonly pendingUi = new Map<string, api.UiRequestView | null>(fx.LIVE.map((spec) => [spec.session, spec.ui]));
   readonly activity = new Map<string, fx.LiveSpec['state']>(fx.LIVE.map((spec) => [spec.session, spec.state]));
   readonly extraItems = new Map<string, api.Item[]>();
+  readonly forks = new Map<string, fx.LiveSpec>();
+  readonly liveOverrides = new Map<string, api.LiveSession>();
+  forkResumeFailure: string | null = null;
+  treeNav = false;
+  treeListing: ((op: Extract<api.Op, { op: 'tree' }>) => Extract<api.Resp, { type: 'tree' }>) | null = null;
+  navigate: ((op: Extract<api.Op, { op: 'navigate' }>) => api.DoneView) | null = null;
+  navigateDelay: Promise<void> | null = null;
   readonly deleted = new Set<string>();
   readonly killed = new Set<string>();
   readonly staged = new Map<string, Set<string>>();
@@ -114,7 +121,9 @@ export class SmokeGateway {
         max_views: api.MAX_VIEWS,
         max_feeds: api.MAX_FEEDS,
       },
-      features: this.opts.s4 ? [api.FEATURE_S4, api.FEATURE_FORM, api.FEATURE_PROGRESS] : [],
+      features: this.opts.s4
+        ? [api.FEATURE_S4, api.FEATURE_FORM, api.FEATURE_PROGRESS, ...(this.treeNav ? [api.FEATURE_TREE_NAV] : [])]
+        : [],
     };
     if (this.opts.s4 && this.opts.pushKey !== null) welcome.push_key = this.opts.pushKey;
     send([{ kind: 'welcome', body: utf8(JSON.stringify(welcome)) }]);
@@ -139,13 +148,15 @@ export class SmokeGateway {
   }
 
   liveSessions(): api.LiveSession[] {
-    return fx.LIVE.filter((spec) => !this.deleted.has(spec.session)).map((spec) =>
-      fx.liveSession({ ...spec, ui: this.pendingUi.get(spec.session) ?? null, state: this.activity.get(spec.session) ?? spec.state }),
-    );
+    return [...fx.LIVE, ...this.forks.values()]
+      .filter((spec) => !this.deleted.has(spec.session) && (spec.state !== 'exited' || !this.forks.has(spec.session)))
+      .map((spec) => this.liveOverrides.get(spec.session)
+        ?? fx.liveSession({ ...spec, ui: this.pendingUi.get(spec.session) ?? null, state: this.activity.get(spec.session) ?? spec.state }));
   }
 
   specByLive(live: api.LiveRef): fx.LiveSpec | undefined {
-    return fx.LIVE.find((spec) => fx.liveRef(spec).key === live.key);
+    return fx.LIVE.find((spec) => fx.liveRef(spec).key === live.key)
+      ?? [...this.forks.values()].find((spec) => spec.state !== 'exited' && fx.liveRef(spec).key === live.key);
   }
 
   items(session: string, agent: string | null): api.Item[] {
@@ -389,7 +400,7 @@ export class SmokeConnection {
         return { ok: { type: 'chunk', data: toB64(download.bytes.subarray(op.offset, end)), eof: end >= download.bytes.length } };
       }
       case 'tree':
-        return { ok: fx.tree(gw.t0, op.session, op.filter, op.cursor ?? null, op.limit) };
+        return { ok: gw.treeListing?.(op) ?? fx.tree(gw.t0, op.session, op.filter, op.cursor ?? null, op.limit) };
       case 'browse':
         return { ok: fx.browse(op.dir ?? null) };
       case 'usage_activity':
@@ -492,6 +503,10 @@ export class SmokeConnection {
         done({ state: 'failed', message: error instanceof Error ? error.message : String(error) });
       }
     };
+    if (op.op === 'navigate' && gw.navigateDelay !== null) {
+      void gw.navigateDelay.then(finish);
+      return;
+    }
     if (steps === undefined) {
       setTimeout(finish, gw.opts.outcomeDelayMs);
       return;
@@ -524,8 +539,14 @@ export class SmokeConnection {
       case 'restart':
       case 'update_run':
         return ok(someLive('s-idle'));
-      case 'resume':
-        return ok(someLive(op.session));
+      case 'resume': {
+        const forked = gw.forks.get(op.session);
+        if (forked === undefined) return ok(someLive(op.session));
+        if (gw.forkResumeFailure !== null) return { state: 'failed', message: gw.forkResumeFailure };
+        gw.forks.set(op.session, { ...forked, state: 'idle' });
+        gw.changed('live');
+        return ok({ type: 'session', live: fx.liveRef(forked) });
+      }
       case 'worktree_create':
         return op.open ? ok(someLive('s-exited')) : unit;
       case 'prompt':
@@ -577,11 +598,19 @@ export class SmokeConnection {
         for (const session of op.sessions) gw.deleted.add(session);
         gw.changed('sessions', 'inventory', 'live', 'projects');
         return ok({ type: 'deleted', results: op.sessions.map((session) => ({ session, error: null })) });
-      case 'copy_session':
       case 'move_session':
-        return ok({ type: 'file', session: op.op === 'copy_session' ? `${op.session}-copy` : op.session });
-      case 'fork_at':
-        return ok({ type: 'file', session: `${op.session}-fork` });
+        return ok({ type: 'file', session: op.session });
+      case 'copy_session':
+      case 'fork_at': {
+        const session = `${op.session}-${op.op === 'copy_session' ? 'copy' : 'fork'}`;
+        const original = fx.LIVE.find((spec) => spec.session === op.session);
+        if (original !== undefined) {
+          gw.forks.set(session, { ...original, session, state: 'exited', ui: null, title: `${original.title} (fork)`, tmux: session });
+        }
+        return ok({ type: 'file', session });
+      }
+      case 'navigate':
+        return gw.navigate === null ? unit : ok(gw.navigate(op));
       case 'running_kill':
         for (const id of op.ids) gw.killed.add(id);
         gw.changed('running');

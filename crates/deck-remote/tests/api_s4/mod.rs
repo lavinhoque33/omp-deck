@@ -90,6 +90,7 @@ pub fn requests() -> Vec<(&'static str, Request)> {
                     filter,
                     cursor,
                     limit: 500,
+                    at_leaf: false,
                 },
             ),
         ));
@@ -924,6 +925,8 @@ fn replies() -> Vec<(&'static str, Reply)> {
                     active_leaf: Some(s("n15")),
                     next_cursor: Some(s("c-15")),
                     truncated: false,
+                    prev_cursor: None,
+                    total: None,
                 },
             ),
         ),
@@ -2195,6 +2198,7 @@ fn s4_parameter_bounds() {
         filter: TreeFilter::Default,
         cursor: None,
         limit,
+        at_leaf: false,
     };
     assert!(tree(0).check().is_err());
     assert!(tree(MAX_TREE_LIMIT + 1).check().is_err());

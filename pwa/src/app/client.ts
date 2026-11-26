@@ -25,7 +25,7 @@ import type { Dialer, Link, LinkClose, PairingResult, PairingStage } from './lin
 import { decideRetry, type Stop } from './retry.ts';
 
 /** Optional features this app announces in `DeviceHello.features`. */
-export const DEVICE_FEATURES: readonly string[] = [api.FEATURE_S4, api.FEATURE_FORM, api.FEATURE_PROGRESS];
+export const DEVICE_FEATURES: readonly string[] = [api.FEATURE_S4, api.FEATURE_FORM, api.FEATURE_PROGRESS, api.FEATURE_TREE_NAV];
 
 /** Feeds of protocol v1; every other feed needs a gateway announcing `s4`. */
 const V1_FEEDS: Partial<Record<api.Feed['feed'], true>> = {
@@ -196,6 +196,8 @@ export interface TranscriptState {
   /** Index of `items[0]` in the transcript. */
   start: number;
   items: readonly api.Item[];
+  /** Counts replacements after the first page; survives append events until a view sees it. */
+  resets: number;
 }
 
 export type RequestStatus =
@@ -244,11 +246,18 @@ export interface ClientState {
   welcome: api.Welcome | null;
   feeds: ReadonlyMap<string, api.FeedValue>;
   transcripts: ReadonlyMap<string, TranscriptState>;
+  /** Unsent text for each live session, kept when its conversation screen is covered. */
+  composerDrafts: ReadonlyMap<string, { live: api.LiveRef; text: string }>;
   /** Open requests first, then the recently finished ones (newest first). */
   requests: readonly RequestView[];
   confirms: readonly ConfirmView[];
   models: { models: api.Model[]; truncated: boolean; favorites: string[]; provider: string | null } | null;
   notices: readonly Notice[];
+}
+
+/** A controller key alone can be reused by a new session. */
+export function composerDraftKey(live: api.LiveRef): string {
+  return `${live.generation}:${live.key}`;
 }
 
 /** Whether a request has its final answer. */
@@ -412,6 +421,7 @@ interface OpenRequest {
 
 const EMPTY_FEEDS: ReadonlyMap<string, api.FeedValue> = new Map();
 const EMPTY_TRANSCRIPTS: ReadonlyMap<string, TranscriptState> = new Map();
+const EMPTY_DRAFTS: ClientState['composerDrafts'] = new Map();
 
 function statusOf(outcome: api.OutcomeView): RequestStatus {
   return outcome.state === 'unknown' ? 'unknown' : outcome.state;
@@ -444,6 +454,8 @@ export class Client {
   readonly #open = new Map<number, OpenRequest>();
   #recent: RequestView[] = [];
   readonly #subs = new Map<string, { feed: api.Feed; refs: number }>();
+  /** High-water marks survive missing live rows, but not a gateway epoch or pairing change. */
+  readonly #maxGeneration = new Map<string, number>();
   readonly #views = new Map<number, ViewEntry>();
   readonly #orphans = new Map<number, TermRecord[]>();
   /** The latest `term_state` of views not yet registered. */
@@ -461,6 +473,7 @@ export class Client {
       welcome: null,
       feeds: EMPTY_FEEDS,
       transcripts: EMPTY_TRANSCRIPTS,
+      composerDrafts: EMPTY_DRAFTS,
       requests: [],
       confirms: [],
       models: null,
@@ -489,6 +502,24 @@ export class Client {
   #publishRequests(): void {
     const open = [...this.#open.values()].map((entry) => entry.view).sort((a, b) => b.seq - a.seq);
     this.#set({ requests: [...open, ...this.#recent] });
+  }
+
+  /** Is this live identity still valid for a write started in `epoch`? */
+  acceptsLiveDraft(live: api.LiveRef, epoch: string | null): boolean {
+    return !this.#stopped && epoch !== null && epoch === this.#state.welcome?.epoch &&
+      (this.#maxGeneration.get(live.key) ?? live.generation) <= live.generation;
+  }
+
+  setComposerDraft(live: api.LiveRef, text: string, epoch: string | null): boolean {
+    // A delayed outcome must not re-create a draft pruned after a restart or /new.
+    if (!this.acceptsLiveDraft(live, epoch)) return false;
+    const key = composerDraftKey(live);
+    if ((this.#state.composerDrafts.get(key)?.text ?? '') === text) return true;
+    const composerDrafts = new Map(this.#state.composerDrafts);
+    if (text.length === 0) composerDrafts.delete(key);
+    else composerDrafts.set(key, { live, text });
+    this.#set({ composerDrafts });
+    return true;
   }
 
   notify(text: string, tone: Notice['tone'] = 'info'): void {
@@ -591,10 +622,12 @@ export class Client {
     await this.#deps.store.clear();
     this.#adopt(null);
     this.#failOpenRequests();
+    this.#maxGeneration.clear();
     this.#set({
       welcome: null,
       feeds: EMPTY_FEEDS,
       transcripts: EMPTY_TRANSCRIPTS,
+      composerDrafts: EMPTY_DRAFTS,
       confirms: [],
       models: null,
     });
@@ -609,6 +642,8 @@ export class Client {
   stop(): void {
     this.#stopped = true;
     this.#disconnect();
+    this.#maxGeneration.clear();
+    this.#set({ composerDrafts: EMPTY_DRAFTS });
     this.#failOpenRequests();
   }
 
@@ -761,7 +796,8 @@ export class Client {
       void this.#deps.persistStorage().catch(() => false);
       const saved = await this.#deps.store.load();
       this.#adopt(saved);
-      this.#set({ pairingFlow: null, welcome: null, feeds: EMPTY_FEEDS, transcripts: EMPTY_TRANSCRIPTS });
+      this.#maxGeneration.clear();
+      this.#set({ pairingFlow: null, welcome: null, feeds: EMPTY_FEEDS, transcripts: EMPTY_TRANSCRIPTS, composerDrafts: EMPTY_DRAFTS });
       this.#setConn({ attempt: 0, stop: null, lastClose: null });
       void this.#connect();
       return true;
@@ -858,9 +894,19 @@ export class Client {
     const previous = this.#state.welcome;
     this.#builder = new api.RequestBuilder(welcome);
     const epochChanged = previous !== null && previous.epoch !== welcome.epoch;
+    let feeds = this.#state.feeds;
+    if (epochChanged) {
+      this.#maxGeneration.clear();
+      // Do not mistake the previous epoch's controller rows for the new epoch's.
+      const withoutLive = new Map(feeds);
+      withoutLive.delete('live');
+      feeds = withoutLive;
+    }
     this.#set({
       welcome,
       // Live refs are bound to the gateway epoch: a new epoch invalidates every live view.
+      feeds,
+      composerDrafts: epochChanged ? EMPTY_DRAFTS : this.#state.composerDrafts,
       confirms: epochChanged ? [] : this.#state.confirms,
       models: epochChanged ? null : this.#state.models,
     });
@@ -935,13 +981,13 @@ export class Client {
       const current = this.#state.transcripts.get(key);
       let next: TranscriptState;
       if (value.reset || current === undefined) {
-        next = { start: value.start, items: value.items };
+        next = { start: value.start, items: value.items, resets: current === undefined ? 0 : current.resets + 1 };
       } else {
         const offset = value.start - current.start;
         if (offset < 0 || offset > current.items.length) {
-          next = { start: value.start, items: value.items };
+          next = { start: value.start, items: value.items, resets: current.resets };
         } else {
-          next = { start: current.start, items: [...current.items.slice(0, offset), ...value.items] };
+          next = { start: current.start, items: [...current.items.slice(0, offset), ...value.items], resets: current.resets };
         }
       }
       const transcripts = new Map(this.#state.transcripts);
@@ -952,7 +998,22 @@ export class Client {
     if (value.feed === 'live') this.#reconcileConfirms(value.sessions);
     const feeds = new Map(this.#state.feeds);
     feeds.set(key, value);
-    this.#set({ feeds });
+    this.#set({ feeds, ...(value.feed === 'live' ? { composerDrafts: this.#pruneComposerDrafts(value.sessions) } : {}) });
+  }
+
+  #pruneComposerDrafts(sessions: readonly api.LiveSession[]): ClientState['composerDrafts'] {
+    for (const { live } of sessions) {
+      if (live.generation > (this.#maxGeneration.get(live.key) ?? -1)) this.#maxGeneration.set(live.key, live.generation);
+    }
+    const current = this.#state.composerDrafts;
+    if (current.size === 0) return current;
+    let updated: Map<string, { live: api.LiveRef; text: string }> | undefined;
+    for (const [key, { live }] of current) {
+      if ((this.#maxGeneration.get(live.key) ?? live.generation) <= live.generation) continue;
+      updated ??= new Map(current);
+      updated.delete(key);
+    }
+    return updated ?? current;
   }
 
   /**

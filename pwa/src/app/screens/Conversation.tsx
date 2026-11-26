@@ -6,7 +6,7 @@ import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState }
 import { api } from '../../remote/index.ts';
 import type { ToolRenderHost } from '../../vendor/omp-collab/tool-render/index.ts';
 import { ClientError, type ConfirmView } from '../client.ts';
-import { useNav } from '../nav.ts';
+import { useNav, useScreenNavigationGuard } from '../nav.ts';
 import { downloadAndSave, isAbort } from '../transfer.ts';
 import { adaptTranscript } from '../transcript/adapter.ts';
 import { perform, shortModel, statusLabel, succeeded } from '../ui/format.ts';
@@ -19,17 +19,18 @@ import { ContextSheet } from './conversation/ContextSheet.tsx';
 import { ModelSheet } from './conversation/ModelSheet.tsx';
 import { GoneCard, PendingUiCard } from './conversation/PendingUi.tsx';
 import { EMPTY_TRACKER, GONE_MS, dismissGone, noteAnswer, noteSending, trackPending } from './conversation/pending.ts';
+import { doneResult, resumeFork } from './fleet/common.ts';
 import { TranscriptList } from './Transcript.tsx';
 
 const FIRST_TAIL = 120;
 
-/** Finds the live session for a route: by its pinned key, else by the omp session id. */
+/** A pinned key can follow an unsaved conversation, but must not override a known session id. */
 export function useLive(liveKey: string | null, session: string | null): api.LiveSession | null {
   const feed = useFeed({ feed: 'live' }, 'live');
   return useMemo(() => {
     const sessions = feed?.sessions ?? [];
     if (liveKey !== null) {
-      const pinned = sessions.find((entry) => entry.live.key === liveKey);
+      const pinned = sessions.find((entry) => entry.live.key === liveKey && (session === null || entry.session === session));
       if (pinned !== undefined) return pinned;
     }
     if (session === null) return null;
@@ -59,6 +60,7 @@ export function ConversationScreen({
 }): ReactNode {
   const client = useClient();
   const nav = useNav();
+  const ownsTop = useScreenNavigationGuard(nav);
   const can = useCan();
   const now = useNow();
   const [liveKey, setLiveKey] = useState(routeLiveKey);
@@ -107,10 +109,17 @@ export function ConversationScreen({
   // Keep the view pinned to the newest entry while the reader is at the bottom.
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+  const seenResets = useRef(0);
   useLayoutEffect(() => {
+    const resets = transcript?.resets ?? 0;
+    if (resets !== 0 && resets !== seenResets.current) {
+      pinned.current = true;
+      if (tail !== FIRST_TAIL) setTail(FIRST_TAIL);
+    }
+    seenResets.current = resets;
     const element = scroller.current;
     if (element !== null && pinned.current) element.scrollTop = element.scrollHeight;
-  }, [entries, confirms.length, pending.length, tracker.gone.length]);
+  }, [entries, confirms.length, pending.length, tracker.gone.length, transcript?.resets, tail]);
   // Images, expanding cards and the composer (modes, attachment chips) change the heights after
   // render: stay at the bottom while pinned.
   const flow = useRef<HTMLDivElement>(null);
@@ -203,7 +212,7 @@ export function ConversationScreen({
         ) : entries.length === 0 ? (
           <Empty title="No messages yet">Send the first prompt below.</Empty>
         ) : (
-          <TranscriptList entries={entries} busy={busy} host={host} now={now} source={source} />
+          <TranscriptList key={transcript.resets} entries={entries} busy={busy} host={host} now={now} source={source} />
         )}
         {confirms.map((confirm) => (
           <ApprovalCard key={`${confirm.live.key}:${confirm.request}`} confirm={confirm} />
@@ -264,9 +273,10 @@ export function ConversationScreen({
             setSheet(null);
             if (session !== null) nav.push({ kind: 'tree', session, title });
           }}
-          onForked={(forked) => {
+          onForked={(forked, liveKey) => {
+            if (!ownsTop()) return;
             setSheet(null);
-            nav.push({ kind: 'conversation', session: forked, liveKey: null, title: `${title} (fork)` });
+            nav.push({ kind: 'conversation', session: forked, liveKey, title: `${title} (fork)` });
           }}
           onClose={() => setSheet(null)}
         />
@@ -356,7 +366,7 @@ function ActionSheet({
   entries: readonly api.Item[];
   onTerminal: () => void;
   onTree: () => void;
-  onForked: (session: string) => void;
+  onForked: (session: string, liveKey: string | null) => void;
   onClose: () => void;
 }): ReactNode {
   const client = useClient();
@@ -368,6 +378,7 @@ function ActionSheet({
   const [name, setName] = useState(title);
   const [split, setSplit] = useState<api.Split>('none');
   const [busy, setBusy] = useState(false);
+  const [startingFork, setStartingFork] = useState(false);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
   const lastReply = entries.findLast((item) => item.type === 'assistant' && item.text.length > 0);
 
@@ -426,10 +437,15 @@ function ActionSheet({
     if (session === null || project === null) return;
     setBusy(true);
     const view = await perform(client, { op: 'copy_session', session, project }, `Fork “${title}”`);
+    if (!succeeded(view)) {
+      setBusy(false);
+      return;
+    }
+    const result = doneResult(view);
+    const forked = result?.type === 'file' ? await resumeFork(client, result.session, () => setStartingFork(true)) : null;
+    setStartingFork(false);
     setBusy(false);
-    const result = view?.outcome?.state === 'done' ? view.outcome.result : null;
-    if (!succeeded(view)) return;
-    if (result?.type === 'file' && result.session !== null) onForked(result.session);
+    if (forked !== null) onForked(forked.session, forked.liveKey);
     else {
       client.notify(`Forked “${title}”.`);
       onClose();
@@ -537,7 +553,7 @@ function ActionSheet({
                 disabled={session === null || project === null || !can({ op: 'copy_session', session, project })}
                 onClick={() => setMode('fork')}
               >
-                ⑂ Fork session<span className="hint">{project === null ? 'resume it first' : 'a copy in its project'}</span>
+                ⑂ Fork session<span className="hint">{project === null ? 'resume it first' : 'start a copy in its project'}</span>
               </button>
               <button type="button" className="button" disabled={session === null} onClick={onTree}>
                 ⌥ Session tree<span className="hint">fork at a message · go here</span>
@@ -595,7 +611,7 @@ function ActionSheet({
       )}
       {mode === 'fork' && (
         <>
-          <p>A full copy of “{title}” is added to its project as a new session; the original stays as it is.</p>
+          <p>A full copy of “{title}” starts as a new session in its project. The original stays as it is.</p>
           <dl className="kv">
             <dt>Session</dt>
             <dd>{title}</dd>
@@ -607,11 +623,11 @@ function ActionSheet({
             <dd>{entries.filter((item) => item.type === 'user' || item.type === 'assistant').length} loaded</dd>
           </dl>
           <div className="buttons pair">
-            <button type="button" className="button" onClick={() => setMode('menu')}>
+            <button type="button" className="button" disabled={busy} onClick={() => setMode('menu')}>
               Back
             </button>
             <button type="button" className="button primary" disabled={busy || session === null || project === null} onClick={() => void fork()}>
-              {busy ? 'Forking…' : 'Fork'}
+              {startingFork ? 'Starting the fork…' : busy ? 'Forking…' : 'Fork'}
             </button>
           </div>
         </>

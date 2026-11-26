@@ -44,12 +44,13 @@ const makeSocket = (returns: (number | boolean | Error)[]) => {
   writer.write(socket, "latest snapshot\n", true);
   writer.write(socket, "tool\n");
   writer.write(socket, "tool_cancel\n");
+  assert.equal(socket.data.writer.bytes, Buffer.byteLength("界\nreply\nlatest snapshot\ntool\ntool_cancel\n") - 1);
   assert.equal(socket.calls(), 1, "new lines must not retry a blocked socket");
   writer.drain(socket); // zero bytes: preserve the tail
   writer.drain(socket); // another partial code point
   writer.drain(socket); // zero bytes again
   writer.drain(socket);
-  assert.equal(Buffer.concat(socket.chunks).toString(), "界\nlatest snapshot\nreply\ntool\ntool_cancel\n");
+  assert.equal(Buffer.concat(socket.chunks).toString(), "界\nreply\nlatest snapshot\ntool\ntool_cancel\n");
   assert.equal(socket.data.writer.bytes, 0);
   assert.equal(socket.data.writer.queue.length, 0);
 }

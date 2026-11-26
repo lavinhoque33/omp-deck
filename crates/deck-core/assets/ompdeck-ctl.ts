@@ -27,6 +27,26 @@ interface ToolClient {
   destroy?(): void;
   terminate?(): void;
 }
+
+// Private composer surface used by omp 19's own navigate and clear-editor handlers.
+type DraftComposer = {
+  pendingImages: unknown[];
+  clearDraft(options: { recall: boolean }): void;
+  setDraft(text: string, images?: unknown[]): void;
+};
+type ComposerController = { ctx?: { session?: object; composer?: DraftComposer } };
+// Mirror deck_remote::api::MAX_MOVED_TEXT: never clear a draft the phone cannot receive whole.
+const MAX_MOVED_TEXT = 64 * 1024;
+// ctl connections share one interactive composer and may dispatch concurrently.
+let navigationInFlight = false;
+
+function withoutAttachmentMarkers(text: string, images: number): string {
+  if (images === 0) return text;
+  // omp expands native chips into this text when submitting, then collapses the markers
+  // back to chips on restore. Strip only markers backed by an attachment in this prompt.
+  return text.replace(/\[(?:Image|Video) #([1-9]\d*)(?:,[^\]\n]*)?\](?: attachment:\/\/\1(?!\d))? ?/g,
+    (marker, index: string) => Number(index) <= images ? "" : marker);
+}
 const TOOL_NAMES: ToolName[] = ["open_session", "notify", "show_changes", "request_review", "sessions", "send_prompt", "wait_session", "answer_question", "finish_worktree", "report", "fan_out", "watch_session", "message_session"];
 const toolProcess = globalThis as typeof globalThis & { __ompdeckTools?: string[] };
 const toolResult = (text: string, isError = false, details?: Record<string, unknown>): ToolResult =>
@@ -260,24 +280,67 @@ export default async function ompdeckCtl(api: any) {
       ({ cfgWorktreeOnExit: worktreeOnExit } = await import("@oh-my-pi/pi-coding-agent/task/settings"));
     } catch (e) { log("parking API import failed: " + e); }
     // Optional: the /context breakdown. Literal specifiers; a missing module just omits `context` from snapshots.
-    let contextRuntime: any, contextUsage: any;
+    let contextRuntime: any;
     try { contextRuntime = await import("@oh-my-pi/pi-coding-agent/session/context-usage-runtime"); } catch (e) { log("context-usage-runtime import failed: " + e); }
-    try { contextUsage = await import("@oh-my-pi/pi-tui/status-line/context-usage"); } catch (e) { log("context-usage import failed: " + e); }
+    // Optional: per-tool schema tokens for the /context tooltip (else a plain token count). Each omp has only one of the
+    // two modules, so static imports cannot work: newer omp (verified 19.2.1) moved `estimateToolSchemaTokens` from
+    // pi-tui into the coding agent and takes `{ sourceRevision, pruneDescriptions }` as its third argument; older omp
+    // takes the revision number.
+    let estimateToolSchema: ((tools: unknown[], tokenizer: unknown, revision: number, prune: boolean) => number) | undefined;
+    try {
+      const { estimateToolSchemaTokens: est } = await import("@oh-my-pi/pi-coding-agent/session/context-usage");
+      if (typeof est === "function") estimateToolSchema = (tools, tokenizer, sourceRevision, pruneDescriptions) => est(tools, tokenizer, { sourceRevision, pruneDescriptions });
+    } catch {}
+    if (!estimateToolSchema) {
+      try {
+        const { estimateToolSchemaTokens: est } = await import("@oh-my-pi/pi-tui/status-line/context-usage");
+        if (typeof est === "function") estimateToolSchema = (tools, tokenizer, revision) => est(tools, tokenizer, revision);
+      } catch {}
+    }
+    if (!estimateToolSchema) log("tool schema estimator unavailable");
     // Optional: live IRC unread counts (`createAgentHubRuntime({}).irc.unreadCount(id)`). A missing
     // module (older omp) just leaves `unread` null in snapshots. Cached like the context imports:
     // constructing the runtime once keeps every snapshot cheap and never throws into omp.
     let hubRuntime: any = null;
     try { hubRuntime = (await import("@oh-my-pi/pi-coding-agent/modes/agent-hub-runtime")).createAgentHubRuntime({}); } catch (e) { log("agent-hub-runtime import failed: " + e); }
-    // Optional (omp >= 18.18): the HTML-form ask. Literal specifiers; without them a formDialog request gets no pending entry (the TUI dialog still runs).
+    // Optional (omp >= 18.18): the HTML-form ask; without it a formDialog request gets no pending entry (the TUI dialog
+    // still runs). Each omp has only one of the two module paths, so static imports cannot work: newer omp (verified
+    // 19.2.1) moved them from pi-tui into the coding agent.
     let formLib: any;
-    try {
-      const parse = await import("@oh-my-pi/pi-tui/html-form/parse");
-      const data = await import("@oh-my-pi/pi-tui/html-form/data");
-      if (["parseHtmlForm", "spansText"].every(k => typeof (parse as any)[k] === "function")
-        && ["fieldQuestions", "defaultFormData", "choiceValue", "textValue", "fieldError"].every(k => typeof (data as any)[k] === "function")) formLib = { ...parse, ...data };
-      else log("html-form API missing");
-    } catch (e) { log("html-form import failed: " + e); }
+    for (const load of [
+      async () => [await import("@oh-my-pi/pi-coding-agent/tools/html-form/parse"), await import("@oh-my-pi/pi-coding-agent/tools/html-form/data")],
+      async () => [await import("@oh-my-pi/pi-tui/html-form/parse"), await import("@oh-my-pi/pi-tui/html-form/data")],
+    ]) {
+      try {
+        const [parse, data]: Record<string, unknown>[] = await load();
+        if (["parseHtmlForm", "spansText"].every(k => typeof parse[k] === "function")
+          && ["fieldQuestions", "defaultFormData", "choiceValue", "textValue", "fieldError"].every(k => typeof data[k] === "function")) {
+          formLib = { ...parse, ...data };
+          break;
+        }
+      } catch {}
+    }
+    if (!formLib) log("html-form API unavailable");
     if (!AgentLifecycleManager || !AgentRegistry || typeof sessionFileBelongsToRoot !== "function") { log("internal API missing"); return; }
+
+    // The extension UI can read text but cannot clear image attachments. Observe the TUI
+    // controller when it binds the hooks. Older omp does not bundle this module, so this
+    // import must stay optional: version drift must not stop the extension loading.
+    if (!G.__ompdeckComposers) {
+      try {
+        const { ExtensionUiController } = await import("@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller");
+        const proto = ExtensionUiController?.prototype;
+        const init = proto?.initHooksAndCustomTools;
+        if (typeof init === "function" && !G.__ompdeckComposers) {
+          const composers = new WeakMap<object, DraftComposer>();
+          proto.initHooksAndCustomTools = function (this: ComposerController, ...args: unknown[]) {
+            if (this.ctx?.session && this.ctx.composer) composers.set(this.ctx.session, this.ctx.composer);
+            return init.apply(this, args);
+          };
+          G.__ompdeckComposers = composers;
+        }
+      } catch (e) { log("composer access unavailable: " + e); }
+    }
 
     const isMain = (ctx: any) => ctx?.agent?.kind === "main";
     // The standalone omp binary does not export its kernel registry. Observe the built-in
@@ -329,6 +392,7 @@ export default async function ompdeckCtl(api: any) {
       const rootFile = (): string | null => { try { return mainCtx.sessionManager.getSessionFile?.() ?? null; } catch { return null; } };
       const mainIdle = (): boolean | null => { try { return typeof mainCtx.isIdle === "function" ? !!mainCtx.isIdle() : null; } catch { return null; } };
       const mainLeaf = (): string | null => { try { return mainCtx.sessionManager.getLeafId?.() ?? null; } catch { return null; } };
+      const mainTail = (): string | null => { try { return mainCtx.sessionManager.getEntries?.()?.at(-1)?.id ?? null; } catch { return null; } };
 
       const MAX_BACKLOG = 64 * 1024 * 1024;
       const disconnect = (s: ToolClient) => {
@@ -369,6 +433,11 @@ export default async function ompdeckCtl(api: any) {
         if (queued) {
           writer.bytes += bytes.length - queued.bytes.length;
           queued.bytes = bytes; // only untouched snapshots can be coalesced
+          // New snapshot content must follow replies enqueued since the old snapshot.
+          if (writer.queue.at(-1) !== queued) {
+            writer.queue.splice(writer.queue.indexOf(queued), 1);
+            writer.queue.push(queued);
+          }
         } else {
           const entry = { bytes, offset: 0 };
           writer.queue.push(entry);
@@ -537,7 +606,7 @@ export default async function ompdeckCtl(api: any) {
       // ---- /context breakdown (omp's computeSessionContextBreakdown + per-tool schema tokens), cached ----
       let contextCache: any = null;
       let contextKey = "";
-      const toolTokenCaches = new WeakMap<object, WeakMap<object, number>>(); // tokenizer -> tool -> tokens
+      const toolTokenCaches = new WeakMap<object, [WeakMap<object, number>, WeakMap<object, number>]>(); // tokenizer -> [full, pruned descriptions] -> tool -> tokens
       const mainSession = (): any => { try { return registry.list().find((r: any) => r.kind === "main")?.session; } catch { return undefined; } };
       const modelKey = (): string => { const m = mainSession()?.model; return m ? `${m.provider}/${m.id}` : ""; };
       // The main session's in-memory model and thinking level: the file records them only once the session is persisted (first message).
@@ -591,17 +660,20 @@ export default async function ompdeckCtl(api: any) {
         const tokenizer = sess.agent?.tokenizer;
         const tools: any[] = sess.agent?.state?.tools ?? [];
         if (!tokenizer || typeof tokenizer.countTokens !== "function" || sess.model?.toolSchemasInContext === false) return [];
-        let toolTokens = toolTokenCaches.get(tokenizer);
-        if (!toolTokens) { toolTokens = new WeakMap(); toolTokenCaches.set(tokenizer, toolTokens); }
-        const est = contextUsage?.estimateToolSchemaTokens;
+        // Counted like omp's /context: pruned descriptions for models whose tool descriptions omp prunes.
+        let prune = false;
+        try { prune = sess.agent?.prunesToolDescriptions?.(sess.model) === true; } catch {}
+        let caches = toolTokenCaches.get(tokenizer);
+        if (!caches) { caches = [new WeakMap(), new WeakMap()]; toolTokenCaches.set(tokenizer, caches); }
+        const toolTokens = caches[prune ? 1 : 0];
         const out: [string, number][] = [];
         for (const t of tools) {
           if (typeof t?.name !== "string") continue;
           let n = toolTokens.get(t);
           if (n === undefined) {
             try {
-              n = typeof est === "function"
-                ? est([t], tokenizer, sess.settings?.revision ?? 0)
+              n = estimateToolSchema
+                ? estimateToolSchema([t], tokenizer, sess.settings?.revision ?? 0, prune)
                 : tokenizer.countTokens([t.name, t.description ?? "", JSON.stringify(t.parameters ?? {})]);
             } catch { n = undefined; }
             if (typeof n === "number" && Number.isFinite(n)) toolTokens.set(t, n);
@@ -696,7 +768,7 @@ export default async function ompdeckCtl(api: any) {
               unread: unreadOf(r.id),
             }));
         } catch (e) { log("snapshot failed: " + e); }
-        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), agents, context: contextCache, model: mainModel(), account: mainAccount(), progress: mainProgress(), pendingUi: [...pendingUi.values()].map(p => p.summary) };
+        return { t: "agents", pid: process.pid, sessionFile: root, mainIdle: mainIdle(), leaf: mainLeaf(), tail: mainTail(), agents, context: contextCache, model: mainModel(), account: mainAccount(), progress: mainProgress(), pendingUi: [...pendingUi.values()].map(p => p.summary) };
       };
       let lastSnapshot = "";
       const push = (m: unknown) => {
@@ -928,7 +1000,7 @@ export default async function ompdeckCtl(api: any) {
           // omp could not recover the original questions and made the plain leaf move onto the result.
           await redraw(oldLeaf, id, probe);
           schedule();
-          return { ok: true, leaf: mainLeaf(), message: "The original questions are unavailable: moved to the answer instead." };
+          return { ok: true, leaf: mainLeaf(), tail: mainTail(), message: "The original questions are unavailable: moved to the answer instead." };
         }
         const toolSession = { cwd: sm.getCwd(), hasUI: true, settings: sess.settings, getSessionFile: () => sm.getSessionFile() ?? null, getSessionSpawns: () => null, getPlanModeState: () => sess.getPlanModeState?.() };
         let answer: any;
@@ -944,9 +1016,10 @@ export default async function ompdeckCtl(api: any) {
         const done = await sess.navigateTree(id, { allowAskReopen: true, reanswerAskResult: answer, requireIdle: true });
         if (done?.cancelled) return { ok: false, error: "navigation cancelled" };
         await redraw(oldLeaf, id, done);
+        const leaf = mainLeaf(), tail = mainTail();
         if (done.askReanswerCommitted) sess.resumeAfterAskReanswer();
         schedule();
-        return { ok: true, leaf: mainLeaf() };
+        return { ok: true, leaf, tail };
       }
       // == `/advisor configure`: read or save one WATCHDOG.yml, then apply the merged roster to the running session.
       async function advisorConfig(cmd: any): Promise<any> {
@@ -1202,25 +1275,113 @@ export default async function ompdeckCtl(api: any) {
           if (cmd.t === "navigate") {
             // navigateTree has no streaming guard of its own: idle only.
             if (mainIdle() !== true) return { ok: false, error: "busy" };
-            const cc = commandContext();
-            if (typeof cc?.navigateTree !== "function") return { ok: false, error: "navigation unavailable" };
-            const oldLeaf = mainLeaf();
-            if (cmd.summarize === true) {
-              // The command context's navigateTree cannot carry custom instructions: run the session's own (what /tree does), then redraw.
-              const sess = mainSession();
-              if (typeof sess?.navigateTree !== "function") return { ok: false, error: "navigation unavailable" };
-              const instructions = typeof cmd.customInstructions === "string" && cmd.customInstructions.trim() ? cmd.customInstructions : undefined;
-              const r = await sess.navigateTree(id, { summarize: true, customInstructions: instructions, requireIdle: true });
-              if (r?.aborted) return { ok: false, error: "summarization cancelled" };
-              if (r?.cancelled) return { ok: false, error: "navigation cancelled" };
-              await redraw(oldLeaf, id, r);
-            } else {
-              const r = await cc.navigateTree(id, { summarize: false });
-              if (r?.cancelled) return { ok: false, error: "navigation cancelled" };
+            if (navigationInFlight) return { ok: false, error: "busy" };
+            navigationInFlight = true;
+            try {
+              const cc = commandContext();
+              if (typeof cc?.navigateTree !== "function") return { ok: false, error: "navigation unavailable" };
+              const oldLeaf = mainLeaf();
+              let value: { editorText: string; editorImages: number } | undefined;
+              if (cmd.summarize === true) {
+                // The command context's navigateTree cannot carry custom instructions: run the session's own (what /tree does), then redraw.
+                const sess = mainSession();
+                if (typeof sess?.navigateTree !== "function") return { ok: false, error: "navigation unavailable" };
+                const instructions = typeof cmd.customInstructions === "string" && cmd.customInstructions.trim() ? cmd.customInstructions : undefined;
+                const r = await sess.navigateTree(id, { summarize: true, customInstructions: instructions, requireIdle: true });
+                if (r?.aborted) return { ok: false, error: "summarization cancelled" };
+                if (r?.cancelled) return { ok: false, error: "navigation cancelled" };
+                await redraw(oldLeaf, id, r);
+              } else {
+                const ui = mainCtx.ui;
+                let before: string | undefined;
+                let composer: DraftComposer | undefined;
+                let savedImages: unknown[] | undefined;
+                let setDraft: DraftComposer["setDraft"] | undefined;
+                let hadOwnSetDraft = false;
+                let restored: { text: string; shown: string; images?: unknown[] } | undefined;
+                let editorText = "";
+                let editorImages = 0;
+                if (cmd.takeEditor === true) {
+                  try {
+                    composer = G.__ompdeckComposers?.get(mainSession());
+                    const content = entry.type === "message" ? entry.message?.content : entry.content;
+                    if (typeof ui?.getEditorText === "function" && (Array.isArray(content) || typeof content === "string")) {
+                      const draft = ui.getEditorText();
+                      if (typeof draft === "string") {
+                        if (typeof content === "string") editorText = content;
+                        else for (const part of content) {
+                          if (part.type === "text") editorText += part.text ?? "";
+                          else if (part.type === "image") ++editorImages;
+                        }
+                        // omp restores into trim-empty drafts, even if one already has images.
+                        if (!draft.trim() && Array.isArray(composer?.pendingImages) && (draft || composer.pendingImages.length)) {
+                          savedImages = [...composer.pendingImages];
+                        }
+                        before = draft;
+                      }
+                    }
+                  } catch (e) { log("cannot read editor before navigation: " + e); }
+                }
+                if (before !== undefined && composer && typeof composer.setDraft === "function") {
+                  try {
+                    const original = composer.setDraft;
+                    hadOwnSetDraft = Object.hasOwn(composer, "setDraft");
+                    composer.setDraft = function (text, images) {
+                      original.call(this, text, images);
+                      try {
+                        const shown = ui.getEditorText();
+                        if (typeof shown === "string") restored = { text, shown, images };
+                      } catch (e) { log("cannot read restored editor draft: " + e); }
+                    };
+                    setDraft = original;
+                  } catch (e) { log("cannot observe navigated editor draft: " + e); }
+                }
+                let r;
+                try {
+                  r = await cc.navigateTree(id, { summarize: false });
+                } finally {
+                  if (setDraft && composer) {
+                    if (hadOwnSetDraft) composer.setDraft = setDraft;
+                    else delete (composer as Partial<DraftComposer>).setDraft;
+                  }
+                }
+                if (r?.cancelled) return { ok: false, error: "navigation cancelled" };
+                if (before !== undefined && mainLeaf() !== id && sameRoot(cmd) && mainCtx.ui === ui) {
+                  try {
+                    if (setDraft && composer && restored && ui.getEditorText() === restored.shown) {
+                      // omp may collapse image markers into chips while setting the draft.
+                      // Check ownership against what it showed, but do not send those markers.
+                      editorImages = restored.images?.length ?? 0;
+                      editorText = withoutAttachmentMarkers(restored.text, editorImages);
+                      if (Buffer.byteLength(editorText) <= MAX_MOVED_TEXT
+                        && (savedImages || typeof composer.clearDraft === "function")) {
+                        if (savedImages) setDraft.call(composer, before, savedImages);
+                        else composer.clearDraft({ recall: false });
+                        value = { editorText, editorImages };
+                      }
+                    } else {
+                      editorText = withoutAttachmentMarkers(editorText, editorImages);
+                      if (Buffer.byteLength(editorText) <= MAX_MOVED_TEXT) {
+                        if (setDraft || before.trim()) {
+                          value = { editorText, editorImages };
+                        } else if (!composer && before === "" && editorImages === 0 && typeof ui.setEditorText === "function") {
+                          // Older UI hooks can take text-only prompts. Leave image prompts in omp:
+                          // clearing just the text would leave hidden attachments in its editor.
+                          if (ui.getEditorText() === editorText) ui.setEditorText("");
+                          value = { editorText, editorImages: 0 };
+                        }
+                      }
+                    }
+                  } catch (e) { log("cannot take navigated editor draft: " + e); }
+                }
+              }
+              schedule();
+              const leaf = mainLeaf(), tail = mainTail();
+              if (leaf === oldLeaf && id === oldLeaf) return { ok: true, leaf, tail, message: "Already at this point" };
+              return value ? { ok: true, leaf, tail, value } : { ok: true, leaf, tail };
+            } finally {
+              navigationInFlight = false;
             }
-            schedule();
-            const leaf = mainLeaf();
-            return leaf === oldLeaf && id === oldLeaf ? { ok: true, leaf, message: "Already at this point" } : { ok: true, leaf };
           }
           if (entry.type !== "message") return { ok: false, error: "only message entries can be forked" };
           if (!SessionManager) return { ok: false, error: "fork unavailable" };

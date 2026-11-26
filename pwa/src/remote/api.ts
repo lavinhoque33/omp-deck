@@ -2,18 +2,18 @@
 // `deck_remote::api` (crates/deck-remote/src/api.rs is the source of truth;
 // docs/notes/mobile-relay.md, "R4 contract"; docs/notes/mobile-pwa.md, "Wire additions"). JSON
 // enums are internally tagged (`op`, `feed`, `type`, `state`, `code`, `reason`), snake_case,
-// struct variants only; `None` is `null`, except the fields slice 4 added to R5 types
-// (`Welcome.push_key`, `SessionSummary.stub`, `LiveSession.pending_ui`, `images`/`args_value`/
-// `details` of transcript items) and `UiRequestView.form`, which are absent when empty and
-// optional here. A device uses the slice-4 ops and feeds only when `Welcome.features` lists
-// {@link FEATURE_S4}; it gets `form` requests only after announcing {@link FEATURE_FORM}.
+// struct variants only; `None` is `null` except for fields added to existing types under the
+// v1 freeze rules. Those fields may be absent on the wire and are optional here. A device uses
+// slice-4 ops and feeds only when `Welcome.features` lists {@link FEATURE_S4}; it gets `form`
+// requests only after announcing {@link FEATURE_FORM}. Send `tree.at_leaf` only when the gateway
+// lists {@link FEATURE_TREE_NAV}; a device gets `moved` outcomes only after announcing it.
 //
 // Gateway → device JSON (`Welcome`, `Reply`, `Event`, `TermEnd`) is validated at runtime:
 // unknown fields are ignored, wrong types and unknown variants refused, except that an unknown
 // `Event` or transcript `Item` type decodes to `unknown_event` / `unknown_item` (a newer gateway's
 // additions are skipped, not fatal). Device → gateway JSON (`Request`) is built here and
-// serialized canonically by the same validators (Rust field order, `null` for absent optionals,
-// free-form JSON values with sorted object keys as Rust's `serde_json::Value` writes them), so it
+// serialized canonically by the same validators (Rust field order, `null` for absent optionals
+// unless omitted by the freeze rules, and free-form JSON values with sorted object keys), so it
 // is byte-identical to Rust's serialization (except integer-like object keys inside a free-form
 // value, which JavaScript always orders first).
 
@@ -62,6 +62,10 @@ export const FEATURE_S4 = 's4';
 export const FEATURE_FORM = 'form';
 /** Live todo phases and goal state, sent only after the device announces this feature. */
 export const FEATURE_PROGRESS = 'progress';
+/** Tree paging around the active leaf and structured `navigate` outcomes. */
+export const FEATURE_TREE_NAV = 'tree_nav';
+/** `moved.editor_text` is cut by the gateway to at most this many bytes at a character boundary. */
+export const MAX_MOVED_TEXT = 64 * 1024;
 /**
  * Native Android encrypted FCM push (`push_android_subscribe`): the gateway lists it in
  * `Welcome.features` only while its FCM sender is configured. Gateway → device only; a device never announces it.
@@ -305,7 +309,7 @@ export type Op =
   | { op: 'export'; session: string }
   | { op: 'blob'; session: string; agent?: string | null; blob: string }
   | { op: 'download'; download: string; offset: number }
-  | { op: 'tree'; session: string; filter: TreeFilter; cursor?: string | null; limit: number }
+  | { op: 'tree'; session: string; filter: TreeFilter; cursor?: string | null; limit: number; at_leaf?: boolean }
   | { op: 'browse'; dir?: string | null }
   | { op: 'usage_activity'; days: number }
   | { op: 'usage_refresh' }
@@ -584,8 +588,8 @@ export function checkRequest(request: Request): string | null {
 }
 
 /**
- * The canonical JSON text of a request (Rust field order, `null` for absent optionals). Throws
- * {@link ApiRequestError} when {@link checkRequest} fails.
+ * The canonical JSON text of a request (Rust field order; absent optionals are `null` unless
+ * omitted by the freeze rules). Throws {@link ApiRequestError} when {@link checkRequest} fails.
  */
 export function requestJson(request: Request): string {
   const bad = checkRequest(request);
@@ -1286,7 +1290,8 @@ export type DoneView =
   // slice 4
   | { type: 'text'; text: string }
   | { type: 'killed'; results: KillResult[] }
-  | { type: 'restore_plan'; handle: number; plan: RestorePlanView; truncated: boolean };
+  | { type: 'restore_plan'; handle: number; plan: RestorePlanView; truncated: boolean }
+  | { type: 'moved'; leaf: string | null; before_prompt: boolean; editor_text: string | null; dropped_images: number; message: string | null };
 
 /** Per running id, `null` = killed. */
 export interface KillResult {
@@ -1484,7 +1489,7 @@ export type Resp =
   | { type: 'text'; text: string; truncated: boolean }
   | { type: 'download'; download: string; name: string; mime: string; size: number }
   | { type: 'chunk'; data: string; eof: boolean }
-  | { type: 'tree'; nodes: TreeNode[]; active_leaf: string | null; next_cursor: string | null; truncated: boolean }
+  | { type: 'tree'; nodes: TreeNode[]; active_leaf: string | null; next_cursor: string | null; truncated: boolean; prev_cursor?: string | null; total?: number | null }
   | { type: 'dir'; dir: string | null; display: string; parent: string | null; entries: DirEntry[]; truncated: boolean }
   | { type: 'activity'; days: DayCount[] }
   | { type: 'omp_settings'; groups: SettingsGroup[]; truncated: boolean }
@@ -1605,7 +1610,7 @@ function nullable<T>(inner: V<T>): V<T | null> {
 }
 
 /**
- * A field slice 4 added to an R5 type, which Rust omits when empty: a missing one stays missing
+ * A field added to an existing type, which Rust omits when empty: a missing one stays missing
  * ({@link readFields} leaves it out, so the decoded object matches the wire), a present one is
  * read by `inner`. Only for `readFields` checkers: it returns `undefined` despite `V<T>`.
  */
@@ -2323,6 +2328,7 @@ const doneView = tagged<DoneView, 'type'>('type', {
   text: { text: str },
   killed: { results: list(struct<KillResult>({ id: str, error: nullable(str) })) },
   restore_plan: { handle: u64, plan: restorePlanView, truncated: bool },
+  moved: { leaf: nullable(str), before_prompt: bool, editor_text: nullable(str), dropped_images: u32, message: nullable(str) },
 });
 const rejectedView = tagged<RejectedView, 'code'>('code', {
   stale: { current: nullable(liveRef) },
@@ -2367,7 +2373,10 @@ const resp = tagged<Resp, 'type'>('type', {
   text: { text: str, truncated: bool },
   download: { download: str, name: str, mime: str, size: u64 },
   chunk: { data: str, eof: bool },
-  tree: { nodes: list(treeNode), active_leaf: nullable(str), next_cursor: nullable(str), truncated: bool },
+  tree: {
+    nodes: list(treeNode), active_leaf: nullable(str), next_cursor: nullable(str), truncated: bool,
+    prev_cursor: optional(nullable(str)), total: optional(nullable(u64)),
+  },
   dir: { dir: nullable(str), display: str, parent: nullable(str), entries: list(dirEntry), truncated: bool },
   activity: { days: list(dayCount) },
   omp_settings: { groups: list(settingsGroup), truncated: bool },
@@ -2508,7 +2517,7 @@ const opV = tagged<Op, 'op'>('op', {
   export: { session: str },
   blob: { session: str, agent: nullable(str), blob: str },
   download: { download: str, offset: u64 },
-  tree: { session: str, filter: treeFilter, cursor: nullable(str), limit: u32 },
+  tree: { session: str, filter: treeFilter, cursor: nullable(str), limit: u32, at_leaf: optional((value, path) => bool(value, path) || undefined) },
   browse: { dir: nullable(str) },
   usage_activity: { days: u32 },
   usage_refresh: {},

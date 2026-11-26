@@ -67,6 +67,11 @@ export function followMode(mode: api.ComposeMode, previous: SessionPhase, phase:
   return fallback;
 }
 
+/** A jumped-to prompt goes before the unsent text the phone already held. */
+export function mergeComposerPrefill(draft: string, prompt: string): string {
+  return draft.length === 0 ? prompt : `${prompt}\n\n${draft}`;
+}
+
 /** Why the draft cannot go now, or null. Steer and follow-up refuse empty text (an empty Enter while busy aborts the turn). */
 export function composeProblem(
   mode: api.ComposeMode,

@@ -36,7 +36,7 @@ const vectors: FormVectors = JSON.parse(
 test('protocol version and form features stay frozen; the app also announces progress', () => {
   expect(vectors.protocol).toBe(PROTOCOL);
   expect(vectors.features).toEqual([FEATURE_S4, FEATURE_FORM]);
-  expect(DEVICE_FEATURES).toEqual([...vectors.features, FEATURE_PROGRESS]);
+  expect(DEVICE_FEATURES).toEqual([...vectors.features, FEATURE_PROGRESS, 'tree_nav']);
 });
 
 describe('form answers encode canonically', () => {

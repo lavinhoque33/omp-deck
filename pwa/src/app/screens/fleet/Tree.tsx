@@ -4,14 +4,16 @@
 // (`fork_at`, disabled with the reason the desktop would refuse it) and Go here (`navigate`,
 // idle only).
 
-import { type CSSProperties, type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
-import type { api } from '../../../remote/index.ts';
-import { useNav } from '../../nav.ts';
+import { type CSSProperties, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { api } from '../../../remote/index.ts';
+import { composerDraftKey } from '../../client.ts';
+import { useNav, useScreenNavigationGuard } from '../../nav.ts';
 import { age, dollars, perform, succeeded } from '../../ui/format.ts';
 import { useCan, useClient, useClientState, useLiveFor, useNow } from '../../ui/hooks.ts';
 import { Empty, NeedsS4, Sheet, StaleBanner, useS4 } from '../../ui/kit.tsx';
-import { doneResult, errorText } from './common.ts';
-import { type TreeRow, forkRefusal, layoutTree, mergeTreePage, navigateRefusal, searchTree } from './logic.ts';
+import { mergeComposerPrefill } from '../conversation/compose.ts';
+import { doneResult, errorText, resumeFork } from './common.ts';
+import { type TreeRow, forkRefusal, layoutTree, mergeTreePage, navigateRefusal, searchTree, treeMove } from './logic.ts';
 import '../../../styles/fleet.css';
 
 const PAGE = 500;
@@ -44,56 +46,107 @@ const KIND: Record<api.TreeNodeKind, readonly [string, string]> = {
 interface TreeState {
   nodes: api.TreeNode[];
   activeLeaf: string | null;
-  cursor: string | null;
+  prev: string | null;
+  next: string | null;
+  total: number | null;
   truncated: boolean;
+}
+
+type Page = 'initial' | 'earlier' | 'later';
+type TreeScroll = 'here' | { row: HTMLElement; top: number };
+
+function visibleAnchor(body: HTMLDivElement): TreeScroll | null {
+  const viewportTop = body.getBoundingClientRect().top;
+  for (const row of body.querySelectorAll<HTMLElement>('.tree-row')) {
+    const { top, bottom } = row.getBoundingClientRect();
+    if (bottom > viewportTop) return { row, top };
+  }
+  return null;
 }
 
 export function TreeScreen({ session, title }: { session: string; title: string }): ReactNode {
   const client = useClient();
   const nav = useNav();
+  const ownsTop = useScreenNavigationGuard(nav);
   const s4 = useS4();
+  const treeNav = useClientState((state) => state.welcome?.features.includes(api.FEATURE_TREE_NAV) === true);
   const online = useClientState((state) => state.conn.phase === 'online');
   const epoch = useClientState((state) => state.welcome?.epoch ?? null);
   const live = useLiveFor(session);
   const [filter, setFilter] = useState<api.TreeFilter>('default');
   const [query, setQuery] = useState('');
   const [tree, setTree] = useState<TreeState | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState<Page | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<TreeRow | null>(null);
   const [reload, setReload] = useState(0);
+  const body = useRef<HTMLDivElement>(null);
+  const pendingScroll = useRef<TreeScroll | null>(null);
+  const requestId = useRef(0);
 
   const load = useCallback(
-    async (cursor: string | null, base: TreeState | null) => {
-      setLoading(true);
+    async (page: Page, cursor: string | null, base: TreeState | null) => {
+      const id = ++requestId.current;
+      setLoading(page);
       setError(null);
       try {
-        const resp = await client.request({ op: 'tree', session, filter, cursor, limit: PAGE });
-        if (resp.type !== 'tree') return;
+        const resp = await client.request({
+          op: 'tree', session, filter, cursor, limit: PAGE,
+          ...(treeNav && cursor === null ? { at_leaf: true } : {}),
+        });
+        if (id !== requestId.current || resp.type !== 'tree') return;
+        if (page === 'initial' && treeNav) pendingScroll.current = 'here';
+        else if (page === 'earlier' && body.current !== null) pendingScroll.current = visibleAnchor(body.current);
         setTree({
-          nodes: base === null ? resp.nodes : mergeTreePage(base.nodes, resp.nodes),
-          activeLeaf: resp.active_leaf ?? base?.activeLeaf ?? null,
-          cursor: resp.next_cursor,
+          nodes: base === null ? resp.nodes : page === 'earlier' ? mergeTreePage(resp.nodes, base.nodes) : mergeTreePage(base.nodes, resp.nodes),
+          activeLeaf: treeNav ? resp.active_leaf : resp.active_leaf ?? base?.activeLeaf ?? null,
+          prev: !treeNav ? null : page === 'later' ? base?.prev ?? null : resp.prev_cursor ?? null,
+          next: page === 'earlier' ? base?.next ?? null : resp.next_cursor,
+          total: treeNav ? resp.total ?? base?.total ?? null : null,
           truncated: resp.truncated,
         });
       } catch (failure) {
-        setError(errorText(failure));
+        if (id === requestId.current) setError(errorText(failure));
       } finally {
-        setLoading(false);
+        if (id === requestId.current) setLoading(null);
       }
     },
-    [client, session, filter],
+    [client, session, filter, treeNav],
   );
 
   useEffect(() => {
     if (!online || !s4) return;
+    pendingScroll.current = null;
     setTree(null);
-    void load(null, null);
+    void load('initial', null, null);
+    return () => {
+      requestId.current++;
+    };
   }, [load, online, s4, epoch, reload]);
 
   const rows = useMemo(() => (tree === null ? [] : layoutTree(tree.nodes, tree.activeLeaf)), [tree]);
   const shown = useMemo(() => searchTree(rows, query), [rows, query]);
   const hereIndex = shown.findIndex((row) => row.here);
+
+  useLayoutEffect(() => {
+    const scroll = pendingScroll.current;
+    pendingScroll.current = null;
+    const element = body.current;
+    if (element === null || scroll === null) return;
+    if (scroll === 'here') element.querySelector('#tree-here')?.scrollIntoView({ block: 'center' });
+    else if (element.contains(scroll.row)) element.scrollTop += scroll.row.getBoundingClientRect().top - scroll.top;
+  }, [shown]);
+
+  const goToConversation = (liveKey: string | null) => {
+    if (!ownsTop()) return;
+    const previous = nav.stack.at(-2);
+    if (previous?.kind === 'conversation' &&
+        (previous.session === session || (liveKey !== null && previous.session === null && previous.liveKey === liveKey))) {
+      nav.pop();
+    } else {
+      nav.replace({ kind: 'conversation', session, liveKey, title });
+    }
+  };
 
   return (
     <div className="screen pushed tree-screen">
@@ -104,7 +157,7 @@ export function TreeScreen({ session, title }: { session: string; title: string 
             ‹
           </button>
           <h2 className="grow ellipsis">{title}</h2>
-          <span className="count">{tree?.nodes.length ?? 0}</span>
+          <span className="count">{tree?.total ?? tree?.nodes.length ?? 0}</span>
         </div>
         <div className="segmented" style={{ marginTop: 10 }}>
           {FILTERS.map(([id, label]) => (
@@ -114,7 +167,7 @@ export function TreeScreen({ session, title }: { session: string; title: string 
           ))}
         </div>
       </header>
-      <div className="body">
+      <div className="body" ref={body}>
         <StaleBanner />
         <NeedsS4 what="The session tree">
           <label className="search">
@@ -124,12 +177,17 @@ export function TreeScreen({ session, title }: { session: string; title: string 
               <button
                 type="button"
                 className="chip accent"
-                onClick={() => document.getElementById('tree-here')?.scrollIntoView({ block: 'center', behavior: 'smooth' })}
+                onClick={() => body.current?.querySelector('#tree-here')?.scrollIntoView({ block: 'center', behavior: 'smooth' })}
               >
                 ◉ Here
               </button>
             )}
           </label>
+          {tree?.prev != null && (
+            <button type="button" className="more-row" disabled={loading !== null} onClick={() => void load('earlier', tree.prev, tree)}>
+              {loading === 'earlier' ? 'Loading…' : 'Load earlier entries'}
+            </button>
+          )}
           {error !== null ? (
             <Empty title="Could not load the tree">
               <span>{error}</span>
@@ -150,9 +208,9 @@ export function TreeScreen({ session, title }: { session: string; title: string 
               ))}
             </ol>
           )}
-          {tree !== null && tree.cursor !== null && (
-            <button type="button" className="more-row" disabled={loading} onClick={() => void load(tree.cursor, tree)}>
-              {loading ? 'Loading…' : 'Load more entries'}
+          {tree?.next != null && (
+            <button type="button" className="more-row" disabled={loading !== null} onClick={() => void load('later', tree.next, tree)}>
+              {loading === 'later' ? 'Loading…' : 'Load more entries'}
             </button>
           )}
           {tree?.truncated === true && <p className="muted small">Some entry texts were shortened.</p>}
@@ -164,7 +222,12 @@ export function TreeScreen({ session, title }: { session: string; title: string 
           session={session}
           live={live}
           onClose={() => setPicked(null)}
-          onMoved={() => {
+          onForked={(forked) => {
+            if (ownsTop()) nav.push({ kind: 'conversation', ...forked, title: 'Fork' });
+          }}
+          onMoved={goToConversation}
+          onLegacyMoved={() => {
+            if (!ownsTop()) return;
             setPicked(null);
             setReload((count) => count + 1);
           }}
@@ -208,18 +271,21 @@ function NodeSheet({
   session,
   live,
   onClose,
+  onForked,
   onMoved,
+  onLegacyMoved,
 }: {
   row: TreeRow;
   session: string;
   live: api.LiveSession | null;
   onClose: () => void;
-  onMoved: () => void;
+  onForked: (forked: { session: string; liveKey: string | null }) => void;
+  onMoved: (liveKey: string | null) => void;
+  onLegacyMoved: () => void;
 }): ReactNode {
   const client = useClient();
-  const nav = useNav();
   const can = useCan();
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<'forking' | 'starting' | 'moving' | null>(null);
   const node = row.node;
   const [glyph, kind] = KIND[node.kind];
   const forkWhy = forkRefusal(node, live);
@@ -227,21 +293,43 @@ function NodeSheet({
   const forkOp: api.Op = { op: 'fork_at', session, entry: node.id };
 
   const fork = async () => {
-    setBusy(true);
-    const view = await perform(client, forkOp, 'Fork at this entry', 'Forked into a new session.');
-    setBusy(false);
-    const result = doneResult(view);
-    if (result?.type === 'file') {
-      onClose();
-      if (result.session !== null) nav.push({ kind: 'conversation', session: result.session, liveKey: null, title: 'Fork' });
-    }
+    setBusy('forking');
+    const result = doneResult(await perform(client, forkOp, 'Fork at this entry', 'Forked into a new session.'));
+    const forked = result?.type === 'file' ? await resumeFork(client, result.session, () => setBusy('starting')) : null;
+    setBusy(null);
+    if (result?.type === 'file') onClose();
+    if (forked !== null) onForked(forked);
   };
   const go = async () => {
     if (live === null) return;
-    setBusy(true);
-    const view = await perform(client, { op: 'navigate', live: live.live, entry: node.id }, 'Go to this entry', 'Moved the session here.');
-    setBusy(false);
-    if (succeeded(view)) onMoved();
+    const epoch = client.getState().welcome?.epoch ?? null;
+    setBusy('moving');
+    const view = await perform(client, { op: 'navigate', live: live.live, entry: node.id }, 'Go to this entry');
+    setBusy(null);
+    const result = doneResult(view);
+    if (result?.type !== 'moved') {
+      if (succeeded(view)) onLegacyMoved();
+      return;
+    }
+    if (result.message !== null) {
+      client.notify(result.message);
+      return;
+    }
+    const state = client.getState();
+    const feed = state.feeds.get('live');
+    const target = live.live;
+    const current = client.acceptsLiveDraft(target, epoch) && feed?.feed === 'live' &&
+      feed.sessions.some((entry) => entry.session === session && entry.status.state !== 'exited' &&
+        entry.live.key === target.key && entry.live.generation === target.generation);
+    let decision = treeMove(result, current);
+    let restore = current;
+    if (decision.prefill !== null) {
+      const draft = state.composerDrafts.get(composerDraftKey(target))?.text ?? '';
+      restore = client.setComposerDraft(target, mergeComposerPrefill(draft, decision.prefill), epoch);
+      if (!restore) decision = treeMove(result, false);
+    }
+    client.notify(decision.notice);
+    onMoved(restore ? target.key : null);
   };
 
   return (
@@ -277,21 +365,23 @@ function NodeSheet({
       </dl>
       <div className="node-actions">
         <div className="action-block">
-          <button type="button" className="button primary block" disabled={busy || forkWhy !== null || !can(forkOp)} onClick={() => void fork()}>
-            ⑂ Fork here
+          <button type="button" className="button primary block" disabled={busy !== null || forkWhy !== null || !can(forkOp)} onClick={() => void fork()}>
+            {busy === 'starting' ? 'Starting the fork…' : busy === 'forking' ? 'Forking…' : '⑂ Fork here'}
           </button>
-          <small className={forkWhy === null ? 'muted' : 'refusal'}>{forkWhy ?? 'A new session file branches off at this entry.'}</small>
+          <small className={forkWhy === null ? 'muted' : 'refusal'}>{forkWhy ?? 'Starts a new session branching off at this entry.'}</small>
         </div>
         <div className="action-block">
           <button
             type="button"
             className="button block"
-            disabled={busy || goWhy !== null || live === null || !can({ op: 'navigate', live: live.live, entry: node.id })}
+            disabled={busy !== null || goWhy !== null || live === null || !can({ op: 'navigate', live: live.live, entry: node.id })}
             onClick={() => void go()}
           >
             ↪ Go here
           </button>
-          <small className={goWhy === null ? 'muted' : 'refusal'}>{goWhy ?? 'The running session continues from this entry.'}</small>
+          <small className={goWhy === null ? 'muted' : 'refusal'}>
+            {goWhy ?? (node.kind === 'user' ? 'Move just before this prompt so you can edit it.' : 'Continue the running session from this point.')}
+          </small>
         </div>
       </div>
     </Sheet>

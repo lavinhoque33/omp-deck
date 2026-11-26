@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
+use deck_core::agents::LeafAnchor;
 use deck_core::config::SessionView;
 use deck_core::ctl::{
-    CtlClient, CtlCommand, LiveSnapshot, PendingUi, ctl_dir, ctl_env, prepare_ctl_dir, with_ctl,
+    CtlClient, CtlCommand, CtlReply, LiveSnapshot, NavigateOutcome, PendingUi, ctl_dir, ctl_env,
+    prepare_ctl_dir, with_ctl,
 };
 use deck_core::mux::{Launch, Mux, MuxKind};
 use deck_core::status::{self as core_status, StatusTarget};
@@ -134,11 +136,89 @@ fn controller_pending_ui(snapshot: Option<&LiveSnapshot>, ui_hook: bool) -> &[Pe
     &pending[..pending.len().min(8)]
 }
 
+struct PendingCtl {
+    key: Option<RequestKey>,
+    leaf: Option<PendingLeaf>,
+}
+
+struct PendingLeaf {
+    root: PathBuf,
+    connection: u64,
+    /// Only device navigations project the reply as a phone result.
+    device_entry: Option<String>,
+}
+
+struct LiveLeaf {
+    file: PathBuf,
+    connection: u64,
+    anchor: Option<LeafAnchor>,
+    unpinned_reply: Option<UnpinnedLeafReply>,
+    /// `Some(None)` means the reply arrived before the session's first snapshot.
+    reply_tree_after: Option<Option<u64>>,
+}
+
+struct UnpinnedLeafReply {
+    leaf: Option<String>,
+    file_len: Option<u64>,
+}
+
+impl LiveLeaf {
+    fn for_file<'a>(slot: &'a mut Option<Self>, file: &Path, connection: u64) -> &'a mut Self {
+        if slot
+            .as_ref()
+            .is_some_and(|state| !state.matches(file, connection))
+        {
+            *slot = None;
+        }
+        slot.get_or_insert_with(|| Self {
+            file: file.to_path_buf(),
+            connection,
+            anchor: None,
+            unpinned_reply: None,
+            reply_tree_after: None,
+        })
+    }
+
+    fn matches(&self, file: &Path, connection: u64) -> bool {
+        self.connection == connection && super::spelling::same_spelling(&self.file, file)
+    }
+
+    fn initial_anchor(&self, file: &Path, connection: u64) -> Option<LeafAnchor> {
+        if !self.matches(file, connection) {
+            return None;
+        }
+        if let Some(anchor) = &self.anchor {
+            return Some(anchor.clone());
+        }
+        let reply = self.unpinned_reply.as_ref()?;
+        let file_len = std::fs::metadata(&self.file).ok()?.len();
+        (reply.file_len == Some(file_len)).then(|| LeafAnchor {
+            leaf: reply.leaf.clone(),
+            tail: None,
+        })
+    }
+
+    fn reply_leaf(
+        &self,
+        file: &Path,
+        connection: u64,
+        snapshot_arrival: Option<u64>,
+    ) -> Option<Option<String>> {
+        if self.reply_tree_after != Some(snapshot_arrival) || !self.matches(file, connection) {
+            return None;
+        }
+        self.anchor
+            .as_ref()
+            .map(|anchor| anchor.leaf.clone())
+            .or_else(|| self.unpinned_reply.as_ref().map(|reply| reply.leaf.clone()))
+    }
+}
+
 /// The persistent live-control link of a managed session, independent of UI subscriptions.
 pub(super) struct LiveLink {
     pub(super) client: CtlClient,
     queued: Vec<(Option<RequestKey>, CtlCommand, Instant)>,
-    pending: HashMap<u64, Option<RequestKey>>,
+    pending: HashMap<u64, PendingCtl>,
     seen: (bool, Option<Arc<LiveSnapshot>>),
     seen_ui_hook: bool,
     subscribed: Option<(bool, bool)>,
@@ -147,6 +227,87 @@ pub(super) struct LiveLink {
     /// [`CtlCommand::EditorState`] questions under way (request id, when sent), see
     /// [`Engine::ask_editors`].
     editor: Vec<(u64, Instant)>,
+    leaf: Option<LiveLeaf>,
+    snapshot_arrival: Option<u64>,
+    connection: u64,
+}
+
+impl LiveLink {
+    fn observe_leaf_snapshot(
+        &mut self,
+        interest: &super::interest::Interest,
+        snapshot: &LiveSnapshot,
+        controller_path: Option<&Path>,
+    ) {
+        if self
+            .seen
+            .1
+            .as_ref()
+            .is_some_and(|previous| previous.session_file != snapshot.session_file)
+        {
+            self.leaf = None;
+        }
+        let Some(file) = snapshot.session_file.as_deref().or(controller_path) else {
+            self.leaf = None;
+            return;
+        };
+        let state = LiveLeaf::for_file(&mut self.leaf, file, self.connection);
+        state.reply_tree_after = None;
+        let Some(tail) = &snapshot.tail else {
+            if state
+                .unpinned_reply
+                .as_ref()
+                .is_some_and(|reply| reply.leaf != snapshot.leaf)
+            {
+                state.unpinned_reply = None;
+            }
+            return;
+        };
+        state.unpinned_reply = None;
+        if state
+            .anchor
+            .as_ref()
+            .is_none_or(|a| a.leaf != snapshot.leaf || a.tail.as_ref() != Some(tail))
+        {
+            let anchor = LeafAnchor {
+                leaf: snapshot.leaf.clone(),
+                tail: Some(tail.clone()),
+            };
+            interest.anchor_transcript(file, &anchor);
+            state.anchor = Some(anchor);
+        }
+    }
+
+    fn observe_leaf_reply(
+        &mut self,
+        interest: &super::interest::Interest,
+        file: &Path,
+        reply: &CtlReply,
+        tree_after: Option<Option<u64>>,
+    ) {
+        let state = LiveLeaf::for_file(&mut self.leaf, file, self.connection);
+        let anchor = LeafAnchor {
+            leaf: reply.leaf.clone(),
+            tail: reply.tail.clone(),
+        };
+        let file_len = anchor
+            .tail
+            .is_none()
+            .then(|| std::fs::metadata(file).ok().map(|m| m.len()))
+            .flatten();
+        interest.anchor_transcript(file, &anchor);
+        state.reply_tree_after = tree_after;
+        if anchor.tail.is_some() {
+            state.anchor = Some(anchor);
+            state.unpinned_reply = None;
+        } else {
+            state.anchor = None;
+            state.unpinned_reply = Some(UnpinnedLeafReply {
+                leaf: anchor.leaf,
+                file_len,
+            });
+        }
+    }
 }
 
 pub(super) struct Managed {
@@ -185,6 +346,53 @@ pub(super) struct Managed {
 }
 
 impl Managed {
+    pub(super) fn initial_leaf_anchor(&self, path: &Path) -> Option<LeafAnchor> {
+        let link = self.live.as_ref().filter(|link| link.client.connected())?;
+        let connection = link.client.connection_serial();
+        let anchor = link.leaf.as_ref()?.initial_anchor(path, connection)?;
+        (link.client.connected() && link.client.connection_serial() == connection).then_some(anchor)
+    }
+
+    pub(super) fn tree_leaf(&self, path: &Path) -> Option<Option<String>> {
+        let link = self.live.as_ref().filter(|link| link.client.connected())?;
+        let connection = link.client.connection_serial();
+        let state = link.leaf.as_ref();
+        let arrival = link.client.snapshot_arrival();
+        if let Some(leaf) = state.and_then(|state| state.reply_leaf(path, connection, arrival)) {
+            return (link.client.connected() && link.client.connection_serial() == connection)
+                .then_some(leaf);
+        }
+        // A new snapshot can arrive between engine steps. Do not use the previously
+        // observed one if its association was cleared when the controller changed files.
+        if link.snapshot_arrival == arrival
+            && state.is_none_or(|state| !state.matches(path, connection))
+        {
+            return None;
+        }
+        let snapshot = link.client.latest()?;
+        let file = snapshot
+            .session_file
+            .as_deref()
+            .or(self.ctl.session_path())?;
+        (super::spelling::same_spelling(file, path)
+            && link.client.connected()
+            && link.client.connection_serial() == connection)
+            .then(|| snapshot.leaf.clone())
+    }
+
+    fn set_session_path(&mut self, path: Option<PathBuf>) -> bool {
+        if self.ctl.session_path() != path.as_deref()
+            && let Some(link) = &mut self.live
+            && link.leaf.as_ref().is_some_and(|leaf| {
+                path.as_deref()
+                    .is_none_or(|path| !super::spelling::same_spelling(&leaf.file, path))
+            })
+        {
+            link.leaf = None;
+        }
+        self.ctl.set_session_path(path)
+    }
+
     /// Includes commands queued for the live socket, not just the terminal injector.
     pub(super) fn checkpoint_pending_command(&self) -> bool {
         self.ctl.is_busy()
@@ -1306,7 +1514,7 @@ impl Engine {
                     GatewayError::Failed("the session was closed".to_owned()),
                 );
             }
-            for key in link.pending.into_values().flatten() {
+            for key in link.pending.into_values().filter_map(|pending| pending.key) {
                 self.job_failed(
                     key,
                     GatewayError::Failed("the session was closed".to_owned()),
@@ -1487,7 +1695,7 @@ impl Engine {
     pub(super) fn set_session_path(&mut self, i: usize, path: Option<PathBuf>) -> SessionTarget {
         let m = &mut self.sess.managed[i];
         let key = m.ctl.target().key.clone();
-        if m.ctl.set_session_path(path) {
+        if m.set_session_path(path) {
             self.end_views(&key, ViewEnd::Stale);
         }
         self.sess.manifest_dirty = true;
@@ -1602,6 +1810,9 @@ impl Engine {
             tools: false,
             probe_deadline: Instant::now() + Duration::from_secs(10),
             editor: Vec::new(),
+            leaf: None,
+            snapshot_arrival: None,
+            connection: 0,
         });
     }
 
@@ -1677,6 +1888,7 @@ impl Engine {
                 continue;
             };
             let connected = link.client.connected();
+            let updates = link.client.take_updates();
             if connected {
                 m.ctl_probed = true;
             }
@@ -1690,8 +1902,28 @@ impl Engine {
             }
             if connected {
                 for (rk, cmd, _) in std::mem::take(&mut link.queued) {
-                    let rid = link.client.send(cmd);
-                    link.pending.insert(rid, rk);
+                    let leaf = match &cmd {
+                        CtlCommand::Navigate { root, entry_id, .. } => Some(PendingLeaf {
+                            root: root.clone(),
+                            connection: updates.connection,
+                            device_entry: rk.as_ref().and_then(|key| {
+                                (self.jobs.get(key)?.label == super::mutate::DEVICE_NAVIGATE_JOB)
+                                    .then(|| entry_id.clone())
+                            }),
+                        }),
+                        CtlCommand::ReanswerAsk { root, .. } => Some(PendingLeaf {
+                            root: root.clone(),
+                            connection: updates.connection,
+                            device_entry: None,
+                        }),
+                        _ => None,
+                    };
+                    let rid = if let Some(leaf) = &leaf {
+                        link.client.send_on(leaf.connection, cmd)
+                    } else {
+                        link.client.send(cmd)
+                    };
+                    link.pending.insert(rid, PendingCtl { key: rk, leaf });
                 }
             } else {
                 let (expired, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut link.queued)
@@ -1710,7 +1942,30 @@ impl Engine {
                     self.soon = Some(self.soon.map_or(d, |s| s.min(d)));
                 }
             }
-            for (rid, reply) in link.client.take_replies() {
+            let latest = updates.snapshot;
+            let same_snapshot = match (&link.seen.1, &latest) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            let reconnected = link.connection != 0 && link.connection != updates.connection;
+            link.connection = updates.connection;
+            if !connected || reconnected || latest.is_none() && link.seen.1.is_some() {
+                link.leaf = None;
+            }
+            let mut snapshot = latest
+                .as_deref()
+                .filter(|_| connected && link.snapshot_arrival != updates.snapshot_arrival);
+            link.snapshot_arrival = if connected {
+                updates.snapshot_arrival
+            } else {
+                None
+            };
+            for (position, (rid, reply)) in updates.replies.into_iter().enumerate() {
+                let newer_than_snapshot = position >= updates.replies_before_snapshot;
+                if newer_than_snapshot && let Some(snapshot) = snapshot.take() {
+                    link.observe_leaf_snapshot(&self.interest, snapshot, m.ctl.session_path());
+                }
                 if let Some(at) = link.editor.iter().position(|(id, _)| *id == rid) {
                     let (_, sent) = link.editor.swap_remove(at);
                     m.ctl.editor_answered(sent, reply.editor_empty());
@@ -1745,14 +2000,45 @@ impl Engine {
                     reply.code.as_deref() == Some("root_mismatch"),
                     reply.error.clone(),
                 ));
-                if let Some(Some(rk)) = link.pending.remove(&rid) {
-                    finished.push((rk, Ok(Done::Ctl(reply))));
+                if let Some(pending) = link.pending.remove(&rid) {
+                    let result = match pending.leaf {
+                        Some(leaf) => {
+                            let root_matches = link.leaf.as_ref().is_none_or(|state| {
+                                super::spelling::same_spelling(&state.file, &leaf.root)
+                            }) && m.ctl.session_path().is_some_and(|file| {
+                                super::spelling::same_spelling(file, &leaf.root)
+                            });
+                            if connected
+                                && reply.ok
+                                && root_matches
+                                && leaf.connection == updates.connection
+                            {
+                                link.observe_leaf_reply(
+                                    &self.interest,
+                                    &leaf.root,
+                                    &reply,
+                                    newer_than_snapshot.then_some(updates.snapshot_arrival),
+                                );
+                            }
+                            match leaf.device_entry {
+                                Some(entry) => navigate_result(reply, &entry),
+                                None => Ok(Done::Ctl(reply)),
+                            }
+                        }
+                        None => Ok(Done::Ctl(reply)),
+                    };
+                    if let Some(key) = pending.key {
+                        finished.push((key, result));
+                    }
                 }
+            }
+            if let Some(snapshot) = snapshot {
+                link.observe_leaf_snapshot(&self.interest, snapshot, m.ctl.session_path());
             }
             if !subscription.0 {
                 continue;
             }
-            let latest = link.client.latest();
+            // The same snapshot is also used for the controller's status and file discovery.
             // omp writes a fresh session's file only when its first reply lands; until then
             // the reported path is checked again shortly (the snapshot may not change).
             let reported = unresolved
@@ -1769,13 +2055,7 @@ impl Engine {
                 }
             }
             let ui_hook = link.client.ui_hook();
-            let same = link.seen.0 == connected
-                && link.seen_ui_hook == ui_hook
-                && match (&link.seen.1, &latest) {
-                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                    (None, None) => true,
-                    _ => false,
-                };
+            let same = link.seen.0 == connected && link.seen_ui_hook == ui_hook && same_snapshot;
             if !same {
                 let previous = link.seen.1.as_deref();
                 let current = latest.as_deref();
@@ -1866,7 +2146,7 @@ impl Engine {
             let Some(p) = followed_path(m.ctl.session_path(), snap.files_of(name)).cloned() else {
                 continue;
             };
-            if m.ctl.set_session_path(Some(p)) {
+            if m.set_session_path(Some(p)) {
                 stale.push(m.ctl.target().key.clone());
             }
             self.sess.manifest_dirty = true;
@@ -2705,6 +2985,33 @@ fn prepare(
     }
 }
 
+fn navigate_result(reply: CtlReply, entry: &str) -> Result<Done, GatewayError> {
+    if !reply.ok {
+        return Err(GatewayError::Failed(
+            reply
+                .error
+                .unwrap_or_else(|| "omp did not navigate".to_owned()),
+        ));
+    }
+    let NavigateOutcome {
+        mut editor_text,
+        editor_images,
+    } = NavigateOutcome::of(&reply);
+    if let Some(text) = &mut editor_text
+        && text.len() > deck_remote::api::MAX_MOVED_TEXT
+    {
+        text.truncate(text.floor_char_boundary(deck_remote::api::MAX_MOVED_TEXT));
+        text.shrink_to_fit();
+    }
+    Ok(Done::Navigated {
+        before_prompt: reply.message.is_none() && reply.leaf.as_deref() != Some(entry),
+        leaf: reply.leaf,
+        editor_text,
+        dropped_images: editor_images,
+        message: reply.message,
+    })
+}
+
 /// Never enter closing (which cancels unwritten input) while an operation or frontend owns it.
 fn agent_child_attach_can_release(
     needed: bool,
@@ -2716,6 +3023,89 @@ fn agent_child_attach_can_release(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn leaf_cache_never_returns_facts_from_another_ctl_connection() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path();
+        let mut slot = None;
+        let state = super::LiveLeaf::for_file(&mut slot, path, 1);
+        state.reply_tree_after = Some(None);
+        state.anchor = Some(super::LeafAnchor {
+            leaf: Some("leaf".to_owned()),
+            tail: Some("tail".to_owned()),
+        });
+        assert_eq!(state.initial_anchor(path, 1), state.anchor);
+        assert_eq!(
+            state.reply_leaf(path, 1, None),
+            Some(Some("leaf".to_owned()))
+        );
+        assert!(state.initial_anchor(path, 2).is_none());
+        assert!(state.reply_leaf(path, 2, None).is_none());
+
+        state.anchor = None;
+        state.unpinned_reply = Some(super::UnpinnedLeafReply {
+            leaf: None,
+            file_len: Some(0),
+        });
+        assert_eq!(
+            state.initial_anchor(path, 1),
+            Some(super::LeafAnchor {
+                leaf: None,
+                tail: None
+            })
+        );
+        assert_eq!(state.reply_leaf(path, 1, None), Some(None));
+        assert!(state.initial_anchor(path, 2).is_none());
+        assert!(state.reply_leaf(path, 2, None).is_none());
+
+        let state = super::LiveLeaf::for_file(&mut slot, path, 2);
+        assert!(state.initial_anchor(path, 2).is_none());
+        assert!(state.reply_leaf(path, 2, None).is_none());
+    }
+
+    #[test]
+    fn device_navigate_bounds_the_moved_text_on_a_character_boundary() {
+        let limit = deck_remote::api::MAX_MOVED_TEXT;
+        let prefix = "x".repeat(limit - 1);
+        let reply = deck_core::ctl::CtlReply {
+            ok: true,
+            leaf: Some("parent".to_owned()),
+            value: Some(serde_json::json!({"editorText": format!("{prefix}é"), "editorImages": 2})),
+            ..Default::default()
+        };
+        match super::navigate_result(reply, "prompt").unwrap() {
+            super::Done::Navigated {
+                before_prompt,
+                editor_text,
+                dropped_images,
+                ..
+            } => {
+                assert!(before_prompt);
+                assert_eq!(editor_text.as_deref(), Some(prefix.as_str()));
+                assert_eq!(dropped_images, 2);
+            }
+            outcome => panic!("not a navigation result: {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn device_navigate_before_the_first_prompt_has_no_leaf() {
+        let reply = deck_core::ctl::CtlReply {
+            ok: true,
+            value: Some(serde_json::json!({"editorText": "first prompt"})),
+            ..Default::default()
+        };
+        assert!(matches!(
+            super::navigate_result(reply, "first"),
+            Ok(super::Done::Navigated {
+                leaf: None,
+                before_prompt: true,
+                editor_text: Some(text),
+                ..
+            }) if text == "first prompt"
+        ));
+    }
+
     #[test]
     fn pending_ui_projection_requires_a_hook_and_caps_the_oldest_eight() {
         let snapshot = super::LiveSnapshot {

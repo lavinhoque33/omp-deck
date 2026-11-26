@@ -297,6 +297,178 @@ async function setPush(page: Page, on: boolean): Promise<void> {
   await page.getByText(on ? 'subscribed' : 'not subscribed', { exact: true }).waitFor({ timeout: STEP });
 }
 
+interface LiveTreeRoute {
+  kind: string;
+  session?: string | null;
+  liveKey?: string | null;
+}
+
+interface LiveTreeController {
+  session_path: string | null;
+  live_control: boolean;
+}
+
+async function runTree(live: LiveRun, page: Page): Promise<void> {
+  const a = 'TREE-A first turn';
+  const b = 'TREE-B abandoned turn';
+  const c = 'TREE-C replacement turn';
+  const reply = (prompt: string) => `LIVE-REPLY to: ${prompt}`;
+  const chat = page.locator('.chat-content');
+  const composer = page.getByRole('textbox', { name: 'Message', exact: true });
+  const toast = page.locator('.toasts');
+  const back = page.getByRole('button', { name: 'Back', exact: true });
+  const tree = page.locator('.tree-screen');
+  const dialog = page.getByRole('dialog');
+  const routes = () => page.evaluate(() => history.state.stack as LiveTreeRoute[]);
+  const turn = async (prompt: string) => {
+    await live.send(prompt);
+    await chat.getByText(reply(prompt), { exact: true }).waitFor({ timeout: SLOW });
+    await live.idle();
+  };
+  const openTree = async () => {
+    await page.getByRole('button', { name: 'Session actions', exact: true }).click();
+    await dialog.getByRole('button', { name: /Session tree/ }).click();
+    await tree.getByRole('list', { name: 'Session entries' }).waitFor();
+  };
+  const choose = async (kind: 'You' | 'Assistant', text: string) => {
+    await tree.getByRole('button', { name: `${kind}: ${text}`, exact: true }).click();
+  };
+  const go = async (kind: 'You' | 'Assistant', text: string, notice: string) => {
+    await choose(kind, text);
+    await dialog.getByRole('button', { name: /Go here/ }).click();
+    await toast.getByText(notice, { exact: true }).waitFor();
+    await composer.waitFor();
+  };
+  const checkBranch = async (...prompts: string[]) => {
+    for (const prompt of prompts) {
+      await chat.getByText(prompt, { exact: true }).waitFor({ state: 'detached' });
+      await chat.getByText(reply(prompt), { exact: true }).waitFor({ state: 'detached' });
+    }
+    await chat.getByText(a, { exact: true }).waitFor();
+    await chat.getByText(reply(a), { exact: true }).waitFor();
+  };
+
+  await turn(a);
+  await turn(b);
+  const origin = (await routes()).at(-1);
+  assert(origin?.kind === 'conversation' && origin.liveKey != null, `missing original live route: ${JSON.stringify(origin)}`);
+  const originalTitle = await page.locator('.chat .top h2').innerText();
+  await openTree();
+  const original = (await routes()).at(-1)?.session;
+  assert(original != null, 'tree route is missing the original session id');
+  const here = tree.locator('#tree-here');
+  await here.getByText(/you are here/).waitFor();
+  const visible = await here.evaluate((row) => {
+    const body = row.closest('.body')?.getBoundingClientRect();
+    const rect = row.getBoundingClientRect();
+    return body !== undefined && rect.top >= Math.max(body.top, 0) && rect.bottom <= Math.min(body.bottom, window.innerHeight);
+  });
+  assert(visible, 'the here row is outside the scroll viewport when the tree opens');
+  const listed = await tree.getByRole('list', { name: 'Session entries' }).getByRole('listitem').count();
+  const total = Number(await tree.locator('.top .count').innerText());
+  assert(total === listed && total >= 4, `tree total ${total}, listed ${listed}`);
+  assert(await tree.getByRole('button', { name: /Load (earlier|more) entries/ }).count() === 0, 'the tiny tree is unexpectedly paged');
+  await live.shot('tree-01-here');
+  live.note('tree opens at the leaf', `the here row was fully in view without scrolling; the count and the complete list both have ${listed} entries`);
+
+  await go('Assistant', reply(a), 'Moved there — new prompts continue from this point');
+  const returned = await routes();
+  assert(returned.length === 1 && returned[0]?.kind === 'conversation' && returned[0]?.liveKey === origin.liveKey, `jump did not return to the original live conversation: ${JSON.stringify(returned)}`);
+  await checkBranch(b);
+  await live.shot('tree-02-jump');
+  const seen = (await live.requests(0)).count;
+  await turn(c);
+  const replacement = await live.modelRequest(seen, 'replacement turn C', (request) => request.tools && request.last_user.includes(c));
+  assert(replacement.messages.some(({ role, text }) => role === 'user' && text.includes(a)), 'turn C did not include turn A');
+  assert(!replacement.messages.some(({ text }) => text.includes(b)), `turn C included the abandoned turn B: ${JSON.stringify(replacement.messages)}`);
+  const chatText = await chat.innerText();
+  const replyA = chatText.indexOf(reply(a));
+  assert(replyA >= 0 && chatText.indexOf(reply(c)) > replyA, 'reply C does not follow reply A');
+  await live.shot('tree-03-replacement');
+  live.note('tree jump to reply A', 'the only conversation route stayed live, B and its reply disappeared, and the model received C with A but not B');
+
+  const editNotice = 'Moved before that prompt — its text is in the composer';
+  await openTree();
+  await go('You', b, editNotice);
+  const restored = await composer.inputValue();
+  assert(restored === b, `the composer did not recover B exactly: ${JSON.stringify(restored)}`);
+  await checkBranch(b, c);
+  await live.shot('tree-04-restored-prompt');
+
+  const draft = 'Unsent draft typed on the phone';
+  await composer.fill(draft);
+  await openTree();
+  await go('You', a, editNotice);
+  const merged = await composer.inputValue();
+  assert(merged === `${a}\n\n${draft}`, `the existing phone draft was not preserved after the recovered prompt: ${JSON.stringify(merged)}`);
+  await chat.getByText(reply(a), { exact: true }).waitFor({ state: 'detached' });
+  await live.shot('tree-05-kept-draft');
+  live.note('tree jumps to prompts', 'jumping to B restored its exact text and showed only its parent branch (A and reply A); jumping to A kept the phone draft after a blank line');
+
+  const expectFork = async (prompt: string, ...otherSessions: string[]) => {
+    await live.idle();
+    await composer.waitFor();
+    assert(await composer.isEnabled(), 'the fork composer is disabled');
+    assert(await page.getByRole('button', { name: 'Resume', exact: true }).count() === 0, 'the fork requires manual Resume');
+    const opened = (await routes()).at(-1);
+    assert(opened?.kind === 'conversation' && opened.session != null && opened.liveKey != null && opened.liveKey !== origin.liveKey, `fork did not open a new live conversation: ${JSON.stringify(opened)}`);
+    assert(!otherSessions.includes(opened.session), `the fork reused session ${opened.session}`);
+    await turn(prompt);
+    const active = await live.ctl<LiveTreeController[]>('/live');
+    for (const id of [...otherSessions, opened.session]) {
+      assert(active.some((entry) => entry.live_control && entry.session_path?.endsWith(`_${id}.jsonl`)), `session ${id} is not live: ${JSON.stringify(active)}`);
+    }
+    return opened.session;
+  };
+
+  await openTree();
+  await choose('Assistant', reply(a));
+  await dialog.getByRole('button', { name: /Fork here/ }).click();
+  // The tree is a separate screen, so the fork's composer cannot be mistaken for the original.
+  const entryFork = await expectFork('TREE-FORK-ENTRY live reply', original);
+  await live.shot('tree-06-entry-fork');
+  live.note('fork here', `new session ${entryFork} accepted and answered a prompt without Resume; original ${original} remains live`);
+
+  await back.click();
+  await tree.getByRole('list', { name: 'Session entries' }).waitFor();
+  await back.click();
+  await composer.waitFor();
+  await page.getByRole('button', { name: 'Session actions', exact: true }).click();
+  await dialog.getByRole('button', { name: /Fork session/ }).click();
+  await dialog.getByRole('button', { name: 'Fork', exact: true }).click();
+  await dialog.waitFor({ state: 'detached' });
+  const wholeFork = await expectFork('TREE-FORK-WHOLE live reply', original, entryFork);
+  await live.shot('tree-07-conversation-fork');
+
+  await back.click();
+  await composer.waitFor();
+  await back.click();
+  const running = page.getByRole('region', { name: 'Running sessions', exact: true });
+  const expand = running.locator('button.name');
+  if (await expand.getAttribute('aria-expanded') !== 'true') await expand.click();
+  await running.getByText(originalTitle, { exact: true }).first().waitFor();
+  await live.shot('tree-08-original-listed');
+  live.note('fork session', `new session ${wholeFork} accepted and answered a prompt without Resume; both forks and original remain live, and the original is in Running sessions`);
+}
+
+async function reportTreeFailure(live: LiveRun): Promise<void> {
+  const page = live.page;
+  const dom = await page.evaluate(() => ({
+    route: history.state?.stack,
+    header: document.querySelector('.screen .top')?.textContent,
+    dialog: document.querySelector('.sheet')?.textContent,
+    notices: document.querySelector('.toasts')?.textContent,
+    tree: Array.from(document.querySelectorAll('.tree-row'), (row) => row.textContent),
+    transcript: document.querySelector('.chat-content')?.textContent?.slice(-4000),
+    composer: document.querySelector<HTMLTextAreaElement>('.compose-text')?.value,
+    buttons: Array.from(document.querySelectorAll<HTMLButtonElement>('.sheet button, .composer button'), (button) => ({
+      text: button.textContent?.trim(), disabled: button.disabled,
+    })),
+  })).catch((error: unknown) => String(error));
+  const controllers = await live.ctl<unknown>('/live').catch((error: unknown) => String(error));
+  console.error(`live --tree: failure screenshot ${join(OUT, 'tree-failure.png')}\nDOM: ${JSON.stringify(dom)}\n/live: ${JSON.stringify(controllers)}`);
+}
+
 export async function runLive(stack: Stack): Promise<LiveRun> {
   mkdirSync(OUT, { recursive: true });
   const live = new LiveRun(stack);
@@ -305,11 +477,13 @@ export async function runLive(stack: Stack): Promise<LiveRun> {
     const context = await persistentPhone(profile);
     try {
       context.setDefaultTimeout(STEP);
-      await context.grantPermissions(['notifications'], { origin: stack.origin });
+      if (!process.argv.includes('--tree')) await context.grantPermissions(['notifications'], { origin: stack.origin });
       await live.open(context);
       await steps(live, stack, live.page);
     } catch (error) {
-      await live.shot('failure').catch(() => undefined);
+      const treeOnly = process.argv.includes('--tree');
+      await live.shot(treeOnly ? 'tree-failure' : 'failure').catch(() => undefined);
+      if (treeOnly) await reportTreeFailure(live).catch((failure: unknown) => console.error(`Failed to capture tree diagnostics: ${String(failure)}`));
       throw error;
     } finally {
       await context.close();
@@ -322,6 +496,7 @@ export async function runLive(stack: Stack): Promise<LiveRun> {
 
 async function steps(live: LiveRun, stack: Stack, page: Page): Promise<void> {
   const modelsOnly = process.argv.includes('--models');
+  const treeOnly = process.argv.includes('--tree');
   // -- pair --
   await page.goto(stack.link);
   await page.getByRole('button', { name: 'Pair this phone' }).waitFor();
@@ -363,7 +538,7 @@ async function steps(live: LiveRun, stack: Stack, page: Page): Promise<void> {
   await live.shot('03-sessions');
   live.note('sessions', `project ${stack.project} listed with its seeded session “Seeded”`);
 
-  if (!modelsOnly) {
+  if (!modelsOnly && !treeOnly) {
     // -- push: enable (real push service first, then the stubbed one) --
     await notificationsScreen(page);
     const probe = await probeRealPush(page);
@@ -402,6 +577,13 @@ async function steps(live: LiveRun, stack: Stack, page: Page): Promise<void> {
   await modelCard.filter({ hasText: 'fake-1' }).waitFor({ timeout: STEP });
   assert((await live.requests(0)).count === 0, 'the initial model must be known before the first prompt');
   live.note('initial model', 'fake-1 shown before any model request, without a desktop view');
+  if (treeOnly) {
+    await runTree(live, page);
+    assert(live.errors.length === 0, `console/page errors: ${live.errors.join(' | ')}`);
+    assert(live.csp.length === 0, `CSP violations: ${live.csp.join(' | ')}`);
+    live.note('tree browser diagnostics', '0 console/page errors; 0 CSP violations');
+    return;
+  }
 
   const switchModel = async (name: string, id: string): Promise<void> => {
     await modelCard.click();

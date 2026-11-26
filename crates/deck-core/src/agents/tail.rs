@@ -12,7 +12,7 @@ use crate::platform::{self, FileId};
 /// Bytes read per [`LineTail::poll`] call.
 const MAX_READ: u64 = 8 * 1024 * 1024;
 /// A single line longer than this (no newline inside) is dropped instead of buffered.
-const MAX_LINE: usize = 48 * 1024 * 1024;
+pub(super) const MAX_LINE: usize = 48 * 1024 * 1024;
 
 /// Retained allocation estimate, allowing for allocator metadata and rounding.
 pub(super) fn allocation_weight(bytes: usize) -> usize {
@@ -30,6 +30,10 @@ pub(crate) struct Chunk {
     pub reset: bool,
     /// Zero or more complete lines (each terminated by `\n`).
     pub data: Vec<u8>,
+    /// File offset of `data`, including when an oversized line was skipped ahead of it.
+    pub offset: u64,
+    /// Span of an oversized line that finished before `data`, not held in memory.
+    pub skipped: Option<std::ops::Range<u64>>,
     /// More bytes are waiting; poll again.
     pub more: bool,
 }
@@ -41,8 +45,8 @@ pub(crate) struct LineTail {
     /// Bytes consumed from the file (including those still held in `pending`).
     offset: u64,
     pending: Vec<u8>,
-    /// Inside an over-long line: drop bytes up to the next newline.
-    skipping: bool,
+    /// Start of an over-long line: drop bytes up to the next newline.
+    skipping: Option<u64>,
     /// A replacement was observed but has not been reported to the consumer yet.
     reset_pending: bool,
 }
@@ -54,7 +58,7 @@ impl LineTail {
             id: None,
             offset: 0,
             pending: Vec::new(),
-            skipping: false,
+            skipping: None,
             reset_pending: false,
         }
     }
@@ -113,8 +117,20 @@ impl LineTail {
     pub fn poll(&mut self) -> io::Result<Chunk> {
         // Regular files only: a FIFO is never opened, a link never followed (`platform`).
         let mut file = platform::open_regular_file(&self.path)?;
+        self.poll_file(&mut file)
+    }
+
+    /// Replay a line and any later bytes from a chunk the consumer could not finish.
+    pub(super) fn rewind(&mut self, offset: u64) {
+        self.offset = offset;
+        self.pending.clear();
+        self.skipping = None;
+    }
+
+    /// Poll a file already open for reading; the transcript reader also seeks to entry spans.
+    pub(super) fn poll_file(&mut self, file: &mut std::fs::File) -> io::Result<Chunk> {
         let md = file.metadata()?;
-        let id = platform::file_identity(&file)?;
+        let id = platform::file_identity(file)?;
         let len = md.len();
         if self.id != Some(id) || len < self.offset {
             // Latch the reset until a successful poll, including if a truncated file
@@ -123,12 +139,14 @@ impl LineTail {
             self.id = Some(id);
             self.offset = 0;
             self.pending = Vec::new();
-            self.skipping = false;
+            self.skipping = None;
         }
         if len <= self.offset {
             return Ok(Chunk {
                 reset: std::mem::take(&mut self.reset_pending),
                 data: Vec::new(),
+                offset: self.offset,
+                skipped: None,
                 more: false,
             });
         }
@@ -139,16 +157,21 @@ impl LineTail {
         let reset = std::mem::take(&mut self.reset_pending);
         self.offset += fresh.len() as u64;
         let more = self.offset < len;
-        if self.skipping {
+        let mut skipped = None;
+        if let Some(start) = self.skipping {
             match memchr(b'\n', &fresh) {
                 Some(i) => {
+                    let end = self.offset - fresh.len() as u64 + i as u64 + 1;
+                    skipped = Some(start..end);
                     fresh.drain(..=i);
-                    self.skipping = false;
+                    self.skipping = None;
                 }
                 None => {
                     return Ok(Chunk {
                         reset,
                         data: Vec::new(),
+                        offset: self.offset,
+                        skipped: None,
                         more,
                     });
                 }
@@ -162,16 +185,23 @@ impl LineTail {
             }
             None => Vec::new(),
         };
+        let offset = self.offset - self.pending.len() as u64 - data.len() as u64;
         if self.pending.len() > MAX_LINE {
             log::debug!(
                 "agents: dropping over-long line in {} ({} bytes)",
                 self.path.display(),
                 self.pending.len()
             );
+            self.skipping = Some(self.offset - self.pending.len() as u64);
             self.pending = Vec::new();
-            self.skipping = true;
         }
-        Ok(Chunk { reset, data, more })
+        Ok(Chunk {
+            reset,
+            data,
+            offset,
+            skipped,
+            more,
+        })
     }
 }
 

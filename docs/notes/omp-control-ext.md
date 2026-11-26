@@ -249,3 +249,19 @@ export default async function ompdeckCtl(api: any) {
   `ctx.ui.getEditorText() === ""` on the main session's UI context; `{ok: false, error: "editor unavailable"}` when the
   host omp lacks `getEditorText`. Read-only, no hello feature flag (an older loaded extension answers `unknown cmd`).
   Used only by the injector to tell omp 19's prediction ghost from a draft (`contracts.md` "omp 19 parity").
+- Snapshot `tail` (2026-11-26, omp 19.2.1): `sessionManager.getEntries().at(-1)?.id` beside `leaf`. Together they
+  are an exact statement ("the leaf is `leaf` as of entry `tail`"), which a file reader folds forward over the lines
+  after `tail`; `leaf` alone cannot be ordered against the file. Absent from sessions that loaded an older extension.
+- `navigate` with `takeEditor: true` (2026-11-26; the phone's "Go here"): when the move landed before a prompt
+  (leaf ≠ target) the reply carries `value: { editorText, editorImages }` and omp's editor is left empty.
+  - omp restores the prompt into its editor only when the editor is trim-empty (`extension-ui-controller.ts`), so a
+    draft the user already had stays; the text then comes from the entry itself.
+  - Clearing needs omp's private composer (`ctx.ui` can set text but cannot drop pending images): the extension
+    wraps `ExtensionUiController.prototype.initHooksAndCustomTools` (optional import of
+    `@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller`) to record `ctx.composer` per session in
+    `globalThis.__ompdeckComposers`, then calls `composer.clearDraft({ recall: false })` (19.2.1 bundle: clears text,
+    `pendingImages` and `pendingImageLinks`). An empty-text draft that held images is put back with
+    `composer.setDraft(before, images)`.
+  - No composer (import failed, another omp version): a text-only prompt is taken with `ui.setEditorText("")`; a
+    prompt with images stays in omp's editor (no `value`), since clearing only the text would leave hidden
+    attachments for the next send. The fallback was not exercised against an older omp.

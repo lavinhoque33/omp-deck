@@ -1,0 +1,8 @@
+{"type":"title","title":"Branches"}
+{"type":"session","id":"session-id","version":3}
+{"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"root"}}
+{"type":"message","id":"old","parentId":"root","message":{"role":"assistant","content":"abandoned"}}
+{"type":"message","id":"child","parentId":"old","message":{"role":"user","content":"also abandoned"}}
+{"type":"message","message":{"role":"assistant","id":"child","parentId":"old","activeLeafId":"old","content":"active"},"id":"act\u0069ve","parentId":"root"}
+{"type":"message","message":{"role":"user","id":"not-an-entry","content":"no top-level id"}}
+{"type":"model_usage","id":"usage","parentId":"child","activeLeafId":"active"}

@@ -14,6 +14,7 @@ import * as fixtures from '../test/smoke/fixtures.ts';
 
 const OUT = process.env['E2E_OUT'] ?? '/tmp/pwa-smoke/e2e';
 const TIMEOUT = 15_000;
+const treeOnly = process.argv.includes('--tree');
 mkdirSync(OUT, { recursive: true });
 
 const smoke = await startSmoke();
@@ -32,6 +33,7 @@ async function scenario(
   /** A real (non-incognito) profile: the Push API exists there, as on a phone. */
   realProfile = false,
 ): Promise<void> {
+  if (treeOnly && !name.startsWith('tree:')) return;
   const profile = realProfile ? mkdtempSync(join(tmpdir(), 'pwa-e2e-profile-')) : null;
   const context = profile === null ? await phone(browser, blockWorkers) : await persistentPhone(profile);
   context.setDefaultTimeout(TIMEOUT);
@@ -356,6 +358,263 @@ try {
     false,
     true,
   );
+
+  const treeSession = 's-idle';
+  const treeTitle = 'Refactor tmux launcher';
+  const treeConversation = `route=conversation&session=${treeSession}&title=${encodeURIComponent(treeTitle)}`;
+  const gw = smoke.gateway;
+  const sample = fixtures.tree(gw.t0, treeSession, 'default', null, 1).nodes[0];
+  if (sample === undefined) throw new Error('missing tree fixture');
+  const windowNodes: api.TreeNode[] = Array.from({ length: 60 }, (_, i) => ({
+    ...sample, id: `window-${i}`, parent: i === 0 ? null : `window-${i - 1}`, text: `Window entry ${i}`,
+  }));
+  const treeRequests: Extract<api.Op, { op: 'tree' }>[] = [];
+  const extraBeforeTree = gw.extraItems.get(treeSession);
+  try {
+    gw.treeNav = true;
+    let leaf = 'window-45';
+    gw.treeListing = (op) => {
+      treeRequests.push(op);
+      const [start, end] = op.cursor === 'b-24' ? [0, 24] : op.cursor === 't-54' ? [54, 60] : [24, 54];
+      return {
+        type: 'tree', nodes: windowNodes.slice(start, end), active_leaf: leaf, truncated: false, total: windowNodes.length,
+        prev_cursor: start === 0 ? null : `b-${start}`,
+        next_cursor: end === windowNodes.length ? null : `t-${end}`,
+      };
+    };
+    gw.navigate = (op) => {
+      if (op.entry === 'window-43') {
+        return { type: 'moved', leaf, before_prompt: false, editor_text: null, dropped_images: 0, message: 'Already at this point' };
+      }
+      leaf = op.entry === 'window-42' ? 'window-41' : op.entry;
+      gw.extraItems.set(treeSession, [{ type: 'user', text: 'Reached the new branch', from_agent: false, at_unix_ms: null }]);
+      gw.changed('transcript');
+      return {
+        type: 'moved', leaf, before_prompt: op.entry === 'window-42', dropped_images: op.entry === 'window-42' ? 1 : 0,
+        editor_text: op.entry === 'window-42' ? 'Original prompt text' : null, message: null,
+      };
+    };
+    await scenario('tree: windowed paging, no-op notice, branch jump and existing draft', treeConversation, async (page) => {
+      gw.extraItems.set(treeSession, [{ type: 'user', text: 'Abandoned turn', from_agent: false, at_unix_ms: null }]);
+      gw.changed('transcript');
+      await page.getByText('Abandoned turn', { exact: true }).waitFor();
+      await page.getByLabel('Message').fill('Keep my phone draft');
+      await page.getByRole('button', { name: 'Session actions' }).click();
+      await page.getByRole('button', { name: /Session tree/ }).click();
+
+      const body = page.locator('.tree-screen .body');
+      const here = body.locator('#tree-here');
+      await here.getByText('◉ you are here').waitFor();
+      const centered = await here.evaluate((row) => {
+        const viewport = row.closest('.body')?.getBoundingClientRect();
+        const rect = row.getBoundingClientRect();
+        return viewport !== undefined && Math.abs(rect.top + rect.bottom - viewport.top - viewport.bottom) < 80;
+      });
+      if (!centered || (await page.locator('.tree-screen .count').innerText()) !== '60') throw new Error('initial window did not center the leaf or show the total');
+      const earlier = page.getByRole('button', { name: 'Load earlier entries' });
+      const first = page.getByRole('button', { name: 'You: Window entry 24', exact: true });
+      await earlier.scrollIntoViewIfNeeded();
+      const top = (await first.boundingBox())?.y;
+      await earlier.click();
+      await page.getByRole('button', { name: 'You: Window entry 0', exact: true }).waitFor();
+      const newTop = (await first.boundingBox())?.y;
+      if (top === undefined || newTop === undefined || Math.abs(top - newTop) > 4) throw new Error(`prepend shifted the old window: ${top} → ${newTop}`);
+      await page.getByRole('button', { name: 'Load more entries' }).click();
+      await page.getByRole('button', { name: 'You: Window entry 59', exact: true }).waitFor();
+      await page.getByRole('button', { name: 'Conversation', exact: true }).click();
+      await page.getByRole('button', { name: 'You: Window entry 0', exact: true }).waitFor({ state: 'detached' });
+
+      await page.getByRole('button', { name: 'You: Window entry 43', exact: true }).click();
+      await page.getByRole('button', { name: /Go here/ }).click();
+      await page.getByText('Already at this point', { exact: true }).waitFor();
+      await page.getByRole('dialog').getByRole('button', { name: 'Close' }).click();
+      await page.getByRole('button', { name: 'You: Window entry 42', exact: true }).click();
+      await page.getByRole('button', { name: /Go here/ }).click();
+      await page.getByText(/Moved before that prompt — its text is in the composer.*1 image of that prompt was not carried over/).waitFor();
+      const message = await page.getByLabel('Message').inputValue();
+      if (message !== 'Original prompt text\n\nKeep my phone draft') throw new Error(`jump lost the composer text: ${JSON.stringify(message)}`);
+      await page.getByText('Reached the new branch', { exact: true }).waitFor();
+      await page.getByText('Abandoned turn', { exact: true }).waitFor({ state: 'detached' });
+      await page.getByRole('button', { name: 'Session actions' }).click();
+      await page.getByRole('button', { name: /Session tree/ }).click();
+      await page.locator('#tree-here').getByRole('button', { name: 'You: Window entry 41', exact: true }).waitFor();
+      await page.getByRole('button', { name: 'Back' }).click();
+      await page.getByLabel('Message').waitFor();
+      await page.getByRole('button', { name: 'Back' }).click();
+      await page.getByRole('navigation', { name: 'Main' }).waitFor();
+
+      // StrictMode may repeat a mount's initial request in this unminified build.
+      const ops = treeRequests.map((op) => JSON.stringify([op.filter, op.cursor ?? null, op.at_leaf ?? null]))
+        .filter((op, i, all) => op !== all[i - 1]);
+      const wanted = [
+        ['default', null, true], ['default', 'b-24', null], ['default', 't-54', null], ['conversation', null, true],
+        ['default', null, true],
+      ];
+      if (JSON.stringify(ops) !== JSON.stringify(wanted.map((op) => JSON.stringify(op)))) throw new Error(`unexpected tree requests: ${ops.join(', ')}`);
+    });
+
+    await scenario('tree: jump from the fleet replaces the tree with the live conversation', 'route=sessions', async (page) => {
+      await page.getByRole('button', { name: `Actions for ${treeTitle}`, exact: true }).first().click();
+      await page.getByRole('button', { name: /Session tree/ }).click();
+      await page.getByRole('button', { name: 'You: Window entry 38', exact: true }).click();
+      await page.getByRole('button', { name: /Go here/ }).click();
+      await page.getByText('Moved there — new prompts continue from this point', { exact: true }).waitFor();
+      await page.getByLabel('Message').waitFor();
+      await page.getByRole('button', { name: 'Back' }).click();
+      await page.getByRole('navigation', { name: 'Main' }).waitFor();
+    });
+
+    await scenario('tree: leaving a pending jump keeps the new route and receives its outcome', treeConversation, async (page) => {
+      const pending = Promise.withResolvers<void>();
+      gw.navigateDelay = pending.promise;
+      try {
+        await page.getByLabel('Message').fill('Kept while the request is pending');
+        await page.getByRole('button', { name: 'Session actions' }).click();
+        await page.getByRole('button', { name: /Session tree/ }).click();
+        await page.getByRole('button', { name: 'You: Window entry 42', exact: true }).click();
+        await page.getByRole('button', { name: /Go here/ }).click();
+        await page.getByRole('button', { name: /Go here/, disabled: true }).waitFor();
+        await page.goBack();
+        await page.getByRole('button', { name: '± Changes', exact: true }).click();
+        await page.getByText('Changes', { exact: true }).waitFor();
+        const route = await page.evaluate(() => JSON.stringify(history.state.stack));
+
+        pending.resolve();
+        await page.getByText(/Moved before that prompt — its text is in the composer/).waitFor();
+        if (await page.evaluate(() => JSON.stringify(history.state.stack)) !== route) throw new Error('late jump replaced or popped the current route');
+        await page.getByText('Changes', { exact: true }).waitFor();
+        await page.getByRole('button', { name: 'Back', exact: true }).click();
+        const message = await page.getByLabel('Message').inputValue();
+        if (message !== 'Original prompt text\n\nKept while the request is pending') throw new Error(`late jump lost its prefill: ${JSON.stringify(message)}`);
+      } finally {
+        pending.resolve();
+        gw.navigateDelay = null;
+      }
+    });
+
+    await scenario('tree: a late jump after controller reuse opens only the moved session', 'route=sessions', async (page) => {
+      const pending = Promise.withResolvers<void>();
+      const original = gw.liveSessions().find((entry) => entry.session === treeSession);
+      if (original === undefined) throw new Error('missing original live session');
+      gw.navigateDelay = pending.promise;
+      try {
+        const actions = page.getByRole('button', { name: `Actions for ${treeTitle}`, exact: true }).first();
+        await actions.click();
+        await page.getByRole('button', { name: /Session tree/ }).click();
+        await page.getByRole('button', { name: 'You: Window entry 42', exact: true }).click();
+        await page.getByRole('button', { name: /Go here/ }).click();
+        const dialog = page.getByRole('dialog');
+        const forkHere = dialog.getByRole('button', { name: /Fork here/ });
+        if (!await forkHere.isDisabled()) throw new Error('the jump is not pending');
+        gw.liveOverrides.set(treeSession, {
+          ...original, session: 's-reused', title: 'Replacement session',
+          live: { ...original.live, generation: original.live.generation + 1 },
+        });
+        gw.changed('live');
+        await dialog.getByText('Go here needs the session running.').waitFor();
+        pending.resolve();
+
+        await page.getByText(/Moved before that prompt — its text was not applied because the session is no longer running there/).waitFor();
+        await page.getByRole('button', { name: 'Resume', exact: true }).waitFor();
+        const route = await page.evaluate(() => history.state.stack);
+        if (JSON.stringify(route) !== JSON.stringify([{ kind: 'conversation', session: treeSession, liveKey: null, title: treeTitle }])) {
+          throw new Error(`late jump attached the moved session to the reused controller: ${JSON.stringify(route)}`);
+        }
+        await page.getByRole('button', { name: 'Back', exact: true }).click();
+        await openSession(page, 'Replacement session');
+        if (await page.getByLabel('Message').inputValue() !== '') throw new Error('the moved prompt leaked into the replacement session');
+      } finally {
+        pending.resolve();
+        gw.navigateDelay = null;
+        gw.liveOverrides.delete(treeSession);
+      }
+    });
+  } finally {
+    gw.treeNav = false;
+    gw.treeListing = null;
+    gw.navigate = null;
+    if (extraBeforeTree === undefined) gw.extraItems.delete(treeSession);
+    else gw.extraItems.set(treeSession, extraBeforeTree);
+  }
+
+  await scenario('tree: a legacy gateway keeps Go here on the tree', treeConversation, async (page) => {
+    gw.treeListing = (op) => {
+      treeRequests.push(op);
+      return fixtures.tree(gw.t0, op.session, op.filter, op.cursor ?? null, op.limit);
+    };
+    try {
+      await page.getByRole('button', { name: 'Session actions' }).click();
+      await page.getByRole('button', { name: /Session tree/ }).click();
+      await page.getByRole('button', { name: 'You: Start with the wire types', exact: true }).click();
+      await page.getByRole('button', { name: /Go here/ }).click();
+      await page.locator('.sheet').waitFor({ state: 'detached' });
+      await page.getByRole('list', { name: 'Session entries' }).waitFor();
+      if (treeRequests.at(-1)?.at_leaf !== undefined) throw new Error('sent at_leaf without tree_nav');
+      if (await page.getByRole('button', { name: 'Load earlier entries' }).count() !== 0) throw new Error('legacy tree advertised backwards paging');
+    } finally {
+      gw.treeListing = null;
+    }
+  });
+
+  await scenario('tree: a transcript reset replaces earlier pages and returns to the bottom', treeConversation, async (page) => {
+    const older = gw.extraItems.get(treeSession);
+    const history = (branch: string): api.Item[] => Array.from({ length: 140 }, (_, i) => ({
+      type: 'user', text: `${branch} turn ${i}`, from_agent: false, at_unix_ms: null,
+    }));
+    try {
+      gw.extraItems.set(treeSession, history('Old'));
+      gw.changed('transcript');
+      const earlier = page.getByRole('button', { name: 'Load earlier messages' });
+      await earlier.click();
+      const first = page.getByText('Old turn 0', { exact: true });
+      await first.scrollIntoViewIfNeeded();
+      gw.extraItems.set(treeSession, history('New'));
+      gw.changed('transcript');
+      await earlier.waitFor();
+      await first.waitFor({ state: 'detached' });
+      await page.getByText('New turn 139', { exact: true }).waitFor();
+      await page.waitForFunction(() => {
+        const scroller = document.querySelector('.chat-content');
+        return scroller !== null && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 4;
+      });
+    } finally {
+      if (older === undefined) gw.extraItems.delete(treeSession);
+      else gw.extraItems.set(treeSession, older);
+    }
+  });
+
+  for (const from of ['entry', 'conversation', 'failed start'] as const) {
+    await scenario(`tree: fork from ${from}`, treeConversation, async (page) => {
+      const forkId = `${treeSession}-${from === 'entry' ? 'fork' : 'copy'}`;
+      gw.forkResumeFailure = from === 'failed start' ? 'omp could not start on the fixture' : null;
+      try {
+        await page.getByLabel('Message').waitFor();
+        await page.getByRole('button', { name: 'Session actions' }).click();
+        if (from === 'entry') {
+          await page.getByRole('button', { name: /Session tree/ }).click();
+          await page.getByRole('button', { name: 'You: Start with the wire types', exact: true }).click();
+          await page.getByRole('button', { name: /Fork here/ }).click();
+        } else {
+          await page.getByRole('button', { name: /Fork session/ }).click();
+          await page.getByRole('button', { name: 'Fork', exact: true }).click();
+        }
+        await page.getByRole('button', { name: 'Starting the fork…', exact: true }).waitFor();
+        await page.getByRole('heading', { name: `${treeTitle} (fork)`, exact: true }).waitFor();
+        if (from === 'failed start') {
+          await page.getByText(/Start the fork failed: omp could not start on the fixture/).waitFor();
+          await page.getByRole('button', { name: 'Resume', exact: true }).waitFor();
+        } else {
+          await page.getByLabel('Message').waitFor();
+        }
+        const screen = await page.evaluate(() => history.state.stack.at(-1) as { session: string; liveKey: string | null });
+        const liveKey = from === 'failed start' ? null : `tmux:8:omp-deck:${forkId}`;
+        if (screen.session !== forkId || screen.liveKey !== liveKey) throw new Error(`opened the wrong fork: ${JSON.stringify(screen)}`);
+      } finally {
+        gw.forkResumeFailure = null;
+        gw.forks.delete(forkId);
+      }
+    });
+  }
 
   await scenario('send a prompt and see the reply', 'route=sessions', async (page) => {
     await openSession(page, 'Refactor tmux launcher');

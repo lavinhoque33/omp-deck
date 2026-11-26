@@ -5,7 +5,8 @@
 //! `tests/vectors/api-s4.json`, the HTML-form additions in `api_form` against
 //! `tests/vectors/api-form.json`, the model-picker preferences in `api_models` against
 //! `tests/vectors/api-models.json`, and live progress in `api_progress` against
-//! `tests/vectors/api-progress.json`; variant coverage spans all API vector files.
+//! `tests/vectors/api-progress.json`. Tree navigation is in `api_treenav` against
+//! `tests/vectors/api-treenav.json`; variant coverage spans all API vector files.
 //!
 //! Rewrite after an intentional protocol change:
 //! `OMPDECK_WRITE_VECTORS=1 cargo test -p deck-remote --test api`
@@ -20,6 +21,7 @@ mod api_form;
 mod api_models;
 mod api_progress;
 mod api_s4;
+mod api_treenav;
 use api_form as form;
 use api_models as models;
 use api_progress as progress;
@@ -2220,6 +2222,7 @@ variants!(Op, Some("op"), {
         filter: TreeFilter::All,
         cursor: None,
         limit: 1,
+        at_leaf: false,
     },
     Op::Browse { .. } => Op::Browse { dir: None },
     Op::UsageActivity { .. } => Op::UsageActivity { days: 1 },
@@ -2607,6 +2610,8 @@ variants!(Resp, Some("type"), {
         active_leaf: None,
         next_cursor: None,
         truncated: false,
+        prev_cursor: None,
+        total: None,
     },
     Resp::Dir { .. } => Resp::Dir {
         dir: None,
@@ -2664,6 +2669,13 @@ variants!(DoneView, Some("type"), {
         handle: 1,
         plan: s4::backup_plan(),
         truncated: false,
+    },
+    DoneView::Moved { .. } => DoneView::Moved {
+        leaf: None,
+        before_prompt: false,
+        editor_text: None,
+        dropped_images: 0,
+        message: None,
     },
 });
 
@@ -3024,8 +3036,7 @@ impl Seen {
     }
 }
 
-/// Per type, every variant (tag or string) appears in `api-v1.json`, `api-s4.json` or
-/// `api-form.json`.
+/// Per type, every variant (tag or string) appears in the API vector files.
 #[test]
 fn the_vectors_cover_every_variant() {
     let file: Value = serde_json::from_str(&std::fs::read_to_string(PATH).unwrap()).unwrap();
@@ -3038,6 +3049,8 @@ fn the_vectors_cover_every_variant() {
         serde_json::from_str(&std::fs::read_to_string(models::PATH).unwrap()).unwrap();
     let progress_file: Value =
         serde_json::from_str(&std::fs::read_to_string(progress::PATH).unwrap()).unwrap();
+    let treenav_file: Value =
+        serde_json::from_str(&std::fs::read_to_string(api_treenav::PATH).unwrap()).unwrap();
     let mut seen = Seen::default();
     for m in file["messages"]
         .as_array()
@@ -3048,6 +3061,7 @@ fn the_vectors_cover_every_variant() {
         .chain(android_file["messages"].as_array().unwrap())
         .chain(models_file["messages"].as_array().unwrap())
         .chain(progress_file["messages"].as_array().unwrap())
+        .chain(treenav_file["messages"].as_array().unwrap())
     {
         let text = m["json"].as_str().unwrap();
         match m["type"].as_str().unwrap() {

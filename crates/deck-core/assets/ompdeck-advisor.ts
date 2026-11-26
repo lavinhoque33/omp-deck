@@ -13,11 +13,13 @@ import { getAgentDir, slugify } from "@oh-my-pi/pi-utils";
 import { repo } from "@oh-my-pi/pi-natives/vcs";
 import { expandAtImports } from "@oh-my-pi/pi-coding-agent/discovery/at-imports";
 import { BUILTIN_TOOL_NAMES, normalizeToolNames } from "@oh-my-pi/pi-coding-agent/tools/builtin-names";
-import {
-  ADVISOR_REVIEW_MODES,
-  ADVISOR_SESSION_SCOPES,
-  ADVISOR_SYNC_BACKLOG_MODES,
-} from "@oh-my-pi/pi-tui/overlays/advisor-config";
+
+// omp's WATCHDOG.yml enums (values as of omp 19.2.1, `advisor/advisor-config-types.ts`). Older omp exported them from
+// `@oh-my-pi/pi-tui/overlays/advisor-config`; newer omp exports them to no extension-importable module, and a static
+// import of a missing module would fail this whole module (Settings → Advisor and live apply).
+const ADVISOR_REVIEW_MODES = ["turn", "agent-end"] as const;
+const ADVISOR_SYNC_BACKLOG_MODES = ["off", "1", "3", "5", "strict"] as const;
+const ADVISOR_SESSION_SCOPES = ["main", "subagent", "all"] as const;
 
 export type Scope = "project" | "user";
 export type Dirs = { projectDir: string; agentDir: string };

@@ -4166,9 +4166,11 @@ Facts: `docs/notes/tsp.md` "The ask form"; omp source `packages/tui/src/html-for
 ### Extension (`crates/deck-core/assets/ompdeck-ctl.ts`)
 - Wrap `formDialog` (options at arg 1) beside the six existing members with the same race/abort pattern. It is
   optional: absent (omp < 18.18) ⇒ not wrapped and `uiState.hook` is still decided by the six existing members only.
-- Parse with omp's own `parseHtmlForm` (`@oh-my-pi/pi-tui/html-form/parse`) and use `fieldQuestions`,
-  `defaultFormData`, `choiceValue`, `textValue`, `fieldError` (`@oh-my-pi/pi-tui/html-form/data`), imported
-  dynamically; an import/parse failure ⇒ no pending entry (the TUI dialog still works), logged.
+- Parse with omp's own `parseHtmlForm` (`…/html-form/parse`) and use `fieldQuestions`, `defaultFormData`,
+  `choiceValue`, `textValue`, `fieldError` (`…/html-form/data`), imported dynamically from
+  `@oh-my-pi/pi-coding-agent/tools/html-form/*` (newer omp, verified 19.2.1, where `@oh-my-pi/pi-tui` no longer exists
+  for extensions) else `@oh-my-pi/pi-tui/html-form/*` (older omp); both failing ⇒ no pending entry (the TUI dialog
+  still works), logged.
 - Pending entry: `{id, kind:"form", title:"Ask", timeoutMs?, form:{sections, fields}}` (camelCase, `str()` 16 KiB cut):
   - `sections[] = {title: Span[], blocks: Block[]}`; `Span = {text, style?: "code"|"strong"|"em"}`;
     `Block` tagged `kind`: `text {spans, heading}`, `list {items: Span[][], ordered}`, `pre {text}`,
@@ -5407,3 +5409,137 @@ recency, so a turn starting or ending re-sorts without a session rescan. Strip o
   so it must look busy).
 
 Not changed: the session manager's Running view and the phone's Processes screen (sortable / by RAM).
+
+## Phone tree jumps, branch-aware transcripts, forks that start (user, 2026-11-26)
+
+User report: "tree jumping from phone doesn't work properly", then "fix all 3 … forking a session from phone … doesn't
+automatically start the new forked session". Cause (verified on a real session: 6927 entries, 3816 on the active
+path, 30 jumps): `TranscriptReader` replayed the jsonl top to bottom and ignored `parentId`, and a plain jump is in
+omp's memory only, so the phone kept showing abandoned branches and appended new turns below them.
+
+### 1. Transcripts follow the active branch (`deck_core::agents::transcript`)
+- A transcript = the items of the entries on the root → leaf path, in path order. Lines without an `id` (header,
+  title) are never items. Entries off the path contribute nothing.
+- Leaf rules are omp's (`session-tree.md` §1), the same as `SessionTree::file_leaf`:
+  `A(e) = e.activeLeafId if present else e.id`; initial load → `A(last line)` (an `activeLeafId` naming an entry that
+  is not in the file → the last entry that selected itself; explicit `null` → no leaf); every line appended later →
+  `leaf = A(line)` (omp's `insert`), except that an appended `activeLeafId` naming an entry that is not in the index
+  leaves the leaf where it was (decided: an unreadable line must not blank a transcript).
+- A reader never stores items of off-path entries (RAM). It keeps a compact index per entry (id, parent, line span)
+  and reads lines by span when the path changes.
+- Path extended (old path is a prefix of the new one) → the new entries' items are appended. Anything else →
+  `TranscriptUpdate.reset = true` and the items replace everything.
+- Live leaf: `LeafAnchor { leaf: Option<String>, tail: Option<String> }` = "the running omp says the leaf is `leaf`
+  as of entry `tail` being the last one in its journal". `TranscriptReader::anchor(LeafAnchor)` /
+  `TranscriptWatcher::anchor(LeafAnchor)` (wakes the watcher thread at once). `TranscriptWatcher::spawn_anchored(path,
+  Option<LeafAnchor>, on_update)` starts with one, so the first published value is already on the right branch.
+  - `tail: Some(t)`: applied once `t` has been read: `leaf = fold(anchor.leaf, lines after t, A)`. Exact, so a
+    snapshot older than the file view never truncates the transcript.
+  - `tail: None`: "as of everything in the file now" (a navigate reply of an older extension; omp is idle): read to
+    EOF, then `leaf = anchor.leaf`. It is an event: applied every time it is given, never deduplicated (applying it
+    when the leaf is already there changes nothing). Known race, self-healing at the next appended entry: a prompt
+    written between the reply and the watcher's read is hidden until omp writes the next entry.
+  - Equal consecutive anchors with `tail: Some` are no-ops (a state).
+  - A leaf id that is not in the file is ignored (the anchor is dropped). A replaced / shrunken file drops anchors.
+  - A pending initial anchor does not delay the first publication (its tail is on disk whenever the jump is not
+    already durable through later entries).
+- A watcher stops promptly: indexing and path replay observe the stop flag (`drop` runs on the gateway engine
+  thread), and a cancelled refresh publishes nothing. The leaf fold is not cancellable (decided: it walks the
+  in-memory index only, no I/O).
+- `TranscriptWatcher::epoch() -> u64` bumps on every reset; consumers that keep a cursor compare it.
+  `latest_with_epoch() -> (u64, Arc<Vec<TranscriptItem>>)` reads both under one lock (a reset is never seen with
+  the old epoch); cursor keepers use it.
+- Subagent transcripts have no anchor: file rules only.
+
+### 2. ctl (`deck_core::ctl` + `ompdeck-ctl.ts`, additive)
+- Snapshot `tail`: id of the last entry of `sessionManager.getEntries()` (`null` when none) →
+  `LiveSnapshot.tail: Option<String>` (`None` from older extensions).
+- Navigate / ask re-answer replies carry `tail` (the journal's last entry when `leaf` was read) →
+  `CtlReply.tail: Option<String>` (`None` from older extensions): the gateway's anchor for them is exact.
+- The extension never lets a coalesced snapshot overtake a reply queued after it (a replaced snapshot moves to the
+  back of the outbound queue): wire order = the order of leaf facts.
+- `CtlCommand::Navigate { …, take_editor: bool }` (`#[serde(default)]`; wire `takeEditor: true` only when set). With
+  it, when the move landed before a prompt (leaf ≠ target), the reply's `value` is
+  `{ "editorText": <the prompt's text>, "editorImages": <images of that prompt, count> }` and omp's editor is left
+  empty (no hidden draft for the device's next send). Only the draft omp's own navigate restored is taken (recorded
+  from omp's `composer.setDraft` during the call): a draft the user already had, or typed meanwhile, is never
+  touched; the text then comes from the entry itself. A prompt longer than 64 KiB (`MAX_MOVED_TEXT`) stays in omp's
+  editor and no `value` is sent. Ownership is checked against the editor's text right after omp's `setDraft` (omp
+  normalises image markers). One navigate at a time per omp: a second one while one is in flight answers `busy`.
+  Without a composer (an omp whose UI controller cannot be captured) a text-only prompt is cleared when the editor
+  holds exactly the entry's text (decided: typing that very text during the redraw is not a case worth losing the
+  transfer for). `NavigateOutcome::of(&CtlReply)` reads it. Desktop callers pass `false`
+  (omp keeps the text in its editor, as before).
+- `CtlClient::take_updates() -> LiveUpdates { snapshot, snapshot_arrival, replies, replies_before_snapshot,
+  connection }`: the latest snapshot and the drained replies with their wire order kept
+  (`replies[..replies_before_snapshot]` arrived before the snapshot, the rest after it; one arrival counter across
+  both kinds). The drain and the snapshot read happen under the `replies` lock, so a reply is never reported by a
+  later call than a snapshot that followed it: processing older replies → snapshot → newer replies is always wire
+  order. `snapshot_arrival` (also the getter `CtlClient::snapshot_arrival()`) advances for every received snapshot,
+  content-equal ones included (those keep the `Arc` and do not wake). `connection` = the client's connection serial
+  (0 before the first hello). `latest()` / `take_replies()` stay.
+
+### 3. Device api (`deck_remote::api`, additive; feature `tree_nav`, vectors `api-treenav.json`)
+- `FEATURE_TREE_NAV = "tree_nav"` in `Welcome.features`; a device that understands the additions announces it.
+- `Op::Tree { …, at_leaf: bool }` (default false, omitted when false; sent only when the gateway lists `tree_nav`):
+  without a cursor, the page is the window of `limit` listed nodes ending `limit / 2` nodes after the active leaf
+  (clamped; no leaf → from the start).
+- `Resp::Tree { …, prev_cursor: Option<String>, total: Option<u64> }` (both omitted when `None`). Every page reports
+  `prev_cursor` (`b-<start>`, the page that ends just before this one; `None` at the start) and `next_cursor`
+  (`t-<end>`), and `total` = listed nodes under the filter. A `b-` cursor returns the `limit` nodes before it. A page
+  cut to fit `MAX_REPLY` keeps the nodes next to its anchor (forward: the first; `b-`: the last; `at_leaf`: a run
+  containing the leaf), with cursors computed from what was kept.
+- `DoneView::Moved { leaf, before_prompt, editor_text, dropped_images, message }` = `navigate`'s result, sent only
+  to devices that announced `tree_nav` (others keep `Unit`). `before_prompt`: the target was a prompt, the session
+  stands on its parent (`message` absent and reply leaf ≠ target, a null leaf included = before the first prompt).
+  `editor_text`: the prompt's text for the device's composer (`None`: omp kept it in its own
+  editor — session started before this extension version). `dropped_images`: images of that prompt that were not
+  carried over. `message`: omp's own status ("Already at this point": nothing moved).
+
+### 4. Gateway (`deck-service`)
+- `drive_live` processes `take_updates` in wire order. A successful `Navigate` / `ReanswerAsk` reply with `tail` →
+  `watcher.anchor({ leaf, tail })`, kept as the session's anchor state exactly like a snapshot's (later watchers
+  start from it and fold the entries appended since). A reply without `tail` (older extension) →
+  `watcher.anchor({ leaf, tail: None })` on that session file's watcher (every time), remembered with the session
+  file's length for a watcher created later. A new snapshot with `tail` → `watcher.anchor({ leaf, tail })` and it
+  supersedes the remembered reply. A snapshot without `tail` (older extension) is never an anchor; it drops the
+  remembered reply when its leaf differs. A new `connection` or another session file clears both; every cached
+  leaf fact carries the ctl connection serial it was learned on (`CtlClient::connection_serial()`) and is ignored
+  by any read made on another one.
+- A watcher is created with `spawn_anchored`: the newest `{ leaf, tail }` state (snapshot or reply); else the
+  remembered tail-less reply as `{ leaf, tail: None }` only while the file length is unchanged (nothing appended
+  since); else none (the entries appended after the jump define the leaf).
+- Device `tree` rows: `label` is cut like `text` (`TREE_TEXT_CHARS`); a non-empty tree whose next row cannot fit a
+  reply fails with "a tree entry is too large to send" instead of returning the request's own cursor.
+- Device `tree`: the leaf is the navigate reply's while no snapshot arrived after it (`snapshot_arrival`), else the
+  snapshot's, else the file's. Device transcript cursors restart on a watcher epoch change (not only on a last-item
+  hash mismatch).
+- Device `navigate`: `take_editor = device announced tree_nav`; result `Moved` for those devices.
+- Device `fork_at` / `copy_session`: the `File { session: Some(id) }` outcome is delivered only when a `resume` of
+  that id resolves (no race with the session rescan; the outcome waits ≤ 5 s for the scan, then goes out as
+  `File { session: None }`, never as a failure). `Done::Navigated` (gateway protocol, additive) carries the phone
+  result of a device navigate; it is produced only for device requests.
+
+### 5. Phone (`pwa/`)
+- Conversation: a transcript `reset` replaces the list (and jumps to the bottom).
+- Tree: opens on the page around "you are here" and scrolls to it; "Load earlier entries" above, "Load more entries"
+  below; the count shows `total`. A window that starts mid-file lays out nodes whose parent is not loaded at depth 0.
+- Go here → `Moved`: "Already at this point" keeps the tree open; otherwise the tree closes onto the session's
+  conversation with a notice ("Moved there — new prompts continue from this point" / "Moved before that prompt — its
+  text is in the composer" / "… its text is in omp's editor on the desktop" when `editor_text` is `None`), plus
+  "N image(s) of that prompt were not carried over" when `dropped_images > 0`. The prompt text goes into the phone's
+  composer; an existing phone draft is kept below it.
+- Fork (tree "Fork here" and conversation "Fork session"): after the fork, the phone sends `resume` for the new
+  session and opens its live conversation; if the start fails the stopped conversation opens with its Resume button
+  and the error is shown.
+- A request that finishes after the user left its screen (Go here, both forks) still reports its outcome and still
+  prefills the composer, but changes the route only while the originating screen is mounted and on top.
+- Composer drafts and the tree's prefill are keyed by the whole `LiveRef` (key + generation) within one gateway
+  epoch (`Welcome.epoch`) of one desktop: `/new` on the desktop never shows the previous session's draft; a new
+  epoch or a desktop switch drops them; the highest generation seen per key is remembered for the epoch, so a late
+  outcome for a superseded generation is rejected even after its row left the live feed.
+- Go here that completes after its controller was reused by another session opens the moved session by its session
+  id (stopped conversation) and says the prompt text was not applied.
+- Accepted limits: images of a re-edited prompt are not carried to the phone composer; sessions launched before this
+  version (older extension in memory) follow jumps made from OmpDeck (reply anchor) but not jumps made in omp's own
+  `/tree` until the next entry is written, and keep the prompt text in omp's editor.

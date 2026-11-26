@@ -2,6 +2,8 @@
 //! tree filters (the desktop tree view's rules), hidden entries lifted out so a listed node's
 //! `parent` is its nearest listed ancestor, file order, an opaque cursor.
 
+use std::ops::Range;
+
 use deck_core::tree::{NodeKind, SessionTree};
 use deck_core::usage::parse_iso_ms;
 use deck_remote::api::{self, TreeFilter};
@@ -13,8 +15,38 @@ pub(super) struct Page {
     pub nodes: Vec<api::TreeNode>,
     /// The listed node "you are here" stands on.
     pub active_leaf: Option<String>,
-    /// Where the listing continues (`None`: this was the last page).
-    pub next: Option<usize>,
+    pub start: usize,
+    pub total: usize,
+    pub window: Window,
+}
+
+/// Where a page stays anchored if the wire cap limits how many of its nodes fit.
+pub(super) enum Window {
+    Forward,
+    Backward,
+    /// The leaf's position relative to this page's original start.
+    Centered(usize),
+}
+
+impl Window {
+    pub(super) fn clip(&self, total: usize, keep: usize) -> Range<usize> {
+        let start = match *self {
+            Self::Forward => 0,
+            Self::Backward => total - keep,
+            Self::Centered(leaf) => centered_start(leaf, total, keep),
+        };
+        start..start + keep
+    }
+}
+
+fn centered_start(leaf: usize, total: usize, limit: usize) -> usize {
+    if limit == 0 {
+        return leaf;
+    }
+    (leaf + 1)
+        .saturating_add(limit / 2)
+        .min(total)
+        .saturating_sub(limit)
 }
 
 /// Omp's `default` filter hides bookkeeping entries and assistant turns without text that
@@ -75,32 +107,50 @@ fn kind(k: &NodeKind) -> (api::TreeNodeKind, Option<String>) {
     }
 }
 
-/// The page cursor of `offset`.
-pub(super) fn cursor(offset: usize) -> String {
-    format!("t-{offset}")
+/// A page boundary: `t-` starts at the offset, `b-` ends there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Boundary {
+    Start(usize),
+    End(usize),
 }
 
-/// The offset of a cursor this gateway handed out.
-pub(super) fn offset(cursor: &str) -> Option<usize> {
-    let digits = cursor.strip_prefix("t-")?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+impl Boundary {
+    pub(super) fn parse(cursor: &str) -> Option<Self> {
+        let (direction, digits) = cursor.split_once('-')?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let offset = digits.parse().ok()?;
+        match direction {
+            "t" => Some(Self::Start(offset)),
+            "b" => Some(Self::End(offset)),
+            _ => None,
+        }
     }
-    digits.parse().ok()
+
+    pub(super) fn cursor(self) -> String {
+        match self {
+            Self::Start(offset) => format!("t-{offset}"),
+            Self::End(offset) => format!("b-{offset}"),
+        }
+    }
 }
 
-/// The nodes `filter` lists, from `start`, at most `limit`. `live_leaf`: the live session's
-/// current entry (else the file's last one).
+/// File-order nodes under `filter`. An explicit live empty leaf is distinct from a
+/// closed session, which uses the file's leaf.
 pub(super) fn page(
     tree: &SessionTree,
     filter: TreeFilter,
-    live_leaf: Option<&str>,
-    start: usize,
+    live_leaf: Option<Option<&str>>,
+    boundary: Option<Boundary>,
+    at_leaf: bool,
     limit: usize,
 ) -> Page {
-    let leaf = live_leaf
-        .and_then(|id| tree.index.get(id).copied())
-        .or(tree.file_leaf);
+    let leaf = match live_leaf {
+        Some(Some(id)) => tree.index.get(id).copied().or(tree.file_leaf),
+        Some(None) => None,
+        None => tree.file_leaf,
+    };
     let shown: Vec<bool> = (0..tree.nodes.len())
         .map(|i| visible(tree, i, filter, leaf))
         .collect();
@@ -114,18 +164,43 @@ pub(super) fn page(
         }
         None
     };
-    let active_leaf = leaf
-        .and_then(|l| {
-            if shown[l] {
-                Some(l)
-            } else {
-                listed_ancestor(l)
-            }
-        })
-        .map(|i| tree.nodes[i].id.clone());
+    let active = leaf.and_then(|l| {
+        if shown[l] {
+            Some(l)
+        } else {
+            listed_ancestor(l)
+        }
+    });
+    let active_leaf = active.map(|i| tree.nodes[i].id.clone());
     let listed: Vec<usize> = (0..tree.nodes.len()).filter(|&i| shown[i]).collect();
-    let start = start.min(listed.len());
-    let end = start.saturating_add(limit).min(listed.len());
+    let total = listed.len();
+    let (start, end, window) = match boundary {
+        Some(Boundary::End(end)) => {
+            let end = end.min(total);
+            (end.saturating_sub(limit), end, Window::Backward)
+        }
+        Some(Boundary::Start(start)) => {
+            let start = start.min(total);
+            (
+                start,
+                start.saturating_add(limit).min(total),
+                Window::Forward,
+            )
+        }
+        None => {
+            let position = active
+                .filter(|_| at_leaf)
+                .and_then(|i| listed.binary_search(&i).ok());
+            let (start, window) = match position {
+                Some(leaf) => {
+                    let start = centered_start(leaf, total, limit);
+                    (start, Window::Centered(leaf - start))
+                }
+                None => (0, Window::Forward),
+            };
+            (start, start.saturating_add(limit).min(total), window)
+        }
+    };
     let nodes = listed[start..end]
         .iter()
         .map(|&i| {
@@ -144,7 +219,10 @@ pub(super) fn page(
                 text: cut_chars(&n.text, api::TREE_TEXT_CHARS),
                 has_text: n.has_text,
                 stop_reason: n.stop_reason.clone(),
-                label: tree.labels.get(&n.id).cloned(),
+                label: tree
+                    .labels
+                    .get(&n.id)
+                    .map(|label| cut_chars(label, api::TREE_TEXT_CHARS)),
                 forkable: tree.is_forkable(i),
                 cost_before: Some(n.cost_before.total).filter(|c| c.is_finite() && *c > 0.0),
                 cost_incomplete: n.cost_before.incomplete,
@@ -154,7 +232,9 @@ pub(super) fn page(
     Page {
         nodes,
         active_leaf,
-        next: (end < listed.len()).then_some(end),
+        start,
+        total,
+        window,
     }
 }
 
@@ -186,23 +266,47 @@ mod tests {
     }
 
     #[test]
+    fn tree_labels_have_the_same_unicode_character_limit_as_node_text() {
+        let mut t = sample();
+        let at_limit = "🧪".repeat(api::TREE_TEXT_CHARS);
+        t.labels.insert("u1".to_owned(), format!("{at_limit}é"));
+        let p = page(&t, TreeFilter::Conversation, None, None, false, 2);
+        assert_eq!(p.nodes[0].label.as_deref(), Some(at_limit.as_str()));
+        assert_eq!(p.nodes[1].label, None);
+    }
+
+    #[test]
     fn hidden_entries_are_lifted_and_pages_continue() {
         let t = sample();
-        let all = page(&t, TreeFilter::All, None, 0, 100);
+        let all = page(&t, TreeFilter::All, None, None, false, 100);
         assert!(all.nodes.iter().any(|n| n.id == "m1"));
-        let conv = page(&t, TreeFilter::Conversation, None, 0, 100);
+        let conv = page(&t, TreeFilter::Conversation, None, None, false, 100);
         let ids: Vec<&str> = conv.nodes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(ids, ["u1", "a1", "u2"]);
         // `a1`'s parent `m1` is hidden: it hangs below `u1`.
         assert_eq!(conv.nodes[1].parent.as_deref(), Some("u1"));
         assert_eq!(conv.active_leaf.as_deref(), Some("u2"));
-        assert!(conv.next.is_none());
-        let first = page(&t, TreeFilter::Conversation, Some("a1"), 0, 2);
-        assert_eq!(first.next, Some(2));
+        assert_eq!(conv.total, 3);
+        let first = page(
+            &t,
+            TreeFilter::Conversation,
+            Some(Some("a1")),
+            None,
+            false,
+            2,
+        );
+        assert_eq!((first.start, first.nodes.len(), first.total), (0, 2, 3));
         assert_eq!(first.active_leaf.as_deref(), Some("a1"));
-        let rest = page(&t, TreeFilter::Conversation, None, 2, 2);
-        assert_eq!(rest.nodes.len(), 1);
-        assert!(rest.next.is_none());
+        let rest = page(
+            &t,
+            TreeFilter::Conversation,
+            None,
+            Some(Boundary::Start(2)),
+            true,
+            2,
+        );
+        assert_eq!(rest.start, 2);
+        assert_eq!(rest.nodes[0].id, "u2");
         // The user prompt after a reply forks before itself; the first one cannot.
         assert!(!conv.nodes[0].forkable);
         assert!(conv.nodes[2].forkable);
@@ -210,9 +314,57 @@ mod tests {
 
     #[test]
     fn cursors_are_opaque_offsets() {
-        assert_eq!(offset(&cursor(42)), Some(42));
-        for bad in ["42", "t-", "t-+1", "t-x", "/home"] {
-            assert_eq!(offset(bad), None, "{bad}");
+        for cursor in [Boundary::Start(42), Boundary::End(42)] {
+            assert_eq!(Boundary::parse(&cursor.cursor()), Some(cursor));
         }
+        for bad in ["42", "t-", "t-+1", "t-x", "b-", "b--1", "f-1", "/home"] {
+            assert_eq!(Boundary::parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn centered_and_backward_pages_use_listed_positions() {
+        let t = sample();
+        let p = page(&t, TreeFilter::All, Some(Some("a1")), None, true, 3);
+        assert_eq!((p.start, p.total), (1, 4));
+        assert_eq!(p.active_leaf.as_deref(), Some("a1"));
+        assert_eq!(
+            p.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            ["m1", "a1", "u2"]
+        );
+        let previous = page(
+            &t,
+            TreeFilter::All,
+            None,
+            Some(Boundary::End(p.start)),
+            true,
+            3,
+        );
+        assert_eq!((previous.start, previous.total), (0, 4));
+        assert_eq!(previous.nodes.len(), 1);
+        assert_eq!(previous.nodes[0].id, "u1");
+
+        let at_start = page(
+            &t,
+            TreeFilter::Conversation,
+            Some(Some("m1")),
+            None,
+            true,
+            2,
+        );
+        assert_eq!(at_start.start, 0);
+        assert_eq!(at_start.active_leaf.as_deref(), Some("u1"));
+        let no_leaf = page(&t, TreeFilter::All, Some(None), None, true, 2);
+        assert_eq!(no_leaf.start, 0);
+        assert_eq!(no_leaf.active_leaf, None);
+        let clamped = page(
+            &t,
+            TreeFilter::All,
+            None,
+            Some(Boundary::End(usize::MAX)),
+            false,
+            2,
+        );
+        assert_eq!((clamped.start, clamped.nodes.len()), (2, 2));
     }
 }

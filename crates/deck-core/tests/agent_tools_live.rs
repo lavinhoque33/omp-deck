@@ -1677,11 +1677,13 @@ fn cross_session_tools_are_gated_and_forward_refs_and_options() {
         assert_eq!(request.args, args);
         assert_eq!(request.root, Some(live.session_file()));
         let model = live.model.find(before, fm::has_tools).unwrap();
-        let tools: Vec<_> = fm::tool_names(&model)
+        let mut tools: Vec<_> = fm::tool_names(&model)
             .into_iter()
             .filter(|name| name.starts_with("ompdeck_"))
             .collect();
-        assert_eq!(tools, ["ompdeck_watch_session", "ompdeck_message_session"]);
+        // omp decides the order tools reach the model (19.2.1 changed it from registration order).
+        tools.sort();
+        assert_eq!(tools, ["ompdeck_message_session", "ompdeck_watch_session"]);
         let text = if name == "watch_session" {
             "Peer (01234567): completed; final reply."
         } else {

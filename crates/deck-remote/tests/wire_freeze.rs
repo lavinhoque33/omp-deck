@@ -31,6 +31,10 @@ const PINNED: &[(&str, &str)] = &[
         "c2f61bf6eb1c7113b250fd891f81ff86f992e54df551c097d8ebeae47ebe1047",
     ),
     (
+        "api-treenav.json",
+        "580ec7b03331355f8a16c690239ec5fd2213aea3099fe67dfc03f916f26af188",
+    ),
+    (
         "api-v1.json",
         "461095267dd7e0ae605be1cc57c1b91bfd2d8e1cf7af9615b59578773e5c0197",
     ),

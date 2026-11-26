@@ -124,6 +124,7 @@ fn parses_hello_and_snapshot_including_parked() {
     );
     assert_eq!(snap.main_idle, Some(true));
     assert_eq!(snap.leaf.as_deref(), Some("e7"));
+    assert_eq!(snap.tail, None, "older snapshots have no journal tail");
     // the malformed "2-C" entry is skipped, the rest survive
     let ids: Vec<_> = snap.agents.iter().map(|a| a.id.as_str()).collect();
     assert_eq!(ids, ["0-A", "1-B", "3-D"]);
@@ -468,6 +469,7 @@ fn fork_at_and_navigate_round_trip() {
         root: "/s/main.jsonl".into(),
         entry_id: "u2".into(),
         summary: deck_core::ctl::BranchSummary::Custom("focus on tests".into()),
+        take_editor: false,
     });
     let mut rd = BufReader::new(s.try_clone().unwrap());
     let mut got = Vec::new();
@@ -560,11 +562,13 @@ fn navigate_summary_and_new_commands_encode_and_replies_carry_value_and_message(
             root: root(),
             entry_id: "a".into(),
             summary: BranchSummary::None,
+            take_editor: false,
         }),
         client.send(CtlCommand::Navigate {
             root: root(),
             entry_id: "b".into(),
             summary: BranchSummary::Summarize,
+            take_editor: false,
         }),
         client.send(CtlCommand::SetLabel {
             root: root(),

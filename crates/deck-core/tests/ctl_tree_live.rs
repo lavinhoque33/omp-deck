@@ -8,7 +8,7 @@ mod support;
 
 use std::time::Duration;
 
-use deck_core::ctl::{BranchSummary, CtlCommand};
+use deck_core::ctl::{BranchSummary, CtlCommand, NavigateOutcome};
 use deck_core::omp::{AdvisorScope, SessError};
 use deck_tsp::wire::Event;
 use serde_json::{Value, json};
@@ -71,6 +71,7 @@ fn nav(live: &Live, id: &str, summary: BranchSummary) -> deck_core::ctl::CtlRepl
             root: live.session_file(),
             entry_id: id.to_owned(),
             summary,
+            take_editor: false,
         },
         TURN,
     )
@@ -98,6 +99,16 @@ fn navigate_summarises_the_branch_left_and_redraws_the_tab() {
     let plain = nav(&live, &assistants[0], BranchSummary::None);
     assert!(plain.ok, "{plain:?}");
     assert_eq!(plain.leaf.as_deref(), Some(assistants[0].as_str()));
+    assert!(
+        plain.tail.as_ref().is_some_and(|tail| {
+            tail != &assistants[0]
+                && live
+                    .entries()
+                    .iter()
+                    .any(|entry| entry["id"] == tail.as_str())
+        }),
+        "{plain:?}",
+    );
     wait_for("the tab to drop the second answer", TURN, || {
         (!live.peek().to_string().contains("Reply to two")).then_some(())
     });
@@ -107,6 +118,7 @@ fn navigate_summarises_the_branch_left_and_redraws_the_tab() {
     let same = nav(&live, &assistants[0], BranchSummary::None);
     assert!(same.ok);
     assert_eq!(same.message.as_deref(), Some("Already at this point"));
+    assert_eq!(same.tail, plain.tail);
 
     // With a summary: the branch left (u1 a1 → back at a1's sibling work) is summarised by the
     // model into a `branch_summary` entry on the new leaf's path.
@@ -136,6 +148,7 @@ fn navigate_summarises_the_branch_left_and_redraws_the_tab() {
         summaries[0]["id"].as_str(),
         "the summary is the new leaf"
     );
+    assert_eq!(reply.tail, reply.leaf, "the summary was just appended");
     let request = live
         .model
         .find(before, |r| {
@@ -159,6 +172,284 @@ fn navigate_summarises_the_branch_left_and_redraws_the_tab() {
     assert_eq!(
         (refused.ok, refused.error.as_deref()),
         (false, Some("busy"))
+    );
+}
+
+#[cfg(unix)]
+fn overlapping_navigations(live: &Live, id: &str) -> deck_core::ctl::CtlReply {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let dir = deck_core::ctl::ctl_dir(&live.ns, support::SESSION);
+    let mut socket = UnixStream::connect(dir.join("ctl.sock")).unwrap();
+    socket.set_read_timeout(Some(TURN)).unwrap();
+    let navigation = |rid| {
+        json!({
+            "t": "navigate", "rid": rid, "root": live.session_file(), "entryId": id, "takeEditor": true,
+        })
+    };
+    // Write both requests in one small socket write: the extension dispatches both before
+    // the first navigation can resume from its await.
+    let batch = format!("{}\n{}\n", navigation(1), navigation(2));
+    socket.write_all(batch.as_bytes()).unwrap();
+    let mut replies = [None, None];
+    for line in BufReader::new(socket).lines() {
+        let reply: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if reply["t"] == "reply" {
+            let rid = reply["rid"].as_u64().unwrap() as usize;
+            replies[rid - 1] =
+                Some(serde_json::from_value::<deck_core::ctl::CtlReply>(reply).unwrap());
+            if replies.iter().all(Option::is_some) {
+                break;
+            }
+        }
+    }
+    let [first, second] = replies;
+    let second = second.unwrap();
+    assert_eq!((second.ok, second.error.as_deref()), (false, Some("busy")));
+    first.unwrap()
+}
+
+fn composer_pty_input(live: &Live, bytes: &[u8]) {
+    let namespace = deck_host::Namespace::new(&live.ns).unwrap();
+    let attached = deck_host::attach(
+        &namespace,
+        support::SESSION,
+        deck_host::AttachParams {
+            cols: 100,
+            rows: 30,
+            cell_width: 8,
+            cell_height: 16,
+            history_lines: 0,
+            palette: deck_host::Palette::default(),
+        },
+    )
+    .unwrap();
+    let (mut rx, tx) = attached.split();
+    tx.input(bytes).unwrap();
+    tx.detach().unwrap();
+    while let Ok(event) = rx.recv() {
+        if matches!(
+            event,
+            deck_host::HostEvent::Closed | deck_host::HostEvent::Exited(_)
+        ) {
+            break;
+        }
+    }
+}
+
+const PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jL9sAAAAASUVORK5CYII=";
+
+#[test]
+fn navigate_takes_a_prompt_and_its_images_without_clobbering_existing_text() {
+    let Some(exe) = std::env::var_os("OMPDECK_TEST_OMP") else {
+        eprintln!("skipping: OMPDECK_TEST_OMP is not set");
+        return;
+    };
+    let version = std::process::Command::new(exe)
+        .arg("--version")
+        .output()
+        .unwrap();
+    if !String::from_utf8_lossy(&version.stdout).starts_with("omp/19.") {
+        eprintln!("skipping: the composer clear-draft path uses omp 19");
+        return;
+    }
+    let live = Live::start(
+        "nav-take-editor",
+        script,
+        |_| {},
+        |live| {
+            let file = live.proj.join("fixture.jsonl");
+            let header = json!({
+                "type": "session", "version": 3,
+                "id": "01a2a687-1000-7000-8000-e034503e0001",
+                "timestamp": "2026-11-26T10:00:00Z", "cwd": live.proj,
+            });
+            let before = json!({
+                "type": "custom", "id": "before", "parentId": null,
+                "timestamp": "2026-11-26T10:00:01Z", "customType": "seed", "data": {},
+            });
+            let oversized_prompt = json!({
+                "type": "message", "id": "oversized", "parentId": "before",
+                "timestamp": "2026-11-26T10:00:02Z",
+                "message": {"role": "user", "timestamp": 1795687202000_u64,
+                    "content": "é".repeat(32 * 1024 + 1)},
+            });
+            let prompt = json!({
+                "type": "message", "id": "prompt", "parentId": "before",
+                "timestamp": "2026-11-26T10:00:02Z",
+                "message": {"role": "user", "timestamp": 1795687202000_u64, "content": [
+                    {"type": "text", "text": "prior prompt"},
+                    {"type": "image", "mimeType": "image/png", "data": PNG},
+                ]},
+            });
+            std::fs::write(
+                &file,
+                format!("{header}\n{before}\n{oversized_prompt}\n{prompt}\n"),
+            )
+            .unwrap();
+            Some(file)
+        },
+    )
+    .unwrap();
+    wait_for("snapshot advertising the persisted prompt", TURN, || {
+        live.client()
+            .latest()
+            .filter(|s| s.tail.as_deref() == Some("prompt"))
+    });
+    let navigate = |entry_id: &str| {
+        live.ctl(
+            CtlCommand::Navigate {
+                root: live.session_file(),
+                entry_id: entry_id.into(),
+                summary: BranchSummary::None,
+                take_editor: true,
+            },
+            TURN,
+        )
+    };
+    let check_outcome = |reply: deck_core::ctl::CtlReply| {
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(reply.leaf.as_deref(), Some("before"));
+        assert_eq!(
+            NavigateOutcome::of(&reply),
+            NavigateOutcome {
+                editor_text: Some("prior prompt".into()),
+                editor_images: 1
+            },
+        );
+    };
+    #[cfg(unix)]
+    check_outcome(overlapping_navigations(&live, "prompt"));
+
+    let restored = navigate("prompt");
+    assert_eq!(restored.tail.as_deref(), Some("prompt"));
+    check_outcome(restored);
+    assert_eq!(
+        live.ctl(CtlCommand::EditorState, TURN).editor_empty(),
+        Some(true)
+    );
+    turn(&live, "fresh prompt");
+    let entries = live.entries();
+    let new_message = entries
+        .iter()
+        .rfind(|e| e["message"]["role"] == "user")
+        .unwrap();
+    assert_ne!(new_message["id"], "prompt");
+    assert!(
+        new_message["message"]["content"]
+            .as_array()
+            .is_none_or(|parts| parts.iter().all(|p| p["type"] != "image"))
+    );
+
+    let (sf, id) = wait_for("ready composer", TURN, || live.composer());
+    let draft = "keep this draft";
+    live.events(&[Event::Edit {
+        sf,
+        id,
+        from: 0,
+        to: 0,
+        text: draft.into(),
+        cursor: draft.len() as u32,
+        len: 0,
+    }]);
+    assert_eq!(
+        live.ctl(CtlCommand::EditorState, TURN).editor_empty(),
+        Some(false)
+    );
+    check_outcome(navigate("prompt"));
+    wait_for("untouched draft", TURN, || {
+        live.peek().to_string().contains(draft).then_some(())
+    });
+
+    let (sf, id) = wait_for("ready composer", TURN, || live.composer());
+    live.events(&[Event::Edit {
+        sf,
+        id,
+        from: 0,
+        to: draft.len() as u32,
+        text: String::new(),
+        cursor: 0,
+        len: draft.len() as u32,
+    }]);
+    assert_eq!(
+        live.ctl(CtlCommand::EditorState, TURN).editor_empty(),
+        Some(true)
+    );
+
+    // Paste an actual image path into omp and submit via Enter. TSP Send would replace
+    // the draft and lose the attachment rather than expanding the native composer chip.
+    let image = live.proj.join("pixel.png");
+    use base64::Engine as _;
+    std::fs::write(
+        &image,
+        base64::engine::general_purpose::STANDARD
+            .decode(PNG)
+            .unwrap(),
+    )
+    .unwrap();
+    composer_pty_input(
+        &live,
+        format!("\x1b[200~{}\x1b[201~", image.display()).as_bytes(),
+    );
+    wait_for("omp's pasted image chip", Duration::from_secs(12), || {
+        live.peek().to_string().contains("#1").then_some(())
+    });
+    let native_prompt = "attached prompt (literal [Image #9])";
+    composer_pty_input(
+        &live,
+        format!("\x1b[200~{native_prompt}\x1b[201~\r").as_bytes(),
+    );
+    let native_id = wait_for(
+        "the submitted image prompt and completed turn",
+        TURN,
+        || {
+            let entries = live.entries();
+            let snapshot = live.client().latest()?;
+            if snapshot.main_idle != Some(true)
+                || snapshot.leaf.as_deref() != entries.iter().rev().find_map(|e| e["id"].as_str())
+            {
+                return None;
+            }
+            let user = entries.iter().rfind(|e| e["message"]["role"] == "user")?;
+            let content = user["message"]["content"].as_array()?;
+            let text = content.iter().find_map(|p| p["text"].as_str())?;
+            if !text.contains(native_prompt) {
+                return None;
+            }
+            assert!(
+                text.starts_with("[Image #1"),
+                "expected the native marker in {text:?}"
+            );
+            assert_eq!(content.iter().filter(|p| p["type"] == "image").count(), 1);
+            user["id"].as_str().map(str::to_owned)
+        },
+    );
+    let native = navigate(&native_id);
+    assert!(native.ok, "{native:?}");
+    assert_eq!(
+        NavigateOutcome::of(&native),
+        NavigateOutcome {
+            editor_text: Some(native_prompt.into()),
+            editor_images: 1,
+        },
+    );
+    assert_eq!(
+        live.ctl(CtlCommand::EditorState, TURN).editor_empty(),
+        Some(true)
+    );
+
+    let oversized = navigate("oversized");
+    assert!(oversized.ok, "{oversized:?}");
+    assert!(
+        oversized.value.is_none(),
+        "an oversized prompt must not be truncated for the phone"
+    );
+    assert_eq!(
+        live.ctl(CtlCommand::EditorState, TURN).editor_empty(),
+        Some(false),
+        "leave the whole prompt in omp's editor",
     );
 }
 
@@ -583,6 +874,11 @@ fn reanswering_an_ask_opens_omps_dialog_and_resumes_the_turn() {
     assert!(done.ok, "{done:?}");
     let all = ask_results(&live.entries());
     assert_eq!(all.len(), 2, "the old answer stays as a sibling branch");
+    assert_eq!(done.leaf.as_deref(), all[1]["id"].as_str());
+    assert_eq!(
+        done.tail, done.leaf,
+        "report the journal before resuming the turn"
+    );
     assert_eq!(all[0]["parentId"], all[1]["parentId"]);
     assert_eq!(
         all[0]["message"]["toolCallId"],

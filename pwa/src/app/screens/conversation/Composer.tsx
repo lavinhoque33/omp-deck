@@ -5,10 +5,10 @@
 
 import { type ReactNode, useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import type { api } from '../../../remote/index.ts';
-import { ClientError } from '../../client.ts';
+import { ClientError, composerDraftKey } from '../../client.ts';
 import { upload } from '../../transfer.ts';
 import { UNOBSERVED_TEXT, describeDelivery, perform, succeeded } from '../../ui/format.ts';
-import { useCan, useClient } from '../../ui/hooks.ts';
+import { useCan, useClient, useClientState } from '../../ui/hooks.ts';
 import { useS4 } from '../../ui/kit.tsx';
 import {
   type Attachment,
@@ -52,9 +52,11 @@ export function Composer({
   const phase: SessionPhase = phaseOf(live);
   const [mode, setMode] = useState<api.ComposeMode>(phase === 'busy' ? 'steer' : 'send');
   const lastPhase = useRef(phase);
-  const [text, setText] = useState('');
-  // Bumped on every edit, so a send can tell whether the draft changed while it was in flight.
-  const textRevision = useRef(0);
+  const draftKey = composerDraftKey(live.live);
+  const epoch = useClientState((state) => state.welcome?.epoch ?? null);
+  // Identity, not text equality, fences a send from clearing a draft edited while it was in flight.
+  const draft = useClientState((state) => state.composerDrafts.get(draftKey));
+  const text = draft?.text ?? '';
   const [sending, setSending] = useState(false);
   const [outcome, setOutcome] = useState<{ text: string; tone: 'ok' | 'warn' } | null>(null);
   const [attachments, dispatch] = useReducer(attachmentsReducer, []);
@@ -144,7 +146,6 @@ export function Composer({
   const send = async () => {
     if (!canSend) return;
     const sentText = text.trim();
-    const submittedRevision = textRevision.current;
     const submittedUploads = uploadIds(attachments);
     const label = s4 ? `${MODE_LABEL[effective]}${sentText.length > 0 ? ` “${sentText.slice(0, 40)}${sentText.length > 40 ? '…' : ''}”` : ''}` : 'Prompt';
     setSending(true);
@@ -164,7 +165,7 @@ export function Composer({
     const result = view?.outcome?.state === 'done' ? view.outcome.result : null;
     const delivery = result?.type === 'submitted' ? result.delivery : null;
     // Only what was submitted goes: text typed and files attached during the send survive.
-    if (textRevision.current === submittedRevision) setText('');
+    if (client.getState().composerDrafts.get(draftKey) === draft) client.setComposerDraft(live.live, '', epoch);
     dispatch({ type: 'remove_sent', uploads: submittedUploads });
     setOutcome(
       delivery?.state === 'awaiting_confirm'
@@ -230,8 +231,7 @@ export function Composer({
         placeholder={effective === 'steer' ? 'Steer omp…' : effective === 'follow_up' ? 'Follow up after this turn…' : 'Message omp…'}
         value={text}
         onChange={(event) => {
-          textRevision.current += 1;
-          setText(event.target.value);
+          client.setComposerDraft(live.live, event.target.value, epoch);
           if (outcome !== null) setOutcome(null);
         }}
         aria-label="Message"

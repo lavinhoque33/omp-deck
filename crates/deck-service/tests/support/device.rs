@@ -46,11 +46,18 @@ impl Sandbox {
     /// `tag` names the namespace (`omp-deck-test-<tag>-<pid>`); `omp_config` is omp's
     /// `config.yml` (see [`OMP_CONFIG`]).
     pub fn new(tag: &str, omp_config: &str) -> Sandbox {
-        // Short: the ctl socket path (`$XDG_RUNTIME_DIR/omp-deck/ctl/<ns>/<leaf>/ctl.sock`, both
-        // under this root) must stay well inside `sun_path`, or omp runs without live control.
+        // Linux uses a 107-byte Unix socket path limit; a UUID-named host socket already
+        // contains the namespace and a long name. Do not put the namespace in the root as well.
         let ns = format!("omp-deck-test-{tag}-{}", std::process::id());
-        let root = std::env::temp_dir().join(&ns);
-        let _ = std::fs::remove_dir_all(&root);
+        let mut temp = tempfile::Builder::new();
+        temp.prefix("od").rand_bytes(5);
+        let root = if cfg!(unix) {
+            temp.tempdir_in("/tmp")
+        } else {
+            temp.tempdir()
+        }
+        .expect("sandbox root")
+        .keep();
         for d in [
             "home",
             "home/AppData/Roaming",

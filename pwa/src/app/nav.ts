@@ -1,7 +1,7 @@
 // In-app navigation: a bottom-nav tab plus a stack of pushed screens. The browser back button
 // pops the stack (each push adds a history entry).
 
-import { createContext, useContext } from 'react';
+import { createContext, useContext, useLayoutEffect, useRef } from 'react';
 import { isDesktopId } from '../push.ts';
 
 export type Tab = 'sessions' | 'agents' | 'inbox' | 'settings';
@@ -43,6 +43,8 @@ export type Screen =
 export interface Nav {
   tab: Tab;
   stack: readonly Screen[];
+  /** Reads the current top even from a callback that outlived its render. */
+  currentTop(): Screen | undefined;
   setTab(tab: Tab): void;
   push(screen: Screen): void;
   /** Replaces the top screen (or pushes when none). */
@@ -56,6 +58,21 @@ export function useNav(): Nav {
   const nav = useContext(NavContext);
   if (nav === null) throw new Error('useNav outside NavContext');
   return nav;
+}
+
+/** Async completions may navigate only for their still-mounted, exact route object. */
+export function ownsTopScreen(mounted: boolean, origin: Screen | undefined, top: Screen | undefined): boolean {
+  return mounted && origin !== undefined && origin === top;
+}
+
+export function useScreenNavigationGuard(nav: Nav): () => boolean {
+  const mounted = useRef(false);
+  const origin = nav.stack.at(-1);
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  return () => ownsTopScreen(mounted.current, origin, nav.currentTop());
 }
 
 /** Reads a deep link (`#s=<session id>`, e.g. from a notification) from a URL hash. */

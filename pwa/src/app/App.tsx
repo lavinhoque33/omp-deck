@@ -174,6 +174,15 @@ function Shell({ initialRoute, theme, onTheme, standalone, onShellLink, onShellB
   const [start] = useState(() => startRoute(initialRoute, history.state, desktop));
   const [tab, setTabState] = useState<Tab>(start.tab);
   const [stack, setStack] = useState<readonly Screen[]>(() => start.stack);
+  const current = useRef<{ tab: Tab; stack: readonly Screen[] }>(start);
+  const backPending = useRef(false);
+  const applyRoute = useCallback((tab: Tab, stack: readonly Screen[]) => {
+    current.current = { tab, stack };
+    backPending.current = false;
+    setTabState(tab);
+    setStack(stack);
+  }, []);
+  const currentTop = useCallback(() => backPending.current ? undefined : current.current.stack.at(-1), []);
   const [switcher, setSwitcher] = useState(false);
   const openSwitcher = useCallback(() => setSwitcher(true), []);
   // Always followed: running indicators, pending confirmations, and the inbox badge.
@@ -192,55 +201,47 @@ function Shell({ initialRoute, theme, onTheme, standalone, onShellLink, onShellB
   useEffect(() => {
     const onPop = (event: PopStateEvent) => {
       const route = routeFromHistory(event.state, desktop);
-      if (route === null) {
-        setStack([]);
-        return;
-      }
-      setTabState(route.tab);
-      setStack(route.stack);
+      if (route === null) applyRoute(current.current.tab, []);
+      else applyRoute(route.tab, route.stack);
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
-  }, [desktop]);
-  const depth = useRef(stack.length);
-  depth.current = stack.length;
-  const current = useRef({ tab, stack });
-  current.current = { tab, stack };
+  }, [applyRoute, desktop]);
 
   const push = useCallback((screen: Screen) => {
     const next = [...current.current.stack, screen];
     history.pushState(historyEntry(current.current.tab, next, false, desktop), '');
-    setStack(next);
-  }, [desktop]);
+    applyRoute(current.current.tab, next);
+  }, [applyRoute, desktop]);
   const replace = useCallback(
     (screen: Screen) => {
       const { tab: at, stack: from } = current.current;
       const next = from.length === 0 ? [screen] : [...from.slice(0, -1), screen];
       syncEntry(at, next);
-      setStack(next);
+      applyRoute(at, next);
     },
-    [syncEntry],
+    [applyRoute, syncEntry],
   );
   const pop = useCallback(() => {
-    if (depth.current === 0) return;
+    if (current.current.stack.length === 0 || backPending.current) return;
     if (!isBaseEntry(history.state, desktop)) {
+      backPending.current = true;
       history.back();
       return;
     }
     // The starting entry has nothing behind it in the app: pop locally and keep the entry current.
     const next = current.current.stack.slice(0, -1);
     syncEntry(current.current.tab, next);
-    setStack(next);
-  }, [syncEntry]);
+    applyRoute(current.current.tab, next);
+  }, [applyRoute, desktop, syncEntry]);
   const setTab = useCallback(
     (next: Tab) => {
       syncEntry(next, []);
-      setTabState(next);
-      setStack([]);
+      applyRoute(next, []);
     },
-    [syncEntry],
+    [applyRoute, syncEntry],
   );
-  const nav = useMemo<Nav>(() => ({ tab, stack, setTab, push, replace, pop }), [tab, stack, setTab, push, replace, pop]);
+  const nav = useMemo<Nav>(() => ({ tab, stack, currentTop, setTab, push, replace, pop }), [tab, stack, currentTop, setTab, push, replace, pop]);
 
   // The Android app's Back: a sheet closes, then the pushed screen pops (as the browser's back does).
   // Nothing left to close or pop: the Activity may finish.
@@ -252,7 +253,7 @@ function Shell({ initialRoute, theme, onTheme, standalone, onShellLink, onShellB
         setSwitcher(false);
         return true;
       }
-      if (depth.current === 0) return false;
+      if (current.current.stack.length === 0) return false;
       pop();
       return true;
     });
@@ -261,14 +262,13 @@ function Shell({ initialRoute, theme, onTheme, standalone, onShellLink, onShellB
 
   useEffect(() => {
     onShellLink((route) => {
-      setTabState(route.tab);
       // One history entry per screen, each holding its route, so the back button restores
       // whatever was showing before the link.
       for (const entry of deepLinkEntries(route, desktop)) history.pushState(entry, '');
-      setStack(route.stack);
+      applyRoute(route.tab, route.stack);
     });
     return () => onShellLink(null);
-  }, [onShellLink, desktop]);
+  }, [applyRoute, onShellLink, desktop]);
   // The link that brought this shell up is consumed: a later remount must not replay it.
   useEffect(() => onStarted(), [onStarted]);
 

@@ -758,6 +758,37 @@ PWA (`pwa/`):
   prompt (no push/attachment/terminal scenarios). Screenshots include the updated model card with
   “Desktop has control”; the scripted provider records the actual request's model.
 
+## Tree navigation and forks that start (feature `tree_nav`, 2026-11-26)
+
+Contract: `contracts.md` "Phone tree jumps, branch-aware transcripts, forks that start". Additive under the freeze
+rules: vectors `api-treenav.json` (pinned in `wire_freeze.rs`), earlier vector files byte-identical.
+
+- **Why:** the transcript feed replayed the session file linearly, so after a "Go here" the phone still showed the
+  abandoned turns (a plain jump lives only in omp's memory); a jump onto a prompt left its text as a hidden draft in
+  omp's editor on the desktop; the tree opened on its oldest page; a fork had to be resumed by hand.
+- **Wire:** `Op::Tree.at_leaf`, `Resp::Tree.prev_cursor` / `total` (`b-<n>` backward cursors beside `t-<n>`),
+  `DoneView::Moved { leaf, before_prompt, editor_text, dropped_images, message }` for `navigate`. The request field
+  and the new result are sent only to/by peers that list `tree_nav`; the reply fields are omitted when `None`.
+- **Gateway:** ctl snapshots and navigate replies are processed in wire order (`CtlClient::take_updates`) and fed to
+  the session's transcript watcher as leaf anchors; the transcript cursor of a device restarts with `reset: true`
+  when the watcher's epoch changes. `fork_at` / `copy_session` outcomes wait (≤ 5 s) until the session scan lists the
+  new file, so the phone's immediate `resume` resolves.
+- **Phone:** the tree opens around "you are here" and pages both ways; Go here returns to the live conversation,
+  puts a re-edited prompt's text into the phone composer (an existing phone draft is kept below it) and names
+  dropped images; a transcript `reset` replaces the list; both fork actions chain `resume` and open the live
+  conversation (the stopped one with the error when the start fails).
+- **Accepted limits:** images of a re-edited prompt are not carried to the phone composer. A prompt longer than
+  64 KiB stays in omp's editor on the desktop (the phone says so). A session launched before this version keeps its
+  old extension in memory: jumps made from OmpDeck are followed (reply anchor), jumps made in omp's own `/tree` show
+  after the next entry is written, and the prompt text stays in omp's editor.
+- **Gates:** `remote_device_s4.rs` (scripted relay: ordering, anchors, paging, `Moved`, fork → resume),
+  `remote_device_live.rs` `tree_jumps_with_a_real_omp` (real omp 19.2.1: jump onto a reply and onto a prompt;
+  `fork_at` and `copy_session` → immediate `resume` → distinct live sessions under control), `pwa`
+  `bun run e2e --tree` (fake gateway) and `bun run live --tree` (Chromium + real relay, gateway and omp; excludes
+  the `ask` step of the full `bun run live`).
+- **Test fixture:** the shared gateway sandbox uses a short temp root: `omp-<uuid>` host sockets of resumed sessions
+  must fit the 107-byte unix socket path limit.
+
 ## Steps and gates
 
 | Step | Deliverable | Owner | Gate |

@@ -27,3 +27,18 @@ pub fn test_omp_override() -> Option<tempfile::TempDir> {
     }
     Some(dir)
 }
+
+/// The gateway fixtures configure HOME/XDG in their own process before starting workers.
+pub fn isolated_device_test(name: &str) -> bool {
+    const CASE: &str = "OMP_DECK_DEVICE_TEST_CASE";
+    if std::env::var(CASE).as_deref() == Ok(name) {
+        return true;
+    }
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", name, "--nocapture"])
+        .env(CASE, name)
+        .status()
+        .expect("run isolated case");
+    assert!(status.success(), "{name} failed: {status}");
+    false
+}

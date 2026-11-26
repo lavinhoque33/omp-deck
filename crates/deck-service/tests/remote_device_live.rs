@@ -8,7 +8,8 @@
 //!   byte for byte;
 //! - a Web Push for a finished turn to a loopback receiver, decrypted, and none while the device
 //!   reports itself visible;
-//! - Control and Manage ops refused without the permission.
+//! - Control and Manage ops refused without the permission;
+//! - tree jumps, and both phone fork routes opening independent live conversations.
 //!
 //! Private HOME/XDG tree, own `omp-deck-test-*` namespace; skipped when omp is not installed.
 
@@ -511,6 +512,9 @@ fn type_keys(
 
 #[test]
 fn interactive_paths_with_a_real_omp() {
+    if !support::isolated_device_test("interactive_paths_with_a_real_omp") {
+        return;
+    }
     if which(if cfg!(windows) { "omp.exe" } else { "omp" }).is_none() {
         eprintln!("skipped: omp is not installed");
         return;
@@ -1165,6 +1169,551 @@ fn interactive_paths_with_a_real_omp() {
         panic!("a push while the device is visible: {p}");
     }
     eprintln!("(e) no push while visible");
+}
+
+fn transcript_until(
+    d: &mut Device,
+    feed: &Feed,
+    items: &mut Vec<Item>,
+    what: &str,
+    reached: impl Fn(&[Item], bool) -> bool,
+) {
+    loop {
+        let progress = format!("{what}; projected so far: {:?}", turn_texts(items));
+        let (start, chunk, reset) = d.take(&mut [], &progress, STEP, |r| match event(r)? {
+            Event::Feed {
+                feed: sent,
+                value:
+                    FeedValue::Transcript {
+                        start,
+                        items,
+                        reset,
+                    },
+            } if &sent == feed => Some((start as usize, items, reset)),
+            _ => None,
+        });
+        if reset {
+            assert_eq!(start, 0, "the whole short transcript fits in the tail");
+            items.clear();
+        } else {
+            assert_eq!(start, items.len(), "transcript append position");
+        }
+        items.extend(chunk);
+        if reached(items, reset) {
+            return;
+        }
+    }
+}
+
+fn turn_texts(items: &[Item]) -> Vec<&str> {
+    items
+        .iter()
+        .filter_map(|i| match i {
+            Item::User { text, .. } | Item::Assistant { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn tree_jumps_with_a_real_omp() {
+    if !support::isolated_device_test("tree_jumps_with_a_real_omp") {
+        return;
+    }
+    if which(if cfg!(windows) { "omp.exe" } else { "omp" }).is_none() {
+        eprintln!("skipped: omp is not installed");
+        return;
+    }
+    let config = format!("{OMP_CONFIG}modelRoles:\n  default: {}\n", fm::MODEL);
+    let sb = Sandbox::new("rtn", &config);
+    sb.report_failures();
+    sb.seed_session("seed-tree-live");
+    let model = FakeModel::start(|req| {
+        let user = fm::last_user_text(req);
+        let answer = [
+            ("TREE-FIRST", "ack TREE-FIRST question"),
+            ("TREE-SECOND", "ack TREE-SECOND question"),
+            ("TREE-THIRD", "ack TREE-THIRD question"),
+            ("TREE-AFTER", "ack TREE-AFTER draft check"),
+            ("TREE-FORK", "ack TREE-FORK question"),
+            ("TREE-COPY", "ack TREE-COPY question"),
+        ]
+        .into_iter()
+        .find_map(|(mark, answer)| user.contains(mark).then_some(answer))
+        .unwrap_or("Fake title");
+        Reply::text(answer)
+    });
+    std::fs::write(sb.agent().join("models.yml"), model.models_yml()).expect("models.yml");
+    let relay = Relay::start(sb.root.join("relay"));
+    let client = sb.client();
+    wait_for("the gateway link", STEP, || {
+        matches!(client.link(), Link::Up(_)).then_some(())
+    });
+    run(
+        &client,
+        Mutation::RelaySet {
+            url: relay.url(),
+            room_key: SecretText::new(relay.key.encode()),
+        },
+    )
+    .expect("relay set");
+    wait_mobile(&client, "the relay link", |m| m.link == RelayLink::Up);
+    let phone = pair(
+        &client,
+        &relay,
+        "Tree phone",
+        Permissions {
+            control: true,
+            manage: true, // CopySession; ForkAt and Resume require Control.
+        },
+    );
+    let mut a = Device::connect_with(
+        &relay,
+        &phone,
+        "Tree phone",
+        &[api::FEATURE_S4, api::FEATURE_TREE_NAV],
+    );
+    let mut seq = a.welcome.next_seq;
+    assert!(matches!(
+        a.call(
+            &mut [],
+            None,
+            Op::Subscribe {
+                feed: Feed::Live {}
+            }
+        ),
+        ReplyResult::Ok(Resp::Unit {})
+    ));
+    let project = api::project_id(sb.proj().to_string_lossy().as_bytes());
+    exercise_live_tree(&mut a, &mut seq, project, &model);
+}
+
+fn exercise_live_tree(a: &mut Device, seq: &mut u64, project: String, model: &FakeModel) {
+    const FIRST: &str = "TREE-FIRST question";
+    const FIRST_REPLY: &str = "ack TREE-FIRST question";
+    const SECOND: &str = "TREE-SECOND question";
+    const SECOND_REPLY: &str = "ack TREE-SECOND question";
+    const THIRD: &str = "TREE-THIRD question";
+    const THIRD_REPLY: &str = "ack TREE-THIRD question";
+    const AFTER: &str = "TREE-AFTER draft check";
+    const AFTER_REPLY: &str = "ack TREE-AFTER draft check";
+    let launch = *seq;
+    *seq += 1;
+    assert!(!accepted(a.call(
+        &mut [],
+        Some(launch),
+        Op::NewSession {
+            project: project.clone(),
+        }
+    )));
+    let DoneView::Session { live } = done(a.outcome(&mut [], launch, TURN)) else {
+        panic!("no live session for the tree case");
+    };
+    let mut w = Watch {
+        live: live.clone(),
+        latest: None,
+    };
+    w.until(a, "tree case live control", TURN, |s| {
+        s.live_control && !s.busy && s.activity == Activity::Idle
+    });
+    let send = |a: &mut Device, w: &mut Watch, seq: &mut u64, text| {
+        assert!(
+            matches!(
+                compose(a, w, seq, text, Vec::new(), api::ComposeMode::Send),
+                DoneView::Submitted {
+                    delivery: api::DeliveryView::Delivered {},
+                    ..
+                }
+            ),
+            "sending {text:?} should need no draft confirmation"
+        );
+    };
+    let before = model.count();
+    send(a, &mut w, seq, FIRST);
+    model_request(a, &mut w, model, before, "the first tree turn", |r| {
+        fm::last_user_text(r).contains(FIRST)
+    });
+    let session = w
+        .until(a, "first tree turn's session id", TURN, |s| {
+            s.session.is_some()
+        })
+        .session
+        .unwrap();
+    w.idle(a);
+    let feed = Feed::Transcript {
+        session: session.clone(),
+        agent: None,
+        tail: 50,
+    };
+    assert!(matches!(
+        a.call(&mut [], None, Op::Subscribe { feed: feed.clone() }),
+        ReplyResult::Ok(Resp::Unit {})
+    ));
+    let mut items = Vec::new();
+    transcript_until(a, &feed, &mut items, "the first tree turn", |items, _| {
+        turn_texts(items).last() == Some(&FIRST_REPLY)
+    });
+    send(a, &mut w, seq, SECOND);
+    transcript_until(
+        a,
+        &feed,
+        &mut items,
+        "two turns before jumping",
+        |items, _| turn_texts(items).last() == Some(&SECOND_REPLY),
+    );
+    assert_eq!(
+        turn_texts(&items),
+        [FIRST, FIRST_REPLY, SECOND, SECOND_REPLY]
+    );
+    w.idle(a);
+
+    let read_tree = |a: &mut Device, at_leaf, limit| match a.call(
+        &mut [],
+        None,
+        Op::Tree {
+            session: session.clone(),
+            filter: api::TreeFilter::Conversation,
+            cursor: None,
+            limit,
+            at_leaf,
+        },
+    ) {
+        ReplyResult::Ok(Resp::Tree {
+            nodes,
+            active_leaf,
+            total,
+            ..
+        }) => (nodes, active_leaf, total),
+        other => panic!("reading the session tree: {other:?}"),
+    };
+    let (nodes, _, total) = read_tree(a, false, 20);
+    assert_eq!(total, Some(4));
+    let first_reply = nodes
+        .iter()
+        .find(|n| n.text.contains(FIRST_REPLY))
+        .unwrap()
+        .id
+        .clone();
+    let second_prompt = nodes
+        .iter()
+        .find(|n| n.text.contains(SECOND) && n.kind == api::TreeNodeKind::User)
+        .unwrap()
+        .id
+        .clone();
+    let moved = done(journaled(
+        a,
+        &mut w,
+        seq,
+        Op::Navigate {
+            live: live.clone(),
+            entry: first_reply.clone(),
+        },
+    ));
+    assert_eq!(
+        moved,
+        DoneView::Moved {
+            leaf: Some(first_reply.clone()),
+            before_prompt: false,
+            editor_text: None,
+            dropped_images: 0,
+            message: None,
+        }
+    );
+    transcript_until(
+        a,
+        &feed,
+        &mut items,
+        "rewinding to the first reply",
+        |items, reset| reset && turn_texts(items) == [FIRST, FIRST_REPLY],
+    );
+
+    let before = model.count();
+    send(a, &mut w, seq, THIRD);
+    let request = model_request(
+        a,
+        &mut w,
+        model,
+        before,
+        "the new branch model request",
+        |r| fm::last_user_text(r) == THIRD,
+    );
+    assert!(
+        !fm::messages(&request)
+            .iter()
+            .any(|m| fm::text(m).contains(SECOND))
+    );
+    transcript_until(
+        a,
+        &feed,
+        &mut items,
+        "the new transcript branch",
+        |items, _| turn_texts(items).last() == Some(&THIRD_REPLY),
+    );
+    assert_eq!(turn_texts(&items), [FIRST, FIRST_REPLY, THIRD, THIRD_REPLY]);
+    w.idle(a);
+
+    let moved = done(journaled(
+        a,
+        &mut w,
+        seq,
+        Op::Navigate {
+            live,
+            entry: second_prompt,
+        },
+    ));
+    assert!(
+        matches!(&moved, DoneView::Moved {
+        before_prompt: true, editor_text: Some(text), dropped_images: 0, message: None,
+        ..
+    } if text == SECOND),
+        "{moved:?}"
+    );
+    transcript_until(
+        a,
+        &feed,
+        &mut items,
+        "rewinding before the second prompt",
+        |items, reset| reset && turn_texts(items) == [FIRST, FIRST_REPLY],
+    );
+    let (nodes, leaf, total) = read_tree(a, true, 1);
+    assert_eq!(total, Some(6));
+    assert_eq!(leaf.as_deref(), Some(first_reply.as_str()));
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].id, first_reply);
+    send(a, &mut w, seq, AFTER);
+    transcript_until(
+        a,
+        &feed,
+        &mut items,
+        "the parent's active branch",
+        |items, _| turn_texts(items).last() == Some(&AFTER_REPLY),
+    );
+    let parent_turns = [FIRST, FIRST_REPLY, AFTER, AFTER_REPLY];
+    assert_eq!(turn_texts(&items), parent_turns);
+    w.idle(a);
+
+    let fork_turns = [FIRST, FIRST_REPLY];
+    // Copy first so it exercises exactly the parent's persisted active branch, with the earlier
+    // abandoned turns still in the journal, before we try the live-source tree fork.
+    let mut live_refs = vec![w.live.clone()];
+    let mut ids = vec![session.clone()];
+    let mut failures = Vec::new();
+    for (op, expected, prompt, reply) in [
+        (
+            Op::CopySession {
+                session: session.clone(),
+                project,
+            },
+            parent_turns.as_slice(),
+            "TREE-COPY question",
+            "ack TREE-COPY question",
+        ),
+        (
+            Op::ForkAt {
+                session: session.clone(),
+                entry: first_reply,
+            },
+            fork_turns.as_slice(),
+            "TREE-FORK question",
+            "ack TREE-FORK question",
+        ),
+    ] {
+        let route = op.name();
+        let (id, mut branch) = match resume_created_branch(a, &mut w, seq, op, &ids, &live_refs) {
+            Ok(branch) => branch,
+            Err(error) => {
+                failures.push(error);
+                continue;
+            }
+        };
+        let branch_feed = Feed::Transcript {
+            session: id.clone(),
+            agent: None,
+            tail: 50,
+        };
+        let mut branch_items = fresh_transcript(a, &branch_feed, route);
+        assert_eq!(
+            turn_texts(&branch_items),
+            expected,
+            "{route}: initial branch"
+        );
+        if route == "copy_session" {
+            // The headless omp that writes the copy can record its normal shutdown.
+            let exit = Item::Exit {
+                reason: "dispose (normal)".to_owned(),
+            };
+            assert!(
+                branch_items == items || branch_items.strip_suffix(&[exit]) == Some(&items),
+                "copy: unexpected non-conversation changes: {branch_items:?}"
+            );
+        }
+
+        let before = model.count();
+        send(a, &mut branch, seq, prompt);
+        let request = model_request(a, &mut branch, model, before, prompt, |r| {
+            fm::last_user_text(r).contains(prompt)
+        });
+        let history = fm::messages(&request)
+            .iter()
+            .flat_map(|m| {
+                request_markers(&fm::text(m))
+                    .map(|mark| (fm::role(m), mark.to_owned()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected_history = expected
+            .iter()
+            .copied()
+            .chain([prompt])
+            .enumerate()
+            .map(|(i, text)| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                (role, request_markers(text).next().unwrap().to_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(history, expected_history, "{route}: model request history");
+        transcript_until(a, &branch_feed, &mut branch_items, route, |items, _| {
+            turn_texts(items).last() == Some(&reply)
+        });
+        assert_eq!(
+            turn_texts(&branch_items),
+            expected
+                .iter()
+                .copied()
+                .chain([prompt, reply])
+                .collect::<Vec<_>>(),
+            "{route}: independent conversation"
+        );
+        let parent = fresh_transcript(a, &feed, "the unchanged parent transcript");
+        assert_eq!(parent, items, "{route}: must not write to the parent");
+        eprintln!("{route}: resumed {id}, verified branch history and independent reply");
+        ids.push(id);
+        live_refs.push(branch.live);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_distinct_running_pids(a, &live_refs);
+}
+
+fn request_markers(text: &str) -> impl Iterator<Item = &str> {
+    text.split_whitespace()
+        .filter(|part| part.starts_with("TREE-"))
+}
+
+fn fresh_transcript(a: &mut Device, feed: &Feed, what: &str) -> Vec<Item> {
+    let response = a.call(&mut [], None, Op::Subscribe { feed: feed.clone() });
+    assert!(
+        matches!(response, ReplyResult::Ok(Resp::Unit {})),
+        "{what}: {response:?}"
+    );
+    let mut items = Vec::new();
+    transcript_until(a, feed, &mut items, what, |_, reset| reset);
+    items
+}
+
+fn resume_created_branch(
+    a: &mut Device,
+    parent: &mut Watch,
+    seq: &mut u64,
+    op: Op,
+    existing_ids: &[String],
+    existing_live: &[LiveRef],
+) -> Result<(String, Watch), String> {
+    let route = op.name();
+    let file = journaled(a, parent, seq, op);
+    let OutcomeView::Done {
+        result: DoneView::File {
+            session: Some(session),
+        },
+    } = file
+    else {
+        return Err(format!(
+            "{route}: expected an immediately resumable file, got {file:?}"
+        ));
+    };
+    assert!(!existing_ids.contains(&session), "{route}: not a new file");
+    // Send Resume now, without waiting for a session-list or Live feed update. Keep all Live
+    // records from the resume so the new branch's Watch can see its initial idle state.
+    let resume = *seq;
+    *seq += 1;
+    let response = a.call(
+        &mut [],
+        Some(resume),
+        Op::Resume {
+            session: session.to_owned(),
+        },
+    );
+    if !matches!(
+        response,
+        ReplyResult::Ok(Resp::Accepted {
+            duplicate: false,
+            ..
+        })
+    ) {
+        return Err(format!(
+            "{route}: resume of {session} was not accepted: {response:?}"
+        ));
+    }
+    let outcome = a.outcome(&mut [], resume, TURN);
+    let OutcomeView::Done {
+        result: DoneView::Session { live },
+    } = outcome
+    else {
+        return Err(format!("{route}: resume of {session} yielded {outcome:?}"));
+    };
+    assert!(
+        existing_live.iter().all(|old| old.key != live.key),
+        "{route}: resume reused an existing live key: {live:?}"
+    );
+    eprintln!("{route}: Resume returned {live:?} for {session}");
+    let mut branch = Watch { live, latest: None };
+    let state = branch.until(a, route, TURN, |s| {
+        matches!(s.status, api::Status::Exited { .. })
+            || (s.live_control
+                && !s.busy
+                && s.activity == Activity::Idle
+                && s.session.as_deref() == Some(session.as_str()))
+    });
+    if matches!(state.status, api::Status::Exited { .. }) {
+        return Err(format!(
+            "{route}: immediate resume of {session} exited before live control: {state:?}"
+        ));
+    }
+    Ok((session, branch))
+}
+
+fn assert_distinct_running_pids(a: &mut Device, branches: &[LiveRef]) {
+    let response = a.call(
+        &mut [],
+        None,
+        Op::Subscribe {
+            feed: Feed::Running {},
+        },
+    );
+    assert!(
+        matches!(response, ReplyResult::Ok(Resp::Unit {})),
+        "{response:?}"
+    );
+    let mut pids = a.take(&mut [], "the three live processes", STEP, |record| {
+        let Event::Feed {
+            value: FeedValue::Running { sessions, .. },
+            ..
+        } = event(record)?
+        else {
+            return None;
+        };
+        branches
+            .iter()
+            .map(|live| sessions.iter().find(|s| s.live.as_ref() == Some(live))?.pid)
+            .collect::<Option<Vec<_>>>()
+    });
+    pids.sort_unstable();
+    pids.dedup();
+    assert_eq!(
+        pids.len(),
+        branches.len(),
+        "the live processes must be distinct"
+    );
+    eprintln!("verified three distinct omp process IDs: {pids:?}");
 }
 
 fn which(program: &str) -> Option<PathBuf> {

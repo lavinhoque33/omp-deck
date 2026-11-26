@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -338,43 +339,87 @@ fn detached(name: &str, f: impl FnOnce() + Send + 'static) {
     }
 }
 
-/// `nodes` of a tree page as one reply: as many as fit, the rest on the next page.
-fn tree_reply(page: super::tree::Page, start: usize) -> ReplyResult {
+/// Measure JSON without allocating or copying the serialized rows.
+fn json_size(value: &impl serde::Serialize) -> usize {
+    #[derive(Default)]
+    struct Count(usize);
+    impl io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut count = Count::default();
+    serde_json::to_writer(&mut count, value).map_or(usize::MAX, |()| count.0)
+}
+
+/// Keep the nodes closest to the requested anchor when the page exceeds the wire cap.
+fn tree_reply(page: super::tree::Page, max_reply: usize) -> ReplyResult {
+    use super::tree::Boundary;
     let super::tree::Page {
-        nodes,
+        mut nodes,
         active_leaf,
-        next,
+        start,
+        total,
+        window,
     } = page;
     let all = nodes.len();
-    let make = |n: usize| {
-        let next = if n < all { Some(start + n) } else { next };
+    let make = |range: &Range<usize>, nodes| {
+        let end = start + range.end;
+        let start = start + range.start;
         ReplyResult::Ok(Resp::Tree {
-            nodes: nodes[..n].to_vec(),
+            nodes,
             active_leaf: active_leaf.clone(),
-            next_cursor: next.map(super::tree::cursor),
-            truncated: n < all,
+            next_cursor: (end < total).then(|| Boundary::Start(end).cursor()),
+            truncated: range.len() < all,
+            prev_cursor: (start > 0).then(|| Boundary::End(start).cursor()),
+            total: Some(total as u64),
         })
     };
-    let size = |n: usize| {
-        serde_json::to_vec(&api::Reply {
+    // The envelope already contains `nodes: []`. Only the encoded nodes and separating
+    // commas contribute extra bytes, so probes never clone or re-encode the rows.
+    let size = |range: &Range<usize>, body| {
+        json_size(&api::Reply {
             id: u64::MAX,
-            result: make(n),
+            result: make(range, Vec::new()),
         })
-        .map_or(usize::MAX, |b| b.len())
+        .saturating_add(body)
     };
-    if size(all) <= api::MAX_REPLY {
-        return make(all);
+    if size(&(0..all), json_size(&nodes) - 2) <= max_reply {
+        return make(&(0..all), nodes);
+    }
+    let mut bytes: Vec<usize> = Vec::with_capacity(all + 1);
+    bytes.push(0);
+    let mut offset = 0usize;
+    for node in &nodes {
+        offset = offset.saturating_add(json_size(node));
+        bytes.push(offset);
     }
     let (mut lo, mut hi) = (0, all);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        if size(mid) <= api::MAX_REPLY {
+        let range = window.clip(all, mid);
+        let body = (bytes[range.end] - bytes[range.start]).saturating_add(mid - 1);
+        if size(&range, body) <= max_reply {
             lo = mid;
         } else {
             hi = mid;
         }
     }
-    make(lo)
+    if lo == 0 && all > 0 {
+        return ReplyResult::Err(ApiError::Failed {
+            message: "a tree entry is too large to send".to_owned(),
+        });
+    }
+    let range = window.clip(all, lo);
+    nodes.truncate(range.end);
+    nodes.drain(..range.start);
+    make(&range, nodes)
 }
 
 impl Engine {
@@ -581,23 +626,16 @@ impl Engine {
                 filter,
                 cursor,
                 limit,
+                at_leaf,
             } => {
                 let path = resolve_session(&groups, &session)?.path.clone();
-                let start = match cursor.as_deref() {
-                    None => 0,
-                    Some(c) => super::tree::offset(c).ok_or_else(|| bad("not a tree cursor"))?,
-                };
-                // "You are here": the live session's current entry.
-                let leaf = self
-                    .sess
-                    .managed
-                    .iter()
-                    .filter(|m| {
-                        m.ctl
-                            .session_path()
-                            .is_some_and(|p| super::same_spelling(p, &path))
+                let boundary = cursor
+                    .as_deref()
+                    .map(|c| {
+                        super::tree::Boundary::parse(c).ok_or_else(|| bad("not a tree cursor"))
                     })
-                    .find_map(|m| m.live.as_ref()?.client.latest()?.leaf.clone());
+                    .transpose()?;
+                let leaf = self.sess.managed.iter().find_map(|m| m.tree_leaf(&path));
                 let out = self.device_out(conn)?;
                 detached("tree", move || {
                     let result = match deck_core::tree::SessionTree::load(&path) {
@@ -605,11 +643,12 @@ impl Engine {
                             super::tree::page(
                                 &tree,
                                 filter,
-                                leaf.as_deref(),
-                                start,
+                                leaf.as_ref().map(|leaf| leaf.as_deref()),
+                                boundary,
+                                at_leaf,
                                 limit as usize,
                             ),
-                            start,
+                            api::MAX_REPLY,
                         ),
                         Err(_) => ReplyResult::Err(ApiError::Failed {
                             message: "the session could not be read".to_owned(),
@@ -1899,6 +1938,7 @@ impl Engine {
                         root,
                         entry_id: entry,
                         summary: deck_core::ctl::BranchSummary::None,
+                        take_editor: self.device_conn(conn).is_some_and(DeviceConn::tree_nav),
                     },
                 }
             }
@@ -2352,6 +2392,90 @@ fn cached<'a, T>(cache: &'a Option<(BackupPlace, Vec<T>)>, place: &BackupPlace) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tree_node(i: usize) -> api::TreeNode {
+        api::TreeNode {
+            id: format!("n{i}"),
+            parent: None,
+            kind: api::TreeNodeKind::Assistant,
+            subtype: None,
+            at_unix_ms: None,
+            text: "\"🧪".repeat(125),
+            has_text: true,
+            stop_reason: None,
+            label: None,
+            forkable: true,
+            cost_before: None,
+            cost_incomplete: false,
+        }
+    }
+
+    #[test]
+    fn an_oversized_tree_entry_errors_instead_of_returning_a_cursor_that_cannot_advance() {
+        use super::super::tree::{Page, Window};
+
+        for window in [Window::Forward, Window::Backward, Window::Centered(0)] {
+            let page = Page {
+                nodes: vec![tree_node(0)],
+                active_leaf: Some("n0".to_owned()),
+                start: 1,
+                total: 3,
+                window,
+            };
+            assert_eq!(
+                tree_reply(page, 250),
+                ReplyResult::Err(ApiError::Failed {
+                    message: "a tree entry is too large to send".to_owned(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn wire_truncation_keeps_each_tree_window_adjacent_to_its_anchor() {
+        use super::super::tree::{Page, Window};
+
+        for (window, kept, prev, next) in [
+            (Window::Forward, ["n0", "n1"], "b-10", "t-12"),
+            (Window::Backward, ["n4", "n5"], "b-14", "t-16"),
+            (Window::Centered(3), ["n3", "n4"], "b-13", "t-15"),
+        ] {
+            let nodes: Vec<_> = (0..6).map(tree_node).collect();
+            let max_reply = json_size(&nodes[0]) * 2 + 250;
+            let page = Page {
+                nodes,
+                active_leaf: Some("n3".to_owned()),
+                start: 10,
+                total: 20,
+                window,
+            };
+            let reply = api::Reply {
+                id: u64::MAX,
+                result: tree_reply(page, max_reply),
+            };
+            assert!(json_size(&reply) <= max_reply);
+            let ReplyResult::Ok(Resp::Tree {
+                nodes,
+                active_leaf,
+                prev_cursor,
+                next_cursor,
+                truncated,
+                total,
+            }) = reply.result
+            else {
+                panic!("not a tree response: {:?}", reply.result);
+            };
+            assert!(truncated);
+            assert_eq!(
+                nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+                kept
+            );
+            assert_eq!(active_leaf.as_deref(), Some("n3"));
+            assert_eq!(prev_cursor.as_deref(), Some(prev));
+            assert_eq!(next_cursor.as_deref(), Some(next));
+            assert_eq!(total, Some(20));
+        }
+    }
 
     #[test]
     fn v1_operations_and_feeds_are_not_gated() {
