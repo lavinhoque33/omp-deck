@@ -184,6 +184,73 @@ fn read_blob_finds_decodes_and_tolerates_a_truncated_tail() {
     assert!(read_blob(&d.path().join("nope.jsonl"), PNG_ID, 1).is_err());
 }
 
+/// A tool-result line holding one image with base64 `data` (newline included), and its blob id.
+fn image_line(data: &str) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let id = Sha256::digest(data.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let line = message_line(
+        "toolResult",
+        json!({"content": [{"type": "image", "data": data, "mimeType": "image/png"}]}),
+    );
+    (line + "\n", id)
+}
+
+#[test]
+fn read_blob_reaches_images_far_into_a_long_transcript() {
+    use std::io::{Seek, SeekFrom, Write};
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("long.jsonl");
+    let (line, id) = image_line("AAEC");
+    let mut f = fs::File::create(&p).unwrap();
+    f.write_all(&fs::read(rich()).unwrap()).unwrap();
+    // A session of a few days is over 100 MiB: its latest screenshots sit past that much.
+    f.seek(SeekFrom::Current(100 << 20)).unwrap();
+    f.write_all(format!("\n{line}").as_bytes()).unwrap();
+    drop(f);
+    assert_eq!(
+        read_blob(&p, &id, 1 << 20).unwrap(),
+        Some(("image/png".to_owned(), vec![0, 1, 2]))
+    );
+    assert!(read_blob(&p, PNG_ID, 1 << 20).unwrap().is_some());
+}
+
+#[test]
+fn read_blob_follows_a_growing_and_a_rewritten_transcript() {
+    use std::io::Write;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("live.jsonl");
+    let found = |id: &str| read_blob(&p, id, 1 << 20).unwrap().map(|(_, bytes)| bytes);
+    let append = |text: &str| {
+        let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    };
+    let (a, a_id) = image_line("AAAA");
+    let (b, b_id) = image_line("AQID");
+    let (c, c_id) = image_line("BAUG");
+    let (e, e_id) = image_line("BwgJ");
+
+    fs::write(&p, &a).unwrap();
+    assert_eq!(found(&a_id), Some(vec![0, 0, 0]));
+    assert_eq!(found(&b_id), None);
+    // Appended after the first lookup; the last line still lacks its newline.
+    append(b.trim_end());
+    assert_eq!(found(&b_id), Some(vec![1, 2, 3]));
+    append(&format!("\n{c}"));
+    assert_eq!(found(&c_id), Some(vec![4, 5, 6]));
+    assert_eq!(found(&b_id), Some(vec![1, 2, 3]));
+
+    // Rewritten under the same name and longer than before: every line moved.
+    let note = message_line("user", json!({"content": "x".repeat(4096)}));
+    fs::write(&p, format!("{note}\n{c}{e}")).unwrap();
+    assert_eq!(found(&c_id), Some(vec![4, 5, 6]));
+    assert_eq!(found(&e_id), Some(vec![7, 8, 9]));
+    assert_eq!(found(&a_id), None);
+}
+
 #[test]
 fn read_blob_resolves_externalized_images_from_the_blob_store() {
     let d = tempfile::tempdir().unwrap();

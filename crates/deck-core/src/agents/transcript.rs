@@ -1,8 +1,9 @@
 //! Subagent transcript → [`TranscriptItem`]s (docs/notes/agent-hub.md §6), with a live tail.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,14 +25,16 @@ const MAX_ARGS: usize = 4 * 1024;
 const MAX_ARG_LEAF: usize = 16 * 1024;
 const MAX_ARGS_VALUE: usize = 64 * 1024;
 const MAX_DETAILS: usize = 32 * 1024;
-/// `read_blob` reads at most this much of a transcript …
-const MAX_SCAN: u64 = 64 * 1024 * 1024;
-/// … decodes images up to this size …
+/// `read_blob` decodes images up to this size …
 const MAX_BLOB: u64 = 20 * 1024 * 1024;
 /// … and skips lines longer than 20 MiB of base64 (4/3 expansion) plus envelope.
 const MAX_BLOB_LINE: usize = (MAX_BLOB as usize / 3 + 1) * 4 + 64 * 1024;
 /// omp's marker for an image kept in its content-addressed blob store.
 const BLOB_REF: &str = "blob:sha256:";
+/// `read_blob` keeps the image index of this many transcripts (the latest read).
+const MAX_BLOB_INDEXES: usize = 8;
+/// Read buffer of an index scan (a long session is hundreds of MiB).
+const SCAN_BUF: usize = 256 * 1024;
 const MAX_TEXT: usize = 256 * 1024;
 const MAX_NOTICE: usize = 16 * 1024;
 const MAX_SUMMARY: usize = 64 * 1024;
@@ -217,13 +220,140 @@ fn images_of(content: Option<&Content>) -> Vec<ImageRef> {
     }
 }
 
+/// Where a transcript's images are: blob id → byte offset of the line holding it. Built on the
+/// first lookup and extended as the file grows, so an image late in a long session costs one
+/// seek instead of a scan of everything before it.
+#[derive(Default)]
+struct BlobIndex {
+    /// Offset of the first byte not indexed yet (always a line start).
+    scanned: u64,
+    lines: HashMap<String, u64>,
+}
+
+impl BlobIndex {
+    /// Indexes what `file` gained since the last call. A last line without its newline is
+    /// indexed but read again next time: omp may still be writing it.
+    fn extend(&mut self, file: &mut File) -> io::Result<()> {
+        file.seek(SeekFrom::Start(self.scanned))?;
+        let mut reader = BufReader::with_capacity(SCAN_BUF, file);
+        let mut line = Vec::new();
+        loop {
+            let (read, ended) = read_capped_line(&mut reader, &mut line, MAX_BLOB_LINE)?;
+            if read == 0 {
+                return Ok(());
+            }
+            for part in image_parts(&line).iter().flatten() {
+                if let Some(data) = image_data(part) {
+                    self.lines.entry(blob_id(data)).or_insert(self.scanned);
+                }
+            }
+            if !ended {
+                return Ok(());
+            }
+            self.scanned += read;
+        }
+    }
+}
+
+/// Indexes of the transcripts read most recently, latest first.
+static BLOB_INDEXES: Mutex<Vec<(PathBuf, Arc<Mutex<BlobIndex>>)>> = Mutex::new(Vec::new());
+
+/// The index of `transcript`; lookups in one transcript share it (and wait for each other),
+/// other transcripts are not held up.
+fn blob_index(transcript: &Path) -> Arc<Mutex<BlobIndex>> {
+    let mut all = lock(&BLOB_INDEXES);
+    let at = match all.iter().position(|(p, _)| p == transcript) {
+        Some(at) => at,
+        None => {
+            all.truncate(MAX_BLOB_INDEXES - 1);
+            all.push((transcript.to_path_buf(), Arc::default()));
+            all.len() - 1
+        }
+    };
+    all[..=at].rotate_right(1);
+    Arc::clone(&all[0].1)
+}
+
+/// The content parts of a transcript line that may hold an image; `None` for any other line,
+/// a truncated tail or a malformed one.
+fn image_parts(line: &[u8]) -> Option<Vec<Value>> {
+    memchr::memmem::find(line, b"\"image\"")?;
+    let mut v: Value = serde_json::from_slice(line).ok()?;
+    let content = match v.pointer_mut("/message/content") {
+        Some(c) => c.take(),
+        None => v.get_mut("content")?.take(),
+    };
+    match content {
+        Value::Array(parts) => Some(parts),
+        _ => None,
+    }
+}
+
+/// The `data` of an image part: its base64, or omp's blob-store reference.
+fn image_data(part: &Value) -> Option<&str> {
+    if part.get("type").and_then(Value::as_str) != Some("image") {
+        return None;
+    }
+    part.get("data").and_then(Value::as_str)
+}
+
+/// The `(mime, data)` of image `blob` on the line at offset `at`; `None` when that line does
+/// not hold it (the file changed under the index).
+fn image_at(file: &mut File, at: u64, blob: &str) -> io::Result<Option<(String, String)>> {
+    file.seek(SeekFrom::Start(at))?;
+    let mut line = Vec::new();
+    read_capped_line(&mut BufReader::new(file), &mut line, MAX_BLOB_LINE)?;
+    Ok(image_parts(&line)
+        .into_iter()
+        .flatten()
+        .find_map(|mut part| {
+            if image_data(&part).is_none_or(|data| blob_id(data) != blob) {
+                return None;
+            }
+            let mime = part
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream")
+                .to_owned();
+            match part.get_mut("data").map(Value::take) {
+                Some(Value::String(data)) => Some((mime, data)),
+                _ => None,
+            }
+        }))
+}
+
+/// Finds image `blob` through the transcript's index: `(mime, data)`.
+fn locate_blob(transcript: &Path, blob: &str) -> io::Result<Option<(String, String)>> {
+    let mut file = File::open(transcript)?;
+    let index = blob_index(transcript);
+    let mut index = lock(&index);
+    let mut rebuilt = false;
+    loop {
+        if file.metadata()?.len() < index.scanned {
+            *index = BlobIndex::default();
+        }
+        rebuilt |= index.scanned == 0;
+        index.extend(&mut file)?;
+        let found = match index.lines.get(blob) {
+            Some(&at) => image_at(&mut file, at, blob)?,
+            None => None,
+        };
+        if found.is_some() || rebuilt {
+            return Ok(found);
+        }
+        // Not where (or what) the index says: the file was rewritten under the same name.
+        *index = BlobIndex::default();
+    }
+}
+
 /// Finds the image `blob` in `transcript` and decodes it: `(mime, bytes)`.
 ///
-/// A bounded scan: at most 64 MiB of the file is read, lines over 28 MiB are skipped unparsed,
-/// and an image whose decoded size exceeds `max_bytes` (itself capped at 20 MiB) yields `None`.
-/// A truncated last line is tolerated. Images omp externalized to its blob store
-/// (`<agent dir>/blobs/<sha256>`) are read from there, found by walking up to the `sessions`
-/// directory the transcript lives under.
+/// The whole transcript is searched, whatever its size: the first lookup indexes its images
+/// line by line (lines over 28 MiB are skipped unparsed), later ones only read what was
+/// appended since. An image whose decoded size exceeds `max_bytes` (itself capped at 20 MiB)
+/// yields `None`. A truncated last line is tolerated. Images omp externalized to its blob
+/// store (`<agent dir>/blobs/<sha256>`) are read from there, found by walking up to the
+/// `sessions` directory the transcript lives under.
 pub fn read_blob(
     transcript: &Path,
     blob: &str,
@@ -231,61 +361,36 @@ pub fn read_blob(
 ) -> io::Result<Option<(String, Vec<u8>)>> {
     use base64::Engine;
     let max = max_bytes.min(MAX_BLOB);
-    let mut file = BufReader::new(File::open(transcript)?.take(MAX_SCAN));
-    let mut line = Vec::new();
-    loop {
-        let more = read_capped_line(&mut file, &mut line, MAX_BLOB_LINE)?;
-        if !more {
-            return Ok(None);
-        }
-        if line.is_empty() || memchr::memmem::find(&line, b"\"image\"").is_none() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_slice::<Value>(&line) else {
-            continue; // truncated tail or malformed line
-        };
-        let content = v.pointer("/message/content").or_else(|| v.get("content"));
-        let Some(parts) = content.and_then(Value::as_array) else {
-            continue;
-        };
-        for p in parts {
-            let Some(data) = p.get("data").and_then(Value::as_str) else {
-                continue;
-            };
-            if p.get("type").and_then(Value::as_str) != Some("image") || blob_id(data) != blob {
-                continue;
-            }
-            let mime = p
-                .get("mimeType")
-                .and_then(Value::as_str)
-                .unwrap_or("application/octet-stream")
-                .to_owned();
-            if let Some(hash) = data.strip_prefix(BLOB_REF) {
-                return read_external(transcript, hash, max).map(|b| b.map(|b| (mime, b)));
-            }
-            if decoded_len(data) > max {
-                return Ok(None);
-            }
-            return Ok(base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .ok()
-                .map(|b| (mime, b)));
-        }
+    let Some((mime, data)) = locate_blob(transcript, blob)? else {
+        return Ok(None);
+    };
+    if let Some(hash) = data.strip_prefix(BLOB_REF) {
+        return read_external(transcript, hash, max).map(|b| b.map(|b| (mime, b)));
     }
+    if decoded_len(&data) > max {
+        return Ok(None);
+    }
+    Ok(base64::engine::general_purpose::STANDARD
+        .decode(&data)
+        .ok()
+        .map(|b| (mime, b)))
 }
 
-/// Reads one `\n`-terminated line (without it) into `buf`; a line over `cap` bytes is consumed
-/// but left empty. `false` at end of input with nothing read.
-fn read_capped_line(r: &mut impl BufRead, buf: &mut Vec<u8>, cap: usize) -> io::Result<bool> {
+/// Reads one line into `buf` (without its `\n`); a line over `cap` bytes is consumed but left
+/// empty. Returns the bytes consumed (0 at end of input) and whether a `\n` ended the line.
+fn read_capped_line(
+    r: &mut impl BufRead,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> io::Result<(u64, bool)> {
     buf.clear();
-    let mut any = false;
+    let mut read = 0;
     let mut over = false;
     loop {
         let chunk = r.fill_buf()?;
         if chunk.is_empty() {
-            break;
+            return Ok((read, false));
         }
-        any = true;
         let (take, done) = match memchr::memchr(b'\n', chunk) {
             Some(i) => (i, true),
             None => (chunk.len(), false),
@@ -298,12 +403,13 @@ fn read_capped_line(r: &mut impl BufRead, buf: &mut Vec<u8>, cap: usize) -> io::
                 buf.extend_from_slice(&chunk[..take]);
             }
         }
-        r.consume(take + usize::from(done));
+        let used = take + usize::from(done);
+        r.consume(used);
+        read += used as u64;
         if done {
-            break;
+            return Ok((read, true));
         }
     }
-    Ok(any)
 }
 
 /// An externalized image: `<agent dir>/blobs/<hash>` beside the `sessions` ancestor.
