@@ -1,5 +1,8 @@
 //! Model favorites and provider filtering use the gateway's real settings writer and wire path.
 
+#[path = "support/strays.rs"]
+mod strays;
+
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -106,6 +109,7 @@ fn gateway_owned_model_preferences_survive_a_new_gateway() {
         .prefix("od-fav-")
         .tempdir()
         .expect("sandbox");
+    let _strays = strays::Guard(dir.path().to_path_buf());
     isolate(dir.path());
     for (i, mode) in [GatewayMode::Off, GatewayMode::Background]
         .into_iter()

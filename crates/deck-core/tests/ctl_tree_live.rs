@@ -6,6 +6,7 @@
 
 mod support;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use deck_core::ctl::{BranchSummary, CtlCommand, NavigateOutcome};
@@ -683,6 +684,9 @@ fn ask_dock(live: &Live) -> Option<(String, String, String)> {
 }
 
 /// Answers the shown ask: picks option `index` and submits, or cancels the dialog (`None`).
+/// The submit waits until the tab shows the pick: selecting re-renders the card, and until omp has
+/// described it again its action buttons resolve to the disposed nodes, so a submit sent in that
+/// window is dropped ("TSP: event for an unknown node") and the dialog stays open.
 fn answer_ask(live: &Live, index: Option<usize>) {
     let (sf, list, actions) = wait_for("omp's ask dialog in the tab", TURN, || ask_dock(live));
     let action = |act: &str| Event::Action {
@@ -692,18 +696,23 @@ fn answer_ask(live: &Live, index: Option<usize>) {
         value: None,
         mods: None,
     };
-    let events = match index {
-        Some(i) => vec![
-            Event::Select {
-                sf: sf.clone(),
-                id: list.clone(),
-                item: format!("{list}/o{i}"),
-            },
-            action("submit"),
-        ],
-        None => vec![action("cancel")],
+    let Some(i) = index else {
+        live.events(&[action("cancel")]);
+        return;
     };
-    live.events(&events);
+    let item = format!("{list}/o{i}");
+    live.events(&[Event::Select {
+        sf: sf.clone(),
+        id: list.clone(),
+        item: item.clone(),
+    }]);
+    wait_for("the picked option in the tab", TURN, || {
+        support::nodes(&live.peek())
+            .iter()
+            .any(|(id, _, p)| *id == list && p["selected"] == item.as_str())
+            .then_some(())
+    });
+    live.events(&[action("submit")]);
 }
 
 /// The model sees the ask's answer as a tool result and echoes it.
@@ -850,8 +859,9 @@ fn reanswering_an_ask_opens_omps_dialog_and_resumes_the_turn() {
         (false, Some("not an ask result"))
     );
 
-    // Skipping omp's dialog leaves the session untouched.
-    let leaf = live.client().latest().and_then(|s| s.leaf.clone());
+    // Skipping omp's dialog leaves the session untouched: the leaf stays on its branch (omp may
+    // still append bookkeeping such as the turn's `model_usage` below it).
+    let leaf = live.client().latest().and_then(|s| s.leaf.clone()).unwrap();
     let cancelled = reask(&target);
     answer_ask(&live, None);
     let cancelled = reply_of(cancelled);
@@ -859,12 +869,19 @@ fn reanswering_an_ask_opens_omps_dialog_and_resumes_the_turn() {
         (cancelled.ok, cancelled.error.as_deref()),
         (false, Some("cancelled"))
     );
-    assert_eq!(
-        ask_results(&live.entries()).len(),
-        1,
-        "no answer was recorded"
+    // The leaf first: every entry it names is in the file read after it.
+    let now = live.client().latest().and_then(|s| s.leaf.clone()).unwrap();
+    let rows = live.entries();
+    assert_eq!(ask_results(&rows).len(), 1, "no answer was recorded");
+    let parent: HashMap<&str, &str> = rows
+        .iter()
+        .filter_map(|e| Some((e["id"].as_str()?, e["parentId"].as_str()?)))
+        .collect();
+    assert!(
+        std::iter::successors(Some(now.as_str()), |id| parent.get(id).copied())
+            .any(|id| id == leaf),
+        "the leaf {now} left the branch of {leaf}"
     );
-    assert_eq!(live.client().latest().and_then(|s| s.leaf.clone()), leaf);
 
     // Answering: a sibling result on the same tool call, and the turn resumes with it.
     let before = live.model.count();
@@ -889,8 +906,14 @@ fn reanswering_an_ask_opens_omps_dialog_and_resumes_the_turn() {
         new_text.contains("alpha") && !new_text.contains("beta"),
         "{new_text}"
     );
-    wait_for("the resumed turn", TURN, || {
-        (live.model.count() > before && live.main_idle()).then_some(())
+    // The resumed turn's own reply, not just any model call (omp's side requests count too).
+    wait_for("the resumed turn's reply", TURN, || {
+        let last = live
+            .entries()
+            .into_iter()
+            .rev()
+            .find(|e| e["type"] == "message" && e["message"]["role"] == "assistant")?;
+        (last["message"]["content"].to_string().contains("alpha") && live.main_idle()).then_some(())
     });
     let resumed = live
         .model
@@ -906,13 +929,6 @@ fn reanswering_an_ask_opens_omps_dialog_and_resumes_the_turn() {
             .iter()
             .any(|m| fm::text(m).contains("beta"))
     );
-    let last = live
-        .entries()
-        .into_iter()
-        .rev()
-        .find(|e| e["type"] == "message" && e["message"]["role"] == "assistant")
-        .unwrap();
-    assert!(last["message"]["content"].to_string().contains("alpha"));
 }
 
 /// Two more models next to `fake-1`: a thinking-capable one and one with a tiny context window.

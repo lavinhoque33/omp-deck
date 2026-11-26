@@ -3,6 +3,9 @@
 //! Runs only when `OMPDECK_TEST_OMP=<path to omp>` is set (omp is not a build dependency).
 //! No model is called. Nothing under the real `~/.omp` is read or written.
 
+#[path = "../../deck-service/tests/support/strays.rs"]
+mod strays;
+
 use std::path::{Path, PathBuf};
 
 use deck_core::omp::{
@@ -85,6 +88,12 @@ impl Sandbox {
         let text: Vec<String> = lines.iter().map(Value::to_string).collect();
         std::fs::write(&file, text.join("\n") + "\n").expect("session file");
         file
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        strays::stop(self.root.path());
     }
 }
 

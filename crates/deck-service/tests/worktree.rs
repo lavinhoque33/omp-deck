@@ -170,6 +170,7 @@ impl Drop for Sandbox {
                 .args(["-L", &self.ns, "kill-server"])
                 .output();
         }
+        support::strays::stop(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

@@ -1,3 +1,6 @@
+#[path = "../../../deck-service/tests/support/strays.rs"]
+mod strays;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -2351,6 +2354,7 @@ mod project_sync {
             .prefix("omp-deck-sync-test-")
             .tempdir_in(&cache)
             .unwrap();
+        let _strays = strays::Guard(disk.path().to_path_buf());
         let Some((omp, _)) = real_omp(disk.path(), "same") else {
             return;
         };
@@ -2574,6 +2578,7 @@ mod project_sync {
             .prefix("omp-deck-sync-test-")
             .tempdir_in(&cache)
             .unwrap();
+        let _strays = strays::Guard(disk.path().to_path_buf());
         let Some((omp, _)) = real_omp(disk.path(), "overwrite") else {
             return;
         };
@@ -2645,6 +2650,7 @@ mod project_sync {
             .prefix("omp-deck-sync-test-")
             .tempdir_in(&cache)
             .unwrap();
+        let _strays = strays::Guard(disk.path().to_path_buf());
         if Omp::detect().is_none() {
             eprintln!("omp not found on PATH; skipping the rollback test");
             return;

@@ -7,6 +7,8 @@
 
 #[path = "../../../deck-service/tests/support/fake_model.rs"]
 pub mod fake_model;
+#[path = "../../../deck-service/tests/support/strays.rs"]
+pub mod strays;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -367,6 +369,7 @@ impl Drop for Live {
             let _ = self.namespace.kill(&name);
         }
         prune_ctl_dirs(&self.ns, &std::collections::HashSet::new());
+        strays::stop(&self.root);
         let _ = std::fs::remove_dir_all(&self.ctl);
         let _ = std::fs::remove_dir_all(&self.root);
     }

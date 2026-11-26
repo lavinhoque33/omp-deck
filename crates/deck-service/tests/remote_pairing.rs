@@ -10,6 +10,9 @@
 //! Everything runs in a private HOME/XDG tree under a unique `omp-deck-test-*` namespace; the
 //! real omp store and the real `omp-deck` tmux server are never touched.
 
+#[path = "support/strays.rs"]
+mod strays;
+
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -239,6 +242,7 @@ impl Drop for Sandbox {
                 .args(["-L", &self.ns, "kill-server"])
                 .output();
         }
+        strays::stop(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

@@ -1,5 +1,8 @@
-//! Runs the real `omp` binary, always against a throwaway agent dir (`PI_CODING_AGENT_DIR` is set
-//! per command through `Omp::with_env`; the test process env is never touched).
+//! Runs the real `omp` binary with a throwaway home and agent dir; the test process env is never
+//! touched. Other cases use executable stand-ins to exercise failure paths.
+
+#[path = "../../deck-service/tests/support/strays.rs"]
+mod strays;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,9 +19,15 @@ fn session_lock() -> MutexGuard<'static, ()> {
     SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn sandboxed(agent: &Path) -> Option<Omp> {
+fn sandboxed(home: &Path) -> Option<Omp> {
     match Omp::detect() {
-        Some(o) => Some(o.with_env("PI_CODING_AGENT_DIR", agent)),
+        Some(o) => Some(
+            o.with_env("PI_CODING_AGENT_DIR", home.join("agent"))
+                // omp joins PI_CONFIG_DIR onto HOME.
+                .with_env("PI_CONFIG_DIR", "cfg")
+                .with_env("HOME", home)
+                .with_env("USERPROFILE", home),
+        ),
         None => {
             eprintln!("omp not found; skipping real-omp integration test");
             None
@@ -59,7 +68,8 @@ fn setting<'a>(cat: &'a deck_core::omp::SettingsCatalog, key: &str) -> &'a deck_
 #[test]
 fn set_and_reset_round_trip_in_sandbox() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some(omp) = sandboxed(&tmp.path().join("agent")) else {
+    let _strays = strays::Guard(tmp.path().to_path_buf());
+    let Some(omp) = sandboxed(tmp.path()) else {
         return;
     };
     let cat = omp.load_settings().unwrap();
@@ -93,7 +103,8 @@ fn set_and_reset_round_trip_in_sandbox() {
 #[test]
 fn secret_set_returns_null_and_is_flagged() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some(omp) = sandboxed(&tmp.path().join("agent")) else {
+    let _strays = strays::Guard(tmp.path().to_path_buf());
+    let Some(omp) = sandboxed(tmp.path()) else {
         return;
     };
     let cat = omp.load_settings().unwrap();
@@ -112,7 +123,8 @@ fn secret_set_returns_null_and_is_flagged() {
 #[test]
 fn invalid_value_is_rejected_with_omp_message() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some(omp) = sandboxed(&tmp.path().join("agent")) else {
+    let _strays = strays::Guard(tmp.path().to_path_buf());
+    let Some(omp) = sandboxed(tmp.path()) else {
         return;
     };
     let cat = omp.load_settings().unwrap();
@@ -129,8 +141,9 @@ fn invalid_value_is_rejected_with_omp_message() {
 fn move_session_relocates_and_rewrites_header_cwd() {
     let _guard = session_lock();
     let tmp = tempfile::tempdir().unwrap();
+    let _strays = strays::Guard(tmp.path().to_path_buf());
     let agent = tmp.path().join("agent");
-    let Some(omp) = sandboxed(&agent) else {
+    let Some(omp) = sandboxed(tmp.path()) else {
         return;
     };
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -165,8 +178,9 @@ fn move_session_relocates_and_rewrites_header_cwd() {
 fn move_session_to_missing_dir_fails_and_keeps_original() {
     let _guard = session_lock();
     let tmp = tempfile::tempdir().unwrap();
+    let _strays = strays::Guard(tmp.path().to_path_buf());
     let agent = tmp.path().join("agent");
-    let Some(omp) = sandboxed(&agent) else {
+    let Some(omp) = sandboxed(tmp.path()) else {
         return;
     };
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -244,24 +258,16 @@ fn entry_ids(file: &Path) -> Vec<String> {
         .collect()
 }
 
-/// omp joins `PI_CONFIG_DIR` onto the home directory: the sandbox is the home and `cfg` its
-/// config directory (an absolute value is an invalid path on Windows).
-fn isolate_home(omp: Omp, home: &Path) -> Omp {
-    omp.with_env("PI_CONFIG_DIR", "cfg")
-        .with_env("HOME", home)
-        .with_env("USERPROFILE", home)
-}
-
 #[test]
 fn fork_at_creates_a_new_file_ending_at_the_entry_and_keeps_the_source() {
     let tmp = tempfile::tempdir().unwrap();
+    let _strays = strays::Guard(tmp.path().to_path_buf());
     let agent = tmp.path().join("agent");
     let cwd = tmp.path().join("proj");
     fs::create_dir_all(&cwd).unwrap();
-    let Some(omp) = sandboxed(&agent) else {
+    let Some(omp) = sandboxed(tmp.path()) else {
         return;
     };
-    let omp = isolate_home(omp, tmp.path());
     let src = write_session(&agent, &cwd);
     let before = fs::read(&src).unwrap();
 
@@ -278,15 +284,15 @@ fn fork_at_creates_a_new_file_ending_at_the_entry_and_keeps_the_source() {
 #[test]
 fn copy_session_copies_the_whole_session_with_artifacts_into_the_destination() {
     let tmp = tempfile::tempdir().unwrap();
+    let _strays = strays::Guard(tmp.path().to_path_buf());
     let agent = tmp.path().join("agent");
     let cwd = tmp.path().join("proj");
     let dest = tmp.path().join("dest");
     fs::create_dir_all(&cwd).unwrap();
     fs::create_dir_all(&dest).unwrap();
-    let Some(omp) = sandboxed(&agent) else {
+    let Some(omp) = sandboxed(tmp.path()) else {
         return;
     };
-    let omp = isolate_home(omp, tmp.path());
     let src = write_session(&agent, &cwd);
     let artifacts = src.with_extension("");
     fs::create_dir_all(artifacts.join("artifacts")).unwrap();
@@ -336,15 +342,15 @@ fn copy_session_copies_the_whole_session_with_artifacts_into_the_destination() {
 #[test]
 fn copy_session_finds_the_fork_omp_wrote_before_failing_to_restore_the_model() {
     let tmp = tempfile::tempdir().unwrap();
+    let _strays = strays::Guard(tmp.path().to_path_buf());
     let agent = tmp.path().join("agent");
     let cwd = tmp.path().join("proj");
     let dest = tmp.path().join("dest");
     fs::create_dir_all(&cwd).unwrap();
     fs::create_dir_all(&dest).unwrap();
-    let Some(omp) = sandboxed(&agent) else {
+    let Some(omp) = sandboxed(tmp.path()) else {
         return;
     };
-    let omp = isolate_home(omp, tmp.path());
     let src = write_session(&agent, &cwd);
     // No provider for `fake/fake-1`: nothing to restore the model with.
     fs::remove_file(agent.join("models.yml")).unwrap();

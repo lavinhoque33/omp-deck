@@ -554,6 +554,26 @@ pub(crate) fn serve_args(profile: &Profile) -> Vec<String> {
     ]
 }
 
+/// Binds `endpoint` in a test that dropped its previous listener of it moments ago. The instance
+/// lock is an flock of the open file description, which a child forked by a parallel test (fd
+/// table copied between fork and exec; `O_CLOEXEC` closes it at exec) can briefly share, so the
+/// release may lag the drop. A later owner in production is another process, which never meets
+/// this; a lock that is really kept still fails after 5 s.
+#[cfg(test)]
+pub(crate) fn rebind_released(
+    endpoint: &deck_host::transport::Endpoint,
+) -> deck_host::Result<deck_host::transport::Listener> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match deck_host::transport::Listener::bind(endpoint) {
+            Err(deck_host::Error::AlreadyRunning(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            r => return r,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

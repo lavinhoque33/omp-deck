@@ -3,6 +3,7 @@
 
 pub mod device;
 pub mod fake_model;
+pub mod strays;
 
 /// Make a selected real binary visible to fixture admission and gateway Omp::detect.
 pub fn test_omp_override() -> Option<tempfile::TempDir> {

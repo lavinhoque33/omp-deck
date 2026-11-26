@@ -7,6 +7,9 @@
 //! Everything lives in a temp sandbox: HOME, `PI_*` and `XDG_*` point there.
 //! No prompt is sent, so no model is called.
 
+#[path = "../../deck-service/tests/support/strays.rs"]
+mod strays;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -96,6 +99,7 @@ fn live_omp_serves_a_snapshot_of_its_session_through_the_host() {
 
     // Sandbox.
     let tmp = tempfile::tempdir().unwrap();
+    let _strays = strays::Guard(tmp.path().to_path_buf());
     let home = tmp.path().join("home");
     let agent = home.join(".omp/agent");
     let project = tmp.path().join("project");

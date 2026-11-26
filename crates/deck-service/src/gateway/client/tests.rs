@@ -140,16 +140,18 @@ fn a_dead_owner_fails_pending_requests_and_the_next_owner_gets_the_interests_bac
     until(&mut s, &mut asm, |r| {
         matches!(r, Request::Subscribe(Topic::Inventory))
     });
-    wait_until("link up", || matches!(client.link(), Link::Up(_)));
-    assert_eq!(client.epoch(), Some(ServiceEpoch([1; 16])));
-
-    let q = client.query(Query::OmpVersion);
-    let m = client.mutate(Mutation::InboxClear);
+    // The connection thread publishes the link before it subscribes and fetches, so the fetch is
+    // read here, ahead of this thread's own requests (it follows the subscription on that thread).
     let env = request(&mut s, &mut asm).expect("request");
     assert!(matches!(
         env.body,
         Request::Query(Query::Topic(Topic::Inventory))
     ));
+    wait_until("link up", || matches!(client.link(), Link::Up(_)));
+    assert_eq!(client.epoch(), Some(ServiceEpoch([1; 16])));
+
+    let q = client.query(Query::OmpVersion);
+    let m = client.mutate(Mutation::InboxClear);
     let env = request(&mut s, &mut asm).expect("request");
     assert!(matches!(env.body, Request::Query(Query::OmpVersion)));
     let env = request(&mut s, &mut asm).expect("request");
@@ -181,7 +183,7 @@ fn a_dead_owner_fails_pending_requests_and_the_next_owner_gets_the_interests_bac
         Some(Err(GatewayError::Disconnected))
     ));
 
-    let listener = Arc::new(Listener::bind(&ep).expect("rebind"));
+    let listener = Arc::new(crate::gateway::rebind_released(&ep).expect("rebind"));
     let mut s = accept(&listener);
     hello(&mut s);
     welcome(&mut s, ServiceEpoch([2; 16]), &profile);

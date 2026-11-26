@@ -2,13 +2,16 @@
 //! cancelled Anthropic browser flow. No browser is launched and no real account is logged in.
 //! Opt in with OMPDECK_TEST_OMP=<omp binary>.
 
+#[path = "../../deck-service/tests/support/strays.rs"]
+mod strays;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use deck_core::omp::{LoginEvent, LoginRun, Omp};
 
 struct Sandbox {
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
     omp: Omp,
 }
 
@@ -38,7 +41,13 @@ impl Sandbox {
         ] {
             omp = omp.with_env(key, home.join(subdir));
         }
-        Some(Self { _root: root, omp })
+        Some(Self { root, omp })
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        strays::stop(self.root.path());
     }
 }
 

@@ -1,4 +1,7 @@
 //! Provider-login answers take the transient wire path, never the mutation journal.
+#[path = "support/strays.rs"]
+mod strays;
+
 use deck_service::gateway::Profile;
 use deck_service::gateway::client::{GatewayClient, GatewayOptions};
 use deck_service::gateway::protocol::{
@@ -21,6 +24,7 @@ fn transient_login_answer_never_enters_journal() {
         .prefix("od-auth-")
         .tempdir()
         .expect("sandbox");
+    let _strays = strays::Guard(temp.path().to_path_buf());
     let profile = Profile {
         host_namespace: format!("omp-deck-test-auth-{}", std::process::id()),
         settings: temp.path().join("settings.json"),

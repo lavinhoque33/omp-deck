@@ -1852,7 +1852,9 @@ mod tests {
         t.join().unwrap();
         drop(first);
         // Released with the listener: the next supervisor may take over.
-        assert!(bind_supervisor(&p).is_ok());
+        let ep = endpoint(&p, SUPERVISOR_ENDPOINT).unwrap();
+        let next = crate::gateway::rebind_released(&ep);
+        assert!(next.is_ok(), "{:?}", next.err());
     }
 
     #[test]

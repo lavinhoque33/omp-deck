@@ -16,6 +16,9 @@
 //! real omp store and the real `omp-deck` tmux server are never touched. Skipped (with a
 //! message) when omp is not installed.
 
+#[path = "support/strays.rs"]
+mod strays;
+
 use std::collections::VecDeque;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -225,6 +228,7 @@ impl Drop for Sandbox {
                 .args(["-L", &self.ns, "kill-server"])
                 .output();
         }
+        strays::stop(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

@@ -3,6 +3,9 @@
 //! batch), rejects non-session files, streams one result per target.
 //! Never contacts a real provider. Skips (with a message) when `omp` or `tmux` is not installed.
 
+#[path = "../../deck-service/tests/support/strays.rs"]
+mod strays;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,7 +18,7 @@ const USER: &str = r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2
 const ASSISTANT: &str = r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":2}"#;
 
 struct Sandbox {
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     agent: PathBuf,
     config: PathBuf,
     dir: PathBuf,
@@ -41,7 +44,7 @@ fn sandbox() -> Option<Sandbox> {
         .with_env("HOME", tmp.path())
         .with_env("USERPROFILE", tmp.path());
     Some(Sandbox {
-        _tmp: tmp,
+        tmp,
         agent,
         config,
         dir,
@@ -85,6 +88,12 @@ impl Sandbox {
         walk(&self.dir, &self.dir, &mut out);
         out.sort();
         out
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        strays::stop(self.tmp.path());
     }
 }
 

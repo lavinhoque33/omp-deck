@@ -1,6 +1,9 @@
 //! Worktree detection, status and removal against real git repositories in temp dirs; `create`
 //! against the real omp when `OMPDECK_TEST_OMP=<omp path>` is set (skipped otherwise).
 
+#[path = "../../deck-service/tests/support/strays.rs"]
+mod strays;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -579,6 +582,7 @@ fn create_makes_a_clean_worktree_on_a_new_branch() {
         return;
     };
     let f = fixture();
+    let _strays = strays::Guard(f.root.clone());
     let (omp, sandbox) = sandboxed_omp(&f, omp_bin);
 
     git(&f.repo, &["branch", "base-x"]);
@@ -627,6 +631,7 @@ fn add_existing_with_real_omp_checks_out_the_existing_branch() {
         return;
     };
     let f = fixture();
+    let _strays = strays::Guard(f.root.clone());
     let (omp, sandbox) = sandboxed_omp(&f, omp_bin);
     let parked = linked(&f, "p", "parked/real");
     commit(&parked.path, "p.txt", "parked work");
