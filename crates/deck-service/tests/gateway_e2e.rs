@@ -1,6 +1,7 @@
 //! The gateway as a real process with real omp, no GUI: concurrent startup gives one owner, a
 //! session is launched and controlled through the private IPC alone, a lost owner is replaced and
-//! re-adopts the live backend session, and a stopped session is only that session.
+//! re-adopts the live backend session, a stopped session is only that session (its exit reads as
+//! stopped, not crashed), and starting it again runs omp anew instead of the dead controller.
 //!
 //! Everything runs in a private HOME/XDG tree under a unique `omp-deck-test-*` namespace (backend
 //! sockets included); the real omp store and the real `omp-deck` tmux server are never touched.
@@ -464,13 +465,60 @@ fn headless_gateway_controls_real_omp_without_a_gui() {
         Some(Ok(Outcome::Done(_))) => {}
         other => panic!("kill outcome: {other:?}"),
     }
-    wait_for("the process to end", Duration::from_secs(30), || {
+    let ended = wait_for("the process to end", Duration::from_secs(30), || {
         let list = controllers(&client);
         (!list
             .iter()
             .any(|c| c.label == "e2e" && c.exit_code.is_none()))
-        .then_some(())
+        .then(|| {
+            list.into_iter()
+                .find(|c| c.target.key == adopted.target.key)
+        })
     });
+    // A process the user killed did not crash, whatever signal ended it.
+    let ended = ended.expect("the killed session stays listed until it is closed");
+    assert_eq!(
+        ended.status,
+        deck_service::status::TabStatus::Exited { clean: true },
+        "a killed session reads as stopped: {ended:?}"
+    );
+
+    // Starting the session again runs omp anew instead of handing back the dead controller.
+    let relaunch = client.mutate(Mutation::Launch(LaunchSpec {
+        agent_child: false,
+        mux_name: Some("omp-new-gwe2e".into()),
+        cwd: sb.proj(),
+        session_path: None,
+        label: "e2e".into(),
+        argv: vec!["omp".into()],
+        role: SessionRole::Session,
+        copy_of: None,
+        view: Default::default(),
+    }));
+    let fresh = match relaunch.outcome.wait(Duration::from_secs(60)) {
+        Some(Ok(Outcome::Done(d))) => match *d {
+            Done::Session(t, _) => t,
+            other => panic!("relaunch result: {other:?}"),
+        },
+        other => panic!("relaunch outcome: {other:?}"),
+    };
+    assert!(
+        fresh.generation > adopted.target.generation,
+        "a relaunch is a new generation: {fresh:?} vs {:?}",
+        adopted.target
+    );
+    wait_for("the relaunched omp", Duration::from_secs(60), || {
+        controllers(&client)
+            .into_iter()
+            .find(|c| c.target == fresh && c.exit_code.is_none())
+            .map(|_| ())
+    });
+    assert!(
+        !controllers(&client)
+            .iter()
+            .any(|c| c.target == adopted.target),
+        "the exited controller is gone"
+    );
 }
 
 fn which(program: &str) -> Option<PathBuf> {

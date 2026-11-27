@@ -1173,6 +1173,11 @@ reservePct, reserveSource: "global"|"override", reclaimAbovePct?, state: "eligib
   amber `!` badge, `widgets::Spin`, warn dot; Idle → caller's own icon/LED) for the tab strip, the
   "Open tabs" rows and session rows; `tabs::paint_attention_pill` tints Attention pills/rows. No pulse:
   idle frames stay free (the spinner repaints at 10 fps only while visible).
+- An exit the user asked for (Stop, Kill, the sidebar's stop by backend name, a view's kill) reads as
+  `Exited { clean: true }` everywhere (gateway `Managed::status`: phone "Exited", not "Crashed"; notifications,
+  Orchestration); the raw `exit_code` stays the signal's. A launch (phone Resume, sidebar open) that matches an
+  exited controller replaces it (`reuse_launch`): omp starts again and a view of the same backend name follows the
+  new generation (2026-11-26).
 - Tab labels use `Tab::label` (omp's `π <glyph>` prefix stripped, also from stored fallback titles);
   `Tab::title` stays raw for persistence/kill labels.
 - Background tabs: `Terminal::poll` runs every frame for every tab; title events repaint through the

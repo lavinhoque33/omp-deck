@@ -329,6 +329,8 @@ pub(super) struct Managed {
     spawned_ms: u64,
     /// A journaled close waiting for the controller to settle.
     closing: Option<RequestKey>,
+    /// The user stopped or killed the process: its exit is not a crash, whatever the signal.
+    stopped: bool,
     /// Set only for a deliberately detached backend session.
     parking: Option<Parking>,
     /// The view owning focus, geometry, palette and the clipboard.
@@ -441,6 +443,15 @@ impl Managed {
 
     pub(super) fn exited(&self) -> bool {
         self.ctl.terminal().is_exited()
+    }
+
+    /// The session's indicator as every client shows it; an exit the user asked for is clean.
+    pub(super) fn status(&self) -> crate::status::TabStatus {
+        use crate::status::TabStatus;
+        match self.ctl.status(false) {
+            TabStatus::Exited { .. } if self.stopped => TabStatus::Exited { clean: true },
+            status => status,
+        }
     }
 
     /// The folder omp runs in now (its breadcrumb), else the one it was launched in.
@@ -777,7 +788,7 @@ impl Engine {
                     title: m.ctl.terminal().title().map(str::to_owned),
                     activity: m.ctl.activity(),
                     exit_code: m.ctl.terminal().exit_code(),
-                    status: m.ctl.status(false),
+                    status: m.status(),
                     busy: m.ctl.is_busy() || self.checkpoint_restore_busy(m.ctl.target()),
                     current_model: m.ctl.current_model(),
                     pending_switch: m.ctl.pending_switch().map(SwitchInfo::from),
@@ -1551,6 +1562,7 @@ impl Engine {
     /// Ends this session's process only (`key`: the journaled Kill; `None`: a view's kill).
     pub(super) fn kill_session(&mut self, i: usize, key: Option<RequestKey>) {
         let m = &mut self.sess.managed[i];
+        m.stopped = true;
         match (&m.mux, &m.mux_name) {
             (Some(mux), Some(name)) => {
                 let (mux, name) = (mux.clone(), name.clone());
@@ -1579,9 +1591,19 @@ impl Engine {
         }
     }
 
+    /// The controllers of backend sessions `names` are about to be stopped by the user.
+    pub(super) fn mark_stopped(&mut self, names: &[String]) {
+        for m in &mut self.sess.managed {
+            if m.mux_name.as_ref().is_some_and(|n| names.contains(n)) {
+                m.stopped = true;
+            }
+        }
+    }
+
     /// Graceful stop of this session's backend process only.
     pub(super) fn stop_session(&mut self, i: usize, key: RequestKey) {
         let m = &mut self.sess.managed[i];
+        m.stopped = true;
         match &m.mux_name {
             Some(name) if m.mux.is_some() => {
                 let (backends, name) = (self.backends.clone(), name.clone());
@@ -2364,14 +2386,15 @@ impl Engine {
             return Some(job);
         }
         let name = name.or(job.spec.mux_name.as_deref());
-        let Some(m) = self
+        let Some(i) = self
             .sess
             .managed
-            .iter_mut()
-            .find(|m| m.matches_launch(&job.spec, name))
+            .iter()
+            .position(|m| m.matches_launch(&job.spec, name))
         else {
             return Some(job);
         };
+        let m = &mut self.sess.managed[i];
         if m.parking_in_flight() || (m.parking.is_some() && m.exited()) {
             if matches!(m.parking, Some(Parking::Requested { until, .. } | Parking::Stopping { until }) if Instant::now() >= until)
             {
@@ -2391,6 +2414,14 @@ impl Engine {
             self.sess.launches.push_back(job);
             return None;
         }
+        if m.exited() {
+            // A dead controller is no session to hand back: the launch starts omp again, and a
+            // view of the same backend name follows the new generation.
+            let session = self.remove_session(i, ViewEnd::Stale, Instant::now());
+            log::debug!("replacing the exited {session}");
+            return Some(job);
+        }
+        let m = &mut self.sess.managed[i];
         // The reopen has arrived even if its view has not connected yet.
         self.dirty.parking |= m.parking.take().is_some();
         let view = m.view;
@@ -2662,6 +2693,7 @@ impl Engine {
                     ctl_key,
                     spawned_ms: crate::gateway::unix_ms(),
                     closing: None,
+                    stopped: false,
                     parking: None,
                     controlling: None,
                     copy,

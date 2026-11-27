@@ -730,7 +730,7 @@ impl Engine {
                 .unwrap_or_default(),
             status: managed.map_or_else(
                 || TabStatus::of((!live).then_some(0), activity, false),
-                |m| m.ctl.status(false),
+                |m| m.status(),
             ),
             busy: activity == Activity::Busy || managed.is_some_and(|m| m.ctl.is_busy()),
             live,

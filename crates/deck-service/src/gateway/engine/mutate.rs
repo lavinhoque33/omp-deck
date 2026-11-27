@@ -848,6 +848,7 @@ impl Engine {
                 // Only the named backend sessions; a controller of one sees its terminal end,
                 // exactly as after `Kill`.
                 self.accepted(conn, id, &key);
+                self.mark_stopped(&names);
                 self.job(
                     key,
                     "kill-names",

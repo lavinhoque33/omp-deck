@@ -73,7 +73,7 @@ impl Engine {
                 let target = m.ctl.target();
                 Observation {
                     target,
-                    status: m.ctl.status(false),
+                    status: m.status(),
                     exit_code: m.ctl.terminal().exit_code(),
                     session: m.ctl.session_path(),
                     title,

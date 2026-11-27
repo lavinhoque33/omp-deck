@@ -238,12 +238,14 @@ export function ConversationScreen({
         ))}
         </div>
       </div>
-      {live !== null ? (
+      {live !== null && live.status.state !== 'exited' ? (
         <Composer live={live} busy={busy} share={contextShare} onMeter={() => setSheet('meter')} />
       ) : session !== null ? (
         <div className="composer">
           <div className="line spread">
-            <span className="muted small">This session is not running on the desktop.</span>
+            <span className="muted small">
+              {live === null ? 'This session is not running on the desktop.' : 'omp has exited on the desktop.'}
+            </span>
             <button
               type="button"
               className="button primary"
