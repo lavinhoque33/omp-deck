@@ -108,6 +108,12 @@ pub fn serve(opts: &ServeOptions<'_>) -> Result<()> {
     let _ = opts.foreground;
 
     crate::logfile::init(ns.log_path(opts.name).as_deref());
+    // Before the program starts: it and everything it runs inherit the scope.
+    #[cfg(target_os = "linux")]
+    crate::scope::enter_own(
+        "host",
+        &format!("OmpDeck session {} ({})", opts.name, opts.ns),
+    );
     let result = start(&endpoint, opts.name, request);
     let (shared, listener) = match result {
         Ok(started) => started,

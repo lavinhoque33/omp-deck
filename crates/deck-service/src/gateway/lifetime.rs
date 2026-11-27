@@ -942,6 +942,14 @@ pub fn supervise(startup_file: &Path, context: StartupContext) -> i32 {
         profile.settings.display(),
         own.program.display()
     );
+    // An in-place update replaces the programs, not the unit: bring its text up to date (the
+    // reload leaves this running supervisor alone).
+    #[cfg(unix)]
+    match autostart::refresh(&startup_for(&context, startup_file)) {
+        Ok(true) => log::info!("rewrote the outdated gateway supervisor unit"),
+        Ok(false) => {}
+        Err(e) => log::warn!("updating the gateway supervisor unit: {e}"),
+    }
     let code = supervise_loop(startup_file, &mut context, &own);
     listener.remove();
     code

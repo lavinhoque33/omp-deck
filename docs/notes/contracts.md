@@ -2680,8 +2680,9 @@ crashed supervisor (systemd `Restart=`; on Windows the repeating trigger, within
 Supervisors are not GUI clients and hold no session controller/input rights.
 They exit when Background is disabled and honor update maintenance barriers.
 
-Linux uses `KillMode=process`: stopping the supervisor must not kill host/omp descendants that
-share its cgroup. Windows registration removal never uses task-tree termination. Mode changes
+Linux uses `KillMode=process` and `OOMPolicy=continue`: stopping the supervisor must not kill host/omp descendants
+that share its cgroup, and an OOM kill of one of them must not stop the unit (section "systemd scopes: one OOM kill
+takes one session"). Windows registration removal never uses task-tree termination. Mode changes
 register/start/remove supervision through the gateway and report desired/effective state;
 failed registration cannot leave a falsely enabled mode or duplicate autostart entries.
 
@@ -5568,3 +5569,33 @@ omp's memory only, so the phone kept showing abandoned branches and appended new
 - Accepted limits: images of a re-edited prompt are not carried to the phone composer; sessions launched before this
   version (older extension in memory) follow jumps made from OmpDeck (reply anchor) but not jumps made in omp's own
   `/tree` until the next entry is written, and keep the prompt text in omp's editor.
+
+## systemd scopes: one OOM kill takes one session (user, 2026-11-26)
+
+Incident (2026-11-19): the kernel OOM-killed one tool run (`python3`, 23 GB) inside the KDE launcher unit
+`app-omp\x2ddeck@….service` (`OOMPolicy=stop`, `KillMode=control-group`, `ExitType=cgroup`); systemd then stopped
+the unit, and every process in it died: GUI, gateway, every session host and omp. systemd-oomd (this Fedora box: memory
+pressure of `user@1000.service` and of its `app.slice`, `oomctl dump`) kills a whole cgroup the same way.
+
+- `deck_host::scope::enter_own(role, description)` (Linux only) moves the calling process into a new transient scope
+  `app-omp\x2ddeck-<role>_<pid>_<8 hex>.scope` (the XDG `app-<ApplicationID>-<RANDOM>.scope` scheme, so desktop
+  tools attribute it to OmpDeck) with `busctl --user call … Manager.StartTransientUnit`: `Description`, `PIDs` (its
+  own), `Slice` = the innermost slice it runs in now (`app.slice` when none), `CollectMode=inactive-or-failed`,
+  `OOMPolicy=continue` (retried without it when systemd < 253 rejects the property; scopes there are never stopped on
+  an OOM kill). The call returns once the start job is queued, so it waits ≤ 1 s until `/proc/self/cgroup` names the
+  scope. Skipped (debug log; the process stays) without a cgroup v2 line or outside `…/user@<uid>.service/…` (login
+  session scopes, system services, CI runners: that user manager cannot move them); a failed call logs a warning.
+- Callers, once, before starting any child (children inherit the cgroup; processes started earlier stay behind):
+  `omp-deck-host serve` after daemonizing and opening its log, before the program starts (role `host`,
+  `OmpDeck session <name> (<ns>)`), and `omp-deck-gateway serve` after daemonizing and opening its log, before it
+  serves (role `gateway`, `OmpDeck gateway (<ns>)`). Hosts the gateway starts inherit its scope, then move into
+  their own. The GUI stays in the launcher's unit (it is that unit's main process).
+- Effect: an OOM kill loses only the killed process (that session's omp sees its tool fail); oomd's whole-cgroup kill
+  picks one session's scope. Not covered: tmux-backed sessions (one tmux server), omp's shared daemon (it lives in the
+  scope of the session that first started it), and hosts or gateways started by an older version (they move only when
+  restarted).
+- Supervisor unit: `OOMPolicy=continue` (with `KillMode=process` an OOM stop only restarted the supervisor, still
+  churn). `platform::gateway::refresh` (systemd only) rewrites an owned, outdated unit and runs `daemon-reload` (never
+  enables, starts or stops; a failed reload restores the old text); `omp-deck-gateway supervise` calls it at start,
+  because an in-place update replaces the programs, not the unit (install.sh's `resume` re-registers anyway), and the
+  status would otherwise call the registration "(outdated)".

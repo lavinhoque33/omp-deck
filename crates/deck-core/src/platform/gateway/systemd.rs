@@ -1,9 +1,11 @@
 //! The user systemd unit that supervises the gateway.
 //!
-//! `KillMode=process` is mandatory: the supervisor shares its cgroup with every session host and
-//! omp child ever spawned under it (`setsid` does not leave a cgroup), so stopping the unit must
-//! signal the supervisor only. There is no finite stop timeout and no `SIGKILL` either, so a
-//! stop never cuts an accepted job short.
+//! `KillMode=process` is mandatory: the supervisor may share its cgroup with session hosts and
+//! omp children spawned under it (`setsid` does not leave a cgroup; hosts and the gateway move
+//! into scopes of their own where they can, `deck_host::scope`, but older ones stay), so stopping
+//! the unit must signal the supervisor only. There is no finite stop timeout and no `SIGKILL`
+//! either, so a stop never cuts an accepted job short. `OOMPolicy=continue`: the kernel
+//! OOM-killing one of those processes must not stop (and restart) the unit.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,6 +73,7 @@ pub(super) fn render(startup: &Startup) -> Result<String, AutostartError> {
          Restart=on-failure\n\
          RestartSec=5\n\
          KillMode=process\n\
+         OOMPolicy=continue\n\
          SendSIGKILL=no\n\
          TimeoutStopSec=infinity\n\
          \n\
@@ -183,6 +186,33 @@ pub(super) fn register(
         name: unit,
         path: Some(path),
     })
+}
+
+/// Rewrites OmpDeck's existing unit when its text is out of date (an in-place update replaces the
+/// programs, not the unit) and reloads the manager; a running supervisor keeps running. Never
+/// creates, enables, starts or stops anything: `Ok(false)` when there is no unit or it is
+/// current. A failed reload puts the previous text back.
+pub(super) fn refresh(
+    dir: &Path,
+    startup: &Startup,
+    run: Runner<'_>,
+) -> Result<bool, AutostartError> {
+    let text = render(startup)?;
+    let path = dir.join(unit_name(&startup.namespace));
+    let Some(previous) = read_owned(&path, &startup.namespace)? else {
+        return Ok(false);
+    };
+    if previous == text {
+        return Ok(false);
+    }
+    ensure_manager(run)?;
+    super::super::write_private(&path, text.as_bytes()).map_err(|e| io_error(&path, e))?;
+    if let Err(e) = ctl_ok(run, &["daemon-reload"]) {
+        let _ = super::super::write_private(&path, previous.as_bytes());
+        let _ = ctl(run, &["daemon-reload"]);
+        return Err(e);
+    }
+    Ok(true)
 }
 
 pub(super) fn start(
@@ -322,6 +352,7 @@ mod tests {
         for line in [
             "Restart=on-failure",
             "KillMode=process",
+            "OOMPolicy=continue",
             "SendSIGKILL=no",
             "TimeoutStopSec=infinity",
             "WantedBy=default.target",
@@ -512,6 +543,35 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!got.current);
+    }
+
+    #[test]
+    fn refresh_rewrites_only_an_outdated_owned_unit_and_never_enables_or_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::new("");
+        let run = fake.runner();
+        assert!(!refresh(dir.path(), &startup(), &run).unwrap());
+        assert!(fake.calls().is_empty());
+        register(dir.path(), &startup(), &run).unwrap();
+        let path = dir.path().join(unit_name("omp-deck"));
+        let current = fs::read_to_string(&path).unwrap();
+        fake.calls.borrow_mut().clear();
+        assert!(!refresh(dir.path(), &startup(), &run).unwrap());
+        assert!(fake.calls().is_empty());
+        // A unit written before `OOMPolicy=continue`.
+        let older = current.replace("OOMPolicy=continue\n", "");
+        fs::write(&path, &older).unwrap();
+        assert!(refresh(dir.path(), &startup(), &run).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), current);
+        assert_eq!(
+            fake.calls(),
+            ["--user show-environment", "--user daemon-reload"]
+        );
+        // A failed reload leaves the older text in place.
+        fs::write(&path, &older).unwrap();
+        let down = Fake::new("--user daemon-reload");
+        assert!(refresh(dir.path(), &startup(), &down.runner()).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), older);
     }
 
     #[test]

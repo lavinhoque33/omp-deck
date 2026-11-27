@@ -310,6 +310,13 @@ fn serve(a: &Args, profile: Profile, context: Option<StartupContext>) -> i32 {
         profile.id().as_str(),
         std::process::id()
     );
+    // Before any job, session or launch: what it starts inherits the scope (session hosts move
+    // on into scopes of their own).
+    #[cfg(target_os = "linux")]
+    deck_host::scope::enter_own(
+        "gateway",
+        &format!("OmpDeck gateway ({})", profile.host_namespace),
+    );
     #[cfg(unix)]
     let ready: Option<Box<dyn FnOnce()>> = ready_fd
         .map(|fd| Box::new(move || deck_host::daemon::signal_ready(fd)) as Box<dyn FnOnce()>);

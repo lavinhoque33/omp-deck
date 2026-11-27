@@ -17,6 +17,8 @@ mod namespace;
 pub mod protocol;
 pub mod pty;
 pub mod run_state;
+#[cfg(target_os = "linux")]
+pub mod scope;
 pub mod snapshot;
 mod spawn;
 pub mod transport;

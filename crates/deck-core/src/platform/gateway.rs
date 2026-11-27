@@ -165,6 +165,15 @@ pub fn inspect(startup: &Startup) -> Result<Option<Inspection>, AutostartError> 
     os::inspect(startup)
 }
 
+/// Rewrites OmpDeck's existing unit when its text is out of date (an in-place update replaces the
+/// programs, not the unit). Never creates, enables, starts or stops anything; `Ok(false)` when
+/// there is none or it is current. systemd only: the Windows task has not changed shape.
+#[cfg(unix)]
+pub fn refresh(startup: &Startup) -> Result<bool, AutostartError> {
+    startup.validate(host_absolute)?;
+    os::refresh(startup)
+}
+
 /// Removes OmpDeck's registration for `namespace` (disables autostart, deletes the unit / task).
 /// `Ok(false)` = there was none. A running supervisor is neither stopped nor are any processes
 /// terminated. A same-named registration that is not OmpDeck's is left alone:
@@ -267,6 +276,10 @@ mod os {
 
     pub fn inspect(startup: &Startup) -> Result<Option<Inspection>, AutostartError> {
         systemd::inspect(&systemd::user_unit_dir()?, startup, &run)
+    }
+
+    pub fn refresh(startup: &Startup) -> Result<bool, AutostartError> {
+        systemd::refresh(&systemd::user_unit_dir()?, startup, &run)
     }
 
     pub fn remove(namespace: &str) -> Result<bool, AutostartError> {
