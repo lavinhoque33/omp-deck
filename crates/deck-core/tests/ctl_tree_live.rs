@@ -355,10 +355,7 @@ fn navigate_takes_a_prompt_and_its_images_without_clobbering_existing_text() {
         cursor: draft.len() as u32,
         len: 0,
     }]);
-    assert_eq!(
-        live.ctl(CtlCommand::EditorState, TURN).editor_empty(),
-        Some(false)
-    );
+    editor_settles(&live, false);
     check_outcome(navigate("prompt"));
     wait_for("untouched draft", TURN, || {
         live.peek().to_string().contains(draft).then_some(())
@@ -374,10 +371,7 @@ fn navigate_takes_a_prompt_and_its_images_without_clobbering_existing_text() {
         cursor: 0,
         len: draft.len() as u32,
     }]);
-    assert_eq!(
-        live.ctl(CtlCommand::EditorState, TURN).editor_empty(),
-        Some(true)
-    );
+    editor_settles(&live, true);
 
     // Paste an actual image path into omp and submit via Enter. TSP Send would replace
     // the draft and lose the attachment rather than expanding the native composer chip.
@@ -394,7 +388,8 @@ fn navigate_takes_a_prompt_and_its_images_without_clobbering_existing_text() {
         &live,
         format!("\x1b[200~{}\x1b[201~", image.display()).as_bytes(),
     );
-    wait_for("omp's pasted image chip", Duration::from_secs(12), || {
+    // omp reads and decodes the pasted file first: slow under parallel test load.
+    wait_for("omp's pasted image chip", TURN, || {
         live.peek().to_string().contains("#1").then_some(())
     });
     let native_prompt = "attached prompt (literal [Image #9])";
@@ -452,6 +447,20 @@ fn navigate_takes_a_prompt_and_its_images_without_clobbering_existing_text() {
         Some(false),
         "leave the whole prompt in omp's editor",
     );
+}
+
+/// Waits until omp's editor is (`empty`) or is not empty. A TSP edit reaches omp through the
+/// PTY and `EditorState` through the ctl socket, so a query sent right after the edit can be
+/// answered before omp has read the edit.
+fn editor_settles(live: &Live, empty: bool) {
+    let what = if empty {
+        "omp's editor emptied"
+    } else {
+        "omp's editor holding the draft"
+    };
+    wait_for(what, TURN, || {
+        (live.ctl(CtlCommand::EditorState, TURN).editor_empty() == Some(empty)).then_some(())
+    });
 }
 
 /// Aborting with no summary in flight is a no-op success: the leaf is unchanged and no
