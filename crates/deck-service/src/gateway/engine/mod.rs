@@ -10,6 +10,7 @@
 
 mod agent_tools;
 mod auth;
+mod bookmarks;
 pub(super) mod checkpoints;
 mod deferred;
 mod device;
@@ -231,6 +232,8 @@ pub(crate) enum Fin {
     Device(Box<device::DeviceFin>),
     /// A worktree flow's worker result ([`worktree::WtFin`]).
     Worktree(Box<worktree::WtFin>),
+    /// A tab's bookmark follow ([`bookmarks`]).
+    BookmarkFollow(bookmarks::Followed),
 }
 
 /// Results the schedules own ([`Engine::on_schedule_fin`]).
@@ -397,7 +400,8 @@ struct JobState {
 struct Published {
     gateway: Option<GatewayStatus>,
     settings_rev: Option<u64>,
-    sessions_gen: Option<u64>,
+    /// Sessions-watcher generation and bookmark revision.
+    sessions_gen: Option<(u64, u64)>,
     running: Option<Arc<RunningSnapshot>>,
     status: Option<(
         Option<SessionTarget>,
@@ -479,6 +483,8 @@ pub(crate) struct Engine {
     worktree: worktree::Worktrees,
     /// Commands typed into sessions later ([`deferred`]).
     defer: deferred::Deferred,
+    /// Bookmarks that follow their tab ([`bookmarks`]).
+    bookmarks: bookmarks::Bookmarks,
 
     barrier: Option<MaintenanceMarker>,
     exit_requested: bool,
@@ -621,6 +627,7 @@ impl Engine {
             devices: device::Devices::default(),
             worktree: worktree::Worktrees::default(),
             defer: deferred::Deferred::default(),
+            bookmarks: bookmarks::Bookmarks::default(),
             barrier: None,
             exit_requested: false,
             stopping: false,
@@ -833,6 +840,7 @@ impl Engine {
             } => self.on_review_built(key, target, send, result),
             Fin::OpenUrl(url) => self.open_url(url),
             Fin::Device(f) => self.on_device_fin(*f),
+            Fin::BookmarkFollow(result) => self.on_bookmark_follow(result),
         }
     }
 
@@ -1399,7 +1407,7 @@ impl Engine {
             self.published.gateway = Some(status);
             self.changed(Topic::Gateway);
         }
-        let generation = self.sessions_watch.generation();
+        let generation = (self.sessions_watch.generation(), self.bookmarks.revision);
         if self.published.sessions_gen != Some(generation) {
             self.published.sessions_gen = Some(generation);
             self.changed(Topic::Sessions);
@@ -1471,6 +1479,7 @@ impl Engine {
                 root: self.root.path.clone(),
                 root_exists: self.sessions_watch.root_exists(),
                 groups: self.sessions_watch.latest().unwrap_or_default(),
+                pins_revision: self.bookmarks.revision,
             }),
             Topic::Running => TopicValue::Running(self.running_view()),
             Topic::Controllers => TopicValue::Controllers(self.controller_infos()),

@@ -34,6 +34,8 @@ pub(super) enum Post {
     None,
     /// Rescan the sessions and poll the backends.
     Refresh,
+    /// [`Post::Refresh`] after a pin write: clients re-read the pins.
+    Pins,
     /// A device's fork/copy outcome waits until it names a resumable session.
     RefreshCreated,
     /// Recompute the changes of this repository (when followed).
@@ -614,6 +616,12 @@ impl Engine {
                 Post::Refresh | Post::RefreshCreated => {
                     self.sessions_watch.refresh_now();
                     self.running.poke();
+                }
+                Post::Pins => {
+                    self.sessions_watch.refresh_now();
+                    self.running.poke();
+                    // Even a failure may have written: omp replaces the file before it answers.
+                    self.bookmarks.revision += 1;
                 }
                 Post::Changes(root) => self.refresh_changes(&root),
                 Post::CheckpointRestore(session) => self.finish_checkpoint_restore(&key, &session),

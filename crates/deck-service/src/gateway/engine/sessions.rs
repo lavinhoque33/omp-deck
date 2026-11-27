@@ -2158,6 +2158,7 @@ impl Engine {
         }
         self.sess.last_running = Some(snap.clone());
         let mut stale: Vec<SessionKey> = Vec::new();
+        let mut followed: Vec<(PathBuf, PathBuf)> = Vec::new();
         for m in &mut self.sess.managed {
             if m.role != SessionRole::Session || m.copy.is_some() || m.exited() {
                 continue;
@@ -2168,14 +2169,25 @@ impl Engine {
             let Some(p) = followed_path(m.ctl.session_path(), snap.files_of(name)).cloned() else {
                 continue;
             };
+            let from = m
+                .ctl
+                .session_path()
+                .filter(|f| *f != p.as_path())
+                .map(Path::to_path_buf);
             if m.set_session_path(Some(p)) {
                 stale.push(m.ctl.target().key.clone());
+                if let (Some(from), Some(to)) = (from, m.ctl.session_path()) {
+                    followed.push((from, to.to_path_buf()));
+                }
             }
             self.sess.manifest_dirty = true;
             self.dirty.controllers = true;
         }
         for key in stale {
             self.end_views(&key, ViewEnd::Stale);
+        }
+        for (from, to) in followed {
+            self.tab_followed(from, to);
         }
     }
 

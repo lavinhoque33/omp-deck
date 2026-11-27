@@ -5599,3 +5599,30 @@ pressure of `user@1000.service` and of its `app.slice`, `oomctl dump`) kills a w
   enables, starts or stops; a failed reload restores the old text); `omp-deck-gateway supervise` calls it at start,
   because an in-place update replaces the programs, not the unit (install.sh's `resume` re-registers anyway), and the
   status would otherwise call the registration "(outdated)".
+
+## Bookmarks follow their tab across omp 19.2 rewinds (user, 2026-11-26)
+
+omp 19.2 moves a conversation onto a new session file (new id, header `parentSession`) on a rewind (Esc Esc,
+`/branch`, `/rewind`), a turn's Edit & resend or Retry, a turn-menu/entry fork, a `/btw` "Branch into chat", `/fork`
+and a continuation off a contested file; a rewind's Undo resumes the old file. Host tabs follow (breadcrumbs), but omp
+never carries a pin. User decision (default of "move, copy or leave"): the bookmark **moves** with the tab.
+
+- `deck_core::sessions::lineage(path) -> io::Result<Option<Lineage { id, parent }>>` (bounded header read; `None`
+  while the file has no header with an id). `deck_core::pins::followed_bookmark((from, &Lineage), (to, &Lineage),
+  &pinned) -> Option<(unpin, pin)>`: one file names the other as its parent (forward: rewind/fork/btw/`/fork`/
+  continuation; backward: Undo or resuming the parent), compared as `parent == id` or by file name (the name carries
+  the id: other spellings and a `/move`d parent still match); only one level; same id (`/move`) never; only when
+  `from` is pinned and `to` is not.
+- Owner: the gateway (`engine/bookmarks.rs`), so it works without a GUI. Hooked only in `follow_session_files` (a
+  tab's backend files moved from one `Some` path to another); `SetSessionPath`, the fresh-file resolution and
+  relocations keep the session id and are not hooked. Moves run one at a time, oldest first, on a worker: read
+  `from`'s header (missing → nothing), read the pins (not pinned → done at once), wait ≤ 3 s (100 ms polls) for `to`'s
+  header (`/fork` names its file before writing it), then `Omp::set_pinned(to, true)` before `set_pinned(from,
+  false)`: a failure in between leaves both bookmarked, never none. Never writes the pins file directly.
+- `SessionsView.pins_revision: u64` (`#[serde(default)]`) counts the gateway's pin writes (these moves, and the
+  `SessionPin` mutation through `Post::Pins`); it is part of the Sessions topic's change key. The GUI re-reads the
+  pins (`Query::SessionPins`) whenever it differs from the last one seen, so the sidebar, tabs and Session Manager
+  show the moved mark.
+- Limits: tmux tabs follow (and so move the bookmark) only once omp holds the new file open (its next write);
+  direct-PTY tabs never follow. OmpDeck's own tree-view Fork (`fork_at`) leaves the live session in place: nothing
+  moves.

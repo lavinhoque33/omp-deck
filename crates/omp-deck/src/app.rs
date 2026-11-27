@@ -394,6 +394,8 @@ pub struct App {
     bookmarked_paths: HashSet<PathBuf>,
     /// Session and bookmark revisions reflected in the path lookups above.
     session_cache_key: Option<(u64, u64)>,
+    /// The gateway's pins revision the bookmarks were last read for.
+    pins_seen: u64,
     /// Revision of the controllers topic the tabs last took their records from.
     controllers_rev: u64,
     filter: String,
@@ -646,6 +648,7 @@ impl App {
             labels: HashMap::new(),
             bookmarked_paths: HashSet::new(),
             session_cache_key: None,
+            pins_seen: 0,
             controllers_rev: 0,
             filter: String::new(),
             scope,
@@ -1413,6 +1416,12 @@ impl App {
     }
 
     fn refresh_sessions_cache(&mut self) {
+        // A bookmark moved with its tab (or another client changed one): read omp's pins again.
+        let pins = self.gw.pins_revision();
+        if pins != self.pins_seen {
+            self.pins_seen = pins;
+            self.load_pins();
+        }
         let key = (
             self.gw.revision(&Topic::Sessions),
             self.sessions.model.bookmark_revision(),

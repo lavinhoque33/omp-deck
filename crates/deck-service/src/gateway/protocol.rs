@@ -859,6 +859,11 @@ pub struct SessionsView {
     pub root: PathBuf,
     pub root_exists: bool,
     pub groups: std::sync::Arc<Vec<ProjectGroup>>,
+    /// Changes whenever the gateway wrote omp's session pins (a bookmark set from a client or one
+    /// that followed its tab onto a new session file): clients read the pins again. Absent from an
+    /// older gateway (0).
+    #[serde(default)]
+    pub pins_revision: u64,
 }
 
 /// Where a controlled session runs.

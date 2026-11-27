@@ -321,6 +321,26 @@ fn header_fork(path: &Path) -> io::Result<Option<ForkHeader>> {
     Ok(None)
 }
 
+/// Where a session file came from, as its header says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lineage {
+    /// Header session `id`.
+    pub id: String,
+    /// Header `parentSession` exactly as written: an absolute path or a session id.
+    pub parent: Option<String>,
+}
+
+/// The [`Lineage`] of the session file at `path`, from its first [`HEADER_LIMIT`] bytes; `None`
+/// while it has no session header with an id (omp can name a new file before writing it).
+pub fn lineage(path: &Path) -> io::Result<Option<Lineage>> {
+    Ok(header_fork(path)?.and_then(|h| {
+        Some(Lineage {
+            id: h.id?,
+            parent: h.parent,
+        })
+    }))
+}
+
 /// Every top-level session `.jsonl` under `root` (real files; sibling artifact directories such
 /// as subagent transcripts are never entered; prompt-less stubs included) whose header `cwd` is
 /// `dir` or lies inside it, textually or after resolving symlinks, as `(path, header session

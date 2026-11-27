@@ -117,7 +117,7 @@ impl Engine {
                     "session-pin",
                     None,
                     false,
-                    Post::Refresh,
+                    Post::Pins,
                     move |ctx, _, _| jobs::session_pin(ctx, &session, pinned),
                 );
             }

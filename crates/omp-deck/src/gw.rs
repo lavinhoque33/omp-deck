@@ -579,6 +579,15 @@ impl Gw {
             .map_or(0, |s| s.generation)
     }
 
+    /// Bumped whenever the gateway wrote omp's session pins: read them again.
+    pub fn pins_revision(&self) -> u64 {
+        self.client
+            .state()
+            .sessions
+            .get()
+            .map_or(0, |s| s.pins_revision)
+    }
+
     pub fn sessions_root_exists(&self) -> bool {
         self.client
             .state()
