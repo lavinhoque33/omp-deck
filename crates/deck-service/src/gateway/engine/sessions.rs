@@ -2534,6 +2534,7 @@ impl Engine {
             let ext = self.ctl_ext.clone();
             let ns = self.ctl_ns.clone();
             let omp = self.omp.as_ref().map(|o| o.program().to_path_buf());
+            let overlay = self.omp_overlay.clone();
             let mut tools = self.cfg.agent_tools.clone();
             tools.report &= job.spec.agent_child;
             let tools = tools.env_value();
@@ -2551,6 +2552,7 @@ impl Engine {
                     omp,
                     tools,
                     checkpoints,
+                    Some(overlay),
                     login,
                 )))
             });
@@ -2852,8 +2854,9 @@ fn effective_view(
     }
 }
 
-/// Worker: control dir and environment, the resolved argv and the backend launch. `login` =
-/// the current login's display/bus variables ([`crate::gateway::login_env::overrides`]).
+/// Worker: control dir and environment, the resolved argv and the backend launch. `overlay` =
+/// the omp session settings overlay ([`deck_core::omp::overlay`]); `login` = the current login's
+/// display/bus variables ([`crate::gateway::login_env::overrides`]).
 #[allow(clippy::too_many_arguments)]
 fn prepare(
     mut job: LaunchJob,
@@ -2865,6 +2868,7 @@ fn prepare(
     omp: Option<PathBuf>,
     tools: Option<String>,
     checkpoints: bool,
+    overlay: Option<PathBuf>,
     login: Vec<(String, String)>,
 ) -> Prepared {
     let created = match (&mux, &name) {
@@ -2951,6 +2955,18 @@ fn prepare(
         }
         .to_owned(),
     ));
+    // omp's own settings OmpDeck decides (same-folder agent messaging): every session reads the
+    // overlay last, so a running one follows a later rewrite. A tool run is no omp session.
+    if job.spec.role == SessionRole::Session
+        && let Some(files) = overlay
+            .as_deref()
+            .and_then(deck_core::omp::overlay::config_files)
+    {
+        env.push((
+            deck_core::omp::overlay::CONFIG_FILES_ENV.to_owned(),
+            files.to_string_lossy().into_owned(),
+        ));
+    }
     env.extend(login);
     let mut argv = job.spec.argv.clone();
     // The detected omp may live outside PATH (`~/.local/bin`).
@@ -3530,6 +3546,7 @@ mod tests {
             None,
             None,
             false,
+            Some(PathBuf::from("/state/omp-overlay.yml")),
             Vec::new(),
         );
         assert_eq!(chat.view, SessionView::Chat);
@@ -3542,6 +3559,15 @@ mod tests {
                         key == deck_core::ctl::OMPDECK_TOOLS_ENV && value.is_empty()
                     }),
                     "disabled tools must override an inherited tools setting"
+                );
+                let files = spec
+                    .env_set
+                    .iter()
+                    .find(|(key, _)| key == "PI_CONFIG_FILES")
+                    .map(|(_, value)| value.as_str());
+                assert!(
+                    files.is_some_and(|v| v.ends_with("/state/omp-overlay.yml")),
+                    "a session reads the settings overlay last: {files:?}"
                 );
             }
             other => panic!("not a host launch: {other:?}"),
@@ -3556,6 +3582,7 @@ mod tests {
             None,
             None,
             false,
+            Some(PathBuf::from("/state/omp-overlay.yml")),
             Vec::new(),
         );
         assert_eq!(term.view, SessionView::Terminal);
@@ -3571,10 +3598,20 @@ mod tests {
             None,
             None,
             false,
+            Some(PathBuf::from("/state/omp-overlay.yml")),
             Vec::new(),
         );
         assert_eq!(tool.view, SessionView::Terminal);
-        assert!(matches!(tool.launch, Ok(Launch::Host(s)) if !s.tsp));
+        match tool.launch {
+            Ok(Launch::Host(s)) => {
+                assert!(!s.tsp);
+                assert!(
+                    !s.env_set.iter().any(|(key, _)| key == "PI_CONFIG_FILES"),
+                    "a tool run is no omp session: no overlay"
+                );
+            }
+            other => panic!("not a host launch: {other:?}"),
+        }
     }
 
     #[cfg(unix)]
@@ -3596,6 +3633,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             Vec::new(),
         );
         assert_eq!(p.view, SessionView::Terminal);
@@ -3611,6 +3649,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             Vec::new(),
         );
         assert_eq!(p.view, SessionView::Terminal);

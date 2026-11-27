@@ -27,7 +27,7 @@ pub(super) mod worktree;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -433,6 +433,9 @@ pub(crate) struct Engine {
     ctl_ns: String,
     ctl_ext: Option<PathBuf>,
     omp: Option<Omp>,
+    /// The settings overlay every omp session launched here reads (`PI_CONFIG_FILES`), kept in
+    /// step with "Let sessions message each other" ([`deck_core::omp::overlay`]).
+    omp_overlay: PathBuf,
     /// Backups to every destination (the Drive side is unavailable without OAuth credentials).
     service: Arc<Service>,
     handles: Arc<Handles>,
@@ -521,6 +524,8 @@ impl Engine {
             log::warn!("live control extension unavailable: no per-user data directory");
         }
         let omp = super::resolve_omp(context.omp.as_deref());
+        let omp_overlay = state_dir.join(deck_core::omp::overlay::FILE_NAME);
+        write_omp_overlay(&omp_overlay, cfg.agent_tools.message_session);
         // The backup credentials belong to the served profile: `app_root()` is `config_dir()` for
         // the default profile, and an explicit profile (`--settings`) keeps its own on every
         // platform (Windows' config dir ignores the environment).
@@ -581,6 +586,7 @@ impl Engine {
             ctl_ns,
             ctl_ext,
             omp,
+            omp_overlay,
             service,
             handles: Arc::new(Handles::default()),
             stats: Arc::new(Mutex::new(StatsCache::default())),
@@ -1379,6 +1385,9 @@ impl Engine {
             self.running.probe_parking(self.cfg.park_idle_sessions);
             self.dirty.parking = true;
         }
+        if old.agent_tools.message_session != self.cfg.agent_tools.message_session {
+            write_omp_overlay(&self.omp_overlay, self.cfg.agent_tools.message_session);
+        }
         self.sync_mobile_link();
         self.changed(Topic::Settings);
     }
@@ -1493,6 +1502,14 @@ impl Engine {
     fn start_background_work(&mut self) {
         self.start_schedules();
         self.refresh_registration();
+    }
+}
+
+/// Brings the omp session overlay in line with "Let sessions message each other"; running
+/// sessions follow the rewrite. A failed write leaves them on the file's previous value (logged).
+fn write_omp_overlay(path: &Path, allow_messages: bool) {
+    if let Err(e) = deck_core::omp::overlay::write(path, allow_messages) {
+        log::warn!("omp session overlay {}: {e}", path.display());
     }
 }
 

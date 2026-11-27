@@ -1643,7 +1643,7 @@ fn agent_tools_card(
             ),
             (
                 "Let sessions message each other",
-                "Lets one session's agent start turns in another by sending it a message (never touches its composer)",
+                "Lets one session's agent start turns in another by sending it a message (never touches its composer). Off also keeps OmpDeck's sessions out of omp's own same-folder agent messaging (task.crossInstance)",
                 |t| &mut t.message_session,
             ),
         ];

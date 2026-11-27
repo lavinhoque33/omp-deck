@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use serde_json::{Map, Value};
 
 pub mod auth;
+pub mod overlay;
 mod plugins;
 mod sess;
 mod usage_reset;

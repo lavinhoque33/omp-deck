@@ -5265,6 +5265,26 @@ own Settings toggle.
   (Background badge, hover buttons) → B's turn ends → A gets "Watch: Worker B (2a62879c) completed" and acts; Stop watching
   → "Stopped by the user"; B messages A → A wakes with "Message from Worker B (2a62879c)"; Settings shows 13 tool toggles.
 
+### omp 19 cross-instance messaging follows the toggle (user, 2026-11-26)
+omp ≥ 19 has its own same-folder agent messaging (`task.crossInstance`, default **on** since 19.2.0: "Let other omp
+instances in this folder read agent outputs and send messages that can wake agents"; `irc/mesh.ts` joins an `agents`
+unit of omp's per-user daemon scoped to `realpath(cwd)`, one lease per joined session, and starts/stops it live when the
+setting changes). User decision: "Let sessions message each other" (`AgentTools.message_session`, default off) governs it
+for the sessions OmpDeck launches.
+- Overlay `<gateway state dir>/omp-overlay.yml` (`deck_core::omp::overlay`, per profile so test gateways never touch the
+  user's file): off = `task: {crossInstance: false}`, on = `{}` (the user's own omp setting applies), each with a `#`
+  header. Written atomically (`platform::write_private`) and only when the text differs, at `Engine::new` and in
+  `refresh_settings` when the toggle changes.
+- Every `SessionRole::Session` launch (`sessions.rs` `prepare`) gets `PI_CONFIG_FILES` = the gateway's inherited list
+  (empties and the overlay removed) + the overlay last (last layer wins; omp passes it on to child omps). Tool runs get
+  none; headless `--mode rpc` helpers need none (omp joins the mesh only in interactive sessions).
+- The file always exists, so omp's config poll (`fs.watchFile`, 500 ms, includes `PI_CONFIG_FILES` layers) sees flips
+  both ways: running sessions join/leave without a restart. Sessions launched before this change keep omp's default
+  until restarted. Off also hides OmpDeck's sessions from `agent://peers` of omps started elsewhere in the folder.
+- omp's `/settings` marks the key "A --config / PI_CONFIG_FILES overlay overrides this value for this process".
+- Gate: `deck-core/tests/cross_instance_live.rs` (real omp; off at launch → 0 leases for 4 s, overlay on → joins, off →
+  leaves; `omp ps --json`).
+
 ## ctl stream integrity + tool-result routing (user, 2026-11-14)
 
 Cause (reproduced): on Unix the extension serves ctl with `Bun.listen`, whose `socket.write` is unbuffered and

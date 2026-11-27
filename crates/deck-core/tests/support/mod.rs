@@ -106,6 +106,8 @@ pub struct Live {
     pub proj: PathBuf,
     pub ns: String,
     pub omp: Omp,
+    /// The sandbox environment (HOME, `PI_CODING_AGENT_DIR`, `XDG_*`) for side commands.
+    pub env: Vec<(String, String)>,
     pub model: FakeModel,
     client: Option<CtlClient>,
     namespace: Namespace,
@@ -143,6 +145,27 @@ impl Live {
         resume: impl FnOnce(&Live) -> Option<PathBuf>,
         tools: Option<&str>,
         checkpoints: bool,
+    ) -> Option<Live> {
+        Self::launch(tag, script, seed, resume, tools, checkpoints, Vec::new())
+    }
+
+    /// A fresh session with `extra` added to omp's environment (e.g. `PI_CONFIG_FILES`).
+    pub fn start_with_env(
+        tag: &str,
+        script: impl FnMut(&Value) -> Reply + Send + 'static,
+        extra: Vec<(String, String)>,
+    ) -> Option<Live> {
+        Self::launch(tag, script, |_| {}, |_| None, None, false, extra)
+    }
+
+    fn launch(
+        tag: &str,
+        script: impl FnMut(&Value) -> Reply + Send + 'static,
+        seed: impl FnOnce(&Live),
+        resume: impl FnOnce(&Live) -> Option<PathBuf>,
+        tools: Option<&str>,
+        checkpoints: bool,
+        extra: Vec<(String, String)>,
     ) -> Option<Live> {
         let omp_exe = std::env::var_os("OMPDECK_TEST_OMP").map(PathBuf::from)?;
         ensure_host_exe();
@@ -195,6 +218,7 @@ impl Live {
             proj,
             ns,
             omp,
+            env: env.clone(),
             model,
             client: None,
             namespace,
@@ -212,6 +236,10 @@ impl Live {
         }
         prepare_ctl_dir(&ctl).expect("ctl dir");
         let mut launch_env = env;
+        // A settings overlay of the shell running the tests must not leak into the sandbox.
+        let config_files = deck_core::omp::overlay::CONFIG_FILES_ENV;
+        let own_config_files = extra.iter().any(|(k, _)| k == config_files);
+        launch_env.extend(extra);
         launch_env.extend(
             ctl_env_with_key(&ctl, &key_file)
                 .expect("ctl env")
@@ -239,6 +267,9 @@ impl Live {
         }
         if !checkpoints {
             env_remove.push("OMPDECK_CHECKPOINTS".into());
+        }
+        if !own_config_files {
+            env_remove.push(config_files.into());
         }
         env_set.retain(|(k, _)| k != "PI_NOTIFICATIONS");
         env_set.push(("PI_NOTIFICATIONS".into(), "off".into()));
